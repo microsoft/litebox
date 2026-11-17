@@ -700,7 +700,7 @@ fn read_only_backend_reads_live_and_refuses_every_host_mutation() {
     fs::create_dir(temp.path().join("empty")).unwrap();
     let before = host_tree(temp.path());
     let resolver: Resolver<TestPlatform, _> = Resolver::new(
-        Composer::builder()
+        Composer::<TestPlatform>::builder()
             .try_mount("/ro", |ids| {
                 LocalFs::new(temp.path(), ids).map(ReadOnly::new)
             })
@@ -1041,7 +1041,7 @@ fn final_symlink_removal_does_not_follow_the_link() {
 fn resolver_and_composer_use_host_permissions_and_live_positions() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("file"), b"abc").unwrap();
-    let composer = Composer::builder()
+    let composer = Composer::<TestPlatform>::builder()
         .try_mount("/host", |ids| LocalFs::new(temp.path(), ids))
         .unwrap()
         .build()

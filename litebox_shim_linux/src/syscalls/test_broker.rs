@@ -128,7 +128,7 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
                 .with_terminal(StdioStream::Stdout),
         );
         let devices_stdio = Arc::clone(&stdio);
-        let fs = litebox_broker_core::fs::composer::Composer::builder()
+        let fs = litebox_broker_core::fs::composer::Composer::<TestPlatform>::builder()
             .mount("/", |allocator| {
                 litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(
                     vec![("/", root)],

@@ -232,6 +232,10 @@ mod private {
             Err(BrokerError::UnsupportedOperation)
         }
 
+        fn mount_in_mem(&self, _path: &str, _user: FileUser) -> ServiceResult<()> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
         fn symlink(&self, _target: &str, _linkpath: &str, _user: FileUser) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -564,6 +568,10 @@ where
 
     fn mkdir(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
         Ok(Resolver::mkdir(self, user, path, mode & FileMode::SUPPORTED).map_err(file_mkdir_error))
+    }
+
+    fn mount_in_mem(&self, path: &str, user: FileUser) -> ServiceResult<()> {
+        Ok(Resolver::mount_in_mem(self, user, path))
     }
 
     fn symlink(&self, target: &str, linkpath: &str, user: FileUser) -> ServiceResult<()> {
@@ -959,6 +967,15 @@ pub fn mkdir(
     process.fs.mkdir(path, user, mode)
 }
 
+/// Mounts a fresh in-memory filesystem on an existing directory at an absolute path.
+pub fn mount_in_mem(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
+    process.require_object_rights(ObjectRights::WRITE)?;
+    if let Err(error) = validate_path(path) {
+        return Ok(Err(error));
+    }
+    process.fs.mount_in_mem(path, user)
+}
+
 /// Creates a symbolic link at an absolute path, storing `target` without resolving it.
 pub fn symlink(
     process: &BrokerProcess,
@@ -1250,7 +1267,7 @@ fn file_status_error(error: FileStatusError) -> FileError {
     }
 }
 
-fn file_walk_error(error: WalkError) -> FileError {
+pub(super) fn file_walk_error(error: WalkError) -> FileError {
     match error {
         WalkError::PathError(error) => file_path_error(error),
         WalkError::Io => FileError::Io,

@@ -123,6 +123,13 @@ fn test_utimensat_through_broker_mount() {
 }
 
 #[test]
+fn test_mount_tmpfs() {
+    let target = common::compile("./tests/mount.c", "mount_tmpfs", true, false);
+    let output = Runner::new(&target, "mount_tmpfs").output();
+    assert!(String::from_utf8_lossy(&output).contains("mount tmpfs ok"));
+}
+
+#[test]
 fn test_utimensat_in_memory() {
     let target = common::compile("./tests/utimensat.c", "utimensat_in_memory", true, false);
     let output = Runner::new(&target, "utimensat_in_memory").output();
@@ -145,6 +152,9 @@ fn run_c_test(path: &str, suffix: &str, exec_or_lib: bool) {
 }
 
 macro_rules! c_test {
+    (r#mount, $path:literal) => {
+        c_test!(#[ignore = "has a dedicated test"] r#mount, $path);
+    };
     ($(#[$attribute:meta])* $stem:ident, $path:literal) => {
         $(#[$attribute])*
         #[test]
@@ -2099,7 +2109,7 @@ fn test_file_service(
         }
     }
 
-    let backend = Composer::builder()
+    let backend = Composer::<LinuxSyncPrimitivesProvider>::builder()
         .mount("/", |allocator| {
             InMem::<LinuxSyncPrimitivesProvider>::new_initialized(entries, allocator)
                 .with_shared_memory(

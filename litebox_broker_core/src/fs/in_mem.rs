@@ -1098,7 +1098,7 @@ mod tests {
             Node::File(file) => file.clone(),
             Node::Dir(_) => panic!("expected backing file"),
         };
-        let composer = Composer::builder()
+        let composer = Composer::<TestPlatform>::builder()
             .mount("/", |_| backend)
             .mount("/a/b", InMem::<TestPlatform>::new)
             .mount("/link/child", InMem::<TestPlatform>::new)
@@ -1165,7 +1165,7 @@ mod tests {
             allocators.next(),
         );
         let overlay = Overlay::<TestPlatform>::new(upper, lower, allocators.next());
-        let backend = Composer::builder()
+        let backend = Composer::<TestPlatform>::builder()
             .mount("/mnt", |_| overlay)
             .build()
             .unwrap();

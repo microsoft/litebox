@@ -8,12 +8,12 @@ use crate::fs::{
     FileNodeInfo, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
     FileTimeUpdate, FileTimestamp, FileTimestamps, FileUser, HandleFilePathRequest,
     HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MapFileRequest,
-    MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-    ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest, SetTimesFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
+    MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest,
+    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -45,6 +45,7 @@ const REQUEST_TAG_RENAME: u8 = 19;
 const REQUEST_TAG_SET_TIMES: u8 = 20;
 const REQUEST_TAG_MAP: u8 = 21;
 const REQUEST_TAG_LOCK: u8 = 22;
+const REQUEST_TAG_MOUNT: u8 = 23;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -69,6 +70,7 @@ const RESPONSE_TAG_RENAME: u8 = 19;
 const RESPONSE_TAG_SET_TIMES: u8 = 20;
 const RESPONSE_TAG_MAP: u8 = 21;
 const RESPONSE_TAG_LOCK: u8 = 22;
+const RESPONSE_TAG_MOUNT: u8 = 23;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -94,6 +96,7 @@ const _: () = {
     assert!(REQUEST_TAG_SET_TIMES == RESPONSE_TAG_SET_TIMES);
     assert!(REQUEST_TAG_MAP == RESPONSE_TAG_MAP);
     assert!(REQUEST_TAG_LOCK == RESPONSE_TAG_LOCK);
+    assert!(REQUEST_TAG_MOUNT == RESPONSE_TAG_MOUNT);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -233,6 +236,11 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
             encoder.handle(request.handle);
             encoder.u64(request.end);
         }
+        FileRequest::Mount(request) => {
+            encoder.u8(REQUEST_TAG_MOUNT);
+            encoder.shared_buffer_sequence(request.path);
+            encode_user(encoder, request.user);
+        }
     }
 }
 
@@ -357,6 +365,10 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             handle: decoder.handle()?,
             end: decoder.u64()?,
         })),
+        REQUEST_TAG_MOUNT => Ok(FileRequest::Mount(MountFileRequest {
+            path: decoder.shared_buffer_sequence()?,
+            user: decode_user(decoder)?,
+        })),
         _ => Err(WireError::InvalidTag),
     }
 }
@@ -410,6 +422,7 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
         FileResponse::Rmdir => encoder.u8(RESPONSE_TAG_RMDIR),
         FileResponse::Symlink => encoder.u8(RESPONSE_TAG_SYMLINK),
         FileResponse::Rename => encoder.u8(RESPONSE_TAG_RENAME),
+        FileResponse::Mount => encoder.u8(RESPONSE_TAG_MOUNT),
         FileResponse::ReadLink(FilePathResponse { length }) => {
             encoder.u8(RESPONSE_TAG_READ_LINK);
             encoder.u32(length);
@@ -477,6 +490,7 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         RESPONSE_TAG_RMDIR => Ok(FileResponse::Rmdir),
         RESPONSE_TAG_SYMLINK => Ok(FileResponse::Symlink),
         RESPONSE_TAG_RENAME => Ok(FileResponse::Rename),
+        RESPONSE_TAG_MOUNT => Ok(FileResponse::Mount),
         RESPONSE_TAG_READ_LINK => Ok(FileResponse::ReadLink(FilePathResponse {
             length: decoder.u32()?,
         })),

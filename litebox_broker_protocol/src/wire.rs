@@ -798,7 +798,7 @@ mod tests {
         FileNodeInfo, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
         FileTimeUpdate, FileTimestamp, FileTimestamps, FileType, FileUser, HandleFilePathRequest,
         HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MapFileRequest,
-        MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+        MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest, OpenFileResponse,
         PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
         ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest,
         SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest,
@@ -1241,6 +1241,10 @@ mod tests {
             BrokerOperation::File(FileRequest::Map(MapFileRequest {
                 handle,
                 end: 3 << 32 | 0x1000,
+            })),
+            BrokerOperation::File(FileRequest::Mount(MountFileRequest {
+                path: sequence(14, 9),
+                user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
@@ -2149,6 +2153,7 @@ mod tests {
             BrokerResult::File(FileResponse::Chown),
             BrokerResult::File(FileResponse::Unlink),
             BrokerResult::File(FileResponse::Mkdir),
+            BrokerResult::File(FileResponse::Mount),
             BrokerResult::File(FileResponse::Rmdir),
             BrokerResult::File(FileResponse::ReadLink(FilePathResponse { length: 31 })),
             BrokerResult::File(FileResponse::ResolvePath(FilePathResponse { length: 37 })),
@@ -3609,6 +3614,38 @@ mod tests {
                 160, 1,
             ]
         );
+    }
+
+    #[test]
+    fn fs_mount_wire_shape_is_pinned() {
+        let request = BrokerRequest {
+            request_id: RequestId(13),
+            operation: BrokerOperation::File(FileRequest::Mount(MountFileRequest {
+                path: sequence(2, 3),
+                user: FileUser { user: 5, group: 7 },
+            })),
+        };
+        let encoded = encode_request(request.clone());
+        assert_eq!(
+            encoded,
+            [
+                7, 13, 0, 0, 0, 0, 0, 0, 0, 23, 1, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0
+            ]
+        );
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+        for length in 0..encoded.len() {
+            assert_eq!(
+                decode_request(&encoded[..length]),
+                Err(WireError::TruncatedFrame)
+            );
+        }
+        let response = BrokerResponse {
+            request_id: RequestId(13),
+            result: BrokerResult::File(FileResponse::Mount),
+        };
+        let encoded = encode_response(response.clone());
+        assert_eq!(encoded, [7, 13, 0, 0, 0, 0, 0, 0, 0, 23]);
+        assert_eq!(decode_response(&encoded).unwrap(), response);
     }
 
     #[test]

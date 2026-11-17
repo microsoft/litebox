@@ -198,6 +198,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(MkdirError::from)
     }
 
+    /// Mount a fresh in-memory filesystem at a directory path.
+    pub fn mount_in_mem(&self, context: &Context, path: &str) -> Result<(), FileError> {
+        if path.is_empty() {
+            return Err(FileError::NoSuchFileOrDirectory);
+        }
+        // Preserve dot components and trailing slashes for the broker's target validation.
+        let path = if path.starts_with('/') {
+            String::from(path)
+        } else {
+            let mut absolute = context.cwd().to_string();
+            if !absolute.ends_with('/') {
+                absolute.push('/');
+            }
+            absolute.push_str(path);
+            absolute
+        };
+        self.broker_control()
+            .ok_or(FileError::Io)?
+            .mount_in_mem(&path, context.acting_user())
+            .map_err(|_| FileError::Io)?
+    }
+
     /// Remove a directory.
     pub fn rmdir_file(&self, context: &Context, path: &str) -> Result<(), RmdirError> {
         let path = Self::broker_path(context, path);

@@ -681,6 +681,15 @@ pub struct MkdirFileRequest {
     pub mode: FileMode,
 }
 
+/// Mounts a fresh tmpfs at a directory path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MountFileRequest {
+    /// Shared-buffer region containing one absolute UTF-8 path.
+    pub path: SharedBufferSequence,
+    /// Caller identity for permission checks.
+    pub user: FileUser,
+}
+
 /// Removes a directory by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RmdirFileRequest {

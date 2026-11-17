@@ -2994,6 +2994,13 @@ pub enum SyscallRequest {
         pathname: UserPtr<c_char>,
         mode: u32,
     },
+    Mount {
+        source: Option<UserPtr<c_char>>,
+        target: UserPtr<c_char>,
+        filesystemtype: Option<UserPtr<c_char>>,
+        mountflags: usize,
+        data: Option<UserPtr<u8>>,
+    },
     Symlinkat {
         target: UserPtr<c_char>,
         dirfd: i32,
@@ -3693,6 +3700,9 @@ impl SyscallRequest {
                 mode: ctx.sys_req_arg(1),
             },
             Sysno::mkdirat => sys_req!(Mkdirat { dirfd, pathname:*, mode }),
+            Sysno::mount => {
+                sys_req!(Mount { source:*, target:*, filesystemtype:*, mountflags, data:* })
+            }
             #[cfg(target_arch = "x86_64")]
             Sysno::symlink => SyscallRequest::Symlinkat {
                 target: ctx.sys_req_ptr(0),

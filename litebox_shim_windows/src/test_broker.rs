@@ -98,7 +98,7 @@ pub(crate) fn litebox_with_broker_files_and_stdio(
     entries: Vec<(String, InitialNode)>,
     stdio: Arc<dyn StdioProvider>,
 ) -> (litebox::LiteBox<TestPlatform>, usize) {
-    let fs = litebox_broker_core::fs::composer::Composer::builder()
+    let fs = litebox_broker_core::fs::composer::Composer::<TestPlatform>::builder()
         .mount("/", |allocator| {
             litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(
                 entries, allocator,

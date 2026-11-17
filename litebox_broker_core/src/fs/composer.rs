@@ -10,8 +10,10 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
+use core::marker::PhantomData;
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
@@ -29,8 +31,20 @@ use crate::readiness::ReadinessSource;
 use thiserror::Error;
 
 /// A [`Backend`] composed from mounted [`Backend`]s at various paths.
-pub struct Composer {
-    mounts: Vec<Mount>,
+pub struct Composer<Platform: RawSyncPrimitivesProvider> {
+    state: RwLock<Platform, MountState>,
+}
+
+struct MountState {
+    // Append-only: borrowed backend handles point into these boxes.
+    #[expect(
+        clippy::vec_box,
+        reason = "published mounts need stable addresses for borrowed handles"
+    )]
+    mounts: Vec<Box<Mount>>,
+    limit: usize,
+    allocators: InodeAllocators,
+    virtual_dir_allocator: InodeAllocator,
     // TODO(jayb): We have these to account for `/mnt` in something like mounting `/mnt/foo`; I am
     // not certain this is the best design (maybe we should have something _explicitly_ make
     // `/mnt`), but for now, this is the design I've chosen.
@@ -38,9 +52,12 @@ pub struct Composer {
 }
 
 /// A [`Composer`] builder.
-pub struct ComposerBuilder {
+// XXX(jayb): Possibly replaceable by `Composer::new(root)` + runtime `mount`, once that supports
+// nestable/fallible constructors and startup mounts don't count against the runtime cap.
+pub struct ComposerBuilder<Platform: RawSyncPrimitivesProvider> {
     mounts: Vec<(String, Box<dyn Backend>)>,
     allocators: InodeAllocators,
+    _sync: PhantomData<fn() -> Platform>,
 }
 
 /// A mounted backend.
@@ -67,20 +84,102 @@ pub enum BuildError {
     DuplicateMountPath,
 }
 
-impl Composer {
+/// Runtime mount errors.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum MountError {
+    #[error("mount paths must be absolute normalized paths")]
+    InvalidMountPath,
+    #[error("a backend is already mounted at this path")]
+    Busy,
+    #[error("runtime mount capacity is exhausted")]
+    NoSpace,
+}
+
+// XXX(jayb): Arbitrary cap; Linux allows ~100k. Revisit once unmount exists.
+const RUNTIME_MOUNT_CAPACITY: usize = 16;
+
+fn parse_mount_path(raw: &str) -> Result<Vec<String>, MountError> {
+    if !raw.starts_with('/') || raw.contains('\0') {
+        return Err(MountError::InvalidMountPath);
+    }
+    let path: Vec<String> = raw
+        .split('/')
+        .skip(1)
+        .filter(|component| !component.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if path
+        .iter()
+        .any(|component| component == "." || component == "..")
+        || raw != format!("/{}", path.join("/"))
+    {
+        return Err(MountError::InvalidMountPath);
+    }
+    Ok(path)
+}
+
+impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
+    /// Append a mounted backend without invalidating existing handles.
+    ///
+    /// Missing ancestor directories are synthesized; callers that require an existing target
+    /// directory must validate it before calling this method.
+    ///
+    /// # Deadlocks
+    ///
+    /// `make` runs while the namespace state is exclusively locked; it must not access this
+    /// `Composer`.
+    pub fn mount<B: Backend>(
+        &self,
+        path: &str,
+        make: impl FnOnce(InodeAllocator) -> B,
+    ) -> Result<(), MountError> {
+        let path = parse_mount_path(path)?;
+        let mut state = self.state.write();
+        // XXX(jayb): No mount stacking or unmount; Linux would stack here instead of EBUSY.
+        if MountRelation::of(state.mounts.iter().map(Box::as_ref), &path) == MountRelation::Exact {
+            return Err(MountError::Busy);
+        }
+        if state.mounts.len() >= state.limit {
+            return Err(MountError::NoSpace);
+        }
+        let backend = Box::new(make(state.allocators.next()));
+        let MountState {
+            mounts,
+            virtual_dirs,
+            virtual_dir_allocator,
+            ..
+        } = &mut *state;
+        for len in 0..path.len() {
+            let ancestor = &path[..len];
+            if virtual_dirs.iter().any(|dir| dir.path == ancestor) {
+                continue;
+            }
+            virtual_dirs.push(VirtualDir {
+                path: ancestor.to_vec(),
+                node_info: virtual_dir_allocator.next(),
+            });
+        }
+        // Publish fallback metadata first: a host ancestor can disappear after validation.
+        // XXX(jayb): Mounts are keyed by path, not dentry; renaming an ancestor doesn't move the
+        // mount as on Linux.
+        mounts.push(Box::new(Mount { path, backend }));
+        Ok(())
+    }
+
     /// Start building an empty composer.
     #[must_use]
-    pub fn builder() -> ComposerBuilder {
+    pub fn builder() -> ComposerBuilder<Platform> {
         ComposerBuilder {
             mounts: vec![],
             // XXX(jayb): Each builder numbers devices from 1, so nesting composers (unsupported
             // for now) would collide device IDs unless the outer `InodeAllocators` is threaded in.
             allocators: InodeAllocators::new(),
+            _sync: PhantomData,
         }
     }
 }
 
-impl ComposerBuilder {
+impl<Platform: RawSyncPrimitivesProvider> ComposerBuilder<Platform> {
     /// Add a backend mounted at `path`.
     #[must_use]
     pub fn mount<B: Backend>(self, path: &str, backend: impl FnOnce(InodeAllocator) -> B) -> Self {
@@ -125,7 +224,7 @@ impl ComposerBuilder {
     }
 
     /// Validate mount paths and finalize the composer.
-    pub fn build(self) -> Result<Composer, BuildError> {
+    pub fn build(self) -> Result<Composer<Platform>, BuildError> {
         if self.mounts.is_empty() {
             return Err(BuildError::NoMounts);
         }
@@ -133,25 +232,7 @@ impl ComposerBuilder {
         let mut mounts = vec![];
         let mut paths = vec![];
         for (raw, backend) in self.mounts {
-            if !raw.starts_with('/') {
-                return Err(BuildError::InvalidMountPath);
-            }
-            let path: Vec<String> = raw
-                .split('/')
-                .skip(1)
-                .filter(|component| !component.is_empty())
-                .map(ToString::to_string)
-                .collect();
-            if path
-                .iter()
-                .any(|component| component == "." || component == "..")
-            {
-                return Err(BuildError::InvalidMountPath);
-            }
-            if raw != format!("/{}", path.join("/")) {
-                // Just confirming that it is absolute + canonical
-                return Err(BuildError::InvalidMountPath);
-            }
+            let path = parse_mount_path(&raw).map_err(|_| BuildError::InvalidMountPath)?;
             paths.push(path.clone());
             mounts.push(Mount { path, backend });
         }
@@ -184,10 +265,19 @@ impl ComposerBuilder {
             }
         }
 
+        let mount_limit = mounts.len() + RUNTIME_MOUNT_CAPACITY;
+        let mut published = Vec::with_capacity(mount_limit);
+        published.extend(mounts.into_iter().map(Box::new));
+
         // TODO(jayb): Validate mounted backend device IDs once backends expose that cheaply.
         Ok(Composer {
-            mounts,
-            virtual_dirs,
+            state: RwLock::new(MountState {
+                mounts: published,
+                limit: mount_limit,
+                allocators: self.allocators,
+                virtual_dir_allocator,
+                virtual_dirs,
+            }),
         })
     }
 }
@@ -200,7 +290,7 @@ enum MountRelation {
 }
 
 impl MountRelation {
-    fn of(mounts: &[Mount], path: &[String]) -> Self {
+    fn of<'a>(mounts: impl IntoIterator<Item = &'a Mount>, path: &[String]) -> Self {
         let mut relation = MountRelation::Unrelated;
         for mount in mounts {
             if mount.path == path {
@@ -219,9 +309,29 @@ fn append_components(mut path: Vec<String>, components: &[&str]) -> Vec<String> 
     path
 }
 
-impl Composer {
+impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
+    fn mount_at(&self, index: usize) -> Option<&Mount> {
+        let mount = core::ptr::from_ref(self.state.read().mounts.get(index)?.as_ref());
+        // SAFETY: Writers only push new boxed mounts; published mounts remain immutable.
+        // Their boxes keep their addresses stable, and the pointees cannot be freed while
+        // `self` is borrowed. The read lock synchronizes publication and is released before
+        // calling into a backend.
+        Some(unsafe { &*mount })
+    }
+
+    fn initialized_mounts(&self) -> impl Iterator<Item = (usize, &Mount)> {
+        (0..).map_while(move |index| self.mount_at(index).map(|mount| (index, mount)))
+    }
+
+    fn backend(&self, index: usize) -> &dyn Backend {
+        self.mount_at(index)
+            .expect("handle refers to an initialized mount")
+            .backend
+            .as_ref()
+    }
+
     fn mount_relation(&self, path: &[String]) -> MountRelation {
-        MountRelation::of(&self.mounts, path)
+        MountRelation::of(self.initialized_mounts().map(|(_, mount)| mount), path)
     }
 
     /// This function exists primarily to simplify + mark implementations of mutating operations
@@ -245,7 +355,7 @@ impl Composer {
     /// Returns child names from mount paths only; mounted backend contents are not inspected.
     fn immediate_mount_children(&self, path: &[String]) -> Vec<String> {
         let mut children = vec![];
-        for mount in &self.mounts {
+        for (_, mount) in self.initialized_mounts() {
             if path.len() < mount.path.len() && mount.path.starts_with(path) {
                 let child = mount.path[path.len()].clone();
                 if !children.contains(&child) {
@@ -280,9 +390,7 @@ impl Composer {
         &self,
         path: &[String],
     ) -> Result<Option<(usize, ResolvedDir<'_>)>, WalkError> {
-        self.mounts
-            .iter()
-            .enumerate()
+        self.initialized_mounts()
             .find(|(_, mount)| mount.path == path)
             .map(|(index, mount)| mount.backend.root().map(|root| (index, root)))
             .transpose()
@@ -308,6 +416,8 @@ impl Composer {
 
     fn virtual_dir_status(&self, path: &[String]) -> FileStatus {
         let node_info = self
+            .state
+            .read()
             .virtual_dirs
             .iter()
             .find(|dir| dir.path == path)
@@ -428,14 +538,14 @@ impl Clone for ComposerDirHandleInner {
     }
 }
 
-impl BackendHandles for Composer {
+impl<Platform: RawSyncPrimitivesProvider> BackendHandles for Composer<Platform> {
     type ResolvedDir<'a> = ComposerWalkingDirHandle<'a>;
     type ResolvedFile<'a> = ComposerResolvedFile<'a>;
     type FileHandle = ComposerFileHandle;
     type DirHandle = ComposerDirHandle;
 }
 
-impl Backend for Composer {
+impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         let inner = match self.exact_mount_root(&[])? {
             Some((mount_index, handle)) => ComposerWalkingDirHandleInner::Mounted {
@@ -505,7 +615,7 @@ impl Backend for Composer {
                     };
                     let child_path = append_components(path.clone(), &[component]);
                     let relation = self.mount_relation(&child_path);
-                    let backend = &self.mounts[mount_index].backend;
+                    let backend = self.backend(mount_index);
                     if relation == MountRelation::Exact {
                         // XXX: an overlay can hide a nested server's search denial at a mount
                         // crossing; precise enforcement needs a backend/9P API change.
@@ -636,7 +746,7 @@ impl Backend for Composer {
                 ComposerDirHandleInner::Mounted {
                     path,
                     mount_index,
-                    handle: self.mounts[mount_index].backend.open_dir(handle, flags)?,
+                    handle: self.backend(mount_index).open_dir(handle, flags)?,
                 }
             }
         };
@@ -653,8 +763,8 @@ impl Backend for Composer {
                 path,
                 mount_index,
                 handle,
-            } => self.mounts[*mount_index]
-                .backend
+            } => self
+                .backend(*mount_index)
                 .walking_dir_at(handle)
                 .map(|handle| {
                     self.resolved_dir(
@@ -682,7 +792,7 @@ impl Backend for Composer {
                 let ResolvedTarget::Dir(handle) = target else {
                     unreachable!()
                 };
-                self.mounts[*mount_index].backend.read_link_at(handle, name)
+                self.backend(*mount_index).read_link_at(handle, name)
             }
         }
     }
@@ -695,7 +805,7 @@ impl Backend for Composer {
         let ResolvedTarget::File(handle) = target else {
             unreachable!()
         };
-        let handle = self.mounts[mount_index].backend.open_file(handle, flags)?;
+        let handle = self.backend(mount_index).open_file(handle, flags)?;
         Ok(FileHandle::from_typed::<Self>(ComposerFileHandle {
             mount_index,
             handle,
@@ -711,7 +821,7 @@ impl Backend for Composer {
                 mount_index,
                 handle,
             } => {
-                let entries = self.mounts[mount_index].backend.list_dir_at(handle)?;
+                let entries = self.backend(mount_index).list_dir_at(handle)?;
                 Ok(self.merge_mount_children(entries, &path))
             }
         }
@@ -724,21 +834,18 @@ impl Backend for Composer {
         offset: usize,
     ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
-        self.mounts[h.mount_index]
-            .backend
-            .read(&h.handle, buf, offset)
+        self.backend(h.mount_index).read(&h.handle, buf, offset)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
         let h = h.get_typed::<Self>();
-        self.mounts[h.mount_index]
-            .backend
+        self.backend(h.mount_index)
             .get_static_backing_data(&h.handle)
     }
 
     fn map_shared(&self, h: &FileHandle) -> Result<Arc<SharedFile>, MapSharedError> {
         let h = h.get_typed::<Self>();
-        self.mounts[h.mount_index].backend.map_shared(&h.handle)
+        self.backend(h.mount_index).map_shared(&h.handle)
     }
 
     fn write(
@@ -748,29 +855,24 @@ impl Backend for Composer {
         offset: usize,
     ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
-        self.mounts[h.mount_index]
-            .backend
-            .write(&h.handle, buf, offset)
+        self.backend(h.mount_index).write(&h.handle, buf, offset)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
         let h = h.get_typed::<Self>();
-        self.mounts[h.mount_index]
-            .backend
-            .truncate(&h.handle, length)
+        self.backend(h.mount_index).truncate(&h.handle, length)
     }
 
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
         let h = h.get_typed::<Self>();
-        self.mounts[h.mount_index].backend.seek_behavior(&h.handle)
+        self.backend(h.mount_index).seek_behavior(&h.handle)
     }
 
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
             HandleRef::File(h) => {
                 let h = h.get_typed::<Self>();
-                self.mounts[h.mount_index]
-                    .backend
+                self.backend(h.mount_index)
                     .status(HandleRef::File(&h.handle))
             }
             HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
@@ -779,32 +881,26 @@ impl Backend for Composer {
                     mount_index,
                     handle,
                     ..
-                } => self.mounts[*mount_index]
-                    .backend
-                    .status(HandleRef::Dir(handle)),
+                } => self.backend(*mount_index).status(HandleRef::Dir(handle)),
             },
         }
     }
 
     fn terminal(&self, h: &FileHandle) -> Option<super::backend::FileTerminal> {
         let h = h.get_typed::<Self>();
-        self.mounts[h.mount_index].backend.terminal(&h.handle)
+        self.backend(h.mount_index).terminal(&h.handle)
     }
 
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
         let h = h.get_typed::<Self>();
-        self.mounts[h.mount_index]
-            .backend
-            .readiness_source(&h.handle)
+        self.backend(h.mount_index).readiness_source(&h.handle)
     }
 
     fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
         match target {
             ResolvedTarget::File(h) => {
                 let h = h.get_typed::<Self>();
-                self.mounts[h.mount_index]
-                    .backend
-                    .resolved_status(&h.target)
+                self.backend(h.mount_index).resolved_status(&h.target)
             }
             ResolvedTarget::Dir(h) => match &h.get_typed::<Self>().inner {
                 ComposerWalkingDirHandleInner::Virtual { path } => {
@@ -814,7 +910,7 @@ impl Backend for Composer {
                     mount_index,
                     target,
                     ..
-                } => self.mounts[*mount_index].backend.resolved_status(target),
+                } => self.backend(*mount_index).resolved_status(target),
             },
         }
     }
@@ -837,8 +933,7 @@ impl Backend for Composer {
                     unreachable!()
                 };
                 self.checked_child_path(path, name, OpenError::ReadOnlyFileSystem)?;
-                self.mounts[mount_index]
-                    .backend
+                self.backend(mount_index)
                     .create_file_at(handle, name, metadata)
                     .map(|handle| {
                         FileHandle::from_typed::<Self>(ComposerFileHandle {
@@ -869,8 +964,7 @@ impl Backend for Composer {
                     unreachable!()
                 };
                 self.checked_child_path(path, name, SymlinkError::ReadOnlyFileSystem)?;
-                self.mounts[mount_index]
-                    .backend
+                self.backend(mount_index)
                     .symlink_at(handle, name, target, metadata)
             }
         }
@@ -894,8 +988,7 @@ impl Backend for Composer {
                     unreachable!()
                 };
                 let path = self.checked_child_path(path, name, MkdirError::ReadOnlyFileSystem)?;
-                self.mounts[mount_index]
-                    .backend
+                self.backend(mount_index)
                     .mkdir_at(handle, name, metadata)
                     .map(|handle| {
                         DirHandle::from_typed::<Self>(
@@ -924,7 +1017,7 @@ impl Backend for Composer {
                     unreachable!()
                 };
                 self.checked_child_path(path, name, UnlinkError::ReadOnlyFileSystem)?;
-                self.mounts[mount_index].backend.unlink_at(handle, name)
+                self.backend(mount_index).unlink_at(handle, name)
             }
         }
     }
@@ -942,7 +1035,7 @@ impl Backend for Composer {
                     unreachable!()
                 };
                 self.checked_child_path(path, name, RmdirError::ReadOnlyFileSystem)?;
-                self.mounts[mount_index].backend.rmdir_at(handle, name)
+                self.backend(mount_index).rmdir_at(handle, name)
             }
         }
     }
@@ -980,8 +1073,8 @@ impl Backend for Composer {
                     handle: new_handle,
                     ..
                 },
-            ) if old_mount == new_mount => self.mounts[old_mount]
-                .backend
+            ) if old_mount == new_mount => self
+                .backend(old_mount)
                 .rename_at(old_handle, old_name, new_handle, new_name),
             (ComposerDirHandleInner::Virtual { .. }, ComposerDirHandleInner::Virtual { .. }) => {
                 Err(RenameError::ReadOnlyFileSystem)
@@ -999,9 +1092,7 @@ impl Backend for Composer {
         match target {
             ResolvedTarget::File(h) => {
                 let h = h.into_typed::<Self>();
-                self.mounts[h.mount_index]
-                    .backend
-                    .set_times(h.target, times)
+                self.backend(h.mount_index).set_times(h.target, times)
             }
             ResolvedTarget::Dir(h) => match h.into_typed::<Self>().inner {
                 ComposerWalkingDirHandleInner::Virtual { .. } => {
@@ -1011,7 +1102,7 @@ impl Backend for Composer {
                     mount_index,
                     target,
                     ..
-                } => self.mounts[mount_index].backend.set_times(target, times),
+                } => self.backend(mount_index).set_times(target, times),
             },
         }
     }
@@ -1020,7 +1111,7 @@ impl Backend for Composer {
         match h {
             ResolvedTarget::File(h) => {
                 let h = h.into_typed::<Self>();
-                self.mounts[h.mount_index].backend.chmod(h.target, mode)
+                self.backend(h.mount_index).chmod(h.target, mode)
             }
             ResolvedTarget::Dir(h) => match h.into_typed::<Self>().inner {
                 ComposerWalkingDirHandleInner::Virtual { .. } => {
@@ -1030,7 +1121,7 @@ impl Backend for Composer {
                     mount_index,
                     target,
                     ..
-                } => self.mounts[mount_index].backend.chmod(target, mode),
+                } => self.backend(mount_index).chmod(target, mode),
             },
         }
     }
@@ -1044,9 +1135,7 @@ impl Backend for Composer {
         match h {
             ResolvedTarget::File(h) => {
                 let h = h.into_typed::<Self>();
-                self.mounts[h.mount_index]
-                    .backend
-                    .chown(h.target, user, group)
+                self.backend(h.mount_index).chown(h.target, user, group)
             }
             ResolvedTarget::Dir(h) => match h.into_typed::<Self>().inner {
                 ComposerWalkingDirHandleInner::Virtual { .. } => {
@@ -1056,7 +1145,7 @@ impl Backend for Composer {
                     mount_index,
                     target,
                     ..
-                } => self.mounts[mount_index].backend.chown(target, user, group),
+                } => self.backend(mount_index).chown(target, user, group),
             },
         }
     }
@@ -1069,13 +1158,300 @@ mod tests {
     use crate::test_platform::TestPlatform;
 
     #[test]
+    fn runtime_mount_shadows_files_without_invalidating_handles() {
+        let file = |data: &'static [u8]| InitialNode::File {
+            mode: Mode::RWXU,
+            owner: UserInfo::ROOT,
+            data: data.into(),
+        };
+        let composer = Composer::<TestPlatform>::builder()
+            .mount("/", |allocator| {
+                InMem::<TestPlatform>::new_initialized(
+                    [
+                        (
+                            "/mnt",
+                            InitialNode::Directory {
+                                mode: Mode::RWXU,
+                                owner: UserInfo::ROOT,
+                            },
+                        ),
+                        ("/mnt/file", file(b"old")),
+                    ],
+                    allocator,
+                )
+            })
+            .build()
+            .unwrap();
+        let open_file = || {
+            let Resolution::Found(ResolvedTarget::File(file)) = composer
+                .resolve(composer.root().unwrap(), &["mnt", "file"], &|_| Ok(()))
+                .unwrap()
+            else {
+                panic!("expected mounted file");
+            };
+            composer.open_file(file, OFlags::RDONLY).unwrap()
+        };
+        let old_file = open_file();
+        let Resolution::Found(ResolvedTarget::Dir(dir)) = composer
+            .resolve(composer.root().unwrap(), &["mnt"], &|_| Ok(()))
+            .unwrap()
+        else {
+            panic!("expected original directory");
+        };
+        let old_dir = composer.open_dir(dir, OFlags::RDONLY).unwrap();
+        let Resolution::Found(ResolvedTarget::File(unopened)) = composer
+            .resolve(composer.root().unwrap(), &["mnt", "file"], &|_| Ok(()))
+            .unwrap()
+        else {
+            panic!("expected original file");
+        };
+
+        composer
+            .mount("/mnt", |allocator| {
+                InMem::<TestPlatform>::new_initialized([("/file", file(b"new"))], allocator)
+            })
+            .unwrap();
+        let new_file = open_file();
+        let late_open = composer.open_file(unopened, OFlags::RDONLY).unwrap();
+        let Resolution::Found(ResolvedTarget::File(from_old_dir)) = composer
+            .resolve(
+                composer.walking_dir_at(&old_dir).unwrap(),
+                &["file"],
+                &|_| Ok(()),
+            )
+            .unwrap()
+        else {
+            panic!("expected original directory's file");
+        };
+        let from_old_dir = composer.open_file(from_old_dir, OFlags::RDONLY).unwrap();
+        for (handle, expected) in [
+            (&old_file, b"old"),
+            (&late_open, b"old"),
+            (&from_old_dir, b"old"),
+            (&new_file, b"new"),
+        ] {
+            let mut data = [0; 3];
+            assert_eq!(composer.read(handle, &mut data, 0).unwrap(), 3);
+            assert_eq!(&data, expected);
+        }
+        assert_ne!(
+            composer
+                .status(HandleRef::File(&old_file))
+                .unwrap()
+                .node_info
+                .dev,
+            composer
+                .status(HandleRef::File(&new_file))
+                .unwrap()
+                .node_info
+                .dev,
+        );
+    }
+
+    #[test]
+    fn runtime_mount_rejects_duplicates_and_exhaustion_before_construction() {
+        let composer = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        assert_eq!(
+            composer.mount::<InMem<TestPlatform>>("/", |_| panic!("duplicate constructor")),
+            Err(MountError::Busy),
+        );
+        for index in 0..RUNTIME_MOUNT_CAPACITY {
+            composer
+                .mount(&format!("/runtime/{index}"), InMem::<TestPlatform>::new)
+                .unwrap();
+        }
+        assert_eq!(
+            composer
+                .mount::<InMem<TestPlatform>>("/runtime/0", |_| panic!("duplicate constructor")),
+            Err(MountError::Busy),
+        );
+        assert_eq!(
+            composer.mount::<InMem<TestPlatform>>("/overflow", |_| panic!("exhausted constructor")),
+            Err(MountError::NoSpace),
+        );
+        assert!(matches!(
+            composer
+                .resolve(composer.root().unwrap(), &["overflow"], &|_| Ok(()))
+                .unwrap(),
+            Resolution::MissingFinal { .. },
+        ));
+        assert_eq!(
+            composer.initialized_mounts().count(),
+            1 + RUNTIME_MOUNT_CAPACITY
+        );
+    }
+
+    #[test]
+    fn builder_and_runtime_mount_paths_share_validation() {
+        let composer = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        for path in ["", "relative", "//a", "/a/", "/a/./b", "/a/../b", "/a\0b"] {
+            assert_eq!(
+                Composer::<TestPlatform>::builder()
+                    .mount(path, InMem::<TestPlatform>::new)
+                    .build()
+                    .err(),
+                Some(BuildError::InvalidMountPath),
+            );
+            assert_eq!(
+                composer.mount::<InMem<TestPlatform>>(path, |_| panic!("invalid constructor")),
+                Err(MountError::InvalidMountPath),
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_mount_retains_virtual_metadata_when_host_ancestor_disappears() {
+        let composer = Composer::<TestPlatform>::builder()
+            .mount("/", |allocator| {
+                InMem::<TestPlatform>::new_initialized(
+                    [(
+                        "/host",
+                        InitialNode::Directory {
+                            mode: Mode::RWXU,
+                            owner: UserInfo::ROOT,
+                        },
+                    )],
+                    allocator,
+                )
+            })
+            .build()
+            .unwrap();
+        composer
+            .mount("/host/child", InMem::<TestPlatform>::new)
+            .unwrap();
+        let host = composer.backend(0);
+        host.rmdir_at(host.root().unwrap(), "host").unwrap();
+
+        let virtual_status = || {
+            let Resolution::Found(target) = composer
+                .resolve(composer.root().unwrap(), &["host"], &|_| Ok(()))
+                .unwrap()
+            else {
+                panic!("expected synthesized ancestor");
+            };
+            composer.resolved_status(&target).unwrap()
+        };
+        let status = virtual_status();
+        assert_eq!(status.file_type, FileType::Directory);
+        composer
+            .mount("/host/sibling", InMem::<TestPlatform>::new)
+            .unwrap();
+        assert_eq!(virtual_status().node_info, status.node_info);
+        let Resolution::Found(ResolvedTarget::Dir(dir)) = composer
+            .resolve(composer.root().unwrap(), &["host"], &|_| Ok(()))
+            .unwrap()
+        else {
+            panic!("expected synthesized ancestor");
+        };
+        let entries = composer
+            .list_dir_at(composer.open_dir(dir, OFlags::RDONLY).unwrap())
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["child", "sibling"],
+        );
+        assert!(matches!(
+            composer.resolve(composer.root().unwrap(), &["host", "child"], &|_| Ok(())),
+            Ok(Resolution::Found(ResolvedTarget::Dir(_))),
+        ));
+    }
+
+    #[test]
+    fn runtime_mounts_publish_while_borrowed_backends_are_in_use() {
+        let composer = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        let original = composer.backend(0);
+        let start = std::sync::Barrier::new(RUNTIME_MOUNT_CAPACITY + 1);
+        std::thread::scope(|scope| {
+            for index in 0..RUNTIME_MOUNT_CAPACITY {
+                let composer = &composer;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    composer
+                        .mount(&format!("/runtime/{index}"), InMem::<TestPlatform>::new)
+                        .unwrap();
+                });
+            }
+            start.wait();
+            for _ in 0..128 {
+                original.root().unwrap();
+                for (_, mount) in composer.initialized_mounts() {
+                    mount.backend.root().unwrap();
+                }
+            }
+        });
+        assert_eq!(
+            composer.initialized_mounts().count(),
+            RUNTIME_MOUNT_CAPACITY + 1
+        );
+        for index in 0..RUNTIME_MOUNT_CAPACITY {
+            assert!(matches!(
+                composer.resolve(
+                    composer.root().unwrap(),
+                    &["runtime", &index.to_string()],
+                    &|_| Ok(())
+                ),
+                Ok(Resolution::Found(ResolvedTarget::Dir(_))),
+            ));
+        }
+    }
+
+    #[test]
+    fn concurrent_mounts_of_the_same_path_construct_one_backend() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        let composer = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        let constructed = AtomicUsize::new(0);
+        let start = std::sync::Barrier::new(RUNTIME_MOUNT_CAPACITY);
+        let results = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..RUNTIME_MOUNT_CAPACITY)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        composer.mount("/runtime", |allocator| {
+                            constructed.fetch_add(1, Ordering::Relaxed);
+                            InMem::<TestPlatform>::new(allocator)
+                        })
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(constructed.load(Ordering::Relaxed), 1);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            results
+                .into_iter()
+                .all(|result| matches!(result, Ok(()) | Err(MountError::Busy)))
+        );
+    }
+
+    #[test]
     fn child_mount_before_parent_does_not_truncate_shadowed_file() {
         let file = || InitialNode::File {
             mode: Mode::RWXU,
             owner: UserInfo::ROOT,
             data: b"preserve".as_slice().into(),
         };
-        let composer = Composer::builder()
+        let composer = Composer::<TestPlatform>::builder()
             .mount("/", |allocator| {
                 InMem::<TestPlatform>::new_initialized(
                     [
@@ -1109,7 +1485,7 @@ mod tests {
             .unwrap();
 
         for (index, components, expected) in [(0, &["a", "file"][..], 8), (2, &["file"][..], 0)] {
-            let backend = &composer.mounts[index].backend;
+            let backend = composer.backend(index);
             let Resolution::Found(target) = backend
                 .resolve(backend.root().unwrap(), components, &|_| Ok(()))
                 .unwrap()

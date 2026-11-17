@@ -126,6 +126,78 @@ impl ResolvedPath {
 impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
+    /// Mount a fresh in-memory filesystem on an existing directory.
+    // XXX(jayb): Once guests can request other mount kinds, replace this with a mount taking the
+    // requested kind; the permission checks here are backend-independent.
+    pub fn mount_in_mem(
+        &self,
+        user: UserInfo,
+        path: &str,
+    ) -> Result<(), litebox_broker_protocol::fs::FileError> {
+        use super::composer::{Composer, MountError};
+        use super::in_mem::{InMem, InitialNode};
+        use super::service::file_walk_error;
+        use litebox_broker_protocol::fs::FileError;
+
+        let context = Context::new(user);
+        let path = self
+            .resolve_path(&context, path, true, false)
+            .map_err(file_walk_error)?;
+        let ResolvedTarget::Dir(target) = self
+            .resolve_target(&context, &path)
+            .map_err(file_walk_error)?
+        else {
+            return Err(FileError::NotDirectory);
+        };
+        if user.user != UserInfo::ROOT.user {
+            // XXX(jayb): Linux requires CAP_SYS_ADMIN; we let non-root mount over directories they own.
+            if !matches!(&target.permissions, PermissionCheck::ByResolver(info) if info.owner.user == user.user)
+            {
+                return Err(FileError::NotOwner);
+            }
+            // Overlay walking handles hold its namespace lock; release it before rewalking.
+            drop(target);
+            // XXX(jayb): Path-based mount can race renames; refusing foreign sticky ancestors is a
+            // stopgap.
+            for len in 0..path.components.len() {
+                let components: Vec<_> =
+                    path.components[..len].iter().map(String::as_str).collect();
+                let Resolution::Found(ResolvedTarget::Dir(ancestor)) = self
+                    .resolve_components(&context, &components)
+                    .map_err(|error| file_walk_error(error.error))?
+                else {
+                    return Err(FileError::NotOwner);
+                };
+                match ancestor.permissions {
+                    PermissionCheck::ByResolver(info)
+                        if info.owner.user == user.user || !info.mode.contains(Mode::SVTX) => {}
+                    _ => return Err(FileError::NotOwner),
+                }
+            }
+        }
+        let composer = (&self.backend as &dyn core::any::Any)
+            .downcast_ref::<Composer<Platform>>()
+            .ok_or(FileError::NotSupported)?;
+        composer
+            .mount(&path.to_absolute(), |allocator| {
+                InMem::<Platform>::new_initialized(
+                    [(
+                        "/",
+                        InitialNode::Directory {
+                            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO | Mode::SVTX,
+                            owner: user,
+                        },
+                    )],
+                    allocator,
+                )
+            })
+            .map_err(|error| match error {
+                MountError::InvalidMountPath => FileError::InvalidPathname,
+                MountError::Busy => FileError::Busy,
+                MountError::NoSpace => FileError::NoSpace,
+            })
+    }
+
     /// Resolve an absolute path to its physical location, following symbolic links.
     pub fn resolve_following_symlinks(
         &self,

@@ -9,12 +9,12 @@ use crate::event::{
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
     HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
-    MapFileRequest, MapFileResponse, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
-    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
-    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -147,6 +147,7 @@ impl BrokerOperation {
                 | FileRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
                 | FileRequest::Rename(RenameFileRequest { paths: buffer, .. })
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
+                | FileRequest::Mount(MountFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. })
                 | FileRequest::HandlePath(HandleFilePathRequest { buffer, .. })
                 | FileRequest::ReadLink(ReadLinkFileRequest { buffer, .. })
@@ -1052,6 +1053,8 @@ pub enum FileRequest {
     Rename(RenameFileRequest),
     /// Obtain the host shared object holding an open file's contents.
     Map(MapFileRequest),
+    /// Mount a fresh tmpfs at a directory path.
+    Mount(MountFileRequest),
 }
 
 /// Broker-owned fs response.
@@ -1103,6 +1106,8 @@ pub enum FileResponse {
     Symlink,
     /// Rename completed.
     Rename,
+    /// Tmpfs mount completed.
+    Mount,
     /// File operation failed with a guest-visible error.
     Failed(FileError),
 }

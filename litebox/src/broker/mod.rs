@@ -618,6 +618,12 @@ pub(crate) trait BrokerControl: Send + Sync {
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
+    fn mount_in_mem(
+        &self,
+        path: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
+
     fn rmdir_file(
         &self,
         path: &str,
@@ -1882,6 +1888,15 @@ where
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.mkdir_file(lease.sequence(), path, user, mode))
+    }
+
+    fn mount_in_mem(
+        &self,
+        path: &str,
+        user: FileUser,
+    ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| local.mount_in_mem(lease.sequence(), path, user))
     }
 
     fn rmdir_file(
