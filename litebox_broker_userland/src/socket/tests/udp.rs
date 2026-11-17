@@ -2776,17 +2776,16 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
-    let guest_port = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let receiver_address = SocketAddrV4::new(GUEST_IPV4_ADDRESS, guest_port);
     let receiver = create_udp_socket(&receiver_process, readiness.clone());
-    assert_eq!(
-        litebox_broker_core::socket::bind(&receiver_process, receiver, receiver_address,),
-        Ok(SocketOutcome::Completed(receiver_address))
-    );
+    let SocketOutcome::Completed(receiver_address) = litebox_broker_core::socket::bind(
+        &receiver_process,
+        receiver,
+        SocketAddrV4::new(GUEST_IPV4_ADDRESS, 0),
+    )
+    .unwrap() else {
+        panic!("private UDP bind failed");
+    };
+    let guest_port = receiver_address.port();
     let sender = create_udp_socket(&sender_process, readiness);
     assert_eq!(
         send_datagram(
