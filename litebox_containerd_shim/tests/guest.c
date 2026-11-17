@@ -4,6 +4,7 @@
 // Static guest for the shim tests. argv[1] selects the behavior; every mode first describes its
 // startup on stdout.
 #include <errno.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,6 +126,14 @@ int main(int argc, char **argv) {
         if (file && fputs(argv[3], file) >= 0 && fclose(file) == 0) return 0;
         printf("write: %s\n", strerror(errno));
         return 51;
+    }
+    // Listens on port 80, then writes "hello" to one client.
+    if (strcmp(mode, "serve") == 0) {
+        struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(80)};
+        int server = socket(AF_INET, SOCK_STREAM, 0);
+        if (bind(server, (struct sockaddr *)&addr, sizeof addr) || listen(server, 1)) return 61;
+        dprintf(1, "listening\n");
+        return write(accept(server, NULL, NULL), "hello", 5) == 5 ? 0 : 62;
     }
     for (;;) pause();
 }

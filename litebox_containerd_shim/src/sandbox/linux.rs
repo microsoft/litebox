@@ -8,7 +8,7 @@
 mod guardian;
 mod mount;
 
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fs::{File, Permissions};
 use std::io::{self, Read as _};
 use std::net::Shutdown;
@@ -18,6 +18,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -28,7 +29,7 @@ pub(crate) use self::mount::{mount_rootfs, unmount_rootfs};
 use super::{
     STOP_TIMEOUT, StateDir, broker_arguments, broker_program, log_lines, program, stable_name,
 };
-use crate::spec::{Bind, Egress, Network};
+use crate::spec::{Bind, Network, Plan};
 use crate::{Result, internal};
 
 /// The installed name of LiteBox's Linux runner, which the broker runs once per guest process.
@@ -104,6 +105,15 @@ fn choose(
         Some((uid, gid)) if root_broker => Deprivileged::Runners(uid, gid),
         Some((uid, gid)) => Deprivileged::Broker(uid, gid),
     })
+}
+
+/// Whether `namespace` is the daemon's own network namespace.
+fn is_daemons(namespace: &File) -> bool {
+    let id = |stat: rustix::fs::Stat| (stat.st_dev, stat.st_ino);
+    let daemons = rustix::fs::stat("/proc/self/ns/net").map(id);
+    rustix::fs::fstat(namespace)
+        .map(id)
+        .is_ok_and(|id| daemons == Ok(id))
 }
 
 /// Runs the guardian or the mount mode, and exits, if this executable's `args` ask for it.
@@ -197,20 +207,39 @@ pub struct Broker {
     /// The daemon's end of the lifeline: its end makes the guardian kill everything below it.
     lifeline: UnixStream,
     ended: Arc<(Mutex<bool>, Condvar)>,
+    /// The last line of the broker's stderr, once that ends.
+    stderr: Mutex<Receiver<Vec<u8>>>,
 }
 
 impl Broker {
-    /// Spawns the broker serving the archive of `state` and the directory `binds`, allowing
-    /// `egress`, in the `network` namespace; calls `exited` once it exited, after [`Broker::wait`]
-    /// reports it.
+    /// Spawns the broker serving the archive of `state` and the directory `binds` (as `RootFs`
+    /// resolved `plan`'s), with `plan`'s egress, ingress, ports, network namespace and sysctls;
+    /// calls `exited` once it exited, after [`Broker::wait`] reports it.
     pub fn spawn(
         state: &StateDir,
         binds: &[Bind],
-        egress: &Egress,
-        network: &Network,
+        plan: &Plan,
         exited: impl FnOnce() + Send + 'static,
     ) -> Result<Self> {
         let failed = |error: io::Error| internal(format!("cannot start the broker: {error}"));
+        let network = &plan.network;
+        let joined = match network {
+            // Never blocking (on a FIFO, say): `setns` checks that it is a network namespace.
+            Network::Join(path) => Some(open_nonblocking(path).map_err(|error| {
+                crate::error(
+                    crate::ttrpc::Code::FAILED_PRECONDITION,
+                    format!(
+                        "cannot open the network namespace {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?),
+            Network::Daemon | Network::New => None,
+        };
+        // Joined by path, the daemon's own is still the daemon's, whose sysctls runc refuses.
+        let own = joined
+            .as_ref()
+            .map_or(*network == Network::New, |joined| !is_daemons(joined));
         // The child's own link to the daemon's executable, which it can follow after `setresuid`.
         let mut command = Command::new("/proc/self/exe");
         // Runners of another user cannot follow the guardian's `/proc/<pid>/fd`: they get the
@@ -236,8 +265,13 @@ impl Broker {
         if let Deprivileged::Runners(uid, gid) = state.deprivileged {
             command.arg("--runner-user").arg(format!("{uid}:{gid}"));
         }
+        if own {
+            // The namespace's port mappings (Docker's, CNI's) then reach the guest's servers. Only
+            // those the broker can bind: see the crate's documentation.
+            command.arg("--publish-listener-ip").arg("0.0.0.0");
+        }
         let runner = program("LITEBOX_RUNNER", RUNNER);
-        broker_arguments(&mut command, state, binds, egress, &runner);
+        broker_arguments(&mut command, state, binds, plan, &runner);
         let (lifeline, guardian_socket) = UnixStream::pair().map_err(failed)?;
         // Above `LIFELINE_FD`: `dup2` onto its own number would keep it close-on-exec.
         let guardian_end = rustix::io::fcntl_dupfd_cloexec(&guardian_socket, LIFELINE_FD + 1)
@@ -252,20 +286,25 @@ impl Broker {
             // The broker and its runners share the guardian's group.
             .process_group(0);
         let deprivileged = state.deprivileged;
-        let joined = match network {
-            // Never blocking (on a FIFO, say): `setns` checks that it is a network namespace.
-            Network::Join(path) => Some(open_nonblocking(path).map_err(|error| {
-                crate::error(
-                    crate::ttrpc::Code::FAILED_PRECONDITION,
-                    format!(
-                        "cannot open the network namespace {}: {error}",
-                        path.display()
-                    ),
-                )
-            })?),
-            Network::Daemon | Network::New => None,
-        };
         let new = *network == Network::New;
+        let sysctl = if own { &plan.sysctl[..] } else { &[] };
+        let names: Vec<&str> = sysctl.iter().map(|(path, _)| path.as_str()).collect();
+        let names = if names.is_empty() {
+            String::new()
+        } else {
+            format!(" with the sysctls {names:?}")
+        };
+        // Prepared here: the hook may not allocate.
+        let sysctl = sysctl
+            .iter()
+            .map(|(path, value)| {
+                let path = CString::new(format!("/proc/sys/{path}"));
+                Ok((
+                    path.map_err(|_| internal("a sysctl with a NUL"))?,
+                    value.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         // SAFETY: the hook makes async-signal-safe calls only, on descriptors it owns.
         unsafe {
             command.pre_exec(move || {
@@ -277,6 +316,27 @@ impl Broker {
                 }
                 if new {
                     new_network()?;
+                }
+                // Set as root, in the namespace: `/proc/sys/net` is the opener's namespace's.
+                for (path, value) in &sysctl {
+                    let file = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                    let written = match file {
+                        0.. => libc::write(file, value.as_ptr().cast(), value.len()),
+                        _ => -1,
+                    };
+                    // A short write applied only part of the value, as Linux does with a list
+                    // longer than a page.
+                    let error = match usize::try_from(written) {
+                        Ok(written) if written == value.len() => None,
+                        Ok(_) => Some(io::Error::from_raw_os_error(libc::EMSGSIZE)),
+                        Err(_) => Some(io::Error::last_os_error()),
+                    };
+                    if file >= 0 {
+                        libc::close(file);
+                    }
+                    if let Some(error) = error {
+                        return Err(error);
+                    }
                 }
                 if let Deprivileged::Broker(uid, gid) = deprivileged
                     && (libc::setgroups(0, std::ptr::null()) < 0
@@ -302,12 +362,12 @@ impl Broker {
         let mut guardian = command.spawn().map_err(|error| match network {
             Network::Daemon => failed(error),
             Network::Join(_) | Network::New => internal(format!(
-                "cannot start the broker in the container's network namespace: {error}"
+                "cannot start the broker in the container's network namespace{names}: {error}"
             )),
         })?;
         drop(command);
         log_lines("stdout", guardian.stdout.take().expect("piped"));
-        log_lines("stderr", guardian.stderr.take().expect("piped"));
+        let stderr = Mutex::new(log_lines("stderr", guardian.stderr.take().expect("piped")));
         let group = Pid::from_child(&guardian);
         let ended = Arc::new((Mutex::new(false), Condvar::new()));
         let reaper = Arc::clone(&ended);
@@ -335,10 +395,12 @@ impl Broker {
             guardian: group,
             lifeline,
             ended,
+            stderr,
         };
         (&broker.lifeline).read_exact(&mut pid).map_err(|error| {
             if error.kind() == io::ErrorKind::UnexpectedEof {
-                internal("the guardian could not start the broker; see the shim's log")
+                let why = broker.last_words();
+                internal(format!("the guardian could not start the broker: {why}"))
             } else {
                 failed(error)
             }
@@ -347,6 +409,17 @@ impl Broker {
             pid: u32::from_le_bytes(pid),
             ..broker
         })
+    }
+
+    /// Why the broker ended early: the last line of its stderr, which ends with it.
+    pub(super) fn last_words(&self) -> String {
+        let stderr = self.stderr.lock().expect("not poisoned");
+        match stderr.recv_timeout(Duration::from_secs(1)) {
+            Ok(last) if !last.is_empty() => {
+                crate::truncated(&String::from_utf8_lossy(&last)).to_owned()
+            }
+            _ => "see the shim's log".to_owned(),
+        }
     }
 
     /// The broker's host PID, which containerd knows as the pid of every process.

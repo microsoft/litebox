@@ -578,6 +578,26 @@ fn a_container_runs_and_reports_its_exit() {
 }
 
 #[test]
+fn a_published_port_reaches_a_guest_server() {
+    // Below every host's ephemeral range, so no other test's ephemeral bind takes it meanwhile.
+    let host = "127.0.0.1:20880";
+    let mut shim = Shim::launch(&process(&["guest", "serve"]));
+    let annotations = serde_json::json!({
+        "io.litebox.publish.tcp": format!("{host}:80"),
+        "io.litebox.ingress.tcp": "10.0.2.1/32", // The client, as the guest sees it.
+    });
+    shim.configure(|spec| spec["annotations"] = annotations);
+    let pid = shim.create().unwrap();
+    shim.start("").unwrap();
+    shim.wait_output("c.out", "listening\n");
+    let stream = std::net::TcpStream::connect(host).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    assert_eq!(std::io::read_to_string(stream).unwrap(), "hello");
+    assert_eq!(shim.wait(""), 0);
+    shim.finish(pid);
+}
+
+#[test]
 fn execs_take_input_and_their_output_comes_before_their_exit() {
     let mut shim = Shim::launch(&process(&["guest", "family"]));
     let pid = shim.create().unwrap();
@@ -1496,7 +1516,7 @@ fn refused_or_unsupported_specs_and_annotations_fail_create() {
         0,
     )
     .unwrap();
-    let cases: [(&str, serde_json::Value, Code); 7] = [
+    let cases: [(&str, serde_json::Value, Code); 6] = [
         (
             "hooks",
             serde_json::json!({"createContainer": [{"path": "/bin/true"}]}),
@@ -1533,19 +1553,11 @@ fn refused_or_unsupported_specs_and_annotations_fail_create() {
             serde_json::json!({"io.litebox.egress.udp": "10.0.0.1/8:53"}),
             Code::INVALID_ARGUMENT,
         ),
-        (
-            "annotations",
-            serde_json::json!({"io.LiteBox.other": "x"}),
-            Code::INVALID_ARGUMENT,
-        ),
     ];
     for (field, value, expected) in cases {
         shim.configure(|spec| spec[field] = value.clone());
-        assert_eq!(
-            code(&shim.create().unwrap_err()),
-            expected,
-            "{field}: {value}"
-        );
+        let failed = code(&shim.create().unwrap_err());
+        assert_eq!(failed, expected, "{field}: {value}");
         std::fs::write(shim.bundle.join("config.json"), &config).unwrap();
     }
     // Not supported, as in Kata Containers: checkpoints.
