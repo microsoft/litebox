@@ -18,6 +18,7 @@ use litebox_broker_core::socket::SocketProvider;
 use litebox_broker_core::vsock_socket::VsockProvider;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngine};
 
+use crate::publish::Publishing;
 use crate::random::UserlandRandomProvider;
 use crate::timer::UserlandTimerProvider;
 
@@ -78,6 +79,7 @@ pub struct BrokerCoreBuilder {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     vsock: Option<Arc<dyn VsockProvider>>,
+    publishing: Publishing,
 }
 
 impl BrokerCoreBuilder {
@@ -89,7 +91,15 @@ impl BrokerCoreBuilder {
             policy,
             limits: BrokerCoreLimits::DEFAULT,
             vsock: None,
+            publishing: Publishing::default(),
         }
+    }
+
+    /// Publishes guest TCP ports on host ports as `publishing` says.
+    #[must_use]
+    pub fn with_publishing(mut self, publishing: Publishing) -> Self {
+        self.publishing = publishing;
+        self
     }
 
     /// Overrides the default authority-state limits.
@@ -121,7 +131,7 @@ impl BrokerCoreBuilder {
             litebox_platform::sync::init_lock_tracing(&LOCK_TRACING_PLATFORM);
         }
 
-        let socket_provider = platform_socket_provider(&self.limits)?;
+        let socket_provider = platform_socket_provider(&self.limits, self.publishing)?;
         Ok(BrokerCore::new(
             self.policy,
             self.limits,
@@ -136,11 +146,14 @@ impl BrokerCoreBuilder {
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn platform_socket_provider(
     limits: &BrokerCoreLimits,
+    publishing: Publishing,
 ) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
-    Ok(Arc::new(crate::socket::UserlandSocketProvider::new(
+    let provider = crate::socket::UserlandSocketProvider::with_publishing(
         limits.max_sockets,
         limits.max_sockets_per_process,
-    )?))
+        publishing,
+    )?;
+    Ok(Arc::new(provider))
 }
 
 // The `Result` return type is infallible on this cfg branch, but it must
@@ -150,6 +163,7 @@ fn platform_socket_provider(
 #[allow(clippy::unnecessary_wraps)]
 fn platform_socket_provider(
     _limits: &BrokerCoreLimits,
+    _publishing: Publishing,
 ) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
     Ok(Arc::new(
         litebox_broker_core::socket::UnsupportedSocketProvider,

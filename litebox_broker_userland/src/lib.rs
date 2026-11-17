@@ -25,6 +25,7 @@ pub mod fs;
 pub mod mapped_file;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 mod process_launcher;
+pub mod publish;
 pub mod readiness;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 pub mod runner;

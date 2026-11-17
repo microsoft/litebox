@@ -29,6 +29,7 @@ use core::fmt;
 use core::ops::{BitOr, BitOrAssign};
 use std::io::Result as IoResult;
 use std::net::{Shutdown, SocketAddrV4};
+use std::process::{Child, Command};
 use std::time::Duration;
 
 use litebox_broker_core::BrokerError;
@@ -65,6 +66,9 @@ pub(crate) trait Host {
     type Poller: HostPoller<Errno = Self::Errno, Socket = Self::Socket, Waiter = Self::Waiter>;
     type Waiter: HostWaiter<Errno = Self::Errno, EventBuffer = Self::EventBuffer>;
     type EventBuffer: HostEventBuffer;
+
+    /// Starts `command`, a runner, which must inherit no socket that a published port accepts.
+    fn spawn(command: &mut Command) -> IoResult<Child>;
 }
 
 /// A host error code. Hosts name their errors after POSIX's; these are the
@@ -132,6 +136,16 @@ pub(crate) trait HostSocket: Sized + Send {
     /// Opens a UDP socket.
     fn udp() -> Result<Self, Self::Errno>;
 
+    /// Opens a TCP socket listening at `address` with room for [`LISTEN_BACKLOG`] connections,
+    /// which keeps every other socket off the port.
+    fn tcp_listening(address: SocketAddrV4) -> Result<Self, Self::Errno>;
+
+    /// Listens with room for `backlog` connections; a listener keeps those pending.
+    fn listen(&self, backlog: u32) -> Result<(), Self::Errno>;
+
+    /// Accepts a listener's connection and its peer, or fails with [`HostErrno::AGAIN`].
+    fn accept(&self) -> Result<(Self, SocketAddrV4), Self::Errno>;
+
     fn bind(&self, address: SocketAddrV4) -> Result<(), Self::Errno>;
 
     /// Connects to `address`, or starts connecting a TCP socket, which fails
@@ -196,7 +210,8 @@ pub(crate) trait HostSocket: Sized + Send {
     fn queued_bytes(&self) -> Result<usize, Self::Errno>;
 
     /// Reports whether a stream receive would return data or the end of the
-    /// stream now, as a poll for ordinary data does.
+    /// stream now, as a poll for ordinary data does; on a listener, whether a
+    /// connection is waiting.
     ///
     /// Unlike [`Self::queued_bytes`], which Linux stops at the urgent mark,
     /// this counts the ordinary data behind urgent data, which a receive skips
@@ -325,6 +340,9 @@ pub(crate) trait HostEventBuffer: Sized {
     /// Returns the token and events of each event the last wait reported.
     fn iter(&self) -> impl Iterator<Item = (u64, SocketEvents)> + '_;
 }
+
+/// The backlog a host listener starts with, which Winsock keeps whatever the guest's listen asks.
+pub(crate) const LISTEN_BACKLOG: u32 = 128;
 
 /// Poller token reserved for the poller's own wakes.
 pub(crate) const WAKE_TOKEN: u64 = 0;

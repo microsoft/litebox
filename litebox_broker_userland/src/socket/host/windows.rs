@@ -9,29 +9,33 @@
 use std::cell::Cell;
 use std::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
-use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4};
 use std::os::windows::io::AsRawSocket;
+use std::process::{Child, Command};
 use std::ptr::{self, NonNull};
+use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
 
 use litebox_broker_core::BrokerError;
 use litebox_broker_protocol::socket::MAX_UDP_DATAGRAM_SIZE;
-use mio::net::{TcpStream, UdpSocket};
+use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Type};
+use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONREAD, IN_ADDR, IN_ADDR_0, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
-    SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SOCKADDR_IN, SOCKET, SOCKET_ERROR,
-    SOL_SOCKET, WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT,
-    WSAEALREADY, WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS,
-    WSAEINTR, WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH,
-    WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl,
-    WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendTo, getsockopt, ioctlsocket,
+    SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME, SO_EXCLUSIVEADDRUSE, SOCKADDR_IN, SOCKET,
+    SOCKET_ERROR, SOL_SOCKET, WSA_NOT_ENOUGH_MEMORY, WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL,
+    WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH,
+    WSAEINPROGRESS, WSAEINTR, WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET,
+    WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK,
+    WSAGetLastError, WSAIoctl, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendTo,
+    getsockopt, ioctlsocket, setsockopt,
 };
 
 use super::{
-    Host, HostErrno, HostEventBuffer, HostPoller, HostSocket, HostWaiter, Interest, ReceiveMode,
-    SocketEvents, WAKE_TOKEN,
+    Host, HostErrno, HostEventBuffer, HostPoller, HostSocket, HostWaiter, Interest, LISTEN_BACKLOG,
+    ReceiveMode, SocketEvents, WAKE_TOKEN,
 };
 use crate::fine_timer::FineTimer;
 use crate::socket::direct::{MAX_RAW_PARTS, RawParts};
@@ -45,7 +49,16 @@ impl Host for Windows {
     type Poller = Poller;
     type Waiter = Waiter;
     type EventBuffer = EventBuffer;
+
+    fn spawn(command: &mut Command) -> IoResult<Child> {
+        let _no_accept = INHERITABLE.write().unwrap_or_else(PoisonError::into_inner);
+        command.spawn()
+    }
 }
+
+/// Held shared from an accept until the accepted socket is non-inheritable (`accept` cannot create
+/// it so), and exclusively to start a runner, which would inherit the socket meanwhile.
+static INHERITABLE: RwLock<()> = RwLock::new(());
 
 /// The length of the longest datagram a UDP socket receives.
 const MAX_DATAGRAM_LENGTH: usize = MAX_UDP_DATAGRAM_SIZE as usize;
@@ -153,6 +166,7 @@ pub(crate) struct Socket {
 enum Source {
     Tcp(TcpStream),
     Udp(UdpSocket),
+    Listener(TcpListener),
 }
 
 impl Socket {
@@ -170,6 +184,7 @@ impl Socket {
         match &self.source {
             Source::Tcp(socket) => raw_socket(socket),
             Source::Udp(socket) => raw_socket(socket),
+            Source::Listener(socket) => raw_socket(socket),
         }
     }
 
@@ -177,6 +192,7 @@ impl Socket {
         match &self.source {
             Source::Tcp(socket) => SockRef::from(socket),
             Source::Udp(socket) => SockRef::from(socket),
+            Source::Listener(socket) => SockRef::from(socket),
         }
     }
 
@@ -184,6 +200,7 @@ impl Socket {
         match &mut self.source {
             Source::Tcp(socket) => socket,
             Source::Udp(socket) => socket,
+            Source::Listener(socket) => socket,
         }
     }
 
@@ -315,6 +332,42 @@ impl HostSocket for Socket {
         report_icmp_errors(raw_socket(&socket), SIO_UDP_CONNRESET, false)?;
         report_icmp_errors(raw_socket(&socket), SIO_UDP_NETRESET, false)?;
         Ok(Self::new(Source::Udp(UdpSocket::from_std(socket.into()))))
+    }
+
+    /// With `SO_EXCLUSIVEADDRUSE`, without which a socket bound to a specific address could share
+    /// a wildcard one's port. Connections accepted on the port keep it from being bound again
+    /// until they end.
+    fn tcp_listening(address: SocketAddrV4) -> Result<Self, Errno> {
+        let socket = open(Type::STREAM, Protocol::TCP)?;
+        use_exclusively(raw_socket(&socket))?;
+        socket.bind(&SockAddr::from(address))?;
+        let listener = Self::new(Source::Listener(TcpListener::from_std(socket.into())));
+        listener.listen(LISTEN_BACKLOG)?;
+        Ok(listener)
+    }
+
+    /// Winsock keeps a listener's first backlog: listening again succeeds without changing it.
+    fn listen(&self, backlog: u32) -> Result<(), Errno> {
+        Ok(self
+            .socket()
+            .listen(i32::try_from(backlog).unwrap_or(i32::MAX))?)
+    }
+
+    /// mio's accept rearms the listener when it would block. Unlike `socket`, `accept` cannot
+    /// make a socket non-inheritable, so runners would get it if it stayed so.
+    fn accept(&self) -> Result<(Self, SocketAddrV4), Errno> {
+        let _accepting = INHERITABLE.read().unwrap_or_else(PoisonError::into_inner);
+        if let Source::Listener(listener) = &self.source
+            && let (stream, SocketAddr::V4(peer)) = listener.accept()?
+        {
+            let handle = raw_socket(&stream) as HANDLE;
+            // SAFETY: The call changes only the flags of the handle that `stream` owns.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                return Err(Error::last_os_error().into());
+            }
+            return Ok((Self::new(Source::Tcp(stream)), peer));
+        }
+        Err(Errno::INVAL)
     }
 
     fn bind(&self, address: SocketAddrV4) -> Result<(), Errno> {
@@ -576,6 +629,25 @@ fn open(socket_type: Type, protocol: Protocol) -> Result<socket2::Socket, Errno>
 fn raw_socket(socket: &impl AsRawSocket) -> SOCKET {
     // A `SOCKET` is pointer-sized, which on x86_64 holds every raw socket.
     socket.as_raw_socket() as SOCKET
+}
+
+/// Keeps every other socket off `socket`'s port, whichever address either binds.
+fn use_exclusively(socket: SOCKET) -> Result<(), Errno> {
+    let on = 1_u32;
+    // SAFETY: `on` outlives the call, which reads only it.
+    let set = unsafe {
+        setsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&raw const on).cast(),
+            U32_LENGTH,
+        )
+    };
+    if set == SOCKET_ERROR {
+        return Err(Errno::last());
+    }
+    Ok(())
 }
 
 /// Sets whether a UDP socket reports the ICMP errors its datagrams cause

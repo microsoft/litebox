@@ -8,6 +8,7 @@ use core::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::process::{Child, Command};
 use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,12 +19,13 @@ use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, epoll, eventfd, p
 use rustix::io::{Errno as RustixErrno, ioctl_fionread, read, write};
 use rustix::net::{
     AddressFamily, Protocol, RecvFlags, SendFlags, Shutdown as HostShutdown, SocketFlags,
-    SocketType, bind, connect, getpeername, getsockname, ipproto, shutdown, socket_with, sockopt,
+    SocketType, acceptfrom_with, bind, connect, getpeername, getsockname, ipproto, listen,
+    shutdown, socket_with, sockopt,
 };
 
 use super::{
-    Host, HostErrno, HostEventBuffer, HostPoller, HostSocket, HostWaiter, Interest, ReceiveMode,
-    SocketEvents, WAKE_TOKEN,
+    Host, HostErrno, HostEventBuffer, HostPoller, HostSocket, HostWaiter, Interest, LISTEN_BACKLOG,
+    ReceiveMode, SocketEvents, WAKE_TOKEN,
 };
 use crate::socket::direct::{MAX_RAW_PARTS, RawParts};
 
@@ -36,6 +38,11 @@ impl Host for Linux {
     type Poller = Poller;
     type Waiter = Waiter;
     type EventBuffer = EventBuffer;
+
+    /// Every host socket is close-on-exec.
+    fn spawn(command: &mut Command) -> IoResult<Child> {
+        command.spawn()
+    }
 }
 
 /// A Linux error code.
@@ -125,6 +132,27 @@ impl HostSocket for Socket {
 
     fn udp() -> Result<Self, Errno> {
         Self::open(SocketType::DGRAM, ipproto::UDP)
+    }
+
+    /// `SO_REUSEADDR` lets the bind take a port whose connections linger in `TIME_WAIT`; it stays
+    /// on, as other binds of a listener's port fail all the same.
+    fn tcp_listening(address: SocketAddrV4) -> Result<Self, Errno> {
+        let socket = Self::tcp()?;
+        sockopt::set_socket_reuseaddr(&socket.0, true).map_err(Errno)?;
+        bind(&socket.0, &address).map_err(Errno)?;
+        socket.listen(LISTEN_BACKLOG)?;
+        Ok(socket)
+    }
+
+    fn listen(&self, backlog: u32) -> Result<(), Errno> {
+        listen(&self.0, i32::try_from(backlog).unwrap_or(i32::MAX)).map_err(Errno)
+    }
+
+    fn accept(&self) -> Result<(Self, SocketAddrV4), Errno> {
+        let flags = SocketFlags::NONBLOCK | SocketFlags::CLOEXEC;
+        let (socket, peer) = acceptfrom_with(&self.0, flags).map_err(Errno)?;
+        let peer = peer.and_then(|peer| SocketAddrV4::try_from(peer).ok());
+        Ok((Self(socket), peer.ok_or(Errno(RustixErrno::AFNOSUPPORT))?))
     }
 
     fn bind(&self, address: SocketAddrV4) -> Result<(), Errno> {

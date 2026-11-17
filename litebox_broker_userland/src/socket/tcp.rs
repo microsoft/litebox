@@ -4,11 +4,13 @@
 //! TCP socket state and transport-specific helpers.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{Error, Result as IoResult};
 use std::net::{Shutdown, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::socket::stream::{StreamEnd, StreamError, stream_pair};
+use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
 use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, PlatformSocketStatus,
     host_socket_destination, is_internal_socket_address, normalize_socket_destination,
@@ -21,6 +23,8 @@ use litebox_broker_protocol::socket::{
     SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
 };
 use litebox_platform::buffer::RawBytes;
+
+use crate::publish::Publish;
 
 use super::direct::RawParts;
 use super::host::{
@@ -66,6 +70,13 @@ struct PeekCache {
 /// retries, so only a peek that no one waits for any longer, such as one
 /// whose guest thread exited, stops being watched.
 pub(super) const PEEK_WAITALL_INTEREST: Duration = Duration::from_secs(1);
+
+/// Marks the event tokens of published ports' host sockets that no guest listener holds; the
+/// rest of the token is the rule's index. Socket IDs stay below it.
+pub(super) const PUBLISHED_EVENT_TOKEN_FLAG: u64 = 1 << 62;
+
+/// Most clients that one accept or one event of an idle host socket resets.
+const MAX_RESETS_AT_ONCE: usize = 64;
 
 /// The data that waiting `MSG_PEEK | MSG_WAITALL` peeks need.
 #[derive(Clone, Copy)]
@@ -172,6 +183,8 @@ pub(super) enum TcpDescriptor {
     ExternalInet(Socket),
     /// This socket's end of an internal connection.
     Internal(StreamEnd),
+    /// A published port's host socket, listening while the socket listens.
+    Listener(Socket),
 }
 
 impl TcpDescriptor {
@@ -179,7 +192,7 @@ impl TcpDescriptor {
     pub(super) fn socket(&self) -> BrokerResult<&Socket> {
         match self {
             Self::ExternalInet(socket) => Ok(socket),
-            Self::Internal(_) | Self::Unrealized => Err(BrokerError::Internal),
+            Self::Internal(_) | Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
         }
     }
 
@@ -187,7 +200,7 @@ impl TcpDescriptor {
     fn socket_mut(&mut self) -> BrokerResult<&mut Socket> {
         match self {
             Self::ExternalInet(socket) => Ok(socket),
-            Self::Internal(_) | Self::Unrealized => Err(BrokerError::Internal),
+            Self::Internal(_) | Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
         }
     }
 
@@ -204,7 +217,7 @@ impl TcpDescriptor {
         match self {
             Self::ExternalInet(socket) => socket.queued_bytes().map_err(broker_error_from_errno),
             Self::Internal(end) => Ok(end.available()),
-            Self::Unrealized => Err(BrokerError::Internal),
+            Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
         }
     }
 
@@ -214,7 +227,7 @@ impl TcpDescriptor {
         match self {
             Self::ExternalInet(socket) => socket.stream_readable().map_err(broker_error_from_errno),
             Self::Internal(end) => Ok(end.readiness().readable),
-            Self::Unrealized => Err(BrokerError::Internal),
+            Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
         }
     }
 
@@ -226,7 +239,7 @@ impl TcpDescriptor {
         match self {
             Self::ExternalInet(socket) => Ok(socket.send(data, None)),
             Self::Internal(end) => errno_from_stream(end.write(data.parts())),
-            Self::Unrealized => Err(BrokerError::Internal),
+            Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
         }
     }
 
@@ -241,8 +254,116 @@ impl TcpDescriptor {
             Self::ExternalInet(socket) => Ok(socket.receive(output, mode)),
             Self::Internal(end) if mode.is_peek() => errno_from_stream(end.peek(output.parts())),
             Self::Internal(end) => errno_from_stream(end.read(output.parts())),
-            Self::Unrealized => Err(BrokerError::Internal),
+            Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
         }
+    }
+}
+
+/// A published connection's client as the guest sees it: itself, as behind Docker's NAT, or the
+/// host gateway if the guest would take its address for its own.
+fn guest_visible_client(client: SocketAddrV4) -> SocketAddrV4 {
+    if is_internal_socket_address(client) {
+        SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, client.port())
+    } else {
+        client
+    }
+}
+
+/// The event token of the idle host socket of the rule at `index`.
+fn idle_token(index: usize) -> u64 {
+    PUBLISHED_EVENT_TOKEN_FLAG | index as u64
+}
+
+/// Opens each rule's listening host socket, watched under its idle token.
+pub(super) fn listen_published(
+    poller: &Poller,
+    rules: Vec<Publish>,
+) -> IoResult<Vec<(Publish, Option<Socket>)>> {
+    let listen = |(index, rule): (usize, Publish)| {
+        let listening = Socket::tcp_listening(rule.host).and_then(|mut socket| {
+            poller.add(&mut socket, idle_token(index), Interest::Stream)?;
+            Ok(socket)
+        });
+        match listening {
+            Ok(socket) => Ok((rule, Some(socket))),
+            Err(error) => Err(Error::other(format!("cannot publish {rule}: {error}"))),
+        }
+    };
+    rules.into_iter().enumerate().map(listen).collect()
+}
+
+impl super::ProviderCore {
+    /// Takes the idle host socket of the rule publishing `guest_port`, unwatched; without a rule,
+    /// opens a listener at `guest_port` of the mirroring IP, if any and free.
+    fn take_published(&self, guest_port: u16) -> Option<Socket> {
+        let mut published = lock(&self.published);
+        if let Some((_, socket)) = published
+            .iter_mut()
+            .find(|(rule, _)| rule.guest_port == guest_port)
+        {
+            let mut socket = socket.take()?;
+            self.unwatch_host_socket(&mut socket);
+            return Some(socket);
+        }
+        drop(published);
+        let address = SocketAddrV4::new(self.published_listener_ip?, guest_port);
+        match Socket::tcp_listening(address) {
+            Ok(socket) => Some(socket),
+            Err(error) => {
+                // A guest can listen again and again.
+                if lock(&self.unmirrored).insert(guest_port) {
+                    std::eprintln!("broker cannot mirror a guest listener at {address}: {error}");
+                }
+                None
+            }
+        }
+    }
+
+    /// Unwatches a listener's host socket, and gives a rule's back to reset its clients while no
+    /// guest listens; a mirror's closes.
+    fn release_published(&self, guest_port: u16, mut socket: Socket) {
+        self.unwatch_host_socket(&mut socket);
+        let mut published = lock(&self.published);
+        if let Some(index) = published
+            .iter()
+            .position(|(rule, _)| rule.guest_port == guest_port)
+        {
+            // If the watch fails, the next guest listener watches it again.
+            let _ = self.watch_host_socket(&mut socket, idle_token(index), Interest::Stream);
+            published[index].1 = Some(socket);
+        }
+    }
+
+    /// Resets the clients waiting on the idle host socket of the rule that `token` names, and
+    /// returns whether more may wait.
+    pub(super) fn reset_idle_clients(&self, token: u64) -> bool {
+        let published = lock(&self.published);
+        let index = usize::try_from(token & !PUBLISHED_EVENT_TOKEN_FLAG);
+        let Some((_, Some(socket))) = index.ok().and_then(|index| published.get(index)) else {
+            return false;
+        };
+        for _ in 0..MAX_RESETS_AT_ONCE {
+            match socket.accept() {
+                Ok((client, _)) => {
+                    let _ = client.set_linger_zero();
+                }
+                Err(Errno::INTR | Errno::CONNABORTED | Errno::CONNRESET) => {}
+                // Freed resources raise no event, so the clients wait for a retry.
+                Err(error) if error.broker_resource_error().is_some() => return true,
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    /// Whether a published port admits `client`: whether a source contains it, as the guest sees
+    /// it.
+    fn admits(&self, client: SocketAddrV4) -> bool {
+        let client = u32::from(*guest_visible_client(client).ip());
+        self.tcp_sources.iter().any(|source| {
+            let host_bits = u32::MAX.checked_shr(source.prefix_length().into());
+            client & !host_bits.unwrap_or(0) == u32::from_be_bytes(source.network().0)
+        })
     }
 }
 
@@ -1262,6 +1383,16 @@ pub(super) fn handle_socket_event(
         TcpDescriptor::Internal(end) => (stream_events(end), false),
         TcpDescriptor::ExternalInet(_) => (events, !Poller::REPORTS_EVERY_ARRIVAL),
         TcpDescriptor::Unrealized => (events, false),
+        // A host listener's event may mean a connection to accept, or an error the accept reports.
+        // An accept may have taken the connection since, so an edge counts only while one waits.
+        TcpDescriptor::Listener(listener) => {
+            let failed = events.intersects(SocketEvents::ERROR | SocketEvents::HANGUP);
+            let readable = events.contains(SocketEvents::READABLE);
+            if failed || (readable && listener.stream_readable() != Ok(false)) {
+                add_readiness(socket, ReadinessFlags::READ);
+            }
+            return Ok(false);
+        }
     };
     // A connection's failure, once reported, raises no more errors.
     if socket.tcp_state()?.connection_failed {
@@ -1296,6 +1427,8 @@ pub(super) fn handle_socket_event(
         SocketConnectionStatus::Failed(_) => {
             set_own_readiness(socket, ReadinessFlags::ERROR);
         }
+        // A stale event of a host listener that a failed listen closed.
+        SocketConnectionStatus::Unconnected => {}
         _ => return Err(BrokerError::Internal),
     }
     if republish_readiness {
@@ -1516,7 +1649,23 @@ impl SocketEntry<'_> {
             inbox.set_own(ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
         }
         topology.discard_listener_queue(listener.queue);
+        drop(topology);
+        self.close_host_listener();
         Ok(SocketOutcome::Completed(()))
+    }
+
+    /// Hands back a listener's host socket, if any: a rule's resets its clients until a guest
+    /// listens again, and a mirror's closes.
+    fn close_host_listener(&mut self) {
+        let core = self.core();
+        let port = self.guest_local_address.map_or(0, |address| address.port());
+        if let Ok(tcp) = self.tcp_state_mut()
+            && matches!(tcp.descriptor, TcpDescriptor::Listener(_))
+            && let TcpDescriptor::Listener(host) =
+                core::mem::replace(&mut tcp.descriptor, TcpDescriptor::Unrealized)
+        {
+            core.release_published(port, host);
+        }
     }
 
     pub(super) fn bind_tcp_socket(
@@ -1781,28 +1930,61 @@ impl SocketEntry<'_> {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         let guest_address = self.guest_local_address.ok_or(BrokerError::Internal)?;
+        // A listen again passes the new backlog to the host listener, which Linux applies and
+        // Winsock ignores.
+        if let TcpDescriptor::Listener(host) = &self.tcp_state()?.descriptor
+            && let Err(error) = host.listen(backlog)
+        {
+            return socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
+        }
         let mut topology = self.topology();
-        topology
+        let binding = topology
             .tcp
             .binding_for_socket(self.id())
             .filter(|binding| binding.guest_binding.local_address() == guest_address)
             .ok_or(BrokerError::Internal)?;
+        let host_backlog = backlog;
         let backlog = usize::try_from(backlog)
             .map_err(|_| BrokerError::UnsupportedOperation)?
             .max(1);
+        let descriptor = &self.tcp_state()?.descriptor;
         if self.connection_status != SocketConnectionStatus::Unconnected
-            || !matches!(self.tcp_state()?.descriptor, TcpDescriptor::Unrealized)
+            || descriptor.is_external()
+            || descriptor.is_internal()
         {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         if let Some(listener) = topology.tcp.listeners.get_mut(&self.id()) {
             listener.backlog = backlog;
         } else {
-            topology
-                .tcp
-                .listeners
-                .try_reserve(1)
-                .map_err(|_| BrokerError::OutOfMemory)?;
+            let core = self.core();
+            let port = guest_address.port();
+            if binding
+                .guest_binding
+                .covers(SocketAddrV4::new(GUEST_IPV4_ADDRESS, port))
+            {
+                // Host calls run outside `topology`; a failure fails the listen.
+                drop(topology);
+                if let Some(mut host) = core.take_published(port) {
+                    if let Err(error) = host.listen(host_backlog) {
+                        core.release_published(port, host);
+                        return socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
+                    }
+                    if let Err(error) =
+                        core.watch_host_socket(&mut host, self.id(), Interest::Stream)
+                    {
+                        core.release_published(port, host);
+                        return Err(error);
+                    }
+                    self.tcp_state_mut()?.descriptor = TcpDescriptor::Listener(host);
+                }
+                topology = self.topology();
+            }
+            if topology.tcp.listeners.try_reserve(1).is_err() {
+                drop(topology);
+                self.close_host_listener();
+                return Err(BrokerError::OutOfMemory);
+            }
             topology.tcp.listeners.insert(
                 self.id(),
                 TcpListener {
@@ -1842,7 +2024,8 @@ impl SocketEntry<'_> {
             .map(|connection| connection.connector_process_key)
         else {
             publish_listener_queue(listener);
-            return Err(BrokerError::WouldBlock);
+            drop(topology);
+            return self.accept_host_connection(accepted, &mut state, options);
         };
         let core = self.core();
         core.register(accepted)?;
@@ -1901,6 +2084,78 @@ impl SocketEntry<'_> {
         }))
     }
 
+    /// Accepts a published listener's host connection into `accepted`, charged to its process.
+    fn accept_host_connection(
+        &mut self,
+        accepted: &Arc<UserlandSocket>,
+        state: &mut SocketState,
+        options: TcpOptions,
+    ) -> BrokerResult<SocketOutcome<AcceptedEndpoints>> {
+        let TcpDescriptor::Listener(listener) = &self.tcp_state()?.descriptor else {
+            return Err(BrokerError::WouldBlock);
+        };
+        let (core, process_key) = (self.core(), self.process_key());
+        core.charge_socket(process_key)?;
+        let mut refused = 0;
+        let (host, peer) = loop {
+            let error = match listener.accept() {
+                // A client from outside the allowed sources is reset unseen. An accept that stops
+                // early announces READ again for the clients it left.
+                Ok((host, peer)) if !core.admits(peer) => {
+                    let _ = host.set_linger_zero();
+                    refused += 1;
+                    if refused < MAX_RESETS_AT_ONCE {
+                        continue;
+                    }
+                    core.release_socket_charge(process_key);
+                    super::republish_own_readiness(self, self.own() | ReadinessFlags::READ);
+                    return Err(BrokerError::WouldBlock);
+                }
+                Ok((host, peer)) => match apply_tcp_options(&host, options) {
+                    Ok(()) => break (host, peer),
+                    // The client reset since the accept (Windows reports it here).
+                    Err(Errno::NOTCONN | Errno::CONNRESET | Errno::CONNABORTED) => continue,
+                    Err(error) => error,
+                },
+                // Windows reports a client that reset before the accept to it.
+                Err(Errno::INTR | Errno::CONNABORTED | Errno::CONNRESET) => continue,
+                Err(error) => error,
+            };
+            core.release_socket_charge(process_key);
+            if error == Errno::AGAIN {
+                clear_readiness(self, ReadinessFlags::READ);
+                return Err(BrokerError::WouldBlock);
+            }
+            return socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
+        };
+        // With the last waiting connection taken, READ goes. Windows reports the next one only once
+        // the listener is watched again, as an accept that would block does.
+        let id = self.id();
+        if let TcpDescriptor::Listener(listener) = &mut self.tcp_state_mut()?.descriptor
+            && listener.stream_readable() == Ok(false)
+            && core.poller.modify(listener, id, Interest::Stream).is_ok()
+        {
+            clear_readiness(self, ReadinessFlags::READ);
+        }
+        let port = self.guest_local_address.map_or(0, |address| address.port());
+        let local_address = SocketAddrV4::new(GUEST_IPV4_ADDRESS, port);
+        state.closed = false;
+        state.connection_status = SocketConnectionStatus::Connected;
+        state.guest_local_address = Some(local_address);
+        let tcp = state.tcp_state_mut()?;
+        tcp.descriptor = TcpDescriptor::ExternalInet(host);
+        tcp.options = options;
+        core.register(accepted)?;
+        accepted.inbox.lock().set_own(ReadinessFlags::WRITE);
+        // Adding the socket to the poller reports the data that arrived before.
+        let host = state.tcp_state_mut()?.descriptor.socket_mut()?;
+        core.watch_host_socket(host, accepted.id, Interest::Stream)?;
+        Ok(SocketOutcome::Completed(AcceptedEndpoints {
+            local_address,
+            guest_source_lease: GuestSourceLease::external(guest_visible_client(peer)),
+        }))
+    }
+
     /// Unbinds and unlinks a retiring TCP socket, then closes its descriptor.
     pub(super) fn retire_tcp(&mut self) {
         let id = self.id();
@@ -1918,10 +2173,12 @@ impl SocketEntry<'_> {
         let core = self.core();
         core.hook(HookPoint::Unlinked(id));
         core.unregister(id);
+        let port = self.guest_local_address.map_or(0, |address| address.port());
         let Ok(tcp) = self.tcp_state_mut() else {
             return;
         };
         match core::mem::replace(&mut tcp.descriptor, TcpDescriptor::Unrealized) {
+            TcpDescriptor::Listener(socket) => core.release_published(port, socket),
             TcpDescriptor::ExternalInet(mut socket) => {
                 if tcp.abortive_close {
                     // Abort may be requested before lazy external realization,
@@ -2117,7 +2374,7 @@ impl super::ProviderCore {
             let descriptor = socket.call(|socket| {
                 Ok(match socket.tcp_state()?.descriptor {
                     TcpDescriptor::Unrealized => &mut counts.0,
-                    TcpDescriptor::ExternalInet(_) => &mut counts.1,
+                    TcpDescriptor::ExternalInet(_) | TcpDescriptor::Listener(_) => &mut counts.1,
                     TcpDescriptor::Internal(_) => &mut counts.2,
                 })
             });

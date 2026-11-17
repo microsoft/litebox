@@ -15,7 +15,6 @@ use litebox_broker_core::pid_namespace::PidNamespace;
 use litebox_broker_core::{BrokerCoreLimits, BrokerProcess, ObjectRights, PolicyEngine};
 use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
-use litebox_broker_protocol::vsock_socket::VsockCid;
 use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, WindowsNamedPipeStream,
     validate_client_process,
@@ -44,12 +43,8 @@ pub(super) fn run(
         limits.max_shared_files,
         stdio,
     )?;
-    let vsock_uds = args
-        .vsock_uds
-        .as_deref()
-        .map(|path| (path, VsockCid(args.vsock_guest_cid)));
     // The bridge runs until `run` returns.
-    let (core, _vsock) = super::build_broker(policy, limits, vsock_uds)?;
+    let (core, _vsock) = super::build_broker(policy, limits, &args)?;
     let pid_namespace = Arc::new(PidNamespace::new(&core)?);
 
     if args.in_process_runner {
