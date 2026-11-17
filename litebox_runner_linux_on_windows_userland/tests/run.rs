@@ -4,6 +4,7 @@
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
 use std::{
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -53,38 +54,94 @@ fn brokered_runner_command(initial_files: &Path) -> Command {
     command
 }
 
-fn packaged_rootfs(test_directory: &str, image: &str, cache_hit_variable: &str) -> PathBuf {
+fn rootfs_fingerprint(root: &Path, args: &[&str]) -> u64 {
+    fn hash_input(root: &Path, path: &Path, hasher: &mut DefaultHasher) {
+        path.strip_prefix(root).unwrap().hash(hasher);
+        if path.is_dir() {
+            let mut children: Vec<_> = std::fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            children.sort();
+            for child in children {
+                hash_input(root, &child, hasher);
+            }
+        } else {
+            std::fs::read(path).unwrap().hash(hasher);
+        }
+    }
+
+    let mut hasher = DefaultHasher::new();
+    "windows-oci-rootfs-v1".hash(&mut hasher);
+    args.hash(&mut hasher);
+    for input in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
+        hash_input(root, &root.join(input), &mut hasher);
+    }
+    for package in [
+        "litebox_packager",
+        "litebox_syscall_rewriter",
+        "litebox_trampoline",
+        "litebox_common_windows",
+    ] {
+        for input in ["Cargo.toml", "src", "build.rs"] {
+            let path = root.join(package).join(input);
+            if path.exists() {
+                hash_input(root, &path, &mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
+fn packaged_rootfs(test_directory: &str, image: &str) -> PathBuf {
     let test_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(test_directory);
     std::fs::create_dir_all(&test_dir).unwrap();
     let tar_path = test_dir.join("rootfs.tar");
-    if std::env::var_os(cache_hit_variable).is_some_and(|value| value == "true") {
-        assert!(
-            tar_path.is_file(),
-            "CI reported a rootfs cache hit via {cache_hit_variable}, but {} is missing",
-            tar_path.display(),
-        );
+    let fingerprint_path = test_dir.join("rootfs.tar.fingerprint");
+    let args = [
+        "run",
+        "-p",
+        "litebox_packager",
+        "--",
+        "--oci-image",
+        image,
+        "--target-arch",
+        "x86-64",
+        "--target-host",
+        "windows",
+        "--output",
+    ];
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let fingerprint = rootfs_fingerprint(root, &args);
+    // Length survives archive restores even when the filesystem rounds mtimes.
+    if let Ok(metadata) = std::fs::metadata(&tar_path)
+        && metadata.is_file()
+        && std::fs::read_to_string(&fingerprint_path).ok()
+            == Some(format!("{fingerprint:016x}:{}", metadata.len()))
+    {
         println!("Using cached rootfs: {}", tar_path.display());
-    } else {
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        checked_output(
-            Command::new(cargo)
-                .current_dir(env!("CARGO_MANIFEST_DIR"))
-                .args([
-                    "run",
-                    "-p",
-                    "litebox_packager",
-                    "--",
-                    "--oci-image",
-                    image,
-                    "--target-arch",
-                    "x86-64",
-                    "--target-host",
-                    "windows",
-                    "--output",
-                ])
-                .arg(&tar_path),
-        );
+        return tar_path;
     }
+
+    if fingerprint_path.exists() {
+        std::fs::remove_file(&fingerprint_path).unwrap();
+    }
+    println!("Packaging rootfs: {}", tar_path.display());
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    checked_output(
+        Command::new(cargo)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args(args)
+            .arg(&tar_path),
+    );
+    std::fs::write(
+        fingerprint_path,
+        format!(
+            "{fingerprint:016x}:{}",
+            std::fs::metadata(&tar_path).unwrap().len()
+        ),
+    )
+    .unwrap();
     tar_path
 }
 
@@ -94,7 +151,6 @@ fn test_runner_with_python() {
         "windows_python_rewriter",
         // python:3.12-slim-bookworm, pinned for reproducible guest files.
         "docker.io/library/python@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258",
-        "LITEBOX_PYTHON_ROOTFS_CACHE_HIT",
     );
     let output = checked_output(
         brokered_runner_command(&tar_path)
@@ -131,7 +187,6 @@ fn test_node_with_rewriter() {
         "windows_node_rewriter",
         // node:22-bookworm-slim, pinned for reproducible guest files.
         "docker.io/library/node@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392",
-        "LITEBOX_NODE_ROOTFS_CACHE_HIT",
     );
     let output = checked_output(
         brokered_runner_command(&tar_path)
