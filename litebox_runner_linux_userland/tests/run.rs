@@ -1740,6 +1740,15 @@ fn waitid_reports_and_reaps_children() {
     runner.run();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn pidfds_follow_children() {
+    let parent = common::compile("./tests/pidfd_parent.c", "pidfd_parent", true, false);
+    let mut runner = Runner::new(&parent, "pidfd_parent");
+    runner.allow_process_duplication();
+    runner.run();
+}
+
 /// A 512 KiB host stack makes 32 generations exceed the old native fork stack-growth limit,
 /// without retaining the hundreds of live runtimes needed to exhaust the default 8 MiB stack.
 #[cfg(target_os = "linux")]

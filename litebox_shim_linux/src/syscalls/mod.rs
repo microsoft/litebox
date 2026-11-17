@@ -11,6 +11,7 @@ pub(crate) mod inet;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;
+pub(crate) mod pidfd;
 pub(crate) mod pipe;
 pub mod process;
 pub(crate) mod timerfd;

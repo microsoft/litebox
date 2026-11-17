@@ -27,7 +27,7 @@ use litebox::platform::ArchSpecificRegister;
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::TimerHandle;
 use litebox::platform::{ForkError, ForkResult, ProcessHandle, ProcessProvider};
-use litebox::process::{PendingChild, ProcessError};
+use litebox::process::{PendingChild, Process, ProcessError};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
@@ -38,7 +38,6 @@ use litebox_broker_protocol::process::{
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::{ProcessGroupId, ProcessId, ThreadId};
-use litebox_common_linux::ProtFlags;
 #[cfg(target_arch = "aarch64")]
 use litebox_common_linux::SveSetVlFlags;
 use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
@@ -49,6 +48,7 @@ use litebox_common_linux::{
     Rusage, SchedParam, TimeParam, Tms, WaitIdType, WaitOptions, clock_ticks, errno::Errno,
     program_startup::LinuxProgramStartup,
 };
+use litebox_common_linux::{OFlags, ProtFlags};
 use litebox_common_linux::{
     PAGE_SIZE,
     vmem::{CreatePagesFlags, MappingError},
@@ -470,6 +470,14 @@ impl<Platform: ShimPlatform> Drop for ThreadState<Platform> {
         self.remove_thread_id();
         self.process.complete_thread_detach();
     }
+}
+
+/// The children a wait considers.
+enum WaitTarget<Platform: ShimPlatform> {
+    /// The children a selector matches.
+    Children(ChildSelector),
+    /// The child process a pidfd refers to.
+    Process(Arc<Process<Platform>>),
 }
 
 /// Keeps the other threads of a process paused for `fork` until dropped.
@@ -1798,12 +1806,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handles `vfork`; see [`Self::begin_vfork`].
     pub(crate) fn sys_vfork(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
-        self.begin_vfork(ctx, None, false, ChildRelation::CHILD)
+        self.begin_vfork(ctx, None, false, None, ChildRelation::CHILD)
     }
 
     /// Handle syscall `fork`.
     pub(crate) fn sys_fork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
-        self.fork(ctx, 0, 0, None, ChildRelation::CHILD)
+        self.fork(ctx, 0, 0, None, None, ChildRelation::CHILD)
     }
 
     /// Duplicates this process in a fresh runner, which continues the child at the parent's
@@ -1811,7 +1819,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// The child stores its thread ID at `set_child_tid` and clears `clear_child_tid` when it
     /// exits, unless they are zero, and continues on `child_stack`, if given, rather than on the
-    /// parent's stack. It relates to this process as `relation` describes.
+    /// parent's stack. It relates to this process as `relation` describes. If `pidfd` is given
+    /// (`CLONE_PIDFD`), the parent gets a close-on-exec pidfd for the child, which the child does
+    /// not inherit, and stores its number at `pidfd` before the child starts. Unlike Linux, which
+    /// stores it after copying the parent's memory, the child finds the number there too.
     ///
     /// The child gets a copy of the parent's memory, program break, registers, and thread
     /// pointer, of its credentials, command name, working directory, and umask, of its
@@ -1834,6 +1845,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         set_child_tid: usize,
         clear_child_tid: usize,
         child_stack: Option<usize>,
+        pidfd: Option<UserPtrMut<i32>>,
         relation: ChildRelation,
     ) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some() {
@@ -1911,14 +1923,38 @@ impl<Platform: ShimPlatform> Task<Platform> {
         for (forked, handle) in startup.fds.iter_mut().zip(handles) {
             forked.inherited.handle = handle;
         }
+        // Like Linux, the pidfd is installed after the child's descriptors are copied. The other
+        // threads stay paused until the child starts or the pidfd is removed, so that, as on
+        // Linux, none sees a pidfd for a child that fails to start.
+        let pidfd = pidfd
+            .map(|dest| self.install_child_pidfd(&self.files.borrow(), &child, dest))
+            .transpose()?;
+        let started = self.start_forked_child(&child, startup, has_shared_mappings);
+        if started.is_err()
+            && let Some(pidfd) = pidfd
+        {
+            self.remove_child_pidfd(pidfd);
+        }
+        drop(pause);
+        started.map(|()| child_pid.cast_unsigned() as usize)
+    }
+
+    /// Starts the pending `child` [`Self::fork`] prepared from `startup`, natively if possible,
+    /// or else from a copy of this process's memory, while the other threads are paused.
+    fn start_forked_child(
+        &self,
+        child: &PendingChild,
+        mut startup: LinuxForkStartup,
+        has_shared_mappings: bool,
+    ) -> Result<(), Errno> {
         if let Some(launcher) = &self.global.fork_launcher {
             let payload = startup
                 .encode()
                 .expect("the startup fit with placeholder handles");
             // SAFETY: Sibling guest threads remain paused, and the payload snapshots this
             // calling thread and the stable process state.
-            match unsafe { launcher.start(&child, &payload) } {
-                Ok(()) => return Ok(child_pid.cast_unsigned() as usize),
+            match unsafe { launcher.start(child, &payload) } {
+                Ok(()) => return Ok(()),
                 Err(litebox::platform::ForkError::Unsupported) if has_shared_mappings => {
                     return Err(Errno::EAGAIN);
                 }
@@ -1943,11 +1979,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map(|(range, flags)| ForkMemoryRegion { range, flags })
             .collect();
         let payload = startup.encode().map_err(|_| Errno::ENOMEM)?;
-        self.write_fork_image(&child, &startup.regions)?;
-        // The child's memory and objects are copied, so the other threads may go on.
-        drop(pause);
-        child.start(&payload).map_err(Errno::from)?;
-        Ok(child_pid.cast_unsigned() as usize)
+        self.write_fork_image(child, &startup.regions)?;
+        child.start(&payload).map_err(Errno::from)
     }
 
     /// Writes the contents of each of `regions` that has contents to the pending `child`'s
@@ -2071,8 +2104,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// The child continues from the syscall on `child_stack` if given, or else on the parent's
     /// stack. If `clear_signal_handlers` is set (`CLONE_CLEAR_SIGHAND`), the child's handled
-    /// signals start with their default action. The child relates to this process as `relation`
-    /// describes.
+    /// signals start with their default action. If `pidfd` is given (`CLONE_PIDFD`), the parent
+    /// gets a close-on-exec pidfd for the child, which the child does not get, and stores its
+    /// number at `pidfd`. The child relates to this process as `relation` describes.
     ///
     /// Only processes with default alarm state are admitted. The child gets its own copy of the
     /// parent's resource limits, working directory, umask, and `no_new_privs`, of its descriptor
@@ -2092,6 +2126,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ctx: &mut litebox_common_linux::PtRegs,
         child_stack: Option<usize>,
         clear_signal_handlers: bool,
+        pidfd: Option<UserPtrMut<i32>>,
         relation: ChildRelation,
     ) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some() || !self.thread.process.has_default_alarm_state() {
@@ -2114,8 +2149,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             parent_context.regs[0] = child_pid.cast_unsigned() as usize;
         }
-        let child_fs = crate::syscalls::file::FsState::clone(&self.fs.borrow());
-        let parent_fs = self.fs.replace(Arc::new(child_fs));
         let child_files = self.files.borrow().copy_for_vfork(&self.global);
         // A sibling may have changed the parent's limits since this task's descriptor table was
         // limited, so limit the child's to its copy of the limits.
@@ -2124,6 +2157,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
         );
         let parent_files = self.files.replace(Arc::new(child_files));
+        // Like Linux, the pidfd is installed after the child's descriptors are copied.
+        if let Some(dest) = pidfd
+            && let Err(error) = self.install_child_pidfd(&parent_files, &child, dest)
+        {
+            self.close_vfork_child_descriptors();
+            self.files.replace(parent_files);
+            return Err(error);
+        }
+        let child_fs = crate::syscalls::file::FsState::clone(&self.fs.borrow());
+        let parent_fs = self.fs.replace(Arc::new(child_fs));
         let child_init_process = self.process_is_init(child.identity().process_id);
         self.vfork.replace(Some(crate::VforkState {
             child,
@@ -2150,7 +2193,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Among other flags, a child process supports `CLONE_PARENT` and the namespace flags
     /// `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWIPC`, and a `vfork` child supports
-    /// `CLONE_CLEAR_SIGHAND` and the same namespace flags. Both support only `SIGCHLD` as the exit
+    /// `CLONE_CLEAR_SIGHAND` and the same namespace flags. Both support `CLONE_PIDFD`, but threads
+    /// don't, since thread pidfds are unsupported. Both support only `SIGCHLD` as the exit
     /// signal, as `posix_spawn` uses, except that, like Linux, a sibling (`CLONE_PARENT`) gets this
     /// process's exit signal instead. Other process creation is unsupported.
     fn do_clone(
@@ -2163,7 +2207,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let litebox_common_linux::CloneArgs {
             mut flags,
-            pidfd: _,
+            pidfd,
             child_tid,
             parent_tid,
             exit_signal,
@@ -2180,6 +2224,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if !clone3 && !flags.contains(CloneFlags::PIDFD) {
             flags.remove(CloneFlags::DETACHED);
         }
+
+        // Like Linux, `CLONE_PIDFD` refuses `CLONE_DETACHED` and a destination shared with
+        // `CLONE_PARENT_SETTID`, as `clone`'s always is.
+        if flags.contains(CloneFlags::PIDFD)
+            && (flags.contains(CloneFlags::DETACHED)
+                || (flags.contains(CloneFlags::PARENT_SETTID) && pidfd == parent_tid))
+        {
+            return Err(Errno::EINVAL);
+        }
+        let pidfd = flags
+            .contains(CloneFlags::PIDFD)
+            .then(|| UserPtrMut::<i32>::from_usize(pidfd.trunc()));
 
         if cgroup != 0 {
             log_unsupported!("clone with cgroup");
@@ -2224,6 +2280,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 | CloneFlags::CHILD_CLEARTID
                 | CloneFlags::PARENT_SETTID
                 | CloneFlags::PARENT
+                | CloneFlags::PIDFD
                 | CloneFlags::NEWPID
                 | UTS_AND_IPC_NAMESPACE_FLAGS;
             if flags.intersects(!supported_fork_flags) {
@@ -2262,6 +2319,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 tid_if(CloneFlags::CHILD_SETTID),
                 tid_if(CloneFlags::CHILD_CLEARTID),
                 sp,
+                pidfd,
                 relation,
             )?;
             // Like Linux, the parent stores the child's ID in its own memory after the copy, and
@@ -2277,6 +2335,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let supported_vfork_flags = CloneFlags::VM
                 | CloneFlags::VFORK
                 | CloneFlags::CLEAR_SIGHAND
+                | CloneFlags::PIDFD
                 | CloneFlags::NEWPID
                 | UTS_AND_IPC_NAMESPACE_FLAGS;
             if flags.intersects(!supported_vfork_flags) || !flags.contains(CloneFlags::VM) {
@@ -2296,7 +2355,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 sibling: false,
                 new_host_names: flags.contains(CloneFlags::NEWUTS),
             };
-            return self.begin_vfork(ctx, sp, flags.contains(CloneFlags::CLEAR_SIGHAND), relation);
+            return self.begin_vfork(
+                ctx,
+                sp,
+                flags.contains(CloneFlags::CLEAR_SIGHAND),
+                pidfd,
+                relation,
+            );
         }
 
         // Like Linux, refuse a new thread with `CLONE_NEWPID` or after `unshare(CLONE_NEWPID)`.
@@ -3233,7 +3298,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             0 => self.own_process_group_selector()?,
             _ => ChildSelector::ProcessGroup(ProcessGroupId(pid.unsigned_abs())),
         };
-        let Some(exit) = self.wait_child_exit(selector, options)? else {
+        let Some(exit) = self.wait_child_exit(WaitTarget::Children(selector), options)? else {
             return Ok(0);
         };
         let (code, status) = child_termination(exit.exit_status);
@@ -3302,8 +3367,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Like [`Self::sys_wait4`], only terminated children are reported. Since LiteBox does not
     /// keep an exited child waitable once its exit is collected, and children never stop or
-    /// continue, `WNOWAIT` and options without `WEXITED` are unsupported. Since LiteBox has no
-    /// pidfds, every `P_PIDFD` descriptor is a bad one.
+    /// continue, `WNOWAIT` and options without `WEXITED` are unsupported. Like Linux, waiting on
+    /// a nonblocking pidfd (`P_PIDFD`) never blocks, and fails with `EAGAIN` if the child has not
+    /// terminated, unless `options` has `WNOHANG`.
     fn wait_child_exit_by_id(
         &self,
         idtype: i32,
@@ -3320,14 +3386,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if !valid.contains(options) || !options.intersects(reported) {
             return Err(Errno::EINVAL);
         }
-        let selector = match WaitIdType::try_from(idtype).map_err(|_| Errno::EINVAL)? {
-            WaitIdType::All => ChildSelector::Any,
-            WaitIdType::Pid if id > 0 => ChildSelector::Process(ProcessId(id.cast_unsigned())),
-            WaitIdType::Pgid if id > 0 => {
-                ChildSelector::ProcessGroup(ProcessGroupId(id.cast_unsigned()))
+        let mut nonblocking = false;
+        let target = match WaitIdType::try_from(idtype).map_err(|_| Errno::EINVAL)? {
+            WaitIdType::All => WaitTarget::Children(ChildSelector::Any),
+            WaitIdType::Pid if id > 0 => {
+                WaitTarget::Children(ChildSelector::Process(ProcessId(id.cast_unsigned())))
             }
-            WaitIdType::Pgid if id == 0 => self.own_process_group_selector()?,
-            WaitIdType::Pidfd if id >= 0 => return Err(Errno::EBADF),
+            WaitIdType::Pgid if id > 0 => WaitTarget::Children(ChildSelector::ProcessGroup(
+                ProcessGroupId(id.cast_unsigned()),
+            )),
+            WaitIdType::Pgid if id == 0 => WaitTarget::Children(self.own_process_group_selector()?),
+            WaitIdType::Pidfd if id >= 0 => self.with_pidfd_at(id, |file| {
+                nonblocking = file.get_status_flags()?.contains(OFlags::NONBLOCK);
+                Ok(WaitTarget::Process(Arc::clone(file.process())))
+            })?,
             WaitIdType::Pid | WaitIdType::Pgid | WaitIdType::Pidfd => return Err(Errno::EINVAL),
         };
         if options.contains(WaitOptions::WNOWAIT) {
@@ -3338,7 +3410,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             log_unsupported!("waitid without WEXITED");
             return Err(Errno::ENOSYS);
         }
-        self.wait_child_exit(selector, options)
+        if nonblocking && !options.contains(WaitOptions::WNOHANG) {
+            return self
+                .wait_child_exit(target, options | WaitOptions::WNOHANG)?
+                .ok_or(Errno::EAGAIN)
+                .map(Some);
+        }
+        self.wait_child_exit(target, options)
     }
 
     /// Returns the selector of the children in the process group this process is in now.
@@ -3351,11 +3429,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
-    /// Waits for a child that `selector` matches to terminate and collects its exit, or returns
+    /// Waits for a child that `target` selects to terminate and collects its exit, or returns
     /// `None` if `options` has `WNOHANG` and none has terminated yet.
     fn wait_child_exit(
         &self,
-        selector: ChildSelector,
+        target: WaitTarget<Platform>,
         options: WaitOptions,
     ) -> Result<Option<ChildExit>, Errno> {
         // Every child is created with the default exit signal, so only __WALL selects it
@@ -3364,7 +3442,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ECHILD);
         }
         let process = &self.thread.process;
-        let mut reap_child = || match self.global.litebox.collect_child_exit(selector) {
+        let collect = || match &target {
+            WaitTarget::Children(selector) => self.global.litebox.collect_child_exit(*selector),
+            WaitTarget::Process(process) => process.collect_exit(),
+        };
+        let mut reap_child = || match collect() {
             Ok(Some(exit)) => Ok(exit),
             Ok(None) => Err(TryOpError::TryAgain),
             // Without a process service, or a matching child, there is nothing to wait for.
@@ -4915,6 +4997,27 @@ mod tests {
                     .unwrap(),
             );
         }
+    }
+
+    #[test]
+    fn pidfd_send_signal_takes_a_signal_it_sends_to_this_process() {
+        use litebox_common_linux::PidfdFlags;
+        use litebox_common_linux::signal::{SigSet, Signal};
+
+        let signal = Signal::SIGUSR1;
+        run_with_unwatched_signals(SigSet::empty(), |task| {
+            task.set_test_signal_action(signal, 0x1000);
+            let fd = task
+                .sys_pidfd_open(task.sys_getpid(), PidfdFlags::empty())
+                .unwrap();
+            let fd = i32::try_from(fd).unwrap();
+            assert_eq!(
+                task.sys_pidfd_send_signal(fd, signal.as_i32(), None, 0),
+                Ok(0)
+            );
+            // The signal is pending though its notification has not arrived.
+            assert!(task.pending_signal_set().contains(signal));
+        });
     }
 
     #[test]

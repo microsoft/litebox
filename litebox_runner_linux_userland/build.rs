@@ -28,6 +28,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "native_tp.c",
     "inherited_ignored_signals.c",
     "pid_namespace.c",
+    "pidfd_parent.c",
     "prctl_flags.c",
     "process_group_parent.c",
     "process_tree_parent.c",

@@ -1235,6 +1235,54 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
+    /// Handle syscall `pidfd_send_signal`.
+    ///
+    /// Like Linux, this sends `signal` as `kill` does, so its target sees an `SI_USER` signal from
+    /// this process. A broker signal carries only its number, so caller-supplied `info`, which
+    /// would set its `siginfo` as `rt_sigqueueinfo` does, is unsupported and fails with `ENOSYS`.
+    /// `PIDFD_SIGNAL_*` flags, which Linux 6.9+ accepts, fail with `EINVAL` as on earlier kernels.
+    pub(crate) fn sys_pidfd_send_signal(
+        &self,
+        pidfd: i32,
+        signal: i32,
+        info: Option<UserPtr<Siginfo>>,
+        flags: u32,
+    ) -> Result<usize, Errno> {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        // The shared LiteBox instance retains the parent's process identity during `vfork`.
+        if self.vfork.borrow().is_some() {
+            log_unsupported!("pidfd_send_signal in a vfork child");
+            return Err(Errno::EINVAL);
+        }
+        let process = self.with_pidfd_at(pidfd, |file| Ok(Arc::clone(file.process())))?;
+        if info.is_some() {
+            log_unsupported!("pidfd_send_signal with siginfo");
+            return Err(Errno::ENOSYS);
+        }
+        let send = |number: u32| match process.send_signal(number) {
+            Ok(()) => Ok(()),
+            // Like Linux, a signal that cannot be queued fails with `EAGAIN`.
+            Err(ProcessError::OutOfMemory) => Err(Errno::EAGAIN),
+            Err(error) => Err(Errno::from(error)),
+        };
+        // Like Linux, a reaped process fails with `ESRCH` before the signal is checked.
+        let signal = match signal_or_probe(signal) {
+            Ok(signal) => signal,
+            Err(error) => {
+                send(0)?;
+                return Err(error);
+            }
+        };
+        send(signal.map_or(0, |signal| signal.as_i32().cast_unsigned()))?;
+        // The pidfd may refer to this process.
+        if signal.is_some() {
+            self.take_signals(true);
+        }
+        Ok(0)
+    }
+
     pub(crate) fn sys_tkill(&self, tid: i32, signal: i32) -> Result<usize, Errno> {
         // Like Linux, `tkill` and `tgkill` reject nonpositive IDs before anything else, and check
         // the signal only once the thread is found.
