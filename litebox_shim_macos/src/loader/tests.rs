@@ -25,8 +25,14 @@ use litebox_broker_core::{
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileUser};
-use litebox_common_macos::{STACK_ALIGNMENT, TaskParams, errno::Errno, user_pointers::UserPtr};
+use litebox_broker_protocol::fs::{
+    FileAccessMode, FileOpenFlags, FileTimeUpdate, FileTimestamp, FileUser, SetFileTimes,
+};
+use litebox_common_macos::{
+    STACK_ALIGNMENT, Stat64, TaskParams,
+    errno::Errno,
+    user_pointers::{UserPtr, UserPtrMut},
+};
 use litebox_platform_macos_userland::{GuestAbi, MacosUserland as Platform, set_guest_abi};
 use std::process::Command;
 
@@ -164,6 +170,20 @@ fn filesystem_loader_runs_linked_static_macho() {
             FileMode::empty(),
         )
         .unwrap();
+    fd.set_times(
+        FileUser::ROOT,
+        &SetFileTimes {
+            access: FileTimeUpdate::Set(FileTimestamp {
+                seconds: -123,
+                nanoseconds: 999_999_999,
+            }),
+            modify: FileTimeUpdate::Set(FileTimestamp {
+                seconds: 456,
+                nanoseconds: 123_456_789,
+            }),
+        },
+    )
+    .unwrap();
     assert_eq!(builder.inherit_file(fd), Ok(0));
     let shim = builder.build();
     let global = Arc::downgrade(&shim.global);
@@ -179,6 +199,13 @@ fn filesystem_loader_runs_linked_static_macho() {
     let task = &program.entrypoints.task;
     assert!(task.files.typed_fd(0).is_ok());
     assert!(matches!(task.files.typed_fd(1), Err(Errno::EBADF)));
+    let mut file_stat = Stat64::default();
+    let stat_ptr = UserPtrMut::from_usize(core::ptr::from_mut(&mut file_stat) as usize);
+    task.sys_fstat64(0, stat_ptr).unwrap();
+    let expected_times = [[-123, 999_999_999], [456, 123_456_789], [0, 0], [0, 0]];
+    assert_eq!(file_stat.times, expected_times);
+    task.sys_stat64("/bin/main", stat_ptr, true).unwrap();
+    assert_eq!(file_stat.times, expected_times);
     let relocate = |address| {
         program.initial_ctx.pc - (plan.entry - plan.virtual_range.start)
             + (address - plan.virtual_range.start)
