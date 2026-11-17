@@ -1044,7 +1044,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         args: PrctlArg::GetDumpable
                             | PrctlArg::SetDumpable(_)
                             | PrctlArg::GetNoNewPrivs
-                            | PrctlArg::SetNoNewPrivs,
+                            | PrctlArg::SetNoNewPrivs
+                            | PrctlArg::GetPDeathSig(_)
+                            | PrctlArg::SetPDeathSig(_),
                     }
                     | SyscallRequest::Kill { .. }
                     | SyscallRequest::PidfdOpen { .. }

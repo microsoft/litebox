@@ -2715,6 +2715,10 @@ bitflags::bitflags! {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum PrctlArg {
+    /// PR_SET_PDEATHSIG: set the calling thread's parent-death signal, or 0 for none
+    SetPDeathSig(usize),
+    /// PR_GET_PDEATHSIG: read the calling thread's parent-death signal
+    GetPDeathSig(UserPtrMut<i32>),
     SetName(UserPtr<u8>),
     GetName(UserPtrMut<u8>),
     CapBSetRead(usize),
@@ -4004,6 +4008,12 @@ impl SyscallRequest {
                 let op: u32 = ctx.sys_req_arg(0);
                 if let Ok(op) = PrctlOption::try_from(op) {
                     match op {
+                        PrctlOption::SetPDeathSig => SyscallRequest::Prctl {
+                            args: PrctlArg::SetPDeathSig(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetPDeathSig => SyscallRequest::Prctl {
+                            args: PrctlArg::GetPDeathSig(ctx.sys_req_ptr(1)),
+                        },
                         PrctlOption::SetName => SyscallRequest::Prctl {
                             args: PrctlArg::SetName(ctx.sys_req_ptr(1)),
                         },

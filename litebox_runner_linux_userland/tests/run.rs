@@ -1705,6 +1705,27 @@ fn dumpable_and_no_new_privs_follow_threads_and_processes() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn parent_death_signal_is_sent_when_the_parent_exits() {
+    let program = common::compile(
+        "./tests/parent_death_signal.c",
+        "parent_death_signal",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&program, "parent_death_signal");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "parent-death-signal failures=0"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cpu_time_covers_the_process_and_its_waited_descendants() {
     let parent = common::compile("./tests/cpu_time_parent.c", "cpu_time_parent", true, false);
     let mut runner = Runner::new(&parent, "cpu_time_parent");
