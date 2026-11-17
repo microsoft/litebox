@@ -20,7 +20,6 @@ use litebox_platform_lvbs::host::LvbsLinuxKernel as Platform;
 use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
 use litebox_platform_lvbs::{
     arch::{gdt, interrupts, timer},
-    debug_serial_println,
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables},
     mm::MemoryProvider,
     mshv::{
@@ -67,7 +66,7 @@ pub fn seed_initial_heap() {
     unsafe {
         Platform::mem_fill_pages(mem_fill_start, VTL1_INIT_HEAP_SIZE);
     }
-    debug_serial_println!(
+    log::info!(
         "heap: seed init region (pages {}..+{:#x}): VA {:#x}, size {:#x}",
         VTL1_INIT_HEAP_START_PAGE,
         VTL1_INIT_HEAP_SIZE,
@@ -84,7 +83,7 @@ pub fn seed_initial_heap() {
     unsafe {
         Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
     }
-    debug_serial_println!(
+    log::info!(
         "heap: add pre-populated region (_heap_start..Phase 1 end): VA {:#x}, size {:#x}",
         mem_fill_start,
         mem_fill_size
@@ -155,7 +154,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
             unsafe {
                 Platform::mem_fill_pages(rela_virt, rela_size);
             }
-            debug_serial_println!(
+            log::info!(
                 "heap: reclaim .rela.dyn section: VA {:#x}, size {:#x}",
                 rela_virt,
                 rela_size
@@ -190,7 +189,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
             unsafe {
                 Platform::mem_fill_pages(early_pt_start, early_pt_size);
             }
-            debug_serial_println!(
+            log::info!(
                 "heap: reclaim early page table frames (pages {}..{}): VA {:#x}, size {:#x}",
                 VTL1_PML4E_PAGE,
                 VTL1_PML4E_PAGE + (early_pt_size / PAGE_SIZE),
@@ -210,7 +209,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
             unsafe {
                 Platform::mem_fill_pages(remap_pt_start, remap_pt_size);
             }
-            debug_serial_println!(
+            log::info!(
                 "heap: reclaim Phase 1 remap PT frames (pages {}..{}): VA {:#x}, size {:#x}",
                 VTL1_REMAP_PDPT_PAGE,
                 VTL1_REMAP_PDE_PAGE + 1,
@@ -229,7 +228,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
         unsafe {
             Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
         }
-        debug_serial_println!(
+        log::info!(
             "heap: add remaining VTL1 memory (post Phase 2): VA {:#x}, size {:#x}",
             mem_fill_start,
             mem_fill_size
@@ -299,6 +298,10 @@ fn vtlcall_dispatch(platform: &'static Platform, params: &[u64; NUM_VTLCALL_PARA
             let key_alg = params[2];
             litebox_shim_optee::idk::generate_identity_signing_key(platform, public_key_pa, key_alg)
         }
+
+        #[cfg(feature = "lvbs-test")]
+        VsmFunction::RunLvbsTest => lvbs_tests::run_lvbs_test(params[1], params[2], params[3]),
+
         _ => vsm_dispatch(platform, func_id, &params[1..]),
     }
 }
@@ -355,6 +358,8 @@ fn vsm_dispatch(platform: &'static Platform, func_id: VsmFunction, params: &[u64
             Err(VsmError::OperationNotSupported("Identity key generation"))
         }
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
+        VsmFunction::SetCrashDumpKey => vtl1.set_crash_dump_key(params[0], params[1]).map(|()| 0),
+        VsmFunction::RunLvbsTest => Err(VsmError::OperationNotSupported("Cannot run LVBS test")),
     };
     match result {
         Ok(value) => value,
@@ -400,7 +405,9 @@ fn vsm_error_to_errno(error: VsmError) -> Errno {
         | VsmError::SymbolTableOutOfRange => Errno::ERANGE,
 
         // Init/hardware failures - I/O error
-        VsmError::ApInitFailed(_) | VsmError::HypercallFailed(_) => Errno::EIO,
+        VsmError::ApInitFailed(_) | VsmError::HypercallFailed(_) | VsmError::CipherOpFailed(_) => {
+            Errno::EIO
+        }
         VsmError::OutOfMemory => Errno::ENOMEM,
 
         // True format/validation errors - invalid argument
@@ -421,6 +428,10 @@ fn vsm_error_to_errno(error: VsmError) -> Errno {
         | VsmError::CertificateDerLengthInvalid { .. }
         | VsmError::CertificateParseFailed => Errno::EINVAL,
 
+        VsmError::InvalidKey(_) => Errno::EKEYREJECTED,
+
+        VsmError::OperationTimeout(_) => Errno::ETIMEDOUT,
+
         // Signature verification failures delegate to VerificationError's Errno mapping
         VsmError::SignatureVerificationFailed(error) => match error {
             VerificationError::AuthenticationFailed => Errno::EKEYREJECTED,
@@ -433,7 +444,7 @@ fn vsm_error_to_errno(error: VsmError) -> Errno {
 
         // Future VSM errors default to an invalid request and are logged so they can be mapped.
         unmapped => {
-            debug_serial_println!("Unmapped VSM error: {unmapped:?}");
+            log::warn!("Unmapped VSM error: {unmapped:?}");
             Errno::EINVAL
         }
     }
@@ -550,7 +561,7 @@ fn teardown_ta_page_table(platform: &'static Platform, task_pt_id: usize) {
     // Safety: OP-TEE has no shared/COW user-page mappings, and active access
     // retains an owning page-table handle.
     if let Err(error) = unsafe { platform.unregister_task_page_table(task_pt_id) } {
-        debug_serial_println!("Failed to unregister task page table {task_pt_id:#x}: {error:?}");
+        log::error!("Failed to unregister task page table {task_pt_id:#x}: {error:?}");
     }
 }
 
@@ -659,7 +670,7 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
             msg_args_phys_addr,
         } => {
             let mut msg_args = *msg_args;
-            debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
+            log::info!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
             let result = match msg_args.cmd {
                 OpenSession => handle_open_session(
                     platform,
@@ -693,7 +704,7 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
 
             if let Err(e) = result {
                 if e == OpteeSmcReturnCode::RpcCmd {
-                    debug_serial_println!("OP-TEE SMC returning RPC command to normal world");
+                    log::info!("OP-TEE SMC returning RPC command to normal world");
 
                     // Dynamic TA RPC continuation requires CallWithRegdArg because the request
                     // buffer must be identified by a registered SHM reference and offset.
@@ -729,7 +740,7 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
                     ) {
                         Ok(context_id) => context_id,
                         Err(error) => {
-                            debug_serial_println!(
+                            log::error!(
                                 "Failed to allocate RPC context for LOAD_TA request: {:?}",
                                 error
                             );
@@ -753,7 +764,7 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
                         smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
                     }
                 } else {
-                    debug_serial_println!("OP-TEE SMC returning error code: {:?}", e);
+                    log::error!("OP-TEE SMC returning error code: {:?}", e);
                     smc_args.set_return_code(e);
                 }
             } else {
@@ -891,9 +902,9 @@ fn handle_return_from_load_ta_rpc(
     rpc_args: &mut OpteeRpcArgs,
 ) -> Result<RpcContext, OpteeSmcReturnCode> {
     let ta_size = rpc_args.load_ta_size_response()?;
-    debug_serial_println!("First LOAD_TA request, TA size: {}", ta_size);
+    log::info!("First LOAD_TA request, TA size: {}", ta_size);
     if checked_memref_size(ta_size).is_err() {
-        debug_serial_println!("Invalid TA size in first LOAD_TA request");
+        log::error!("Invalid TA size in first LOAD_TA request");
         return Err(OpteeSmcReturnCode::EBadCmd);
     }
 
@@ -1042,7 +1053,7 @@ fn handle_open_session(
 
     if let Some(pta) = ClientPta::from_uuid(&ta_uuid) {
         pta.open_session(msg_args);
-        debug_serial_println!("OpenSession on client PTA {:?}", pta);
+        log::info!("OpenSession on client PTA {:?}", pta);
         return write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr);
     }
 
@@ -1102,7 +1113,7 @@ fn open_session_single_instance(
     // Record the client identity before running OpenSession
     session_manager().set_session_client_identity(runner_session_id, client_identity);
 
-    debug_serial_println!(
+    log::info!(
         "Reusing single-instance TA: uuid={:?}, task_pt_id={}, session_id={}",
         ta_uuid,
         task_pt_id,
@@ -1138,7 +1149,7 @@ fn open_session_single_instance(
     // Per OP-TEE OS: if OpenSession fails, don't register the session
     // Reference: tee_ta_open_session() in tee_ta_manager.c
     if return_code != TeeResult::Success {
-        debug_serial_println!(
+        log::error!(
             "OpenSession failed on single-instance TA: return_code={:?}",
             return_code
         );
@@ -1159,7 +1170,7 @@ fn open_session_single_instance(
         // Regular errors (access denied, bad params, etc.) don't mean the TA is dead -
         // it can still serve future OpenSession requests from other clients.
         if return_code == TeeResult::TargetDead {
-            debug_serial_println!("Single-instance TA panicked during OpenSession, cleaning up");
+            log::error!("Single-instance TA panicked during OpenSession, cleaning up");
 
             session_manager().mark_sessions_dead_for_instance(instance);
             teardown_ta_page_table(platform, task_pt_id);
@@ -1209,7 +1220,7 @@ fn open_session_single_instance(
     session_manager().register_sibling_session(runner_session_id, instance)?;
     session_token.disarm();
 
-    debug_serial_println!(
+    log::info!(
         "OpenSession complete on single-instance TA: session_id={}",
         runner_session_id
     );
@@ -1238,13 +1249,13 @@ fn open_session_new_instance(
         .build();
 
     if ta_binary.is_none() && !shim.contains_embedded_ta_bin(&ta_uuid) {
-        debug_serial_println!(
+        log::error!(
             "TA binary not found for uuid={:?}, requesting load from normal world",
             ta_uuid
         );
 
         let Some(rpc) = rpc_args.as_deref_mut() else {
-            debug_serial_println!(
+            log::error!(
                 "RPC args not present in incoming request, cannot request LOAD_TA from normal world"
             );
             msg_args.session = 0;
@@ -1264,24 +1275,24 @@ fn open_session_new_instance(
     let runner_session_id = session_token.session_id().unwrap();
 
     let task_pt_id = create_task_page_table(platform)?;
-    debug_serial_println!("Created task page table ID: {}", task_pt_id);
+    log::info!("Created task page table ID: {}", task_pt_id);
 
     let page_table = platform
         .page_table_manager()
         .task_page_table(task_pt_id)
         .map_err(|_| OpteeSmcReturnCode::EBadCmd)
         .inspect_err(|error| {
-            debug_serial_println!("Failed to acquire task page-table handle: {error:?}");
+            log::error!("Failed to acquire task page-table handle: {error:?}");
             teardown_ta_page_table(platform, task_pt_id);
         })?;
 
     let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id).inspect_err(|error| {
-        debug_serial_println!("Failed to activate task page table: {error:?}");
+        log::error!("Failed to activate task page table: {error:?}");
         teardown_ta_page_table(platform, task_pt_id);
     })?;
 
     let shim = shim.with_page_table_keepalive(page_table).ok_or_else(|| {
-        debug_serial_println!("BUG: failed to attach task page-table keepalive");
+        log::error!("BUG: failed to attach task page-table keepalive");
         debug_assert!(false, "failed to attach task page-table keepalive");
         teardown_ta_page_table(platform, task_pt_id);
         OpteeSmcReturnCode::ENotAvail
@@ -1302,7 +1313,7 @@ fn open_session_new_instance(
 
     let ta_flags = loaded_program.ta_flags;
 
-    debug_serial_println!(
+    log::info!(
         "TA flags: {:?}, single_instance={}",
         ta_flags,
         ta_flags.is_single_instance()
@@ -1322,7 +1333,7 @@ fn open_session_new_instance(
     let ldelf_return_code =
         TeeResult::try_from(ldelf_return_code).unwrap_or(TeeResult::GenericError);
     if ldelf_return_code != TeeResult::Success {
-        debug_serial_println!(
+        log::error!(
             "ldelf/TA_CreateEntryPoint failed: return_code={:?}",
             ldelf_return_code
         );
@@ -1377,7 +1388,7 @@ fn open_session_new_instance(
     // Per OP-TEE OS: if OpenSession fails, tear down the instance
     // Reference: tee_ta_open_session() in tee_ta_manager.c
     if return_code != TeeResult::Success {
-        debug_serial_println!(
+        log::error!(
             "OpenSession failed on new instance: return_code={:?}",
             return_code
         );
@@ -1422,7 +1433,7 @@ fn open_session_new_instance(
     );
     session_token.disarm();
 
-    debug_serial_println!(
+    log::info!(
         "OpenSession complete: session_id={}, single_instance={}",
         runner_session_id,
         ta_flags.is_single_instance()
@@ -1447,7 +1458,7 @@ fn finalize_dead_session(
     msg_args.ret = return_code;
     msg_args.ret_origin = TeeOrigin::Tee;
     write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)?;
-    debug_serial_println!(
+    log::info!(
         "{}: session_id={} on dead TA session",
         log_prefix,
         session_id
@@ -1493,7 +1504,7 @@ fn handle_invoke_command(
 
         let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id)?;
 
-        debug_serial_println!(
+        log::info!(
             "InvokeCommand: session_id={}, task_pt_id={}, cmd_id={}",
             session_id,
             task_pt_id,
@@ -1533,7 +1544,7 @@ fn handle_invoke_command(
         // unrecoverable; all sessions on the same single-instance TA are
         // implicitly dead (Ref: tee_ta_invoke_command() in tee_ta_manager.c).
         if return_code == TeeResult::TargetDead {
-            debug_serial_println!(
+            log::error!(
                 "InvokeCommand: TA panicked (TARGET_DEAD), session_id={}",
                 session_id
             );
@@ -1545,7 +1556,7 @@ fn handle_invoke_command(
             session_manager().unregister_session(session_id);
             teardown_ta_page_table(platform, task_pt_id);
 
-            debug_serial_println!(
+            log::error!(
                 "InvokeCommand: cleaned up dead TA instance, task_pt_id={}",
                 task_pt_id
             );
@@ -1576,7 +1587,7 @@ fn handle_close_session(
     }
     let session_id = ta_req_info.session;
 
-    debug_serial_println!("CloseSession: session_id={}", session_id);
+    log::info!("CloseSession: session_id={}", session_id);
 
     if let Some(pta) = ClientPta::from_session_id(session_id) {
         pta.close_session(msg_args);
@@ -1638,7 +1649,7 @@ fn handle_close_session(
             && let Some(flags) = removed_flags
         {
             if flags.is_single_instance() && flags.is_keep_alive() {
-                debug_serial_println!(
+                log::warn!(
                     "CloseSession complete: session_id={}, TA kept alive (INSTANCE_KEEP_ALIVE flag)",
                     session_id
                 );
@@ -1653,12 +1664,12 @@ fn handle_close_session(
             }
             teardown_ta_page_table(platform, task_pt_id);
 
-            debug_serial_println!(
+            log::info!(
                 "CloseSession complete: deleted task_pt_id={} (last session)",
                 task_pt_id
             );
         } else {
-            debug_serial_println!(
+            log::info!(
                 "CloseSession complete: session_id={}, other sessions remaining on TA",
                 session_id
             );
@@ -1773,6 +1784,40 @@ fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim<Platform>) {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     litebox_platform_lvbs::on_panic(info.location());
-    serial_println!("{}", info);
+    if let Some(logger) = litebox_platform_lvbs::crash_log::try_crash_logger() {
+        let _ = logger.panic_dump(info);
+    } else {
+        serial_println!("{}", info);
+    }
     panic_to_vtl0()
+}
+
+#[cfg(feature = "lvbs-test")]
+mod lvbs_tests {
+    use crate::serial_println;
+    use litebox_common_linux::errno::Errno;
+    use num_enum::TryFromPrimitive;
+
+    const LVBS_TEST_PANIC: u64 = 1234;
+
+    #[derive(Debug, PartialEq, TryFromPrimitive)]
+    #[repr(u64)]
+    enum LvbsTest {
+        Noop = 0,
+        Panic = LVBS_TEST_PANIC,
+    }
+
+    pub fn run_lvbs_test(param_1: u64, _param_2: u64, _param_3: u64) -> i64 {
+        let Ok(test) = LvbsTest::try_from(param_1) else {
+            serial_println!("Unknown test");
+            return Errno::EINVAL.as_neg().into();
+        };
+        match test {
+            LvbsTest::Noop => 0,
+            LvbsTest::Panic => {
+                serial_println!("Run LVBS panic test");
+                panic!("Panicking...")
+            }
+        }
+    }
 }

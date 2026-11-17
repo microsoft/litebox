@@ -158,6 +158,11 @@ struct Vault {
 
 static VAULT: spin::Once<Vault> = spin::Once::new();
 
+/// Check if vault, and therefore PRK is installed.
+pub(crate) fn is_installed() -> bool {
+    VAULT.get().is_some()
+}
+
 /// Create the vault. `fill` reads the PRK into a zeroized boot buffer, which is
 /// copied into its reserved page through the vault mapping.
 ///
