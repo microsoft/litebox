@@ -13,7 +13,7 @@ use spin::rwlock::RwLock;
 use crate::event::EventObject;
 use crate::fs::File;
 use crate::pipe::PipeObject;
-use crate::process_handle::ProcessHandleObject;
+use crate::process::ProcessHandleObject;
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::readiness_queue::ReadinessQueueObject;
 use crate::shared_futex::FutexWaiterObject;

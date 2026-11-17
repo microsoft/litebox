@@ -666,13 +666,9 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::CopyHostNames(process_id) => process
             .copy_host_names(process_id)
             .map(|()| ProcessResponse::CopyHostNames),
-        ProcessRequest::OpenProcessHandle(request) => litebox_broker_core::process_handle::open(
-            process,
-            request.process_id,
-            request.flags,
-            readiness_sink,
-        )
-        .map(ProcessResponse::OpenProcessHandle),
+        ProcessRequest::OpenProcessHandle(request) => process
+            .open_process_handle(request.process_id, request.flags, readiness_sink)
+            .map(ProcessResponse::OpenProcessHandle),
     };
     response.map_err(RequestFailure::from)
 }

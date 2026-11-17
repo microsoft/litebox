@@ -12,14 +12,16 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::fs::FileService;
 use crate::job::Job;
-use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
+use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights, StatusFlags};
 use crate::pid_namespace::PidNamespace;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::signal::ProcessSignals;
 use crate::socket::SocketAccount;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
-use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
+use litebox_broker_protocol::fs::{
+    FileAccessMode, FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest,
+};
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
     ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
@@ -299,8 +301,7 @@ pub struct BrokerProcess {
     pub(crate) pid_namespaces: Arc<AtomicUsize>,
     /// Signals and child exits this process has not taken.
     pub(crate) signals: Arc<ProcessSignals>,
-    /// This process's exit as its handles see it (see
-    /// [`crate::process_handle`]).
+    /// This process's exit as its handles see it.
     pub(crate) exit: Arc<ExitReadiness>,
     /// Cancellation state of this process's association.
     pub(crate) cancellation: AssociationCancellation,
@@ -463,6 +464,54 @@ impl ExitReadiness {
         if readiness != state.readiness {
             state.readiness = readiness;
             state.watchers.publish_if_changed(readiness);
+        }
+    }
+}
+
+/// A handle to one process rather than to its ID, whose references share its
+/// status flags.
+///
+/// A handle never refers to a later process that reuses its process's ID, and
+/// it keeps neither the process, nor its IDs, nor its registration in its PID
+/// namespace from going away. Its readiness is its process's
+/// [`ExitReadiness`].
+pub(crate) struct ProcessHandleObject {
+    /// The process, held weakly so that only its allocation is kept, whose
+    /// address identifies it even once its ID is reused.
+    target: Weak<BrokerProcess>,
+    /// The process's exit, which the handle reads without upgrading `target`,
+    /// so that the process's last reference never drops under an object lock.
+    exit: Arc<ExitReadiness>,
+    status: StatusFlags,
+}
+
+impl ProcessHandleObject {
+    pub(crate) fn readiness(&self) -> ReadinessFlags {
+        self.exit.readiness()
+    }
+
+    /// Publishes the process's exit through `registration` until every clone
+    /// of `registration` drops.
+    pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
+        self.exit.watch(registration)
+    }
+
+    /// Returns the handle's access mode and status flags.
+    pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
+        self.status.get(FileAccessMode::ReadWrite)
+    }
+
+    /// Changes the status flags in `mask` to their values in `flags`.
+    pub(crate) fn set_status_flags(&mut self, mask: FileOpenFlags, flags: FileOpenFlags) {
+        self.status.set(mask, flags);
+    }
+}
+
+impl ObjectEntry {
+    fn as_process_handle(&self) -> Result<&ProcessHandleObject> {
+        match self {
+            Self::ProcessHandle(handle) => Ok(handle),
+            _ => Err(BrokerError::InvalidRights),
         }
     }
 }
@@ -1164,7 +1213,8 @@ impl BrokerProcess {
         // taken under it.
         let handle_target = match selector {
             ChildSelector::ProcessHandle(handle) => {
-                Some(crate::process_handle::target(self, handle)?)
+                let object = self.authorized_object(handle, ObjectRights::WAIT)?;
+                Some(Weak::clone(&object.read().as_process_handle()?.target))
             }
             _ => None,
         };
@@ -1340,6 +1390,72 @@ impl BrokerProcess {
         } else {
             self.with_pending_child(target, |child| f(&child.host_names))
         }
+    }
+
+    /// Opens a handle to the process `process_id` in this process's PID
+    /// namespace, which may be a child that hasn't started yet.
+    ///
+    /// The handle starts with the status flags `flags`, which must be within
+    /// [`FileOpenFlags::STATUS`] (or this returns `UnsupportedOperation`), and
+    /// its reference publishes readiness through `readiness_sink`. Returns
+    /// `UnknownObject` if no such process exists or it was released, and
+    /// `PolicyDenied` if this process may not wait on objects, since every use
+    /// of the handle needs that right.
+    pub fn open_process_handle(
+        &self,
+        process_id: ProcessId,
+        flags: FileOpenFlags,
+        readiness_sink: &Arc<dyn ReadinessSink>,
+    ) -> Result<ObjectHandle> {
+        let status = StatusFlags::new(flags)?;
+        let target = self.pid_namespace().registered_process(process_id)?;
+        let rights = self.require_object_rights(ObjectRights::WAIT)?;
+        let reference = self.reserve_object_reference(rights)?;
+        let registration =
+            ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
+        target.exit.watch(&registration)?;
+        reference.commit_with_readiness(
+            ObjectEntry::ProcessHandle(ProcessHandleObject {
+                target: Arc::downgrade(&target),
+                exit: Arc::clone(&target.exit),
+                status,
+            }),
+            Some(registration),
+        )
+    }
+
+    /// Returns the process that `handle`, a process handle of this process,
+    /// refers to, for sending it a signal.
+    ///
+    /// Returns `InvalidRights` if `handle` is of another kind, `PeerClosed` if
+    /// the process was released or torn down, and `UnknownObject` if this
+    /// process's PID namespace doesn't see it.
+    pub(crate) fn process_handle_signal_target(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Arc<BrokerProcess>> {
+        let object = self.authorized_object(handle, ObjectRights::WAIT)?;
+        let target = {
+            let object = object.read();
+            let process_handle = object.as_process_handle()?;
+            if process_handle
+                .exit
+                .readiness()
+                .contains(ReadinessFlags::CLOSED)
+            {
+                return Err(BrokerError::PeerClosed);
+            }
+            Weak::clone(&process_handle.target)
+        };
+        // The process's last reference must not drop under the object lock.
+        let target = target.upgrade().ok_or(BrokerError::PeerClosed)?;
+        if target
+            .process_id_in_namespace(self.pid_namespace())
+            .is_none()
+        {
+            return Err(BrokerError::UnknownObject);
+        }
+        Ok(target)
     }
 
     /// Returns the place in the process tree and the initial thread of the
@@ -3064,11 +3180,14 @@ mod tests {
         FileType, FileUser, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
-        ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, ProcessExitStatus,
-        ResourceKind, ResourceLimit, ThreadInfo,
+        ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
+        ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::signal::SignalEvent;
+    use litebox_broker_protocol::readiness_queue::{
+        ReadinessQueueEntryFlags, ReadinessQueueInterest, ReadyEvent,
+    };
+    use litebox_broker_protocol::signal::{PendingSignal, SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
     use std::{boxed::Box, sync::Arc, vec, vec::Vec};
 
@@ -6057,5 +6176,342 @@ mod tests {
             crate::event::create(&process, 0, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
+    }
+
+    const HANDLE_EXITED: ReadinessFlags = ReadinessFlags::READ;
+    const HANDLE_RELEASED: ReadinessFlags =
+        ReadinessFlags(ReadinessFlags::READ.0 | ReadinessFlags::CLOSED.0);
+
+    fn process_handle_broker() -> TestBroker {
+        TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap()
+    }
+
+    /// Creates and starts a root process.
+    fn started_root(broker: &TestBroker) -> Arc<BrokerProcess> {
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        root.complete_start().unwrap();
+        root
+    }
+
+    /// Opens a handle of `process` to `target`, returning it and the sink its
+    /// readiness goes to.
+    fn open_process_handle(
+        process: &BrokerProcess,
+        target: &BrokerProcess,
+    ) -> (
+        ObjectHandle,
+        Arc<crate::readiness::tests::TestReadinessSink>,
+    ) {
+        let sink = readiness_sink();
+        let target = target
+            .process_id_in_namespace(process.pid_namespace())
+            .unwrap();
+        let handle = process
+            .open_process_handle(
+                target,
+                FileOpenFlags::NONE,
+                &(sink.clone() as Arc<dyn ReadinessSink>),
+            )
+            .unwrap();
+        (handle, sink)
+    }
+
+    /// Returns the readiness published to `sink`, in order.
+    fn published(sink: &crate::readiness::tests::TestReadinessSink) -> Vec<ReadinessFlags> {
+        sink.published
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, readiness)| *readiness)
+            .collect()
+    }
+
+    #[test]
+    fn process_handles_become_readable_at_exit_and_closed_at_collection() {
+        let broker = process_handle_broker();
+        let root = started_root(&broker);
+        let child = child_of(&root);
+        let (handle, root_sink) = open_process_handle(&root, &child);
+        // A duplicate in another process and a readiness queue entry see the
+        // same changes.
+        let other = started_root(&broker);
+        let other_sink = readiness_sink();
+        let duplicate = root
+            .duplicate_object_reference_to(handle, &other, ObjectRights::WAIT)
+            .unwrap();
+        other
+            .register_readiness(&(other_sink.clone() as Arc<dyn ReadinessSink>))
+            .unwrap();
+        let queue =
+            crate::readiness_queue::create(&root, &(readiness_sink() as Arc<dyn ReadinessSink>))
+                .unwrap();
+        let interest = ReadinessQueueInterest {
+            readiness: ReadinessFlags::READ,
+            flags: ReadinessQueueEntryFlags::empty(),
+            token: 7,
+        };
+        crate::readiness_queue::add(&root, queue, handle, 0, interest)
+            .unwrap()
+            .unwrap();
+        // Every reference shares the status flags.
+        root.set_status_flags(SetStatusFlagsRequest {
+            handle,
+            mask: FileOpenFlags::NONBLOCKING,
+            flags: FileOpenFlags::NONBLOCKING,
+        })
+        .unwrap();
+        assert_eq!(
+            other.get_status_flags(duplicate),
+            Ok(FileStatusFlags {
+                access: FileAccessMode::ReadWrite,
+                flags: FileOpenFlags::NONBLOCKING,
+            })
+        );
+
+        assert_eq!(root.check_readiness(handle), Ok(ReadinessFlags::default()));
+        run_to_exit(&child, EXITED);
+        assert_eq!(other.check_readiness(duplicate), Ok(HANDLE_EXITED));
+        assert_eq!(
+            crate::readiness_queue::take_ready(&root, queue, 1),
+            Ok(alloc::vec![ReadyEvent {
+                token: 7,
+                readiness: HANDLE_EXITED,
+            }])
+        );
+        root.collect_child_exit(ChildSelector::Process(child.id()))
+            .unwrap();
+        assert_eq!(root.check_readiness(handle), Ok(HANDLE_RELEASED));
+        for sink in [&root_sink, &other_sink] {
+            assert_eq!(published(sink), [HANDLE_EXITED, HANDLE_RELEASED]);
+        }
+    }
+
+    #[test]
+    fn process_handles_close_when_their_process_goes_away_uncollected() {
+        let broker = process_handle_broker();
+        let root = started_root(&broker);
+        let observer = started_root(&broker);
+
+        // An exit the parent discards.
+        root.set_child_exit_retention(false).unwrap();
+        let discarded = child_of(&root);
+        let (_, discarded_sink) = open_process_handle(&observer, &discarded);
+        run_to_exit(&discarded, EXITED);
+        assert_eq!(published(&discarded_sink), [HANDLE_EXITED, HANDLE_RELEASED]);
+        root.set_child_exit_retention(true).unwrap();
+
+        // A pending child that its creator cancels.
+        let identity = root.allocate_child_process(None, false).unwrap();
+        let cancelled = root
+            .with_pending_child(identity.process_id, Arc::clone)
+            .unwrap();
+        let (_, cancelled_sink) = open_process_handle(&observer, &cancelled);
+        root.cancel_child_process(identity.process_id).unwrap();
+        assert_eq!(published(&cancelled_sink), [HANDLE_RELEASED]);
+
+        // A starting child whose creator dies.
+        let failed = child_of(&root);
+        let (_, failed_sink) = open_process_handle(&observer, &failed);
+        root.handle_owner_death();
+        assert_eq!(published(&failed_sink), [HANDLE_RELEASED]);
+
+        // A process torn down while still held.
+        let torn_down = started_root(&broker);
+        let (torn_down_handle, torn_down_sink) = open_process_handle(&observer, &torn_down);
+        torn_down.cleanup(true);
+        assert_eq!(published(&torn_down_sink), [HANDLE_RELEASED]);
+        assert_eq!(
+            crate::signal::send(&observer, SignalTarget::ProcessHandle(torn_down_handle), 0),
+            Err(BrokerError::PeerClosed)
+        );
+
+        // A process dropped without ever exiting.
+        let (_, root_sink) = open_process_handle(&observer, &root);
+        drop(root);
+        assert_eq!(published(&root_sink), [HANDLE_RELEASED]);
+    }
+
+    #[test]
+    fn a_process_handle_sees_a_withheld_exit_once_its_namespace_is_gone() {
+        let broker = process_handle_broker();
+        let root = started_root(&broker);
+        let identity = root
+            .allocate_child_process(Some(PidNamespaceOptions::new(true, false)), false)
+            .unwrap();
+        let first = root.take_child_process(identity.process_id).unwrap();
+        let other = child_of(&first);
+        other.complete_start().unwrap();
+        let (handle, sink) = open_process_handle(&root, &first);
+
+        run_to_exit(&first, EXITED);
+        assert_eq!(root.check_readiness(handle), Ok(ReadinessFlags::default()));
+        run_to_exit(&other, EXITED);
+        assert_eq!(published(&sink), [HANDLE_EXITED]);
+    }
+
+    #[test]
+    fn a_process_handle_keeps_neither_its_process_nor_its_id() {
+        let broker = process_handle_broker();
+        // With four IDs, the next child gets the first child's ID.
+        *broker.pid_namespace.id_allocator.lock() = crate::id::IdAllocator::new(4).unwrap();
+        let root = started_root(&broker);
+        let child = child_of(&root);
+        let child_id = child.id();
+        let (handle, _) = open_process_handle(&root, &child);
+        run_to_exit(&child, EXITED);
+        root.collect_child_exit(ChildSelector::Process(child_id))
+            .unwrap();
+        // The process is gone for its handles, even while still held.
+        assert_eq!(
+            crate::signal::send(&root, SignalTarget::ProcessHandle(handle), 0),
+            Err(BrokerError::PeerClosed)
+        );
+        drop(child);
+
+        assert!(!broker.pid_namespace.is_registered(child_id));
+        assert!(
+            !broker
+                .pid_namespace
+                .id_allocator
+                .lock()
+                .is_allocated(child_id.0)
+        );
+        // The handle never reaches the process that reuses the ID.
+        let reused = child_of(&root);
+        assert_eq!(reused.id(), child_id);
+        let signals = crate::signal::open(&reused, readiness_sink()).unwrap();
+        assert_eq!(
+            crate::signal::send(&root, SignalTarget::ProcessHandle(handle), 15),
+            Err(BrokerError::PeerClosed)
+        );
+        assert_eq!(
+            crate::signal::take(&reused, signals),
+            Err(BrokerError::WouldBlock)
+        );
+        run_to_exit(&reused, EXITED);
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::ProcessHandle(handle)),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::Process(child_id))
+                .map(|exit| exit.process_id),
+            Ok(child_id)
+        );
+    }
+
+    #[test]
+    fn a_process_handle_inherited_into_a_nested_namespace_cannot_signal_outside_it() {
+        let broker = process_handle_broker();
+        let root = started_root(&broker);
+        let target = child_of(&root);
+        let (handle, _) = open_process_handle(&root, &target);
+        let identity = root
+            .allocate_child_process(Some(PidNamespaceOptions::default()), false)
+            .unwrap();
+        let inherited = root
+            .duplicate_object_references_to_child(
+                identity.process_id,
+                &[handle],
+                &(readiness_sink() as Arc<dyn ReadinessSink>),
+            )
+            .unwrap()[0];
+        let nested = root.take_child_process(identity.process_id).unwrap();
+        let nested_sink = readiness_sink();
+        nested
+            .register_readiness(&(nested_sink.clone() as Arc<dyn ReadinessSink>))
+            .unwrap();
+
+        for signal in [0, 15] {
+            assert_eq!(
+                crate::signal::send(&nested, SignalTarget::ProcessHandle(inherited), signal),
+                Err(BrokerError::UnknownObject)
+            );
+        }
+        run_to_exit(&target, EXITED);
+        assert_eq!(published(&nested_sink), [HANDLE_EXITED]);
+    }
+
+    #[test]
+    fn a_process_handle_signals_its_process_and_selects_it_only_as_a_child() {
+        let broker = process_handle_broker();
+        let root = started_root(&broker);
+        let child = child_of(&root);
+        child.complete_start().unwrap();
+        let sibling = child_of(&root);
+        let grandchild = child_of(&child);
+        let (handle, _) = open_process_handle(&root, &child);
+        let (to_sibling, _) = open_process_handle(&child, &sibling);
+        let (to_itself, _) = open_process_handle(&child, &child);
+        let signals = crate::signal::open(&child, readiness_sink()).unwrap();
+
+        crate::signal::send(&root, SignalTarget::ProcessHandle(handle), 15).unwrap();
+        assert_eq!(
+            crate::signal::take(&child, signals),
+            Ok(SignalEvent::Signal(PendingSignal {
+                thread: None,
+                signal: 15,
+                sender: root.id(),
+            }))
+        );
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::ProcessHandle(handle)),
+            Err(BrokerError::WouldBlock)
+        );
+        // Neither a sibling nor the caller is a child, even with an exited
+        // child of the caller to collect.
+        run_to_exit(&sibling, EXITED);
+        run_to_exit(&grandchild, EXITED);
+        for selected in [to_sibling, to_itself] {
+            assert_eq!(
+                child.collect_child_exit(ChildSelector::ProcessHandle(selected)),
+                Err(BrokerError::UnknownObject)
+            );
+        }
+        run_to_exit(&child, EXITED);
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::ProcessHandle(handle))
+                .map(|exit| exit.process_id),
+            Ok(child.id())
+        );
+
+        // A handle of another kind is neither.
+        let event = crate::event::create(&root, 0, FileOpenFlags::NONE).unwrap();
+        assert_eq!(
+            crate::signal::send(&root, SignalTarget::ProcessHandle(event), 0),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(
+            root.collect_child_exit(ChildSelector::ProcessHandle(event)),
+            Err(BrokerError::InvalidRights)
+        );
+    }
+
+    #[test]
+    fn opening_a_process_handle_requires_the_wait_right() {
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::WRITE,
+        ))
+        .build()
+        .unwrap();
+        let root = started_root(&broker);
+        let sink = readiness_sink();
+
+        assert_eq!(
+            root.open_process_handle(
+                root.id(),
+                FileOpenFlags::NONE,
+                &(sink.clone() as Arc<dyn ReadinessSink>),
+            ),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert!(sink.retired.lock().unwrap().is_empty());
     }
 }

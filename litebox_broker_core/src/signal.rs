@@ -64,9 +64,7 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
     }
     let targets = match target {
         SignalTarget::Process(id) => vec![process.pid_namespace().registered_process(id)?],
-        SignalTarget::ProcessHandle(handle) => {
-            vec![crate::process_handle::signal_target(process, handle)?]
-        }
+        SignalTarget::ProcessHandle(handle) => vec![process.process_handle_signal_target(handle)?],
         SignalTarget::Thread {
             process: id,
             thread,

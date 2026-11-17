@@ -30,7 +30,6 @@ pub mod pipe;
 mod policy;
 mod process;
 pub mod process_group;
-pub mod process_handle;
 mod pseudo_terminal;
 mod quota;
 pub mod random;

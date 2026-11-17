@@ -483,19 +483,17 @@ pub enum ProcessRequest {
     /// Open a handle to a process in the caller's PID namespace, including a
     /// pending child.
     ///
-    /// A process handle refers to the process itself rather than to its ID:
-    /// it never refers to a later process with the same ID, and it keeps
-    /// neither the process nor its ID from going away. It becomes readable
-    /// once the process's exit becomes observable, and also closed once the
-    /// process is released: its exit was collected or discarded, or it never
-    /// started. The exit of a namespace's first process that ends its
-    /// namespace becomes observable only once the rest of the namespace is
-    /// gone (see [`PidNamespaceOptions::ends_with_first_process`]).
+    /// The handle refers to the process itself rather than to its ID: it never
+    /// refers to a later process with the same ID, and it keeps neither the
+    /// process nor its ID from going away. It reports `READ` once the
+    /// process's exit becomes observable, and `READ` and `CLOSED` once the
+    /// process is released (its exit was collected or discarded, or it never
+    /// started) or otherwise leaves the broker.
     ///
-    /// References to a process handle can be duplicated, and the caller can
-    /// use one as a
-    /// [`SignalTarget::ProcessHandle`](crate::signal::SignalTarget::ProcessHandle)
-    /// and a [`ChildSelector::ProcessHandle`].
+    /// The caller can signal the process through the handle
+    /// ([`SignalTarget::ProcessHandle`](crate::signal::SignalTarget::ProcessHandle))
+    /// and, if the process is its child, collect its exit through it
+    /// ([`ChildSelector::ProcessHandle`]).
     ///
     /// The broker returns `UnknownObject` if no such process exists or it was
     /// released, and `UnsupportedOperation` if the flags are outside

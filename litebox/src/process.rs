@@ -620,12 +620,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Signals<
 
 /// A reference to one process, rather than to its ID.
 ///
-/// It never refers to a later process that reuses its process's ID, and it
-/// keeps neither the process nor its ID from going away. It reports
+/// It never refers to a later process that reuses the ID, and it keeps
+/// neither the process nor its ID from going away. It reports
 /// [`Events::IN`] once the process's exit is observable, and also
 /// [`Events::HUP`] once the process is released: its exit was collected or
-/// discarded, or it never started. The broker owns its status flags, which
-/// every reference to it, in any process, shares.
+/// discarded, or it never started.
+///
+/// Each [`LiteBox::open_process`] call opens a separate broker object with its
+/// own status flags, which copies inherited through [`PendingChild::inherit`]
+/// share.
 pub struct Process<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
