@@ -51,6 +51,8 @@ jobs:
         run: |
           sudo apt install -y binutils-aarch64-linux-gnu
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_qemu --exclude litebox_runner_optee_on_vm_userland --exclude litebox_runner_linux_on_vm_userland --exclude litebox_runner_vm_kernel --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_linux_on_macos_userland
@@ -159,6 +161,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
       - name: Enable KVM
         # GitHub-hosted x64 Linux runners support KVM, but the runner user
         # cannot open /dev/kvm by default.
@@ -177,9 +181,9 @@ jobs:
           sudo udevadm trigger --name-match=vhost-vsock
           sudo udevadm settle
           test -r /dev/vhost-vsock -a -w /dev/vhost-vsock
-      - name: Cache vhost-device-vsock
+      - name: Restore vhost-device-vsock
         id: vhost-device-vsock
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/vhost-device-vsock
           key: vhost-device-vsock-${{ env.VHOST_DEVICE_VSOCK_VERSION }}-${{ runner.os }}-${{ runner.arch }}
@@ -243,6 +247,12 @@ jobs:
         run: |
           QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
+      - name: Save vhost-device-vsock
+        if: github.event_name != 'merge_group' && steps.vhost-device-vsock.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/vhost-device-vsock
+          key: ${{ steps.vhost-device-vsock.outputs.cache-primary-key }}
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
@@ -298,8 +308,11 @@ jobs:
         run: |
           sudo apt install -y diod
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Cache custom out directories
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+      - name: Restore custom out directories
+        id: custom-out-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
@@ -357,6 +370,13 @@ jobs:
         run: |
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items $AARCH64_CRATES --features $AARCH64_COMMON_FEATURES,litebox_broker_userland/aarch64_virtualize_x18
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items $AARCH64_CRATES --features $AARCH64_COMMON_FEATURES,litebox_broker_userland/aarch64_pacga
+      - name: Save custom out directories
+        if: github.event_name != 'merge_group' && steps.custom-out-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/*/build/litebox_runner_linux_userland-*/out
+          key: ${{ steps.custom-out-cache.outputs.cache-primary-key }}
 
   build_and_test_macos_arm64:
     name: Build and Test (macOS AArch64)
@@ -388,6 +408,8 @@ jobs:
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $MACOS_AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo build $MACOS_AARCH64_CRATES
@@ -437,8 +459,11 @@ jobs:
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Cache custom out directories
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+      - name: Restore custom out directories
+        id: custom-out-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
@@ -459,6 +484,13 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
+      - name: Save custom out directories
+        if: github.event_name != 'merge_group' && steps.custom-out-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/*/build/litebox_runner_linux_userland-*/out
+          key: ${{ steps.custom-out-cache.outputs.cache-primary-key }}
 
   build_and_test_windows:
     name: Build and Test Windows
@@ -506,17 +538,19 @@ jobs:
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
       - run: cargo clippy --locked --verbose --all-targets --all-features ($env:WINDOWS_CRATES -split ' ')
       - run: cargo build --locked --verbose ($env:WINDOWS_CRATES -split ' ')
-      - name: Cache packaged Linux Python
+      - name: Restore packaged Linux Python
         id: linux-python-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/tmp/windows_python_rewriter/rootfs.tar
           key: linux-python-rootfs-${{ runner.os }}-${{ runner.arch }}-x86-64-windows-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'litebox_packager/**', 'litebox_syscall_rewriter/**', 'litebox_trampoline/**', 'litebox_runner_linux_on_windows_userland/tests/run.rs') }}
-      - name: Cache packaged Linux Node.js
+      - name: Restore packaged Linux Node.js
         id: linux-node-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/tmp/windows_node_rewriter/rootfs.tar
           key: linux-node-rootfs-${{ runner.os }}-${{ runner.arch }}-x86-64-windows-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'litebox_packager/**', 'litebox_syscall_rewriter/**', 'litebox_trampoline/**', 'litebox_runner_linux_on_windows_userland/tests/run.rs') }}
@@ -531,6 +565,18 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items ($env:WINDOWS_CRATES -split ' ')
+      - name: Save packaged Linux Python
+        if: github.event_name != 'merge_group' && steps.linux-python-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tmp/windows_python_rewriter/rootfs.tar
+          key: ${{ steps.linux-python-cache.outputs.cache-primary-key }}
+      - name: Save packaged Linux Node.js
+        if: github.event_name != 'merge_group' && steps.linux-node-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/tmp/windows_node_rewriter/rootfs.tar
+          key: ${{ steps.linux-node-cache.outputs.cache-primary-key }}
 
   build_and_test_snp:
     name: Build and Test SNP
@@ -549,6 +595,8 @@ jobs:
           rustup override set ${RUST_CHANNEL}
           rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
       - run: ./.github/tools/github_actions_run_cargo clippy -Zjson-target-spec --all-features --target litebox_runner_snp/target.json --manifest-path=litebox_runner_snp/Cargo.toml -Zbuild-std=core,compiler_builtins,alloc
       - run: |
           ./.github/tools/github_actions_run_cargo build -Zjson-target-spec -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
@@ -565,6 +613,8 @@ jobs:
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-none
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
       - name: Confirm that we haven't accidentally pulled in std into LiteBox
         run: |
           # Essentially, we run a build on a target that simply does NOT have
