@@ -1237,7 +1237,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `pidfd_send_signal`.
     ///
-    /// Like Linux, this sends `signal` as `kill` does. Caller-supplied `info` is unsupported.
+    /// Like Linux, this sends `signal` as `kill` does, so its target sees an `SI_USER` signal from
+    /// this process. A broker signal carries only its number, so caller-supplied `info`, which
+    /// would set its `siginfo` as `rt_sigqueueinfo` does, is unsupported and fails with `ENOSYS`.
+    /// `PIDFD_SIGNAL_*` flags, which Linux 6.9+ accepts, fail with `EINVAL` as on earlier kernels.
     pub(crate) fn sys_pidfd_send_signal(
         &self,
         pidfd: i32,
