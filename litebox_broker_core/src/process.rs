@@ -301,7 +301,7 @@ pub struct BrokerProcess {
     pub(crate) pid_namespaces: Arc<AtomicUsize>,
     /// Signals and child exits this process has not taken.
     pub(crate) signals: Arc<ProcessSignals>,
-    /// This process's exit as its handles see it.
+    /// This process's exit as handles to it see it.
     pub(crate) exit: Arc<ExitReadiness>,
     /// Cancellation state of this process's association.
     pub(crate) cancellation: AssociationCancellation,
@@ -425,7 +425,7 @@ impl ProcessTreeNode {
 ///
 /// It becomes readable once the process's exit is observable, when its exit
 /// status is set, and readable and closed once the process is released or
-/// gone. It never changes back. Changes are published without holding a
+/// torn down. It never changes back. Changes are published without holding a
 /// process tree node lock, under which no other lock is taken.
 #[derive(Default)]
 pub(crate) struct ExitReadiness(Mutex<ExitReadinessState>);
@@ -453,7 +453,7 @@ impl ExitReadiness {
         self.add(ReadinessFlags::READ);
     }
 
-    /// Records that the process was released or is gone.
+    /// Records that the process was released or torn down.
     fn set_released(&self) {
         self.add(ReadinessFlags::READ | ReadinessFlags::CLOSED);
     }
@@ -475,7 +475,7 @@ impl ExitReadiness {
 /// it keeps neither the process, nor its IDs, nor its registration in its PID
 /// namespace from going away. Its readiness is its process's
 /// [`ExitReadiness`].
-pub(crate) struct ProcessHandleObject {
+pub(crate) struct ProcessObject {
     /// The process, held weakly so that only its allocation is kept, whose
     /// address identifies it even once its ID is reused.
     target: Weak<BrokerProcess>,
@@ -485,7 +485,7 @@ pub(crate) struct ProcessHandleObject {
     status: StatusFlags,
 }
 
-impl ProcessHandleObject {
+impl ProcessObject {
     pub(crate) fn readiness(&self) -> ReadinessFlags {
         self.exit.readiness()
     }
@@ -508,9 +508,9 @@ impl ProcessHandleObject {
 }
 
 impl ObjectEntry {
-    fn as_process_handle(&self) -> Result<&ProcessHandleObject> {
+    fn as_process(&self) -> Result<&ProcessObject> {
         match self {
-            Self::ProcessHandle(handle) => Ok(handle),
+            Self::Process(process) => Ok(process),
             _ => Err(BrokerError::InvalidRights),
         }
     }
@@ -1203,18 +1203,17 @@ impl BrokerProcess {
     /// Collects the exit of this running process's oldest exited child that
     /// `selector` matches, removing the child from the process tree.
     ///
-    /// Returns `WouldBlock` if only live children match, and `UnknownObject`
-    /// if none does. Each matching child's exit or removal is then posted to
-    /// this process's signals. A selector naming a process handle of this
-    /// process matches only the process it refers to, and fails with
-    /// `InvalidRights` if the handle is of another kind.
+    /// Returns `WouldBlock` if only live children match, `UnknownObject` if
+    /// none does, and `InvalidRights` if `selector` names a handle that isn't a
+    /// process handle. Each matching child's exit or removal is then posted to
+    /// this process's signals.
     pub fn collect_child_exit(&self, selector: ChildSelector) -> Result<ChildExit> {
         // Resolve the handle before taking the tree lock, so no object lock is
         // taken under it.
         let handle_target = match selector {
             ChildSelector::ProcessHandle(handle) => {
                 let object = self.authorized_object(handle, ObjectRights::WAIT)?;
-                Some(Weak::clone(&object.read().as_process_handle()?.target))
+                Some(Weak::clone(&object.read().as_process()?.target))
             }
             _ => None,
         };
@@ -1415,7 +1414,7 @@ impl BrokerProcess {
             ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
         target.exit.watch(&registration)?;
         reference.commit_with_readiness(
-            ObjectEntry::ProcessHandle(ProcessHandleObject {
+            ObjectEntry::Process(ProcessObject {
                 target: Arc::downgrade(&target),
                 exit: Arc::clone(&target.exit),
                 status,
@@ -1437,7 +1436,7 @@ impl BrokerProcess {
         let object = self.authorized_object(handle, ObjectRights::WAIT)?;
         let target = {
             let object = object.read();
-            let process_handle = object.as_process_handle()?;
+            let process_handle = object.as_process()?;
             if process_handle
                 .exit
                 .readiness()
@@ -2883,7 +2882,7 @@ impl BrokerProcess {
     }
 
     /// Cleans up this process, optionally releasing its numeric IDs for reuse.
-    /// Its handles then become readable and closed.
+    /// Handles to it then become readable and closed.
     ///
     /// Set `release_ids` only after fully accounted teardown. Final process
     /// drop otherwise retains IDs after an unwind or uncertain retirement.

@@ -56,8 +56,8 @@ pub fn open(
 ///
 /// A signal already pending for a target is not sent again. Returns
 /// `UnknownObject` if no process or thread is targeted. For a process handle,
-/// returns `PeerClosed` if its process was released, and `UnknownObject` if
-/// the caller's PID namespace doesn't see it.
+/// returns `PeerClosed` if its process was released or torn down, and
+/// `UnknownObject` if the caller's PID namespace doesn't see it.
 pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Result<()> {
     if signal > MAX_SIGNAL {
         return Err(BrokerError::UnsupportedOperation);

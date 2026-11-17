@@ -623,8 +623,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Signals<
 /// It never refers to a later process that reuses the ID, and it keeps
 /// neither the process nor its ID from going away. It reports
 /// [`Events::IN`] once the process's exit is observable, and also
-/// [`Events::HUP`] once the process is released: its exit was collected or
-/// discarded, or it never started.
+/// [`Events::HUP`] once the process is released (its exit was collected or
+/// discarded, or it never started) or otherwise leaves the broker.
 ///
 /// Each [`LiteBox::open_process`] call opens a separate broker object with its
 /// own status flags, which copies inherited through [`PendingChild::inherit`]
@@ -653,7 +653,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
         }
     }
 
-    /// The broker handle this process owns.
+    /// The broker handle this `Process` owns.
     pub(crate) fn handle(&self) -> ObjectHandle {
         self.handle
     }
@@ -662,8 +662,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
     /// `signal` is zero.
     ///
     /// The process takes the signal through [`Signals`]. Returns
-    /// [`ProcessError::NoSuchProcess`] if the process was released or this
-    /// process's PID namespace doesn't see it.
+    /// [`ProcessError::NoSuchProcess`] if the process was released or left the
+    /// broker, or the caller's PID namespace doesn't see it.
     pub fn send_signal(&self, signal: u32) -> Result<(), ProcessError> {
         match self
             .broker
@@ -677,10 +677,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
     }
 
     /// Collects the process's exit, removing it from the process tree, if it
-    /// is a terminated child of this process.
+    /// is a terminated child of the caller.
     ///
     /// Returns `None` if the child is live, and [`ProcessError::NoSuchProcess`]
-    /// if the process isn't this process's child, such as once its exit was
+    /// if the process isn't the caller's child, such as once its exit was
     /// collected.
     pub fn collect_exit(&self) -> Result<Option<ChildExit>, ProcessError> {
         match self
@@ -693,7 +693,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
         }
     }
 
-    /// Returns the reference's access mode and status flags.
+    /// Returns the access mode and status flags.
     pub fn get_status_flags(&self) -> Result<FileStatusFlags, StatusFlagsError> {
         Ok(self.broker.get_status_flags(self.handle)?)
     }
