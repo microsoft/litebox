@@ -4767,6 +4767,156 @@ mod tests {
         });
     }
 
+    /// Accumulates the events an observer is notified of.
+    struct RecordedEvents(StdMutex<litebox::event::Events>);
+
+    impl RecordedEvents {
+        fn new() -> Self {
+            Self(StdMutex::new(litebox::event::Events::empty()))
+        }
+
+        fn take(&self) -> litebox::event::Events {
+            core::mem::replace(
+                &mut *self.0.lock().unwrap(),
+                litebox::event::Events::empty(),
+            )
+        }
+    }
+
+    impl litebox::event::observer::Observer<litebox::event::Events> for RecordedEvents {
+        fn on_events(&self, events: &litebox::event::Events) {
+            *self.0.lock().unwrap() |= *events;
+        }
+    }
+
+    #[test]
+    fn open_process_follows_a_child_through_exit_and_collection() {
+        use alloc::sync::Arc;
+        use litebox::event::{Events, IOPollable as _};
+        use litebox::process::ProcessError;
+        use litebox_broker_protocol::fs::FileOpenFlags;
+        use litebox_broker_protocol::process::ProcessExitStatus;
+
+        let platform = crate::syscalls::tests::test_platform();
+        let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
+        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child_id = child.identity().process_id;
+        let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
+        let observer = Arc::new(RecordedEvents::new());
+        process.register_observer(Arc::downgrade(&observer) as _, Events::IN | Events::HUP);
+        assert_eq!(process.check_io_events(), Events::empty());
+        assert_eq!(process.collect_exit(), Ok(None));
+
+        child.exit(ProcessExitStatus::Exited { code: 7 }).unwrap();
+        assert_eq!(observer.take(), Events::IN);
+        assert_eq!(process.check_io_events(), Events::IN);
+        // Like a Linux zombie, the process exists until its exit is collected.
+        assert_eq!(process.send_signal(0), Ok(()));
+
+        let exit = process.collect_exit().unwrap().unwrap();
+        assert_eq!(
+            (exit.process_id, exit.exit_status),
+            (child_id, ProcessExitStatus::Exited { code: 7 })
+        );
+        assert_eq!(observer.take(), Events::IN | Events::HUP);
+        assert_eq!(process.check_io_events(), Events::IN | Events::HUP);
+        assert_eq!(process.send_signal(0), Err(ProcessError::NoSuchProcess));
+        assert_eq!(process.collect_exit(), Err(ProcessError::NoSuchProcess));
+        assert!(matches!(
+            litebox.open_process(child_id, FileOpenFlags::NONE),
+            Err(ProcessError::NoSuchProcess)
+        ));
+    }
+
+    #[test]
+    fn open_process_signals_any_process_but_collects_only_a_child() {
+        use litebox::process::ProcessError;
+        use litebox_broker_protocol::ProcessId;
+        use litebox_broker_protocol::fs::FileOpenFlags;
+        use litebox_broker_protocol::signal::{PendingSignal, SignalEvent};
+
+        let platform = crate::syscalls::tests::test_platform();
+        let (litebox, process_id) = crate::syscalls::test_broker::litebox(platform);
+        let process_id = ProcessId(u32::try_from(process_id).unwrap());
+        let signals = litebox.open_signals().unwrap();
+        let process = litebox
+            .open_process(process_id, FileOpenFlags::NONE)
+            .unwrap();
+
+        process.send_signal(10).unwrap();
+        assert_eq!(
+            signals.take(),
+            Ok(Some(SignalEvent::Signal(PendingSignal {
+                thread: None,
+                signal: 10,
+                sender: process_id,
+            })))
+        );
+        assert_eq!(process.collect_exit(), Err(ProcessError::NoSuchProcess));
+    }
+
+    #[test]
+    fn readiness_queue_follows_an_open_process_collected_by_id() {
+        use litebox::event::readiness_queue::{
+            ReadinessInterest, ReadinessQueue, ReadinessTarget, ReadyEntry,
+        };
+        use litebox::event::{Events, wait::WaitState};
+        use litebox_broker_protocol::fs::FileOpenFlags;
+        use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus};
+        use litebox_broker_protocol::readiness_queue::ReadinessQueueEntryFlags;
+
+        let platform = crate::syscalls::tests::test_platform();
+        let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
+        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child_id = child.identity().process_id;
+        let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
+        let queue = ReadinessQueue::new(&litebox).unwrap();
+        let interest = ReadinessInterest {
+            events: Events::IN | Events::HUP,
+            flags: ReadinessQueueEntryFlags::empty(),
+            token: 1,
+        };
+        queue
+            .add(&ReadinessTarget::Process(&process), 0, interest)
+            .unwrap();
+        let wait = |events| {
+            let state = WaitState::new(platform);
+            let cx = state.context().with_timeout(Duration::from_secs(10));
+            assert_eq!(
+                queue.wait(&cx, 1).unwrap(),
+                [ReadyEntry { token: 1, events }]
+            );
+        };
+
+        child.exit(ProcessExitStatus::Exited { code: 0 }).unwrap();
+        wait(Events::IN);
+        assert!(
+            litebox
+                .collect_child_exit(ChildSelector::Process(child_id))
+                .unwrap()
+                .is_some()
+        );
+        wait(Events::IN | Events::HUP);
+    }
+
+    #[test]
+    fn dropping_an_open_process_releases_its_broker_reference() {
+        use litebox_broker_protocol::ProcessId;
+        use litebox_broker_protocol::fs::FileOpenFlags;
+
+        let platform = crate::syscalls::tests::test_platform();
+        let (litebox, process_id) = crate::syscalls::test_broker::litebox(platform);
+        let process_id = ProcessId(u32::try_from(process_id).unwrap());
+        // Without the release, these would exhaust the broker's references.
+        for _ in 0..=crate::syscalls::test_broker::MAX_TEST_BROKER_REFERENCES {
+            drop(
+                litebox
+                    .open_process(process_id, FileOpenFlags::NONE)
+                    .unwrap(),
+            );
+        }
+    }
+
     #[test]
     fn thread_stays_counted_until_its_broker_state_is_released() {
         use litebox_broker_protocol::ObjectHandle;

@@ -4,6 +4,7 @@
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessRequest, ProcessResponse,
 };
@@ -12,10 +13,10 @@ use litebox_broker_protocol::process::{
     ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostName, HostNameKind,
     HostNameSizes, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
     MAX_HOST_NAME_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
-    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    ResourceKind, ResourceLimit, SetHostNameRequest, SetResourceLimitRequest,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-    WriteChildMemoryRequest,
+    OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
+    ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
+    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    ThreadInfo, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
@@ -492,6 +493,27 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn copy_host_names(&self, process_id: ProcessId) -> Result<(), Channel::Error> {
         match self.request_process(ProcessRequest::CopyHostNames(process_id))? {
             ProcessResponse::CopyHostNames => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Opens a handle to the process `process_id` with the status flags
+    /// `flags`, which must be within [`FileOpenFlags::STATUS`].
+    ///
+    /// Returns `UnknownObject` if no such process exists or it was released.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn open_process_handle(
+        &self,
+        process_id: ProcessId,
+        flags: FileOpenFlags,
+    ) -> Result<ObjectHandle, Channel::Error> {
+        match self.request_process(ProcessRequest::OpenProcessHandle(
+            OpenProcessHandleRequest { process_id, flags },
+        ))? {
+            ProcessResponse::OpenProcessHandle(handle) => Ok(handle),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

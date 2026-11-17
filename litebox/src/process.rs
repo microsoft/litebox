@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
@@ -30,6 +31,7 @@ use crate::event::{
     readiness_queue::ReadinessQueue, timer::Timer,
 };
 use crate::fs::File;
+use crate::fs::errors::StatusFlagsError;
 use crate::inet_socket::InetSocket;
 use crate::pipes::PipeEnd;
 use crate::sync::RawSyncPrimitivesProvider;
@@ -151,7 +153,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Returns `None` if every matching child is live, and
     /// [`ProcessError::NoSuchProcess`] if no child matches. Each child that
     /// terminates, or leaves without terminating, such as a child whose
-    /// startup failed, is also reported through [`Signals`].
+    /// startup failed, is also reported through [`Signals`]. An opened child's
+    /// exit is collected with [`Process::collect_exit`].
     pub fn collect_child_exit(
         &self,
         selector: ChildSelector,
@@ -250,10 +253,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     ///
     /// Each target process takes the signal through [`Signals`]. A signal
     /// already pending for a target is not sent again. Returns
-    /// [`ProcessError::NoSuchProcess`] if no process or thread is targeted.
+    /// [`ProcessError::NoSuchProcess`] if no process or thread is targeted. An
+    /// opened process is signalled with [`Process::send_signal`].
     pub fn send_signal(&self, target: SignalTarget, signal: u32) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        broker.send_signal(target, signal).map_err(no_such_process)
+        broker.send_signal(target, signal).map_err(signal_error)
     }
 
     /// Moves process `process_id`, which is this process or one of its
@@ -351,6 +355,36 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         let handle = broker.open_signals()?;
         Ok(Signals::new(self, broker, handle))
     }
+
+    /// Opens process `process_id`, which may be a pending child, with the
+    /// status flags `flags`, within [`FileOpenFlags::STATUS`].
+    ///
+    /// Returns [`ProcessError::NoSuchProcess`] if no such process exists or
+    /// it was released.
+    pub fn open_process(
+        &self,
+        process_id: ProcessId,
+        flags: FileOpenFlags,
+    ) -> Result<Process<Platform>, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        let handle = broker
+            .open_process_handle(process_id, flags)
+            .map_err(no_such_process)?;
+        Ok(Process::new(self, broker, handle))
+    }
+
+    /// Returns the process this process inherited from its parent as `handle`
+    /// through [`PendingChild::inherit`].
+    ///
+    /// The [`Process`] owns `handle`, so callers adopt each handle once and
+    /// share the [`Process`] for every other use.
+    pub fn adopt_inherited_process(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Process<Platform>, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(Process::new(self, broker, handle))
+    }
 }
 
 /// A descriptor a pending child process can inherit through [`PendingChild::inherit`].
@@ -374,6 +408,8 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Timer(Arc<Timer<Platform>>),
     /// A readiness queue, adopted with [`LiteBox::adopt_inherited_readiness_queue`].
     ReadinessQueue(Arc<ReadinessQueue<Platform>>),
+    /// A process, adopted with [`LiteBox::adopt_inherited_process`].
+    Process(Arc<Process<Platform>>),
 }
 
 /// A child process that has not started.
@@ -462,6 +498,7 @@ impl PendingChild {
                 InheritableFd::EventCounter(counter) => counter.handle(),
                 InheritableFd::Timer(timer) => timer.handle(),
                 InheritableFd::ReadinessQueue(queue) => queue.handle(),
+                InheritableFd::Process(process) => process.handle(),
             };
             fd_handles.push(handle);
         }
@@ -581,11 +618,127 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Signals<
     }
 }
 
+/// A reference to one process, rather than to its ID.
+///
+/// It never refers to a later process that reuses the ID, and it keeps
+/// neither the process nor its ID from going away. It reports
+/// [`Events::IN`] once the process's exit is observable, and also
+/// [`Events::HUP`] once the process is released (its exit was collected or
+/// discarded, or it never started) or otherwise leaves the broker.
+///
+/// Each [`LiteBox::open_process`] call opens a separate broker object with its
+/// own status flags, which copies inherited through [`PendingChild::inherit`]
+/// share.
+pub struct Process<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    broker: Arc<dyn BrokerControl>,
+    handle: ObjectHandle,
+    pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
+    pollee: Arc<Pollee<Platform>>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
+    fn new(
+        litebox: &LiteBox<Platform>,
+        broker: Arc<dyn BrokerControl>,
+        handle: ObjectHandle,
+    ) -> Self {
+        let pollable_registry = litebox.broker_pollable_registry();
+        let pollee = Arc::new(Pollee::new());
+        pollable_registry.register_pollable(handle, &pollee);
+        Self {
+            broker,
+            handle,
+            pollable_registry,
+            pollee,
+        }
+    }
+
+    /// The broker handle this `Process` owns.
+    pub(crate) fn handle(&self) -> ObjectHandle {
+        self.handle
+    }
+
+    /// Sends `signal` to the process, or only checks that it exists if
+    /// `signal` is zero.
+    ///
+    /// The process takes the signal through [`Signals`]. Returns
+    /// [`ProcessError::NoSuchProcess`] if the process was released or left the
+    /// broker, or the caller's PID namespace doesn't see it.
+    pub fn send_signal(&self, signal: u32) -> Result<(), ProcessError> {
+        self.broker
+            .send_signal(SignalTarget::ProcessHandle(self.handle), signal)
+            .map_err(signal_error)
+    }
+
+    /// Collects the process's exit, removing it from the process tree, if it
+    /// is a terminated child of the caller.
+    ///
+    /// Returns `None` if the child is live, and [`ProcessError::NoSuchProcess`]
+    /// if the process isn't the caller's child, such as once its exit was
+    /// collected.
+    pub fn collect_exit(&self) -> Result<Option<ChildExit>, ProcessError> {
+        match self
+            .broker
+            .collect_child_exit(ChildSelector::ProcessHandle(self.handle))
+        {
+            Ok(exit) => Ok(Some(exit)),
+            Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Ok(None),
+            Err(error) => Err(no_such_process(error)),
+        }
+    }
+
+    /// Returns the access mode and status flags.
+    pub fn get_status_flags(&self) -> Result<FileStatusFlags, StatusFlagsError> {
+        Ok(self.broker.get_status_flags(self.handle)?)
+    }
+
+    /// Changes the status flags in `mask`, within [`FileOpenFlags::STATUS`],
+    /// to their values in `flags`.
+    ///
+    /// Every reference that shares this one's broker object, including those
+    /// in other processes, sees the change.
+    pub fn set_status_flags(
+        &self,
+        mask: FileOpenFlags,
+        flags: FileOpenFlags,
+    ) -> Result<(), StatusFlagsError> {
+        Ok(self.broker.set_status_flags(self.handle, mask, flags)?)
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for Process<Platform> {
+    fn drop(&mut self) {
+        self.pollable_registry.unregister_pollable(self.handle);
+        let _ = self.broker.close_object(self.handle);
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Process<Platform> {
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
+        self.pollee.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        self.broker
+            .check_readiness(self.handle)
+            .map_or(Events::ERR, readiness_events)
+    }
+}
+
 /// Converts an error from a request that targets processes by ID.
 fn no_such_process(error: BrokerControlError) -> ProcessError {
     match error {
         BrokerControlError::Broker(ErrorCode::UnknownObject) => ProcessError::NoSuchProcess,
         error => error.into(),
+    }
+}
+
+/// Converts an error from a signal request, whose process handle target
+/// fails with `PeerClosed` once its process is gone.
+fn signal_error(error: BrokerControlError) -> ProcessError {
+    match error {
+        BrokerControlError::Broker(ErrorCode::PeerClosed) => ProcessError::NoSuchProcess,
+        error => no_such_process(error),
     }
 }
 
@@ -627,9 +780,10 @@ mod tests {
     use litebox_broker_local::test_support::test_broker_local;
     use litebox_broker_protocol::message::{
         BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, ProcessRequest,
-        ProcessResponse,
+        ProcessResponse, SignalRequest,
     };
     use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
+    use litebox_broker_protocol::signal::SendSignalRequest;
     use litebox_broker_protocol::{ProcessId, ThreadId};
     use litebox_broker_transport::channel::LocalCallChannel;
     use litebox_broker_transport::shared_memory::HeapSharedMemory;
@@ -692,5 +846,50 @@ mod tests {
 
     fn test_shared_memory() -> Arc<HeapSharedMemory> {
         Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE))
+    }
+
+    #[test]
+    fn signalling_a_gone_process_by_handle_finds_no_such_process() {
+        let litebox = LiteBox::new_with_broker_local(
+            MockPlatform::new(),
+            test_broker_local(GoneProcessChannel, test_shared_memory()),
+        );
+        let process = litebox
+            .open_process(ProcessId(3), FileOpenFlags::NONE)
+            .unwrap();
+
+        assert_eq!(process.send_signal(0), Err(ProcessError::NoSuchProcess));
+        assert_eq!(
+            litebox.send_signal(SignalTarget::ProcessHandle(process.handle()), 0),
+            Err(ProcessError::NoSuchProcess)
+        );
+    }
+
+    /// Opens handles to a process that is gone by the time it is signalled.
+    struct GoneProcessChannel;
+
+    impl LocalCallChannel for GoneProcessChannel {
+        type Error = ();
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            let handle = ObjectHandle(5);
+            let result = match request.operation {
+                BrokerOperation::Process(ProcessRequest::OpenProcessHandle(_)) => {
+                    BrokerResult::Process(ProcessResponse::OpenProcessHandle(handle))
+                }
+                BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
+                    target: SignalTarget::ProcessHandle(target),
+                    ..
+                })) if target == handle => BrokerResult::Error(ErrorCode::PeerClosed),
+                BrokerOperation::CloseObject(target) if target == handle => {
+                    BrokerResult::ObjectClosed
+                }
+                operation => panic!("unexpected operation {operation:?}"),
+            };
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result,
+            })
+        }
     }
 }

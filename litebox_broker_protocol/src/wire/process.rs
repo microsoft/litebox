@@ -7,10 +7,10 @@ use crate::message::{ProcessRequest, ProcessResponse};
 use crate::process::{
     AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameKind,
-    HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo, ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    HostNameSizes, MAX_HOST_NAME_SIZE, OpenProcessHandleRequest, PidNamespaceOptions,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind,
+    ResourceLimit, SetHostNameRequest, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::ProcessGroupMembership;
 use crate::{ProcessId, SharedObjectToken, ThreadId};
@@ -39,6 +39,7 @@ const PROCESS_REQUEST_TAG_CREATE_CHILDREN_PID_NAMESPACE: u8 = 17;
 const PROCESS_REQUEST_TAG_GET_HOST_NAMES: u8 = 18;
 const PROCESS_REQUEST_TAG_SET_HOST_NAME: u8 = 19;
 const PROCESS_REQUEST_TAG_COPY_HOST_NAMES: u8 = 20;
+const PROCESS_REQUEST_TAG_OPEN_PROCESS_HANDLE: u8 = 21;
 
 const PROCESS_RESPONSE_TAG_ALLOCATE_CHILD: u8 = 0;
 const PROCESS_RESPONSE_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 1;
@@ -61,6 +62,7 @@ const PROCESS_RESPONSE_TAG_CREATE_CHILDREN_PID_NAMESPACE: u8 = 17;
 const PROCESS_RESPONSE_TAG_GET_HOST_NAMES: u8 = 18;
 const PROCESS_RESPONSE_TAG_SET_HOST_NAME: u8 = 19;
 const PROCESS_RESPONSE_TAG_COPY_HOST_NAMES: u8 = 20;
+const PROCESS_RESPONSE_TAG_OPEN_PROCESS_HANDLE: u8 = 21;
 
 const RESOURCE_KIND_TAG_CPU_TIME: u8 = 0;
 const RESOURCE_KIND_TAG_TASKS: u8 = 1;
@@ -75,6 +77,7 @@ const PROCESS_EXIT_STATUS_TAG_UNKNOWN: u8 = 2;
 const CHILD_SELECTOR_TAG_ANY: u8 = 0;
 const CHILD_SELECTOR_TAG_PROCESS: u8 = 1;
 const CHILD_SELECTOR_TAG_PROCESS_GROUP: u8 = 2;
+const CHILD_SELECTOR_TAG_PROCESS_HANDLE: u8 = 3;
 
 const PID_NAMESPACE_ENDS_WITH_FIRST_PROCESS: u8 = 1 << 0;
 const PID_NAMESPACE_FIRST_PROCESS_ADOPTS_ORPHANS: u8 = 1 << 1;
@@ -209,6 +212,11 @@ pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequ
             encoder.u8(PROCESS_REQUEST_TAG_COPY_HOST_NAMES);
             encoder.process_id(process_id);
         }
+        ProcessRequest::OpenProcessHandle(OpenProcessHandleRequest { process_id, flags }) => {
+            encoder.u8(PROCESS_REQUEST_TAG_OPEN_PROCESS_HANDLE);
+            encoder.process_id(process_id);
+            encoder.u16(flags.bits());
+        }
     }
 }
 
@@ -295,6 +303,12 @@ pub(super) fn decode_process_request(
             name: decoder.shared_buffer_sequence()?,
         }),
         PROCESS_REQUEST_TAG_COPY_HOST_NAMES => ProcessRequest::CopyHostNames(decoder.process_id()?),
+        PROCESS_REQUEST_TAG_OPEN_PROCESS_HANDLE => {
+            ProcessRequest::OpenProcessHandle(OpenProcessHandleRequest {
+                process_id: decoder.process_id()?,
+                flags: super::fs::decode_open_flags(decoder)?,
+            })
+        }
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -370,6 +384,10 @@ pub(super) fn encode_process_response(encoder: &mut Encoder, response: ProcessRe
         }
         ProcessResponse::SetHostName => encoder.u8(PROCESS_RESPONSE_TAG_SET_HOST_NAME),
         ProcessResponse::CopyHostNames => encoder.u8(PROCESS_RESPONSE_TAG_COPY_HOST_NAMES),
+        ProcessResponse::OpenProcessHandle(handle) => {
+            encoder.u8(PROCESS_RESPONSE_TAG_OPEN_PROCESS_HANDLE);
+            encoder.handle(handle);
+        }
     }
 }
 
@@ -422,6 +440,9 @@ pub(super) fn decode_process_response(
         }),
         PROCESS_RESPONSE_TAG_SET_HOST_NAME => ProcessResponse::SetHostName,
         PROCESS_RESPONSE_TAG_COPY_HOST_NAMES => ProcessResponse::CopyHostNames,
+        PROCESS_RESPONSE_TAG_OPEN_PROCESS_HANDLE => {
+            ProcessResponse::OpenProcessHandle(decoder.handle()?)
+        }
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -551,6 +572,10 @@ fn encode_child_selector(encoder: &mut Encoder, selector: ChildSelector) {
             encoder.u8(CHILD_SELECTOR_TAG_PROCESS_GROUP);
             encoder.process_group_id(process_group);
         }
+        ChildSelector::ProcessHandle(handle) => {
+            encoder.u8(CHILD_SELECTOR_TAG_PROCESS_HANDLE);
+            encoder.handle(handle);
+        }
     }
 }
 
@@ -561,6 +586,7 @@ fn decode_child_selector(decoder: &mut Decoder<'_>) -> Result<ChildSelector, Wir
         CHILD_SELECTOR_TAG_PROCESS_GROUP => {
             ChildSelector::ProcessGroup(decoder.process_group_id()?)
         }
+        CHILD_SELECTOR_TAG_PROCESS_HANDLE => ChildSelector::ProcessHandle(decoder.handle()?),
         _ => return Err(WireError::InvalidTag),
     })
 }
