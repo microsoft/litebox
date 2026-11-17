@@ -996,7 +996,8 @@ mod tests {
     use litebox_broker_host::test_support::InProcessBrokerSetup;
     use litebox_broker_local::BrokerLocal;
     use litebox_broker_protocol::fs::{
-        FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileUser,
+        FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileTimeUpdate, FileTimestamp,
+        FileUser, SetFileTimes,
     };
     use litebox_common_linux::{PtRegs, vmem::CreatePagesFlags};
     use litebox_common_macos::{
@@ -1821,6 +1822,7 @@ mod tests {
         assert_eq!(call(nr::STAT64, &[ptr(c"/dir/data"), stat_ptr]), Ok(0));
         assert_eq!((stat.mode, stat.size, stat.nlink), (0o100_640, 10, 1));
         assert_eq!((stat.uid, stat.gid, stat.blocks), (1000, 1000, 1));
+        assert_eq!(stat.times, [[0; 2]; 4]);
         assert_ne!(stat.ino, 0);
         let data_ino = stat.ino;
         assert_eq!(call(nr::LSTAT64, &[ptr(c"/dir"), stat_ptr]), Ok(0));
@@ -1838,12 +1840,36 @@ mod tests {
         let dir = openat(AT_FDCWD, c"/dir", OpenFlags::RDONLY).unwrap();
         let data = openat(dir, c"data", OpenFlags::RDWR).unwrap();
         assert_eq!(get_path(data, &mut path_buffer).as_deref(), Ok("/dir/data"));
+        task.files
+            .file(&task.files.typed_fd(i32::try_from(data).unwrap()).unwrap())
+            .unwrap()
+            .set_times(
+                user,
+                &SetFileTimes {
+                    access: FileTimeUpdate::Set(FileTimestamp {
+                        seconds: -123,
+                        nanoseconds: 999_999_999,
+                    }),
+                    modify: FileTimeUpdate::Set(FileTimestamp {
+                        seconds: 456,
+                        nanoseconds: 123_456_789,
+                    }),
+                },
+            )
+            .unwrap();
+        let expected_times = [[-123, 999_999_999], [456, 123_456_789], [0, 0], [0, 0]];
+        for number in [nr::STAT64, nr::LSTAT64] {
+            assert_eq!(call(number, &[ptr(c"/dir/data"), stat_ptr]), Ok(0));
+            assert_eq!(stat.times, expected_times);
+        }
         assert_eq!(call(nr::FSTAT64, &[data, stat_ptr]), Ok(0));
         assert_eq!((stat.ino, stat.size), (data_ino, 10));
+        assert_eq!(stat.times, expected_times);
         assert_eq!(call(nr::FSTAT64, &[data, 0x10]), Err(Errno::EFAULT));
         assert_eq!(call(nr::FSTAT64, &[999, stat_ptr]), Err(Errno::EBADF));
         assert_eq!(call(nr::FSTAT64, &[dir, stat_ptr]), Ok(0));
         assert_eq!(stat.mode, 0o040_755);
+        assert_eq!(stat.times, [[0; 2]; 4]);
         assert_eq!(
             openat(dir, c"data/", OpenFlags::RDONLY),
             Err(Errno::ENOTDIR)

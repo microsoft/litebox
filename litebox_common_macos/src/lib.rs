@@ -165,8 +165,7 @@ mod file_type {
 impl TryFrom<&litebox_broker_protocol::fs::FileStatus> for Stat64 {
     type Error = errno::Errno;
 
-    /// LiteBox files have no timestamps, link counts or flags: those read
-    /// as zero (one link).
+    /// LiteBox files have no link counts or flags: report one link and zero flags.
     fn try_from(status: &litebox_broker_protocol::fs::FileStatus) -> Result<Self, Self::Error> {
         use litebox_broker_protocol::fs::FileType;
         let kind = match status.file_type {
@@ -178,6 +177,7 @@ impl TryFrom<&litebox_broker_protocol::fs::FileStatus> for Stat64 {
         };
         let size = i64::try_from(status.size).map_err(|_| errno::Errno::EOVERFLOW)?;
         let blksize = i32::try_from(status.blksize).map_err(|_| errno::Errno::EOVERFLOW)?;
+        let times = status.times.unwrap_or_default();
         Ok(Self {
             // dev_t and the 32-bit rdev are truncated like XNU's `stat`.
             dev: litebox::utils::TruncateExt::<u32>::trunc(status.node_info.dev).cast_signed(),
@@ -189,6 +189,15 @@ impl TryFrom<&litebox_broker_protocol::fs::FileStatus> for Stat64 {
             rdev: status.node_info.rdev.map_or(0, |rdev| {
                 litebox::utils::TruncateExt::<u32>::trunc(rdev.get()).cast_signed()
             }),
+            times: [
+                times.accessed,
+                times.modified,
+                times.changed,
+                // XXX: the broker has no birth time; report 0, as XNU does on filesystems that
+                // don't record one.
+                litebox_broker_protocol::fs::FileTimestamp::default(),
+            ]
+            .map(|time| [time.seconds, i64::from(time.nanoseconds)]),
             size,
             blocks: size.saturating_add(511) / 512,
             blksize,
