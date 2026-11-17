@@ -257,7 +257,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// opened process is signalled with [`Process::send_signal`].
     pub fn send_signal(&self, target: SignalTarget, signal: u32) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        broker.send_signal(target, signal).map_err(no_such_process)
+        broker.send_signal(target, signal).map_err(signal_error)
     }
 
     /// Moves process `process_id`, which is this process or one of its
@@ -665,15 +665,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
     /// [`ProcessError::NoSuchProcess`] if the process was released or left the
     /// broker, or the caller's PID namespace doesn't see it.
     pub fn send_signal(&self, signal: u32) -> Result<(), ProcessError> {
-        match self
-            .broker
+        self.broker
             .send_signal(SignalTarget::ProcessHandle(self.handle), signal)
-        {
-            Err(BrokerControlError::Broker(ErrorCode::PeerClosed)) => {
-                Err(ProcessError::NoSuchProcess)
-            }
-            result => result.map_err(no_such_process),
-        }
+            .map_err(signal_error)
     }
 
     /// Collects the process's exit, removing it from the process tree, if it
@@ -739,6 +733,15 @@ fn no_such_process(error: BrokerControlError) -> ProcessError {
     }
 }
 
+/// Converts an error from a signal request, whose process handle target
+/// fails with `PeerClosed` once its process is gone.
+fn signal_error(error: BrokerControlError) -> ProcessError {
+    match error {
+        BrokerControlError::Broker(ErrorCode::PeerClosed) => ProcessError::NoSuchProcess,
+        error => no_such_process(error),
+    }
+}
+
 impl From<ProcessGroupError> for ProcessError {
     fn from(error: ProcessGroupError) -> Self {
         match error {
@@ -777,9 +780,10 @@ mod tests {
     use litebox_broker_local::test_support::test_broker_local;
     use litebox_broker_protocol::message::{
         BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, ProcessRequest,
-        ProcessResponse,
+        ProcessResponse, SignalRequest,
     };
     use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
+    use litebox_broker_protocol::signal::SendSignalRequest;
     use litebox_broker_protocol::{ProcessId, ThreadId};
     use litebox_broker_transport::channel::LocalCallChannel;
     use litebox_broker_transport::shared_memory::HeapSharedMemory;
@@ -842,5 +846,50 @@ mod tests {
 
     fn test_shared_memory() -> Arc<HeapSharedMemory> {
         Arc::new(HeapSharedMemory::new(SHARED_BUFFER_POOL_SIZE))
+    }
+
+    #[test]
+    fn signalling_a_gone_process_by_handle_finds_no_such_process() {
+        let litebox = LiteBox::new_with_broker_local(
+            MockPlatform::new(),
+            test_broker_local(GoneProcessChannel, test_shared_memory()),
+        );
+        let process = litebox
+            .open_process(ProcessId(3), FileOpenFlags::NONE)
+            .unwrap();
+
+        assert_eq!(process.send_signal(0), Err(ProcessError::NoSuchProcess));
+        assert_eq!(
+            litebox.send_signal(SignalTarget::ProcessHandle(process.handle()), 0),
+            Err(ProcessError::NoSuchProcess)
+        );
+    }
+
+    /// Opens handles to a process that is gone by the time it is signalled.
+    struct GoneProcessChannel;
+
+    impl LocalCallChannel for GoneProcessChannel {
+        type Error = ();
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            let handle = ObjectHandle(5);
+            let result = match request.operation {
+                BrokerOperation::Process(ProcessRequest::OpenProcessHandle(_)) => {
+                    BrokerResult::Process(ProcessResponse::OpenProcessHandle(handle))
+                }
+                BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
+                    target: SignalTarget::ProcessHandle(target),
+                    ..
+                })) if target == handle => BrokerResult::Error(ErrorCode::PeerClosed),
+                BrokerOperation::CloseObject(target) if target == handle => {
+                    BrokerResult::ObjectClosed
+                }
+                operation => panic!("unexpected operation {operation:?}"),
+            };
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result,
+            })
+        }
     }
 }
