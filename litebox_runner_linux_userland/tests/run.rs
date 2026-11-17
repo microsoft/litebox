@@ -60,76 +60,6 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
     }
 }
 
-// Dedicated fixtures build static binaries concurrently; exclude them to avoid
-// colliding with this sweep's dynamic `<stem>_rewriter` outputs.
-const DEDICATED_C_TESTS: &[&str] = &[
-    "aarch64_hwcaps.c",
-    "async_x16.c",
-    "auxv_execfn.c",
-    "cpu_time_parent.c",
-    "ctty_parent.c",
-    "fork_chain_parent.c",
-    "fork_parent.c",
-    "fork_interrupt_parent.c",
-    "fork_threads_parent.c",
-    "fork_aarch64_state.c",
-    "fork_epoll_parent.c",
-    "fork_event_parent.c",
-    "fork_flock_parent.c",
-    "fork_inet_parent.c",
-    "fork_shared_futex_parent.c",
-    "fork_unix_parent.c",
-    "gate_signals.c",
-    "native_tp.c",
-    "inherited_ignored_signals.c",
-    "pid_namespace.c",
-    "prctl_flags.c",
-    "process_group_parent.c",
-    "process_tree_parent.c",
-    "regular_file_readiness.c",
-    "rlimit_parent.c",
-    "shared_file_mapping.c",
-    "sigreturn.c",
-    "sigreturn_simd.c",
-    "sigtimedwait_fork_parent.c",
-    "thread_kill_process_parent.c",
-    "svc_scratch_regs.c",
-    "sve_async.c",
-    "sve_signal.c",
-    "sve_syscall_abi.c",
-    "sve_x18.c",
-    "tty.c",
-    "utimensat.c",
-    "uts_ipc_namespace.c",
-    "vfork_fault_parent.c",
-    "vfork_exec_child.c",
-    "vfork_fd_parent.c",
-    "vfork_fd_ops_parent.c",
-    "vfork_exec_parent.c",
-    "vfork_job_control_parent.c",
-    "vfork_kill_parent.c",
-    "vfork_pipe_parent.c",
-    "vfork_exit_parent.c",
-    "vfork_reap_parent.c",
-    "vfork_sigchld_parent.c",
-    "vfork_shell_parent.c",
-    "vfork_signal_parent.c",
-    "vfork_spawn_parent.c",
-    "waitid_parent.c",
-];
-
-const BROKER_ONLY_C_TESTS: &[&str] = &[
-    "eventfd.c",
-    "getrandom_broker.c",
-    "pipe_broker.c",
-    "tcp_broker.c",
-    "tcp_broker_server.c",
-    "tcp_broker_states.c",
-    "udp_broker.c",
-    "udp_broker_namespace.c",
-    "urandom_broker.c",
-];
-
 #[cfg(target_os = "linux")]
 fn gateway_destination_rule() -> litebox_broker_core::DestinationRule {
     use litebox_broker_protocol::socket::{Ipv4Address, Port};
@@ -153,34 +83,6 @@ fn gateway_udp_policy() -> litebox_broker_core::SocketPolicy {
     litebox_broker_core::SocketPolicy::guest_network()
         .with_udp_destination_rules(&[gateway_destination_rule()])
         .unwrap()
-}
-
-/// Find all C test files in a directory
-fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if let Some("c") = path.extension().and_then(|e| e.to_str()) {
-            files.push(path);
-        }
-    }
-    files
-}
-
-fn is_broker_only_c_test(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| BROKER_ONLY_C_TESTS.contains(&name))
-}
-
-fn has_dedicated_c_test(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| DEDICATED_C_TESTS.contains(&name))
 }
 
 #[cfg(target_os = "linux")]
@@ -227,42 +129,41 @@ fn test_utimensat_in_memory() {
     assert!(String::from_utf8_lossy(&output).contains("utimensat ok"));
 }
 
-#[test]
-fn test_dynamic_lib_with_rewriter() {
-    for path in find_c_test_files("./tests") {
-        if is_broker_only_c_test(&path) || has_dedicated_c_test(&path) {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .expect("failed to get file stem");
-        let unique_name = format!("{stem}_rewriter");
-        let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        let mut runner = Runner::new(&target, &unique_name);
-        #[cfg(target_os = "linux")]
-        configure_pipe_broker(&path, &mut runner);
-        runner.run();
-    }
+include!(concat!(env!("OUT_DIR"), "/c_tests.rs"));
+
+fn run_c_test(path: &str, suffix: &str, exec_or_lib: bool) {
+    let stem = Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .expect("failed to get file stem");
+    let unique_name = format!("{stem}{suffix}");
+    let target = common::compile(path, &unique_name, exec_or_lib, false);
+    let mut runner = Runner::new(&target, &unique_name);
+    #[cfg(target_os = "linux")]
+    configure_pipe_broker(Path::new(path), &mut runner);
+    runner.run();
 }
 
-#[test]
-fn test_static_exec_with_rewriter() {
-    for path in find_c_test_files("./tests") {
-        if is_broker_only_c_test(&path) || has_dedicated_c_test(&path) {
-            continue;
+macro_rules! c_test {
+    ($(#[$attribute:meta])* $stem:ident, $path:literal) => {
+        $(#[$attribute])*
+        #[test]
+        fn $stem() {
+            super::run_c_test($path, SUFFIX, EXEC_OR_LIB);
         }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .expect("failed to get file stem");
-        let unique_name = format!("{stem}_exec_rewriter");
-        let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
-        let mut runner = Runner::new(&target, &unique_name);
-        #[cfg(target_os = "linux")]
-        configure_pipe_broker(&path, &mut runner);
-        runner.run();
-    }
+    };
+}
+
+mod test_dynamic_lib_with_rewriter {
+    const SUFFIX: &str = "_rewriter";
+    const EXEC_OR_LIB: bool = false;
+    for_each_c_test!(c_test);
+}
+
+mod test_static_exec_with_rewriter {
+    const SUFFIX: &str = "_exec_rewriter";
+    const EXEC_OR_LIB: bool = true;
+    for_each_c_test!(c_test);
 }
 
 #[cfg(target_os = "linux")]
