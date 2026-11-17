@@ -883,6 +883,19 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// `pidfd_open` flags.
+    #[derive(Debug, Clone, Copy)]
+    pub struct PidfdFlags: core::ffi::c_uint {
+        /// `PIDFD_NONBLOCK`: `waitid` on the descriptor does not block.
+        const NONBLOCK = OFlags::NONBLOCK.bits();
+        /// `PIDFD_THREAD`: the descriptor refers to a thread rather than a thread group.
+        const THREAD = OFlags::EXCL.bits();
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 type speed_t = ::core::ffi::c_uint;
@@ -3075,6 +3088,16 @@ pub enum SyscallRequest {
         tid: i32,
         sig: i32,
     },
+    PidfdOpen {
+        pid: i32,
+        flags: PidfdFlags,
+    },
+    PidfdSendSignal {
+        pidfd: i32,
+        sig: i32,
+        info: Option<UserPtr<signal::Siginfo>>,
+        flags: u32,
+    },
     Sigaltstack {
         ss: Option<UserPtr<signal::SigAltStack>>,
         old_ss: Option<UserPtrMut<signal::SigAltStack>>,
@@ -3728,6 +3751,8 @@ impl SyscallRequest {
             Sysno::kill => sys_req!(Kill { pid, sig }),
             Sysno::tkill => sys_req!(Tkill { tid, sig }),
             Sysno::tgkill => sys_req!(Tgkill { tgid, tid, sig }),
+            Sysno::pidfd_open => sys_req!(PidfdOpen { pid, flags }),
+            Sysno::pidfd_send_signal => sys_req!(PidfdSendSignal { pidfd, sig, info:*, flags }),
             Sysno::sigaltstack => sys_req!(Sigaltstack { ss:*, old_ss:* }),
             Sysno::ioctl => SyscallRequest::Ioctl {
                 fd: ctx.sys_req_arg(0),
@@ -4689,6 +4714,7 @@ reinterpret_truncated_from_usize_for! {
         EfdFlags,
         TfdFlags,
         TfdTimerFlags,
+        PidfdFlags,
         RngFlags,
         TimerFlags,
         StatxMask,

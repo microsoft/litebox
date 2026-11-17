@@ -935,6 +935,7 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
         resolve_fd!(syscalls::unix::UnixSocketSubsystem<Platform>, Unix);
         resolve_fd!(syscalls::timerfd::TimerfdSubsystem<Platform>, Timerfd);
         resolve_fd!(syscalls::vsock::VsockSocketSubsystem<Platform>, Vsock);
+        resolve_fd!(syscalls::pidfd::PidfdSubsystem<Platform>, Pidfd);
         Err(Errno::EBADF)
     }
 }
@@ -1046,6 +1047,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             | PrctlArg::SetNoNewPrivs,
                     }
                     | SyscallRequest::Kill { .. }
+                    | SyscallRequest::PidfdOpen { .. }
+                    | SyscallRequest::PidfdSendSignal { .. }
                     | SyscallRequest::RtSigaction { .. }
                     | SyscallRequest::RtSigprocmask { .. }
                     | SyscallRequest::RtSigreturn
@@ -1790,6 +1793,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::Kill { pid, sig } => self.sys_kill(pid, sig),
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
+            SyscallRequest::PidfdOpen { pid, flags } => syscall!(sys_pidfd_open(pid, flags)),
+            SyscallRequest::PidfdSendSignal {
+                pidfd,
+                sig,
+                info,
+                flags,
+            } => self.sys_pidfd_send_signal(pidfd, sig, info, flags),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
             SyscallRequest::Alarm { seconds } => syscall!(sys_alarm(seconds)),
             SyscallRequest::Pause => syscall!(sys_pause()),

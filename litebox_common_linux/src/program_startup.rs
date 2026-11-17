@@ -45,6 +45,7 @@ const TIMERFD_TAG: u8 = 4;
 const EPOLL_TAG: u8 = 5;
 const INET_SOCKET_TAG: u8 = 6;
 const VSOCK_SOCKET_TAG: u8 = 7;
+const PIDFD_TAG: u8 = 8;
 const PROGRAM_STARTUP_TAG: u8 = 0;
 const FORK_STARTUP_TAG: u8 = 1;
 
@@ -184,6 +185,8 @@ pub enum InheritedFdKind {
     },
     /// A vsock stream socket.
     VsockSocket,
+    /// A pidfd.
+    Pidfd,
 }
 
 /// Clock against which a timerfd measures absolute expiration times.
@@ -673,7 +676,10 @@ impl InheritedFd {
     fn encoded_len(&self) -> usize {
         INHERITED_FD_HEADER_SIZE
             + match self.kind {
-                InheritedFdKind::File | InheritedFdKind::Epoll | InheritedFdKind::VsockSocket => 0,
+                InheritedFdKind::File
+                | InheritedFdKind::Epoll
+                | InheritedFdKind::VsockSocket
+                | InheritedFdKind::Pidfd => 0,
                 InheritedFdKind::Pipe { .. }
                 | InheritedFdKind::UnixSocket { .. }
                 | InheritedFdKind::InetSocket { .. }
@@ -724,6 +730,7 @@ impl InheritedFd {
                 });
             }
             InheritedFdKind::VsockSocket => output.push(VSOCK_SOCKET_TAG),
+            InheritedFdKind::Pidfd => output.push(PIDFD_TAG),
         }
     }
 
@@ -766,6 +773,7 @@ impl InheritedFd {
                 },
             },
             VSOCK_SOCKET_TAG => InheritedFdKind::VsockSocket,
+            PIDFD_TAG => InheritedFdKind::Pidfd,
             _ => return Err(LinuxProgramStartupError::Malformed),
         };
         Ok(Self { fd, handle, kind })
@@ -1198,6 +1206,11 @@ mod tests {
                     handle: ObjectHandle(16),
                     kind: InheritedFdKind::VsockSocket,
                 },
+                InheritedFd {
+                    fd: 14,
+                    handle: ObjectHandle(17),
+                    kind: InheritedFdKind::Pidfd,
+                },
             ],
         };
 
@@ -1386,6 +1399,14 @@ mod tests {
                         kind: InheritedFdKind::VsockSocket,
                     },
                     close_on_exec: true,
+                },
+                ForkedFd {
+                    inherited: InheritedFd {
+                        fd: 10,
+                        handle: ObjectHandle(15),
+                        kind: InheritedFdKind::Pidfd,
+                    },
+                    close_on_exec: false,
                 },
             ],
         }

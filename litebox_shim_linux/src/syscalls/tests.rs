@@ -4,7 +4,7 @@
 use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence};
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, IoctlArg, OFlags,
-    errno::Errno,
+    PidfdFlags, errno::Errno,
 };
 use zerocopy::FromBytes as _;
 
@@ -1088,7 +1088,7 @@ fn exec_inherits_only_transferable_descriptors() {
         })
     };
 
-    // Files, pipes, eventfds, and epoll instances transfer unless they are close-on-exec.
+    // Files, pipes, eventfds, epoll instances, and pidfds transfer unless they are close-on-exec.
     let (read_fd, write_fd) = task.do_pipe2(OFlags::empty(), |_, _| Ok(())).unwrap();
     assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, 3, 4]));
     task.sys_close(read_fd.try_into().unwrap()).unwrap();
@@ -1105,6 +1105,15 @@ fn exec_inherits_only_transferable_descriptors() {
         .unwrap();
     assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, epoll]));
     task.sys_close(epoll_fd).unwrap();
+    let pidfd = task
+        .sys_pidfd_open(task.sys_getpid(), PidfdFlags::empty())
+        .unwrap();
+    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2]));
+    let pidfd_fd = pidfd.try_into().unwrap();
+    task.sys_fcntl(pidfd_fd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
+        .unwrap();
+    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, pidfd]));
+    task.sys_close(pidfd_fd).unwrap();
 
     // A fresh runner installs descriptors at most a bounded distance apart.
     assert_eq!(task.sys_dup(1, Some(258), None), Ok(258));
@@ -1160,11 +1169,15 @@ fn proc_self_fd_names_open_descriptions() {
     let (read_end, write_end) = task.do_pipe2(OFlags::empty(), |_, _| Ok(())).unwrap();
     let eventfd = task.sys_eventfd2(0, EfdFlags::empty()).unwrap();
     let epoll = task.sys_epoll_create(EpollCreateFlags::empty()).unwrap();
+    let pidfd = task
+        .sys_pidfd_open(task.sys_getpid(), PidfdFlags::empty())
+        .unwrap();
     for (fd, expected) in [
         (read_end, "pipe:[0]"),
         (write_end, "pipe:[0]"),
         (eventfd, "anon_inode:[eventfd]"),
         (epoll, "anon_inode:[eventpoll]"),
+        (pidfd, "anon_inode:[pidfd]"),
     ] {
         assert_eq!(link(fd).as_deref(), Ok(expected));
         assert_eq!(stat(fd), fstat(fd));

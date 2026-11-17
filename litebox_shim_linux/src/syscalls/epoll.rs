@@ -31,6 +31,7 @@ use super::{
     eventfd::EventfdFd,
     file::{FileFd, FilesState, linux_status_flags, status_flags_change},
     inet::InetSocketFd,
+    pidfd::PidfdFd,
     pipe::PipeFd,
     timerfd::TimerfdFd,
     unix::UnixSocketFd,
@@ -66,6 +67,7 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
     Unix(Arc<UnixSocketFd<Platform>>),
     Timerfd(Arc<TimerfdFd<Platform>>),
     Vsock(Arc<VsockSocketFd<Platform>>),
+    Pidfd(Arc<PidfdFd<Platform>>),
 }
 
 impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
@@ -105,6 +107,9 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
         {
             return Ok(EpollDescriptor::Vsock(fd));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer::<super::pidfd::PidfdSubsystem<Platform>>(raw_fd) {
+            return Ok(EpollDescriptor::Pidfd(fd));
+        }
         Err(Errno::EBADF)
     }
 
@@ -141,6 +146,7 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
             EpollDescriptor::Unix(fd) => poll_entry!(fd),
             EpollDescriptor::Timerfd(fd) => poll_entry!(fd),
             EpollDescriptor::Vsock(fd) => poll_entry!(fd),
+            EpollDescriptor::Pidfd(fd) => poll_entry!(fd),
         }
     }
 
@@ -174,6 +180,9 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
             EpollDescriptor::Vsock(fd) => global.with_vsock_socket(fd, |socket| {
                 f(&ReadinessTarget::VsockSocket(socket.vsock_socket()))
             }),
+            EpollDescriptor::Pidfd(fd) => {
+                global.with_pidfd(fd, |file| f(&ReadinessTarget::Process(file.process())))
+            }
             EpollDescriptor::Epoll(_) => Err(Errno::EPERM),
         }
     }
