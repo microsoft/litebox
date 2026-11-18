@@ -196,6 +196,24 @@ fn copied_mount_views_share_files_and_locks_but_not_new_mounts() {
     );
 }
 
+#[test]
+fn a_private_mount_does_not_pin_names_in_an_unrelated_backend() {
+    let fs = Resolver::<TestPlatform, _>::new(
+        super::composer::Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap(),
+    );
+    fs.mkdir(ROOT, "/work", Mode::RWXU).unwrap();
+    fs.mkdir(ROOT, "/work/data", Mode::RWXU).unwrap();
+    let child = fs.copy_mount_view().unwrap();
+    child.mount_in_mem(ROOT, "/work/data").unwrap();
+    fs.mount_in_mem(ROOT, "/work").unwrap();
+    fs.mkdir(ROOT, "/work/data", Mode::RWXU).unwrap();
+    fs.rename(ROOT, "/work/data", "/work/renamed").unwrap();
+    assert!(child.file_status(ROOT, "/work/data", true).is_ok());
+}
+
 /// The path that `path` opens as, and up to 1 KiB of its content.
 fn read_path<Backend: super::backend::Backend + 'static>(
     fs: &Resolver<TestPlatform, Backend>,

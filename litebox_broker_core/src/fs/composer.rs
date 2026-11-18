@@ -6,7 +6,7 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
@@ -85,7 +85,50 @@ pub struct ComposerBuilder<Platform: RawSyncPrimitivesProvider> {
 struct Mount {
     path: Vec<String>,
     backend: Box<dyn Backend>,
+    /// Changes to this backend must respect mount points in *every* view sharing it.
+    points: spin::Mutex<MountPoints>,
+    _point_on_parent: Option<Arc<[String]>>,
     _slot: Option<RuntimeMountSlot>,
+}
+
+/// Paths in one backing mount. A mount holds a pin for its lifetime; a removal holds a
+/// reservation until its backend call returns. Neither holds this lock across the call.
+#[derive(Default)]
+struct MountPoints {
+    pinned: Vec<Weak<[String]>>,
+    changing: Vec<Weak<[String]>>,
+}
+
+impl MountPoints {
+    fn pin(&mut self, path: &[String]) -> Result<Arc<[String]>, MountError> {
+        if self
+            .changing
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|p| path.starts_with(&p))
+        {
+            return Err(MountError::Busy);
+        }
+        Ok(Self::record(&mut self.pinned, path.into()))
+    }
+
+    fn begin_change(&mut self, path: Vec<String>) -> Option<Arc<[String]>> {
+        if self
+            .pinned
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|p| p.starts_with(&path))
+        {
+            return None;
+        }
+        Some(Self::record(&mut self.changing, path.into()))
+    }
+
+    fn record(list: &mut Vec<Weak<[String]>>, path: Arc<[String]>) -> Arc<[String]> {
+        list.retain(|p| p.strong_count() != 0);
+        list.push(Arc::downgrade(&path));
+        path
+    }
 }
 
 /// Synthetic directory needed to connect mount points.
@@ -175,6 +218,15 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
             return Err(MountError::Busy);
         }
         let slot = RuntimeMountSlot::reserve(&self.resources)?;
+        // The most specific mounted ancestor supplies the covered directory. Pins belong
+        // to that backend, not to the pathname in unrelated private mounts at the same path.
+        let point = state
+            .mounts
+            .iter()
+            .filter(|mount| path.starts_with(&mount.path))
+            .max_by_key(|mount| mount.path.len())
+            .map(|mount| mount.points.lock().pin(&path))
+            .transpose()?;
         let backend = Box::new(make(self.resources.allocators.next()));
         let MountState {
             mounts,
@@ -196,6 +248,8 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         mounts.push(Arc::new(Mount {
             path,
             backend,
+            points: spin::Mutex::default(),
+            _point_on_parent: point,
             _slot: Some(slot),
         }));
         Ok(())
@@ -272,6 +326,8 @@ impl<Platform: RawSyncPrimitivesProvider> ComposerBuilder<Platform> {
             mounts.push(Arc::new(Mount {
                 path,
                 backend,
+                points: spin::Mutex::default(),
+                _point_on_parent: None,
                 _slot: None,
             }));
         }
@@ -385,7 +441,12 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
             // TODO(jayb): Define mutation semantics for exact mount points.
             return Err(error);
         }
+
         Ok(path)
+    }
+
+    fn begin_change(&self, mount_index: usize, path: Vec<String>) -> Option<Arc<[String]>> {
+        self.mount_at(mount_index)?.points.lock().begin_change(path)
     }
 
     /// Returns child names from mount paths only; mounted backend contents are not inspected.
@@ -1052,7 +1113,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 let ResolvedTarget::Dir(handle) = target else {
                     unreachable!()
                 };
-                self.checked_child_path(path, name, UnlinkError::ReadOnlyFileSystem)?;
+                let path = self.checked_child_path(path, name, UnlinkError::ReadOnlyFileSystem)?;
+                let _change = self
+                    .begin_change(mount_index, path)
+                    .ok_or(UnlinkError::ReadOnlyFileSystem)?;
                 self.backend(mount_index).unlink_at(handle, name)
             }
         }
@@ -1070,7 +1134,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 let ResolvedTarget::Dir(handle) = target else {
                     unreachable!()
                 };
-                self.checked_child_path(path, name, RmdirError::ReadOnlyFileSystem)?;
+                let path = self.checked_child_path(path, name, RmdirError::ReadOnlyFileSystem)?;
+                let _change = self
+                    .begin_change(mount_index, path)
+                    .ok_or(RmdirError::Busy)?;
                 self.backend(mount_index).rmdir_at(handle, name)
             }
         }
@@ -1090,13 +1157,22 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         }
         let old_dir = old_dir.into_typed::<Self>().inner;
         let new_dir = new_dir.into_typed::<Self>().inner;
-        for (dir, name) in [(&old_dir, old_name), (&new_dir, new_name)] {
+        let reserve = |dir: &ComposerDirHandleInner, name: &str| {
             let path = match dir {
                 ComposerDirHandleInner::Virtual { path }
                 | ComposerDirHandleInner::Mounted { path, .. } => path,
             };
-            self.checked_child_path(path.clone(), name, RenameError::Busy)?;
-        }
+            let path = self.checked_child_path(path.clone(), name, RenameError::Busy)?;
+            match dir {
+                ComposerDirHandleInner::Mounted { mount_index, .. } => self
+                    .begin_change(*mount_index, path)
+                    .map(Some)
+                    .ok_or(RenameError::Busy),
+                ComposerDirHandleInner::Virtual { .. } => Ok(None),
+            }
+        };
+        let _old = reserve(&old_dir, old_name)?;
+        let _new = reserve(&new_dir, new_name)?;
         match (old_dir, new_dir) {
             (
                 ComposerDirHandleInner::Mounted {

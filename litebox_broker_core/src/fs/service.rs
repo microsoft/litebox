@@ -566,9 +566,11 @@ pub fn open(
         return Ok(Err(error));
     }
     let reference = process.reserve_object_reference(rights)?;
-    let file = match Arc::clone(&process.fs).open(path, user, access, flags, mode, &|| {
-        crate::process_group::controlling_terminal(process)
-    })? {
+    let file = match process
+        .file_service()?
+        .open(path, user, access, flags, mode, &|| {
+            crate::process_group::controlling_terminal(process)
+        })? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
@@ -606,9 +608,11 @@ pub(crate) fn open_without_reference(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    let file = match Arc::clone(&process.fs).open(path, user, access, flags, mode, &|| {
-        crate::process_group::controlling_terminal(process)
-    })? {
+    let file = match process
+        .file_service()?
+        .open(path, user, access, flags, mode, &|| {
+            crate::process_group::controlling_terminal(process)
+        })? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
@@ -804,7 +808,9 @@ pub fn path_status(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.path_status(path, user, follow_symlinks)
+    process
+        .file_service()?
+        .path_status(path, user, follow_symlinks)
 }
 
 /// Reads the target of the symbolic link at an absolute path.
@@ -817,7 +823,7 @@ pub fn read_link(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.read_link(path, user)
+    process.file_service()?.read_link(path, user)
 }
 
 /// Resolves an absolute path to its physical location, following symbolic links.
@@ -830,7 +836,7 @@ pub fn resolve_path(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.resolve_path(path, user)
+    process.file_service()?.resolve_path(path, user)
 }
 
 /// Changes timestamps through an open file or directory, regardless of its access mode.
@@ -856,7 +862,7 @@ pub fn chmod(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.chmod(path, user, mode)
+    process.file_service()?.chmod(path, user, mode)
 }
 
 /// Changes ownership for an absolute path.
@@ -871,7 +877,9 @@ pub fn chown(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.chown(path, acting_user, user, group)
+    process
+        .file_service()?
+        .chown(path, acting_user, user, group)
 }
 
 /// Removes a file at an absolute path.
@@ -880,7 +888,7 @@ pub fn unlink(process: &BrokerProcess, path: &str, user: FileUser) -> Result<Fil
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.unlink(path, user)
+    process.file_service()?.unlink(path, user)
 }
 
 /// Renames a file or directory between absolute paths.
@@ -894,7 +902,7 @@ pub fn rename(
     if let Err(error) = validate_path(old_path).and_then(|()| validate_path(new_path)) {
         return Ok(Err(error));
     }
-    process.fs.rename(old_path, new_path, user)
+    process.file_service()?.rename(old_path, new_path, user)
 }
 
 /// Creates a directory at an absolute path.
@@ -908,7 +916,7 @@ pub fn mkdir(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.mkdir(path, user, mode)
+    process.file_service()?.mkdir(path, user, mode)
 }
 
 /// Mounts a fresh in-memory filesystem on an existing directory at an absolute path.
@@ -917,7 +925,7 @@ pub fn mount_in_mem(process: &BrokerProcess, path: &str, user: FileUser) -> Resu
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.mount_in_mem(path, user)
+    process.file_service()?.mount_in_mem(path, user)
 }
 
 /// Creates a symbolic link at an absolute path, storing `target` without resolving it.
@@ -931,7 +939,7 @@ pub fn symlink(
     if let Err(error) = validate_path(linkpath) {
         return Ok(Err(error));
     }
-    process.fs.symlink(target, linkpath, user)
+    process.file_service()?.symlink(target, linkpath, user)
 }
 
 /// Removes a directory at an absolute path.
@@ -940,7 +948,7 @@ pub fn rmdir(process: &BrokerProcess, path: &str, user: FileUser) -> Result<File
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.rmdir(path, user)
+    process.file_service()?.rmdir(path, user)
 }
 
 fn open_required_rights(access: FileAccessMode, flags: FileOpenFlags) -> Result<ObjectRights> {

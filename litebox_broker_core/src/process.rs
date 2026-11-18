@@ -255,9 +255,6 @@ pub struct BrokerProcess {
     ///
     /// No other lock is taken while this one is held.
     children_namespace: Mutex<Option<Arc<PidNamespace>>>,
-    /// The file service through which it opens files: its parent's, for a
-    /// child.
-    pub(crate) fs: Arc<dyn FileService>,
     /// The job that accounts for it: its parent's, for a child.
     pub(crate) job: Arc<Job>,
     /// This process's IDs in its own namespace, [`Self::pid_namespace`], which
@@ -523,6 +520,8 @@ impl ObjectEntry {
 
 struct BrokerProcessState {
     status: ProcessStatus,
+    /// Path lookups use this view until teardown. Open files hold their own references.
+    fs: Option<Arc<dyn FileService>>,
     /// Final termination status reported by the running process.
     reported_exit_status: Option<ProcessExitStatus>,
     /// Child retained until this process requests startup.
@@ -641,7 +640,6 @@ impl BrokerProcess {
         Self {
             core,
             children_namespace: Mutex::new(None),
-            fs,
             job,
             ids,
             key,
@@ -663,6 +661,7 @@ impl BrokerProcess {
             }),
             state: Mutex::new(BrokerProcessState {
                 status: ProcessStatus::Starting,
+                fs: Some(fs),
                 reported_exit_status: None,
                 pending_child_process: None,
                 retirement: ProcessRetirement::Active { abnormal: false },
@@ -790,6 +789,10 @@ impl BrokerProcess {
         &self.core
     }
 
+    pub(crate) fn file_service(&self) -> Result<Arc<dyn FileService>> {
+        self.state.lock().fs.clone().ok_or(BrokerError::PeerClosed)
+    }
+
     /// Creates one child of this process and its initial thread, with IDs in
     /// `pid_namespace`, which is this process's namespace or nested in it, in
     /// this process's job, with its credential, host names and either its file service
@@ -807,11 +810,10 @@ impl BrokerProcess {
     ) -> Result<Arc<BrokerProcess>> {
         let sibling = flags.contains(ChildProcessFlags::SIBLING);
         // Snapshot the creator's view, even for a sibling, without holding the process tree lock.
-        let fs = if flags.contains(ChildProcessFlags::PRIVATE_MOUNT_VIEW) {
-            self.fs.copy_mount_view()?
-        } else {
-            Arc::clone(&self.fs)
-        };
+        let mut fs = self.file_service()?;
+        if flags.contains(ChildProcessFlags::PRIVATE_MOUNT_VIEW) {
+            fs = fs.copy_mount_view()?;
+        }
         let child = {
             // The tree lock orders the new link against this process's and
             // the parent's exits.
@@ -3088,6 +3090,10 @@ impl BrokerProcess {
         // run while its lock is held.
         let socket_account = self.socket_account.lock().take();
         drop(socket_account);
+        // A zombie must not pin its namespace's runtime mount slots. The last reference may
+        // destroy backends, so release it outside the state lock.
+        let fs = self.state.lock().fs.take();
+        drop(fs);
         invariant_fault
     }
 
@@ -3579,6 +3585,56 @@ mod tests {
         assert_eq!(take_republished(&parent_sink), []);
         assert_eq!(child.close_object_reference(child_event), Ok(()));
         assert_eq!(*child_sink.retired.lock().unwrap(), [child_event]);
+    }
+
+    #[test]
+    fn private_mount_view_is_released_before_child_is_reaped() {
+        use crate::fs::{self, composer::Composer, in_mem::InMem, resolver::Resolver};
+
+        let fs = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child = parent
+            .create_child(
+                parent.pid_namespace(),
+                ChildProcessFlags::PRIVATE_MOUNT_VIEW,
+            )
+            .unwrap();
+        child.complete_start().unwrap();
+        fs::mkdir(&parent, "/container", ROOT, FileMode::RWXU)
+            .unwrap()
+            .unwrap();
+        fs::mkdir(&parent, "/container/data", ROOT, FileMode::RWXU)
+            .unwrap()
+            .unwrap();
+        fs::mount_in_mem(&child, "/container/data", ROOT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::rename(&parent, "/container", "/moved", ROOT),
+            Ok(Err(FileError::Busy))
+        );
+        assert_eq!(
+            fs::rmdir(&parent, "/container/data", ROOT),
+            Ok(Err(FileError::Busy))
+        );
+        child.complete_exit(EXITED, CpuTime::default()).unwrap();
+        assert!(broker.pid_namespace.is_registered(child.id()));
+        fs::rename(&parent, "/container", "/moved", ROOT)
+            .unwrap()
+            .unwrap();
+        fs::rmdir(&parent, "/moved/data", ROOT).unwrap().unwrap();
     }
 
     #[test]
