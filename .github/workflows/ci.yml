@@ -551,7 +551,7 @@ jobs:
           $prefix = "windows-oci-rootfs-v1-${{ runner.os }}-${{ runner.arch }}-${env:ImageOS}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}-"
           "prefix=$prefix" >> $env:GITHUB_OUTPUT
           "key=${prefix}${{ hashFiles('litebox_packager/**', 'litebox_syscall_rewriter/**', 'litebox_trampoline/**', 'litebox_common_windows/**', 'litebox_runner_linux_on_windows_userland/tests/**') }}" >> $env:GITHUB_OUTPUT
-      - name: Clear Windows test fixtures before restore
+      - name: Clear Windows OCI test fixtures before restore
         run: |
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/tmp/windows_python_rewriter, target/tmp/windows_node_rewriter
       - name: Restore Windows OCI test fixtures
@@ -591,7 +591,7 @@ jobs:
             target/tmp/windows_python_rewriter
             target/tmp/windows_node_rewriter
           key: ${{ steps.fixture-key.outputs.key }}
-      - name: Remove Windows test fixtures
+      - name: Remove Windows OCI test fixtures
         if: always()
         # Fixtures are cached separately above; keep them out of rust-cache.
         run: |
