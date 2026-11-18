@@ -270,6 +270,8 @@ fn identity(metadata: &fs::Metadata, canonical_path: &Path) -> HostIdentity {
         // one guest inode ID.
         // XXX: Windows identity is path-keyed, so a rename changes the inode ID seen through the
         // new name; retained handles still use the old path.
+        // Mountpoint protection instead identifies directories by host file ID; see
+        // `windows::directory_id`.
         let _ = metadata;
         HostIdentity {
             canonical_path: canonical_path.to_owned(),
@@ -913,6 +915,32 @@ impl Backend for LocalFs {
             .map_err(|_| FileStatusError::Io)
     }
 
+    /// Identifies a directory by its host volume serial number and 128-bit file ID rather than by
+    /// its path-keyed inode ID, so every spelling of one host directory shares an identity.
+    ///
+    /// Only directories are identified: a file target, or one from another `LocalFs`, reports
+    /// [`FileStatusError::Io`].
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn mount_directory_id(
+        &self,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<(u64, u128), FileStatusError> {
+        let ResolvedTarget::Dir(dir) = target else {
+            return Err(FileStatusError::Io);
+        };
+        let dir = dir.get_typed::<Self>();
+        if !self.valid_dir(dir) {
+            return Err(FileStatusError::Io);
+        }
+        windows::directory_id(&dir.canonical_path).map_err(|error| {
+            litebox_util_log::debug!(
+                path:? = dir.canonical_path, error:? = error;
+                "failed to identify host directory by file ID"
+            );
+            FileStatusError::Io
+        })
+    }
+
     fn create_file_at(
         &self,
         dir: ResolvedDir<'_>,
@@ -1241,3 +1269,8 @@ impl Backend for LocalFs {
         }
     }
 }
+
+// Other Windows targets lack the file-ID override, so their mount protection still keys host
+// directories by spelling.
+#[cfg(all(test, any(unix, all(windows, target_arch = "x86_64"))))]
+mod tests;

@@ -168,34 +168,38 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         else {
             return Err(FileError::NotDirectory);
         };
-        if user.user != UserInfo::ROOT.user {
-            // XXX(jayb): Linux requires CAP_SYS_ADMIN; we let non-root mount over directories they own.
-            if !matches!(&target.permissions, PermissionCheck::ByResolver(info) if info.owner.user == user.user)
-            {
-                return Err(FileError::NotOwner);
-            }
-            // Overlay walking handles hold its namespace lock; release it before rewalking.
-            drop(target);
-            // External changes to a backing filesystem are not serialized by the resolver.
-            for len in 0..path.components.len() {
-                let components: Vec<_> =
-                    path.components[..len].iter().map(String::as_str).collect();
+        let privileged = user.user == UserInfo::ROOT.user;
+        // XXX(jayb): Linux requires CAP_SYS_ADMIN; we let non-root mount over directories they own.
+        if !privileged
+            && !matches!(&target.permissions, PermissionCheck::ByResolver(info) if info.owner.user == user.user)
+        {
+            return Err(FileError::NotOwner);
+        }
+        // Overlay walking handles hold its namespace lock; release it before rewalking.
+        drop(target);
+        if !privileged {
+            let components: Vec<_> = path.components.iter().map(String::as_str).collect();
+            for i in 0..components.len() {
                 let Resolution::Found(ResolvedTarget::Dir(ancestor)) = self
-                    .resolve_components(&context, &components)
+                    .resolve_components(&context, &components[..i])
                     .map_err(|error| file_walk_error(error.error))?
                 else {
                     return Err(FileError::NotOwner);
                 };
-                match ancestor.permissions {
-                    PermissionCheck::ByResolver(info)
-                        if info.owner.user == user.user || !info.mode.contains(Mode::SVTX) => {}
-                    _ => return Err(FileError::NotOwner),
+                if !matches!(&ancestor.permissions, PermissionCheck::ByResolver(info) if info.owner.user == user.user || !info.mode.contains(Mode::SVTX))
+                {
+                    return Err(FileError::NotOwner);
                 }
             }
         }
         let composer = composer.ok_or(FileError::NotSupported)?;
+        let pins = composer
+            .mount_pins(&path.components, &|info| {
+                Self::check_search_permission(&context, info)
+            })
+            .map_err(file_walk_error)?;
         composer
-            .mount(&path.to_absolute(), |allocator| {
+            .mount_with_pins(&path.to_absolute(), pins, |allocator| {
                 InMem::<Platform>::new_initialized(
                     [(
                         "/",

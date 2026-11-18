@@ -189,6 +189,19 @@ pub trait Backend: Send + Sync + Any {
     /// Query metadata without consuming or opening the resolved target.
     fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError>;
 
+    /// Identity of a resolved directory for protecting mountpoints. Alternate names for the
+    /// same directory must compare equal within this backend. This does not affect mount lookup.
+    fn mount_directory_id(
+        &self,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<(u64, u128), FileStatusError> {
+        if !matches!(target, ResolvedTarget::Dir(_)) {
+            return Err(FileStatusError::Io);
+        }
+        let node = self.resolved_status(target)?.node_info;
+        Ok((node.dev, node.ino.into()))
+    }
+
     /// The terminal that an open file handle refers to. A file is a terminal
     /// exactly when it refers to one.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]

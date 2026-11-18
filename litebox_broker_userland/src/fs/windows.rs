@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! Windows host file I/O directly between a file and a buffer's [`RawBytes`],
-//! with no bounce buffer, and timestamp updates.
+//! with no bounce buffer, timestamp updates, and directory identities.
 //!
 //! Only a buffer whose bytes are one contiguous part transfers directly, with
 //! one `ReadFile` or `WriteFile` given the offset in an `OVERLAPPED`: one
@@ -18,16 +18,21 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use litebox_broker_core::fs::FileType;
 use litebox_broker_core::fs::errors::SetTimesError;
 use litebox_broker_protocol::fs::{FileTimeUpdate, FileTimestamp, SetFileTimes};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_IO_PENDING};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES, ReadFile,
-    WriteFile,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileIdInfo,
+    GetFileInformationByHandleEx, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::core::BOOL;
+
+#[allow(clippy::cast_possible_truncation)]
+const ID_INFO_LENGTH: u32 = size_of::<FILE_ID_INFO>() as u32;
 
 /// Reads from `file` at `offset` directly into `buf`, from `start` to its end,
 /// with one `ReadFile`.
@@ -146,6 +151,47 @@ fn transfer(
         std::process::abort();
     }
     Err(error)
+}
+
+/// Returns the volume serial number and 128-bit file ID of the directory at
+/// `path`, without following a final reparse point.
+///
+/// These name the host directory itself rather than the spelling of `path`, so
+/// every spelling that reaches one directory, such as one differing in case or
+/// using an 8.3 short name, yields the same pair. A file system that reports no
+/// `FILE_ID_INFO` fails the query rather than falling back on a weaker
+/// identity.
+pub(super) fn directory_id(path: &Path) -> Result<(u64, u128)> {
+    // Reading attributes is the only access needed, and sharing everything keeps
+    // the probe from blocking concurrent host or guest operations.
+    let dir = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    // Check the object opened, as stat does, so a path that no longer names a
+    // directory yields no identity.
+    if super::host_file_type(&dir.metadata()?)? != FileType::Directory {
+        return Err(super::io_errors::unsupported_object());
+    }
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: `info` outlives the call, which writes at most `ID_INFO_LENGTH`
+    // bytes, its size, into it; `dir` keeps the handle open.
+    let queried = unsafe {
+        GetFileInformationByHandleEx(
+            dir.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            ID_INFO_LENGTH,
+        )
+    };
+    if queried == 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok((
+        info.VolumeSerialNumber,
+        u128::from_le_bytes(info.FileId.Identifier),
+    ))
 }
 
 fn system_time_from_timestamp(

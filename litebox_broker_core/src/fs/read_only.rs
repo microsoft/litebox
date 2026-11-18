@@ -158,6 +158,13 @@ impl<B: Backend> Backend for ReadOnly<B> {
         self.inner.resolved_status(target)
     }
 
+    fn mount_directory_id(
+        &self,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<(u64, u128), FileStatusError> {
+        self.inner.mount_directory_id(target)
+    }
+
     fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {
         self.inner.terminal(h)
     }
