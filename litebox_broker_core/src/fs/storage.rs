@@ -113,17 +113,18 @@ impl FileStorageMut for MemoryStorage {
             return Ok(0);
         }
         let end = offset.checked_add(buf.len()).ok_or(StorageError::NoSpace)?;
+        // A fault can leave some bytes copied without reporting a count. Only publish bytes
+        // after the copy succeeds, including when overwriting existing contents.
+        let mut staged =
+            crate::transfer::bounce_buffer(buf.len()).map_err(|_| StorageError::NoSpace)?;
+        buf.copy_to_slice_at(0, &mut staged)?;
         let data = self.0.to_mut();
-        let previous_len = data.len();
-        if end > previous_len {
+        if end > data.len() {
+            data.try_reserve(end - data.len())
+                .map_err(|_| StorageError::NoSpace)?;
             data.resize(end, 0);
         }
-        // XXX(jayb): a fault partway through discards the whole write rather than reporting the
-        // bytes copied so far as a short count, as `FileStorageMut::write_at` permits.
-        if let Err(fault) = buf.copy_to_slice_at(0, &mut data[offset..end]) {
-            data.truncate(previous_len);
-            return Err(fault.into());
-        }
+        data[offset..end].copy_from_slice(&staged);
         Ok(buf.len())
     }
 
@@ -133,5 +134,22 @@ impl FileStorageMut for MemoryStorage {
             data => data.to_mut().resize(len, 0),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::FaultingBuffer;
+
+    #[test]
+    fn memory_storage_publishes_only_completed_writes() {
+        let initial = b"hello".as_slice();
+        let mut storage = MemoryStorage::new(Cow::Borrowed(initial));
+        let result = storage.write_at(3, &FaultingBuffer::new(4, 2));
+        assert!(matches!(result, Err(StorageError::Fault)));
+        assert_eq!(storage.static_bytes(), Some(initial));
+        assert_eq!(storage.write_at(3, &b"pful".as_slice()).unwrap(), 4);
+        assert_eq!(&*storage.0, b"helpful");
     }
 }

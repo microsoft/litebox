@@ -14,7 +14,7 @@
 //! subject that opened `ptmx` and keeps the descriptor its owner sets.
 
 use alloc::string::{String, ToString};
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::authority::Principal;
@@ -35,7 +35,9 @@ use super::errors::{
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SetFileTimes};
 use crate::descriptor::{FileKind, SecurityDescriptor};
-use crate::pseudo_terminal::{ManagerFile, PseudoTerminal, PseudoTerminals, SubsidiaryFile};
+use crate::pseudo_terminal::{
+    ManagerFile, PseudoTerminal, PseudoTerminals, SubsidiaryFile, SubsidiaryMetadata,
+};
 use crate::random::RandomProvider;
 use crate::readiness::{ReadinessRegistration, ReadinessSource};
 use crate::stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream};
@@ -465,8 +467,7 @@ impl Devices {
                 DeviceFile::Subsidiary {
                     index,
                     file,
-                    pair: Arc::downgrade(&pair),
-                    descriptor: pair.descriptor(),
+                    metadata: pair.metadata(),
                 }
             }
         };
@@ -545,10 +546,7 @@ enum DeviceFile {
     Subsidiary {
         index: u32,
         file: Option<Arc<SubsidiaryFile>>,
-        /// The pair, which a path-only handle does not keep, lest it keep the index.
-        pair: Weak<PseudoTerminal>,
-        /// The subsidiary's descriptor when opened, for once the pair is gone.
-        descriptor: SecurityDescriptor,
+        metadata: Arc<SubsidiaryMetadata>,
     },
 }
 
@@ -832,14 +830,8 @@ impl Backend for Devices {
                 DeviceFile::Device(device) => device.file_status(self),
                 DeviceFile::Manager(_) => Device::Ptmx.file_status(self),
                 DeviceFile::Subsidiary {
-                    index,
-                    pair,
-                    descriptor,
-                    ..
-                } => match pair.upgrade() {
-                    Some(pair) => self.subsidiary_status(*index, &pair.descriptor()),
-                    None => self.subsidiary_status(*index, descriptor),
-                },
+                    index, metadata, ..
+                } => self.subsidiary_status(*index, &metadata.descriptor()),
             }),
             HandleRef::Dir(h) => Ok(FileStatus {
                 file_type: FileType::Directory,

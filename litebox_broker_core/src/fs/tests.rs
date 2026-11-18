@@ -2070,8 +2070,8 @@ mod tar_ro {
             &[
                 ArchiveEntry::dir("./", 0o755, root),
                 ArchiveEntry::file("./after/file", 0o644, b""),
-                ArchiveEntry::dir("./after/", 0o750, root),
-                ArchiveEntry::dir("/before", 0o700, 1234),
+                ArchiveEntry::dir("./after/", 0o2750, root),
+                ArchiveEntry::dir("/before", 0o1700, 1234),
                 ArchiveEntry::file("/before/file", 0o644, b""),
                 ArchiveEntry::dir("overflow", 0o555, 70000),
                 ArchiveEntry::file("implicit/file", 0o644, b""),
@@ -2088,8 +2088,8 @@ mod tar_ro {
         };
         let ids = |id| (Some(id), Some(id));
         assert_eq!(status("/"), (0o755, ids(0)));
-        assert_eq!(status("/after"), (0o750, ids(0)));
-        assert_eq!(status("/before"), (0o700, ids(1234)));
+        assert_eq!(status("/after"), (0o2750, ids(0)));
+        assert_eq!(status("/before"), (0o1700, ids(1234)));
         // Ids beyond 16 bits are kept, not mapped to an overflow id.
         assert_eq!(status("/overflow"), (0o555, ids(70000)));
         assert_eq!(status("/implicit"), (0o777, ids(USER.user.into())));
@@ -4700,6 +4700,9 @@ mod credentials {
         );
         let fs = with_devices(device_security().with_terminals(Some(tty), TERMINAL));
         let (manager, path) = open_terminal(&fs, &alice);
+        let path_handle = fs
+            .open(alice.caller(), &path, OFlags::PATH, Mode::empty())
+            .unwrap();
         let subsidiary = fs
             .open(alice.caller(), &path, OFlags::RDWR, Mode::empty())
             .unwrap();
@@ -4746,6 +4749,14 @@ mod credentials {
             Err(ChmodError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert_eq!(fs.handle_status(&subsidiary).unwrap().mode, TERMINAL);
+        drop(subsidiary);
+        let (_replacement, replacement_path) = open_terminal(&fs, &bob);
+        assert_eq!(path, replacement_path);
+        let final_status = fs.handle_status(&path_handle).unwrap();
+        assert_eq!(
+            (final_status.owner, final_status.group),
+            owners(posix(ALICE))
+        );
     }
 
     #[test]
@@ -5281,5 +5292,234 @@ mod credentials {
             .unwrap();
         assert_eq!(fs.handle_status(&entry).unwrap().size, 0);
         assert_eq!(status(&fs, "/truncated").0, ALL);
+    }
+
+    #[test]
+    fn overlay_directory_handles_never_act_on_a_replacement() {
+        use crate::fs::FileType;
+        use crate::fs::backend::{
+            CreationMetadata, DirHandle, HandleRef, Resolution, ResolvedTarget, mode_descriptor,
+        };
+        use crate::fs::errors::ReadDirError;
+        use alloc::string::String;
+        use alloc::vec::Vec;
+
+        let allocators = InodeAllocators::new();
+        let backend = Overlay::<TestPlatform>::new(
+            InMem::<TestPlatform>::new_initialized(
+                [("/", dir(ALL, posix(CAROL)))],
+                allocators.next(),
+            ),
+            InMem::<TestPlatform>::new_initialized(
+                [
+                    ("/lower", dir(ALL, posix(CAROL))),
+                    ("/lower/old", file(ALL, posix(CAROL))),
+                ],
+                allocators.next(),
+            ),
+            allocators.next(),
+        );
+        let metadata = |file_type| {
+            let (owner, group) = owners(posix(CAROL));
+            CreationMetadata::new(mode_descriptor(file_type, ALL, owner, group))
+        };
+        let open = |name: &str| {
+            let Resolution::Found(ResolvedTarget::Dir(dir)) = backend
+                .resolve(backend.root().unwrap(), &[name], &|_| Ok(()))
+                .unwrap()
+            else {
+                panic!("expected a directory");
+            };
+            backend.open_dir(dir, OFlags::RDONLY).unwrap()
+        };
+        let names = |dir: &DirHandle| -> Vec<String> {
+            let entries = backend.list_dir_at(dir.clone()).unwrap();
+            entries.into_iter().map(|entry| entry.name).collect()
+        };
+        let root = backend
+            .open_dir(backend.root().unwrap(), OFlags::PATH)
+            .unwrap();
+
+        // Copying a directory up keeps it the one its handles refer to.
+        let lower = open("lower");
+        let identity = backend.status(HandleRef::Dir(&lower)).unwrap().node_info;
+        backend
+            .create_file_at(
+                backend.walking_dir_at(&lower).unwrap(),
+                "new",
+                metadata(FileType::RegularFile),
+            )
+            .unwrap();
+        assert_eq!(names(&lower), ["new", "old"]);
+        assert_eq!(
+            backend.status(HandleRef::Dir(&lower)).unwrap().node_info,
+            identity
+        );
+
+        let created = backend
+            .mkdir_at(
+                backend.root().unwrap(),
+                "dir",
+                metadata(FileType::Directory),
+            )
+            .unwrap();
+        let opened = open("dir");
+        backend
+            .rename_at(root.clone(), "dir", root.clone(), "moved")
+            .unwrap();
+        backend
+            .mkdir_at(
+                backend.root().unwrap(),
+                "dir",
+                metadata(FileType::Directory),
+            )
+            .unwrap();
+        backend
+            .create_file_at(
+                backend.walking_dir_at(&open("dir")).unwrap(),
+                "replacement",
+                metadata(FileType::RegularFile),
+            )
+            .unwrap();
+        for stale in [created, opened] {
+            assert!(matches!(
+                backend.list_dir_at(stale.clone()),
+                Err(ReadDirError::Io)
+            ));
+            assert!(matches!(
+                backend.status(HandleRef::Dir(&stale)),
+                Err(FileStatusError::Io)
+            ));
+            assert!(backend.walking_dir_at(&stale).is_none());
+            assert!(matches!(
+                backend.rename_at(stale, "replacement", root.clone(), "taken"),
+                Err(RenameError::PathError(PathError::NoSuchFileOrDirectory))
+            ));
+        }
+        assert_eq!(names(&open("dir")), ["replacement"]);
+        assert_eq!(names(&open("moved")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn overlays_refuse_subjects_directories_that_a_self_enforcing_lower_merges_into() {
+        let overlay = || {
+            let allocators = InodeAllocators::new();
+            Overlay::<TestPlatform>::new(
+                InMem::<TestPlatform>::new_initialized(
+                    [
+                        ("/", dir(ALL, posix(CAROL))),
+                        ("/dev", dir(ALL, posix(CAROL))),
+                        ("/home", dir(ALL, posix(CAROL))),
+                    ],
+                    allocators.next(),
+                ),
+                Composer::<TestPlatform>::builder()
+                    .mount("/dev", |allocator| {
+                        Devices::new(
+                            allocator,
+                            Arc::new(TestStdioProvider::default()),
+                            Arc::new(TestRandomProvider),
+                        )
+                    })
+                    .build()
+                    .unwrap(),
+                allocators.next(),
+            )
+        };
+        let read_dir = OFlags::RDONLY | OFlags::DIRECTORY;
+
+        let carol = Credentials::new(CAROL);
+        let fs = Resolver::<TestPlatform, _>::with_credentials(overlay(), profile());
+        let root = fs
+            .open(carol.caller(), "/", read_dir, Mode::empty())
+            .unwrap();
+        assert!(
+            fs.read_dir(&root)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == "dev")
+        );
+        create(&fs, &carol, "/home/file", ALL);
+        // The upper `/dev` describes none of the names that the devices backend contributes.
+        assert!(matches!(
+            fs.open(carol.caller(), "/dev", read_dir, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSearchPerms))
+        ));
+        assert!(matches!(
+            fs.mkdir(carol.caller(), "/dev/new", ALL),
+            Err(MkdirError::PathError(PathError::NoSearchPerms))
+        ));
+        assert!(matches!(
+            fs.rmdir(carol.caller(), "/dev"),
+            Err(RmdirError::PathError(PathError::NoSearchPerms))
+        ));
+
+        let legacy = Resolver::<TestPlatform, _>::new(overlay());
+        let user = posix(CAROL);
+        let dev = legacy.open(user, "/dev", read_dir, Mode::empty()).unwrap();
+        assert!(
+            legacy
+                .read_dir(&dev)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == "null")
+        );
+        legacy
+            .open(user, "/dev/null", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        legacy.mkdir(user, "/dev/new", ALL).unwrap();
+    }
+
+    #[test]
+    fn overlays_copy_up_only_to_change_an_object() {
+        use crate::fs::read_only::ReadOnly;
+
+        // Copying up into this upper fails.
+        let overlay = || {
+            let allocators = InodeAllocators::new();
+            Overlay::<TestPlatform>::new(
+                ReadOnly::new(InMem::<TestPlatform>::new_initialized(
+                    [("/", dir(ALL, posix(CAROL)))],
+                    allocators.next(),
+                )),
+                InMem::<TestPlatform>::new_initialized(
+                    [
+                        ("/dir", dir(ALL, posix(CAROL))),
+                        ("/dir/file", file(ALL, posix(CAROL))),
+                    ],
+                    allocators.next(),
+                ),
+                allocators.next(),
+            )
+        };
+        let read_only_append = OFlags::RDONLY | OFlags::APPEND;
+
+        let carol = Credentials::new(CAROL);
+        let fs = Resolver::<TestPlatform, _>::with_credentials(overlay(), profile());
+        fs.open(carol.caller(), "/dir/file", read_only_append, Mode::empty())
+            .unwrap();
+        fs.chmod(carol.caller(), "/dir/file", ALL).unwrap();
+        fs.chmod(carol.caller(), "/dir", ALL).unwrap();
+        fs.chown(carol.caller(), "/dir/file", Some(CAROL), Some(CAROL))
+            .unwrap();
+        for flags in [OFlags::WRONLY, OFlags::RDONLY | OFlags::TRUNC] {
+            assert!(matches!(
+                fs.open(carol.caller(), "/dir/file", flags, Mode::empty()),
+                Err(OpenError::ReadOnlyFileSystem)
+            ));
+        }
+        assert!(matches!(
+            fs.chmod(carol.caller(), "/dir/file", Mode::RWXU),
+            Err(ChmodError::ReadOnlyFileSystem)
+        ));
+
+        let legacy = Resolver::<TestPlatform, _>::new(overlay());
+        legacy
+            .open(posix(CAROL), "/dir/file", read_only_append, Mode::empty())
+            .unwrap();
+        assert!(matches!(
+            legacy.open(posix(CAROL), "/dir/file", OFlags::WRONLY, Mode::empty()),
+            Err(OpenError::ReadOnlyFileSystem)
+        ));
     }
 }

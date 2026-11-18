@@ -65,8 +65,6 @@ struct State {
     subsidiary_closed: bool,
     manager_watchers: ReadinessWatchers,
     subsidiary_watchers: ReadinessWatchers,
-    /// The subsidiary's descriptor, which opens of it are admitted against.
-    descriptor: SecurityDescriptor,
 }
 
 impl State {
@@ -121,6 +119,16 @@ pub(crate) struct PseudoTerminal {
     /// The PID namespace the subsidiary belongs to.
     owner: TerminalOwner,
     state: Mutex<State>,
+    metadata: Arc<SubsidiaryMetadata>,
+}
+
+/// Path handles retain this metadata without retaining the pair or its index.
+pub(crate) struct SubsidiaryMetadata(Mutex<SecurityDescriptor>);
+
+impl SubsidiaryMetadata {
+    pub(crate) fn descriptor(&self) -> SecurityDescriptor {
+        self.0.lock().clone()
+    }
 }
 
 impl PseudoTerminal {
@@ -128,6 +136,7 @@ impl PseudoTerminal {
         Self {
             index,
             owner: TerminalOwner::default(),
+            metadata: Arc::new(SubsidiaryMetadata(Mutex::new(descriptor))),
             state: Mutex::new(State {
                 engine: TerminalEngine::default(),
                 output: VecDeque::new(),
@@ -139,7 +148,6 @@ impl PseudoTerminal {
                 subsidiary_closed: false,
                 manager_watchers: ReadinessWatchers::default(),
                 subsidiary_watchers: ReadinessWatchers::default(),
-                descriptor,
             }),
         }
     }
@@ -164,7 +172,7 @@ impl PseudoTerminal {
         if !state.manager_open {
             return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
         }
-        admit(&state.descriptor)?;
+        admit(&self.metadata.0.lock())?;
         if state.locked {
             return Err(OpenError::Io);
         }
@@ -178,7 +186,11 @@ impl PseudoTerminal {
 
     /// The subsidiary's descriptor.
     pub(crate) fn descriptor(&self) -> SecurityDescriptor {
-        self.lock().descriptor.clone()
+        self.metadata.descriptor()
+    }
+
+    pub(crate) fn metadata(&self) -> Arc<SubsidiaryMetadata> {
+        Arc::clone(&self.metadata)
     }
 
     /// Replaces the subsidiary's descriptor with what `update` computes from
@@ -189,11 +201,12 @@ impl PseudoTerminal {
         update: impl FnOnce(&SecurityDescriptor) -> Result<SecurityDescriptor, E>,
         hung_up: E,
     ) -> Result<(), E> {
-        let mut state = self.lock();
+        let state = self.lock();
         if !state.manager_open {
             return Err(hung_up);
         }
-        state.descriptor = update(&state.descriptor)?;
+        let mut descriptor = self.metadata.0.lock();
+        *descriptor = update(&descriptor)?;
         Ok(())
     }
 

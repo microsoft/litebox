@@ -489,7 +489,7 @@ impl TarIndex {
             litebox_util_log::warn!(path = path; "skipping tar path containing `..`");
             return;
         };
-        let mode = Mode::from_bits_truncate(u16::try_from(entry.mode & 0o777).unwrap());
+        let mode = Mode::from_bits_truncate(u16::try_from(entry.mode & 0o7777).unwrap());
         let owner = Owner {
             user: u32::try_from(entry.uid).map_or(Principal::UNMAPPED, Principal::posix_user),
             group: u32::try_from(entry.gid).map_or(Principal::UNMAPPED, Principal::posix_group),

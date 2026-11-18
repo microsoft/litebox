@@ -120,10 +120,20 @@ pub struct OverlayResolvedFile<'a, Platform: RawSyncPrimitivesProvider> {
     locked: NamespaceGuard<'a, Platform>,
 }
 
+/// An owned handle to a directory opened through the overlay.
+///
+/// Directories are reached through their logical path, so every operation re-resolves `path`
+/// under the namespace lock and refuses once that path holds a directory other than the one
+/// opened: a handle never acts on a replacement.
+// XXX(jayb): a handle to a directory that was renamed away refuses rather than following it.
 #[derive(Clone)]
 pub struct OverlayDir {
-    // XXX(jayb): directory handles are path-based and go stale on directory rename.
     path: Vec<String>,
+    /// The overlay identity of the directory opened, which copying it up preserves.
+    node: NodeInfo,
+    /// The owning layer's handle to that directory, keeping its node (and thus the identity it
+    /// maps to) from being reused while this handle exists.
+    _pinned: DirHandle,
 }
 
 /// An owned handle to a file opened through the overlay.
@@ -294,6 +304,13 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             .map_err(file_status_to_open_error)?;
         let permissions = layered_permissions(dir.permissions(), &status);
         drop(dir);
+        let permissions = if self.lowers_broker_owned(&resolved)? {
+            permissions
+        } else {
+            // Legacy resolvers check the owning layer's metadata as before; resolvers that
+            // authorize subjects refuse to search, list, or change the merged directory.
+            PermissionCheck::ByResolver(PermissionInfo::reported_posix(&status, false))
+        };
         Ok(ScopedDir::from_typed::<Self>(
             OverlayWalkingDir {
                 path,
@@ -708,9 +725,74 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         }
     }
 
+    /// Whether every lower directory merging into `dir` is broker-owned. The overlay describes a
+    /// merged directory by its owning layer's metadata alone, so names and types that a
+    /// self-enforcing lower contributes would reach subjects without any check of that lower's
+    /// own permissions.
+    fn lowers_broker_owned(&self, dir: &ResolvedDir) -> Result<bool, OpenError> {
+        for (lower, handle) in self.lowers.iter().zip(&dir.lowers) {
+            let Some(handle) = handle else {
+                continue;
+            };
+            // Only one scope of a layer at a time: re-entering a nested overlay would deadlock.
+            let scoped = lower.walking_dir_at(handle).ok_or(OpenError::Io)?;
+            if broker_descriptor(&scoped.permissions).is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The status of the directory `dir`, with the overlay's node identity.
+    fn dir_status(&self, dir: &ResolvedDir) -> Result<FileStatus, FileStatusError> {
+        let (layer, backend, handle) = self.owning_dir(dir).ok_or(FileStatusError::Io)?;
+        let status = backend.status(HandleRef::Dir(handle))?;
+        Ok(self.map_status(status, layer))
+    }
+
+    /// The directory that `dir` was opened on, as it is now resolved, and its status; fails once
+    /// its path no longer leads to that directory (it was removed, replaced, or renamed away).
+    /// `_locked` keeps the result current.
+    fn opened_dir(
+        &self,
+        _locked: &NamespaceGuard<'_, Platform>,
+        dir: &OverlayDir,
+    ) -> Result<(ResolvedDir, FileStatus), OpenError> {
+        let resolved = self.resolve_dir(&dir.path)?;
+        let status = self
+            .dir_status(&resolved)
+            .map_err(file_status_to_open_error)?;
+        if status.node_info != dir.node {
+            return Err(PathError::NoSuchFileOrDirectory.into());
+        }
+        Ok((resolved, status))
+    }
+
+    /// A handle to the directory `resolved` at `path`, pinning its current identity.
+    fn dir_handle(
+        &self,
+        path: Vec<String>,
+        resolved: &ResolvedDir,
+    ) -> Result<DirHandle, OpenError> {
+        let (_, _, pinned) = self.owning_dir(resolved).ok_or(OpenError::Io)?;
+        let node = self
+            .dir_status(resolved)
+            .map_err(file_status_to_open_error)?
+            .node_info;
+        Ok(DirHandle::from_typed::<Self>(OverlayDir {
+            path,
+            node,
+            _pinned: pinned.clone(),
+        }))
+    }
+
     /// The broker-owned descriptor of the overlay directory `dir`, as the layer owning it stores
-    /// it; directories whose layer enforces its own permissions have none.
+    /// it. Directories whose layer enforces its own permissions have none, nor do those that such
+    /// a lower merges into (see [`Self::lowers_broker_owned`]).
     fn dir_descriptor(&self, dir: &ResolvedDir) -> Result<SecurityDescriptor, OpenError> {
+        if !self.lowers_broker_owned(dir)? {
+            return Err(PathError::NoSearchPerms.into());
+        }
         let (_, backend, handle) = self.owning_dir(dir).ok_or(OpenError::Io)?;
         let dir = ResolvedTarget::Dir(backend.walking_dir_at(handle).ok_or(OpenError::Io)?);
         broker_descriptor(dir.permissions())
@@ -907,18 +989,31 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         } else {
             Ok(())
         };
-        if let Err(error) = cleared {
-            let _rollback_marker = self.clear_markers(&locked, &child);
-            let _rollback_dir = self
-                .upper
-                .walking_dir_at(&upper)
-                .ok_or(RmdirError::Io)
-                .and_then(|dir| self.upper.rmdir_at(dir, name));
-            return Err(error);
-        }
+        let status = cleared.and_then(|()| {
+            self.upper
+                .status(HandleRef::Dir(&child))
+                .map_err(|_| MkdirError::Io)
+        });
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                let _rollback_marker = self.clear_markers(&locked, &child);
+                let _rollback_dir = self
+                    .upper
+                    .walking_dir_at(&upper)
+                    .ok_or(RmdirError::Io)
+                    .and_then(|dir| self.upper.rmdir_at(dir, name));
+                return Err(error);
+            }
+        };
 
         path.push(String::from(name));
-        Ok(DirHandle::from_typed::<Self>(OverlayDir { path }))
+        let node = self.map_node(&mut self.state.lock().ids, None, status.node_info);
+        Ok(DirHandle::from_typed::<Self>(OverlayDir {
+            path,
+            node,
+            _pinned: child,
+        }))
     }
 
     /// Unlink `name` from `dir`, once `authorize` (if any) allows the removal.
@@ -1054,10 +1149,16 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         }) {
             return Err(PathError::InvalidPathname.into());
         }
-        let old_path = old_dir.into_typed::<Self>().path;
-        let new_path = new_dir.into_typed::<Self>().path;
+        let old_handle = old_dir.into_typed::<Self>();
+        let new_handle = new_dir.into_typed::<Self>();
+        let (old_path, new_path) = (&old_handle.path, &new_handle.path);
         let locked = self.namespace.lock();
-        let old_dir = self.resolve_dir(&old_path).map_err(open_to_rename_error)?;
+        let (old_dir, _) = self
+            .opened_dir(&locked, &old_handle)
+            .map_err(open_to_rename_error)?;
+        let (new_dir, _) = self
+            .opened_dir(&locked, &new_handle)
+            .map_err(open_to_rename_error)?;
         let source = self
             .entry(&old_dir, old_name)
             .map_err(open_to_rename_error)?
@@ -1076,7 +1177,6 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         if old_path.starts_with(&destination_path) {
             return Err(RenameError::NotEmpty);
         }
-        let new_dir = self.resolve_dir(&new_path).map_err(open_to_rename_error)?;
         let destination = self
             .entry(&new_dir, new_name)
             .map_err(open_to_rename_error)?;
@@ -1153,7 +1253,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         }
         let old_upper = old_dir.upper.ok_or(RenameError::Io)?;
         let new_upper = self
-            .ensure_upper_dir(&locked, &new_path)
+            .ensure_upper_dir(&locked, new_path)
             .map_err(open_to_rename_error)?;
         if source.lower.is_some() {
             // XXX(jayb): hide the old lower entry before moving its upper replacement; not atomic,
@@ -1190,8 +1290,10 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 .resolved_status(&target)
                 .map_err(file_status_to_open_error)?;
             let truncate = !flags.contains(OFlags::PATH) && flags.contains(OFlags::TRUNC);
+            // As in Linux overlayfs, only opens that can change the contents copy up: a read-only
+            // append open cannot write.
             let writing = !flags.contains(OFlags::PATH)
-                && flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::APPEND | OFlags::TRUNC);
+                && flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::TRUNC);
             if let Some(checks) = checks
                 && writing
             {
@@ -1317,7 +1419,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     /// which is what makes copy-up invisible: the object keeps its inode.
     ///
     /// `upper_file` is the new upper handle, which lets lower-backed handles follow the contents;
-    /// directories are addressed by path, so they have nothing to follow.
+    /// directory handles re-resolve their path, so they have nothing to follow.
     fn bind_copy_up(
         &self,
         layer: usize,
@@ -1759,14 +1861,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         } = dir.into_typed::<Self>();
         let (_, backend, handle) = self.owning_dir(&resolved).ok_or(OpenError::Io)?;
         backend.open_dir(backend.walking_dir_at(handle).ok_or(OpenError::Io)?, flags)?;
-        Ok(DirHandle::from_typed::<Self>(OverlayDir { path }))
+        self.dir_handle(path, &resolved)
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ScopedDir<'a>> {
         let locked = self.namespace.lock();
-        let path = dir.get_typed::<Self>().path.clone();
-        let resolved = self.resolve_dir(&path).ok()?;
-        self.scoped_dir(path, resolved, locked).ok()
+        let dir = dir.get_typed::<Self>();
+        let (resolved, _) = self.opened_dir(&locked, dir).ok()?;
+        self.scoped_dir(dir.path.clone(), resolved, locked).ok()
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
@@ -1774,9 +1876,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        let path = handle.into_typed::<Self>().path;
-        let _locked = self.namespace.lock();
-        let resolved = self.resolve_dir(&path).map_err(|_| ReadDirError::Io)?;
+        let locked = self.namespace.lock();
+        let (resolved, _) = self
+            .opened_dir(&locked, handle.get_typed::<Self>())
+            .map_err(|_| ReadDirError::Io)?;
         self.entries(&resolved).map_err(|_| ReadDirError::Io)
     }
 
@@ -1847,13 +1950,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 })
             }
             HandleRef::Dir(handle) => {
-                let path = &handle.get_typed::<Self>().path;
-                let _locked = self.namespace.lock();
-                let resolved = self.resolve_dir(path).map_err(|_| FileStatusError::Io)?;
-                let (layer, backend, handle) =
-                    self.owning_dir(&resolved).ok_or(FileStatusError::Io)?;
-                let status = backend.status(HandleRef::Dir(handle))?;
-                Ok(self.map_status(status, layer))
+                let locked = self.namespace.lock();
+                let (_, status) = self
+                    .opened_dir(&locked, handle.get_typed::<Self>())
+                    .map_err(|_| FileStatusError::Io)?;
+                Ok(status)
             }
         }
     }
@@ -2078,7 +2179,16 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             return Err(SetSecurityError::IsSymlink);
         }
         // As in `set_times_checked`.
-        update(broker_descriptor(target.permissions()).ok_or(SetSecurityError::Io)?)?;
+        let current = broker_descriptor(target.permissions()).ok_or(SetSecurityError::Io)?;
+        let updated = update(current)?;
+        let in_upper = match &target {
+            ResolvedTarget::Dir(dir) => dir.get_typed::<Self>().resolved.upper.is_some(),
+            ResolvedTarget::File(file) => file.get_typed::<Self>().layer.is_none(),
+        };
+        if !in_upper && updated == *current {
+            // Nothing to store, so a lower object needs no upper copy.
+            return Ok(());
+        }
         self.with_upper(target, |target| self.upper.update_security(target, update))
             .map_err(|error| match error {
                 OpenError::PathError(error) => SetSecurityError::PathError(error),
