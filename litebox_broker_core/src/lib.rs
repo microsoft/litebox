@@ -319,7 +319,8 @@ impl BrokerCoreLimits {
         }
     }
 
-    /// Returns these limits with an explicit limit on files in host shared memory.
+    /// Sets separate limits, of the same size, for host-shared files and keyed segments.
+    /// A zero limit disables segment creation.
     #[must_use]
     pub const fn with_shared_file_limit(self, max_shared_files: usize) -> Self {
         Self {

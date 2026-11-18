@@ -608,6 +608,9 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::CreateChildrenPidNamespace(options) => process
             .create_children_pid_namespace(options)
             .map(|()| ProcessResponse::CreateChildrenPidNamespace),
+        ProcessRequest::CreateNamespaces(request) => process
+            .create_namespaces(request)
+            .map(|()| ProcessResponse::CreateNamespaces),
         ProcessRequest::DuplicateObjectsToChild(request) => {
             return duplicate_objects_to_child(process, request, shared_buffers, readiness_sink)
                 .map(|()| ProcessResponse::DuplicateObjectsToChild);

@@ -9,14 +9,15 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessRequest, ProcessResponse,
 };
 use litebox_broker_protocol::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostName, HostNameKind,
-    HostNameSizes, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_HOST_NAME_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
-    OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
-    SetParentExitSignalRequest, SetResourceLimitRequest, StartChildProcessRequest,
-    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostName, HostNameKind, HostNameSizes, HostNames,
+    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
+    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, OpenProcessHandleRequest,
+    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
+    ResourceKind, ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest,
+    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    ThreadInfo, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
@@ -303,6 +304,21 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ) -> Result<(), Channel::Error> {
         match self.request_process(ProcessRequest::CreateChildrenPidNamespace(options))? {
             ProcessResponse::CreateChildrenPidNamespace => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Applies all the namespace changes in one broker request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn create_namespaces(
+        &self,
+        request: CreateNamespacesRequest,
+    ) -> Result<(), Channel::Error> {
+        match self.request_process(ProcessRequest::CreateNamespaces(request))? {
+            ProcessResponse::CreateNamespaces => Ok(()),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

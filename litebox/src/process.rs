@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
@@ -116,6 +116,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     ) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.create_children_pid_namespace(options)?)
+    }
+
+    /// Applies all the requested namespace changes or leaves them unchanged.
+    pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.create_namespaces(request)?)
     }
 
     /// Reports this process's final termination status, which its parent

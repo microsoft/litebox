@@ -59,30 +59,13 @@ where
     vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
 }
 
-/// Exclusive access to an address space. SysV attachments that a change ends are released
-/// only after the lock is dropped, so the release hook's service requests never hold up other
-/// mapping changes or page faults, and the hook may use this manager.
+/// Exclusive access to an address space. Publish SysV count changes under the lock so
+/// concurrent edits cannot reorder deltas or leave stale broker counts for fork to inherit.
 struct VmemWriteGuard<'a, Platform, const ALIGN: usize>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
-    // Fields drop in order: the lock is released before `released` runs the hook.
     vmem: RwLockWriteGuard<'a, Platform, Vmem<Platform, ALIGN>>,
-    released: PendingSysvReleases,
-}
-
-#[derive(Default)]
-struct PendingSysvReleases {
-    hook: Option<alloc::sync::Arc<dyn Fn(u32) + Send + Sync>>,
-    segments: Vec<u32>,
-}
-
-impl Drop for PendingSysvReleases {
-    fn drop(&mut self) {
-        if let Some(hook) = &self.hook {
-            self.segments.iter().for_each(|&segment| hook(segment));
-        }
-    }
 }
 
 impl<Platform, const ALIGN: usize> Drop for VmemWriteGuard<'_, Platform, ALIGN>
@@ -90,11 +73,11 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     fn drop(&mut self) {
-        if !self.vmem.sysv_released.is_empty() {
-            self.released = PendingSysvReleases {
-                hook: self.vmem.sysv_release.clone(),
-                segments: core::mem::take(&mut self.vmem.sysv_released),
-            };
+        let deltas = core::mem::take(&mut self.vmem.sysv_deltas);
+        if let Some(adjust) = &self.vmem.sysv_adjust {
+            for (segment, delta) in deltas.into_iter().filter(|(_, delta)| *delta != 0) {
+                adjust(segment, delta);
+            }
         }
     }
 }
@@ -127,7 +110,6 @@ where
     fn write(&self) -> VmemWriteGuard<'_, Platform, ALIGN> {
         VmemWriteGuard {
             vmem: self.vmem.write(),
-            released: PendingSysvReleases::default(),
         }
     }
 }
@@ -154,11 +136,13 @@ where
         self.write().platform = platform;
     }
 
-    /// Sets the release hook for SysV attachments in this address space. A native clone
+    /// Sets the broker hook for VMA count changes in this address space. A native clone
     /// must bind its own process's hook before changing inherited mappings.
-    /// The hook runs after the change that ended the attachment releases the mapping lock.
-    pub fn set_sysv_release(&self, release: impl Fn(u32) + Send + Sync + 'static) {
-        self.write().sysv_release = Some(alloc::sync::Arc::new(release));
+    ///
+    /// The hook applies a signed, nonzero count delta synchronously, under the VMA write
+    /// lock. It must not reenter this manager, and a failure must not be silently ignored.
+    pub fn set_sysv_adjust(&self, adjust: impl Fn(u32, i64) + Send + Sync + 'static) {
+        self.write().sysv_adjust = Some(alloc::sync::Arc::new(adjust));
     }
 
     /// Whether this address space has any live SysV attachments.
@@ -1149,8 +1133,20 @@ where
     }
 
     /// Maps one broker-authorized SysV attachment. A non-null address must be available
-    /// exactly as requested. On failure the caller retains responsibility for broker rollback.
-    pub fn attach_sysv(
+    /// exactly as requested. `confirm` runs under the mapping write lock, after mapping
+    /// but before registering the attachment. It must not reenter this manager. On
+    /// failure the caller retains responsibility for broker rollback.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the platform cannot unmap a mapping whose confirmation failed.
+    ///
+    /// # Safety
+    ///
+    /// If confirmation fails, the newly mapped range is unmapped. The caller must
+    /// prevent host users (including Rust borrows) that would require it to stay mapped
+    /// from accessing that range before confirmation.
+    pub unsafe fn attach_sysv(
         &self,
         addr: Option<usize>,
         len: usize,
@@ -1159,6 +1155,7 @@ where
             litebox::platform::page_mgmt::SharedObjectOf<Platform, PAGE_SIZE>,
         >,
         id: u32,
+        confirm: impl FnOnce() -> Result<(), Errno>,
     ) -> Result<UserPtrMut<u8>, Errno>
     where
         Platform: litebox::platform::SharedObjectProvider<PAGE_SIZE>,
@@ -1179,7 +1176,7 @@ where
         let (flags, addr, length, permissions) =
             Self::mmap_arguments(addr, len, prot, flags, &MmapPlacement::GUEST)?;
         let mut vmem = self.write();
-        if vmem.sysv_release.is_none() {
+        if vmem.sysv_adjust.is_none() {
             return Err(Errno::ENOSYS);
         }
         // SAFETY: shmat never replaces mappings, and vmem holds its lock until the limits
@@ -1197,13 +1194,26 @@ where
             error => error.into(),
         })?;
         let base = ptr.as_usize();
+        if let Err(error) = confirm() {
+            let range = PageRange::new(base, base + len).unwrap();
+            // SAFETY: The caller excludes host users until confirmation completes.
+            unsafe { vmem.remove_mapping(range) }.expect("failed to roll back unconfirmed shmat");
+            return Err(error);
+        }
         vmem.register_sysv(base..base + len, id, readonly);
         Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr))
     }
 
     /// Detaches the remaining pages of a SysV attachment originally placed at `base`.
-    pub fn detach_sysv(&self, base: usize) -> Result<(), Errno> {
-        self.write().detach_sysv(base)
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no surviving fragment of the selected attachment is in use
+    /// by a Rust borrow or other host operation that requires the mapping to remain valid.
+    /// Guest permission to detach and the mapping write lock do not establish this.
+    pub unsafe fn detach_sysv(&self, base: usize) -> Result<(), Errno> {
+        // SAFETY: The caller excludes host users of every selected fragment.
+        unsafe { self.write().detach_sysv(base) }
     }
 
     /// Handle syscall `msync`.

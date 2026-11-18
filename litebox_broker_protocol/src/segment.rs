@@ -26,7 +26,7 @@ wire_struct! {
         pub creator_pid: u32,
         /// Last attaching/detaching PID, or zero when unknown or not visible.
         pub last_pid: u32,
-        /// Total outstanding attachments in all processes.
+        /// Total confirmed attachments in all processes.
         pub attachments: u64,
         /// Creation or most recent metadata change.
         pub created: u64,
@@ -34,10 +34,18 @@ wire_struct! {
         pub attached: u64,
         /// Most recent detach.
         pub detached: u64,
-        /// Whether deletion is pending the last detach.
+        /// Whether deletion is pending the last detach or provisional attachment.
         pub removed: bool,
     }
 }
+
+/// One provisional attachment, scoped to the requesting process.
+///
+/// This is distinct from the host handle delivery token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SegmentAttachId(pub u64);
+
+wire_newtype!(SegmentAttachId: u64);
 
 wire_enum! {
     /// Operations on the caller's segment namespace or existing attachments.
@@ -55,9 +63,9 @@ wire_enum! {
         Status { id: u32 },
         /// Changes owner and permission bits, preserving creator identity.
         Set { id: u32, owner: FileUser, mode: u16 },
-        /// Unpublishes the key and deletes the object once no attachments remain.
+        /// Unpublishes the key and deletes the object once no attachments or reservations remain.
         Delete { id: u32 },
-        /// Delivers the backing object and records one attachment on success.
+        /// Reserves an attachment and delivers the backing object without changing metadata.
         Attach { id: u32, writable: bool },
         /// Releases one attachment held by this process, even after a namespace switch.
         Detach { id: u32 },
@@ -65,6 +73,12 @@ wire_enum! {
         NewNamespace { target: ProcessId },
         /// Copies attachment counts to a pending child inheriting its parent's VM.
         Inherit { target: ProcessId },
+        /// Records a reserved attachment after the caller has mapped the backing object.
+        ConfirmAttach { attachment: SegmentAttachId },
+        /// Releases an unused reservation without recording an attach or detach.
+        CancelAttach { attachment: SegmentAttachId },
+        /// Adjusts a confirmed attachment count after splitting or releasing mapped regions.
+        AdjustAttachments { id: u32, delta: i64 },
     }
 }
 
@@ -76,8 +90,12 @@ wire_enum! {
         Id(u32),
         /// Current metadata.
         Status(SegmentStatus),
-        /// Delivery token, futex memory identity, access mode, and unrounded length.
-        Attached { mapping: MapFileResponse, size: u64 },
+        /// Reserved attachment, backing-object delivery information, and unrounded length.
+        AttachPrepared {
+            attachment: SegmentAttachId,
+            mapping: MapFileResponse,
+            size: u64,
+        },
         /// The requested change was made.
         Done,
         /// Caller-visible failure.

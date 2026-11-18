@@ -10,13 +10,13 @@ use rustix::fs::MemfdFlags;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_storage::{
-    HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
+    HostHandle, SegmentStorageError, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
 };
 use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::SharedObjectDelivery;
-use super::host_file::{Exported, HostFile, create, host_len, storage_error};
+use super::host_file::{Exported, HostFile, create, exportable, host_len, storage_error};
 
 /// A memfd, whose size is the file's size, so Linux keeps no state of its own.
 #[derive(Default)]
@@ -118,17 +118,31 @@ impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
         Ok(create::<Memfd>(file))
     }
 
-    fn create_segment(&self, len: usize) -> Result<Arc<dyn SharedFileObject>, StorageError> {
+    fn create_segment(&self, len: usize) -> Result<Arc<dyn SharedFileObject>, SegmentStorageError> {
         use rustix::fs::{SealFlags, fcntl_add_seals};
-        let file = memfd(c"litebox-segment", MemfdFlags::ALLOW_SEALING)?;
-        let mut memory = create::<Memfd>(
-            file.try_clone()
-                .map_err(|error| storage_error::<Memfd>(&error))?,
-        );
-        memory.storage.set_len(len)?;
+        let length = u64::try_from(len)
+            .ok()
+            .filter(|length| *length <= Memfd::size_limit())
+            .ok_or(SegmentStorageError::NoSpace)?;
+        let file = rustix::fs::memfd_create(
+            c"litebox-segment",
+            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+        )
+        .map(File::from)
+        .map_err(|error| segment_storage_error(&error.into()))?;
+        file.set_len(length)
+            .map_err(|error| segment_storage_error(&error))?;
         fcntl_add_seals(&file, SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)
-            .map_err(|error| storage_error::<Memfd>(&error.into()))?;
-        Ok(memory.object)
+            .map_err(|error| segment_storage_error(&error.into()))?;
+        Ok(exportable::<Memfd>(file))
+    }
+}
+
+fn segment_storage_error(error: &IoError) -> SegmentStorageError {
+    match error.raw_os_error() {
+        Some(libc::ENOSPC | libc::EFBIG | libc::EDQUOT) => SegmentStorageError::NoSpace,
+        Some(libc::ENOMEM | libc::EMFILE | libc::ENFILE) => SegmentStorageError::OutOfMemory,
+        _ => SegmentStorageError::Io,
     }
 }
 

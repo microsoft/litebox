@@ -74,9 +74,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             _ => return Err(Errno::EINVAL),
         };
         let readonly = flags & SHM_RDONLY != 0;
-        let (file, size) = self
-            .global
-            .litebox
+        let segments = &self.global.litebox;
+        let (file, size, attachment) = segments
             .attach_segment::<_, PAGE_SIZE>(self.global.platform, id, !readonly)
             .map_err(|error| match error {
                 // `shmat` reports any lack of resources as ENOMEM; ENOSPC is `shmget`'s.
@@ -86,26 +85,41 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mapped = usize::try_from(size)
             .map_err(|_| Errno::ENOMEM)
             .and_then(|len| {
-                self.global.mm.attach_sysv(
-                    address,
-                    len,
-                    readonly,
-                    SharedObjectMapping { file, offset: 0 },
-                    id,
-                )
+                // SAFETY: This only creates a guest VMA at a previously unmapped range.
+                // Host code does not borrow from the new VMA: guest pointer access uses
+                // fault-aware copies, and VMA users under the MM lock cannot see it before
+                // confirmation. Other views of the backing object are independent mappings.
+                unsafe {
+                    self.global.mm.attach_sysv(
+                        address,
+                        len,
+                        readonly,
+                        SharedObjectMapping { file, offset: 0 },
+                        id,
+                        || {
+                            segments
+                                .confirm_segment_attach(attachment)
+                                .map_err(Into::into)
+                        },
+                    )
+                }
             });
-        // Report the mapping failure; a failed rollback only overcounts until exit.
+        // A failed mapping never became an attachment. Release its reservation
+        // without reporting an attach or detach.
         if mapped.is_err()
-            && let Err(rollback) = self.global.litebox.detach_segment(id)
+            && let Err(cancel) = segments.cancel_segment_attach(attachment)
         {
-            litebox_util_log::warn!(id, rollback:?; "failed to roll back a SysV attach");
+            litebox_util_log::warn!(id, cancel:?; "failed to cancel a SysV attach");
         }
         mapped
     }
 
     pub(crate) fn sys_shmdt(&self, addr: usize) -> Result<(), Errno> {
         self.check_segment_context()?;
-        self.global.mm.detach_sysv(addr)
+        let _pause = self.pause_other_threads()?;
+        // SAFETY: Sibling guest threads are paused, including when a native view must be split.
+        // Neither the calling task nor the host holds a borrow into the detached pages.
+        unsafe { self.global.mm.detach_sysv(addr) }
     }
 
     pub(crate) fn sys_shmctl(

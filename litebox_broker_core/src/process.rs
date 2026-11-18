@@ -23,8 +23,9 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest,
 };
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
-    ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind, HostNames,
+    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
+    ResourceLimit, ThreadInfo,
 };
 
 use crate::pid_namespace::PerNamespaceIds;
@@ -876,6 +877,68 @@ impl BrokerProcess {
             return Err(BrokerError::UnsupportedOperation);
         }
         *children_namespace = Some(pid_namespace);
+        Ok(())
+    }
+
+    /// Applies a set of namespace changes to this process or its pending
+    /// child, leaving all the existing namespaces intact on failure.
+    pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<()> {
+        let mut state = self.state.lock();
+        if !self.accepts_operations(&state) {
+            return Err(BrokerError::PeerClosed);
+        }
+        let target = if request.process_id == self.id() {
+            self
+        } else {
+            if request.children_pid_namespace.is_some() {
+                return Err(BrokerError::UnsupportedOperation);
+            }
+            &self.pending_child(&mut state, request.process_id)?.process
+        };
+        let _child_state = if core::ptr::eq(target, self) {
+            None
+        } else {
+            let child_state = target.state.lock();
+            if !target.awaits_startup(&child_state) {
+                return Err(BrokerError::PeerClosed);
+            }
+            Some(child_state)
+        };
+        if request.new_segment_namespace {
+            // Use the broker's segment principal and rights, not a guest credential.
+            self.require_object_rights(ObjectRights::WAIT | ObjectRights::WRITE)?;
+            if self.core.policy.segment_user.user != 0 {
+                return Err(BrokerError::PolicyDenied);
+            }
+        }
+
+        let pid_change = if let Some(options) = request.children_pid_namespace {
+            let children_namespace = self.children_namespace.lock();
+            if children_namespace.is_some() {
+                return Err(BrokerError::UnsupportedOperation);
+            }
+            let new_namespace = PidNamespace::new_child(self.pid_namespace(), self, options)?;
+            Some((children_namespace, new_namespace))
+        } else {
+            None
+        };
+        let mut host_names = request.copy_host_names.then(|| target.host_names.lock());
+        let mut segments = request
+            .new_segment_namespace
+            .then(|| target.segments.lock());
+
+        // All fallible checks and quota reservations are done. Publish while
+        // still holding the locks for each affected namespace.
+        if let Some(shared) = &mut host_names {
+            let copy = SharedHostNames::new(shared.0.lock().clone());
+            **shared = Arc::new(copy);
+        }
+        if let Some(segments) = &mut segments {
+            segments.reset_namespace();
+        }
+        if let Some((mut children_namespace, new_namespace)) = pid_change {
+            *children_namespace = Some(new_namespace);
+        }
         Ok(())
     }
 
@@ -2287,8 +2350,10 @@ impl BrokerProcess {
                 }
             }
         }
-        // Like a failed start, a failed child's threads end.
+        // Like a failed start, a failed child releases inherited attachments
+        // and its threads end.
         for child in &failed_children {
+            child.segments.lock().close(child);
             child.end_threads(false);
         }
         if !failed_children.is_empty() {
@@ -3271,8 +3336,8 @@ mod tests {
         FileType, FileUser, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
-        ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
-        ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
+        ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind,
+        HostNames, PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::readiness_queue::{
@@ -4407,6 +4472,45 @@ mod tests {
 
     fn host_name(bytes: &[u8]) -> HostName {
         HostName::new(bytes).unwrap()
+    }
+
+    #[test]
+    fn failed_pid_namespace_reservation_keeps_host_names_shared() {
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true)
+                .with_segment_user(ROOT),
+        )
+        .with_limits(BrokerCoreLimits {
+            max_pid_namespaces_per_process: 0,
+            ..BrokerCoreLimits::DEFAULT
+        })
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        root.complete_start().unwrap();
+        let child_id = root.allocate_child_process(None, false).unwrap().process_id;
+        assert_eq!(
+            root.create_namespaces(CreateNamespacesRequest {
+                process_id: root.id(),
+                children_pid_namespace: Some(PidNamespaceOptions::default()),
+                new_segment_namespace: true,
+                copy_host_names: true,
+            }),
+            Err(BrokerError::ResourceExhausted),
+        );
+        root.set_host_name(root.id(), HostNameKind::Host, host_name(b"still shared"))
+            .unwrap();
+        assert_eq!(
+            root.get_host_names(child_id).unwrap().host,
+            host_name(b"still shared"),
+        );
+        assert!(Arc::ptr_eq(
+            &root.children_namespace(),
+            root.pid_namespace()
+        ));
     }
 
     #[test]

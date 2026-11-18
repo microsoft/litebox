@@ -21,12 +21,13 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameSizes,
-    OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostNameSizes, OpenProcessHandleRequest, PidNamespaceOptions,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceLimit,
+    SetHostNameRequest, SetParentExitSignalRequest, SetResourceLimitRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+    WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -210,6 +211,7 @@ impl BrokerOperation {
             | Self::Process(
                 ProcessRequest::AllocateChild(_)
                 | ProcessRequest::CreateChildrenPidNamespace(_)
+                | ProcessRequest::CreateNamespaces(_)
                 | ProcessRequest::ExitChild(_)
                 | ProcessRequest::CancelChild(_)
                 | ProcessRequest::ReportExitStatus(_)
@@ -519,6 +521,8 @@ wire_enum! {
         /// The broker returns `UnknownObject` if the process is neither, and
         /// `UnsupportedOperation` for a signal number above [`crate::signal::MAX_SIGNAL`].
         SetParentExitSignal(SetParentExitSignalRequest),
+        /// Apply the requested namespace changes together, or leave all namespaces unchanged.
+        CreateNamespaces(CreateNamespacesRequest),
     }
 }
 
@@ -852,6 +856,8 @@ wire_enum! {
         GetParentExitSignal(u32),
         /// The parent-exit signal was set.
         SetParentExitSignal,
+        /// All the requested namespace changes were applied.
+        CreateNamespaces,
     }
 }
 

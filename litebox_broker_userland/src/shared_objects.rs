@@ -21,6 +21,16 @@ pub trait SharedObjectDelivery: Send + Sync {
     /// Fails with [`ErrorKind::Unsupported`] if this deployment cannot deliver `object` at all,
     /// which the runner sees as a file it cannot share.
     fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64>;
+
+    /// Delivers segment backing, allowing platforms to impose a lower permission ceiling.
+    fn deliver_sysv(
+        &self,
+        object: &dyn SharedFileObject,
+        writable: bool,
+        end: u64,
+    ) -> IoResult<u64> {
+        self.deliver(object, writable, end)
+    }
 }
 
 /// Returns `object`'s host handle for delivering it with `writable` rights.
@@ -34,6 +44,7 @@ fn host_handle(
 ) -> IoResult<Box<dyn HostHandle + '_>> {
     object.host_handle(writable).map_err(|error| match error {
         MapSharedError::Unsupported => IoError::new(ErrorKind::Unsupported, error),
+        MapSharedError::NoMemory => IoError::new(ErrorKind::OutOfMemory, error),
         error => IoError::other(error),
     })
 }
@@ -41,7 +52,8 @@ fn host_handle(
 /// Handles file mapping and keyed shared segment requests, delivering shared memory through
 /// `delivery`. Returns `None` for other operations.
 ///
-/// Associations without a delivery leave the request to the broker host, which refuses it.
+/// Without a delivery adapter, the broker host can handle metadata operations but cannot
+/// create backing storage or deliver an attachment.
 pub fn handle_map_file<Delivery: SharedObjectDelivery>(
     delivery: &Delivery,
     process: &BrokerProcess,
@@ -67,7 +79,7 @@ pub fn handle_map_file<Delivery: SharedObjectDelivery>(
                 provider,
                 |object, writable, end| {
                     delivery
-                        .deliver(object, writable, end)
+                        .deliver_sysv(object, writable, end)
                         .map_err(delivery_failure)
                 },
             )
@@ -96,14 +108,15 @@ pub fn handle_map_file<Delivery: SharedObjectDelivery>(
 /// Reports and classifies a failure to deliver a shared object to the runner.
 fn delivery_failure(error: IoError) -> FileError {
     litebox_util_log::warn!(error:% = error; "failed to deliver a shared object");
-    // A deployment that cannot deliver this kind of object, such as a broker without `/proc`
-    // to reopen a memfd read-only, cannot share it, so a runner falls back as for any file it
-    // cannot share. Other failures, such as a runner leaving too many deliveries untaken, are a
-    // lack of resources.
-    if error.kind() == ErrorKind::Unsupported {
-        FileError::NoSuchDevice
-    } else {
-        FileError::NoSpace
+    // Unsupported delivery allows ordinary file mappings to fall back, but fails segment attaches.
+    match error.kind() {
+        ErrorKind::Unsupported => FileError::NoSuchDevice,
+        ErrorKind::OutOfMemory | ErrorKind::WouldBlock => FileError::NoSpace,
+        #[cfg(target_os = "linux")]
+        _ if litebox_broker_transport_linux_userland::is_resource_exhaustion(&error) => {
+            FileError::NoSpace
+        }
+        _ => FileError::Io,
     }
 }
 

@@ -34,12 +34,12 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameKind,
-    HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo, ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostNameKind, HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind,
+    ResourceLimit, SetHostNameRequest, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -94,6 +94,59 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 use core::num::NonZeroU64;
 
 const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
+
+#[test]
+fn segment_and_namespace_wire_shapes_are_pinned() {
+    let request = BrokerRequest {
+        request_id: RequestId(7),
+        operation: BrokerOperation::Segment(crate::segment::SegmentRequest::AdjustAttachments {
+            id: 0x1234,
+            delta: -2,
+        }),
+    };
+    assert_eq!(
+        encode_request(&request),
+        [
+            1, 7, 0, 0, 0, 0, 0, 0, 0, 18, 10, 0x34, 0x12, 0, 0, 254, 255, 255, 255, 255, 255, 255,
+            255
+        ]
+    );
+    let response = BrokerResponse {
+        request_id: RequestId(7),
+        result: BrokerResult::Segment(crate::segment::SegmentResponse::AttachPrepared {
+            attachment: crate::segment::SegmentAttachId(3),
+            mapping: MapFileResponse {
+                memory: SharedMemoryId(5),
+                token: 9,
+                writable: true,
+            },
+            size: 257,
+        }),
+    };
+    let mut expected = alloc::vec![1, 7, 0, 0, 0, 0, 0, 0, 0, 19, 2];
+    expected.extend(3_u64.to_le_bytes());
+    expected.extend(5_u128.to_le_bytes());
+    expected.extend(9_u64.to_le_bytes());
+    expected.push(1);
+    expected.extend(257_u64.to_le_bytes());
+    assert_eq!(encode_response(&response), expected);
+
+    let request = BrokerRequest {
+        operation: BrokerOperation::Process(ProcessRequest::CreateNamespaces(
+            CreateNamespacesRequest {
+                process_id: ProcessId(9),
+                children_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
+                new_segment_namespace: false,
+                copy_host_names: true,
+            },
+        )),
+        ..request
+    };
+    assert_eq!(
+        encode_request(&request),
+        [1, 7, 0, 0, 0, 0, 0, 0, 0, 10, 24, 9, 0, 0, 0, 1, 1, 0, 0, 1]
+    );
+}
 
 fn process_id(id: u32) -> ProcessId {
     ProcessId(id)
@@ -161,6 +214,16 @@ fn request_codec_round_trips_all_variants() {
         }),
         BrokerOperation::Segment(crate::segment::SegmentRequest::Inherit {
             target: ProcessId(19)
+        }),
+        BrokerOperation::Segment(crate::segment::SegmentRequest::ConfirmAttach {
+            attachment: crate::segment::SegmentAttachId(u64::MAX)
+        }),
+        BrokerOperation::Segment(crate::segment::SegmentRequest::CancelAttach {
+            attachment: crate::segment::SegmentAttachId(17)
+        }),
+        BrokerOperation::Segment(crate::segment::SegmentRequest::AdjustAttachments {
+            id: 76,
+            delta: -2
         }),
         BrokerOperation::Thread(ThreadRequest::Exit(thread_id(17))),
         BrokerOperation::CloseObject(handle),
@@ -574,6 +637,18 @@ fn request_codec_round_trips_all_variants() {
         BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
             PidNamespaceOptions::new(true, true)
         )),
+        BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
+            process_id: process_id(u32::MAX),
+            children_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
+            new_segment_namespace: true,
+            copy_host_names: true,
+        })),
+        BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
+            process_id: process_id(1),
+            children_pid_namespace: None,
+            new_segment_namespace: false,
+            copy_host_names: true,
+        })),
         BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(
             DuplicateObjectsToChildRequest {
                 child_process_id: process_id(u32::MAX),
@@ -1018,7 +1093,8 @@ fn response_codec_round_trips_all_variants() {
                 removed: true,
             }
         )),
-        BrokerResult::Segment(crate::segment::SegmentResponse::Attached {
+        BrokerResult::Segment(crate::segment::SegmentResponse::AttachPrepared {
+            attachment: crate::segment::SegmentAttachId(13),
             mapping: MapFileResponse {
                 memory: SharedMemoryId(1234),
                 token: 56,
@@ -1028,6 +1104,7 @@ fn response_codec_round_trips_all_variants() {
         }),
         BrokerResult::Segment(crate::segment::SegmentResponse::Done),
         BrokerResult::Segment(crate::segment::SegmentResponse::Failed(FileError::NotOwner)),
+        BrokerResult::Segment(crate::segment::SegmentResponse::Failed(FileError::Io)),
         BrokerResult::Thread(ThreadResponse::Create(thread_id(17))),
         BrokerResult::Thread(ThreadResponse::Exit),
         BrokerResult::ObjectClosed,
@@ -1363,6 +1440,7 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::Process(ProcessResponse::SetChildExitRetention),
         BrokerResult::Process(ProcessResponse::SetOrphanAdoption),
         BrokerResult::Process(ProcessResponse::CreateChildrenPidNamespace),
+        BrokerResult::Process(ProcessResponse::CreateNamespaces),
         BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
             process_id: process_id(u32::MAX),
             exit_status: ProcessExitStatus::Exited { code: u32::MAX },

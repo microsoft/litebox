@@ -21,7 +21,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
     MAX_PROCESS_BOOTSTRAP_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
@@ -85,6 +85,11 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn create_children_pid_namespace(
         &self,
         options: PidNamespaceOptions,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn create_namespaces(
+        &self,
+        request: CreateNamespacesRequest,
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn cancel_child_process(
@@ -999,6 +1004,13 @@ where
         options: PidNamespaceOptions,
     ) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.create_children_pid_namespace(options))
+    }
+
+    fn create_namespaces(
+        &self,
+        request: CreateNamespacesRequest,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.create_namespaces(request))
     }
 
     fn cancel_child_process(

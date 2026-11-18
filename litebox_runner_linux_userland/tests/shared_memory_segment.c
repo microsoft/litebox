@@ -16,6 +16,30 @@
     return 1; \
 } } while (0)
 
+static int split_attachment(void) {
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    int id = shmget(IPC_PRIVATE, 3 * page, 0600);
+    CHECK(id >= 0);
+    char *data = shmat(id, NULL, 0);
+    CHECK(data != (void *)-1);
+    struct shmid_ds ds;
+    CHECK(munmap(data + page, page) == 0);
+    // Linux counts both surviving VMAs, even though shmdt removes them as one attachment.
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 2);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        _exit(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 4 ? 0 : 1);
+    }
+    int status;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 2);
+    CHECK(shmdt(data) == 0);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 0);
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     struct shmid_ds ds;
     if (argc == 3 && !strcmp(argv[1], "lookup")) {
@@ -31,6 +55,7 @@ int main(int argc, char **argv) {
     // The child reruns this program, from its own path, to look the segment up by key.
     const char *self = argv[0];
     CHECK(argc == 1 && self[0] == '/');
+    CHECK(split_attachment() == 0);
     key_t key = getpid();
     int id = shmget(key, 123, IPC_CREAT | IPC_EXCL | 0600);
     CHECK(id >= 0);
@@ -46,8 +71,15 @@ int main(int argc, char **argv) {
     CHECK(rw != (void *)-1 && rw[0] == 0);
     char *ro = shmat(id, NULL, SHM_RDONLY);
     CHECK(ro != (void *)-1 && ro != rw);
+    struct shmid_ds before_failure;
+    CHECK(shmctl(id, IPC_STAT, &before_failure) == 0);
     CHECK(shmat(id, rw, 0) == (void *)-1 && errno == EINVAL);
     CHECK(shmat(id, rw + 1, SHM_RND) == (void *)-1 && errno == EINVAL);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0);
+    CHECK(ds.shm_nattch == before_failure.shm_nattch &&
+          ds.shm_atime == before_failure.shm_atime &&
+          ds.shm_dtime == before_failure.shm_dtime &&
+          ds.shm_lpid == before_failure.shm_lpid);
     CHECK(mprotect(ro, 4096, PROT_READ | PROT_WRITE) == -1 && errno == EACCES);
     rw[0] = 'a';
     CHECK(ro[0] == 'a');

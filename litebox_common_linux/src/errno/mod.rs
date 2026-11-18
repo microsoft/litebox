@@ -174,7 +174,7 @@ impl From<litebox::segment::SegmentError> for Errno {
             SegmentError::NotOwner => Self::EPERM,
             SegmentError::NoSpace => Self::ENOSPC,
             SegmentError::NoMemory => Self::ENOMEM,
-            SegmentError::ServiceFailed => Self::EIO,
+            SegmentError::Io | SegmentError::ServiceFailed => Self::EIO,
         }
     }
 }

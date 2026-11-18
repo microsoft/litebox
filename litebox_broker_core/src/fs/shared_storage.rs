@@ -46,6 +46,28 @@ pub struct SharedFileMemory {
     pub object: Arc<dyn SharedFileObject>,
 }
 
+/// Failures allocating fixed-length shared segment backing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegmentStorageError {
+    /// The backing store cannot hold a segment of this size.
+    NoSpace,
+    /// The host could not allocate memory or a handle for the segment.
+    OutOfMemory,
+    /// A backing-store operation failed.
+    Io,
+    /// The provider does not support fixed-length segments.
+    Unsupported,
+}
+
+impl From<StorageError> for SegmentStorageError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::NoSpace => Self::NoSpace,
+            StorageError::Fault | StorageError::Busy | StorageError::Io => Self::Io,
+        }
+    }
+}
+
 /// Platform provider that creates [`SharedFileMemory`].
 pub trait SharedFileMemoryProvider: Send + Sync {
     /// Creates empty memory.
@@ -54,7 +76,7 @@ pub trait SharedFileMemoryProvider: Send + Sync {
     /// Creates a zero-filled, fixed-length segment, to be exported as a
     /// mapping only. Providers exporting resizable file handles must also
     /// prevent recipients from changing the length through those handles.
-    fn create_segment(&self, len: usize) -> Result<Arc<dyn SharedFileObject>, StorageError> {
+    fn create_segment(&self, len: usize) -> Result<Arc<dyn SharedFileObject>, SegmentStorageError> {
         let mut memory = self.create()?;
         memory.storage.set_len(len)?;
         Ok(memory.object)
