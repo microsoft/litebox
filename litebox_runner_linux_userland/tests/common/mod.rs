@@ -116,7 +116,7 @@ pub fn find_dependencies(prog: &str) -> Vec<String> {
 }
 
 /// Find the rewriter and shared trampoline sources that affect emitted code.
-fn find_rewriter_source_files() -> Vec<PathBuf> {
+pub(crate) fn find_rewriter_source_files() -> Vec<PathBuf> {
     let mut source_files = Vec::new();
 
     // Get the absolute path to the workspace root.
@@ -263,8 +263,27 @@ pub fn compile_rust(src_path: &str, unique_name: &str) -> PathBuf {
     path
 }
 
+pub(crate) fn rewriter_flags() -> Vec<&'static str> {
+    vec![
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+        "--virtualize-x18",
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "aarch64",
+            feature = "aarch64_pacga"
+        ))]
+        "--native-tpidr-el0",
+    ]
+}
+
 /// Run syscall rewriter with caching
 pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&str]) -> bool {
+    use sha2::{Digest as _, Sha256};
+
+    // Keep rewritten files outside the disposable rootfs stage, isolated by destination.
+    let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rewrites");
+    let cache_key = Sha256::digest(output_path.as_os_str().as_encoded_bytes());
+    let cached_path = cache_dir.join(format!("{cache_key:x}"));
     // Include both the input file and all rewriter source files in the cache key
     let mut input_paths = vec![input_path];
     let rewriter_sources = find_rewriter_source_files();
@@ -275,17 +294,10 @@ pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&
     input_paths.extend(rewriter_paths);
 
     let mut args = vec!["run", "-p", "litebox_syscall_rewriter", "--"];
-    #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
-    args.push("--virtualize-x18");
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "aarch64",
-        feature = "aarch64_pacga"
-    ))]
-    args.push("--native-tpidr-el0");
+    args.extend(rewriter_flags());
     args.extend_from_slice(extra_args);
     args.push("-o");
-    args.push(output_path.to_str().unwrap());
+    args.push(cached_path.to_str().unwrap());
     args.push(input_path.to_str().unwrap());
 
     // Create command string for caching
@@ -294,53 +306,60 @@ pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&
     command_parts.extend_from_slice(&args);
     let command = command_parts.join(" ");
 
-    if let Ok(true) = crate::cache::is_cached_and_valid(&input_paths, output_path, &command) {
+    if let Ok(true) = crate::cache::is_cached_and_valid(&input_paths, &cached_path, &command) {
         println!(
             "Using cached rewriter result for: {} (tracking {} rewriter source files)",
             output_path.display(),
             rewriter_sources.len()
         );
-        return true;
+    } else {
+        println!(
+            "Running rewriter: {} -> {}",
+            input_path.display(),
+            output_path.display()
+        );
+
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        if cached_path.exists() {
+            std::fs::remove_file(&cached_path).unwrap();
+        }
+
+        let output = std::process::Command::new(&cargo)
+            .args(args)
+            .output()
+            .expect("Failed to run litebox_syscall_rewriter");
+
+        let success = output.status.success();
+        if !success {
+            eprintln!(
+                "failed to run litebox_syscall_rewriter {:?}",
+                std::str::from_utf8(output.stderr.as_slice()).unwrap()
+            );
+            return false;
+        }
+
+        // Create cache entry after successful rewriting
+        if let Err(e) = crate::cache::create_cache_entry(&input_paths, &cached_path, &command) {
+            eprintln!(
+                "Warning: Failed to create cache entry for {}: {}",
+                output_path.display(),
+                e
+            );
+        }
     }
 
-    println!(
-        "Running rewriter: {} -> {}",
-        input_path.display(),
-        output_path.display()
-    );
-
-    // Ensure the parent directory exists, then remove any stale output file.
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
     if output_path.exists() {
         std::fs::remove_file(output_path).unwrap();
     }
-
-    let output = std::process::Command::new(&cargo)
-        .args(args)
-        .output()
-        .expect("Failed to run litebox_syscall_rewriter");
-
-    let success = output.status.success();
-    if !success {
-        eprintln!(
-            "failed to run litebox_syscall_rewriter {:?}",
-            std::str::from_utf8(output.stderr.as_slice()).unwrap()
-        );
-        return false;
-    }
-
-    // Create cache entry after successful rewriting
-    if let Err(e) = crate::cache::create_cache_entry(&input_paths, output_path, &command) {
-        eprintln!(
-            "Warning: Failed to create cache entry for {}: {}",
-            output_path.display(),
-            e
-        );
-    }
-
-    success
+    std::fs::copy(&cached_path, output_path).unwrap();
+    std::fs::File::open(output_path)
+        .unwrap()
+        .set_modified(std::fs::metadata(&cached_path).unwrap().modified().unwrap())
+        .unwrap();
+    true
 }
 
 /// Create tar file with caching
@@ -374,7 +393,7 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
     let input_paths: Vec<&Path> = all_files.iter().map(std::path::PathBuf::as_path).collect();
 
     // Create command string for caching
-    let tar_filename = format!("../rootfs_{unique_name}.tar");
+    let tar_filename = format!("../rootfs_{unique_name}.tar.tmp");
     let mut args = vec![
         // ustar format allows longer file names
         "--format=ustar",
@@ -399,6 +418,7 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
 
     if let Ok(true) = crate::cache::is_cached_and_valid(&input_paths, tar_file, &command) {
         println!("Using cached tar file for: {unique_name}");
+        std::fs::remove_dir_all(tar_dir).unwrap();
         return true;
     }
 
@@ -420,10 +440,14 @@ pub(crate) fn create_tar_with_cache(tar_dir: &Path, tar_file: &Path, unique_name
         return false;
     }
 
+    // Readers can still have the old tar mapped when another process rebuilds it.
+    std::fs::rename(tar_dir.join(&tar_filename), tar_file).unwrap();
+
     // Create cache entry after successful tar creation
     if let Err(e) = crate::cache::create_cache_entry(&input_paths, tar_file, &command) {
         eprintln!("Warning: Failed to create cache entry for {unique_name}: {e}");
     }
 
+    std::fs::remove_dir_all(tar_dir).unwrap();
     success
 }

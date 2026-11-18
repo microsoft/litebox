@@ -40,6 +40,7 @@ pub(crate) struct Runner {
     #[cfg(target_os = "linux")]
     host_stack_limit: Option<libc::rlim_t>,
     has_run: bool,
+    rootfs_ready: bool,
 }
 
 #[allow(
@@ -48,53 +49,63 @@ pub(crate) struct Runner {
 )]
 impl Runner {
     pub(crate) fn new(target: &Path, unique_name: &str) -> Self {
-        Self::new_inner(target, unique_name, true)
+        Self::new_inner(target, unique_name, true, false)
     }
 
     pub(crate) fn new_pre_rewritten(target: &Path, unique_name: &str) -> Self {
-        Self::new_inner(target, unique_name, false)
+        Self::new_inner(target, unique_name, false, false)
     }
 
-    fn new_inner(target: &Path, unique_name: &str, rewrite_target: bool) -> Self {
+    pub(crate) fn new_with_rootfs(target: &Path, unique_name: &str) -> Self {
+        Self::new_inner(target, unique_name, false, true)
+    }
+
+    fn new_inner(
+        target: &Path,
+        unique_name: &str,
+        rewrite_target: bool,
+        rootfs_ready: bool,
+    ) -> Self {
         let dir_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
 
         let tar_dir = dir_path.join(format!("tar_files_{unique_name}"));
-        let dirs_to_create = ["lib64", MULTIARCH_LIB_DIR, "lib32"];
-        for dir in dirs_to_create {
-            std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
-        }
-        std::fs::create_dir_all(tar_dir.join("out")).unwrap();
-
         let target_guest_path = std::path::absolute(target).unwrap();
-        let target_dest_path = tar_dir.join(target_guest_path.strip_prefix("/").unwrap());
-        if rewrite_target {
-            let success = super::rewrite_with_cache(target, &target_dest_path, &[]);
-            assert!(success, "failed to run litebox_syscall_rewriter");
-        } else {
-            std::fs::create_dir_all(target_dest_path.parent().unwrap()).unwrap();
-            let source_metadata = std::fs::metadata(target).unwrap();
-            let modified = source_metadata.modified().unwrap();
-            if !std::fs::metadata(&target_dest_path).is_ok_and(|metadata| {
-                metadata.len() == source_metadata.len() && metadata.modified().unwrap() == modified
-            }) {
+        if !rootfs_ready {
+            match std::fs::remove_dir_all(&tar_dir) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => panic!("failed to clear {}: {error}", tar_dir.display()),
+            }
+            let dirs_to_create = ["lib64", MULTIARCH_LIB_DIR, "lib32"];
+            for dir in dirs_to_create {
+                std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
+            }
+            std::fs::create_dir_all(tar_dir.join("out")).unwrap();
+
+            let target_dest_path = tar_dir.join(target_guest_path.strip_prefix("/").unwrap());
+            if rewrite_target {
+                let success = super::rewrite_with_cache(target, &target_dest_path, &[]);
+                assert!(success, "failed to run litebox_syscall_rewriter");
+            } else {
+                std::fs::create_dir_all(target_dest_path.parent().unwrap()).unwrap();
                 std::fs::copy(target, &target_dest_path).unwrap();
                 std::fs::File::open(&target_dest_path)
                     .unwrap()
-                    .set_modified(modified)
+                    .set_modified(std::fs::metadata(target).unwrap().modified().unwrap())
                     .unwrap();
             }
-        }
 
-        let libs = super::find_dependencies(target.to_str().unwrap());
-        for file in &libs {
-            let file_path = Path::new(file.as_str());
-            let dest_path = tar_dir.join(&file[1..]);
-            let success = super::rewrite_with_cache(file_path, &dest_path, &[]);
-            assert!(
-                success,
-                "failed to run litebox_syscall_rewriter for {}",
-                file_path.to_str().unwrap()
-            );
+            let libs = super::find_dependencies(target.to_str().unwrap());
+            for file in &libs {
+                let file_path = Path::new(file.as_str());
+                let dest_path = tar_dir.join(&file[1..]);
+                let success = super::rewrite_with_cache(file_path, &dest_path, &[]);
+                assert!(
+                    success,
+                    "failed to run litebox_syscall_rewriter for {}",
+                    file_path.to_str().unwrap()
+                );
+            }
         }
 
         let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
@@ -132,11 +143,13 @@ impl Runner {
             #[cfg(target_os = "linux")]
             host_stack_limit: None,
             has_run: false,
+            rootfs_ready,
             unique_name: unique_name.to_owned(),
         }
     }
 
     pub(crate) fn tar_dir(&self) -> &Path {
+        assert!(!self.rootfs_ready, "rootfs staging has already finished");
         &self.tar_dir
     }
 
@@ -238,7 +251,7 @@ impl Runner {
     }
 
     pub(crate) fn with_fs_path(&mut self, f: impl FnOnce(&Path)) -> &mut Self {
-        f(&self.tar_dir);
+        f(self.tar_dir());
         self
     }
 
@@ -268,14 +281,23 @@ impl Runner {
         output.stdout
     }
 
-    fn prepare_command(&mut self) {
-        assert!(!self.has_run);
-        self.has_run = true;
+    pub(crate) fn prepare_rootfs(&mut self) -> PathBuf {
         let tar_file = self
             .dir_path
             .join(format!("rootfs_{}.tar", self.unique_name));
-        let tar_success = super::create_tar_with_cache(&self.tar_dir, &tar_file, &self.unique_name);
-        assert!(tar_success, "failed to create tar file");
+        if !self.rootfs_ready {
+            let tar_success =
+                super::create_tar_with_cache(&self.tar_dir, &tar_file, &self.unique_name);
+            assert!(tar_success, "failed to create tar file");
+            self.rootfs_ready = true;
+        }
+        tar_file
+    }
+
+    fn prepare_command(&mut self) {
+        assert!(!self.has_run);
+        self.has_run = true;
+        let tar_file = self.prepare_rootfs();
         println!("Tar file ready at: {}", tar_file.to_str().unwrap());
 
         self.command.arg(&self.cmd_path).args(&self.cmd_args);
