@@ -326,7 +326,7 @@ mod tests {
         let host = accept_stream_guaranteed(listener);
         send_handshake_request(&mut local);
         host.read_frame(None).unwrap().unwrap();
-        host.write_frame(&encode_handshake_response(negotiated()), None)
+        host.write_frame(&encode_handshake_response(&negotiated()), None)
             .unwrap();
         local.recv_handshake_response().unwrap().unwrap();
         let (local_ring, broker_ring) = control_rings();
@@ -753,7 +753,7 @@ mod tests {
             let id = u64::try_from(index).unwrap();
             write_payload(
                 &mut local.lanes[index].request_producer,
-                &encode_request(request(id)),
+                &encode_request(&request(id)),
             );
             let HostReceive::Message(received) = lane.recv_request().unwrap() else {
                 panic!("expected ring request");
@@ -838,8 +838,8 @@ mod tests {
 
             let producer = &mut broker.lanes[0].response_producer;
             match payload_kind {
-                0 => write_payload(producer, &encode_response(response(RequestId(99)))),
-                1 => write_payload(producer, &encode_response(response(other.request_id))),
+                0 => write_payload(producer, &encode_response(&response(RequestId(99)))),
+                1 => write_payload(producer, &encode_response(&response(other.request_id))),
                 _ => write_payload(producer, &[u8::MAX]),
             }
 

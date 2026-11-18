@@ -1,0 +1,2825 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+use super::*;
+use core::time::Duration;
+
+use crate::error::ErrorCode;
+use crate::event::{
+    AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
+    CreateEventResponse, EventConsumeMode, EventConsumption,
+};
+use crate::fs::{
+    ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileLockOperation, FileMode,
+    FileNodeInfo, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
+    FileTimeUpdate, FileTimestamp, FileTimestamps, FileType, FileUser, HandleFilePathRequest,
+    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MapFileRequest,
+    MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest,
+    SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest, SetTimesFileRequest,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    WriteFileResponse,
+};
+use crate::message::{
+    BrokerOperation, BrokerResult, EventRequest, EventResponse, FileRequest, FileResponse,
+    PipeRequest, PipeResponse, ProcessGroupRequest, ProcessGroupResponse, ProcessRequest,
+    ProcessResponse, ReadinessNotification, ReadinessQueueRequest, ReadinessQueueResponse,
+    SharedFutexRequest, SharedFutexResponse, SignalRequest, SignalResponse, SocketRequest,
+    SocketResponse, ThreadRequest, ThreadResponse, TimerRequest, TimerResponse, UnixSocketRequest,
+    UnixSocketResponse,
+};
+use crate::pipe::{
+    CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
+    WritePipeResponse,
+};
+use crate::process::{
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
+    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameKind,
+    HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
+    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    ThreadInfo, WriteChildMemoryRequest,
+};
+use crate::process_group::{
+    ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
+    SetForegroundGroupRequest, SetProcessGroupRequest,
+};
+use crate::readiness::ReadinessFlags;
+use crate::readiness_queue::{
+    AddReadinessQueueEntryRequest, CreateReadinessQueueResponse, ModifyReadinessQueueEntryRequest,
+    ReadinessQueueEntryFlags, ReadinessQueueError, ReadinessQueueInterest,
+    RemoveReadinessQueueEntryRequest, TakeReadyRequest, TakeReadyResponse,
+};
+use crate::shared_buffer::{
+    MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
+    SharedBufferSlotIndex,
+};
+use crate::shared_futex::{
+    CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
+    FutexWakeRequest, FutexWakeResponse, IssueMemoryIdResponse, SharedFutexKey, SharedMemoryId,
+};
+use crate::signal::{
+    OpenSignalsResponse, PendingSignal, SendSignalRequest, SignalEvent, SignalTarget,
+    TakeSignalRequest,
+};
+use crate::socket::{
+    AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
+    BindSocketResponse, CheckConnectSocketRequest, ConnectSocketRequest, ConnectSocketResponse,
+    CreateSocketRequest, CreateSocketResponse, GetSocketNameRequest, GetSocketNameResponse,
+    GetSocketOptionRequest, GetSocketOptionResponse, IpProtocol, ListenSocketRequest,
+    ListenSocketResponse, ReceiveFlags, ReceiveFromFlags, ReceiveFromSocketRequest,
+    ReceiveFromSocketResponse, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags,
+    SendSocketRequest, SendSocketResponse, SendToSocketRequest, SendToSocketResponse,
+    SetSocketErrorRequest, SetSocketOptionRequest, ShutdownMode, ShutdownSocketRequest,
+    SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketType,
+    TakeSocketErrorRequest, TakeSocketErrorResponse,
+};
+use crate::timer::{
+    CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
+    ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
+};
+use crate::unix_socket::{
+    AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
+    ConnectUnixSocketRequest, CreateUnixSocketPairResponse, CreateUnixSocketRequest,
+    CreateUnixSocketResponse, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
+    GetUnixSocketOptionRequest, GetUnixSocketOptionResponse, ListenUnixSocketRequest,
+    ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
+    SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError,
+};
+use crate::{
+    ObjectHandle, ProcessGroupId, ProcessId, ProtocolVersion, RequestId, SessionId, ThreadId,
+};
+use core::net::{Ipv4Addr, SocketAddrV4};
+use core::num::NonZeroU64;
+
+const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
+
+fn process_id(id: u32) -> ProcessId {
+    ProcessId(id)
+}
+
+fn thread_id(id: u32) -> ThreadId {
+    ThreadId(id)
+}
+
+fn sequence(slot_index: u32, length: u32) -> SharedBufferSequence {
+    SharedBufferSequence::new(&[SharedBufferSlotIndex(slot_index)], length).unwrap()
+}
+
+#[test]
+fn handshake_request_codec_round_trips_all_variants() {
+    let requests = [BrokerHandshakeRequest {
+        protocol_version: ProtocolVersion(1),
+    }];
+
+    for request in requests {
+        assert_eq!(
+            decode_handshake_request(&encode_handshake_request(&request)).unwrap(),
+            request
+        );
+    }
+}
+
+#[test]
+fn request_codec_round_trips_all_variants() {
+    let handle = ObjectHandle(13);
+    // The wire bound covers encodable requests before operation-specific
+    // transfer limits are validated.
+    let largest_slots: [SharedBufferSlotIndex; MAX_SHARED_BUFFER_SEQUENCE_SLOTS] =
+        core::array::from_fn(|index| SharedBufferSlotIndex(u32::try_from(2 * index + 1).unwrap()));
+    let largest_sequence = SharedBufferSequence::new(
+        &largest_slots,
+        u32::try_from(MAX_SHARED_BUFFER_SEQUENCE_SLOTS).unwrap() * SHARED_BUFFER_SLOT_SIZE,
+    )
+    .unwrap();
+    let operations = alloc::vec![
+        BrokerOperation::Thread(ThreadRequest::Exit(thread_id(17))),
+        BrokerOperation::CloseObject(handle),
+        BrokerOperation::CheckReadiness(handle),
+        BrokerOperation::GetStatusFlags(handle),
+        BrokerOperation::SetStatusFlags(SetStatusFlagsRequest {
+            handle,
+            mask: FileOpenFlags::STATUS,
+            flags: FileOpenFlags::APPEND,
+        }),
+        BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
+            initial_count: 0,
+            flags: FileOpenFlags::NONE,
+        })),
+        BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
+            initial_count: 7,
+            flags: FileOpenFlags::NONBLOCKING,
+        })),
+        BrokerOperation::Event(EventRequest::Add(AddEventRequest { handle, value: 3 })),
+        BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
+            handle,
+            mode: EventConsumeMode::All,
+        })),
+        BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
+            handle,
+            mode: EventConsumeMode::One,
+        })),
+        BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest {
+            flags: FileOpenFlags::NONE,
+        })),
+        BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest {
+            flags: FileOpenFlags::NONBLOCKING,
+        })),
+        BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest {
+            handle,
+            spec: TimerSpec {
+                value_ns: u64::MAX,
+                interval_ns: 1,
+            },
+        })),
+        BrokerOperation::Timer(TimerRequest::Get(GetTimerRequest { handle })),
+        BrokerOperation::Timer(TimerRequest::Read(ReadTimerRequest { handle })),
+        BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Create),
+        BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Add(
+            AddReadinessQueueEntryRequest {
+                queue: handle,
+                target: ObjectHandle(u64::MAX),
+                key: u64::MAX,
+                interest: ReadinessQueueInterest {
+                    readiness: ReadinessFlags(u32::MAX),
+                    flags: ReadinessQueueEntryFlags::all(),
+                    token: u64::MAX,
+                },
+            },
+        )),
+        BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Modify(
+            ModifyReadinessQueueEntryRequest {
+                queue: handle,
+                target: ObjectHandle(7),
+                key: 0,
+                interest: ReadinessQueueInterest::default(),
+            },
+        )),
+        BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Remove(
+            RemoveReadinessQueueEntryRequest {
+                queue: handle,
+                target: ObjectHandle(7),
+                key: 3,
+            },
+        )),
+        BrokerOperation::ReadinessQueue(ReadinessQueueRequest::TakeReady(TakeReadyRequest {
+            queue: handle,
+            buffer: sequence(4, 48),
+        })),
+        BrokerOperation::SharedFutex(SharedFutexRequest::IssueMemoryId),
+        BrokerOperation::SharedFutex(SharedFutexRequest::CreateWaiter),
+        BrokerOperation::SharedFutex(SharedFutexRequest::Arm(FutexArmRequest {
+            key: SharedFutexKey {
+                memory: SharedMemoryId(u128::MAX - 1),
+                offset: u64::MAX,
+            },
+            bitset: u32::MAX,
+            waiter: ObjectHandle(1),
+        })),
+        BrokerOperation::SharedFutex(SharedFutexRequest::Wake(FutexWakeRequest {
+            key: SharedFutexKey {
+                memory: SharedMemoryId(1 << 64 | 2),
+                offset: 4,
+            },
+            count: u32::MAX,
+            bitset: 1,
+        })),
+        BrokerOperation::SharedFutex(SharedFutexRequest::Disarm(FutexDisarmRequest {
+            waiter: handle,
+        })),
+        BrokerOperation::Signal(SignalRequest::Open),
+        BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
+            target: SignalTarget::Process(process_id(u32::MAX)),
+            signal: 9,
+        })),
+        BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
+            target: SignalTarget::ProcessGroup(ProcessGroupId(7)),
+            signal: 0,
+        })),
+        BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
+            target: SignalTarget::All,
+            signal: 64,
+        })),
+        BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
+            target: SignalTarget::Thread {
+                process: process_id(2),
+                thread: ThreadId(u32::MAX),
+            },
+            signal: 0,
+        })),
+        BrokerOperation::ProcessGroup(ProcessGroupRequest::Set(SetProcessGroupRequest {
+            process_id: process_id(3),
+            process_group: ProcessGroupId(u32::MAX),
+        })),
+        BrokerOperation::ProcessGroup(ProcessGroupRequest::CreateSession(process_id(5))),
+        BrokerOperation::ProcessGroup(ProcessGroupRequest::GetForegroundGroup(handle)),
+        BrokerOperation::ProcessGroup(ProcessGroupRequest::SetForegroundGroup(
+            SetForegroundGroupRequest {
+                terminal: handle,
+                process_group: ProcessGroupId(u32::MAX),
+            },
+        )),
+        BrokerOperation::ProcessGroup(ProcessGroupRequest::SetControllingTerminal(
+            SetControllingTerminalRequest {
+                process_id: process_id(7),
+                terminal: handle,
+            },
+        )),
+        BrokerOperation::Signal(SignalRequest::Take(TakeSignalRequest { handle })),
+        BrokerOperation::Pipe(PipeRequest::Create(CreatePipeRequest {
+            capacity: 4096,
+            atomic_write_size: 512,
+            flags: FileOpenFlags::STATUS,
+        })),
+        BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
+            handle,
+            buffer: sequence(2, 32),
+        })),
+        BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
+            handle,
+            buffer: sequence(15, 3),
+        })),
+        BrokerOperation::FillRandom(sequence(7, 256)),
+        BrokerOperation::File(FileRequest::Open(OpenFileRequest {
+            path: sequence(1, 7),
+            user: FileUser { user: 2, group: 3 },
+            access: FileAccessMode::ReadWrite,
+            flags: FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE | FileOpenFlags::NO_FOLLOW,
+            mode: FileMode::from_bits(0o640).unwrap(),
+        })),
+        BrokerOperation::File(FileRequest::Read(ReadFileRequest {
+            handle,
+            buffer: largest_sequence,
+            offset: Some(u64::MAX),
+        })),
+        BrokerOperation::File(FileRequest::Read(ReadFileRequest {
+            handle,
+            buffer: SharedBufferSequence::new(&[SharedBufferSlotIndex(2)], 32).unwrap(),
+            offset: None,
+        })),
+        BrokerOperation::File(FileRequest::Write(WriteFileRequest {
+            handle,
+            buffer: SharedBufferSequence::new(&[SharedBufferSlotIndex(3)], 17).unwrap(),
+            offset: Some(11),
+        })),
+        BrokerOperation::File(FileRequest::Seek(SeekFileRequest {
+            handle,
+            offset: -19,
+            whence: FileSeekWhence::RelativeToCurrentOffset,
+        })),
+        BrokerOperation::File(FileRequest::Truncate(TruncateFileRequest {
+            handle,
+            length: 4096,
+            reset_offset: true,
+        })),
+        BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
+            handle,
+            buffer: sequence(4, 256),
+            start_index: 19,
+        })),
+        BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
+            path: sequence(5, 9),
+            user: FileUser { user: 2, group: 3 },
+            follow_symlinks: true,
+        })),
+        BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
+            path: sequence(5, 9),
+            user: FileUser { user: 2, group: 3 },
+            follow_symlinks: false,
+        })),
+        BrokerOperation::File(FileRequest::HandleStatus(HandleFileStatusRequest {
+            handle
+        })),
+        BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
+            handle,
+            user: FileUser::ROOT,
+            times: SetFileTimes {
+                access: FileTimeUpdate::Set(FileTimestamp::default()),
+                modify: FileTimeUpdate::Set(FileTimestamp::default()),
+            },
+        })),
+        BrokerOperation::File(FileRequest::IsTerminal(IsTerminalFileRequest { handle })),
+        BrokerOperation::File(FileRequest::TerminalControl(TerminalControlFileRequest {
+            handle,
+            operation: crate::terminal::TerminalOperation::GetSettings,
+        })),
+        BrokerOperation::File(FileRequest::TerminalControl(TerminalControlFileRequest {
+            handle,
+            operation: crate::terminal::TerminalOperation::SetSettings {
+                settings: crate::terminal::TerminalSettings::default(),
+                timing: crate::terminal::ChangeTiming::Now,
+            },
+        })),
+        BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
+            path: sequence(6, 9),
+            user: FileUser { user: 2, group: 3 },
+            mode: FileMode::from_bits(0o755).unwrap(),
+        })),
+        BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
+            path: sequence(7, 9),
+            acting_user: FileUser { user: 0, group: 0 },
+            user: Some(2),
+            group: None,
+        })),
+        BrokerOperation::File(FileRequest::Unlink(UnlinkFileRequest {
+            path: sequence(8, 9),
+            user: FileUser { user: 2, group: 3 },
+        })),
+        BrokerOperation::File(FileRequest::Mkdir(MkdirFileRequest {
+            path: sequence(9, 9),
+            user: FileUser { user: 2, group: 3 },
+            mode: FileMode::from_bits(0o750).unwrap(),
+        })),
+        BrokerOperation::File(FileRequest::Rmdir(RmdirFileRequest {
+            path: sequence(10, 9),
+            user: FileUser { user: 2, group: 3 },
+        })),
+        BrokerOperation::File(FileRequest::ReadLink(ReadLinkFileRequest {
+            buffer: sequence(11, 256),
+            path_length: 9,
+            user: FileUser { user: 2, group: 3 },
+        })),
+        BrokerOperation::File(FileRequest::ResolvePath(ResolvePathFileRequest {
+            buffer: sequence(12, 256),
+            path_length: 9,
+            user: FileUser { user: 2, group: 3 },
+        })),
+        BrokerOperation::File(FileRequest::HandlePath(HandleFilePathRequest {
+            handle,
+            buffer: sequence(13, 256),
+        })),
+        BrokerOperation::File(FileRequest::Map(MapFileRequest {
+            handle,
+            end: 3 << 32 | 0x1000,
+        })),
+        BrokerOperation::File(FileRequest::Mount(MountFileRequest {
+            path: sequence(14, 9),
+            user: FileUser { user: 2, group: 3 },
+        })),
+        BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
+            address_family: AddressFamily::Ipv4,
+            socket_type: SocketType::Stream,
+            protocol: IpProtocol::Tcp,
+            flags: FileOpenFlags::NONE,
+        })),
+        BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
+            address_family: AddressFamily::Ipv4,
+            socket_type: SocketType::Datagram,
+            protocol: IpProtocol::Udp,
+            flags: FileOpenFlags::NONBLOCKING,
+        })),
+        BrokerOperation::Socket(SocketRequest::Bind(BindSocketRequest {
+            handle,
+            address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        })),
+        BrokerOperation::Socket(SocketRequest::Listen(ListenSocketRequest {
+            handle,
+            backlog: 4096
+        })),
+        BrokerOperation::Socket(SocketRequest::Accept(AcceptSocketRequest {
+            handle,
+            flags: FileOpenFlags::NONBLOCKING,
+        })),
+        BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
+            handle,
+            address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
+        })),
+        BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
+            handle,
+            buffer: sequence(15, 3),
+            flags: SendFlags::NONE,
+        })),
+        BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+            handle,
+            buffer: sequence(15, 3),
+            flags: SendFlags::NONE,
+            destination: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 53)),
+        })),
+        BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+            handle,
+            buffer: largest_sequence,
+            flags: SendFlags::NONE,
+            destination: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 53)),
+        })),
+        BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+            handle,
+            buffer: sequence(15, 0),
+            flags: SendFlags::NONE,
+            destination: None,
+        })),
+        BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
+            handle,
+            buffer: sequence(15, 3),
+            flags: ReceiveFlags::PEEK,
+            peek_offset: 2,
+            peek_length: 5,
+        })),
+        BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
+            handle,
+            buffer: largest_sequence,
+            flags: ReceiveFlags::PEEK,
+            peek_offset: u32::MAX,
+            peek_length: u32::MAX,
+        })),
+        BrokerOperation::Socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
+            handle,
+            buffer: sequence(15, 3),
+            flags: ReceiveFromFlags::PEEK,
+        })),
+        BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+            handle,
+            mode: ShutdownMode::Read
+        })),
+        BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+            handle,
+            mode: ShutdownMode::Write
+        })),
+        BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+            handle,
+            mode: ShutdownMode::Both
+        })),
+        BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+            handle,
+            mode: ShutdownMode::Abort
+        })),
+        BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+            handle,
+            mode: ShutdownMode::StopListening
+        })),
+        BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
+            handle,
+            value: SocketOptionValue::NoDelay(true),
+        })),
+        BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
+            handle,
+            value: SocketOptionValue::KeepAlive(false),
+        })),
+        BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
+            handle,
+            value: SocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(3, 4))),
+        })),
+        BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
+            handle,
+            value: SocketOptionValue::Linger(None),
+        })),
+        BrokerOperation::Socket(SocketRequest::GetOption(GetSocketOptionRequest {
+            handle,
+            name: SocketOptionName::NoDelay
+        })),
+        BrokerOperation::Socket(SocketRequest::GetOption(GetSocketOptionRequest {
+            handle,
+            name: SocketOptionName::SendTimeout
+        })),
+        BrokerOperation::Socket(SocketRequest::CheckConnect(CheckConnectSocketRequest {
+            handle
+        })),
+        BrokerOperation::Socket(SocketRequest::GetName(GetSocketNameRequest {
+            handle,
+            peer: false
+        })),
+        BrokerOperation::Socket(SocketRequest::GetName(GetSocketNameRequest {
+            handle,
+            peer: true
+        })),
+        BrokerOperation::Socket(SocketRequest::TakeError(TakeSocketErrorRequest { handle })),
+        BrokerOperation::Socket(SocketRequest::SetError(SetSocketErrorRequest {
+            handle,
+            error: SocketError::ConnectionReset
+        })),
+        BrokerOperation::Thread(ThreadRequest::Create),
+        BrokerOperation::Thread(ThreadRequest::Exit(thread_id(u32::MAX))),
+        BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+            new_pid_namespace: None,
+            sibling: false,
+        })),
+        BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+            new_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
+            sibling: true,
+        })),
+        BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+            new_pid_namespace: Some(PidNamespaceOptions::new(false, true)),
+            sibling: false,
+        })),
+        BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
+            PidNamespaceOptions::default()
+        )),
+        BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
+            PidNamespaceOptions::new(true, true)
+        )),
+        BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(
+            DuplicateObjectsToChildRequest {
+                child_process_id: process_id(u32::MAX),
+                handles: largest_sequence,
+            }
+        )),
+        BrokerOperation::Process(ProcessRequest::WriteChildMemory(WriteChildMemoryRequest {
+            child_process_id: process_id(u32::MAX),
+            offset: u64::MAX,
+            data: largest_sequence,
+        })),
+        BrokerOperation::Process(ProcessRequest::StartChild(StartChildProcessRequest {
+            child_process_id: process_id(u32::MAX),
+            startup: ProcessStartupDescriptor {
+                buffer: largest_sequence
+            },
+        })),
+        BrokerOperation::Process(ProcessRequest::StartChildWithExistingRunner(
+            StartChildWithExistingRunnerRequest {
+                child_process_id: process_id(u32::MAX),
+                runner_descriptor_length: u32::MAX,
+                data: largest_sequence,
+            }
+        )),
+        BrokerOperation::Process(ProcessRequest::ExitChild(ExitChildProcessRequest {
+            child_process_id: process_id(u32::MAX),
+            exit_status: ProcessExitStatus::Exited { code: u32::MAX },
+        })),
+        BrokerOperation::Process(ProcessRequest::ExitChild(ExitChildProcessRequest {
+            child_process_id: process_id(1),
+            exit_status: ProcessExitStatus::Signaled { signal: 9 },
+        })),
+        BrokerOperation::Process(ProcessRequest::ExitChild(ExitChildProcessRequest {
+            child_process_id: process_id(1),
+            exit_status: ProcessExitStatus::Unknown,
+        })),
+        BrokerOperation::Process(ProcessRequest::CancelChild(process_id(u32::MAX))),
+        BrokerOperation::Process(ProcessRequest::ReportExitStatus(
+            ProcessExitStatus::Exited { code: u32::MAX }
+        )),
+        BrokerOperation::Process(ProcessRequest::ReportExitStatus(
+            ProcessExitStatus::Signaled { signal: 6 }
+        )),
+        BrokerOperation::Process(ProcessRequest::ReportExitStatus(ProcessExitStatus::Unknown)),
+        BrokerOperation::Process(ProcessRequest::SetChildExitRetention(false)),
+        BrokerOperation::Process(ProcessRequest::SetChildExitRetention(true)),
+        BrokerOperation::Process(ProcessRequest::SetOrphanAdoption(false)),
+        BrokerOperation::Process(ProcessRequest::SetOrphanAdoption(true)),
+        BrokerOperation::Process(ProcessRequest::CollectChildExit(ChildSelector::Any)),
+        BrokerOperation::Process(ProcessRequest::CollectChildExit(ChildSelector::Process(
+            process_id(u32::MAX)
+        ))),
+        BrokerOperation::Process(ProcessRequest::CollectChildExit(
+            ChildSelector::ProcessGroup(ProcessGroupId(7))
+        )),
+        BrokerOperation::Process(ProcessRequest::GetInfo(process_id(u32::MAX))),
+        BrokerOperation::Process(ProcessRequest::GetThreadInfo(thread_id(u32::MAX))),
+        BrokerOperation::Process(ProcessRequest::CreateChildConnection(process_id(u32::MAX))),
+        BrokerOperation::Process(ProcessRequest::GetChildrenCpuTime),
+        BrokerOperation::Process(ProcessRequest::GetResourceLimit(GetResourceLimitRequest {
+            process_id: process_id(u32::MAX),
+            resource: ResourceKind::CpuTime,
+        })),
+        BrokerOperation::Process(ProcessRequest::GetResourceLimit(GetResourceLimitRequest {
+            process_id: process_id(1),
+            resource: ResourceKind::Tasks,
+        })),
+        BrokerOperation::Process(ProcessRequest::SetResourceLimit(SetResourceLimitRequest {
+            process_id: process_id(u32::MAX),
+            resource: ResourceKind::CpuTime,
+            limit: ResourceLimit::UNLIMITED,
+        })),
+        BrokerOperation::Process(ProcessRequest::SetResourceLimit(SetResourceLimitRequest {
+            process_id: process_id(1),
+            resource: ResourceKind::Tasks,
+            limit: ResourceLimit::new(0, 7).unwrap(),
+        })),
+        BrokerOperation::Process(ProcessRequest::GetHostNames(GetHostNamesRequest {
+            process_id: process_id(u32::MAX),
+            buffer: largest_sequence,
+        })),
+        BrokerOperation::Process(ProcessRequest::SetHostName(SetHostNameRequest {
+            process_id: process_id(u32::MAX),
+            kind: HostNameKind::Host,
+            name: largest_sequence,
+        })),
+        BrokerOperation::Process(ProcessRequest::SetHostName(SetHostNameRequest {
+            process_id: process_id(1),
+            kind: HostNameKind::Domain,
+            name: sequence(0, 0),
+        })),
+        BrokerOperation::Process(ProcessRequest::CopyHostNames(process_id(u32::MAX))),
+        BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
+            socket_type: SocketType::Stream,
+            flags: FileOpenFlags::NONBLOCKING,
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::CreatePair(CreateUnixSocketRequest {
+            socket_type: SocketType::Datagram,
+            flags: FileOpenFlags::NONE,
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::CreatePair(CreateUnixSocketRequest {
+            socket_type: SocketType::SeqPacket,
+            flags: FileOpenFlags::NONE,
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::Bind(BindUnixSocketRequest {
+            handle,
+            address: largest_sequence,
+            user: FileUser {
+                user: 1000,
+                group: u16::MAX
+            },
+            mode: FileMode::from_bits(0o755).unwrap(),
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::Listen(ListenUnixSocketRequest {
+            handle,
+            backlog: u32::MAX
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::Connect(ConnectUnixSocketRequest {
+            handle,
+            address: largest_sequence,
+            user: FileUser { user: 0, group: 0 },
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::Accept(AcceptUnixSocketRequest {
+            handle,
+            flags: FileOpenFlags::NONBLOCKING,
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::Send(SendUnixSocketRequest {
+            handle,
+            buffer: largest_sequence,
+            address_length: u32::MAX,
+            user: FileUser { user: 1, group: 2 },
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
+            handle,
+            buffer: largest_sequence,
+            capacity: u32::MAX,
+            peek: true,
+            source: true,
+            nonblocking: true,
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::Shutdown(ShutdownUnixSocketRequest {
+            handle,
+            mode: ShutdownMode::Both
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::GetName(GetUnixSocketNameRequest {
+            handle,
+            peer: true,
+            buffer: largest_sequence,
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
+            handle,
+            value: SocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(
+                u64::MAX,
+                999_999_999
+            ))),
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
+            handle,
+            value: SocketOptionValue::Linger(None),
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
+            handle,
+            value: SocketOptionValue::Broadcast(true),
+        })),
+        BrokerOperation::UnixSocket(UnixSocketRequest::GetOption(GetUnixSocketOptionRequest {
+            handle,
+            name: SocketOptionName::SendTimeout,
+        })),
+    ];
+    let mut maximum_encoded_size = 0;
+
+    for operation in operations {
+        let request = BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation,
+        };
+        let encoded = encode_request(&request);
+        maximum_encoded_size = maximum_encoded_size.max(encoded.len());
+        assert!(encoded.len() <= MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+        // Every active frame must be reported as a phase violation during
+        // the handshake, not as an unknown tag: only the former is turned
+        // into a clean protocol-violation shutdown by the transport.
+        assert_eq!(
+            decode_handshake_request(&encoded),
+            Err(WireError::WrongMessagePhase)
+        );
+    }
+    assert_eq!(maximum_encoded_size, MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+}
+
+#[test]
+fn flag_bits_round_trip_unmasked() {
+    // The codec carries flags verbatim so the core can reject unsupported
+    // bits; masking them here would hide them from that check, and a
+    // dropped field would make an unsupported flag look like none at all.
+    let handle = ObjectHandle(13);
+    let buffer = sequence(15, 3);
+    let unsupported = 0x8000_0001;
+    for operation in [
+        BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
+            handle,
+            buffer,
+            flags: SendFlags(unsupported),
+        })),
+        BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
+            handle,
+            buffer,
+            flags: ReceiveFlags(unsupported),
+            peek_offset: 0,
+            peek_length: 0,
+        })),
+        BrokerOperation::Socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
+            handle,
+            buffer,
+            flags: ReceiveFromFlags(unsupported),
+        })),
+    ] {
+        let request = BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation,
+        };
+        assert_eq!(decode_request(&encode_request(&request)).unwrap(), request);
+    }
+
+    assert!(SendFlags(unsupported).has_unsupported_bits());
+    assert!(ReceiveFlags(unsupported).has_unsupported_bits());
+    // No send flag exists yet, so every bit is unsupported there.
+    assert!(SendFlags(ReceiveFlags::PEEK.0).has_unsupported_bits());
+    assert!(!SendFlags::NONE.has_unsupported_bits());
+    assert!(!ReceiveFlags::PEEK.has_unsupported_bits());
+    assert!(ReceiveFlags::PEEK.contains(ReceiveFlags::PEEK));
+    assert!(!ReceiveFlags::NONE.contains(ReceiveFlags::PEEK));
+    assert!(ReceiveFromFlags(unsupported).has_unsupported_bits());
+    assert!(!ReceiveFromFlags::PEEK.has_unsupported_bits());
+    assert!(ReceiveFromFlags::PEEK.contains(ReceiveFromFlags::PEEK));
+}
+
+#[test]
+fn socket_error_codec_round_trips_all_variants() {
+    for error in [
+        SocketError::ConnectionRefused,
+        SocketError::ConnectionReset,
+        SocketError::ConnectionAborted,
+        SocketError::NetworkUnreachable,
+        SocketError::HostUnreachable,
+        SocketError::TimedOut,
+        SocketError::AddressInUse,
+        SocketError::AddressNotAvailable,
+        SocketError::PolicyDenied,
+        SocketError::Other,
+        SocketError::NotConnected,
+        SocketError::InvalidArgument,
+        SocketError::AlreadyConnected,
+        SocketError::AlreadyInProgress,
+        SocketError::Shutdown,
+        SocketError::DestinationAddressRequired,
+        SocketError::Listening,
+        SocketError::ResourceExhausted,
+        SocketError::UnsupportedOperation,
+    ] {
+        for socket_response in [
+            SocketResponse::Failed(error),
+            SocketResponse::Connect(ConnectSocketResponse {
+                status: SocketConnectionStatus::Failed(error),
+            }),
+            SocketResponse::TakeError(TakeSocketErrorResponse { error: Some(error) }),
+        ] {
+            let response = BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::Socket(socket_response),
+            };
+            assert_eq!(
+                decode_response(&encode_response(&response)).unwrap(),
+                response
+            );
+        }
+    }
+}
+
+#[test]
+fn file_lock_wire_values_are_stable_and_round_trip() {
+    let handle = ObjectHandle(13);
+    for (operation, raw) in [
+        (FileLockOperation::Shared, 0),
+        (FileLockOperation::Exclusive, 1),
+        (FileLockOperation::Unlock, 2),
+    ] {
+        let request = BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::File(FileRequest::Lock(LockFileRequest {
+                handle,
+                operation,
+            })),
+        };
+        assert_eq!(request.operation.shared_buffer(), None);
+        let encoded = encode_request(&request);
+        assert_eq!(encoded[9..11], [9, 5]);
+        assert_eq!(&encoded[11..19], &handle.0.to_le_bytes());
+        assert_eq!(encoded[19..], [raw]);
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+        for length in 0..encoded.len() {
+            assert_eq!(
+                decode_request(&encoded[..length]),
+                Err(WireError::TruncatedFrame)
+            );
+        }
+    }
+    let response = BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::File(FileResponse::Lock),
+    };
+    let encoded = encode_response(&response);
+    assert_eq!(encoded[9..], [9, 5]);
+    assert_eq!(decode_response(&encoded).unwrap(), response);
+}
+
+#[test]
+fn file_lock_wire_rejects_invalid_operations() {
+    let mut encoded = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::File(FileRequest::Lock(LockFileRequest {
+            handle: ObjectHandle(13),
+            operation: FileLockOperation::Shared,
+        })),
+    });
+    for raw in 3..=u8::MAX {
+        *encoded.last_mut().unwrap() = raw;
+        assert_eq!(decode_request(&encoded), Err(WireError::InvalidTag));
+    }
+}
+
+#[test]
+fn file_error_wire_values_are_stable_and_round_trip() {
+    for (error, raw) in [
+        (FileError::AccessNotAllowed, 0),
+        (FileError::NoWritePermissions, 1),
+        (FileError::ReadOnlyFs, 2),
+        (FileError::AlreadyExists, 3),
+        (FileError::Io, 4),
+        (FileError::NoSuchFileOrDirectory, 5),
+        (FileError::NoSearchPermissions, 6),
+        (FileError::InvalidPathname, 7),
+        (FileError::MissingComponent, 8),
+        (FileError::ComponentNotDirectory, 9),
+        (FileError::NotFile, 10),
+        (FileError::NotForReading, 11),
+        (FileError::NotForWriting, 12),
+        (FileError::InvalidOffset, 13),
+        (FileError::NonSeekable, 14),
+        (FileError::IsDirectory, 15),
+        (FileError::IsTerminalDevice, 16),
+        (FileError::NotOwner, 17),
+        (FileError::NotDirectory, 18),
+        (FileError::Busy, 19),
+        (FileError::NotEmpty, 20),
+        (FileError::PathOnly, 21),
+        (FileError::NotTerminal, 22),
+        (FileError::InvalidTerminalControl, 23),
+        (FileError::TooManySymlinks, 24),
+        (FileError::NoSuchDevice, 25),
+        (FileError::NoSpace, 26),
+    ] {
+        let response = BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::File(FileResponse::Failed(error)),
+        };
+        let encoded = encode_response(&response);
+        assert_eq!(encoded.last(), Some(&raw));
+        assert_eq!(decode_response(&encoded).unwrap(), response);
+    }
+}
+
+#[test]
+fn request_codec_round_trips_identifier_bounds() {
+    for request_id in [RequestId(0), RequestId(u64::MAX)] {
+        let request = BrokerRequest {
+            request_id,
+            operation: BrokerOperation::CloseObject(ObjectHandle(13)),
+        };
+        assert_eq!(decode_request(&encode_request(&request)).unwrap(), request);
+    }
+    for thread_id in [ThreadId(0), ThreadId(u32::MAX)] {
+        let request = BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Thread(ThreadRequest::Exit(thread_id)),
+        };
+        assert_eq!(decode_request(&encode_request(&request)).unwrap(), request);
+    }
+}
+
+#[test]
+fn handshake_response_codec_round_trips_all_variants() {
+    let responses = [
+        BrokerHandshakeResponse::Negotiated {
+            broker_protocol_version: ProtocolVersion(1),
+            process_id: process_id(1),
+            initial_thread_id: thread_id(2),
+            startup: None,
+        },
+        BrokerHandshakeResponse::Negotiated {
+            broker_protocol_version: ProtocolVersion(1),
+            process_id: process_id(7),
+            initial_thread_id: thread_id(8),
+            startup: Some(ProcessStartupDescriptor {
+                buffer: sequence(0, 37),
+            }),
+        },
+        BrokerHandshakeResponse::VersionMismatch {
+            broker_protocol_version: ProtocolVersion(1),
+        },
+        BrokerHandshakeResponse::Error(ErrorCode::PolicyDenied),
+        BrokerHandshakeResponse::Error(ErrorCode::Internal),
+    ];
+
+    for response in responses {
+        assert_eq!(
+            decode_handshake_response(&encode_handshake_response(&response)).unwrap(),
+            response
+        );
+    }
+}
+
+#[test]
+fn response_codec_round_trips_all_variants() {
+    let handle = ObjectHandle(13);
+    let results = alloc::vec![
+        BrokerResult::Thread(ThreadResponse::Create(thread_id(17))),
+        BrokerResult::Thread(ThreadResponse::Exit),
+        BrokerResult::ObjectClosed,
+        BrokerResult::Readiness(ReadinessFlags::READ),
+        BrokerResult::Readiness(ReadinessFlags::WRITE),
+        BrokerResult::StatusFlags(FileStatusFlags {
+            access: FileAccessMode::WriteOnly,
+            flags: FileOpenFlags::NONBLOCKING | FileOpenFlags::APPEND,
+        }),
+        BrokerResult::StatusFlags(FileStatusFlags {
+            access: FileAccessMode::ReadOnly,
+            flags: FileOpenFlags::PATH
+        }),
+        BrokerResult::StatusFlagsSet,
+        BrokerResult::Event(EventResponse::Create(CreateEventResponse { handle })),
+        BrokerResult::Event(EventResponse::Add(AddEventResponse {
+            readiness: ReadinessFlags::READ | ReadinessFlags::WRITE
+        })),
+        BrokerResult::Event(EventResponse::Consume(EventConsumption {
+            value: 3,
+            readiness: ReadinessFlags::WRITE
+        })),
+        BrokerResult::Timer(TimerResponse::Create(CreateTimerResponse { handle })),
+        BrokerResult::Timer(TimerResponse::Set(SetTimerResponse {
+            previous: TimerSpec {
+                value_ns: 5,
+                interval_ns: u64::MAX
+            }
+        })),
+        BrokerResult::Timer(TimerResponse::Get(GetTimerResponse {
+            current: TimerSpec::default()
+        })),
+        BrokerResult::Timer(TimerResponse::Read(ReadTimerResponse {
+            expirations: u64::MAX
+        })),
+        BrokerResult::UnixSocket(UnixSocketResponse::Create(CreateUnixSocketResponse {
+            handle
+        })),
+        BrokerResult::UnixSocket(UnixSocketResponse::CreatePair(
+            CreateUnixSocketPairResponse {
+                first: handle,
+                second: ObjectHandle(u64::MAX)
+            }
+        )),
+        BrokerResult::UnixSocket(UnixSocketResponse::Bind),
+        BrokerResult::UnixSocket(UnixSocketResponse::Listen),
+        BrokerResult::UnixSocket(UnixSocketResponse::Connect),
+        BrokerResult::UnixSocket(UnixSocketResponse::Accept(AcceptUnixSocketResponse {
+            handle
+        })),
+        BrokerResult::UnixSocket(UnixSocketResponse::Send(SendUnixSocketResponse {
+            sent: u32::MAX
+        })),
+        BrokerResult::UnixSocket(UnixSocketResponse::Receive(ReceiveUnixSocketResponse {
+            received: 1,
+            length: u32::MAX,
+            source_length: 109
+        })),
+        BrokerResult::UnixSocket(UnixSocketResponse::Shutdown),
+        BrokerResult::UnixSocket(UnixSocketResponse::GetName(GetUnixSocketNameResponse {
+            length: 3
+        })),
+        BrokerResult::UnixSocket(UnixSocketResponse::SetOption),
+        BrokerResult::UnixSocket(UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
+            value: SocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(u64::MAX, 1))),
+        })),
+        BrokerResult::UnixSocket(UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
+            value: SocketOptionValue::KeepAlive(false)
+        })),
+        BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::AddressInUse)),
+        BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::NotPermitted)),
+        BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::ConnectionReset)),
+        BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::File(
+            FileError::NoSuchFileOrDirectory
+        ))),
+        BrokerResult::ReadinessQueue(ReadinessQueueResponse::Create(
+            CreateReadinessQueueResponse { handle }
+        )),
+        BrokerResult::SharedFutex(SharedFutexResponse::IssueMemoryId(IssueMemoryIdResponse {
+            memory: SharedMemoryId(u128::MAX - 1)
+        })),
+        BrokerResult::SharedFutex(SharedFutexResponse::CreateWaiter(
+            CreateFutexWaiterResponse { handle }
+        )),
+        BrokerResult::SharedFutex(SharedFutexResponse::Arm),
+        BrokerResult::SharedFutex(SharedFutexResponse::Wake(FutexWakeResponse {
+            woken: u32::MAX
+        })),
+        BrokerResult::SharedFutex(SharedFutexResponse::Disarm(FutexDisarmResponse {
+            woken: true
+        })),
+        BrokerResult::SharedFutex(SharedFutexResponse::Disarm(FutexDisarmResponse {
+            woken: false
+        })),
+        BrokerResult::ReadinessQueue(ReadinessQueueResponse::Add),
+        BrokerResult::ReadinessQueue(ReadinessQueueResponse::Modify),
+        BrokerResult::ReadinessQueue(ReadinessQueueResponse::Remove),
+        BrokerResult::ReadinessQueue(ReadinessQueueResponse::TakeReady(TakeReadyResponse {
+            count: u32::MAX
+        })),
+        BrokerResult::ReadinessQueue(ReadinessQueueResponse::Failed(
+            ReadinessQueueError::AlreadyRegistered
+        )),
+        BrokerResult::ReadinessQueue(ReadinessQueueResponse::Failed(
+            ReadinessQueueError::NotRegistered
+        )),
+        BrokerResult::Signal(SignalResponse::Open(OpenSignalsResponse { handle })),
+        BrokerResult::Signal(SignalResponse::Sent),
+        BrokerResult::Signal(SignalResponse::Take(SignalEvent::Signal(PendingSignal {
+            thread: None,
+            signal: 64,
+            sender: process_id(u32::MAX)
+        }))),
+        BrokerResult::Signal(SignalResponse::Take(SignalEvent::Signal(PendingSignal {
+            thread: Some(ThreadId(u32::MAX)),
+            signal: 33,
+            sender: process_id(1)
+        }))),
+        BrokerResult::Signal(SignalResponse::Take(SignalEvent::ChildExited(ChildExit {
+            process_id: process_id(u32::MAX),
+            exit_status: ProcessExitStatus::Signaled { signal: 9 },
+            cpu_time: CpuTime {
+                user: Duration::new(u64::MAX, 999_999_999),
+                system: Duration::new(u64::MAX, 999_999_999)
+            },
+            children_cpu_time: CpuTime {
+                user: Duration::new(1, 2),
+                system: Duration::new(3, 4)
+            },
+        }))),
+        BrokerResult::Signal(SignalResponse::Take(SignalEvent::ChildRemoved)),
+        BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
+            crate::terminal::TerminalEvents::INTERRUPT
+        ))),
+        BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
+            crate::terminal::TerminalEvents::all()
+        ))),
+        BrokerResult::ProcessGroup(ProcessGroupResponse::Set),
+        BrokerResult::ProcessGroup(ProcessGroupResponse::CreateSession),
+        BrokerResult::ProcessGroup(ProcessGroupResponse::GetForegroundGroup(
+            ProcessGroupMembership {
+                process_group: ProcessGroupId(3),
+                session: SessionId(u32::MAX)
+            }
+        )),
+        BrokerResult::ProcessGroup(ProcessGroupResponse::SetForegroundGroup),
+        BrokerResult::ProcessGroup(ProcessGroupResponse::SetControllingTerminal),
+        BrokerResult::ProcessGroup(ProcessGroupResponse::Failed(
+            ProcessGroupError::NotControllingTerminal
+        )),
+        BrokerResult::ProcessGroup(ProcessGroupResponse::Failed(
+            ProcessGroupError::NoSuchProcessGroup
+        )),
+        BrokerResult::ProcessGroup(ProcessGroupResponse::Failed(
+            ProcessGroupError::NotInSession
+        )),
+        BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
+            read_handle: handle,
+            write_handle: ObjectHandle(14)
+        })),
+        BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 3 })),
+        BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
+        BrokerResult::Socket(SocketResponse::Create(CreateSocketResponse { handle })),
+        BrokerResult::Socket(SocketResponse::Bind(BindSocketResponse {
+            local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)
+        })),
+        BrokerResult::Socket(SocketResponse::Listen(ListenSocketResponse {
+            local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)
+        })),
+        BrokerResult::Socket(SocketResponse::Accept(AcceptSocketResponse {
+            handle,
+            local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
+            remote_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
+        })),
+        BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
+            status: SocketConnectionStatus::Unconnected
+        })),
+        BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+            status: SocketConnectionStatus::Connecting
+        })),
+        BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+            status: SocketConnectionStatus::Connected
+        })),
+        BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+            status: SocketConnectionStatus::Failed(SocketError::ConnectionRefused)
+        })),
+        BrokerResult::Socket(SocketResponse::Send(SendSocketResponse { sent: 3 })),
+        BrokerResult::Socket(SocketResponse::SendTo(SendToSocketResponse { sent: 3 })),
+        BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(3))),
+        BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(0))),
+        BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::EndOfStream)),
+        BrokerResult::Socket(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
+            received: 3,
+            datagram_length: 7,
+            source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153)
+        })),
+        BrokerResult::Socket(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
+            received: 0,
+            datagram_length: 0,
+            source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153)
+        })),
+        BrokerResult::Socket(SocketResponse::Shutdown),
+        BrokerResult::Socket(SocketResponse::SetOption),
+        BrokerResult::Socket(SocketResponse::GetOption(GetSocketOptionResponse {
+            value: SocketOptionValue::NoDelay(true)
+        })),
+        BrokerResult::Socket(SocketResponse::GetOption(GetSocketOptionResponse {
+            value: SocketOptionValue::SendTimeout(Some(core::time::Duration::new(5, 6)))
+        })),
+        BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
+            status: SocketConnectionStatus::Connecting
+        })),
+        BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
+            status: SocketConnectionStatus::Connected
+        })),
+        BrokerResult::Socket(SocketResponse::GetName(GetSocketNameResponse {
+            address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152))
+        })),
+        BrokerResult::Socket(SocketResponse::GetName(GetSocketNameResponse {
+            address: None
+        })),
+        BrokerResult::Socket(SocketResponse::TakeError(TakeSocketErrorResponse {
+            error: Some(SocketError::ConnectionReset)
+        })),
+        BrokerResult::Socket(SocketResponse::TakeError(TakeSocketErrorResponse {
+            error: None
+        })),
+        BrokerResult::Socket(SocketResponse::SetError),
+        BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
+        BrokerResult::RandomFilled,
+        BrokerResult::File(FileResponse::Open(OpenFileResponse { handle })),
+        BrokerResult::File(FileResponse::Read(ReadFileResponse { read: 11 })),
+        BrokerResult::File(FileResponse::Write(WriteFileResponse { written: 17 })),
+        BrokerResult::File(FileResponse::Seek(SeekFileResponse { offset: 19 })),
+        BrokerResult::File(FileResponse::Truncate),
+        BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {
+            length: 23,
+            next_index: Some(29)
+        })),
+        BrokerResult::File(FileResponse::PathStatus(FileStatus {
+            file_type: FileType::CharacterDevice,
+            mode: FileMode::from_bits(0o620).unwrap(),
+            size: u64::MAX,
+            owner: FileUser {
+                user: u16::MAX,
+                group: u16::MAX
+            },
+            node_info: FileNodeInfo {
+                dev: u64::MAX,
+                ino: u64::MAX,
+                rdev: Some(NonZeroU64::MAX)
+            },
+            blksize: u64::MAX,
+            times: Some(FileTimestamps {
+                accessed: FileTimestamp {
+                    seconds: i64::MIN,
+                    nanoseconds: 0
+                },
+                modified: FileTimestamp {
+                    seconds: -1,
+                    nanoseconds: 999_999_999
+                },
+                changed: FileTimestamp {
+                    seconds: i64::MAX,
+                    nanoseconds: 1
+                },
+            }),
+        })),
+        BrokerResult::File(FileResponse::HandleStatus(FileStatus {
+            file_type: FileType::CharacterDevice,
+            mode: FileMode::from_bits(0o620).unwrap(),
+            size: u64::MAX,
+            owner: FileUser {
+                user: u16::MAX,
+                group: u16::MAX
+            },
+            node_info: FileNodeInfo {
+                dev: u64::MAX,
+                ino: u64::MAX,
+                rdev: Some(NonZeroU64::MAX)
+            },
+            blksize: u64::MAX,
+            times: None,
+        })),
+        BrokerResult::File(FileResponse::SetTimes),
+        BrokerResult::File(FileResponse::IsTerminal(false)),
+        BrokerResult::File(FileResponse::IsTerminal(true)),
+        BrokerResult::File(FileResponse::TerminalControl(
+            crate::terminal::TerminalResponse::Settings(
+                crate::terminal::TerminalSettings::default()
+            )
+        )),
+        BrokerResult::File(FileResponse::Chmod),
+        BrokerResult::File(FileResponse::Chown),
+        BrokerResult::File(FileResponse::Unlink),
+        BrokerResult::File(FileResponse::Mkdir),
+        BrokerResult::File(FileResponse::Mount),
+        BrokerResult::File(FileResponse::Rmdir),
+        BrokerResult::File(FileResponse::ReadLink(FilePathResponse { length: 31 })),
+        BrokerResult::File(FileResponse::ResolvePath(FilePathResponse { length: 37 })),
+        BrokerResult::File(FileResponse::HandlePath(FilePathResponse { length: 41 })),
+        BrokerResult::File(FileResponse::Map(MapFileResponse {
+            memory: SharedMemoryId((7 << 64) | 9),
+            token: 11,
+            writable: true
+        })),
+        BrokerResult::File(FileResponse::Map(MapFileResponse {
+            memory: SharedMemoryId(13),
+            token: 15,
+            writable: false
+        })),
+        BrokerResult::File(FileResponse::Failed(FileError::Io)),
+        BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
+            process_id: process_id(19),
+            initial_thread_id: thread_id(21),
+            own_process_id: process_id(19)
+        })),
+        BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
+            process_id: process_id(19),
+            initial_thread_id: thread_id(21),
+            own_process_id: process_id(1)
+        })),
+        BrokerResult::Process(ProcessResponse::DuplicateObjectsToChild),
+        BrokerResult::Process(ProcessResponse::WriteChildMemory),
+        BrokerResult::Process(ProcessResponse::StartChild),
+        BrokerResult::Process(ProcessResponse::StartChildWithExistingRunner),
+        BrokerResult::Process(ProcessResponse::CreateChildConnection(
+            crate::SharedObjectToken(u64::MAX)
+        )),
+        BrokerResult::Process(ProcessResponse::ExitChild),
+        BrokerResult::Process(ProcessResponse::CancelChild),
+        BrokerResult::Process(ProcessResponse::ReportExitStatus),
+        BrokerResult::Process(ProcessResponse::SetChildExitRetention),
+        BrokerResult::Process(ProcessResponse::SetOrphanAdoption),
+        BrokerResult::Process(ProcessResponse::CreateChildrenPidNamespace),
+        BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
+            process_id: process_id(u32::MAX),
+            exit_status: ProcessExitStatus::Exited { code: u32::MAX },
+            cpu_time: CpuTime {
+                user: Duration::new(u64::MAX, 999_999_999),
+                system: Duration::new(u64::MAX, 999_999_999)
+            },
+            children_cpu_time: CpuTime {
+                user: Duration::new(u64::MAX, 999_999_999),
+                system: Duration::new(u64::MAX, 999_999_999)
+            },
+        })),
+        BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
+            process_id: process_id(1),
+            exit_status: ProcessExitStatus::Signaled { signal: 11 },
+            cpu_time: CpuTime {
+                user: Duration::from_micros(1),
+                system: Duration::ZERO
+            },
+            children_cpu_time: CpuTime {
+                user: Duration::ZERO,
+                system: Duration::from_micros(2)
+            },
+        })),
+        BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
+            process_id: process_id(1),
+            exit_status: ProcessExitStatus::Unknown,
+            cpu_time: CpuTime::default(),
+            children_cpu_time: CpuTime::default(),
+        })),
+        BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
+            creator: None,
+            parent: None,
+            membership: ProcessGroupMembership {
+                process_group: ProcessGroupId(1),
+                session: SessionId(1)
+            },
+            initial_thread: None,
+            first_in_namespace: Some(PidNamespaceOptions::new(true, true)),
+        })),
+        BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
+            creator: None,
+            parent: None,
+            membership: ProcessGroupMembership {
+                process_group: ProcessGroupId(0),
+                session: SessionId(0)
+            },
+            initial_thread: Some(ThreadId(1)),
+            first_in_namespace: Some(PidNamespaceOptions::default()),
+        })),
+        BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
+            creator: Some(process_id(u32::MAX)),
+            parent: Some(process_id(1)),
+            membership: ProcessGroupMembership {
+                process_group: ProcessGroupId(u32::MAX),
+                session: SessionId(3)
+            },
+            initial_thread: Some(ThreadId(u32::MAX)),
+            first_in_namespace: None,
+        })),
+        BrokerResult::Process(ProcessResponse::GetThreadInfo(ThreadInfo {
+            process_id: process_id(1),
+            initial: false
+        })),
+        BrokerResult::Process(ProcessResponse::GetThreadInfo(ThreadInfo {
+            process_id: process_id(u32::MAX),
+            initial: true
+        })),
+        BrokerResult::Process(ProcessResponse::GetChildrenCpuTime(CpuTime::default())),
+        BrokerResult::Process(ProcessResponse::GetChildrenCpuTime(CpuTime {
+            user: Duration::new(1, 2),
+            system: Duration::new(u64::MAX, 999_999_999)
+        })),
+        BrokerResult::Process(ProcessResponse::GetResourceLimit(ResourceLimit::UNLIMITED)),
+        BrokerResult::Process(ProcessResponse::GetResourceLimit(
+            ResourceLimit::new(3, 3).unwrap()
+        )),
+        BrokerResult::Process(ProcessResponse::SetResourceLimit(
+            ResourceLimit::new(0, u64::MAX).unwrap()
+        )),
+        BrokerResult::Process(ProcessResponse::GetHostNames(HostNameSizes {
+            host: 0,
+            domain: MAX_HOST_NAME_SIZE
+        })),
+        BrokerResult::Process(ProcessResponse::GetHostNames(HostNameSizes {
+            host: MAX_HOST_NAME_SIZE,
+            domain: 0
+        })),
+        BrokerResult::Process(ProcessResponse::SetHostName),
+        BrokerResult::Process(ProcessResponse::CopyHostNames),
+        BrokerResult::Error(ErrorCode::PolicyDenied),
+        BrokerResult::Error(ErrorCode::WouldBlock),
+        BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
+        BrokerResult::Error(ErrorCode::PeerClosed),
+        BrokerResult::Error(ErrorCode::OutOfMemory),
+        BrokerResult::Error(ErrorCode::Internal),
+    ];
+    let mut maximum_encoded_size = 0;
+
+    for result in results {
+        let response = BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result,
+        };
+        let encoded = encode_response(&response);
+        maximum_encoded_size = maximum_encoded_size.max(encoded.len());
+        assert!(encoded.len() <= MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+        assert_eq!(decode_response(&encoded).unwrap(), response);
+        assert_eq!(
+            decode_handshake_response(&encoded),
+            Err(WireError::WrongMessagePhase)
+        );
+    }
+    assert_eq!(maximum_encoded_size, 96);
+}
+
+#[test]
+fn response_codec_round_trips_identifier_bounds() {
+    for request_id in [RequestId(0), RequestId(u64::MAX)] {
+        let response = BrokerResponse {
+            request_id,
+            result: BrokerResult::ObjectClosed,
+        };
+        assert_eq!(
+            decode_response(&encode_response(&response)).unwrap(),
+            response
+        );
+    }
+    for thread_id in [ThreadId(0), ThreadId(u32::MAX)] {
+        let response = BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Thread(ThreadResponse::Create(thread_id)),
+        };
+        assert_eq!(
+            decode_response(&encode_response(&response)).unwrap(),
+            response
+        );
+    }
+    for process_id in [ProcessId(0), ProcessId(u32::MAX)] {
+        let response = BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
+                process_id,
+                initial_thread_id: ThreadId(0),
+                own_process_id: process_id,
+            })),
+        };
+        assert_eq!(
+            decode_response(&encode_response(&response)).unwrap(),
+            response
+        );
+    }
+}
+
+#[test]
+fn notification_codec_round_trips_all_variants() {
+    let handle = ObjectHandle(13);
+    let notifications = [BrokerNotification::Readiness(ReadinessNotification {
+        handle,
+        readiness: ReadinessFlags::READ | ReadinessFlags::HANGUP,
+    })];
+    let mut maximum_encoded_size = 0;
+
+    for notification in notifications {
+        let encoded = encode_notification(&notification);
+        maximum_encoded_size = maximum_encoded_size.max(encoded.len());
+        assert!(encoded.len() <= MAX_ENCODED_NOTIFICATION_SIZE);
+        assert_eq!(decode_notification(&encoded).unwrap(), notification);
+    }
+    assert_eq!(maximum_encoded_size, MAX_ENCODED_NOTIFICATION_SIZE);
+}
+
+#[test]
+fn decode_rejects_malformed_handshake_request_frames() {
+    assert_eq!(
+        decode_handshake_request(&[0xff, 1, 2, 3]),
+        Err(WireError::InvalidTag)
+    );
+    assert_eq!(
+        decode_handshake_request(&[0, 1]),
+        Err(WireError::TruncatedFrame)
+    );
+    assert_eq!(
+        decode_handshake_request(&encode_request(&BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
+                initial_count: 0,
+                flags: FileOpenFlags::NONE,
+            })),
+        })),
+        Err(WireError::WrongMessagePhase)
+    );
+    assert_eq!(
+        decode_handshake_request(&encode_request(&BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::CloseObject(ObjectHandle(13)),
+        })),
+        Err(WireError::WrongMessagePhase)
+    );
+    let mut frame = encode_handshake_request(&BrokerHandshakeRequest {
+        protocol_version: ProtocolVersion(1),
+    });
+    frame.push(0xff);
+    assert_eq!(
+        decode_handshake_request(&frame),
+        Err(WireError::TrailingBytes)
+    );
+}
+
+#[test]
+fn decode_rejects_malformed_request_frames() {
+    assert_eq!(decode_request(&[0xff, 1, 2, 3]), Err(WireError::InvalidTag));
+    assert_eq!(
+        decode_request(&encode_handshake_request(&BrokerHandshakeRequest {
+            protocol_version: ProtocolVersion(1)
+        })),
+        Err(WireError::WrongMessagePhase)
+    );
+    assert_eq!(
+        decode_request(&[1, 0, 0, 0, 0, 0, 0, 0]),
+        Err(WireError::TruncatedFrame)
+    );
+    let mut unknown_operation = Vec::from([1]);
+    unknown_operation.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
+    unknown_operation.push(u8::MAX);
+    assert_eq!(
+        decode_request(&unknown_operation),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_consume_mode = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
+            handle: ObjectHandle(13),
+            mode: EventConsumeMode::All,
+        })),
+    });
+    *unknown_consume_mode.last_mut().unwrap() = 0xff;
+    assert_eq!(
+        decode_request(&unknown_consume_mode),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_timer_request = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest::default())),
+    });
+    unknown_timer_request[10] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_timer_request),
+        Err(WireError::InvalidTag)
+    );
+    let truncated_timer_set = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest {
+            handle: ObjectHandle(13),
+            spec: TimerSpec::default(),
+        })),
+    });
+    assert_eq!(
+        decode_request(&truncated_timer_set[..truncated_timer_set.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+    let set_resource_limit = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Process(ProcessRequest::SetResourceLimit(
+            SetResourceLimitRequest {
+                process_id: ProcessId(1),
+                resource: ResourceKind::Tasks,
+                limit: ResourceLimit::new(1, 1).unwrap(),
+            },
+        )),
+    });
+    let limits = set_resource_limit.len() - 2 * size_of::<u64>();
+    let mut unknown_resource_kind = set_resource_limit.clone();
+    unknown_resource_kind[limits - 1] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_resource_kind),
+        Err(WireError::InvalidTag)
+    );
+    let mut soft_above_hard = set_resource_limit;
+    soft_above_hard[limits + size_of::<u64>()..].fill(0);
+    assert_eq!(decode_request(&soft_above_hard), Err(WireError::InvalidTag));
+    let mut unknown_host_name_kind = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Process(ProcessRequest::SetHostName(SetHostNameRequest {
+            process_id: ProcessId(1),
+            kind: HostNameKind::Domain,
+            name: sequence(0, 0),
+        })),
+    });
+    unknown_host_name_kind[15] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_host_name_kind),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_signal_request = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Signal(SignalRequest::Open),
+    });
+    unknown_signal_request[10] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_signal_request),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_readiness_queue_request = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Create),
+    });
+    unknown_readiness_queue_request[10] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_readiness_queue_request),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_shared_futex_request = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::SharedFutex(SharedFutexRequest::CreateWaiter),
+    });
+    unknown_shared_futex_request[10] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_shared_futex_request),
+        Err(WireError::InvalidTag)
+    );
+    let futex_arm = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::SharedFutex(SharedFutexRequest::Arm(FutexArmRequest {
+            key: SharedFutexKey {
+                memory: SharedMemoryId(u128::MAX),
+                offset: 4,
+            },
+            bitset: 1,
+            waiter: ObjectHandle(13),
+        })),
+    });
+    // Phase, request ID, operation tag, and family tag precede the key,
+    // whose memory ID is cut short.
+    for length in [futex_arm.len() - 1, 11 + 15] {
+        assert_eq!(
+            decode_request(&futex_arm[..length]),
+            Err(WireError::TruncatedFrame)
+        );
+    }
+    let mut unknown_readiness_queue_flags = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Add(
+            AddReadinessQueueEntryRequest {
+                queue: ObjectHandle(1),
+                target: ObjectHandle(2),
+                key: 3,
+                interest: ReadinessQueueInterest::default(),
+            },
+        )),
+    });
+    // Phase, request ID, operation tag, family tag, two handles, key, and
+    // readiness precede the entry flags.
+    unknown_readiness_queue_flags[39] = 1 << 7;
+    assert_eq!(
+        decode_request(&unknown_readiness_queue_flags),
+        Err(WireError::InvalidTag)
+    );
+    let truncated_signal_send = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
+            target: SignalTarget::Process(process_id(1)),
+            signal: 10,
+        })),
+    });
+    assert_eq!(
+        decode_request(&truncated_signal_send[..truncated_signal_send.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+    let mut unknown_signal_target = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
+            target: SignalTarget::All,
+            signal: 10,
+        })),
+    });
+    unknown_signal_target[11] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_signal_target),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_process_group_request = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::ProcessGroup(ProcessGroupRequest::CreateSession(process_id(1))),
+    });
+    unknown_process_group_request[10] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_process_group_request),
+        Err(WireError::InvalidTag)
+    );
+    let truncated_process_group_set = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::ProcessGroup(ProcessGroupRequest::Set(
+            SetProcessGroupRequest {
+                process_id: process_id(1),
+                process_group: ProcessGroupId(2),
+            },
+        )),
+    });
+    assert_eq!(
+        decode_request(&truncated_process_group_set[..truncated_process_group_set.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+    let mut unknown_status_flag = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::SetStatusFlags(SetStatusFlagsRequest {
+            handle: ObjectHandle(13),
+            mask: FileOpenFlags::NONBLOCKING,
+            flags: FileOpenFlags::NONE,
+        }),
+    });
+    *unknown_status_flag.last_mut().unwrap() = 0xff;
+    assert_eq!(
+        decode_request(&unknown_status_flag),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_thread_request = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Thread(ThreadRequest::Create),
+    });
+    unknown_thread_request[10] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_thread_request),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_process_request = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Process(ProcessRequest::GetChildrenCpuTime),
+    });
+    unknown_process_request[10] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_process_request),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_exit_status = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Process(ProcessRequest::ExitChild(ExitChildProcessRequest {
+            child_process_id: process_id(1),
+            exit_status: ProcessExitStatus::Unknown,
+        })),
+    });
+    unknown_exit_status[15] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_exit_status),
+        Err(WireError::InvalidTag)
+    );
+    let mut invalid_child_exit_retention = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Process(ProcessRequest::SetChildExitRetention(true)),
+    });
+    invalid_child_exit_retention[11] = 2;
+    assert_eq!(
+        decode_request(&invalid_child_exit_retention),
+        Err(WireError::InvalidTag)
+    );
+    let mut invalid_orphan_adoption = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Process(ProcessRequest::SetOrphanAdoption(true)),
+    });
+    invalid_orphan_adoption[11] = 2;
+    assert_eq!(
+        decode_request(&invalid_orphan_adoption),
+        Err(WireError::InvalidTag)
+    );
+    // The option tag and all three bool fields reject non-boolean values.
+    let allocate_child = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
+            new_pid_namespace: Some(PidNamespaceOptions::new(true, true)),
+            sibling: true,
+        })),
+    });
+    assert_eq!(allocate_child[10..], [0, 1, 1, 1, 1]);
+    for (index, value) in [(11, 2), (12, 0b100), (12, 0x80), (13, 2), (14, 2)] {
+        let mut invalid_allocate_child = allocate_child.clone();
+        invalid_allocate_child[index] = value;
+        assert_eq!(
+            decode_request(&invalid_allocate_child),
+            Err(WireError::InvalidTag)
+        );
+    }
+    let mut invalid_children_pid_namespace = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
+            PidNamespaceOptions::default(),
+        )),
+    });
+    invalid_children_pid_namespace[11] = 0b100;
+    assert_eq!(
+        decode_request(&invalid_children_pid_namespace),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_child_selector = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Process(ProcessRequest::CollectChildExit(ChildSelector::Any)),
+    });
+    unknown_child_selector[11] = 0xff;
+    assert_eq!(
+        decode_request(&unknown_child_selector),
+        Err(WireError::InvalidTag)
+    );
+    let mut frame = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
+            initial_count: 0,
+            flags: FileOpenFlags::NONE,
+        })),
+    });
+    frame.push(0xff);
+    assert_eq!(decode_request(&frame), Err(WireError::TrailingBytes));
+}
+
+#[test]
+fn file_time_requests_round_trip() {
+    let timestamps = [
+        FileTimestamp::default(),
+        FileTimestamp {
+            seconds: i64::MIN,
+            nanoseconds: 0,
+        },
+        FileTimestamp {
+            seconds: -1,
+            nanoseconds: 999_999_999,
+        },
+        FileTimestamp {
+            seconds: i64::MAX,
+            nanoseconds: 1,
+        },
+    ];
+    for timestamp in timestamps {
+        let updates = [
+            FileTimeUpdate::Omit,
+            FileTimeUpdate::Now,
+            FileTimeUpdate::Set(timestamp),
+        ];
+        for access in updates {
+            for modify in updates {
+                let times = SetFileTimes { access, modify };
+                let operation = BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
+                    handle: ObjectHandle(u64::MAX),
+                    user: FileUser { user: 2, group: 3 },
+                    times,
+                }));
+                assert_eq!(operation.shared_buffer(), None);
+                let request = BrokerRequest {
+                    request_id: TEST_REQUEST_ID,
+                    operation,
+                };
+                assert_eq!(decode_request(&encode_request(&request)), Ok(request));
+            }
+        }
+    }
+}
+
+/// Overwrites the only occurrence of `nanoseconds` in `frame` with an out-of-range count.
+fn invalidate_nanoseconds(frame: &[u8], nanoseconds: u32) -> Vec<u8> {
+    let needle = nanoseconds.to_le_bytes();
+    let mut found = (0..frame.len() - 3).filter(|&at| frame[at..at + 4] == needle);
+    let at = found.next().expect("nanoseconds are encoded");
+    assert!(found.next().is_none(), "nanoseconds must be distinctive");
+    let mut invalid = frame.to_vec();
+    invalid[at..at + 4].copy_from_slice(&1_000_000_000u32.to_le_bytes());
+    invalid
+}
+
+#[test]
+fn decode_rejects_invalid_file_time_requests() {
+    let encode = |times| {
+        encode_request(&BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
+                handle: ObjectHandle(7),
+                user: FileUser::ROOT,
+                times,
+            })),
+        })
+    };
+    // With both updates omitted, the two update tags end the frame.
+    let frame = encode(SetFileTimes {
+        access: FileTimeUpdate::Omit,
+        modify: FileTimeUpdate::Omit,
+    });
+    for tag in frame.len() - 2..frame.len() {
+        let mut invalid = frame.clone();
+        invalid[tag] = u8::MAX;
+        assert_eq!(decode_request(&invalid), Err(WireError::InvalidTag));
+    }
+    let access = FileTimestamp {
+        seconds: -17,
+        nanoseconds: 111_111_111,
+    };
+    let modify = FileTimestamp {
+        seconds: -17,
+        nanoseconds: 222_222_222,
+    };
+    let frame = encode(SetFileTimes {
+        access: FileTimeUpdate::Set(access),
+        modify: FileTimeUpdate::Set(modify),
+    });
+    for nanoseconds in [access.nanoseconds, modify.nanoseconds] {
+        assert_eq!(
+            decode_request(&invalidate_nanoseconds(&frame, nanoseconds)),
+            Err(WireError::InvalidTag)
+        );
+    }
+    for length in 0..frame.len() {
+        assert_eq!(
+            decode_request(&frame[..length]),
+            Err(WireError::TruncatedFrame)
+        );
+    }
+}
+
+#[test]
+fn decode_rejects_invalid_file_status_times() {
+    let status = |times| FileStatus {
+        file_type: FileType::RegularFile,
+        mode: FileMode::default(),
+        size: 0,
+        owner: FileUser::ROOT,
+        node_info: FileNodeInfo {
+            dev: 1,
+            ino: 2,
+            rdev: None,
+        },
+        blksize: 4096,
+        times,
+    };
+    let at = |nanoseconds| FileTimestamp {
+        seconds: -17,
+        nanoseconds,
+    };
+    let times = FileTimestamps {
+        accessed: at(111_111_111),
+        modified: at(222_222_222),
+        changed: at(333_333_333),
+    };
+    let responses: [fn(FileStatus) -> FileResponse; 2] =
+        [FileResponse::PathStatus, FileResponse::HandleStatus];
+    for response in responses {
+        let encode = |status| {
+            encode_response(&BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::File(response(status)),
+            })
+        };
+        // Without times, the times flag ends the frame.
+        let mut invalid = encode(status(None));
+        *invalid.last_mut().unwrap() = u8::MAX;
+        assert_eq!(decode_response(&invalid), Err(WireError::InvalidTag));
+        let frame = encode(status(Some(times)));
+        for timestamp in [times.accessed, times.modified, times.changed] {
+            assert_eq!(
+                decode_response(&invalidate_nanoseconds(&frame, timestamp.nanoseconds)),
+                Err(WireError::InvalidTag)
+            );
+        }
+        for length in 0..frame.len() {
+            assert_eq!(
+                decode_response(&frame[..length]),
+                Err(WireError::TruncatedFrame)
+            );
+        }
+    }
+}
+
+#[test]
+fn decode_rejects_malformed_fs_request_frames() {
+    let open = BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
+            path: sequence(1, 9),
+            user: FileUser { user: 2, group: 3 },
+            access: FileAccessMode::ReadOnly,
+            flags: FileOpenFlags::CREATE,
+            mode: FileMode::from_bits(0o640).unwrap(),
+        })),
+    };
+
+    let mut unknown_operation = Vec::from([1]);
+    unknown_operation.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
+    unknown_operation.extend_from_slice(&[9, 0xff]);
+    assert_eq!(
+        decode_request(&unknown_operation),
+        Err(WireError::InvalidTag)
+    );
+
+    let open = encode_request(&open);
+    let mut unknown_access = open.clone();
+    unknown_access[24] = 0xff;
+    assert_eq!(decode_request(&unknown_access), Err(WireError::InvalidTag));
+    let mut unsupported_flags = open.clone();
+    unsupported_flags[25..27].copy_from_slice(&(1u16 << 15).to_le_bytes());
+    assert_eq!(
+        decode_request(&unsupported_flags),
+        Err(WireError::InvalidTag)
+    );
+    let mut unsupported_mode = open.clone();
+    unsupported_mode[27..29].copy_from_slice(&0o10000u16.to_le_bytes());
+    assert_eq!(
+        decode_request(&unsupported_mode),
+        Err(WireError::InvalidTag)
+    );
+    let mut invalid_reset_offset = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::File(FileRequest::Truncate(TruncateFileRequest {
+            handle: ObjectHandle(13),
+            length: 17,
+            reset_offset: false,
+        })),
+    });
+    *invalid_reset_offset.last_mut().unwrap() = 2;
+    assert_eq!(
+        decode_request(&invalid_reset_offset),
+        Err(WireError::InvalidTag)
+    );
+    let mut invalid_whence = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::File(FileRequest::Seek(SeekFileRequest {
+            handle: ObjectHandle(13),
+            offset: 0,
+            whence: FileSeekWhence::RelativeToBeginning,
+        })),
+    });
+    *invalid_whence.last_mut().unwrap() = 0xff;
+    assert_eq!(decode_request(&invalid_whence), Err(WireError::InvalidTag));
+
+    let chown = BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
+            path: sequence(1, 9),
+            acting_user: FileUser { user: 0, group: 0 },
+            user: Some(2),
+            group: None,
+        })),
+    };
+    let mut invalid_user = encode_request(&chown);
+    let user_tag = invalid_user.len() - 4;
+    invalid_user[user_tag] = 2;
+    assert_eq!(decode_request(&invalid_user), Err(WireError::InvalidTag));
+}
+
+#[test]
+fn decode_rejects_malformed_fs_response_frames() {
+    let status = BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::File(FileResponse::PathStatus(FileStatus {
+            file_type: FileType::RegularFile,
+            mode: FileMode::from_bits(0o640).unwrap(),
+            size: 17,
+            owner: FileUser { user: 2, group: 3 },
+            node_info: FileNodeInfo {
+                dev: 5,
+                ino: 7,
+                rdev: None,
+            },
+            blksize: 4096,
+            times: None,
+        })),
+    };
+    let status = encode_response(&status);
+    let mut unknown_file_type = status.clone();
+    unknown_file_type[11] = 0xff;
+    assert_eq!(
+        decode_response(&unknown_file_type),
+        Err(WireError::InvalidTag)
+    );
+    let mut unsupported_mode = status.clone();
+    unsupported_mode[12..14].copy_from_slice(&0o10000u16.to_le_bytes());
+    assert_eq!(
+        decode_response(&unsupported_mode),
+        Err(WireError::InvalidTag)
+    );
+    let mut invalid_next_index = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {
+            length: 17,
+            next_index: None,
+        })),
+    });
+    *invalid_next_index.last_mut().unwrap() = 2;
+    assert_eq!(
+        decode_response(&invalid_next_index),
+        Err(WireError::InvalidTag)
+    );
+    let mut invalid_is_terminal = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::File(FileResponse::IsTerminal(true)),
+    });
+    *invalid_is_terminal.last_mut().unwrap() = 2;
+    assert_eq!(
+        decode_response(&invalid_is_terminal),
+        Err(WireError::InvalidTag)
+    );
+
+    let mut invalid_error = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::File(FileResponse::Failed(FileError::Io)),
+    });
+    *invalid_error.last_mut().unwrap() = 0xff;
+    assert_eq!(decode_response(&invalid_error), Err(WireError::InvalidTag));
+}
+
+#[test]
+fn decode_rejects_malformed_socket_request_frames() {
+    let mut unknown_operation = Vec::from([1]);
+    unknown_operation.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
+    unknown_operation.extend_from_slice(&[7, 0xff]);
+    assert_eq!(
+        decode_request(&unknown_operation),
+        Err(WireError::InvalidTag)
+    );
+
+    // A socket envelope carrying no family tag at all.
+    assert_eq!(
+        decode_request(&unknown_operation[..unknown_operation.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+
+    // Address family, type, and protocol precede the two-byte status flags
+    // at the end of a create frame, so each unknown tag, and unknown flag
+    // bits, are rejected on their own.
+    let create = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
+            address_family: AddressFamily::Ipv4,
+            socket_type: SocketType::Stream,
+            protocol: IpProtocol::Tcp,
+            flags: FileOpenFlags::NONE,
+        })),
+    });
+    for offset in [1, 3, 4, 5] {
+        let mut frame = create.clone();
+        let index = frame.len() - offset;
+        frame[index] = 0xff;
+        assert_eq!(decode_request(&frame), Err(WireError::InvalidTag));
+    }
+    assert_eq!(
+        decode_request(&create[..create.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+
+    let set_option = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
+            handle: ObjectHandle(13),
+            value: SocketOptionValue::NoDelay(true),
+        })),
+    });
+    for offset in 1..=2 {
+        let mut frame = set_option.clone();
+        let index = frame.len() - offset;
+        frame[index] = 0xff;
+        assert_eq!(decode_request(&frame), Err(WireError::InvalidTag));
+    }
+
+    let mut unknown_shutdown_mode = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+            handle: ObjectHandle(9),
+            mode: ShutdownMode::Both,
+        })),
+    });
+    *unknown_shutdown_mode.last_mut().unwrap() = 0xff;
+    assert_eq!(
+        decode_request(&unknown_shutdown_mode),
+        Err(WireError::InvalidTag)
+    );
+
+    let connect = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
+            handle: ObjectHandle(9),
+            address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
+        })),
+    });
+    assert_eq!(
+        decode_request(&connect[..connect.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+
+    let mut unknown_send_to_destination = encode_request(&BrokerRequest {
+        request_id: TEST_REQUEST_ID,
+        operation: BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+            handle: ObjectHandle(9),
+            buffer: sequence(1, 0),
+            flags: SendFlags::NONE,
+            destination: None,
+        })),
+    });
+    *unknown_send_to_destination.last_mut().unwrap() = 2;
+    assert_eq!(
+        decode_request(&unknown_send_to_destination),
+        Err(WireError::InvalidTag)
+    );
+
+    let mut trailing = connect;
+    trailing.push(0);
+    assert_eq!(decode_request(&trailing), Err(WireError::TrailingBytes));
+}
+
+#[test]
+fn decode_rejects_malformed_socket_response_frames() {
+    let mut unknown_response = Vec::from([1]);
+    unknown_response.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
+    unknown_response.extend_from_slice(&[7, 0xff]);
+    assert_eq!(
+        decode_response(&unknown_response),
+        Err(WireError::InvalidTag)
+    );
+    assert_eq!(
+        decode_response(&unknown_response[..unknown_response.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+
+    let mut unknown_connect_status = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+            status: SocketConnectionStatus::Connecting,
+        })),
+    });
+    *unknown_connect_status.last_mut().unwrap() = 0xff;
+    assert_eq!(
+        decode_response(&unknown_connect_status),
+        Err(WireError::InvalidTag)
+    );
+
+    let mut unknown_optional_error = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Socket(SocketResponse::TakeError(TakeSocketErrorResponse {
+            error: None,
+        })),
+    });
+    *unknown_optional_error.last_mut().unwrap() = 0xff;
+    assert_eq!(
+        decode_response(&unknown_optional_error),
+        Err(WireError::InvalidTag)
+    );
+
+    let get_option = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Socket(SocketResponse::GetOption(GetSocketOptionResponse {
+            value: SocketOptionValue::KeepAlive(true),
+        })),
+    });
+    for offset in 1..=2 {
+        let mut frame = get_option.clone();
+        let index = frame.len() - offset;
+        frame[index] = 0xff;
+        assert_eq!(decode_response(&frame), Err(WireError::InvalidTag));
+    }
+
+    let process_group_error = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::ProcessGroup(ProcessGroupResponse::Failed(
+            ProcessGroupError::NotInSession,
+        )),
+    });
+    let mut unknown_process_group_error = process_group_error.clone();
+    *unknown_process_group_error.last_mut().unwrap() = 3;
+    assert_eq!(
+        decode_response(&unknown_process_group_error),
+        Err(WireError::InvalidTag)
+    );
+    assert_eq!(
+        decode_response(&process_group_error[..process_group_error.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+
+    let socket_error = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Socket(SocketResponse::Failed(SocketError::TimedOut)),
+    });
+    for raw in [19, 20, u8::MAX] {
+        let mut unknown_socket_error = socket_error.clone();
+        *unknown_socket_error.last_mut().unwrap() = raw;
+        assert_eq!(
+            decode_response(&unknown_socket_error),
+            Err(WireError::InvalidTag)
+        );
+    }
+    assert_eq!(
+        decode_response(&socket_error[..socket_error.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+
+    let failed_connection = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
+            status: SocketConnectionStatus::Failed(SocketError::ConnectionRefused),
+        })),
+    });
+    assert_eq!(
+        decode_response(&failed_connection[..failed_connection.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+
+    let received = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(
+            4096,
+        ))),
+    });
+    assert_eq!(
+        decode_response(&received[..received.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+
+    let mut unknown_receive_result = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::EndOfStream)),
+    });
+    *unknown_receive_result.last_mut().unwrap() = 0xff;
+    assert_eq!(
+        decode_response(&unknown_receive_result),
+        Err(WireError::InvalidTag)
+    );
+}
+
+#[test]
+fn decode_rejects_malformed_handshake_response_frames() {
+    assert_eq!(
+        decode_handshake_response(&[0xfb, 1, 2, 3]),
+        Err(WireError::InvalidTag)
+    );
+    assert_eq!(
+        decode_handshake_response(&[0, 1]),
+        Err(WireError::TruncatedFrame)
+    );
+    assert_eq!(
+        decode_handshake_response(&[0, 0xff]),
+        Err(WireError::InvalidTag)
+    );
+    assert_eq!(
+        decode_handshake_response(&[0, 2, 0xff]),
+        Err(WireError::InvalidTag)
+    );
+    assert_eq!(
+        decode_handshake_response(&encode_response(&BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Event(EventResponse::Create(CreateEventResponse {
+                handle: ObjectHandle(13)
+            })),
+        })),
+        Err(WireError::WrongMessagePhase)
+    );
+    assert_eq!(
+        decode_handshake_response(&encode_response(&BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::ObjectClosed
+        })),
+        Err(WireError::WrongMessagePhase)
+    );
+    assert_eq!(
+        decode_handshake_response(&encode_response(&BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Error(ErrorCode::WouldBlock)
+        })),
+        Err(WireError::WrongMessagePhase)
+    );
+
+    let negotiated = BrokerHandshakeResponse::Negotiated {
+        broker_protocol_version: ProtocolVersion(1),
+        process_id: process_id(1),
+        initial_thread_id: thread_id(2),
+        startup: None,
+    };
+    let mut invalid_startup = encode_handshake_response(&negotiated);
+    *invalid_startup.last_mut().unwrap() = 2;
+    assert_eq!(
+        decode_handshake_response(&invalid_startup),
+        Err(WireError::InvalidTag)
+    );
+
+    let mut frame = encode_handshake_response(&negotiated);
+    frame.push(0xff);
+    assert_eq!(
+        decode_handshake_response(&frame),
+        Err(WireError::TrailingBytes)
+    );
+}
+
+#[test]
+fn decode_rejects_malformed_response_frames() {
+    assert_eq!(
+        decode_response(&[0xfb, 1, 2, 3]),
+        Err(WireError::InvalidTag)
+    );
+    for response in [
+        BrokerHandshakeResponse::Negotiated {
+            broker_protocol_version: ProtocolVersion(1),
+            process_id: process_id(1),
+            initial_thread_id: thread_id(2),
+            startup: None,
+        },
+        BrokerHandshakeResponse::Negotiated {
+            broker_protocol_version: ProtocolVersion(1),
+            process_id: process_id(2),
+            initial_thread_id: thread_id(3),
+            startup: Some(ProcessStartupDescriptor {
+                buffer: sequence(0, 5),
+            }),
+        },
+        BrokerHandshakeResponse::VersionMismatch {
+            broker_protocol_version: ProtocolVersion(1),
+        },
+        BrokerHandshakeResponse::Error(ErrorCode::PolicyDenied),
+    ] {
+        assert_eq!(
+            decode_response(&encode_handshake_response(&response)),
+            Err(WireError::WrongMessagePhase)
+        );
+    }
+    assert_eq!(decode_response(&[1, 0xff]), Err(WireError::TruncatedFrame));
+    let mut invalid_result = Vec::from([1]);
+    invalid_result.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
+    invalid_result.push(u8::MAX);
+    assert_eq!(decode_response(&invalid_result), Err(WireError::InvalidTag));
+    let mut invalid_error = Vec::from([1]);
+    invalid_error.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
+    invalid_error.extend_from_slice(&[18, u8::MAX]);
+    assert_eq!(decode_response(&invalid_error), Err(WireError::InvalidTag));
+
+    let truncated = [1, 2, 2, 0];
+    assert_eq!(decode_response(&truncated), Err(WireError::TruncatedFrame));
+
+    let mut unknown_thread_response = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Thread(ThreadResponse::Create(thread_id(1))),
+    });
+    unknown_thread_response[10] = 0xff;
+    assert_eq!(
+        decode_response(&unknown_thread_response),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_process_response = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Process(ProcessResponse::StartChild),
+    });
+    unknown_process_response[10] = 0xff;
+    assert_eq!(
+        decode_response(&unknown_process_response),
+        Err(WireError::InvalidTag)
+    );
+    let mut oversized_host_name = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Process(ProcessResponse::GetHostNames(HostNameSizes {
+            host: MAX_HOST_NAME_SIZE,
+            domain: MAX_HOST_NAME_SIZE,
+        })),
+    });
+    let domain = oversized_host_name.len() - size_of::<u32>();
+    oversized_host_name[domain..].copy_from_slice(&(MAX_HOST_NAME_SIZE + 1).to_le_bytes());
+    assert_eq!(
+        decode_response(&oversized_host_name),
+        Err(WireError::InvalidTag)
+    );
+
+    let mut invalid_exit_status = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
+            process_id: process_id(1),
+            exit_status: ProcessExitStatus::Unknown,
+            cpu_time: CpuTime::default(),
+            children_cpu_time: CpuTime::default(),
+        })),
+    });
+    let mut invalid_cpu_time = invalid_exit_status.clone();
+    invalid_exit_status[15] = 0xff;
+    assert_eq!(
+        decode_response(&invalid_exit_status),
+        Err(WireError::InvalidTag)
+    );
+    invalid_cpu_time[24..28].copy_from_slice(&1_000_000_000_u32.to_le_bytes());
+    assert_eq!(
+        decode_response(&invalid_cpu_time),
+        Err(WireError::InvalidTag)
+    );
+    let mut invalid_creator = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
+            creator: None,
+            parent: None,
+            membership: ProcessGroupMembership {
+                process_group: ProcessGroupId(1),
+                session: SessionId(1),
+            },
+            initial_thread: None,
+            first_in_namespace: None,
+        })),
+    });
+    invalid_creator[11] = 2;
+    assert_eq!(
+        decode_response(&invalid_creator),
+        Err(WireError::InvalidTag)
+    );
+    // The child's own ID follows its IDs in the caller's namespace.
+    let allocated_child = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Process(ProcessResponse::AllocateChild(ProcessIdentity {
+            process_id: process_id(19),
+            initial_thread_id: thread_id(21),
+            own_process_id: process_id(1),
+        })),
+    });
+    assert_eq!(
+        allocated_child[9..],
+        [10, 0, 19, 0, 0, 0, 21, 0, 0, 0, 1, 0, 0, 0]
+    );
+    assert_eq!(
+        decode_response(&allocated_child[..allocated_child.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+    // The first-process options end the process information.
+    let first_process_info = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
+            creator: None,
+            parent: None,
+            membership: ProcessGroupMembership {
+                process_group: ProcessGroupId(1),
+                session: SessionId(1),
+            },
+            initial_thread: None,
+            first_in_namespace: Some(PidNamespaceOptions::default()),
+        })),
+    });
+    let options = first_process_info.len() - 3;
+    assert_eq!(first_process_info[options..], [1, 0, 0]);
+    for (index, value) in [(options, 2), (options + 1, 0b100), (options + 2, 2)] {
+        let mut invalid_first_process = first_process_info.clone();
+        invalid_first_process[index] = value;
+        assert_eq!(
+            decode_response(&invalid_first_process),
+            Err(WireError::InvalidTag)
+        );
+    }
+
+    let mut unknown_timer_response = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Timer(TimerResponse::Read(ReadTimerResponse { expirations: 1 })),
+    });
+    unknown_timer_response[10] = 0xff;
+    assert_eq!(
+        decode_response(&unknown_timer_response),
+        Err(WireError::InvalidTag)
+    );
+
+    let mut unknown_shared_futex_response = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::SharedFutex(SharedFutexResponse::Arm),
+    });
+    unknown_shared_futex_response[10] = 0xff;
+    assert_eq!(
+        decode_response(&unknown_shared_futex_response),
+        Err(WireError::InvalidTag)
+    );
+    let mut invalid_futex_disarm = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::SharedFutex(SharedFutexResponse::Disarm(FutexDisarmResponse {
+            woken: true,
+        })),
+    });
+    *invalid_futex_disarm.last_mut().unwrap() = 2;
+    assert_eq!(
+        decode_response(&invalid_futex_disarm),
+        Err(WireError::InvalidTag)
+    );
+    let reserved = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::SharedFutex(SharedFutexResponse::IssueMemoryId(
+            IssueMemoryIdResponse {
+                memory: SharedMemoryId(1),
+            },
+        )),
+    });
+    assert_eq!(
+        decode_response(&reserved[..reserved.len() - 1]),
+        Err(WireError::TruncatedFrame)
+    );
+
+    let mut unknown_readiness_queue_error = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::ReadinessQueue(ReadinessQueueResponse::Failed(
+            ReadinessQueueError::NotRegistered,
+        )),
+    });
+    unknown_readiness_queue_error[11] = 0xff;
+    assert_eq!(
+        decode_response(&unknown_readiness_queue_error),
+        Err(WireError::InvalidTag)
+    );
+
+    let mut unknown_signal_response = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Signal(SignalResponse::Sent),
+    });
+    unknown_signal_response[10] = 0xff;
+    assert_eq!(
+        decode_response(&unknown_signal_response),
+        Err(WireError::InvalidTag)
+    );
+    let mut unknown_signal_event = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Signal(SignalResponse::Take(SignalEvent::Signal(PendingSignal {
+            thread: None,
+            signal: 1,
+            sender: process_id(1),
+        }))),
+    });
+    unknown_signal_event[11] = 0xff;
+    assert_eq!(
+        decode_response(&unknown_signal_event),
+        Err(WireError::InvalidTag)
+    );
+    unknown_signal_event[11] = 1;
+    assert!(decode_response(&unknown_signal_event).is_ok());
+    let thread_presence = 12;
+    unknown_signal_event[thread_presence] = 2;
+    assert_eq!(
+        decode_response(&unknown_signal_event),
+        Err(WireError::InvalidTag)
+    );
+    for invalid_terminal_events in [0, 0xff] {
+        let mut frame = encode_response(&BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Signal(SignalResponse::Take(SignalEvent::Terminal(
+                crate::terminal::TerminalEvents::INTERRUPT,
+            ))),
+        });
+        assert_eq!(frame.len(), 13);
+        frame[12] = invalid_terminal_events;
+        assert_eq!(decode_response(&frame), Err(WireError::InvalidTag));
+    }
+
+    let mut frame = encode_response(&BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::Event(EventResponse::Add(AddEventResponse {
+            readiness: ReadinessFlags::READ | ReadinessFlags::WRITE,
+        })),
+    });
+    frame.push(0xff);
+    assert_eq!(decode_response(&frame), Err(WireError::TrailingBytes));
+}
+
+#[test]
+fn decode_rejects_malformed_notification_frames() {
+    assert_eq!(
+        decode_notification(&[0xff, 1, 2, 3]),
+        Err(WireError::InvalidTag)
+    );
+    assert_eq!(decode_notification(&[0]), Err(WireError::TruncatedFrame));
+
+    let mut truncated =
+        encode_notification(&BrokerNotification::Readiness(ReadinessNotification {
+            handle: ObjectHandle(13),
+            readiness: ReadinessFlags::READ,
+        }));
+    truncated.pop();
+    assert_eq!(
+        decode_notification(&truncated),
+        Err(WireError::TruncatedFrame)
+    );
+
+    let mut trailing = encode_notification(&BrokerNotification::Readiness(ReadinessNotification {
+        handle: ObjectHandle(13),
+        readiness: ReadinessFlags::READ,
+    }));
+    trailing.push(0xff);
+    assert_eq!(
+        decode_notification(&trailing),
+        Err(WireError::TrailingBytes)
+    );
+}
+
+#[test]
+fn event_create_request_wire_shape_is_pinned() {
+    assert_eq!(
+        encode_request(&BrokerRequest {
+            request_id: RequestId(13),
+            operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
+                initial_count: 7,
+                flags: FileOpenFlags::NONBLOCKING
+            })),
+        }),
+        [
+            1, 13, 0, 0, 0, 0, 0, 0, 0, 5, 0, 7, 0, 0, 0, 0, 0, 0, 0, 32, 0
+        ]
+    );
+}
+
+#[test]
+fn fs_open_request_wire_shape_is_pinned() {
+    assert_eq!(
+        encode_request(&BrokerRequest {
+            request_id: RequestId(13),
+            operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
+                path: sequence(2, 3),
+                user: FileUser { user: 5, group: 7 },
+                access: FileAccessMode::ReadWrite,
+                flags: FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE | FileOpenFlags::NO_FOLLOW,
+                mode: FileMode::from_bits(0o640).unwrap(),
+            })),
+        }),
+        [
+            1, 13, 0, 0, 0, 0, 0, 0, 0, 9, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0,
+            160, 1
+        ]
+    );
+}
+
+#[test]
+fn socket_connect_request_wire_shape_is_pinned() {
+    assert_eq!(
+        encode_request(&BrokerRequest {
+            request_id: RequestId(13),
+            operation: BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
+                handle: ObjectHandle(9),
+                address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
+            })),
+        }),
+        [
+            1, 13, 0, 0, 0, 0, 0, 0, 0, 7, 1, 9, 0, 0, 0, 0, 0, 0, 0, 203, 0, 113, 7, 187, 1
+        ]
+    );
+}
+
+#[test]
+fn socket_accept_request_wire_shape_is_pinned() {
+    assert_eq!(
+        encode_request(&BrokerRequest {
+            request_id: RequestId(13),
+            operation: BrokerOperation::Socket(SocketRequest::Accept(AcceptSocketRequest {
+                handle: ObjectHandle(9),
+                flags: FileOpenFlags::NONBLOCKING
+            })),
+        }),
+        [
+            1, 13, 0, 0, 0, 0, 0, 0, 0, 7, 4, 9, 0, 0, 0, 0, 0, 0, 0, 32, 0
+        ]
+    );
+}
+
+#[test]
+fn socket_send_to_request_wire_shape_is_pinned() {
+    assert_eq!(
+        encode_request(&BrokerRequest {
+            request_id: RequestId(13),
+            operation: BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                handle: ObjectHandle(9),
+                buffer: sequence(2, 3),
+                flags: SendFlags::NONE,
+                destination: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 53)),
+            })),
+        }),
+        [
+            1, 13, 0, 0, 0, 0, 0, 0, 0, 7, 6, 9, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 0,
+            0, 0, 0, 1, 203, 0, 113, 7, 53, 0
+        ]
+    );
+}
+
+#[test]
+fn socket_failure_response_wire_shape_is_pinned() {
+    assert_eq!(
+        encode_response(&BrokerResponse {
+            request_id: RequestId(13),
+            result: BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
+        }),
+        [1, 13, 0, 0, 0, 0, 0, 0, 0, 7, 16, 1]
+    );
+}
+
+#[test]
+fn socket_accept_response_wire_shape_is_pinned() {
+    assert_eq!(
+        encode_response(&BrokerResponse {
+            request_id: RequestId(13),
+            result: BrokerResult::Socket(SocketResponse::Accept(AcceptSocketResponse {
+                handle: ObjectHandle(9),
+                local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
+                remote_address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
+            })),
+        }),
+        [
+            1, 13, 0, 0, 0, 0, 0, 0, 0, 7, 4, 9, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1, 0, 192, 203, 0,
+            113, 7, 187, 1
+        ]
+    );
+}
+
+#[test]
+fn event_add_response_wire_shape_is_pinned() {
+    assert_eq!(
+        encode_response(&BrokerResponse {
+            request_id: RequestId(13),
+            result: BrokerResult::Event(EventResponse::Add(AddEventResponse {
+                readiness: ReadinessFlags::READ
+            })),
+        }),
+        [1, 13, 0, 0, 0, 0, 0, 0, 0, 5, 1, 1, 0, 0, 0]
+    );
+}
+
+#[test]
+fn readiness_notification_wire_shape_is_pinned() {
+    assert_eq!(
+        encode_notification(&BrokerNotification::Readiness(ReadinessNotification {
+            handle: ObjectHandle(13),
+            readiness: ReadinessFlags::READ | ReadinessFlags::HANGUP,
+        })),
+        [0, 13, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0]
+    );
+}

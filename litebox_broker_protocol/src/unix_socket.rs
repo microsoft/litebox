@@ -200,237 +200,275 @@ pub enum UnixSocketCodecError {
     Invalid,
 }
 
-/// Unix socket operation failure that is meaningful to the guest ABI.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum UnixSocketError {
-    #[error("address is already in use")]
-    AddressInUse,
-    #[error("no socket accepts connections at the address")]
-    ConnectionRefused,
-    #[error("socket at the address has a different type")]
-    WrongType,
-    #[error("invalid argument for the socket's state")]
-    InvalidArgument,
-    #[error("socket is already connected")]
-    AlreadyConnected,
-    #[error("socket is not connected")]
-    NotConnected,
-    #[error("operation is not supported by the socket type")]
-    Unsupported,
-    #[error("message is too large")]
-    MessageTooLarge,
-    #[error("sending side is shut down")]
-    BrokenPipe,
-    #[error("receiving socket is connected to another socket")]
-    NotPermitted,
-    #[error("connection was reset")]
-    ConnectionReset,
-    #[error("address lookup failed: {0}")]
-    File(FileError),
+wire_enum! {
+    /// Unix socket operation failure that is meaningful to the guest ABI.
+    #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum UnixSocketError {
+        #[error("address is already in use")]
+        AddressInUse,
+        #[error("no socket accepts connections at the address")]
+        ConnectionRefused,
+        #[error("socket at the address has a different type")]
+        WrongType,
+        #[error("invalid argument for the socket's state")]
+        InvalidArgument,
+        #[error("socket is already connected")]
+        AlreadyConnected,
+        #[error("socket is not connected")]
+        NotConnected,
+        #[error("operation is not supported by the socket type")]
+        Unsupported,
+        #[error("message is too large")]
+        MessageTooLarge,
+        #[error("sending side is shut down")]
+        BrokenPipe,
+        #[error("receiving socket is connected to another socket")]
+        NotPermitted,
+        #[error("connection was reset")]
+        ConnectionReset,
+        #[error("address lookup failed: {0}")]
+        File(FileError),
+    }
 }
 
-/// Request to create one Unix socket or a connected pair.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateUnixSocketRequest {
-    /// Socket type.
-    pub socket_type: SocketType,
-    /// Initial status flags, within [`FileOpenFlags::STATUS`].
-    pub flags: FileOpenFlags,
+wire_struct! {
+    /// Request to create one Unix socket or a connected pair.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreateUnixSocketRequest {
+        /// Socket type.
+        pub socket_type: SocketType,
+        /// Initial status flags, within [`FileOpenFlags::STATUS`].
+        pub flags: FileOpenFlags,
+    }
 }
 
-/// Response to a Unix socket create request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateUnixSocketResponse {
-    /// Handle for the new socket.
-    pub handle: ObjectHandle,
+wire_struct! {
+    /// Response to a Unix socket create request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreateUnixSocketResponse {
+        /// Handle for the new socket.
+        pub handle: ObjectHandle,
+    }
 }
 
-/// Response to a Unix socket pair create request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateUnixSocketPairResponse {
-    /// Handle for the first socket.
-    pub first: ObjectHandle,
-    /// Handle for the second socket, connected to the first.
-    pub second: ObjectHandle,
+wire_struct! {
+    /// Response to a Unix socket pair create request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreateUnixSocketPairResponse {
+        /// Handle for the first socket.
+        pub first: ObjectHandle,
+        /// Handle for the second socket, connected to the first.
+        pub second: ObjectHandle,
+    }
 }
 
-/// Request to bind a Unix socket to a name.
-///
-/// A path name creates a filesystem node at the path, which fails if one
-/// exists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BindUnixSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Shared-buffer region holding one encoded [`UnixSocketAddress`].
-    pub address: SharedBufferSequence,
-    /// Caller identity for filesystem permission checks.
-    pub user: FileUser,
-    /// Mode of the filesystem node a path name creates.
-    pub mode: FileMode,
-}
-
-/// Request to make a bound stream or sequenced-packet socket accept
-/// connections.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ListenUnixSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Connections that may wait to be accepted beyond the first.
-    pub backlog: u32,
-}
-
-/// Request to connect a stream or sequenced-packet socket, or to set a
-/// datagram socket's default destination.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectUnixSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Shared-buffer region holding one encoded [`UnixSocketAddress`].
-    pub address: SharedBufferSequence,
-    /// Caller identity for filesystem permission checks.
-    pub user: FileUser,
-}
-
-/// Request to accept one pending connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AcceptUnixSocketRequest {
-    /// Listening socket handle.
-    pub handle: ObjectHandle,
-    /// Status flags of the accepted socket, within [`FileOpenFlags::STATUS`].
-    pub flags: FileOpenFlags,
-}
-
-/// Response to an accept request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AcceptUnixSocketResponse {
-    /// Handle for the accepted connection.
-    pub handle: ObjectHandle,
-}
-
-/// Request to send bytes staged in shared memory.
-///
-/// A stream socket may send only part of the bytes. A datagram socket sends
-/// them as one datagram. A sequenced-packet socket sends them as one record
-/// to its connected peer, ignoring any destination.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SendUnixSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Shared-buffer region holding an encoded destination
-    /// [`UnixSocketAddress`] of `address_length` bytes followed by the data.
-    pub buffer: SharedBufferSequence,
-    /// Length of the destination address, or zero to send to the connected
-    /// peer.
-    pub address_length: u32,
-    /// Caller identity for filesystem permission checks.
-    pub user: FileUser,
-}
-
-/// Response to a send request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SendUnixSocketResponse {
-    /// Number of data bytes sent.
-    pub sent: u32,
-}
-
-/// Request to receive bytes into shared memory.
-///
-/// A stream socket receives queued bytes. A datagram or sequenced-packet
-/// socket receives one datagram or record, discarding the bytes beyond
-/// `capacity` unless peeking.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReceiveUnixSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Shared-buffer region that receives the data, followed by the sender's
-    /// encoded [`UnixSocketName`] if `source` is set.
+wire_struct! {
+    /// Request to bind a Unix socket to a name.
     ///
-    /// It must hold `capacity` bytes, plus
-    /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] if `source` is set.
-    pub buffer: SharedBufferSequence,
-    /// Maximum data bytes to receive.
-    pub capacity: u32,
-    /// Whether to leave the data queued.
-    pub peek: bool,
-    /// Whether to return the sender's name.
-    pub source: bool,
-    /// Whether the caller will not wait for data, as if the socket were
-    /// non-blocking.
+    /// A path name creates a filesystem node at the path, which fails if one
+    /// exists.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct BindUnixSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Shared-buffer region holding one encoded [`UnixSocketAddress`].
+        pub address: SharedBufferSequence,
+        /// Caller identity for filesystem permission checks.
+        pub user: FileUser,
+        /// Mode of the filesystem node a path name creates.
+        pub mode: FileMode,
+    }
+}
+
+wire_struct! {
+    /// Request to make a bound stream or sequenced-packet socket accept
+    /// connections.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ListenUnixSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Connections that may wait to be accepted beyond the first.
+        pub backlog: u32,
+    }
+}
+
+wire_struct! {
+    /// Request to connect a stream or sequenced-packet socket, or to set a
+    /// datagram socket's default destination.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ConnectUnixSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Shared-buffer region holding one encoded [`UnixSocketAddress`].
+        pub address: SharedBufferSequence,
+        /// Caller identity for filesystem permission checks.
+        pub user: FileUser,
+    }
+}
+
+wire_struct! {
+    /// Request to accept one pending connection.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct AcceptUnixSocketRequest {
+        /// Listening socket handle.
+        pub handle: ObjectHandle,
+        /// Status flags of the accepted socket, within [`FileOpenFlags::STATUS`].
+        pub flags: FileOpenFlags,
+    }
+}
+
+wire_struct! {
+    /// Response to an accept request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct AcceptUnixSocketResponse {
+        /// Handle for the accepted connection.
+        pub handle: ObjectHandle,
+    }
+}
+
+wire_struct! {
+    /// Request to send bytes staged in shared memory.
     ///
-    /// A datagram socket whose receive direction is shut down then reports
-    /// that the receive would block instead of the end of data.
-    pub nonblocking: bool,
+    /// A stream socket may send only part of the bytes. A datagram socket sends
+    /// them as one datagram. A sequenced-packet socket sends them as one record
+    /// to its connected peer, ignoring any destination.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SendUnixSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Shared-buffer region holding an encoded destination
+        /// [`UnixSocketAddress`] of `address_length` bytes followed by the data.
+        pub buffer: SharedBufferSequence,
+        /// Length of the destination address, or zero to send to the connected
+        /// peer.
+        pub address_length: u32,
+        /// Caller identity for filesystem permission checks.
+        pub user: FileUser,
+    }
 }
 
-/// Response to a receive request.
-///
-/// A response with zero `received` and `length` for a nonzero `capacity`
-/// means an empty datagram or record arrived, or no more data can arrive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReceiveUnixSocketResponse {
-    /// Number of data bytes placed in the buffer.
-    pub received: u32,
-    /// Length of the whole datagram or record, or `received` for a stream
-    /// socket.
-    pub length: u32,
-    /// Length of the sender's encoded name, which follows the data, or zero
-    /// if the request did not ask for it.
-    pub source_length: u32,
+wire_struct! {
+    /// Response to a send request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SendUnixSocketResponse {
+        /// Number of data bytes sent.
+        pub sent: u32,
+    }
 }
 
-/// Request to shut down one or both directions of a socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShutdownUnixSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// [`ShutdownMode::Read`], [`ShutdownMode::Write`], or [`ShutdownMode::Both`].
-    pub mode: ShutdownMode,
+wire_struct! {
+    /// Request to receive bytes into shared memory.
+    ///
+    /// A stream socket receives queued bytes. A datagram or sequenced-packet
+    /// socket receives one datagram or record, discarding the bytes beyond
+    /// `capacity` unless peeking.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReceiveUnixSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Shared-buffer region that receives the data, followed by the sender's
+        /// encoded [`UnixSocketName`] if `source` is set.
+        ///
+        /// It must hold `capacity` bytes, plus
+        /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] if `source` is set.
+        pub buffer: SharedBufferSequence,
+        /// Maximum data bytes to receive.
+        pub capacity: u32,
+        /// Whether to leave the data queued.
+        pub peek: bool,
+        /// Whether to return the sender's name.
+        pub source: bool,
+        /// Whether the caller will not wait for data, as if the socket were
+        /// non-blocking.
+        ///
+        /// A datagram socket whose receive direction is shut down then reports
+        /// that the receive would block instead of the end of data.
+        pub nonblocking: bool,
+    }
 }
 
-/// Request to read the name of a socket or its peer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetUnixSocketNameRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Whether to read the peer's name instead of the socket's own.
-    pub peer: bool,
-    /// Shared-buffer region of [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] bytes
-    /// that receives the encoded [`UnixSocketName`].
-    pub buffer: SharedBufferSequence,
+wire_struct! {
+    /// Response to a receive request.
+    ///
+    /// A response with zero `received` and `length` for a nonzero `capacity`
+    /// means an empty datagram or record arrived, or no more data can arrive.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReceiveUnixSocketResponse {
+        /// Number of data bytes placed in the buffer.
+        pub received: u32,
+        /// Length of the whole datagram or record, or `received` for a stream
+        /// socket.
+        pub length: u32,
+        /// Length of the sender's encoded name, which follows the data, or zero
+        /// if the request did not ask for it.
+        pub source_length: u32,
+    }
 }
 
-/// Response to a name request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetUnixSocketNameResponse {
-    /// Length of the encoded name.
-    pub length: u32,
+wire_struct! {
+    /// Request to shut down one or both directions of a socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ShutdownUnixSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// [`ShutdownMode::Read`], [`ShutdownMode::Write`], or [`ShutdownMode::Both`].
+        pub mode: ShutdownMode,
+    }
 }
 
-/// Request to store one socket option.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetUnixSocketOptionRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Option value to store.
-    pub value: SocketOptionValue,
+wire_struct! {
+    /// Request to read the name of a socket or its peer.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct GetUnixSocketNameRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Whether to read the peer's name instead of the socket's own.
+        pub peer: bool,
+        /// Shared-buffer region of [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] bytes
+        /// that receives the encoded [`UnixSocketName`].
+        pub buffer: SharedBufferSequence,
+    }
 }
 
-/// Request to read one socket option.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetUnixSocketOptionRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Option name to read.
-    pub name: SocketOptionName,
+wire_struct! {
+    /// Response to a name request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct GetUnixSocketNameResponse {
+        /// Length of the encoded name.
+        pub length: u32,
+    }
 }
 
-/// Response containing one socket option value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetUnixSocketOptionResponse {
-    /// Stored option value.
-    pub value: SocketOptionValue,
+wire_struct! {
+    /// Request to store one socket option.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SetUnixSocketOptionRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Option value to store.
+        pub value: SocketOptionValue,
+    }
+}
+
+wire_struct! {
+    /// Request to read one socket option.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct GetUnixSocketOptionRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Option name to read.
+        pub name: SocketOptionName,
+    }
+}
+
+wire_struct! {
+    /// Response containing one socket option value.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct GetUnixSocketOptionResponse {
+        /// Stored option value.
+        pub value: SocketOptionValue,
+    }
 }
 
 #[cfg(test)]

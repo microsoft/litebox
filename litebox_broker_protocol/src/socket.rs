@@ -38,92 +38,104 @@ pub const MAX_SOCKET_PEEK_SIZE: u32 = 0x80_000;
 /// Maximum TCP listen backlog accepted by the broker protocol.
 pub const MAX_TCP_LISTEN_BACKLOG: u32 = 4096;
 
-/// Address family of a broker socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AddressFamily {
-    /// IPv4.
-    Ipv4,
+wire_enum! {
+    /// Address family of a broker socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum AddressFamily {
+        /// IPv4.
+        Ipv4,
+    }
 }
 
-/// Communication semantics of a broker socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum SocketType {
-    /// Reliable ordered byte stream.
-    Stream,
-    /// Message-oriented datagrams.
-    Datagram,
-    /// Reliable ordered records over a connection, which keep their
-    /// boundaries.
-    SeqPacket,
+wire_enum! {
+    /// Communication semantics of a broker socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[non_exhaustive]
+    pub enum SocketType {
+        /// Reliable ordered byte stream.
+        Stream,
+        /// Message-oriented datagrams.
+        Datagram,
+        /// Reliable ordered records over a connection, which keep their
+        /// boundaries.
+        SeqPacket,
+    }
 }
 
-/// IP protocol carried by a broker socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum IpProtocol {
-    /// TCP.
-    Tcp,
-    /// UDP.
-    Udp,
+wire_enum! {
+    /// IP protocol carried by a broker socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum IpProtocol {
+        /// TCP.
+        Tcp,
+        /// UDP.
+        Udp,
+    }
 }
 
-/// How to stop I/O on a socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ShutdownMode {
-    /// Disables further receives.
-    Read,
-    /// Disables further sends.
-    Write,
-    /// Both directions.
-    Both,
-    /// The final TCP close discards queued data and resets the connection.
-    Abort,
-    /// Stops accepting new TCP connections while retaining the socket object.
-    StopListening,
+wire_enum! {
+    /// How to stop I/O on a socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum ShutdownMode {
+        /// Disables further receives.
+        Read,
+        /// Disables further sends.
+        Write,
+        /// Both directions.
+        Both,
+        /// The final TCP close discards queued data and resets the connection.
+        Abort,
+        /// Stops accepting new TCP connections while retaining the socket object.
+        StopListening,
+    }
 }
 
-/// Socket option name, shared by internet and Unix sockets.
-///
-/// Every reference to a socket shares its options.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SocketOptionName {
-    /// Longest time a blocking receive or accept waits.
-    ReceiveTimeout,
-    /// Longest time a blocking send or connect waits.
-    SendTimeout,
-    /// Linger time on close.
-    Linger,
-    /// Whether address reuse was requested.
-    ReuseAddress,
-    /// Whether keepalive was requested, which enables keepalive probes on a
-    /// TCP socket.
-    KeepAlive,
-    /// Whether broadcast was requested.
-    Broadcast,
-    /// Whether Nagle's algorithm is disabled, which only TCP sockets support.
-    NoDelay,
+wire_enum! {
+    /// Socket option name, shared by internet and Unix sockets.
+    ///
+    /// Every reference to a socket shares its options.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SocketOptionName {
+        /// Longest time a blocking receive or accept waits.
+        ReceiveTimeout,
+        /// Longest time a blocking send or connect waits.
+        SendTimeout,
+        /// Linger time on close.
+        Linger,
+        /// Whether address reuse was requested.
+        ReuseAddress,
+        /// Whether keepalive was requested, which enables keepalive probes on a
+        /// TCP socket.
+        KeepAlive,
+        /// Whether broadcast was requested.
+        Broadcast,
+        /// Whether Nagle's algorithm is disabled, which only TCP sockets support.
+        NoDelay,
+    }
 }
 
-/// Socket option value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SocketOptionValue {
-    /// [`SocketOptionName::ReceiveTimeout`], or `None` to wait indefinitely.
-    ReceiveTimeout(Option<Duration>),
-    /// [`SocketOptionName::SendTimeout`], or `None` to wait indefinitely.
-    SendTimeout(Option<Duration>),
-    /// [`SocketOptionName::Linger`], or `None` to close in the background.
-    Linger(Option<Duration>),
-    /// [`SocketOptionName::ReuseAddress`].
-    ReuseAddress(bool),
-    /// [`SocketOptionName::KeepAlive`].
-    KeepAlive(bool),
-    /// [`SocketOptionName::Broadcast`].
-    Broadcast(bool),
-    /// [`SocketOptionName::NoDelay`].
-    NoDelay(bool),
+wire_enum! {
+    /// Socket option value.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SocketOptionValue {
+        /// [`SocketOptionName::ReceiveTimeout`], or `None` to wait indefinitely.
+        ReceiveTimeout(Option<Duration>),
+        /// [`SocketOptionName::SendTimeout`], or `None` to wait indefinitely.
+        SendTimeout(Option<Duration>),
+        /// [`SocketOptionName::Linger`], or `None` to close in the background.
+        Linger(Option<Duration>),
+        /// [`SocketOptionName::ReuseAddress`].
+        ReuseAddress(bool),
+        /// [`SocketOptionName::KeepAlive`].
+        KeepAlive(bool),
+        /// [`SocketOptionName::Broadcast`].
+        Broadcast(bool),
+        /// [`SocketOptionName::NoDelay`].
+        NoDelay(bool),
+    }
 }
 
 impl SocketOptionValue {
@@ -248,75 +260,77 @@ impl ReceiveFromFlags {
     }
 }
 
-/// Reason a socket operation failed.
-///
-/// This is a bounded restatement of the network failures a host stack reports,
-/// kept separate from [`ErrorCode`] because those describe how the broker
-/// handled a request, not what a remote peer or network did. Keeping them apart
-/// also means adding a network failure never widens the error type every broker
-/// operation can return.
-///
-/// [`ErrorCode`]: crate::error::ErrorCode
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SocketError {
-    /// The peer refused the connection.
-    #[error("connection refused")]
-    ConnectionRefused,
-    /// The connection was reset by the peer.
-    #[error("connection reset")]
-    ConnectionReset,
-    /// The connection was aborted before it completed.
-    #[error("connection aborted")]
-    ConnectionAborted,
-    /// No route to the network.
-    #[error("network unreachable")]
-    NetworkUnreachable,
-    /// No route to the host.
-    #[error("host unreachable")]
-    HostUnreachable,
-    /// The connection attempt timed out.
-    #[error("connection timed out")]
-    TimedOut,
-    /// The address is already in use.
-    #[error("address already in use")]
-    AddressInUse,
-    /// The address is not available on this host.
-    #[error("address not available")]
-    AddressNotAvailable,
-    /// The operation requires a connected socket.
-    #[error("socket is not connected")]
-    NotConnected,
-    /// An argument or socket state is invalid for the operation.
-    #[error("invalid socket operation argument")]
-    InvalidArgument,
-    /// The policy engine refused the destination.
-    #[error("socket policy denied the operation")]
-    PolicyDenied,
-    /// The host stack failed in a way this protocol does not distinguish.
-    #[error("other socket error")]
-    Other,
-    /// The socket is already connected.
-    #[error("socket is already connected")]
-    AlreadyConnected,
-    /// A connection attempt is already in progress.
-    #[error("connection already in progress")]
-    AlreadyInProgress,
-    /// The direction the operation needs has been shut down.
-    #[error("socket direction is shut down")]
-    Shutdown,
-    /// A datagram send on an unconnected socket named no destination.
-    #[error("destination address required")]
-    DestinationAddressRequired,
-    /// The operation is not valid on a listening socket.
-    #[error("socket is listening")]
-    Listening,
-    /// Socket resources are exhausted.
-    #[error("socket resources exhausted")]
-    ResourceExhausted,
-    /// The socket does not support the operation.
-    #[error("socket operation unsupported")]
-    UnsupportedOperation,
+wire_enum! {
+    /// Reason a socket operation failed.
+    ///
+    /// This is a bounded restatement of the network failures a host stack reports,
+    /// kept separate from [`ErrorCode`] because those describe how the broker
+    /// handled a request, not what a remote peer or network did. Keeping them apart
+    /// also means adding a network failure never widens the error type every broker
+    /// operation can return.
+    ///
+    /// [`ErrorCode`]: crate::error::ErrorCode
+    #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum SocketError {
+        /// The peer refused the connection.
+        #[error("connection refused")]
+        ConnectionRefused,
+        /// The connection was reset by the peer.
+        #[error("connection reset")]
+        ConnectionReset,
+        /// The connection was aborted before it completed.
+        #[error("connection aborted")]
+        ConnectionAborted,
+        /// No route to the network.
+        #[error("network unreachable")]
+        NetworkUnreachable,
+        /// No route to the host.
+        #[error("host unreachable")]
+        HostUnreachable,
+        /// The connection attempt timed out.
+        #[error("connection timed out")]
+        TimedOut,
+        /// The address is already in use.
+        #[error("address already in use")]
+        AddressInUse,
+        /// The address is not available on this host.
+        #[error("address not available")]
+        AddressNotAvailable,
+        /// The operation requires a connected socket.
+        #[error("socket is not connected")]
+        NotConnected,
+        /// An argument or socket state is invalid for the operation.
+        #[error("invalid socket operation argument")]
+        InvalidArgument,
+        /// The policy engine refused the destination.
+        #[error("socket policy denied the operation")]
+        PolicyDenied,
+        /// The host stack failed in a way this protocol does not distinguish.
+        #[error("other socket error")]
+        Other,
+        /// The socket is already connected.
+        #[error("socket is already connected")]
+        AlreadyConnected,
+        /// A connection attempt is already in progress.
+        #[error("connection already in progress")]
+        AlreadyInProgress,
+        /// The direction the operation needs has been shut down.
+        #[error("socket direction is shut down")]
+        Shutdown,
+        /// A datagram send on an unconnected socket named no destination.
+        #[error("destination address required")]
+        DestinationAddressRequired,
+        /// The operation is not valid on a listening socket.
+        #[error("socket is listening")]
+        Listening,
+        /// Socket resources are exhausted.
+        #[error("socket resources exhausted")]
+        ResourceExhausted,
+        /// The socket does not support the operation.
+        #[error("socket operation unsupported")]
+        UnsupportedOperation,
+    }
 }
 
 /// Result of a socket operation that can fail with an ordinary network outcome.
@@ -329,283 +343,341 @@ pub enum SocketOutcome<T> {
     Failed(SocketError),
 }
 
-/// Request to create a broker-owned socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateSocketRequest {
-    /// Address family.
-    pub address_family: AddressFamily,
-    /// Communication semantics.
-    pub socket_type: SocketType,
-    /// Transport protocol.
-    pub protocol: IpProtocol,
-    /// Initial status flags, within [`FileOpenFlags::STATUS`].
-    pub flags: FileOpenFlags,
+wire_struct! {
+    /// Request to create a broker-owned socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreateSocketRequest {
+        /// Address family.
+        pub address_family: AddressFamily,
+        /// Communication semantics.
+        pub socket_type: SocketType,
+        /// Transport protocol.
+        pub protocol: IpProtocol,
+        /// Initial status flags, within [`FileOpenFlags::STATUS`].
+        pub flags: FileOpenFlags,
+    }
 }
 
-/// Response to a socket create request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateSocketResponse {
-    /// Handle naming the new socket.
-    pub handle: ObjectHandle,
+wire_struct! {
+    /// Response to a socket create request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreateSocketResponse {
+        /// Handle naming the new socket.
+        pub handle: ObjectHandle,
+    }
 }
 
-/// Request to connect a socket to a remote address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Remote address to connect to.
-    pub address: SocketAddrV4,
+wire_struct! {
+    /// Request to connect a socket to a remote address.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ConnectSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Remote address to connect to.
+        pub address: SocketAddrV4,
+    }
 }
 
-/// Response to a socket connect request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectSocketResponse {
-    /// Connection state after the nonblocking attempt.
-    pub status: SocketConnectionStatus,
+wire_struct! {
+    /// Response to a socket connect request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ConnectSocketResponse {
+        /// Connection state after the nonblocking attempt.
+        pub status: SocketConnectionStatus,
+    }
 }
 
-/// Request to bind a socket to a local IPv4 address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BindSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Requested local address. Port zero requests an ephemeral port.
-    pub address: SocketAddrV4,
+wire_struct! {
+    /// Request to bind a socket to a local IPv4 address.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct BindSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Requested local address. Port zero requests an ephemeral port.
+        pub address: SocketAddrV4,
+    }
 }
 
-/// Response to a socket bind request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BindSocketResponse {
-    /// Local address assigned by the host network stack.
-    pub local_address: SocketAddrV4,
+wire_struct! {
+    /// Response to a socket bind request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct BindSocketResponse {
+        /// Local address assigned by the host network stack.
+        pub local_address: SocketAddrV4,
+    }
 }
 
-/// Request to make a bound socket listen for connections.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ListenSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Maximum pending connection backlog.
-    pub backlog: u32,
+wire_struct! {
+    /// Request to make a bound socket listen for connections.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ListenSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Maximum pending connection backlog.
+        pub backlog: u32,
+    }
 }
 
-/// Response to a socket listen request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ListenSocketResponse {
-    /// Local address assigned by the host network stack.
-    pub local_address: SocketAddrV4,
+wire_struct! {
+    /// Response to a socket listen request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ListenSocketResponse {
+        /// Local address assigned by the host network stack.
+        pub local_address: SocketAddrV4,
+    }
 }
 
-/// Request to accept one pending connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AcceptSocketRequest {
-    /// Listening socket handle.
-    pub handle: ObjectHandle,
-    /// Status flags of the accepted socket, within [`FileOpenFlags::STATUS`].
-    pub flags: FileOpenFlags,
+wire_struct! {
+    /// Request to accept one pending connection.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct AcceptSocketRequest {
+        /// Listening socket handle.
+        pub handle: ObjectHandle,
+        /// Status flags of the accepted socket, within [`FileOpenFlags::STATUS`].
+        pub flags: FileOpenFlags,
+    }
 }
 
-/// Response containing one accepted broker socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AcceptSocketResponse {
-    /// Handle naming the accepted socket.
-    pub handle: ObjectHandle,
-    /// Local endpoint of the accepted connection.
-    pub local_address: SocketAddrV4,
-    /// Remote endpoint of the accepted connection.
-    pub remote_address: SocketAddrV4,
+wire_struct! {
+    /// Response containing one accepted broker socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct AcceptSocketResponse {
+        /// Handle naming the accepted socket.
+        pub handle: ObjectHandle,
+        /// Local endpoint of the accepted connection.
+        pub local_address: SocketAddrV4,
+        /// Remote endpoint of the accepted connection.
+        pub remote_address: SocketAddrV4,
+    }
 }
 
-/// Broker-authoritative socket connection state.
-///
-/// The broker only performs non-blocking operations, so a connect that cannot
-/// complete immediately reports [`Self::Connecting`] rather than waiting. The
-/// caller waits for write readiness and then finishes the attempt with a
-/// check-connect request.
-///
-/// Connect and check-connect responses report a failed attempt as an
-/// operation failure, so they never carry [`Self::Failed`]. Datagram connects
-/// complete immediately and may replace an existing peer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SocketConnectionStatus {
-    /// No connection attempt has started.
-    Unconnected,
-    /// The connection is still being established.
-    Connecting,
-    /// The connection is established.
-    Connected,
-    /// The connection attempt failed.
-    Failed(SocketError),
-}
-
-/// Request to send bytes staged in shared memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SendSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Leased shared-buffer region containing the staged bytes.
-    pub buffer: SharedBufferSequence,
-    /// Send flags.
-    pub flags: SendFlags,
-}
-
-/// Response describing a completed send.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SendSocketResponse {
-    /// Number of bytes accepted by the socket.
-    pub sent: u32,
-}
-
-/// Request to send one datagram staged in shared memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SendToSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Leased shared-buffer region containing the complete datagram.
-    pub buffer: SharedBufferSequence,
-    /// Send flags.
-    pub flags: SendFlags,
-    /// Explicit destination, or `None` to use the connected peer.
-    pub destination: Option<SocketAddrV4>,
-}
-
-/// Response describing a completed atomic datagram send.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SendToSocketResponse {
-    /// Number of bytes accepted by the socket.
-    pub sent: u32,
-}
-
-/// Request to receive bytes into shared memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReceiveSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Leased shared-buffer region to receive the bytes.
-    pub buffer: SharedBufferSequence,
-    /// Receive flags.
-    pub flags: ReceiveFlags,
-    /// Byte offset from the start of the stream for a peek request.
-    pub peek_offset: u32,
-    /// Total stream prefix covered by this logical peek.
-    pub peek_length: u32,
-}
-
-/// Response to a socket receive request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ReceiveSocketResponse {
-    /// Number of bytes placed in the receive region.
+wire_enum! {
+    /// Broker-authoritative socket connection state.
     ///
-    /// Zero is the successful result of a zero-length request. A socket with
-    /// nothing to read yet reports [`ErrorCode::WouldBlock`] instead.
+    /// The broker only performs non-blocking operations, so a connect that cannot
+    /// complete immediately reports [`Self::Connecting`] rather than waiting. The
+    /// caller waits for write readiness and then finishes the attempt with a
+    /// check-connect request.
     ///
-    /// [`ErrorCode::WouldBlock`]: crate::error::ErrorCode::WouldBlock
-    Received(u32),
-    /// The socket's receive direction reached end of stream.
-    EndOfStream,
+    /// Connect and check-connect responses report a failed attempt as an
+    /// operation failure, so they never carry [`Self::Failed`]. Datagram connects
+    /// complete immediately and may replace an existing peer.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum SocketConnectionStatus {
+        /// No connection attempt has started.
+        Unconnected,
+        /// The connection is still being established.
+        Connecting,
+        /// The connection is established.
+        Connected,
+        /// The connection attempt failed.
+        Failed(SocketError),
+    }
 }
 
-/// Request to receive one datagram into shared memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReceiveFromSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Leased shared-buffer receive region.
-    pub buffer: SharedBufferSequence,
-    /// Datagram receive flags.
-    pub flags: ReceiveFromFlags,
+wire_struct! {
+    /// Request to send bytes staged in shared memory.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SendSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Leased shared-buffer region containing the staged bytes.
+        pub buffer: SharedBufferSequence,
+        /// Send flags.
+        pub flags: SendFlags,
+    }
 }
 
-/// Response describing one received datagram.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReceiveFromSocketResponse {
-    /// Number of bytes copied into the shared-buffer region.
-    pub received: u32,
-    /// Original datagram length before any truncation.
-    pub datagram_length: u32,
-    /// Source address of the datagram.
-    pub source_address: SocketAddrV4,
+wire_struct! {
+    /// Response describing a completed send.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SendSocketResponse {
+        /// Number of bytes accepted by the socket.
+        pub sent: u32,
+    }
 }
 
-/// Request to shut down one or both directions of a socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShutdownSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Directions to shut down.
-    pub mode: ShutdownMode,
+wire_struct! {
+    /// Request to send one datagram staged in shared memory.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SendToSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Leased shared-buffer region containing the complete datagram.
+        pub buffer: SharedBufferSequence,
+        /// Send flags.
+        pub flags: SendFlags,
+        /// Explicit destination, or `None` to use the connected peer.
+        pub destination: Option<SocketAddrV4>,
+    }
 }
 
-/// Request to set a socket option.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetSocketOptionRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Option value to apply.
-    pub value: SocketOptionValue,
+wire_struct! {
+    /// Response describing a completed atomic datagram send.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SendToSocketResponse {
+        /// Number of bytes accepted by the socket.
+        pub sent: u32,
+    }
 }
 
-/// Request to read a socket option.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetSocketOptionRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Option name to read.
-    pub name: SocketOptionName,
+wire_struct! {
+    /// Request to receive bytes into shared memory.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReceiveSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Leased shared-buffer region to receive the bytes.
+        pub buffer: SharedBufferSequence,
+        /// Receive flags.
+        pub flags: ReceiveFlags,
+        /// Byte offset from the start of the stream for a peek request.
+        pub peek_offset: u32,
+        /// Total stream prefix covered by this logical peek.
+        pub peek_length: u32,
+    }
 }
 
-/// Response containing a socket option value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetSocketOptionResponse {
-    /// Stored option value.
-    pub value: SocketOptionValue,
+wire_enum! {
+    /// Response to a socket receive request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum ReceiveSocketResponse {
+        /// Number of bytes placed in the receive region.
+        ///
+        /// Zero is the successful result of a zero-length request. A socket with
+        /// nothing to read yet reports [`ErrorCode::WouldBlock`] instead.
+        ///
+        /// [`ErrorCode::WouldBlock`]: crate::error::ErrorCode::WouldBlock
+        Received(u32),
+        /// The socket's receive direction reached end of stream.
+        EndOfStream,
+    }
 }
 
-/// Request to check the progress of a socket's connection attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CheckConnectSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
+wire_struct! {
+    /// Request to receive one datagram into shared memory.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReceiveFromSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Leased shared-buffer receive region.
+        pub buffer: SharedBufferSequence,
+        /// Datagram receive flags.
+        pub flags: ReceiveFromFlags,
+    }
 }
 
-/// Request for the local or peer address of a socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetSocketNameRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Whether to read the peer's address instead of the socket's own.
-    pub peer: bool,
+wire_struct! {
+    /// Response describing one received datagram.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReceiveFromSocketResponse {
+        /// Number of bytes copied into the shared-buffer region.
+        pub received: u32,
+        /// Original datagram length before any truncation.
+        pub datagram_length: u32,
+        /// Source address of the datagram.
+        pub source_address: SocketAddrV4,
+    }
 }
 
-/// Response containing a socket address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetSocketNameResponse {
-    /// Requested address, or `None` if the socket has none.
-    pub address: Option<SocketAddrV4>,
+wire_struct! {
+    /// Request to shut down one or both directions of a socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ShutdownSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Directions to shut down.
+        pub mode: ShutdownMode,
+    }
 }
 
-/// Request to take a socket's oldest pending error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TakeSocketErrorRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
+wire_struct! {
+    /// Request to set a socket option.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SetSocketOptionRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Option value to apply.
+        pub value: SocketOptionValue,
+    }
 }
 
-/// Response containing a socket's oldest pending error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TakeSocketErrorResponse {
-    /// Taken error, or `None` if no error was pending.
-    pub error: Option<SocketError>,
+wire_struct! {
+    /// Request to read a socket option.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct GetSocketOptionRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Option name to read.
+        pub name: SocketOptionName,
+    }
 }
 
-/// Request to report an error before any already pending one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetSocketErrorRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Error to report.
-    pub error: SocketError,
+wire_struct! {
+    /// Response containing a socket option value.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct GetSocketOptionResponse {
+        /// Stored option value.
+        pub value: SocketOptionValue,
+    }
+}
+
+wire_struct! {
+    /// Request to check the progress of a socket's connection attempt.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CheckConnectSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+    }
+}
+
+wire_struct! {
+    /// Request for the local or peer address of a socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct GetSocketNameRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Whether to read the peer's address instead of the socket's own.
+        pub peer: bool,
+    }
+}
+
+wire_struct! {
+    /// Response containing a socket address.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct GetSocketNameResponse {
+        /// Requested address, or `None` if the socket has none.
+        pub address: Option<SocketAddrV4>,
+    }
+}
+
+wire_struct! {
+    /// Request to take a socket's oldest pending error.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TakeSocketErrorRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+    }
+}
+
+wire_struct! {
+    /// Response containing a socket's oldest pending error.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TakeSocketErrorResponse {
+        /// Taken error, or `None` if no error was pending.
+        pub error: Option<SocketError>,
+    }
+}
+
+wire_struct! {
+    /// Request to report an error before any already pending one.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SetSocketErrorRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Error to report.
+        pub error: SocketError,
+    }
 }

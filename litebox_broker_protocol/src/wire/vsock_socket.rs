@@ -1,278 +1,39 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::message::{VsockSocketRequest, VsockSocketResponse};
-use crate::socket::{
-    AcceptSocketRequest, CheckConnectSocketRequest, ConnectSocketResponse, CreateSocketResponse,
-    GetSocketNameRequest, ListenSocketRequest, SendFlags, SendSocketRequest, SendSocketResponse,
-    ShutdownSocketRequest, TakeSocketErrorRequest, TakeSocketErrorResponse,
-};
-use crate::vsock_socket::{
-    AcceptVsockSocketResponse, BindVsockSocketRequest, ConnectVsockSocketRequest,
-    CreateVsockSocketRequest, GetVsockSocketNameResponse, ReceiveVsockSocketRequest, VsockAddress,
-    VsockCid, VsockPort,
-};
+use crate::vsock_socket::{VsockCid, VsockPort};
 
-use super::fs::decode_open_flags;
-use super::primitive::{Decoder, Encoder};
-use super::socket::{
-    decode_bool, decode_shutdown_mode, decode_socket_type, encode_bool, encode_shutdown_mode,
-    encode_socket_type,
-};
-use super::{
-    WireError, decode_connection_status, decode_optional_socket_error, decode_receive_response,
-    decode_socket_error, encode_connection_status, encode_optional_socket_error,
-    encode_receive_response, encode_socket_error,
-};
-
-const TAG_CREATE: u8 = 0;
-const TAG_BIND: u8 = 1;
-const TAG_LISTEN: u8 = 2;
-const TAG_ACCEPT: u8 = 3;
-const TAG_CONNECT: u8 = 4;
-const TAG_CHECK_CONNECT: u8 = 5;
-const TAG_CANCEL_CONNECT: u8 = 6;
-const TAG_TAKE_ERROR: u8 = 7;
-const TAG_SEND: u8 = 8;
-const TAG_RECEIVE: u8 = 9;
-const TAG_SHUTDOWN: u8 = 10;
-const TAG_GET_NAME: u8 = 11;
-const TAG_FAILED: u8 = 12;
-
-pub(super) fn encode_vsock_socket_request(encoder: &mut Encoder, request: VsockSocketRequest) {
-    match request {
-        VsockSocketRequest::Create(request) => {
-            encoder.u8(TAG_CREATE);
-            encode_socket_type(encoder, request.socket_type);
-            encoder.u16(request.flags.bits());
-        }
-        VsockSocketRequest::Bind(request) => {
-            encoder.u8(TAG_BIND);
-            encoder.handle(request.handle);
-            encode_address(encoder, request.address);
-        }
-        VsockSocketRequest::Listen(request) => {
-            encoder.u8(TAG_LISTEN);
-            encoder.handle(request.handle);
-            encoder.u32(request.backlog);
-        }
-        VsockSocketRequest::Accept(request) => {
-            encoder.u8(TAG_ACCEPT);
-            encoder.handle(request.handle);
-            encoder.u16(request.flags.bits());
-        }
-        VsockSocketRequest::Connect(request) => {
-            encoder.u8(TAG_CONNECT);
-            encoder.handle(request.handle);
-            encode_address(encoder, request.address);
-        }
-        VsockSocketRequest::CheckConnect(request) => {
-            encoder.u8(TAG_CHECK_CONNECT);
-            encoder.handle(request.handle);
-        }
-        VsockSocketRequest::CancelConnect(request) => {
-            encoder.u8(TAG_CANCEL_CONNECT);
-            encoder.handle(request.handle);
-        }
-        VsockSocketRequest::TakeError(request) => {
-            encoder.u8(TAG_TAKE_ERROR);
-            encoder.handle(request.handle);
-        }
-        VsockSocketRequest::Send(request) => {
-            encoder.u8(TAG_SEND);
-            encoder.handle(request.handle);
-            encoder.shared_buffer_sequence(request.buffer);
-            encoder.u32(request.flags.0);
-        }
-        VsockSocketRequest::Receive(request) => {
-            encoder.u8(TAG_RECEIVE);
-            encoder.handle(request.handle);
-            encoder.shared_buffer_sequence(request.buffer);
-        }
-        VsockSocketRequest::Shutdown(request) => {
-            encoder.u8(TAG_SHUTDOWN);
-            encoder.handle(request.handle);
-            encode_shutdown_mode(encoder, request.mode);
-        }
-        VsockSocketRequest::GetName(request) => {
-            encoder.u8(TAG_GET_NAME);
-            encoder.handle(request.handle);
-            encode_bool(encoder, request.peer);
-        }
-    }
-}
-
-pub(super) fn decode_vsock_socket_request(
-    decoder: &mut Decoder<'_>,
-) -> Result<VsockSocketRequest, WireError> {
-    Ok(match decoder.u8()? {
-        TAG_CREATE => VsockSocketRequest::Create(CreateVsockSocketRequest {
-            socket_type: decode_socket_type(decoder)?,
-            flags: decode_open_flags(decoder)?,
-        }),
-        TAG_BIND => VsockSocketRequest::Bind(BindVsockSocketRequest {
-            handle: decoder.handle()?,
-            address: decode_address(decoder)?,
-        }),
-        TAG_LISTEN => VsockSocketRequest::Listen(ListenSocketRequest {
-            handle: decoder.handle()?,
-            backlog: decoder.u32()?,
-        }),
-        TAG_ACCEPT => VsockSocketRequest::Accept(AcceptSocketRequest {
-            handle: decoder.handle()?,
-            flags: decode_open_flags(decoder)?,
-        }),
-        TAG_CONNECT => VsockSocketRequest::Connect(ConnectVsockSocketRequest {
-            handle: decoder.handle()?,
-            address: decode_address(decoder)?,
-        }),
-        TAG_CHECK_CONNECT => VsockSocketRequest::CheckConnect(CheckConnectSocketRequest {
-            handle: decoder.handle()?,
-        }),
-        TAG_CANCEL_CONNECT => VsockSocketRequest::CancelConnect(CheckConnectSocketRequest {
-            handle: decoder.handle()?,
-        }),
-        TAG_TAKE_ERROR => VsockSocketRequest::TakeError(TakeSocketErrorRequest {
-            handle: decoder.handle()?,
-        }),
-        TAG_SEND => VsockSocketRequest::Send(SendSocketRequest {
-            handle: decoder.handle()?,
-            buffer: decoder.shared_buffer_sequence()?,
-            flags: SendFlags(decoder.u32()?),
-        }),
-        TAG_RECEIVE => VsockSocketRequest::Receive(ReceiveVsockSocketRequest {
-            handle: decoder.handle()?,
-            buffer: decoder.shared_buffer_sequence()?,
-        }),
-        TAG_SHUTDOWN => VsockSocketRequest::Shutdown(ShutdownSocketRequest {
-            handle: decoder.handle()?,
-            mode: decode_shutdown_mode(decoder)?,
-        }),
-        TAG_GET_NAME => VsockSocketRequest::GetName(GetSocketNameRequest {
-            handle: decoder.handle()?,
-            peer: decode_bool(decoder)?,
-        }),
-        _ => return Err(WireError::InvalidTag),
-    })
-}
-
-pub(super) fn encode_vsock_socket_response(encoder: &mut Encoder, response: VsockSocketResponse) {
-    match response {
-        VsockSocketResponse::Create(response) => {
-            encoder.u8(TAG_CREATE);
-            encoder.handle(response.handle);
-        }
-        VsockSocketResponse::Bind => encoder.u8(TAG_BIND),
-        VsockSocketResponse::Listen => encoder.u8(TAG_LISTEN),
-        VsockSocketResponse::Accept(response) => {
-            encoder.u8(TAG_ACCEPT);
-            encoder.handle(response.handle);
-            encode_address(encoder, response.remote_address);
-        }
-        VsockSocketResponse::Connect(response) => {
-            encoder.u8(TAG_CONNECT);
-            encode_connection_status(encoder, response.status);
-        }
-        VsockSocketResponse::CheckConnect(response) => {
-            encoder.u8(TAG_CHECK_CONNECT);
-            encode_connection_status(encoder, response.status);
-        }
-        VsockSocketResponse::CancelConnect => encoder.u8(TAG_CANCEL_CONNECT),
-        VsockSocketResponse::TakeError(response) => {
-            encoder.u8(TAG_TAKE_ERROR);
-            encode_optional_socket_error(encoder, response.error);
-        }
-        VsockSocketResponse::Send(response) => {
-            encoder.u8(TAG_SEND);
-            encoder.u32(response.sent);
-        }
-        VsockSocketResponse::Receive(response) => {
-            encoder.u8(TAG_RECEIVE);
-            encode_receive_response(encoder, response);
-        }
-        VsockSocketResponse::Shutdown => encoder.u8(TAG_SHUTDOWN),
-        VsockSocketResponse::GetName(response) => {
-            encoder.u8(TAG_GET_NAME);
-            encode_bool(encoder, response.address.is_some());
-            if let Some(address) = response.address {
-                encode_address(encoder, address);
-            }
-        }
-        VsockSocketResponse::Failed(error) => {
-            encoder.u8(TAG_FAILED);
-            encode_socket_error(encoder, error);
-        }
-    }
-}
-
-pub(super) fn decode_vsock_socket_response(
-    decoder: &mut Decoder<'_>,
-) -> Result<VsockSocketResponse, WireError> {
-    Ok(match decoder.u8()? {
-        TAG_CREATE => VsockSocketResponse::Create(CreateSocketResponse {
-            handle: decoder.handle()?,
-        }),
-        TAG_BIND => VsockSocketResponse::Bind,
-        TAG_LISTEN => VsockSocketResponse::Listen,
-        TAG_ACCEPT => VsockSocketResponse::Accept(AcceptVsockSocketResponse {
-            handle: decoder.handle()?,
-            remote_address: decode_address(decoder)?,
-        }),
-        TAG_CONNECT => VsockSocketResponse::Connect(ConnectSocketResponse {
-            status: decode_connection_status(decoder)?,
-        }),
-        TAG_CHECK_CONNECT => VsockSocketResponse::CheckConnect(ConnectSocketResponse {
-            status: decode_connection_status(decoder)?,
-        }),
-        TAG_CANCEL_CONNECT => VsockSocketResponse::CancelConnect,
-        TAG_TAKE_ERROR => VsockSocketResponse::TakeError(TakeSocketErrorResponse {
-            error: decode_optional_socket_error(decoder)?,
-        }),
-        TAG_SEND => VsockSocketResponse::Send(SendSocketResponse {
-            sent: decoder.u32()?,
-        }),
-        TAG_RECEIVE => VsockSocketResponse::Receive(decode_receive_response(decoder)?),
-        TAG_SHUTDOWN => VsockSocketResponse::Shutdown,
-        TAG_GET_NAME => VsockSocketResponse::GetName(GetVsockSocketNameResponse {
-            address: if decode_bool(decoder)? {
-                Some(decode_address(decoder)?)
-            } else {
-                None
-            },
-        }),
-        TAG_FAILED => VsockSocketResponse::Failed(decode_socket_error(decoder)?),
-        _ => return Err(WireError::InvalidTag),
-    })
-}
-
-fn encode_address(encoder: &mut Encoder, address: VsockAddress) {
-    encoder.u32(address.cid.0);
-    encoder.u32(address.port.0);
-}
-
-fn decode_address(decoder: &mut Decoder<'_>) -> Result<VsockAddress, WireError> {
-    Ok(VsockAddress {
-        cid: VsockCid(decoder.u32()?),
-        port: VsockPort(decoder.u32()?),
-    })
-}
+wire_newtype!(VsockCid: u32);
+wire_newtype!(VsockPort: u32);
 
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
 
-    use super::*;
     use crate::fs::FileOpenFlags;
-    use crate::message::{BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult};
+    use crate::message::{
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, VsockSocketRequest,
+        VsockSocketResponse,
+    };
     use crate::shared_buffer::{
         MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SharedBufferSequence, SharedBufferSlotIndex,
     };
     use crate::socket::{
-        ReceiveSocketResponse, ShutdownMode, SocketConnectionStatus, SocketError, SocketType,
+        AcceptSocketRequest, CheckConnectSocketRequest, ConnectSocketResponse,
+        CreateSocketResponse, GetSocketNameRequest, ListenSocketRequest, ReceiveSocketResponse,
+        SendFlags, SendSocketRequest, SendSocketResponse, ShutdownMode, ShutdownSocketRequest,
+        SocketConnectionStatus, SocketError, SocketType, TakeSocketErrorRequest,
+        TakeSocketErrorResponse,
+    };
+    use crate::vsock_socket::{
+        AcceptVsockSocketResponse, BindVsockSocketRequest, ConnectVsockSocketRequest,
+        CreateVsockSocketRequest, GetVsockSocketNameResponse, ReceiveVsockSocketRequest,
+        VsockAddress, VsockCid, VsockPort,
     };
     use crate::wire::{
-        MAX_ENCODED_ACTIVE_MESSAGE_SIZE, decode_handshake_request, decode_handshake_response,
-        decode_request, decode_response, encode_request, encode_response,
+        MAX_ENCODED_ACTIVE_MESSAGE_SIZE, WireError, decode_handshake_request,
+        decode_handshake_response, decode_request, decode_response, encode_request,
+        encode_response,
     };
     use crate::{ObjectHandle, RequestId};
 
@@ -388,14 +149,14 @@ mod tests {
     }
 
     fn encoded_request(request: VsockSocketRequest) -> Vec<u8> {
-        encode_request(BrokerRequest {
+        encode_request(&BrokerRequest {
             request_id: REQUEST_ID,
             operation: BrokerOperation::VsockSocket(request),
         })
     }
 
     fn encoded_response(response: VsockSocketResponse) -> Vec<u8> {
-        encode_response(BrokerResponse {
+        encode_response(&BrokerResponse {
             request_id: REQUEST_ID,
             result: BrokerResult::VsockSocket(response),
         })
@@ -470,7 +231,7 @@ mod tests {
                 socket_type: SocketType::Stream,
                 flags: FileOpenFlags::NONBLOCKING,
             })),
-            [18, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 32, 0]
+            [1, 8, 7, 6, 5, 4, 3, 2, 1, 17, 0, 0, 32, 0]
         );
         assert_eq!(
             encoded_request(VsockSocketRequest::Connect(ConnectVsockSocketRequest {
@@ -478,7 +239,7 @@ mod tests {
                 address: HOST,
             })),
             [
-                18, 8, 7, 6, 5, 4, 3, 2, 1, 4, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 4, 3, 2, 1
+                1, 8, 7, 6, 5, 4, 3, 2, 1, 17, 4, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 4, 3, 2, 1
             ]
         );
         assert_eq!(
@@ -487,12 +248,12 @@ mod tests {
                 remote_address: HOST,
             })),
             [
-                18, 8, 7, 6, 5, 4, 3, 2, 1, 3, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 4, 3, 2, 1
+                1, 8, 7, 6, 5, 4, 3, 2, 1, 17, 3, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 4, 3, 2, 1
             ]
         );
         assert_eq!(
             encoded_response(VsockSocketResponse::Failed(SocketError::ConnectionReset)),
-            [18, 8, 7, 6, 5, 4, 3, 2, 1, 12, 2]
+            [1, 8, 7, 6, 5, 4, 3, 2, 1, 17, 12, 1]
         );
     }
 
@@ -507,7 +268,7 @@ mod tests {
         let unknown_request = with_last_byte(
             encoded_request(VsockSocketRequest::CheckConnect(
                 CheckConnectSocketRequest { handle: HANDLE },
-            ))[..10]
+            ))[..11]
                 .to_vec(),
             0xff,
         );
@@ -523,7 +284,7 @@ mod tests {
             socket_type: SocketType::Stream,
             flags: FileOpenFlags::NONE,
         }));
-        let frame = with_last_byte(create[..11].to_vec(), 0xff);
+        let frame = with_last_byte(create[..12].to_vec(), 0xff);
         assert_eq!(decode_request(&frame), Err(WireError::InvalidTag));
         // Status flags outside the defined bits are rejected, not masked.
         let frame = with_last_byte(create, 0x80);

@@ -253,7 +253,7 @@ impl LocalSetupChannel for UnixStreamLocalSetupChannel {
     type Error = Error;
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
-        let frame = encode_handshake_request(request.clone());
+        let frame = encode_handshake_request(request);
         write_setup_frame(&mut self.stream, &frame, self.setup_deadline)
     }
 
@@ -473,7 +473,7 @@ mod control_ring_tests {
         );
         write_setup_frame(
             &mut host_stream,
-            &encode_handshake_response(BrokerHandshakeResponse::Negotiated {
+            &encode_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
                 process_id: litebox_broker_protocol::ProcessId(1),
                 initial_thread_id: litebox_broker_protocol::ThreadId(2),
@@ -549,11 +549,11 @@ mod control_ring_tests {
         // The later lane answers first; neither call waits for the other.
         write_payload(
             &mut broker.lanes[1].response_producer,
-            &encode_response(response(second.request_id)),
+            &encode_response(&response(second.request_id)),
         );
         write_payload(
             &mut broker.lanes[0].response_producer,
-            &encode_response(response(first.request_id)),
+            &encode_response(&response(first.request_id)),
         );
         for call in calls {
             assert!(call.join().unwrap().is_ok());
@@ -583,7 +583,7 @@ mod control_ring_tests {
             assert_eq!(request.request_id, RequestId(id));
             write_payload(
                 &mut lane.response_producer,
-                &encode_response(response(request.request_id)),
+                &encode_response(&response(request.request_id)),
             );
             assert_eq!(caller.join().unwrap().unwrap().request_id, RequestId(id));
         }
@@ -616,8 +616,8 @@ mod control_ring_tests {
 
             let producer = &mut broker.lanes[0].response_producer;
             match payload_kind {
-                0 => write_payload(producer, &encode_response(response(RequestId(99)))),
-                1 => write_payload(producer, &encode_response(response(other.request_id))),
+                0 => write_payload(producer, &encode_response(&response(RequestId(99)))),
+                1 => write_payload(producer, &encode_response(&response(other.request_id))),
                 _ => write_payload(producer, &[u8::MAX]),
             }
 

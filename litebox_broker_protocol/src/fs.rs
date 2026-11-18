@@ -25,13 +25,15 @@ const _: () = assert!(
     MAX_FILE_TRANSFER_SLOT_COUNT as usize <= crate::shared_buffer::MAX_SHARED_BUFFER_SEQUENCE_SLOTS
 );
 
-/// File user identity used for permission checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FileUser {
-    /// Effective user ID.
-    pub user: u16,
-    /// Effective group ID.
-    pub group: u16,
+wire_struct! {
+    /// File user identity used for permission checks.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FileUser {
+        /// Effective user ID.
+        pub user: u16,
+        /// Effective group ID.
+        pub group: u16,
+    }
 }
 
 impl FileUser {
@@ -39,88 +41,103 @@ impl FileUser {
     pub const ROOT: Self = Self { user: 0, group: 0 };
 }
 
-/// File object kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FileType {
-    /// Regular file.
-    RegularFile,
-    /// Directory.
-    Directory,
-    /// Character device.
-    CharacterDevice,
-    /// Symbolic link.
-    SymbolicLink,
+wire_enum! {
+    /// File object kind.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum FileType {
+        /// Regular file.
+        RegularFile,
+        /// Directory.
+        Directory,
+        /// Character device.
+        CharacterDevice,
+        /// Symbolic link.
+        SymbolicLink,
+    }
 }
 
-/// Device and inode identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FileNodeInfo {
-    /// Device number.
-    pub dev: u64,
-    /// Inode number.
-    pub ino: u64,
-    /// Nonzero referenced device number for special files.
-    pub rdev: Option<NonZeroU64>,
-}
-
-/// A normalized timestamp relative to the Unix epoch.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FileTimestamp {
-    /// Whole seconds since the Unix epoch, possibly negative.
-    pub seconds: i64,
-    /// Fractional nanoseconds, less than one billion.
-    pub nanoseconds: u32,
-}
-
-/// Timestamps reported for a fs object.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FileTimestamps {
-    /// Last data access.
-    pub accessed: FileTimestamp,
-    /// Last data modification.
-    pub modified: FileTimestamp,
-    /// Last metadata change.
-    pub changed: FileTimestamp,
-}
-
-/// Update to one fs timestamp.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FileTimeUpdate {
-    /// Leave the timestamp unchanged.
-    Omit,
-    /// Set the timestamp to the filesystem's current time.
-    Now,
-    /// Set an explicit timestamp.
-    Set(FileTimestamp),
-}
-
-/// Updates to a fs object's access and modification times.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetFileTimes {
-    /// Access time update.
-    pub access: FileTimeUpdate,
-    /// Modification time update.
-    pub modify: FileTimeUpdate,
-}
-
-/// Status returned for a fs object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FileStatus {
-    /// Object kind.
-    pub file_type: FileType,
-    /// Permission and special mode bits, excluding object-type bits.
-    pub mode: FileMode,
-    /// Object size in bytes.
-    pub size: u64,
-    /// Owner identity.
-    pub owner: FileUser,
+wire_struct! {
     /// Device and inode identity.
-    pub node_info: FileNodeInfo,
-    /// Preferred fs I/O block size.
-    pub blksize: u64,
-    /// Timestamps, when the backing fs provides them.
-    pub times: Option<FileTimestamps>,
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct FileNodeInfo {
+        /// Device number.
+        pub dev: u64,
+        /// Inode number.
+        pub ino: u64,
+        /// Nonzero referenced device number for special files.
+        pub rdev: Option<NonZeroU64>,
+    }
+}
+
+wire_struct! {
+    /// A normalized timestamp relative to the Unix epoch.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct FileTimestamp {
+        /// Whole seconds since the Unix epoch, possibly negative.
+        pub seconds: i64,
+        /// Fractional nanoseconds, less than one billion.
+        pub nanoseconds: u32,
+    }
+    validate |value| value.nanoseconds < 1_000_000_000
+}
+
+wire_struct! {
+    /// Timestamps reported for a fs object.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct FileTimestamps {
+        /// Last data access.
+        pub accessed: FileTimestamp,
+        /// Last data modification.
+        pub modified: FileTimestamp,
+        /// Last metadata change.
+        pub changed: FileTimestamp,
+    }
+}
+
+wire_enum! {
+    /// Update to one fs timestamp.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum FileTimeUpdate {
+        /// Leave the timestamp unchanged.
+        Omit,
+        /// Set the timestamp to the filesystem's current time.
+        Now,
+        /// Set an explicit timestamp.
+        Set(FileTimestamp),
+    }
+}
+
+wire_struct! {
+    /// Updates to a fs object's access and modification times.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SetFileTimes {
+        /// Access time update.
+        pub access: FileTimeUpdate,
+        /// Modification time update.
+        pub modify: FileTimeUpdate,
+    }
+}
+
+wire_struct! {
+    /// Status returned for a fs object.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FileStatus {
+        /// Object kind.
+        pub file_type: FileType,
+        /// Permission and special mode bits, excluding object-type bits.
+        pub mode: FileMode,
+        /// Object size in bytes.
+        pub size: u64,
+        /// Owner identity.
+        pub owner: FileUser,
+        /// Device and inode identity.
+        pub node_info: FileNodeInfo,
+        /// Preferred fs I/O block size.
+        pub blksize: u64,
+        /// Timestamps, when the backing fs provides them.
+        pub times: Option<FileTimestamps>,
+    }
 }
 
 /// One directory entry.
@@ -134,93 +151,99 @@ pub struct FileDirectoryEntry {
     pub ino_info: Option<FileNodeInfo>,
 }
 
-/// File operation failure that is meaningful to the guest ABI.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FileError {
-    #[error("requested access is not allowed")]
-    AccessNotAllowed,
-    #[error("parent directory does not allow writes")]
-    NoWritePermissions,
-    #[error("fs is read-only")]
-    ReadOnlyFs,
-    #[error("object already exists")]
-    AlreadyExists,
-    #[error("I/O error")]
-    Io,
-    #[error("no such file or directory")]
-    NoSuchFileOrDirectory,
-    #[error("directory search permission was denied")]
-    NoSearchPermissions,
-    #[error("invalid pathname")]
-    InvalidPathname,
-    #[error("a pathname component is missing")]
-    MissingComponent,
-    #[error("a pathname component is not a directory")]
-    ComponentNotDirectory,
-    #[error("object is not a file")]
-    NotFile,
-    #[error("object was not opened for reading")]
-    NotForReading,
-    #[error("object was not opened for writing")]
-    NotForWriting,
-    #[error("invalid file offset")]
-    InvalidOffset,
-    #[error("object is not seekable")]
-    NonSeekable,
-    #[error("object is a directory")]
-    IsDirectory,
-    #[error("object is a terminal device")]
-    IsTerminalDevice,
-    #[error("caller does not own the object")]
-    NotOwner,
-    #[error("object is not a directory")]
-    NotDirectory,
-    #[error("object is busy")]
-    Busy,
-    #[error("directory is not empty")]
-    NotEmpty,
-    #[error("operation is not permitted on an O_PATH file descriptor")]
-    PathOnly,
-    #[error("object is not a terminal")]
-    NotTerminal,
-    #[error("terminal control is invalid or unsupported")]
-    InvalidTerminalControl,
-    #[error("too many symbolic links encountered")]
-    TooManySymlinks,
-    #[error("no such device or address")]
-    NoSuchDevice,
-    #[error("no space is left for a new object")]
-    NoSpace,
-    #[error("operation is not supported")]
-    NotSupported,
-    #[error("paths are on different filesystems")]
-    CrossDevice,
-    #[error("invalid argument")]
-    InvalidArgument,
+wire_enum! {
+    /// File operation failure that is meaningful to the guest ABI.
+    #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum FileError {
+        #[error("requested access is not allowed")]
+        AccessNotAllowed,
+        #[error("parent directory does not allow writes")]
+        NoWritePermissions,
+        #[error("fs is read-only")]
+        ReadOnlyFs,
+        #[error("object already exists")]
+        AlreadyExists,
+        #[error("I/O error")]
+        Io,
+        #[error("no such file or directory")]
+        NoSuchFileOrDirectory,
+        #[error("directory search permission was denied")]
+        NoSearchPermissions,
+        #[error("invalid pathname")]
+        InvalidPathname,
+        #[error("a pathname component is missing")]
+        MissingComponent,
+        #[error("a pathname component is not a directory")]
+        ComponentNotDirectory,
+        #[error("object is not a file")]
+        NotFile,
+        #[error("object was not opened for reading")]
+        NotForReading,
+        #[error("object was not opened for writing")]
+        NotForWriting,
+        #[error("invalid file offset")]
+        InvalidOffset,
+        #[error("object is not seekable")]
+        NonSeekable,
+        #[error("object is a directory")]
+        IsDirectory,
+        #[error("object is a terminal device")]
+        IsTerminalDevice,
+        #[error("caller does not own the object")]
+        NotOwner,
+        #[error("object is not a directory")]
+        NotDirectory,
+        #[error("object is busy")]
+        Busy,
+        #[error("directory is not empty")]
+        NotEmpty,
+        #[error("operation is not permitted on an O_PATH file descriptor")]
+        PathOnly,
+        #[error("object is not a terminal")]
+        NotTerminal,
+        #[error("terminal control is invalid or unsupported")]
+        InvalidTerminalControl,
+        #[error("too many symbolic links encountered")]
+        TooManySymlinks,
+        #[error("no such device or address")]
+        NoSuchDevice,
+        #[error("no space is left for a new object")]
+        NoSpace,
+        #[error("operation is not supported")]
+        NotSupported,
+        #[error("paths are on different filesystems")]
+        CrossDevice,
+        #[error("invalid argument")]
+        InvalidArgument,
+    }
 }
 
-/// Seek origin.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FileSeekWhence {
-    /// Offset from the beginning of the file.
-    RelativeToBeginning,
-    /// Offset from the file's current position.
-    RelativeToCurrentOffset,
-    /// Offset from the end of the file.
-    RelativeToEnd,
+wire_enum! {
+    /// Seek origin.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum FileSeekWhence {
+        /// Offset from the beginning of the file.
+        RelativeToBeginning,
+        /// Offset from the file's current position.
+        RelativeToCurrentOffset,
+        /// Offset from the end of the file.
+        RelativeToEnd,
+    }
 }
 
-/// Access mode requested when opening a fs object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FileAccessMode {
-    /// Open for reading.
-    ReadOnly,
-    /// Open for writing.
-    WriteOnly,
-    /// Open for reading and writing.
-    ReadWrite,
+wire_enum! {
+    /// Access mode requested when opening a fs object.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum FileAccessMode {
+        /// Open for reading.
+        ReadOnly,
+        /// Open for writing.
+        WriteOnly,
+        /// Open for reading and writing.
+        ReadWrite,
+    }
 }
 
 bitflags! {
@@ -360,343 +383,411 @@ impl core::ops::BitOr for FileOpenFlags {
     }
 }
 
-/// Access mode and status flags of an open object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FileStatusFlags {
-    /// Access mode the object was opened with.
-    pub access: FileAccessMode,
-    /// Status flags within [`FileOpenFlags::STATUS`], plus [`FileOpenFlags::PATH`] for an object
-    /// opened only for path-based operations.
-    pub flags: FileOpenFlags,
+wire_struct! {
+    /// Access mode and status flags of an open object.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FileStatusFlags {
+        /// Access mode the object was opened with.
+        pub access: FileAccessMode,
+        /// Status flags within [`FileOpenFlags::STATUS`], plus [`FileOpenFlags::PATH`] for an object
+        /// opened only for path-based operations.
+        pub flags: FileOpenFlags,
+    }
 }
 
-/// Changes status flags of an open object, which every reference to the object shares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetStatusFlagsRequest {
-    /// Broker object handle.
-    pub handle: ObjectHandle,
-    /// Status flags to change, within [`FileOpenFlags::STATUS`].
-    pub mask: FileOpenFlags,
-    /// New values of the flags in `mask`; flags outside `mask` are ignored.
-    pub flags: FileOpenFlags,
+wire_struct! {
+    /// Changes status flags of an open object, which every reference to the object shares.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SetStatusFlagsRequest {
+        /// Broker object handle.
+        pub handle: ObjectHandle,
+        /// Status flags to change, within [`FileOpenFlags::STATUS`].
+        pub mask: FileOpenFlags,
+        /// New values of the flags in `mask`; flags outside `mask` are ignored.
+        pub flags: FileOpenFlags,
+    }
 }
 
-/// Opens or creates a fs object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OpenFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
-    /// Requested access mode.
-    pub access: FileAccessMode,
-    /// Open flags.
-    pub flags: FileOpenFlags,
-    /// Creation mode.
-    pub mode: FileMode,
+wire_struct! {
+    /// Opens or creates a fs object.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct OpenFileRequest {
+        /// Shared-buffer region containing one absolute UTF-8 path.
+        pub path: SharedBufferSequence,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+        /// Requested access mode.
+        pub access: FileAccessMode,
+        /// Open flags.
+        pub flags: FileOpenFlags,
+        /// Creation mode.
+        pub mode: FileMode,
+    }
 }
 
-/// Successful open response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OpenFileResponse {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
+wire_struct! {
+    /// Successful open response.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct OpenFileResponse {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+    }
 }
 
-/// Reads from an open file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadFileRequest {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
-    /// Shared-buffer destination sequence.
-    pub buffer: SharedBufferSequence,
-    /// Explicit offset, or `None` to use and update the shared position.
-    pub offset: Option<u64>,
+wire_struct! {
+    /// Reads from an open file.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReadFileRequest {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+        /// Shared-buffer destination sequence.
+        pub buffer: SharedBufferSequence,
+        /// Explicit offset, or `None` to use and update the shared position.
+        pub offset: Option<u64>,
+    }
 }
 
-/// Successful read response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadFileResponse {
-    /// Number of bytes read.
-    pub read: u32,
+wire_struct! {
+    /// Successful read response.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReadFileResponse {
+        /// Number of bytes read.
+        pub read: u32,
+    }
 }
 
-/// Writes to an open file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WriteFileRequest {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
-    /// Shared-buffer source sequence.
-    pub buffer: SharedBufferSequence,
-    /// Explicit offset, or `None` to use and update the shared position.
-    pub offset: Option<u64>,
+wire_struct! {
+    /// Writes to an open file.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WriteFileRequest {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+        /// Shared-buffer source sequence.
+        pub buffer: SharedBufferSequence,
+        /// Explicit offset, or `None` to use and update the shared position.
+        pub offset: Option<u64>,
+    }
 }
 
-/// Successful write response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WriteFileResponse {
-    /// Number of bytes written.
-    pub written: u32,
+wire_struct! {
+    /// Successful write response.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WriteFileResponse {
+        /// Number of bytes written.
+        pub written: u32,
+    }
 }
 
-/// Repositions an open file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SeekFileRequest {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
-    /// Signed offset relative to `whence`.
-    pub offset: i64,
-    /// Seek origin.
-    pub whence: FileSeekWhence,
+wire_struct! {
+    /// Repositions an open file.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SeekFileRequest {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+        /// Signed offset relative to `whence`.
+        pub offset: i64,
+        /// Seek origin.
+        pub whence: FileSeekWhence,
+    }
 }
 
-/// Successful seek response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SeekFileResponse {
-    /// Resulting absolute position.
-    pub offset: u64,
+wire_struct! {
+    /// Successful seek response.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SeekFileResponse {
+        /// Resulting absolute position.
+        pub offset: u64,
+    }
 }
 
-/// Truncates an open file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TruncateFileRequest {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
-    /// New file length.
-    pub length: u64,
-    /// Whether to reset the shared position to zero.
-    pub reset_offset: bool,
+wire_struct! {
+    /// Truncates an open file.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TruncateFileRequest {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+        /// New file length.
+        pub length: u64,
+        /// Whether to reset the shared position to zero.
+        pub reset_offset: bool,
+    }
 }
 
-/// Requests the host shared object holding an open regular file's contents, so that the caller
-/// can map it as a `MAP_SHARED` file mapping.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MapFileRequest {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
-    /// Exclusive end, which may lie past the end of the file.
-    pub end: u64,
+wire_struct! {
+    /// Requests the host shared object holding an open regular file's contents, so that the caller
+    /// can map it as a `MAP_SHARED` file mapping.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MapFileRequest {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+        /// Exclusive end, which may lie past the end of the file.
+        pub end: u64,
+    }
 }
 
-/// Successful map response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MapFileResponse {
-    /// Names the file's shared memory, the same for every caller that maps the file, so that
-    /// futexes in it span every process mapping it.
-    pub memory: crate::shared_futex::SharedMemoryId,
-    /// Tag of the out-of-band delivery of the object.
-    pub token: u64,
-    /// Whether the delivered object may be mapped writable: the file is open for writing.
-    pub writable: bool,
+wire_struct! {
+    /// Successful map response.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MapFileResponse {
+        /// Names the file's shared memory, the same for every caller that maps the file, so that
+        /// futexes in it span every process mapping it.
+        pub memory: crate::shared_futex::SharedMemoryId,
+        /// Tag of the out-of-band delivery of the object.
+        pub token: u64,
+        /// Whether the delivered object may be mapped writable: the file is open for writing.
+        pub writable: bool,
+    }
 }
 
-/// Advisory lock operation for an open file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FileLockOperation {
-    /// Acquire a shared lock.
-    Shared,
-    /// Acquire an exclusive lock.
-    Exclusive,
-    /// Release the lock.
-    Unlock,
+wire_enum! {
+    /// Advisory lock operation for an open file.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum FileLockOperation {
+        /// Acquire a shared lock.
+        Shared,
+        /// Acquire an exclusive lock.
+        Exclusive,
+        /// Release the lock.
+        Unlock,
+    }
 }
 
-/// Attempts an advisory lock operation on an open file without waiting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LockFileRequest {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
-    /// Requested lock operation.
-    pub operation: FileLockOperation,
+wire_struct! {
+    /// Attempts an advisory lock operation on an open file without waiting.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct LockFileRequest {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+        /// Requested lock operation.
+        pub operation: FileLockOperation,
+    }
 }
 
-/// Reads one bounded page of directory entries into a shared-buffer region.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadDirectoryRequest {
-    /// Broker-owned directory handle.
-    pub handle: ObjectHandle,
-    /// Shared-buffer destination for encoded entries.
-    pub buffer: SharedBufferSequence,
-    /// Entry index at which this response should begin.
-    pub start_index: u64,
+wire_struct! {
+    /// Reads one bounded page of directory entries into a shared-buffer region.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReadDirectoryRequest {
+        /// Broker-owned directory handle.
+        pub handle: ObjectHandle,
+        /// Shared-buffer destination for encoded entries.
+        pub buffer: SharedBufferSequence,
+        /// Entry index at which this response should begin.
+        pub start_index: u64,
+    }
 }
 
-/// Successful directory-read response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadDirectoryResponse {
-    /// Encoded payload length.
-    pub length: u32,
-    /// Entry index for the next request, or `None` when this response is complete.
-    pub next_index: Option<u64>,
+wire_struct! {
+    /// Successful directory-read response.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReadDirectoryResponse {
+        /// Encoded payload length.
+        pub length: u32,
+        /// Entry index for the next request, or `None` when this response is complete.
+        pub next_index: Option<u64>,
+    }
 }
 
-/// Reads status by path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PathFileStatusRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
-    /// Whether a final symbolic link is followed rather than described itself.
-    pub follow_symlinks: bool,
+wire_struct! {
+    /// Reads status by path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PathFileStatusRequest {
+        /// Shared-buffer region containing one absolute UTF-8 path.
+        pub path: SharedBufferSequence,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+        /// Whether a final symbolic link is followed rather than described itself.
+        pub follow_symlinks: bool,
+    }
 }
 
-/// Changes access and modification times by open handle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetTimesFileRequest {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
-    /// Requested timestamp updates.
-    pub times: SetFileTimes,
+wire_struct! {
+    /// Changes access and modification times by open handle.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SetTimesFileRequest {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+        /// Requested timestamp updates.
+        pub times: SetFileTimes,
+    }
 }
 
-/// Creates a symbolic link by path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SymlinkFileRequest {
-    /// Shared-buffer region containing the absolute UTF-8 linkpath followed by the target verbatim.
-    pub buffer: SharedBufferSequence,
-    /// Length of the linkpath at the start of `buffer`; the remaining bytes are the target.
-    pub path_length: u32,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
+wire_struct! {
+    /// Creates a symbolic link by path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SymlinkFileRequest {
+        /// Shared-buffer region containing the absolute UTF-8 linkpath followed by the target verbatim.
+        pub buffer: SharedBufferSequence,
+        /// Length of the linkpath at the start of `buffer`; the remaining bytes are the target.
+        pub path_length: u32,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+    }
 }
 
-/// Reads the target of a symbolic link by path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadLinkFileRequest {
-    /// Shared-buffer region whose first `path_length` bytes hold one absolute UTF-8 path; the
-    /// broker replaces its contents with the link's target.
-    pub buffer: SharedBufferSequence,
-    /// Length of the path at the start of `buffer`.
-    pub path_length: u32,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
+wire_struct! {
+    /// Reads the target of a symbolic link by path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReadLinkFileRequest {
+        /// Shared-buffer region whose first `path_length` bytes hold one absolute UTF-8 path; the
+        /// broker replaces its contents with the link's target.
+        pub buffer: SharedBufferSequence,
+        /// Length of the path at the start of `buffer`.
+        pub path_length: u32,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+    }
 }
 
-/// Resolves a path to its physical location, following symbolic links.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ResolvePathFileRequest {
-    /// Shared-buffer region whose first `path_length` bytes hold one absolute UTF-8 path; the
-    /// broker replaces its contents with the resolved absolute path.
-    pub buffer: SharedBufferSequence,
-    /// Length of the path at the start of `buffer`.
-    pub path_length: u32,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
+wire_struct! {
+    /// Resolves a path to its physical location, following symbolic links.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ResolvePathFileRequest {
+        /// Shared-buffer region whose first `path_length` bytes hold one absolute UTF-8 path; the
+        /// broker replaces its contents with the resolved absolute path.
+        pub buffer: SharedBufferSequence,
+        /// Length of the path at the start of `buffer`.
+        pub path_length: u32,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+    }
 }
 
-/// Successful response carrying a path written to the request's shared buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FilePathResponse {
-    /// Length of the path written to the start of the request buffer.
-    pub length: u32,
+wire_struct! {
+    /// Successful response carrying a path written to the request's shared buffer.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FilePathResponse {
+        /// Length of the path written to the start of the request buffer.
+        pub length: u32,
+    }
 }
 
-/// Reads status by open handle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HandleFileStatusRequest {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
+wire_struct! {
+    /// Reads status by open handle.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct HandleFileStatusRequest {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+    }
 }
 
-/// Reads the absolute path of an open file, with symbolic links resolved, as of when it was opened.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HandleFilePathRequest {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
-    /// Shared-buffer region the broker writes the absolute path to.
-    pub buffer: SharedBufferSequence,
+wire_struct! {
+    /// Reads the absolute path of an open file, with symbolic links resolved, as of when it was opened.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct HandleFilePathRequest {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+        /// Shared-buffer region the broker writes the absolute path to.
+        pub buffer: SharedBufferSequence,
+    }
 }
 
-/// Determines whether an open file is connected to a terminal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IsTerminalFileRequest {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
+wire_struct! {
+    /// Determines whether an open file is connected to a terminal.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct IsTerminalFileRequest {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+    }
 }
 
-/// Controls the shared terminal backing an open file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TerminalControlFileRequest {
-    /// Broker-owned file handle.
-    pub handle: ObjectHandle,
-    /// Typed terminal operation.
-    pub operation: crate::terminal::TerminalOperation,
+wire_struct! {
+    /// Controls the shared terminal backing an open file.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TerminalControlFileRequest {
+        /// Broker-owned file handle.
+        pub handle: ObjectHandle,
+        /// Typed terminal operation.
+        pub operation: crate::terminal::TerminalOperation,
+    }
 }
 
-/// Changes mode bits by path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChmodFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
-    /// New mode bits.
-    pub mode: FileMode,
+wire_struct! {
+    /// Changes mode bits by path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ChmodFileRequest {
+        /// Shared-buffer region containing one absolute UTF-8 path.
+        pub path: SharedBufferSequence,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+        /// New mode bits.
+        pub mode: FileMode,
+    }
 }
 
-/// Changes ownership by path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChownFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub acting_user: FileUser,
-    /// New user ID, if changed.
-    pub user: Option<u16>,
-    /// New group ID, if changed.
-    pub group: Option<u16>,
+wire_struct! {
+    /// Changes ownership by path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ChownFileRequest {
+        /// Shared-buffer region containing one absolute UTF-8 path.
+        pub path: SharedBufferSequence,
+        /// Caller identity for permission checks.
+        pub acting_user: FileUser,
+        /// New user ID, if changed.
+        pub user: Option<u16>,
+        /// New group ID, if changed.
+        pub group: Option<u16>,
+    }
 }
 
-/// Removes a file by path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UnlinkFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
+wire_struct! {
+    /// Removes a file by path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct UnlinkFileRequest {
+        /// Shared-buffer region containing one absolute UTF-8 path.
+        pub path: SharedBufferSequence,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+    }
 }
 
-/// Renames a file or directory by path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RenameFileRequest {
-    /// Shared-buffer region containing the old absolute UTF-8 path followed by the new path.
-    pub paths: SharedBufferSequence,
-    /// Length of the old path at the start of `paths`.
-    pub old_path_length: u32,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
+wire_struct! {
+    /// Renames a file or directory by path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RenameFileRequest {
+        /// Shared-buffer region containing the old absolute UTF-8 path followed by the new path.
+        pub paths: SharedBufferSequence,
+        /// Length of the old path at the start of `paths`.
+        pub old_path_length: u32,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+    }
 }
 
-/// Creates a directory by path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MkdirFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
-    /// New directory mode.
-    pub mode: FileMode,
+wire_struct! {
+    /// Creates a directory by path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MkdirFileRequest {
+        /// Shared-buffer region containing one absolute UTF-8 path.
+        pub path: SharedBufferSequence,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+        /// New directory mode.
+        pub mode: FileMode,
+    }
 }
 
-/// Mounts a fresh tmpfs at a directory path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MountFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
+wire_struct! {
+    /// Mounts a fresh tmpfs at a directory path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MountFileRequest {
+        /// Shared-buffer region containing one absolute UTF-8 path.
+        pub path: SharedBufferSequence,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+    }
 }
 
-/// Removes a directory by path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RmdirFileRequest {
-    /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferSequence,
-    /// Caller identity for permission checks.
-    pub user: FileUser,
+wire_struct! {
+    /// Removes a directory by path.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RmdirFileRequest {
+        /// Shared-buffer region containing one absolute UTF-8 path.
+        pub path: SharedBufferSequence,
+        /// Caller identity for permission checks.
+        pub user: FileUser,
+    }
 }
 
 /// Error while encoding or decoding a shared directory payload.

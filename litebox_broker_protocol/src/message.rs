@@ -72,52 +72,56 @@ use crate::vsock_socket::{
 };
 use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, SharedObjectToken, ThreadId};
 
-/// Broker handshake request sent before the control channel is active.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BrokerHandshakeRequest {
-    /// Required protocol version.
-    pub protocol_version: ProtocolVersion,
+wire_struct! {
+    /// Broker handshake request sent before the control channel is active.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct BrokerHandshakeRequest {
+        /// Required protocol version.
+        pub protocol_version: ProtocolVersion,
+    }
 }
 
-/// Operation requested over an active broker control channel.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BrokerOperation {
-    /// Thread request family.
-    Thread(ThreadRequest),
-    /// Close one broker object reference.
-    CloseObject(ObjectHandle),
-    /// Check the current readiness of a broker-owned object.
-    CheckReadiness(ObjectHandle),
-    /// Read the access mode and status flags of a broker-owned object.
-    GetStatusFlags(ObjectHandle),
-    /// Change status flags of a broker-owned object.
-    SetStatusFlags(SetStatusFlagsRequest),
-    /// Event object request family.
-    Event(EventRequest),
-    /// Pipe object request family.
-    Pipe(PipeRequest),
-    /// Socket object request family.
-    Socket(SocketRequest),
-    /// Fill a shared buffer with cryptographically secure random bytes.
-    FillRandom(SharedBufferSequence),
-    /// File request family.
-    File(FileRequest),
-    /// Process request family.
-    Process(ProcessRequest),
-    /// Process group and session request family.
-    ProcessGroup(ProcessGroupRequest),
-    /// Timer object request family.
-    Timer(TimerRequest),
-    /// Signal request family.
-    Signal(SignalRequest),
-    /// Unix socket request family.
-    UnixSocket(UnixSocketRequest),
-    /// Readiness queue request family.
-    ReadinessQueue(ReadinessQueueRequest),
-    /// Futex in shared memory request family.
-    SharedFutex(SharedFutexRequest),
-    /// Vsock socket request family.
-    VsockSocket(VsockSocketRequest),
+wire_enum! {
+    /// Operation requested over an active broker control channel.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum BrokerOperation {
+        /// Thread request family.
+        Thread(ThreadRequest),
+        /// Close one broker object reference.
+        CloseObject(ObjectHandle),
+        /// Check the current readiness of a broker-owned object.
+        CheckReadiness(ObjectHandle),
+        /// Read the access mode and status flags of a broker-owned object.
+        GetStatusFlags(ObjectHandle),
+        /// Change status flags of a broker-owned object.
+        SetStatusFlags(SetStatusFlagsRequest),
+        /// Event object request family.
+        Event(EventRequest),
+        /// Pipe object request family.
+        Pipe(PipeRequest),
+        /// Socket object request family.
+        Socket(SocketRequest),
+        /// Fill a shared buffer with cryptographically secure random bytes.
+        FillRandom(SharedBufferSequence),
+        /// File request family.
+        File(FileRequest),
+        /// Process request family.
+        Process(ProcessRequest),
+        /// Process group and session request family.
+        ProcessGroup(ProcessGroupRequest),
+        /// Timer object request family.
+        Timer(TimerRequest),
+        /// Signal request family.
+        Signal(SignalRequest),
+        /// Unix socket request family.
+        UnixSocket(UnixSocketRequest),
+        /// Readiness queue request family.
+        ReadinessQueue(ReadinessQueueRequest),
+        /// Futex in shared memory request family.
+        SharedFutex(SharedFutexRequest),
+        /// Vsock socket request family.
+        VsockSocket(VsockSocketRequest),
+    }
 }
 
 impl BrokerOperation {
@@ -276,858 +280,904 @@ impl BrokerOperation {
     }
 }
 
-/// Request sent over an active broker control channel.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BrokerRequest {
-    /// Correlation identifier allocated by the local endpoint.
-    pub request_id: RequestId,
-    /// Requested broker operation.
-    pub operation: BrokerOperation,
+wire_struct! {
+    /// Request sent over an active broker control channel.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct BrokerRequest {
+        /// Correlation identifier allocated by the local endpoint.
+        pub request_id: RequestId,
+        /// Requested broker operation.
+        pub operation: BrokerOperation,
+    }
 }
 
-/// Broker handshake response sent before the control channel is active.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BrokerHandshakeResponse {
-    /// Negotiation result.
-    Negotiated {
-        /// Broker protocol version supported by this endpoint.
+wire_enum! {
+    /// Broker handshake response sent before the control channel is active.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum BrokerHandshakeResponse {
+        /// Negotiation result.
+        Negotiated {
+            /// Broker protocol version supported by this endpoint.
+            ///
+            /// The broker returns its supported version after validating that the
+            /// requested version matches it.
+            broker_protocol_version: ProtocolVersion,
+            /// Assigned process ID.
+            process_id: ProcessId,
+            /// Assigned initial thread ID.
+            initial_thread_id: ThreadId,
+            /// Child startup data, absent for the initial process.
+            startup: Option<ProcessStartupDescriptor>,
+        },
+        /// Negotiation failed because the requested version is unsupported.
         ///
-        /// The broker returns its supported version after validating that the
-        /// requested version matches it.
-        broker_protocol_version: ProtocolVersion,
-        /// Assigned process ID.
-        process_id: ProcessId,
-        /// Assigned initial thread ID.
-        initial_thread_id: ThreadId,
-        /// Child startup data, absent for the initial process.
-        startup: Option<ProcessStartupDescriptor>,
-    },
-    /// Negotiation failed because the requested version is unsupported.
+        /// The connection remains in negotiation state and the local peer may retry
+        /// with a compatible version using the broker-supported version advertised
+        /// here.
+        VersionMismatch {
+            /// Broker protocol version supported by this endpoint.
+            broker_protocol_version: ProtocolVersion,
+        },
+        /// Handshake failed with an ABI-neutral broker error.
+        Error(ErrorCode),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned event object request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum EventRequest {
+        /// Create a broker-owned event object.
+        Create(CreateEventRequest),
+        /// Add readiness credits to an event.
+        Add(AddEventRequest),
+        /// Consume readiness credits from an event.
+        Consume(ConsumeEventRequest),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned timer object request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum TimerRequest {
+        /// Create a disarmed broker-owned timer.
+        ///
+        /// Timers are clock-agnostic: they count relative time on the broker's
+        /// monotonic clock, and guests convert their own clocks and absolute
+        /// expiration times before arming them.
+        Create(CreateTimerRequest),
+        /// Arm or disarm a timer.
+        Set(SetTimerRequest),
+        /// Read a timer's current schedule.
+        Get(GetTimerRequest),
+        /// Consume a timer's pending expirations.
+        Read(ReadTimerRequest),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned readiness queue request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ReadinessQueueRequest {
+        /// Create an empty readiness queue.
+        Create,
+        /// Add an entry watching another object.
+        Add(AddReadinessQueueEntryRequest),
+        /// Replace an entry's interest.
+        Modify(ModifyReadinessQueueEntryRequest),
+        /// Remove an entry.
+        Remove(RemoveReadinessQueueEntryRequest),
+        /// Take ready events without waiting.
+        TakeReady(TakeReadyRequest),
+    }
+}
+
+wire_enum! {
+    /// Request about futexes in shared memory.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SharedFutexRequest {
+        /// Issue a signed ID for memory the calling process creates.
+        IssueMemoryId,
+        /// Create an idle futex waiter.
+        CreateWaiter,
+        /// Arm a futex waiter on a futex word.
+        Arm(FutexArmRequest),
+        /// Wake waiters on a futex word.
+        Wake(FutexWakeRequest),
+        /// Disarm a futex waiter, reporting whether it was woken.
+        Disarm(FutexDisarmRequest),
+    }
+}
+
+wire_enum! {
+    /// Request about the caller's threads.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ThreadRequest {
+        /// Create another thread in the caller.
+        Create,
+        /// Record a thread's exit after its local teardown completes.
+        Exit(ThreadId),
+    }
+}
+
+wire_enum! {
+    /// Request about the caller's pending child, its own exit, and the process
+    /// tree.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ProcessRequest {
+        /// Create a pending child process and its initial thread.
+        ///
+        /// The broker returns `UnsupportedOperation` if the request asks for a new
+        /// PID namespace while the caller's children already go to another one,
+        /// `PolicyDenied` if process creation is disabled or the request asks for
+        /// a sibling of a process without a parent, `ResourceExhausted` at a
+        /// process limit or a namespace count or nesting limit, and `PeerClosed`
+        /// if the child's namespace has ended.
+        AllocateChild(AllocateChildRequest),
+        /// Duplicate object references into this process's pending child.
+        DuplicateObjectsToChild(DuplicateObjectsToChildRequest),
+        /// Write bytes into this process's pending child's memory image.
+        WriteChildMemory(WriteChildMemoryRequest),
+        /// Start one pending child process.
+        StartChild(StartChildProcessRequest),
+        /// Start one pending child in an already-created platform runner.
+        StartChildWithExistingRunner(StartChildWithExistingRunnerRequest),
+        /// Record the exit of one pending child process that never started.
+        ExitChild(ExitChildProcessRequest),
+        /// Discard one pending child process that never started, as if it had
+        /// never been created, except that this process learns it was removed.
+        CancelChild(ProcessId),
+        /// Report this process's final termination status before its runner exits.
+        ///
+        /// The status is published once the runner exits, replacing the status the
+        /// broker would otherwise infer from the runner's host termination.
+        ReportExitStatus(ProcessExitStatus),
+        /// Set whether this process retains its children's exits until it
+        /// collects them, rather than discarding each when the child terminates.
+        ///
+        /// Each child applies the setting in effect when it terminates, so a change
+        /// does not affect children that already terminated.
+        SetChildExitRetention(bool),
+        /// Set whether this process adopts the orphaned children of its exiting
+        /// descendants.
+        ///
+        /// When a process exits, its children move to its nearest running ancestor
+        /// that adopts orphans, and otherwise have their exits discarded.
+        SetOrphanAdoption(bool),
+        /// Collect the exit of one exited child matching the selector, oldest
+        /// first, without blocking, removing the child from the process tree.
+        ///
+        /// The broker returns `WouldBlock` if only live children match, and
+        /// `UnknownObject` if none does. Each matching child's exit or removal is
+        /// then reported through the caller's signals.
+        CollectChildExit(ChildSelector),
+        /// Read a process's place in the process tree and its initial thread.
+        ///
+        /// The broker returns `UnknownObject` if no such process exists.
+        GetInfo(ProcessId),
+        /// Read which process a thread belongs to.
+        ///
+        /// The broker returns `UnknownObject` if no such thread exists.
+        GetThreadInfo(ThreadId),
+        /// Create the control connection through which a native clone of this process's runner
+        /// will associate as this process's pending child, before starting it with
+        /// [`Self::StartChildWithExistingRunner`].
+        ///
+        /// The broker returns `UnsupportedOperation` if it cannot create such connections, and
+        /// `UnknownObject` if this process has no such pending child.
+        CreateChildConnection(ProcessId),
+        /// Read the CPU time used by the children whose exits this process
+        /// collected, including the time they collected from their own children.
+        GetChildrenCpuTime,
+        /// Read one resource limit of the caller or of its pending child.
+        ///
+        /// The broker returns `UnknownObject` if the process is neither.
+        GetResourceLimit(GetResourceLimitRequest),
+        /// Replace one resource limit of the caller or of its pending child,
+        /// returning the previous limit.
+        ///
+        /// The broker returns `UnknownObject` if the process is neither, and
+        /// `PolicyDenied` if the new hard limit exceeds the current one.
+        SetResourceLimit(SetResourceLimitRequest),
+        /// Make the children the caller creates from now on go into a new PID
+        /// namespace with these options, nested in the caller's. The first of
+        /// them becomes the namespace's first process.
+        ///
+        /// The broker returns `UnsupportedOperation` if the caller's children
+        /// already go to another PID namespace, and `ResourceExhausted` at a
+        /// namespace count or nesting limit.
+        CreateChildrenPidNamespace(PidNamespaceOptions),
+        /// Read the host names of the caller or of its pending child, both from
+        /// one moment.
+        ///
+        /// The broker returns `UnknownObject` if the process is neither.
+        GetHostNames(GetHostNamesRequest),
+        /// Replace one of the host names of the caller or of its pending child,
+        /// for every process that shares them.
+        ///
+        /// The broker returns `UnknownObject` if the process is neither.
+        SetHostName(SetHostNameRequest),
+        /// Replace the host names of the caller or of its pending child with a
+        /// copy that no other process shares.
+        ///
+        /// The broker returns `UnknownObject` if the process is neither.
+        CopyHostNames(ProcessId),
+        /// Open a handle to a process in the caller's PID namespace.
+        ///
+        /// The broker returns `UnknownObject` if no such process exists, and
+        /// `UnsupportedOperation` for flags outside `FileOpenFlags::STATUS`.
+        OpenProcessHandle(OpenProcessHandleRequest),
+        /// Read the parent-exit signal of the caller or of its pending child.
+        ///
+        /// The broker returns `UnknownObject` if the process is neither.
+        GetParentExitSignal(ProcessId),
+        /// Set the parent-exit signal of the caller or of its pending child.
+        ///
+        /// The broker returns `UnknownObject` if the process is neither, and
+        /// `UnsupportedOperation` for a signal number above [`crate::signal::MAX_SIGNAL`].
+        SetParentExitSignal(SetParentExitSignalRequest),
+    }
+}
+
+wire_enum! {
+    /// Request about process groups and sessions.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ProcessGroupRequest {
+        /// Move a process into a process group.
+        Set(SetProcessGroupRequest),
+        /// Make a process the leader of a new session and of a new process group
+        /// in it.
+        ///
+        /// The process must be the caller or its pending child, or the broker
+        /// returns `UnknownObject`. The broker returns `PolicyDenied` if a process
+        /// group already has the process's ID.
+        CreateSession(ProcessId),
+        /// Read the foreground process group of the caller's controlling terminal,
+        /// given an open handle to it, or of any session's controlling terminal,
+        /// given an open handle to its pseudo-terminal manager.
+        ///
+        /// Fails with [`ProcessGroupError::NotControllingTerminal`] if the handle
+        /// refers to no such terminal.
+        GetForegroundGroup(ObjectHandle),
+        /// Make a process group the foreground group of the caller's controlling
+        /// terminal.
+        ///
+        /// Fails with [`ProcessGroupError::NotControllingTerminal`] if the handle
+        /// does not refer to the caller's controlling terminal, then with
+        /// [`ProcessGroupError::NoSuchProcessGroup`] if no process is in the group,
+        /// and then with [`ProcessGroupError::NotInSession`] if the group is in
+        /// another session.
+        SetForegroundGroup(SetForegroundGroupRequest),
+        /// Make a terminal the controlling terminal of the session that a process
+        /// leads.
+        SetControllingTerminal(SetControllingTerminalRequest),
+    }
+}
+
+wire_enum! {
+    /// Request about signals sent between broker processes.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SignalRequest {
+        /// Open the caller's signals.
+        ///
+        /// Signals sent to the caller stay pending until it takes them, including
+        /// signals sent before it opens them, except that a signal sent to one of
+        /// its threads is dropped if that thread ends first. A process has at most
+        /// one open signals handle; the broker returns `ResourceExhausted` for
+        /// another.
+        Open,
+        /// Send a signal to processes or a thread.
+        Send(SendSignalRequest),
+        /// Take the caller's lowest-numbered pending signal, or else, for one of its
+        /// threads in no particular order, that thread's lowest-numbered pending
+        /// signal, then its pending child exit, and then its pending child removal.
+        Take(TakeSignalRequest),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned pipe object request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum PipeRequest {
+        /// Create a broker-owned byte pipe.
+        Create(CreatePipeRequest),
+        /// Read bytes from a pipe.
+        Read(ReadPipeRequest),
+        /// Write bytes to a pipe.
+        Write(WritePipeRequest),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned Unix socket request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum UnixSocketRequest {
+        /// Create an unbound, unconnected socket.
+        Create(CreateUnixSocketRequest),
+        /// Create a pair of connected unnamed sockets.
+        CreatePair(CreateUnixSocketRequest),
+        /// Bind a socket to a name.
+        Bind(BindUnixSocketRequest),
+        /// Make a bound stream or sequenced-packet socket accept connections.
+        Listen(ListenUnixSocketRequest),
+        /// Connect a socket to a named socket.
+        Connect(ConnectUnixSocketRequest),
+        /// Accept one pending connection.
+        Accept(AcceptUnixSocketRequest),
+        /// Send bytes staged in shared memory.
+        Send(SendUnixSocketRequest),
+        /// Receive bytes into shared memory.
+        Receive(ReceiveUnixSocketRequest),
+        /// Shut down one or both directions.
+        Shutdown(ShutdownUnixSocketRequest),
+        /// Read the name of a socket or its peer.
+        GetName(GetUnixSocketNameRequest),
+        /// Store one socket option.
+        SetOption(SetUnixSocketOptionRequest),
+        /// Read one socket option.
+        GetOption(GetUnixSocketOptionRequest),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned socket object request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SocketRequest {
+        /// Create a broker-owned socket.
+        Create(CreateSocketRequest),
+        /// Connect a socket to a remote address.
+        Connect(ConnectSocketRequest),
+        /// Bind a socket to a local address.
+        Bind(BindSocketRequest),
+        /// Make a bound socket listen for connections.
+        Listen(ListenSocketRequest),
+        /// Accept one pending connection.
+        Accept(AcceptSocketRequest),
+        /// Send bytes staged in shared memory.
+        Send(SendSocketRequest),
+        /// Send one complete datagram staged in shared memory.
+        SendTo(SendToSocketRequest),
+        /// Receive bytes into shared memory.
+        Receive(ReceiveSocketRequest),
+        /// Receive one datagram into shared memory.
+        ReceiveFrom(ReceiveFromSocketRequest),
+        /// Shut down one or both directions.
+        Shutdown(ShutdownSocketRequest),
+        /// Set a socket option.
+        SetOption(SetSocketOptionRequest),
+        /// Read a socket option.
+        GetOption(GetSocketOptionRequest),
+        /// Check the progress of a connection attempt.
+        CheckConnect(CheckConnectSocketRequest),
+        /// Read the local or peer address.
+        GetName(GetSocketNameRequest),
+        /// Take the oldest pending error.
+        TakeError(TakeSocketErrorRequest),
+        /// Report an error before any already pending one.
+        SetError(SetSocketErrorRequest),
+    }
+}
+
+wire_enum! {
+    /// Result returned for an active broker operation.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum BrokerResult {
+        /// Thread response family.
+        Thread(ThreadResponse),
+        /// Object close operation completed.
+        ObjectClosed,
+        /// Current readiness of a broker-owned object.
+        Readiness(ReadinessFlags),
+        /// Access mode and status flags of a broker-owned object.
+        StatusFlags(FileStatusFlags),
+        /// Status flags of a broker-owned object were changed.
+        StatusFlagsSet,
+        /// Event object response family.
+        Event(EventResponse),
+        /// Pipe object response family.
+        Pipe(PipeResponse),
+        /// Socket object response family.
+        Socket(SocketResponse),
+        /// The requested shared buffer was filled with random bytes.
+        RandomFilled,
+        /// File response family.
+        File(FileResponse),
+        /// Process response family.
+        Process(ProcessResponse),
+        /// Process group and session response family.
+        ProcessGroup(ProcessGroupResponse),
+        /// Timer object response family.
+        Timer(TimerResponse),
+        /// Signal response family.
+        Signal(SignalResponse),
+        /// Unix socket response family.
+        UnixSocket(UnixSocketResponse),
+        /// Readiness queue response family.
+        ReadinessQueue(ReadinessQueueResponse),
+        /// Futex in shared memory response family.
+        SharedFutex(SharedFutexResponse),
+        /// Vsock socket response family.
+        VsockSocket(VsockSocketResponse),
+        /// Operation failed with an ABI-neutral broker error.
+        Error(ErrorCode),
+    }
+}
+
+wire_struct! {
+    /// Response sent over an active broker control channel.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct BrokerResponse {
+        /// Correlation identifier copied from the request.
+        pub request_id: RequestId,
+        /// Result of the requested broker operation.
+        pub result: BrokerResult,
+    }
+}
+
+wire_enum! {
+    /// Broker-owned event object response.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum EventResponse {
+        /// Create operation response.
+        Create(CreateEventResponse),
+        /// Add operation response.
+        Add(AddEventResponse),
+        /// Consume operation response.
+        Consume(ConsumeEventResponse),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned timer object response.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum TimerResponse {
+        /// Create operation response.
+        Create(CreateTimerResponse),
+        /// Set operation response.
+        Set(SetTimerResponse),
+        /// Get operation response.
+        Get(GetTimerResponse),
+        /// Read operation response.
+        Read(ReadTimerResponse),
+    }
+}
+
+wire_enum! {
+    /// Response about futexes in shared memory.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SharedFutexResponse {
+        /// Shared memory ID issue operation response.
+        IssueMemoryId(IssueMemoryIdResponse),
+        /// Futex waiter create operation response.
+        CreateWaiter(CreateFutexWaiterResponse),
+        /// Futex arm operation completed.
+        Arm,
+        /// Futex wake operation response.
+        Wake(FutexWakeResponse),
+        /// Futex disarm operation response.
+        Disarm(FutexDisarmResponse),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned readiness queue response.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ReadinessQueueResponse {
+        /// Create operation response.
+        Create(CreateReadinessQueueResponse),
+        /// Add operation completed.
+        Add,
+        /// Modify operation completed.
+        Modify,
+        /// Remove operation completed.
+        Remove,
+        /// Take-ready operation response.
+        TakeReady(TakeReadyResponse),
+        /// The operation failed in a way the guest ABI reports.
+        ///
+        /// Waiting, resource, and request-validation failures use
+        /// [`BrokerResult::Error`] instead.
+        Failed(ReadinessQueueError),
+    }
+}
+
+wire_enum! {
+    /// Response to a thread request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ThreadResponse {
+        /// The thread was created.
+        Create(ThreadId),
+        /// The thread's exit was recorded.
+        Exit,
+    }
+}
+
+wire_enum! {
+    /// Response to a process request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ProcessResponse {
+        /// The pending child was created.
+        AllocateChild(ProcessIdentity),
+        /// Object references were duplicated into the pending child, whose handles
+        /// replaced the request's handles in its shared buffer.
+        DuplicateObjectsToChild,
+        /// Bytes were written into the pending child's memory image.
+        WriteChildMemory,
+        /// The pending child established its broker association.
+        StartChild,
+        /// The pending child established its broker association in an existing runner.
+        StartChildWithExistingRunner,
+        /// The pending child's exit was recorded.
+        ExitChild,
+        /// The pending child was discarded.
+        CancelChild,
+        /// This process's final termination status was recorded.
+        ReportExitStatus,
+        /// This process's child exit retention setting was recorded.
+        SetChildExitRetention,
+        /// This process's orphan-adoption setting was recorded.
+        SetOrphanAdoption,
+        /// An exited child's exit was collected.
+        CollectChildExit(ChildExit),
+        /// A process's place in the process tree and its initial thread.
+        GetInfo(ProcessInfo),
+        /// The process a thread belongs to.
+        GetThreadInfo(ThreadInfo),
+        /// The child's control connection was created, and the runner's end delivered under this
+        /// token.
+        CreateChildConnection(SharedObjectToken),
+        /// The CPU time used by the children whose exits this process collected.
+        GetChildrenCpuTime(CpuTime),
+        /// The process's limit on the resource.
+        GetResourceLimit(ResourceLimit),
+        /// The limit was replaced; this is the previous one.
+        SetResourceLimit(ResourceLimit),
+        /// The children the caller creates from now on go into the new PID
+        /// namespace.
+        CreateChildrenPidNamespace,
+        /// The host names were written to the request's buffer, with these sizes.
+        GetHostNames(HostNameSizes),
+        /// The name was replaced.
+        SetHostName,
+        /// The process has its own copy of the host names.
+        CopyHostNames,
+        /// A handle to the process was opened.
+        OpenProcessHandle(ObjectHandle),
+        /// The process's parent-exit signal, or zero for none.
+        GetParentExitSignal(u32),
+        /// The parent-exit signal was set.
+        SetParentExitSignal,
+    }
+}
+
+wire_enum! {
+    /// Response to a process group request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ProcessGroupResponse {
+        /// The process moved into the group.
+        Set,
+        /// The session was created.
+        CreateSession,
+        /// The foreground process group, in the terminal's session.
+        GetForegroundGroup(ProcessGroupMembership),
+        /// The foreground process group changed.
+        SetForegroundGroup,
+        /// The terminal controls the process's session.
+        SetControllingTerminal,
+        /// A terminal operation failed in a way the guest ABI reports.
+        ///
+        /// Other failures use [`BrokerResult::Error`].
+        Failed(ProcessGroupError),
+    }
+}
+
+wire_enum! {
+    /// Response to a signal request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SignalResponse {
+        /// Open operation response.
+        Open(OpenSignalsResponse),
+        /// The signal was sent.
+        Sent,
+        /// Take operation response.
+        Take(SignalEvent),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned pipe object response.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum PipeResponse {
+        /// Create operation response.
+        Create(CreatePipeResponse),
+        /// Read operation response.
+        Read(ReadPipeResponse),
+        /// Write operation response.
+        Write(WritePipeResponse),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned socket object response.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SocketResponse {
+        /// Create operation response.
+        Create(CreateSocketResponse),
+        /// Connect operation response.
+        Connect(ConnectSocketResponse),
+        /// Bind operation response.
+        Bind(BindSocketResponse),
+        /// Listen operation response.
+        Listen(ListenSocketResponse),
+        /// Accept operation response.
+        Accept(AcceptSocketResponse),
+        /// Send operation response.
+        Send(SendSocketResponse),
+        /// Datagram send operation response.
+        SendTo(SendToSocketResponse),
+        /// Receive operation response.
+        Receive(ReceiveSocketResponse),
+        /// Datagram receive operation response.
+        ReceiveFrom(ReceiveFromSocketResponse),
+        /// Shutdown operation completed.
+        Shutdown,
+        /// Socket option was updated.
+        SetOption,
+        /// Socket option response.
+        GetOption(GetSocketOptionResponse),
+        /// Check-connect operation response.
+        CheckConnect(ConnectSocketResponse),
+        /// Address operation response.
+        GetName(GetSocketNameResponse),
+        /// Take-error operation response.
+        TakeError(TakeSocketErrorResponse),
+        /// Socket error was reported.
+        SetError,
+        /// A socket operation failed with an ordinary socket error.
+        ///
+        /// Broker and request-validation failures use [`BrokerResult::Error`]
+        /// instead.
+        Failed(SocketError),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned Unix socket response.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum UnixSocketResponse {
+        /// Create operation response.
+        Create(CreateUnixSocketResponse),
+        /// Pair create operation response.
+        CreatePair(CreateUnixSocketPairResponse),
+        /// Bind operation completed.
+        Bind,
+        /// Listen operation completed.
+        Listen,
+        /// Connect operation completed.
+        Connect,
+        /// Accept operation response.
+        Accept(AcceptUnixSocketResponse),
+        /// Send operation response.
+        Send(SendUnixSocketResponse),
+        /// Receive operation response.
+        Receive(ReceiveUnixSocketResponse),
+        /// Shutdown operation completed.
+        Shutdown,
+        /// Name operation response.
+        GetName(GetUnixSocketNameResponse),
+        /// Option was stored.
+        SetOption,
+        /// Option read response.
+        GetOption(GetUnixSocketOptionResponse),
+        /// The operation failed in a way the guest ABI reports.
+        ///
+        /// Waiting, resource, and request-validation failures use
+        /// [`BrokerResult::Error`] instead.
+        Failed(UnixSocketError),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned vsock socket request.
     ///
-    /// The connection remains in negotiation state and the local peer may retry
-    /// with a compatible version using the broker-supported version advertised
-    /// here.
-    VersionMismatch {
-        /// Broker protocol version supported by this endpoint.
-        broker_protocol_version: ProtocolVersion,
-    },
-    /// Handshake failed with an ABI-neutral broker error.
-    Error(ErrorCode),
+    /// See [`crate::vsock_socket`] for how a connect completes.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum VsockSocketRequest {
+        /// Create an unbound, unconnected socket.
+        Create(CreateVsockSocketRequest),
+        /// Bind a socket to a local address.
+        Bind(BindVsockSocketRequest),
+        /// Make a bound socket listen for the host's connections.
+        Listen(ListenSocketRequest),
+        /// Accept one pending connection.
+        Accept(AcceptSocketRequest),
+        /// Start connecting a socket, or report the attempt in progress.
+        Connect(ConnectVsockSocketRequest),
+        /// Report a blocking connect's progress, leaving a failure pending
+        /// unless it timed out.
+        CheckConnect(CheckConnectSocketRequest),
+        /// Cancel a connect in progress, as an interrupted blocking connect does.
+        CancelConnect(CheckConnectSocketRequest),
+        /// Take the pending error.
+        TakeError(TakeSocketErrorRequest),
+        /// Send bytes staged in shared memory.
+        Send(SendSocketRequest),
+        /// Receive bytes into shared memory.
+        Receive(ReceiveVsockSocketRequest),
+        /// Shut down one or both directions.
+        Shutdown(ShutdownSocketRequest),
+        /// Read the local or peer address.
+        GetName(GetSocketNameRequest),
+    }
 }
 
-/// Broker-owned event object request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EventRequest {
-    /// Create a broker-owned event object.
-    Create(CreateEventRequest),
-    /// Add readiness credits to an event.
-    Add(AddEventRequest),
-    /// Consume readiness credits from an event.
-    Consume(ConsumeEventRequest),
+wire_enum! {
+    /// Broker-owned vsock socket response.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum VsockSocketResponse {
+        /// Create operation response.
+        Create(CreateSocketResponse),
+        /// Bind operation completed.
+        Bind,
+        /// Listen operation completed.
+        Listen,
+        /// Accept operation response.
+        Accept(AcceptVsockSocketResponse),
+        /// Connect operation response: connected, or connecting.
+        Connect(ConnectSocketResponse),
+        /// Check-connect operation response.
+        CheckConnect(ConnectSocketResponse),
+        /// Cancel operation completed.
+        CancelConnect,
+        /// Take-error operation response.
+        TakeError(TakeSocketErrorResponse),
+        /// Send operation response.
+        Send(SendSocketResponse),
+        /// Receive operation response.
+        Receive(ReceiveSocketResponse),
+        /// Shutdown operation completed.
+        Shutdown,
+        /// Address operation response.
+        GetName(GetVsockSocketNameResponse),
+        /// An ordinary socket error; broker and request-validation failures use
+        /// [`BrokerResult::Error`].
+        Failed(SocketError),
+    }
 }
 
-/// Broker-owned timer object request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TimerRequest {
-    /// Create a disarmed broker-owned timer.
+wire_enum! {
+    /// Broker-owned fs request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum FileRequest {
+        /// Open or create an object.
+        Open(OpenFileRequest),
+        /// Read from an open file.
+        Read(ReadFileRequest),
+        /// Write to an open file.
+        Write(WriteFileRequest),
+        /// Reposition an open file.
+        Seek(SeekFileRequest),
+        /// Truncate an open file.
+        Truncate(TruncateFileRequest),
+        /// Attempt an advisory lock operation on an open file without waiting.
+        Lock(LockFileRequest),
+        /// Read directory entries.
+        ReadDirectory(ReadDirectoryRequest),
+        /// Read status by path.
+        PathStatus(PathFileStatusRequest),
+        /// Read status by open handle.
+        HandleStatus(HandleFileStatusRequest),
+        /// Change access and modification times by open handle.
+        SetTimes(SetTimesFileRequest),
+        /// Read the absolute path of an open file, with symbolic links resolved, as of when it was
+        /// opened.
+        HandlePath(HandleFilePathRequest),
+        /// Determine whether an open file is connected to a terminal.
+        IsTerminal(IsTerminalFileRequest),
+        /// Control the shared terminal backing an open file.
+        TerminalControl(TerminalControlFileRequest),
+        /// Change mode bits by path.
+        Chmod(ChmodFileRequest),
+        /// Change ownership by path.
+        Chown(ChownFileRequest),
+        /// Remove a file by path.
+        Unlink(UnlinkFileRequest),
+        /// Create a directory by path.
+        Mkdir(MkdirFileRequest),
+        /// Remove a directory by path.
+        Rmdir(RmdirFileRequest),
+        /// Read a symbolic link's target by path.
+        ReadLink(ReadLinkFileRequest),
+        /// Resolve a path to its physical location.
+        ResolvePath(ResolvePathFileRequest),
+        /// Create a symbolic link with an opaque target.
+        Symlink(SymlinkFileRequest),
+        /// Rename a file or directory by path.
+        Rename(RenameFileRequest),
+        /// Obtain the host shared object holding an open file's contents.
+        Map(MapFileRequest),
+        /// Mount a fresh tmpfs at a directory path.
+        Mount(MountFileRequest),
+    }
+}
+
+wire_enum! {
+    /// Broker-owned fs response.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum FileResponse {
+        /// Open response.
+        Open(OpenFileResponse),
+        /// Read response.
+        Read(ReadFileResponse),
+        /// Write response.
+        Write(WriteFileResponse),
+        /// Seek response.
+        Seek(SeekFileResponse),
+        /// Truncate completed.
+        Truncate,
+        /// Advisory lock operation completed.
+        Lock,
+        /// Directory-read response.
+        ReadDirectory(ReadDirectoryResponse),
+        /// Path-status response.
+        PathStatus(FileStatus),
+        /// Handle-status response.
+        HandleStatus(FileStatus),
+        /// Timestamp updates completed.
+        SetTimes,
+        /// Handle-path response.
+        HandlePath(FilePathResponse),
+        /// Map response.
+        Map(MapFileResponse),
+        /// Terminal query response.
+        IsTerminal(bool),
+        /// Terminal-control response.
+        TerminalControl(TerminalResponse),
+        /// Mode change completed.
+        Chmod,
+        /// Ownership change completed.
+        Chown,
+        /// File removal completed.
+        Unlink,
+        /// Directory creation completed.
+        Mkdir,
+        /// Directory removal completed.
+        Rmdir,
+        /// Symbolic-link target response.
+        ReadLink(FilePathResponse),
+        /// Resolved-path response.
+        ResolvePath(FilePathResponse),
+        /// Symbolic-link creation completed.
+        Symlink,
+        /// Rename completed.
+        Rename,
+        /// File operation failed with a guest-visible error.
+        Failed(FileError),
+        /// Tmpfs mount completed.
+        Mount,
+    }
+}
+
+wire_enum! {
+    /// Broker-initiated asynchronous notification.
     ///
-    /// Timers are clock-agnostic: they count relative time on the broker's
-    /// monotonic clock, and guests convert their own clocks and absolute
-    /// expiration times before arming them.
-    Create(CreateTimerRequest),
-    /// Arm or disarm a timer.
-    Set(SetTimerRequest),
-    /// Read a timer's current schedule.
-    Get(GetTimerRequest),
-    /// Consume a timer's pending expirations.
-    Read(ReadTimerRequest),
+    /// Notifications are level-triggered snapshots and may be coalesced or
+    /// duplicated by a transport. Local waiters must treat them as wakeups to
+    /// re-check authoritative state, not as ordered state transitions.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum BrokerNotification {
+        /// Readiness changed or should be re-checked for a broker-owned object.
+        Readiness(ReadinessNotification),
+    }
 }
 
-/// Broker-owned readiness queue request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReadinessQueueRequest {
-    /// Create an empty readiness queue.
-    Create,
-    /// Add an entry watching another object.
-    Add(AddReadinessQueueEntryRequest),
-    /// Replace an entry's interest.
-    Modify(ModifyReadinessQueueEntryRequest),
-    /// Remove an entry.
-    Remove(RemoveReadinessQueueEntryRequest),
-    /// Take ready events without waiting.
-    TakeReady(TakeReadyRequest),
-}
-
-/// Request about futexes in shared memory.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SharedFutexRequest {
-    /// Issue a signed ID for memory the calling process creates.
-    IssueMemoryId,
-    /// Create an idle futex waiter.
-    CreateWaiter,
-    /// Arm a futex waiter on a futex word.
-    Arm(FutexArmRequest),
-    /// Wake waiters on a futex word.
-    Wake(FutexWakeRequest),
-    /// Disarm a futex waiter, reporting whether it was woken.
-    Disarm(FutexDisarmRequest),
-}
-
-/// Request about the caller's threads.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ThreadRequest {
-    /// Create another thread in the caller.
-    Create,
-    /// Record a thread's exit after its local teardown completes.
-    Exit(ThreadId),
-}
-
-/// Request about the caller's pending child, its own exit, and the process
-/// tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProcessRequest {
-    /// Create a pending child process and its initial thread.
-    ///
-    /// The broker returns `UnsupportedOperation` if the request asks for a new
-    /// PID namespace while the caller's children already go to another one,
-    /// `PolicyDenied` if process creation is disabled or the request asks for
-    /// a sibling of a process without a parent, `ResourceExhausted` at a
-    /// process limit or a namespace count or nesting limit, and `PeerClosed`
-    /// if the child's namespace has ended.
-    AllocateChild(AllocateChildRequest),
-    /// Duplicate object references into this process's pending child.
-    DuplicateObjectsToChild(DuplicateObjectsToChildRequest),
-    /// Write bytes into this process's pending child's memory image.
-    WriteChildMemory(WriteChildMemoryRequest),
-    /// Start one pending child process.
-    StartChild(StartChildProcessRequest),
-    /// Start one pending child in an already-created platform runner.
-    StartChildWithExistingRunner(StartChildWithExistingRunnerRequest),
-    /// Record the exit of one pending child process that never started.
-    ExitChild(ExitChildProcessRequest),
-    /// Discard one pending child process that never started, as if it had
-    /// never been created, except that this process learns it was removed.
-    CancelChild(ProcessId),
-    /// Report this process's final termination status before its runner exits.
-    ///
-    /// The status is published once the runner exits, replacing the status the
-    /// broker would otherwise infer from the runner's host termination.
-    ReportExitStatus(ProcessExitStatus),
-    /// Set whether this process retains its children's exits until it
-    /// collects them, rather than discarding each when the child terminates.
-    ///
-    /// Each child applies the setting in effect when it terminates, so a change
-    /// does not affect children that already terminated.
-    SetChildExitRetention(bool),
-    /// Set whether this process adopts the orphaned children of its exiting
-    /// descendants.
-    ///
-    /// When a process exits, its children move to its nearest running ancestor
-    /// that adopts orphans, and otherwise have their exits discarded.
-    SetOrphanAdoption(bool),
-    /// Collect the exit of one exited child matching the selector, oldest
-    /// first, without blocking, removing the child from the process tree.
-    ///
-    /// The broker returns `WouldBlock` if only live children match, and
-    /// `UnknownObject` if none does. Each matching child's exit or removal is
-    /// then reported through the caller's signals.
-    CollectChildExit(ChildSelector),
-    /// Read a process's place in the process tree and its initial thread.
-    ///
-    /// The broker returns `UnknownObject` if no such process exists.
-    GetInfo(ProcessId),
-    /// Read which process a thread belongs to.
-    ///
-    /// The broker returns `UnknownObject` if no such thread exists.
-    GetThreadInfo(ThreadId),
-    /// Create the control connection through which a native clone of this process's runner
-    /// will associate as this process's pending child, before starting it with
-    /// [`Self::StartChildWithExistingRunner`].
-    ///
-    /// The broker returns `UnsupportedOperation` if it cannot create such connections, and
-    /// `UnknownObject` if this process has no such pending child.
-    CreateChildConnection(ProcessId),
-    /// Read the CPU time used by the children whose exits this process
-    /// collected, including the time they collected from their own children.
-    GetChildrenCpuTime,
-    /// Read one resource limit of the caller or of its pending child.
-    ///
-    /// The broker returns `UnknownObject` if the process is neither.
-    GetResourceLimit(GetResourceLimitRequest),
-    /// Replace one resource limit of the caller or of its pending child,
-    /// returning the previous limit.
-    ///
-    /// The broker returns `UnknownObject` if the process is neither, and
-    /// `PolicyDenied` if the new hard limit exceeds the current one.
-    SetResourceLimit(SetResourceLimitRequest),
-    /// Make the children the caller creates from now on go into a new PID
-    /// namespace with these options, nested in the caller's. The first of
-    /// them becomes the namespace's first process.
-    ///
-    /// The broker returns `UnsupportedOperation` if the caller's children
-    /// already go to another PID namespace, and `ResourceExhausted` at a
-    /// namespace count or nesting limit.
-    CreateChildrenPidNamespace(PidNamespaceOptions),
-    /// Read the host names of the caller or of its pending child, both from
-    /// one moment.
-    ///
-    /// The broker returns `UnknownObject` if the process is neither.
-    GetHostNames(GetHostNamesRequest),
-    /// Replace one of the host names of the caller or of its pending child,
-    /// for every process that shares them.
-    ///
-    /// The broker returns `UnknownObject` if the process is neither.
-    SetHostName(SetHostNameRequest),
-    /// Replace the host names of the caller or of its pending child with a
-    /// copy that no other process shares.
-    ///
-    /// The broker returns `UnknownObject` if the process is neither.
-    CopyHostNames(ProcessId),
-    /// Open a handle to a process in the caller's PID namespace, including a
-    /// pending child.
-    ///
-    /// The handle refers to the process itself rather than to its ID: it never
-    /// refers to a later process with the same ID, and it keeps neither the
-    /// process nor its ID from going away. It reports `READ` once the
-    /// process's exit becomes observable, and `READ` and `CLOSED` once the
-    /// process is released (its exit was collected or discarded, or it never
-    /// started) or otherwise leaves the broker.
-    ///
-    /// The caller can signal the process through the handle
-    /// ([`SignalTarget::ProcessHandle`](crate::signal::SignalTarget::ProcessHandle))
-    /// and, if the process is its child, collect its exit through it
-    /// ([`ChildSelector::ProcessHandle`]).
-    ///
-    /// The broker returns `UnknownObject` if no such process exists or it was
-    /// released, and `UnsupportedOperation` if the flags are outside
-    /// [`FileOpenFlags::STATUS`](crate::fs::FileOpenFlags::STATUS).
-    OpenProcessHandle(OpenProcessHandleRequest),
-    /// Read the parent-exit signal of the caller or of its pending child, or
-    /// zero for none.
-    ///
-    /// The broker returns `UnknownObject` if the process is neither.
-    GetParentExitSignal(ProcessId),
-    /// Set the parent-exit signal of the caller or of its pending child: the
-    /// signal it receives from its exiting parent once it moves to a new
-    /// parent or to none.
-    ///
-    /// The broker returns `UnsupportedOperation` for a signal above
-    /// [`MAX_SIGNAL`](crate::signal::MAX_SIGNAL), and `UnknownObject` if the
-    /// process is neither.
-    SetParentExitSignal(SetParentExitSignalRequest),
-}
-
-/// Request about process groups and sessions.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProcessGroupRequest {
-    /// Move a process into a process group.
-    Set(SetProcessGroupRequest),
-    /// Make a process the leader of a new session and of a new process group
-    /// in it.
-    ///
-    /// The process must be the caller or its pending child, or the broker
-    /// returns `UnknownObject`. The broker returns `PolicyDenied` if a process
-    /// group already has the process's ID.
-    CreateSession(ProcessId),
-    /// Read the foreground process group of the caller's controlling terminal,
-    /// given an open handle to it, or of any session's controlling terminal,
-    /// given an open handle to its pseudo-terminal manager.
-    ///
-    /// Fails with [`ProcessGroupError::NotControllingTerminal`] if the handle
-    /// refers to no such terminal.
-    GetForegroundGroup(ObjectHandle),
-    /// Make a process group the foreground group of the caller's controlling
-    /// terminal.
-    ///
-    /// Fails with [`ProcessGroupError::NotControllingTerminal`] if the handle
-    /// does not refer to the caller's controlling terminal, then with
-    /// [`ProcessGroupError::NoSuchProcessGroup`] if no process is in the group,
-    /// and then with [`ProcessGroupError::NotInSession`] if the group is in
-    /// another session.
-    SetForegroundGroup(SetForegroundGroupRequest),
-    /// Make a terminal the controlling terminal of the session that a process
-    /// leads.
-    SetControllingTerminal(SetControllingTerminalRequest),
-}
-
-/// Request about signals sent between broker processes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SignalRequest {
-    /// Open the caller's signals.
-    ///
-    /// Signals sent to the caller stay pending until it takes them, including
-    /// signals sent before it opens them, except that a signal sent to one of
-    /// its threads is dropped if that thread ends first. A process has at most
-    /// one open signals handle; the broker returns `ResourceExhausted` for
-    /// another.
-    Open,
-    /// Send a signal to processes or a thread.
-    Send(SendSignalRequest),
-    /// Take the caller's lowest-numbered pending signal, or else, for one of its
-    /// threads in no particular order, that thread's lowest-numbered pending
-    /// signal, then its pending child exit, and then its pending child removal.
-    Take(TakeSignalRequest),
-}
-
-/// Broker-owned pipe object request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PipeRequest {
-    /// Create a broker-owned byte pipe.
-    Create(CreatePipeRequest),
-    /// Read bytes from a pipe.
-    Read(ReadPipeRequest),
-    /// Write bytes to a pipe.
-    Write(WritePipeRequest),
-}
-
-/// Broker-owned Unix socket request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UnixSocketRequest {
-    /// Create an unbound, unconnected socket.
-    Create(CreateUnixSocketRequest),
-    /// Create a pair of connected unnamed sockets.
-    CreatePair(CreateUnixSocketRequest),
-    /// Bind a socket to a name.
-    Bind(BindUnixSocketRequest),
-    /// Make a bound stream or sequenced-packet socket accept connections.
-    Listen(ListenUnixSocketRequest),
-    /// Connect a socket to a named socket.
-    Connect(ConnectUnixSocketRequest),
-    /// Accept one pending connection.
-    Accept(AcceptUnixSocketRequest),
-    /// Send bytes staged in shared memory.
-    Send(SendUnixSocketRequest),
-    /// Receive bytes into shared memory.
-    Receive(ReceiveUnixSocketRequest),
-    /// Shut down one or both directions.
-    Shutdown(ShutdownUnixSocketRequest),
-    /// Read the name of a socket or its peer.
-    GetName(GetUnixSocketNameRequest),
-    /// Store one socket option.
-    SetOption(SetUnixSocketOptionRequest),
-    /// Read one socket option.
-    GetOption(GetUnixSocketOptionRequest),
-}
-
-/// Broker-owned socket object request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SocketRequest {
-    /// Create a broker-owned socket.
-    Create(CreateSocketRequest),
-    /// Connect a socket to a remote address.
-    Connect(ConnectSocketRequest),
-    /// Bind a socket to a local address.
-    Bind(BindSocketRequest),
-    /// Make a bound socket listen for connections.
-    Listen(ListenSocketRequest),
-    /// Accept one pending connection.
-    Accept(AcceptSocketRequest),
-    /// Send bytes staged in shared memory.
-    Send(SendSocketRequest),
-    /// Send one complete datagram staged in shared memory.
-    SendTo(SendToSocketRequest),
-    /// Receive bytes into shared memory.
-    Receive(ReceiveSocketRequest),
-    /// Receive one datagram into shared memory.
-    ReceiveFrom(ReceiveFromSocketRequest),
-    /// Shut down one or both directions.
-    Shutdown(ShutdownSocketRequest),
-    /// Set a socket option.
-    SetOption(SetSocketOptionRequest),
-    /// Read a socket option.
-    GetOption(GetSocketOptionRequest),
-    /// Check the progress of a connection attempt.
-    CheckConnect(CheckConnectSocketRequest),
-    /// Read the local or peer address.
-    GetName(GetSocketNameRequest),
-    /// Take the oldest pending error.
-    TakeError(TakeSocketErrorRequest),
-    /// Report an error before any already pending one.
-    SetError(SetSocketErrorRequest),
-}
-
-/// Result returned for an active broker operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BrokerResult {
-    /// Thread response family.
-    Thread(ThreadResponse),
-    /// Object close operation completed.
-    ObjectClosed,
-    /// Current readiness of a broker-owned object.
-    Readiness(ReadinessFlags),
-    /// Access mode and status flags of a broker-owned object.
-    StatusFlags(FileStatusFlags),
-    /// Status flags of a broker-owned object were changed.
-    StatusFlagsSet,
-    /// Event object response family.
-    Event(EventResponse),
-    /// Pipe object response family.
-    Pipe(PipeResponse),
-    /// Socket object response family.
-    Socket(SocketResponse),
-    /// The requested shared buffer was filled with random bytes.
-    RandomFilled,
-    /// File response family.
-    File(FileResponse),
-    /// Process response family.
-    Process(ProcessResponse),
-    /// Process group and session response family.
-    ProcessGroup(ProcessGroupResponse),
-    /// Timer object response family.
-    Timer(TimerResponse),
-    /// Signal response family.
-    Signal(SignalResponse),
-    /// Unix socket response family.
-    UnixSocket(UnixSocketResponse),
-    /// Readiness queue response family.
-    ReadinessQueue(ReadinessQueueResponse),
-    /// Futex in shared memory response family.
-    SharedFutex(SharedFutexResponse),
-    /// Vsock socket response family.
-    VsockSocket(VsockSocketResponse),
-    /// Operation failed with an ABI-neutral broker error.
-    Error(ErrorCode),
-}
-
-/// Response sent over an active broker control channel.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BrokerResponse {
-    /// Correlation identifier copied from the request.
-    pub request_id: RequestId,
-    /// Result of the requested broker operation.
-    pub result: BrokerResult,
-}
-
-/// Broker-owned event object response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EventResponse {
-    /// Create operation response.
-    Create(CreateEventResponse),
-    /// Add operation response.
-    Add(AddEventResponse),
-    /// Consume operation response.
-    Consume(ConsumeEventResponse),
-}
-
-/// Broker-owned timer object response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TimerResponse {
-    /// Create operation response.
-    Create(CreateTimerResponse),
-    /// Set operation response.
-    Set(SetTimerResponse),
-    /// Get operation response.
-    Get(GetTimerResponse),
-    /// Read operation response.
-    Read(ReadTimerResponse),
-}
-
-/// Response about futexes in shared memory.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SharedFutexResponse {
-    /// Shared memory ID issue operation response.
-    IssueMemoryId(IssueMemoryIdResponse),
-    /// Futex waiter create operation response.
-    CreateWaiter(CreateFutexWaiterResponse),
-    /// Futex arm operation completed.
-    Arm,
-    /// Futex wake operation response.
-    Wake(FutexWakeResponse),
-    /// Futex disarm operation response.
-    Disarm(FutexDisarmResponse),
-}
-
-/// Broker-owned readiness queue response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReadinessQueueResponse {
-    /// Create operation response.
-    Create(CreateReadinessQueueResponse),
-    /// Add operation completed.
-    Add,
-    /// Modify operation completed.
-    Modify,
-    /// Remove operation completed.
-    Remove,
-    /// Take-ready operation response.
-    TakeReady(TakeReadyResponse),
-    /// The operation failed in a way the guest ABI reports.
-    ///
-    /// Waiting, resource, and request-validation failures use
-    /// [`BrokerResult::Error`] instead.
-    Failed(ReadinessQueueError),
-}
-
-/// Response to a thread request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ThreadResponse {
-    /// The thread was created.
-    Create(ThreadId),
-    /// The thread's exit was recorded.
-    Exit,
-}
-
-/// Response to a process request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProcessResponse {
-    /// The pending child was created.
-    AllocateChild(ProcessIdentity),
-    /// Object references were duplicated into the pending child, whose handles
-    /// replaced the request's handles in its shared buffer.
-    DuplicateObjectsToChild,
-    /// Bytes were written into the pending child's memory image.
-    WriteChildMemory,
-    /// The pending child established its broker association.
-    StartChild,
-    /// The pending child established its broker association in an existing runner.
-    StartChildWithExistingRunner,
-    /// The pending child's exit was recorded.
-    ExitChild,
-    /// The pending child was discarded.
-    CancelChild,
-    /// This process's final termination status was recorded.
-    ReportExitStatus,
-    /// This process's child exit retention setting was recorded.
-    SetChildExitRetention,
-    /// This process's orphan-adoption setting was recorded.
-    SetOrphanAdoption,
-    /// An exited child's exit was collected.
-    CollectChildExit(ChildExit),
-    /// A process's place in the process tree and its initial thread.
-    GetInfo(ProcessInfo),
-    /// The process a thread belongs to.
-    GetThreadInfo(ThreadInfo),
-    /// The child's control connection was created, and the runner's end delivered under this
-    /// token.
-    CreateChildConnection(SharedObjectToken),
-    /// The CPU time used by the children whose exits this process collected.
-    GetChildrenCpuTime(CpuTime),
-    /// The process's limit on the resource.
-    GetResourceLimit(ResourceLimit),
-    /// The limit was replaced; this is the previous one.
-    SetResourceLimit(ResourceLimit),
-    /// The children the caller creates from now on go into the new PID
-    /// namespace.
-    CreateChildrenPidNamespace,
-    /// The host names were written to the request's buffer, with these sizes.
-    GetHostNames(HostNameSizes),
-    /// The name was replaced.
-    SetHostName,
-    /// The process has its own copy of the host names.
-    CopyHostNames,
-    /// The process handle was opened.
-    OpenProcessHandle(ObjectHandle),
-    /// The process's parent-exit signal, or zero for none.
-    GetParentExitSignal(u32),
-    /// The parent-exit signal was set.
-    SetParentExitSignal,
-}
-
-/// Response to a process group request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProcessGroupResponse {
-    /// The process moved into the group.
-    Set,
-    /// The session was created.
-    CreateSession,
-    /// The foreground process group, in the terminal's session.
-    GetForegroundGroup(ProcessGroupMembership),
-    /// The foreground process group changed.
-    SetForegroundGroup,
-    /// The terminal controls the process's session.
-    SetControllingTerminal,
-    /// A terminal operation failed in a way the guest ABI reports.
-    ///
-    /// Other failures use [`BrokerResult::Error`].
-    Failed(ProcessGroupError),
-}
-
-/// Response to a signal request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SignalResponse {
-    /// Open operation response.
-    Open(OpenSignalsResponse),
-    /// The signal was sent.
-    Sent,
-    /// Take operation response.
-    Take(SignalEvent),
-}
-
-/// Broker-owned pipe object response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PipeResponse {
-    /// Create operation response.
-    Create(CreatePipeResponse),
-    /// Read operation response.
-    Read(ReadPipeResponse),
-    /// Write operation response.
-    Write(WritePipeResponse),
-}
-
-/// Broker-owned socket object response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SocketResponse {
-    /// Create operation response.
-    Create(CreateSocketResponse),
-    /// Connect operation response.
-    Connect(ConnectSocketResponse),
-    /// Bind operation response.
-    Bind(BindSocketResponse),
-    /// Listen operation response.
-    Listen(ListenSocketResponse),
-    /// Accept operation response.
-    Accept(AcceptSocketResponse),
-    /// Send operation response.
-    Send(SendSocketResponse),
-    /// Datagram send operation response.
-    SendTo(SendToSocketResponse),
-    /// Receive operation response.
-    Receive(ReceiveSocketResponse),
-    /// Datagram receive operation response.
-    ReceiveFrom(ReceiveFromSocketResponse),
-    /// Shutdown operation completed.
-    Shutdown,
-    /// Socket option was updated.
-    SetOption,
-    /// Socket option response.
-    GetOption(GetSocketOptionResponse),
-    /// Check-connect operation response.
-    CheckConnect(ConnectSocketResponse),
-    /// Address operation response.
-    GetName(GetSocketNameResponse),
-    /// Take-error operation response.
-    TakeError(TakeSocketErrorResponse),
-    /// Socket error was reported.
-    SetError,
-    /// A socket operation failed with an ordinary socket error.
-    ///
-    /// Broker and request-validation failures use [`BrokerResult::Error`]
-    /// instead.
-    Failed(SocketError),
-}
-
-/// Broker-owned Unix socket response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UnixSocketResponse {
-    /// Create operation response.
-    Create(CreateUnixSocketResponse),
-    /// Pair create operation response.
-    CreatePair(CreateUnixSocketPairResponse),
-    /// Bind operation completed.
-    Bind,
-    /// Listen operation completed.
-    Listen,
-    /// Connect operation completed.
-    Connect,
-    /// Accept operation response.
-    Accept(AcceptUnixSocketResponse),
-    /// Send operation response.
-    Send(SendUnixSocketResponse),
-    /// Receive operation response.
-    Receive(ReceiveUnixSocketResponse),
-    /// Shutdown operation completed.
-    Shutdown,
-    /// Name operation response.
-    GetName(GetUnixSocketNameResponse),
-    /// Option was stored.
-    SetOption,
-    /// Option read response.
-    GetOption(GetUnixSocketOptionResponse),
-    /// The operation failed in a way the guest ABI reports.
-    ///
-    /// Waiting, resource, and request-validation failures use
-    /// [`BrokerResult::Error`] instead.
-    Failed(UnixSocketError),
-}
-
-/// Broker-owned vsock socket request.
-///
-/// See [`crate::vsock_socket`] for how a connect completes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VsockSocketRequest {
-    /// Create an unbound, unconnected socket.
-    Create(CreateVsockSocketRequest),
-    /// Bind a socket to a local address.
-    Bind(BindVsockSocketRequest),
-    /// Make a bound socket listen for the host's connections.
-    Listen(ListenSocketRequest),
-    /// Accept one pending connection.
-    Accept(AcceptSocketRequest),
-    /// Start connecting a socket, or report the attempt in progress.
-    Connect(ConnectVsockSocketRequest),
-    /// Report a blocking connect's progress, leaving a failure pending
-    /// unless it timed out.
-    CheckConnect(CheckConnectSocketRequest),
-    /// Cancel a connect in progress, as an interrupted blocking connect does.
-    CancelConnect(CheckConnectSocketRequest),
-    /// Take the pending error.
-    TakeError(TakeSocketErrorRequest),
-    /// Send bytes staged in shared memory.
-    Send(SendSocketRequest),
-    /// Receive bytes into shared memory.
-    Receive(ReceiveVsockSocketRequest),
-    /// Shut down one or both directions.
-    Shutdown(ShutdownSocketRequest),
-    /// Read the local or peer address.
-    GetName(GetSocketNameRequest),
-}
-
-/// Broker-owned vsock socket response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VsockSocketResponse {
-    /// Create operation response.
-    Create(CreateSocketResponse),
-    /// Bind operation completed.
-    Bind,
-    /// Listen operation completed.
-    Listen,
-    /// Accept operation response.
-    Accept(AcceptVsockSocketResponse),
-    /// Connect operation response: connected, or connecting.
-    Connect(ConnectSocketResponse),
-    /// Check-connect operation response.
-    CheckConnect(ConnectSocketResponse),
-    /// Cancel operation completed.
-    CancelConnect,
-    /// Take-error operation response.
-    TakeError(TakeSocketErrorResponse),
-    /// Send operation response.
-    Send(SendSocketResponse),
-    /// Receive operation response.
-    Receive(ReceiveSocketResponse),
-    /// Shutdown operation completed.
-    Shutdown,
-    /// Address operation response.
-    GetName(GetVsockSocketNameResponse),
-    /// An ordinary socket error; broker and request-validation failures use
-    /// [`BrokerResult::Error`].
-    Failed(SocketError),
-}
-
-/// Broker-owned fs request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FileRequest {
-    /// Open or create an object.
-    Open(OpenFileRequest),
-    /// Read from an open file.
-    Read(ReadFileRequest),
-    /// Write to an open file.
-    Write(WriteFileRequest),
-    /// Reposition an open file.
-    Seek(SeekFileRequest),
-    /// Truncate an open file.
-    Truncate(TruncateFileRequest),
-    /// Attempt an advisory lock operation on an open file without waiting.
-    Lock(LockFileRequest),
-    /// Read directory entries.
-    ReadDirectory(ReadDirectoryRequest),
-    /// Read status by path.
-    PathStatus(PathFileStatusRequest),
-    /// Read status by open handle.
-    HandleStatus(HandleFileStatusRequest),
-    /// Change access and modification times by open handle.
-    SetTimes(SetTimesFileRequest),
-    /// Read the absolute path of an open file, with symbolic links resolved, as of when it was
-    /// opened.
-    HandlePath(HandleFilePathRequest),
-    /// Determine whether an open file is connected to a terminal.
-    IsTerminal(IsTerminalFileRequest),
-    /// Control the shared terminal backing an open file.
-    TerminalControl(TerminalControlFileRequest),
-    /// Change mode bits by path.
-    Chmod(ChmodFileRequest),
-    /// Change ownership by path.
-    Chown(ChownFileRequest),
-    /// Remove a file by path.
-    Unlink(UnlinkFileRequest),
-    /// Create a directory by path.
-    Mkdir(MkdirFileRequest),
-    /// Remove a directory by path.
-    Rmdir(RmdirFileRequest),
-    /// Read a symbolic link's target by path.
-    ReadLink(ReadLinkFileRequest),
-    /// Resolve a path to its physical location.
-    ResolvePath(ResolvePathFileRequest),
-    /// Create a symbolic link with an opaque target.
-    Symlink(SymlinkFileRequest),
-    /// Rename a file or directory by path.
-    Rename(RenameFileRequest),
-    /// Obtain the host shared object holding an open file's contents.
-    Map(MapFileRequest),
-    /// Mount a fresh tmpfs at a directory path.
-    Mount(MountFileRequest),
-}
-
-/// Broker-owned fs response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FileResponse {
-    /// Open response.
-    Open(OpenFileResponse),
-    /// Read response.
-    Read(ReadFileResponse),
-    /// Write response.
-    Write(WriteFileResponse),
-    /// Seek response.
-    Seek(SeekFileResponse),
-    /// Truncate completed.
-    Truncate,
-    /// Advisory lock operation completed.
-    Lock,
-    /// Directory-read response.
-    ReadDirectory(ReadDirectoryResponse),
-    /// Path-status response.
-    PathStatus(FileStatus),
-    /// Handle-status response.
-    HandleStatus(FileStatus),
-    /// Timestamp updates completed.
-    SetTimes,
-    /// Handle-path response.
-    HandlePath(FilePathResponse),
-    /// Map response.
-    Map(MapFileResponse),
-    /// Terminal query response.
-    IsTerminal(bool),
-    /// Terminal-control response.
-    TerminalControl(TerminalResponse),
-    /// Mode change completed.
-    Chmod,
-    /// Ownership change completed.
-    Chown,
-    /// File removal completed.
-    Unlink,
-    /// Directory creation completed.
-    Mkdir,
-    /// Directory removal completed.
-    Rmdir,
-    /// Symbolic-link target response.
-    ReadLink(FilePathResponse),
-    /// Resolved-path response.
-    ResolvePath(FilePathResponse),
-    /// Symbolic-link creation completed.
-    Symlink,
-    /// Rename completed.
-    Rename,
-    /// Tmpfs mount completed.
-    Mount,
-    /// File operation failed with a guest-visible error.
-    Failed(FileError),
-}
-
-/// Broker-initiated asynchronous notification.
-///
-/// Notifications are level-triggered snapshots and may be coalesced or
-/// duplicated by a transport. Local waiters must treat them as wakeups to
-/// re-check authoritative state, not as ordered state transitions.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BrokerNotification {
-    /// Readiness changed or should be re-checked for a broker-owned object.
-    Readiness(ReadinessNotification),
-}
-
-/// Readiness notification for a broker-owned object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadinessNotification {
-    /// Broker object handle.
-    pub handle: ObjectHandle,
-    /// Current broker-authoritative readiness snapshot.
-    pub readiness: ReadinessFlags,
+wire_struct! {
+    /// Readiness notification for a broker-owned object.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReadinessNotification {
+        /// Broker object handle.
+        pub handle: ObjectHandle,
+        /// Current broker-authoritative readiness snapshot.
+        pub readiness: ReadinessFlags,
+    }
 }

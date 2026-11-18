@@ -65,70 +65,86 @@ impl SharedMemoryId {
     }
 }
 
-/// Response to a request to issue a shared memory ID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IssueMemoryIdResponse {
-    /// ID of the new memory, signed by the broker.
-    pub memory: SharedMemoryId,
+wire_struct! {
+    /// Response to a request to issue a shared memory ID.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct IssueMemoryIdResponse {
+        /// ID of the new memory, signed by the broker.
+        pub memory: SharedMemoryId,
+    }
 }
 
-/// A futex word in shared memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SharedFutexKey {
-    /// Memory holding the futex word.
-    pub memory: SharedMemoryId,
-    /// Byte offset of the futex word in the memory, a multiple of [`FUTEX_WORD_SIZE`].
-    pub offset: u64,
+wire_struct! {
+    /// A futex word in shared memory.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct SharedFutexKey {
+        /// Memory holding the futex word.
+        pub memory: SharedMemoryId,
+        /// Byte offset of the futex word in the memory, a multiple of [`FUTEX_WORD_SIZE`].
+        pub offset: u64,
+    }
 }
 
-/// Response to a futex waiter create request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateFutexWaiterResponse {
-    /// Created futex waiter handle.
-    pub handle: ObjectHandle,
+wire_struct! {
+    /// Response to a futex waiter create request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreateFutexWaiterResponse {
+        /// Created futex waiter handle.
+        pub handle: ObjectHandle,
+    }
 }
 
-/// Request to arm a futex waiter on a futex word in shared memory.
-///
-/// The broker does not read the futex word; the caller compares it after arming.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FutexArmRequest {
-    /// Futex word to wait on.
-    pub key: SharedFutexKey,
-    /// Nonzero mask a wake's mask must intersect to select the waiter.
-    pub bitset: u32,
-    /// Futex waiter to arm, which must be idle: never armed, or disarmed since it was last armed.
-    pub waiter: ObjectHandle,
+wire_struct! {
+    /// Request to arm a futex waiter on a futex word in shared memory.
+    ///
+    /// The broker does not read the futex word; the caller compares it after arming.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FutexArmRequest {
+        /// Futex word to wait on.
+        pub key: SharedFutexKey,
+        /// Nonzero mask a wake's mask must intersect to select the waiter.
+        pub bitset: u32,
+        /// Futex waiter to arm, which must be idle: never armed, or disarmed since it was last armed.
+        pub waiter: ObjectHandle,
+    }
 }
 
-/// Request to wake waiters on a futex word in shared memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FutexWakeRequest {
-    /// Futex word whose waiters to wake.
-    pub key: SharedFutexKey,
-    /// Maximum number of waiters to wake.
-    pub count: u32,
-    /// Nonzero mask selecting the waiters whose masks intersect it.
-    pub bitset: u32,
+wire_struct! {
+    /// Request to wake waiters on a futex word in shared memory.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FutexWakeRequest {
+        /// Futex word whose waiters to wake.
+        pub key: SharedFutexKey,
+        /// Maximum number of waiters to wake.
+        pub count: u32,
+        /// Nonzero mask selecting the waiters whose masks intersect it.
+        pub bitset: u32,
+    }
 }
 
-/// Response to a futex wake request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FutexWakeResponse {
-    /// Number of waiters woken.
-    pub woken: u32,
+wire_struct! {
+    /// Response to a futex wake request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FutexWakeResponse {
+        /// Number of waiters woken.
+        pub woken: u32,
+    }
 }
 
-/// Request to disarm a futex waiter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FutexDisarmRequest {
-    /// Futex waiter to disarm.
-    pub waiter: ObjectHandle,
+wire_struct! {
+    /// Request to disarm a futex waiter.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FutexDisarmRequest {
+        /// Futex waiter to disarm.
+        pub waiter: ObjectHandle,
+    }
 }
 
-/// Response to a futex disarm request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FutexDisarmResponse {
-    /// Whether a wake selected the waiter since it was armed.
-    pub woken: bool,
+wire_struct! {
+    /// Response to a futex disarm request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FutexDisarmResponse {
+        /// Whether a wake selected the waiter since it was armed.
+        pub woken: bool,
+    }
 }

@@ -213,7 +213,7 @@ fn host_failure_preempts_queued_and_decoded_requests_but_peer_close_drains() {
     let (mut lane, _shutdown, mut local) = activate_host_lane();
     write_payload(
         &mut local.lanes[0].request_producer,
-        &encode_request(request(1)),
+        &encode_request(&request(1)),
     );
     lane.association
         .fail(Error::new(ErrorKind::TimedOut, "test failure"))
@@ -223,7 +223,7 @@ fn host_failure_preempts_queued_and_decoded_requests_but_peer_close_drains() {
     let (mut lane, _shutdown, mut local) = activate_host_lane();
     write_payload(
         &mut local.lanes[0].request_producer,
-        &encode_request(request(2)),
+        &encode_request(&request(2)),
     );
     assert!(matches!(
         lane.lane.request_consumer.try_read(decode_request).unwrap(),
@@ -243,7 +243,7 @@ fn host_failure_preempts_queued_and_decoded_requests_but_peer_close_drains() {
     let (mut lane, _shutdown, mut local) = activate_host_lane();
     write_payload(
         &mut local.lanes[0].request_producer,
-        &encode_request(request(3)),
+        &encode_request(&request(3)),
     );
     lane.association.peer_closed();
     assert!(matches!(

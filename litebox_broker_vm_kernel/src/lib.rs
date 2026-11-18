@@ -644,7 +644,7 @@ impl Association {
             }));
         }
         let response = setup.response.ok_or(Status::Denied)?;
-        frame(&wire::encode_handshake_response(response))
+        frame(&wire::encode_handshake_response(&response))
     }
 
     /// [`Futex`](litebox_common_vm_abi::CallId::Futex) on the `u32` at
@@ -930,7 +930,7 @@ impl Active {
                         handle_process_operation(launcher, parent, operation, shared_buffers)
                     },
                     |r| {
-                        response = Some(wire::encode_response(r.clone()));
+                        response = Some(wire::encode_response(r));
                         Ok::<(), Infallible>(())
                     },
                 )

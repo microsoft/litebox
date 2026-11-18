@@ -47,60 +47,64 @@ bitflags::bitflags! {
     }
 }
 
-/// Named editing characters. Zero disables a character.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ControlCharacters {
-    /// Request an interrupt action.
-    pub interrupt: u8,
-    /// Request a quit action.
-    pub quit: u8,
-    /// Erase the preceding character in a canonical line.
-    pub erase: u8,
-    /// Erase the current canonical line.
-    pub kill: u8,
-    /// End the current record without appending a byte.
-    pub end_of_file: u8,
-    /// Additional canonical record delimiter.
-    pub end_of_line: u8,
-    /// Additional delimiter enabled by extended editing.
-    pub end_of_line2: u8,
-    /// Resume transport output.
-    pub start: u8,
-    /// Stop transport output.
-    pub stop: u8,
-    /// Erase the preceding word.
-    pub word_erase: u8,
-    /// Quote the next input character.
-    pub literal_next: u8,
-    /// Echo the current editable line again.
-    pub reprint: u8,
+wire_struct! {
+    /// Named editing characters. Zero disables a character.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ControlCharacters {
+        /// Request an interrupt action.
+        pub interrupt: u8,
+        /// Request a quit action.
+        pub quit: u8,
+        /// Erase the preceding character in a canonical line.
+        pub erase: u8,
+        /// Erase the current canonical line.
+        pub kill: u8,
+        /// End the current record without appending a byte.
+        pub end_of_file: u8,
+        /// Additional canonical record delimiter.
+        pub end_of_line: u8,
+        /// Additional delimiter enabled by extended editing.
+        pub end_of_line2: u8,
+        /// Resume transport output.
+        pub start: u8,
+        /// Stop transport output.
+        pub stop: u8,
+        /// Erase the preceding word.
+        pub word_erase: u8,
+        /// Quote the next input character.
+        pub literal_next: u8,
+        /// Echo the current editable line again.
+        pub reprint: u8,
+    }
 }
 
 /// Size of [`TerminalSettings::guest_attributes`].
 pub const GUEST_ATTRIBUTES_LEN: usize = 32;
 
-/// Settings shared by every descriptor referring to one terminal.
-///
-/// This interface supports canonical reads and immediate or one-byte
-/// noncanonical reads. Timed reads are not emulated; shims must reject
-/// requests that need them rather than silently accepting them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TerminalSettings {
-    /// Incoming byte transformations and flow control.
-    pub input: InputFlags,
-    /// Outgoing byte transformations.
-    pub output: OutputFlags,
-    /// Line editing, echo, and action generation.
-    pub local: LocalFlags,
-    /// Named control characters, independent of guest array indices.
-    pub characters: ControlCharacters,
-    /// Bytes a noncanonical read waits for: zero permits an empty read and one
-    /// waits for input. Canonical reads ignore it.
-    pub minimum_read: u8,
-    /// Guest-defined state that the terminal stores and reports but never
-    /// interprets, such as settings with no effect on a virtual terminal. A new
-    /// terminal starts with zeros, so shims encode it relative to their defaults.
-    pub guest_attributes: [u8; GUEST_ATTRIBUTES_LEN],
+wire_struct! {
+    /// Settings shared by every descriptor referring to one terminal.
+    ///
+    /// This interface supports canonical reads and immediate or one-byte
+    /// noncanonical reads. Timed reads are not emulated; shims must reject
+    /// requests that need them rather than silently accepting them.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TerminalSettings {
+        /// Incoming byte transformations and flow control.
+        pub input: InputFlags,
+        /// Outgoing byte transformations.
+        pub output: OutputFlags,
+        /// Line editing, echo, and action generation.
+        pub local: LocalFlags,
+        /// Named control characters, independent of guest array indices.
+        pub characters: ControlCharacters,
+        /// Bytes a noncanonical read waits for: zero permits an empty read and one
+        /// waits for input. Canonical reads ignore it.
+        pub minimum_read: u8,
+        /// Guest-defined state that the terminal stores and reports but never
+        /// interprets, such as settings with no effect on a virtual terminal. A new
+        /// terminal starts with zeros, so shims encode it relative to their defaults.
+        pub guest_attributes: [u8; GUEST_ATTRIBUTES_LEN],
+    }
 }
 
 impl TerminalSettings {
@@ -147,79 +151,87 @@ impl Default for TerminalSettings {
     }
 }
 
-/// Terminal dimensions, independent of a guest's structure layout.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WindowSize {
-    /// Text rows.
-    pub rows: u16,
-    /// Text columns.
-    pub columns: u16,
-    /// Horizontal pixel dimension, or zero if unknown.
-    pub x_pixels: u16,
-    /// Vertical pixel dimension, or zero if unknown.
-    pub y_pixels: u16,
+wire_struct! {
+    /// Terminal dimensions, independent of a guest's structure layout.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct WindowSize {
+        /// Text rows.
+        pub rows: u16,
+        /// Text columns.
+        pub columns: u16,
+        /// Horizontal pixel dimension, or zero if unknown.
+        pub x_pixels: u16,
+        /// Vertical pixel dimension, or zero if unknown.
+        pub y_pixels: u16,
+    }
 }
 
-/// When to change terminal settings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChangeTiming {
-    /// Apply immediately, without changing already queued output.
-    Now,
-    /// Apply once accepted output reaches the transport.
-    AfterOutput,
-    /// Drain output, discard buffered input, and then apply.
-    AfterOutputAndFlushInput,
+wire_enum! {
+    /// When to change terminal settings.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ChangeTiming {
+        /// Apply immediately, without changing already queued output.
+        Now,
+        /// Apply once accepted output reaches the transport.
+        AfterOutput,
+        /// Drain output, discard buffered input, and then apply.
+        AfterOutputAndFlushInput,
+    }
 }
 
-/// One typed operation on the terminal backing an open file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TerminalOperation {
-    /// Read the shared settings.
-    GetSettings,
-    /// Change the shared settings.
-    SetSettings {
-        /// New settings.
-        settings: TerminalSettings,
-        /// Ordering relative to queued I/O.
-        timing: ChangeTiming,
-    },
-    /// Read transport geometry.
-    GetWindowSize,
-    /// Change transport geometry.
-    SetWindowSize(WindowSize),
-    /// Discard the selected queues; at least one direction must be selected.
-    Flush {
-        /// Discard input.
-        input: bool,
-        /// Discard output.
-        output: bool,
-    },
-    /// Wait for accepted output to reach the transport.
-    Drain,
-    /// Read the index naming a pseudo-terminal's subsidiary. Only a
-    /// pseudo-terminal manager supports this.
-    GetSubsidiaryIndex,
-    /// Read whether a pseudo-terminal's subsidiary is locked against opening.
-    /// Only a pseudo-terminal manager supports this.
-    GetSubsidiaryLock,
-    /// Lock or unlock a pseudo-terminal's subsidiary against opening. Only a
-    /// pseudo-terminal manager supports this.
-    SetSubsidiaryLock(bool),
+wire_enum! {
+    /// One typed operation on the terminal backing an open file.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TerminalOperation {
+        /// Read the shared settings.
+        GetSettings,
+        /// Change the shared settings.
+        SetSettings {
+            /// New settings.
+            settings: TerminalSettings,
+            /// Ordering relative to queued I/O.
+            timing: ChangeTiming,
+        },
+        /// Read transport geometry.
+        GetWindowSize,
+        /// Change transport geometry.
+        SetWindowSize(WindowSize),
+        /// Discard the selected queues; at least one direction must be selected.
+        Flush {
+            /// Discard input.
+            input: bool,
+            /// Discard output.
+            output: bool,
+        },
+        /// Wait for accepted output to reach the transport.
+        Drain,
+        /// Read the index naming a pseudo-terminal's subsidiary. Only a
+        /// pseudo-terminal manager supports this.
+        GetSubsidiaryIndex,
+        /// Read whether a pseudo-terminal's subsidiary is locked against opening.
+        /// Only a pseudo-terminal manager supports this.
+        GetSubsidiaryLock,
+        /// Lock or unlock a pseudo-terminal's subsidiary against opening. Only a
+        /// pseudo-terminal manager supports this.
+        SetSubsidiaryLock(bool),
+    }
 }
 
-/// Result of a terminal control.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TerminalResponse {
-    /// Current settings.
-    Settings(TerminalSettings),
-    /// Current geometry.
-    WindowSize(WindowSize),
-    /// Mutation or drain completed.
-    Done,
-    /// Index naming a pseudo-terminal's subsidiary.
-    SubsidiaryIndex(u32),
-    /// Whether a pseudo-terminal's subsidiary is locked against opening.
-    SubsidiaryLock(bool),
+wire_enum! {
+    /// Result of a terminal control.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TerminalResponse {
+        /// Current settings.
+        Settings(TerminalSettings),
+        /// Current geometry.
+        WindowSize(WindowSize),
+        /// Mutation or drain completed.
+        Done,
+        /// Index naming a pseudo-terminal's subsidiary.
+        SubsidiaryIndex(u32),
+        /// Whether a pseudo-terminal's subsidiary is locked against opening.
+        SubsidiaryLock(bool),
+    }
 }
 
 bitflags::bitflags! {

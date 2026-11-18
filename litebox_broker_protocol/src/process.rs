@@ -21,11 +21,13 @@ pub const MAX_RUNNER_DESCRIPTOR_SIZE: u32 = 4 * 1024;
 pub const MAX_EXISTING_RUNNER_START_SIZE: u32 =
     MAX_RUNNER_DESCRIPTOR_SIZE + MAX_PROCESS_BOOTSTRAP_SIZE;
 
-/// Child startup descriptor transported through the broker protocol.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessStartupDescriptor {
-    /// Operation-scoped shared-buffer sequence containing the bootstrap bytes.
-    pub buffer: SharedBufferSequence,
+wire_struct! {
+    /// Child startup descriptor transported through the broker protocol.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ProcessStartupDescriptor {
+        /// Operation-scoped shared-buffer sequence containing the bootstrap bytes.
+        pub buffer: SharedBufferSequence,
+    }
 }
 
 /// Owned child startup data delivered during broker negotiation.
@@ -35,19 +37,21 @@ pub struct ProcessStartupData {
     pub payload: Vec<u8>,
 }
 
-/// How a PID namespace behaves. A namespace that no process created has the
-/// default options.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct PidNamespaceOptions {
-    /// Whether the namespace ends when its first process ends, for whatever
-    /// reason: every process in it, and in the namespaces nested in it, is
-    /// then killed, no process can join it, and the first process's exit is
-    /// reported only once the others are gone.
-    pub ends_with_first_process: bool,
-    /// Whether the namespace's first process, while it runs, adopts the
-    /// orphans that no other ancestor in the namespace adopts.
-    pub first_process_adopts_orphans: bool,
+wire_struct! {
+    /// How a PID namespace behaves. A namespace that no process created has the
+    /// default options.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct PidNamespaceOptions {
+        /// Whether the namespace ends when its first process ends, for whatever
+        /// reason: every process in it, and in the namespaces nested in it, is
+        /// then killed, no process can join it, and the first process's exit is
+        /// reported only once the others are gone.
+        pub ends_with_first_process: bool,
+        /// Whether the namespace's first process, while it runs, adopts the
+        /// orphans that no other ancestor in the namespace adopts.
+        pub first_process_adopts_orphans: bool,
+    }
 }
 
 impl PidNamespaceOptions {
@@ -61,53 +65,61 @@ impl PidNamespaceOptions {
     }
 }
 
-/// Creates a pending child process and its initial thread.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AllocateChildRequest {
-    /// If set, the child is the first process of a new PID namespace with
-    /// these options, nested in the caller's. Otherwise, the child goes into
-    /// the PID namespace for the caller's children.
-    pub new_pid_namespace: Option<PidNamespaceOptions>,
-    /// Whether the child's parent is the caller's parent rather than the
-    /// caller. Either way, the caller owns the child until it starts.
-    pub sibling: bool,
+wire_struct! {
+    /// Creates a pending child process and its initial thread.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct AllocateChildRequest {
+        /// If set, the child is the first process of a new PID namespace with
+        /// these options, nested in the caller's. Otherwise, the child goes into
+        /// the PID namespace for the caller's children.
+        pub new_pid_namespace: Option<PidNamespaceOptions>,
+        /// Whether the child's parent is the caller's parent rather than the
+        /// caller. Either way, the caller owns the child until it starts.
+        pub sibling: bool,
+    }
 }
 
-/// Broker-assigned process and initial-thread identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessIdentity {
-    /// Broker-assigned process ID, in the caller's PID namespace.
-    pub process_id: ProcessId,
-    /// Broker-assigned initial thread ID, in the caller's PID namespace.
-    pub initial_thread_id: ThreadId,
-    /// The process's ID in its own PID namespace, which is the ID the process
-    /// sees for itself. It differs from `process_id` only if the process is
-    /// in a namespace nested in the caller's.
-    pub own_process_id: ProcessId,
+wire_struct! {
+    /// Broker-assigned process and initial-thread identity.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ProcessIdentity {
+        /// Broker-assigned process ID, in the caller's PID namespace.
+        pub process_id: ProcessId,
+        /// Broker-assigned initial thread ID, in the caller's PID namespace.
+        pub initial_thread_id: ThreadId,
+        /// The process's ID in its own PID namespace, which is the ID the process
+        /// sees for itself. It differs from `process_id` only if the process is
+        /// in a namespace nested in the caller's.
+        pub own_process_id: ProcessId,
+    }
 }
 
-/// Portable process termination status retained until it is collected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ProcessExitStatus {
-    /// The process exited normally with the supplied status code.
-    Exited { code: u32 },
-    /// The process was terminated by a signal.
-    Signaled {
-        /// Signal number reported by the runner platform.
-        signal: u32,
-    },
-    /// The runner terminated without an observable platform status.
-    Unknown,
+wire_enum! {
+    /// Portable process termination status retained until it is collected.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum ProcessExitStatus {
+        /// The process exited normally with the supplied status code.
+        Exited { code: u32 },
+        /// The process was terminated by a signal.
+        Signaled {
+            /// Signal number reported by the runner platform.
+            signal: u32,
+        },
+        /// The runner terminated without an observable platform status.
+        Unknown,
+    }
 }
 
-/// CPU time a process used, split into user and system time.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CpuTime {
-    /// Time spent running the process's own code.
-    pub user: Duration,
-    /// Time the host spent on the process's behalf.
-    pub system: Duration,
+wire_struct! {
+    /// CPU time a process used, split into user and system time.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct CpuTime {
+        /// Time spent running the process's own code.
+        pub user: Duration,
+        /// Time the host spent on the process's behalf.
+        pub system: Duration,
+    }
 }
 
 impl CpuTime {
@@ -121,24 +133,26 @@ impl CpuTime {
     }
 }
 
-/// A kind of resource the broker keeps limits on for each process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResourceKind {
-    /// CPU time the process uses, in seconds.
-    ///
-    /// Where the host can, the process is terminated once it uses its hard
-    /// limit; the broker only keeps the soft limit. A child running in its
-    /// creator's runner before starting its own uses that runner's time and
-    /// is held to the creator's limit until it starts its own runner.
-    CpuTime,
-    /// Threads in the process's job: the group of processes, such as a
-    /// container's, that the broker accounts for together. Each process's
-    /// initial thread counts, so this bounds processes as well as threads. A
-    /// process's threads stop counting once it exits or fails to start.
-    ///
-    /// Creating a thread or process fails with `ResourceExhausted` once the
-    /// creator's job has as many threads as the creator's soft limit.
-    Tasks,
+wire_enum! {
+    /// A kind of resource the broker keeps limits on for each process.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ResourceKind {
+        /// CPU time the process uses, in seconds.
+        ///
+        /// Where the host can, the process is terminated once it uses its hard
+        /// limit; the broker only keeps the soft limit. A child running in its
+        /// creator's runner before starting its own uses that runner's time and
+        /// is held to the creator's limit until it starts its own runner.
+        CpuTime,
+        /// Threads in the process's job: the group of processes, such as a
+        /// container's, that the broker accounts for together. Each process's
+        /// initial thread counts, so this bounds processes as well as threads. A
+        /// process's threads stop counting once it exits or fails to start.
+        ///
+        /// Creating a thread or process fails with `ResourceExhausted` once the
+        /// creator's job has as many threads as the creator's soft limit.
+        Tasks,
+    }
 }
 
 impl ResourceKind {
@@ -191,24 +205,28 @@ impl ResourceLimit {
     }
 }
 
-/// Reads one limit of the caller or of its pending child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetResourceLimitRequest {
-    /// The caller or its pending child.
-    pub process_id: ProcessId,
-    /// The kind of resource limited.
-    pub resource: ResourceKind,
+wire_struct! {
+    /// Reads one limit of the caller or of its pending child.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct GetResourceLimitRequest {
+        /// The caller or its pending child.
+        pub process_id: ProcessId,
+        /// The kind of resource limited.
+        pub resource: ResourceKind,
+    }
 }
 
-/// Replaces one limit of the caller or of its pending child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetResourceLimitRequest {
-    /// The caller or its pending child.
-    pub process_id: ProcessId,
-    /// The kind of resource limited.
-    pub resource: ResourceKind,
-    /// The new limits, whose hard limit cannot exceed the current one.
-    pub limit: ResourceLimit,
+wire_struct! {
+    /// Replaces one limit of the caller or of its pending child.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SetResourceLimitRequest {
+        /// The caller or its pending child.
+        pub process_id: ProcessId,
+        /// The kind of resource limited.
+        pub resource: ResourceKind,
+        /// The new limits, whose hard limit cannot exceed the current one.
+        pub limit: ResourceLimit,
+    }
 }
 
 /// Maximum size of a [`HostName`] in bytes: that of the longest DNS name
@@ -278,13 +296,15 @@ impl core::fmt::Debug for HostName {
     }
 }
 
-/// One of the names in [`HostNames`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HostNameKind {
-    /// The host name.
-    Host,
-    /// The name of the domain the host is in.
-    Domain,
+wire_enum! {
+    /// One of the names in [`HostNames`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum HostNameKind {
+        /// The host name.
+        Host,
+        /// The name of the domain the host is in.
+        Domain,
+    }
 }
 
 /// The host name and the name of the domain the host is in, as a process
@@ -298,171 +318,196 @@ pub struct HostNames {
     pub domain: HostName,
 }
 
-/// Reads the host names of the caller or of its pending child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetHostNamesRequest {
-    /// The caller or its pending child.
-    pub process_id: ProcessId,
-    /// Operation-scoped shared-buffer sequence of exactly twice
-    /// [`MAX_HOST_NAME_SIZE`] bytes, into which the broker writes the host
-    /// name and, right after it, the domain name.
-    pub buffer: SharedBufferSequence,
+wire_struct! {
+    /// Reads the host names of the caller or of its pending child.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct GetHostNamesRequest {
+        /// The caller or its pending child.
+        pub process_id: ProcessId,
+        /// Operation-scoped shared-buffer sequence of exactly twice
+        /// [`MAX_HOST_NAME_SIZE`] bytes, into which the broker writes the host
+        /// name and, right after it, the domain name.
+        pub buffer: SharedBufferSequence,
+    }
 }
 
-/// The sizes of the names a [`GetHostNamesRequest`] wrote, each at most
-/// [`MAX_HOST_NAME_SIZE`] bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostNameSizes {
-    /// Size of the host name, at the start of the buffer.
-    pub host: u32,
-    /// Size of the domain name, right after the host name.
-    pub domain: u32,
+wire_struct! {
+    /// The sizes of the names a [`GetHostNamesRequest`] wrote, each at most
+    /// [`MAX_HOST_NAME_SIZE`] bytes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct HostNameSizes {
+        /// Size of the host name, at the start of the buffer.
+        pub host: u32,
+        /// Size of the domain name, right after the host name.
+        pub domain: u32,
+    }
+    validate |value| value.host <= MAX_HOST_NAME_SIZE && value.domain <= MAX_HOST_NAME_SIZE
 }
 
-/// Replaces one of the host names of the caller or of its pending child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetHostNameRequest {
-    /// The caller or its pending child.
-    pub process_id: ProcessId,
-    /// The name replaced.
-    pub kind: HostNameKind,
-    /// Operation-scoped shared-buffer sequence holding the whole new name, of
-    /// up to [`MAX_HOST_NAME_SIZE`] bytes.
-    pub name: SharedBufferSequence,
+wire_struct! {
+    /// Replaces one of the host names of the caller or of its pending child.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SetHostNameRequest {
+        /// The caller or its pending child.
+        pub process_id: ProcessId,
+        /// The name replaced.
+        pub kind: HostNameKind,
+        /// Operation-scoped shared-buffer sequence holding the whole new name, of
+        /// up to [`MAX_HOST_NAME_SIZE`] bytes.
+        pub name: SharedBufferSequence,
+    }
 }
 
-/// Sets the parent-exit signal of the caller or of its pending child.
-///
-/// When the process's parent exits, the process moves to a new parent or to
-/// none, and then, while it is starting or running, receives this signal from
-/// the exiting parent. No signal is sent if the parent is the first process of
-/// a PID namespace that ends with it (see
-/// [`PidNamespaceOptions::ends_with_first_process`]), since that shuts the
-/// process down. The setting is kept, so every later move sends the signal
-/// again. A new process has none.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetParentExitSignalRequest {
-    /// The caller or its pending child.
-    pub process_id: ProcessId,
-    /// Signal number, or zero for none.
-    pub signal: u32,
-}
-
-/// A child process's exit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChildExit {
-    /// Child that exited.
-    pub process_id: ProcessId,
-    /// Child's termination status.
-    pub exit_status: ProcessExitStatus,
-    /// CPU time used by the child itself.
-    pub cpu_time: CpuTime,
-    /// CPU time used by the children whose exits the child collected,
-    /// including the time they collected from their own children.
-    pub children_cpu_time: CpuTime,
-}
-
-/// Selects which of the caller's children an exit collection considers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChildSelector {
-    /// Any child.
-    Any,
-    /// One child.
-    Process(ProcessId),
-    /// Any child in a process group.
-    ProcessGroup(ProcessGroupId),
-    /// The child a process handle of the caller refers to (see
-    /// [`ProcessRequest::OpenProcessHandle`](crate::message::ProcessRequest::OpenProcessHandle)).
+wire_struct! {
+    /// Sets the parent-exit signal of the caller or of its pending child.
     ///
-    /// No child matches if that process isn't the caller's child.
-    ProcessHandle(ObjectHandle),
+    /// When the process's parent exits, the process moves to a new parent or to
+    /// none, and then, while it is starting or running, receives this signal from
+    /// the exiting parent. No signal is sent if the parent is the first process of
+    /// a PID namespace that ends with it (see
+    /// [`PidNamespaceOptions::ends_with_first_process`]), since that shuts the
+    /// process down. The setting is kept, so every later move sends the signal
+    /// again. A new process has none.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SetParentExitSignalRequest {
+        /// The caller or its pending child.
+        pub process_id: ProcessId,
+        /// Signal number, or zero for none.
+        pub signal: u32,
+    }
 }
 
-/// Opens a handle to a process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OpenProcessHandleRequest {
-    /// The process, by its ID in the caller's PID namespace.
-    pub process_id: ProcessId,
-    /// Initial status flags, within [`FileOpenFlags::STATUS`].
-    pub flags: FileOpenFlags,
+wire_struct! {
+    /// A child process's exit.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ChildExit {
+        /// Child that exited.
+        pub process_id: ProcessId,
+        /// Child's termination status.
+        pub exit_status: ProcessExitStatus,
+        /// CPU time used by the child itself.
+        pub cpu_time: CpuTime,
+        /// CPU time used by the children whose exits the child collected,
+        /// including the time they collected from their own children.
+        pub children_cpu_time: CpuTime,
+    }
 }
 
-/// A process's place in the process tree and its initial thread.
-///
-/// IDs are the ones in the caller's PID namespace: a process that namespace
-/// doesn't see is absent, and a process group or session it doesn't see is 0.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessInfo {
-    /// Process that created this one, absent for a root process.
+wire_enum! {
+    /// Selects which of the caller's children an exit collection considers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ChildSelector {
+        /// Any child.
+        Any,
+        /// One child.
+        Process(ProcessId),
+        /// Any child in a process group.
+        ProcessGroup(ProcessGroupId),
+        /// The child a process handle of the caller refers to (see
+        /// [`ProcessRequest::OpenProcessHandle`](crate::message::ProcessRequest::OpenProcessHandle)).
+        ///
+        /// No child matches if that process isn't the caller's child.
+        ProcessHandle(ObjectHandle),
+    }
+}
+
+wire_struct! {
+    /// Opens a handle to a process.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct OpenProcessHandleRequest {
+        /// The process, by its ID in the caller's PID namespace.
+        pub process_id: ProcessId,
+        /// Initial status flags, within [`FileOpenFlags::STATUS`].
+        pub flags: FileOpenFlags,
+    }
+}
+
+wire_struct! {
+    /// A process's place in the process tree and its initial thread.
     ///
-    /// The creator never changes, even after it exits.
-    pub creator: Option<ProcessId>,
-    /// Process that collects this one's exit.
-    ///
-    /// The parent starts as the creator. When it exits, the nearest running
-    /// ancestor that adopts orphans becomes the parent, or none does and the
-    /// process's exit is discarded.
-    pub parent: Option<ProcessId>,
-    /// Process group and session.
-    pub membership: ProcessGroupMembership,
-    /// The thread the process was created with, or `None` while process
-    /// creation has yet to create it or once it has ended.
-    pub initial_thread: Option<ThreadId>,
-    /// If the process is its PID namespace's first process, that namespace's
-    /// options.
-    pub first_in_namespace: Option<PidNamespaceOptions>,
+    /// IDs are the ones in the caller's PID namespace: a process that namespace
+    /// doesn't see is absent, and a process group or session it doesn't see is 0.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ProcessInfo {
+        /// Process that created this one, absent for a root process.
+        ///
+        /// The creator never changes, even after it exits.
+        pub creator: Option<ProcessId>,
+        /// Process that collects this one's exit.
+        ///
+        /// The parent starts as the creator. When it exits, the nearest running
+        /// ancestor that adopts orphans becomes the parent, or none does and the
+        /// process's exit is discarded.
+        pub parent: Option<ProcessId>,
+        /// Process group and session.
+        pub membership: ProcessGroupMembership,
+        /// The thread the process was created with, or `None` while process
+        /// creation has yet to create it or once it has ended.
+        pub initial_thread: Option<ThreadId>,
+        /// If the process is its PID namespace's first process, that namespace's
+        /// options.
+        pub first_in_namespace: Option<PidNamespaceOptions>,
+    }
 }
 
-/// The process a thread belongs to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ThreadInfo {
-    /// Process the thread belongs to.
-    pub process_id: ProcessId,
-    /// Whether the thread is the process's initial thread.
-    pub initial: bool,
+wire_struct! {
+    /// The process a thread belongs to.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ThreadInfo {
+        /// Process the thread belongs to.
+        pub process_id: ProcessId,
+        /// Whether the thread is the process's initial thread.
+        pub initial: bool,
+    }
 }
 
-/// Starts a pending child created earlier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StartChildProcessRequest {
-    /// Pending child to start.
-    pub child_process_id: ProcessId,
-    /// Opaque platform bootstrap for the child.
-    ///
-    /// The child's runner also receives the memory image written by
-    /// [`WriteChildMemoryRequest`]s, if any.
-    pub startup: ProcessStartupDescriptor,
+wire_struct! {
+    /// Starts a pending child created earlier.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct StartChildProcessRequest {
+        /// Pending child to start.
+        pub child_process_id: ProcessId,
+        /// Opaque platform bootstrap for the child.
+        ///
+        /// The child's runner also receives the memory image written by
+        /// [`WriteChildMemoryRequest`]s, if any.
+        pub startup: ProcessStartupDescriptor,
+    }
 }
 
-/// Starts a pending child in an already-created platform runner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StartChildWithExistingRunnerRequest {
-    /// Pending child to start.
-    pub child_process_id: ProcessId,
-    /// Number of bytes at the beginning of `data` describing the existing host runner's
-    /// platform-specific identity and control endpoint.
-    pub runner_descriptor_length: u32,
-    /// Operation-scoped sequence containing the runner descriptor followed by guest startup bytes.
-    pub data: SharedBufferSequence,
+wire_struct! {
+    /// Starts a pending child in an already-created platform runner.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct StartChildWithExistingRunnerRequest {
+        /// Pending child to start.
+        pub child_process_id: ProcessId,
+        /// Number of bytes at the beginning of `data` describing the existing host runner's
+        /// platform-specific identity and control endpoint.
+        pub runner_descriptor_length: u32,
+        /// Operation-scoped sequence containing the runner descriptor followed by guest startup bytes.
+        pub data: SharedBufferSequence,
+    }
 }
 
 /// Maximum number of object references one [`DuplicateObjectsToChildRequest`]
 /// duplicates, which fill one shared-buffer slot.
 pub const MAX_CHILD_OBJECT_DUPLICATES: u32 = SHARED_BUFFER_SLOT_SIZE / 8;
 
-/// Duplicates the caller's object references into its pending child, as a
-/// Linux child inherits its parent's descriptors.
-///
-/// `handles` holds the caller's handles as consecutive little-endian `u64`
-/// values. On success, the broker overwrites them in place with the child's
-/// handles in the same order. Either every reference is duplicated or none is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DuplicateObjectsToChildRequest {
-    /// Pending child that receives the duplicates.
-    pub child_process_id: ProcessId,
-    /// Operation-scoped shared-buffer sequence holding between one and
-    /// [`MAX_CHILD_OBJECT_DUPLICATES`] handles.
-    pub handles: SharedBufferSequence,
+wire_struct! {
+    /// Duplicates the caller's object references into its pending child, as a
+    /// Linux child inherits its parent's descriptors.
+    ///
+    /// `handles` holds the caller's handles as consecutive little-endian `u64`
+    /// values. On success, the broker overwrites them in place with the child's
+    /// handles in the same order. Either every reference is duplicated or none is.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct DuplicateObjectsToChildRequest {
+        /// Pending child that receives the duplicates.
+        pub child_process_id: ProcessId,
+        /// Operation-scoped shared-buffer sequence holding between one and
+        /// [`MAX_CHILD_OBJECT_DUPLICATES`] handles.
+        pub handles: SharedBufferSequence,
+    }
 }
 
 /// Number of shared-buffer slots one [`WriteChildMemoryRequest`] fills at most.
@@ -475,29 +520,33 @@ const _: () =
 pub const MAX_CHILD_MEMORY_WRITE_SIZE: u32 =
     SHARED_BUFFER_SLOT_SIZE * MAX_CHILD_MEMORY_WRITE_SLOT_COUNT;
 
-/// Writes bytes into the memory image of the caller's pending child, as a
-/// Linux `fork` child starts from a copy of its parent's memory.
-///
-/// The image is a byte array, zero wherever it was not written, that the
-/// child's runner receives when the child starts. Its layout is opaque to the
-/// broker. A pending child has no image until it is first written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WriteChildMemoryRequest {
-    /// Pending child whose image receives the bytes.
-    pub child_process_id: ProcessId,
-    /// Image offset of the first byte.
-    pub offset: u64,
-    /// Operation-scoped shared-buffer sequence holding between one and
-    /// [`MAX_CHILD_MEMORY_WRITE_SIZE`] bytes.
-    pub data: SharedBufferSequence,
+wire_struct! {
+    /// Writes bytes into the memory image of the caller's pending child, as a
+    /// Linux `fork` child starts from a copy of its parent's memory.
+    ///
+    /// The image is a byte array, zero wherever it was not written, that the
+    /// child's runner receives when the child starts. Its layout is opaque to the
+    /// broker. A pending child has no image until it is first written.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WriteChildMemoryRequest {
+        /// Pending child whose image receives the bytes.
+        pub child_process_id: ProcessId,
+        /// Image offset of the first byte.
+        pub offset: u64,
+        /// Operation-scoped shared-buffer sequence holding between one and
+        /// [`MAX_CHILD_MEMORY_WRITE_SIZE`] bytes.
+        pub data: SharedBufferSequence,
+    }
 }
 
-/// Records the exit of a pending child that ran without starting its own
-/// runner, as a Linux `vfork` child does before `execve`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExitChildProcessRequest {
-    /// Pending child that exited.
-    pub child_process_id: ProcessId,
-    /// Termination status retained until it is collected.
-    pub exit_status: ProcessExitStatus,
+wire_struct! {
+    /// Records the exit of a pending child that ran without starting its own
+    /// runner, as a Linux `vfork` child does before `execve`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ExitChildProcessRequest {
+        /// Pending child that exited.
+        pub child_process_id: ProcessId,
+        /// Termination status retained until it is collected.
+        pub exit_status: ProcessExitStatus,
+    }
 }

@@ -20,90 +20,102 @@ use crate::{ObjectHandle, ProcessGroupId, ProcessId, ThreadId};
 /// Largest signal number the broker delivers.
 pub const MAX_SIGNAL: u32 = 64;
 
-/// Process, processes, or thread a signal is sent to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignalTarget {
-    /// One process.
-    Process(ProcessId),
-    /// One thread.
-    Thread {
-        /// Process the thread belongs to.
-        process: ProcessId,
-        /// Thread to signal.
-        thread: ThreadId,
-    },
-    /// Every process in a process group.
-    ProcessGroup(ProcessGroupId),
-    /// Every process in the caller's PID namespace except the caller itself
-    /// and the namespace's first process.
-    All,
-    /// The process a process handle of the caller refers to (see
-    /// [`ProcessRequest::OpenProcessHandle`](crate::message::ProcessRequest::OpenProcessHandle)).
+wire_enum! {
+    /// Process, processes, or thread a signal is sent to.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SignalTarget {
+        /// One process.
+        Process(ProcessId),
+        /// One thread.
+        Thread {
+            /// Process the thread belongs to.
+            process: ProcessId,
+            /// Thread to signal.
+            thread: ThreadId,
+        },
+        /// Every process in a process group.
+        ProcessGroup(ProcessGroupId),
+        /// Every process in the caller's PID namespace except the caller itself
+        /// and the namespace's first process.
+        All,
+        /// The process a process handle of the caller refers to (see
+        /// [`ProcessRequest::OpenProcessHandle`](crate::message::ProcessRequest::OpenProcessHandle)).
+        ///
+        /// The broker returns `PeerClosed` if the process was released or left the
+        /// broker, and `UnknownObject` if the caller's PID namespace doesn't see
+        /// it.
+        ProcessHandle(ObjectHandle),
+    }
+}
+
+wire_struct! {
+    /// Request to send a signal.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SendSignalRequest {
+        /// Target processes or thread.
+        ///
+        /// The broker returns `UnknownObject` if no process or thread is
+        /// targeted.
+        pub target: SignalTarget,
+        /// Signal number, or zero to only check that a target exists.
+        ///
+        /// The broker returns `UnsupportedOperation` for a number above
+        /// [`MAX_SIGNAL`].
+        pub signal: u32,
+    }
+}
+
+wire_struct! {
+    /// Response to a request opening the caller's signals.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct OpenSignalsResponse {
+        /// Handle that becomes readable while signals or child events are pending.
+        pub handle: ObjectHandle,
+    }
+}
+
+wire_struct! {
+    /// Request to take one of the caller's pending signals, its pending child
+    /// exit, or its pending child removal.
     ///
-    /// The broker returns `PeerClosed` if the process was released or left the
-    /// broker, and `UnknownObject` if the caller's PID namespace doesn't see
-    /// it.
-    ProcessHandle(ObjectHandle),
+    /// The broker returns `WouldBlock` when none is pending.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TakeSignalRequest {
+        /// Handle returned by the open request.
+        pub handle: ObjectHandle,
+    }
 }
 
-/// Request to send a signal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SendSignalRequest {
-    /// Target processes or thread.
-    ///
-    /// The broker returns `UnknownObject` if no process or thread is
-    /// targeted.
-    pub target: SignalTarget,
-    /// Signal number, or zero to only check that a target exists.
-    ///
-    /// The broker returns `UnsupportedOperation` for a number above
-    /// [`MAX_SIGNAL`].
-    pub signal: u32,
+wire_enum! {
+    /// One event taken from the caller's signals.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SignalEvent {
+        /// The ABI-neutral terminal actions posted to the caller's initially
+        /// attached process group since the caller last took them.
+        Terminal(crate::terminal::TerminalEvents),
+        /// A signal another process sent to the caller or one of its threads.
+        Signal(PendingSignal),
+        /// The earliest child exit since the caller last took one.
+        ChildExited(ChildExit),
+        /// One or more children left the caller without exiting since it last
+        /// took this event, such as a child whose startup failed.
+        ///
+        /// A collection that found only such children live no longer finds them.
+        ChildRemoved,
+    }
 }
 
-/// Response to a request opening the caller's signals.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OpenSignalsResponse {
-    /// Handle that becomes readable while signals or child events are pending.
-    pub handle: ObjectHandle,
-}
-
-/// Request to take one of the caller's pending signals, its pending child
-/// exit, or its pending child removal.
-///
-/// The broker returns `WouldBlock` when none is pending.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TakeSignalRequest {
-    /// Handle returned by the open request.
-    pub handle: ObjectHandle,
-}
-
-/// One event taken from the caller's signals.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SignalEvent {
-    /// The ABI-neutral terminal actions posted to the caller's initially
-    /// attached process group since the caller last took them.
-    Terminal(crate::terminal::TerminalEvents),
-    /// A signal another process sent to the caller or one of its threads.
-    Signal(PendingSignal),
-    /// The earliest child exit since the caller last took one.
-    ChildExited(ChildExit),
-    /// One or more children left the caller without exiting since it last
-    /// took this event, such as a child whose startup failed.
-    ///
-    /// A collection that found only such children live no longer finds them.
-    ChildRemoved,
-}
-
-/// A signal taken from the caller's pending signals.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingSignal {
-    /// The caller's thread the signal was sent to, which may have ended
-    /// since, or `None` if it was sent to the caller.
-    pub thread: Option<ThreadId>,
-    /// Signal number, from one to [`MAX_SIGNAL`].
-    pub signal: u32,
-    /// Process that first sent the signal while it was pending, such as the
-    /// exiting parent that sent a parent-exit signal.
-    pub sender: ProcessId,
+wire_struct! {
+    /// A signal taken from the caller's pending signals.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PendingSignal {
+        /// The caller's thread the signal was sent to, which may have ended
+        /// since, or `None` if it was sent to the caller.
+        pub thread: Option<ThreadId>,
+        /// Signal number, from one to [`MAX_SIGNAL`].
+        pub signal: u32,
+        /// Process that first sent the signal while it was pending, such as the
+        /// exiting parent that sent a parent-exit signal.
+        pub sender: ProcessId,
+    }
 }

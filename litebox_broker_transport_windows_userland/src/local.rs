@@ -156,10 +156,8 @@ impl LocalSetupChannel for WindowsNamedPipeLocalSetupChannel {
     type Error = Error;
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
-        self.stream.write_frame(
-            &encode_handshake_request(request.clone()),
-            self.setup_deadline,
-        )
+        self.stream
+            .write_frame(&encode_handshake_request(request), self.setup_deadline)
     }
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {

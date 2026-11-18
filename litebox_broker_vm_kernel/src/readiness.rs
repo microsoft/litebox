@@ -175,7 +175,7 @@ impl HostNotificationChannel for Ring<'_> {
         &mut self,
         notification: &BrokerNotification,
     ) -> core::result::Result<(), RingError> {
-        let frame = wire::encode_notification(notification.clone());
+        let frame = wire::encode_notification(notification);
         match self.producer.try_write(&frame).map_err(RingError::Ring)? {
             ControlRingWriteStatus::Written => {
                 self.written = true;
