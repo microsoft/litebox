@@ -23,7 +23,15 @@ pub(crate) struct Encoder {
 }
 
 impl Encoder {
-    pub(super) fn finish(self) -> Vec<u8> {
+    /// Creates an encoder for a payload of exactly `length` bytes, or `None`
+    /// if the allocation fails.
+    pub(crate) fn try_with_capacity(length: usize) -> Option<Self> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).ok()?;
+        Some(Self { bytes })
+    }
+
+    pub(crate) fn finish(self) -> Vec<u8> {
         self.bytes
     }
 
@@ -38,11 +46,16 @@ pub(crate) struct Decoder<'a> {
 }
 
 impl<'a> Decoder<'a> {
-    pub(super) const fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 
-    pub(super) fn finish(&self) -> Result<(), WireError> {
+    /// Returns the number of bytes not yet decoded.
+    pub(crate) const fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
+
+    pub(crate) fn finish(&self) -> Result<(), WireError> {
         if self.offset == self.bytes.len() {
             Ok(())
         } else {

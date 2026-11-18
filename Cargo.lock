@@ -1752,6 +1752,8 @@ dependencies = [
  "bitflags 2.13.1",
  "buddy_system_allocator",
  "hashbrown 0.15.5",
+ "litebox_broker_core",
+ "litebox_broker_host",
  "litebox_broker_local",
  "litebox_broker_protocol",
  "litebox_broker_transport",

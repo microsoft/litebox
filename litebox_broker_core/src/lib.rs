@@ -60,6 +60,7 @@ use litebox_broker_protocol::process::HostNames;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::{Mutex, rwlock::RwLock};
 
+use authority::Authority;
 pub use error::BrokerError;
 use fs::FileService;
 use job::Job;
@@ -465,6 +466,10 @@ impl BrokerCore {
     /// copy, see [`BrokerProcess::copy_host_names`]), and are in
     /// `pid_namespace` or in namespaces nested in it.
     ///
+    /// The trusted deployment supplies `initial_authority` for this root.
+    /// It bounds the subjects the guest can register, independently of
+    /// `caller_credential`, which authenticates the association for broker policy.
+    ///
     /// If `pid_namespace` has no first process yet, this process becomes it
     /// once its creation succeeds (see [`BrokerProcess::is_first_process`]);
     /// a process whose creation fails never does.
@@ -484,9 +489,11 @@ impl BrokerCore {
     ///
     /// Panics if the namespace's ID allocator violates its range or
     /// uniqueness invariants.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_process(
         self: &Arc<Self>,
         caller_credential: CallerCredential,
+        initial_authority: Arc<Authority>,
         pid_namespace: &Arc<PidNamespace>,
         fs: &Arc<dyn FileService>,
         job: &Arc<Job>,
@@ -501,6 +508,7 @@ impl BrokerCore {
             let _tree = self.process_tree_lock.lock();
             self.register_process(
                 caller_credential,
+                initial_authority,
                 pid_namespace,
                 fs,
                 job,
@@ -548,6 +556,7 @@ impl BrokerCore {
     pub(crate) fn register_process(
         self: &Arc<Self>,
         caller_credential: CallerCredential,
+        authority: Arc<Authority>,
         pid_namespace: &Arc<PidNamespace>,
         fs: &Arc<dyn FileService>,
         job: &Arc<Job>,
@@ -595,6 +604,7 @@ impl BrokerCore {
                 parent,
                 creator,
                 caller_credential,
+                authority,
             ));
             for (registry, (_, id)) in registries.iter_mut().zip(ids.iter().rev()) {
                 assert!(

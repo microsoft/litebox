@@ -484,6 +484,7 @@ fn with_in_process_root(
 ) -> Result<(), Box<dyn Error>> {
     let root = core.create_process(
         CallerCredential::HostGuaranteed,
+        Arc::default(),
         &pid_namespace,
         &fs,
         &Job::new(None),

@@ -88,7 +88,7 @@ trait StartRunner: Send + Sync {
     /// Requires the same guarantees as [`ForkLauncher::start`].
     unsafe fn start(
         &self,
-        child: &PendingChild,
+        child: &mut PendingChild,
         startup: &[u8],
     ) -> Result<(), ForkError<ProcessError>>;
 }
@@ -139,7 +139,7 @@ impl<Platform: ProcessProvider, Runner: ForkRunner<Platform>> StartRunner
 {
     unsafe fn start(
         &self,
-        child: &PendingChild,
+        child: &mut PendingChild,
         startup: &[u8],
     ) -> Result<(), ForkError<ProcessError>> {
         let control_channel = self.runner.create_control_channel(child)?;
@@ -231,7 +231,7 @@ impl ForkLauncher {
     /// locks or users that survive only in the copied runtime.
     pub unsafe fn start(
         &self,
-        child: &PendingChild,
+        child: &mut PendingChild,
         startup: &[u8],
     ) -> Result<(), ForkError<ProcessError>> {
         // SAFETY: The caller supplies the pause and snapshot guarantees required by start.
@@ -1686,8 +1686,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> usize {
         let exited = self
             .vfork
-            .borrow()
-            .as_ref()
+            .borrow_mut()
+            .as_mut()
             .expect("vfork child exit lost its child")
             .child
             .exit(exit_status);
@@ -1953,7 +1953,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         startup.encode().map_err(|_| Errno::ENOMEM)?;
 
         // Dropping the pending child on failure discards it.
-        let child = self.allocate_child_process(relation)?;
+        let mut child = self.allocate_child_process(relation)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let handles = child.inherit(&objects).map_err(Errno::from)?;
@@ -1966,7 +1966,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let pidfd = pidfd
             .map(|dest| self.install_child_pidfd(&self.files.borrow(), &child, dest))
             .transpose()?;
-        let started = self.start_forked_child(&child, startup, has_shared_mappings);
+        let started = self.start_forked_child(&mut child, startup, has_shared_mappings);
         if started.is_err()
             && let Some(pidfd) = pidfd
         {
@@ -1980,7 +1980,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// or else from a copy of this process's memory, while the other threads are paused.
     fn start_forked_child(
         &self,
-        child: &PendingChild,
+        child: &mut PendingChild,
         mut startup: LinuxForkStartup,
         has_shared_mappings: bool,
     ) -> Result<(), Errno> {
@@ -3954,7 +3954,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Starts the `vfork` child's new program in a fresh runner and resumes the parent.
     ///
     /// The runner inherits the descriptors not marked close-on-exec and the child's pending
-    /// signals. Failures before the transfer return to the child, which may retry or exit.
+    /// signals. Failures that leave the child pending return to the child, which may retry with
+    /// its descriptors at that time, or exit. Other failures end the `vfork` window.
     fn transfer_vfork_child(
         &self,
         path: alloc::string::String,
@@ -3999,22 +4000,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         // The child keeps the references it inherits until it exits, so check the size first.
         startup.encode().map_err(|_| Errno::E2BIG)?;
-        let vfork = self.vfork.borrow();
-        let child = &vfork.as_ref().expect("vfork transfer lost its child").child;
-        let handles = child.inherit(&fds).map_err(Errno::from)?;
-        for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
-            inherited.handle = handle;
-        }
-        let payload = startup
-            .encode()
-            .expect("the startup fit with placeholder handles");
-        let started = child.start(&payload);
+        let mut vfork = self.vfork.borrow_mut();
+        let child = &mut vfork.as_mut().expect("vfork transfer lost its child").child;
+        let started = child.inherit(&fds).and_then(|handles| {
+            for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
+                inherited.handle = handle;
+            }
+            match startup.encode() {
+                Ok(payload) => child.start(&payload),
+                // The startup fit with placeholder handles, so only its allocation failed.
+                Err(_) => child
+                    .release_inherited()
+                    .and(Err(ProcessError::OutOfMemory)),
+            }
+        });
+        let pending = child.is_pending();
         drop(vfork);
-        if started.is_err() {
-            // The broker no longer holds a pending child that could retry or exit.
-            return Ok(self.abort_vfork_window());
+        match started {
+            Ok(()) => Ok(self.resume_vfork_parent(ctx)),
+            // Staging is atomic, and a rejected start releases what was staged.
+            Err(error) if pending => Err(Errno::from(error)),
+            Err(_) => Ok(self.abort_vfork_window()),
         }
-        Ok(self.resume_vfork_parent(ctx))
     }
 
     /// Handle syscall `execve`.
@@ -4864,7 +4871,7 @@ mod tests {
         let blocked = SigSet::empty().with(Signal::SIGCHLD);
         run_with_unwatched_signals(blocked, |task| {
             task.set_test_signal_action(Signal::SIGCHLD, SIG_IGN);
-            let child = task
+            let mut child = task
                 .global
                 .litebox
                 .allocate_child_process(None, false)
@@ -4918,7 +4925,7 @@ mod tests {
 
         let platform = crate::syscalls::tests::test_platform();
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let mut child = litebox.allocate_child_process(None, false).unwrap();
         let child_id = child.identity().process_id;
         let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let observer = Arc::new(RecordedEvents::new());
@@ -4986,7 +4993,7 @@ mod tests {
 
         let platform = crate::syscalls::tests::test_platform();
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let mut child = litebox.allocate_child_process(None, false).unwrap();
         let child_id = child.identity().process_id;
         let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let queue = ReadinessQueue::new(&litebox).unwrap();
@@ -5441,6 +5448,247 @@ mod tests {
             assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(1)));
             assert_eq!(task.do_prlimit(RlimitResource::CPU, None), Ok(core(1)));
         });
+    }
+
+    enum VforkReplies {
+        Starts(alloc::collections::VecDeque<BrokerResult>),
+        RejectInheritance(litebox_broker_protocol::error::ErrorCode),
+        LoseAssociationOnInherit,
+    }
+
+    struct VforkChannel {
+        inner: InProcessBrokerChannel,
+        replies: StdMutex<VforkReplies>,
+    }
+
+    impl LocalCallChannel for VforkChannel {
+        type Error = <InProcessBrokerChannel as LocalCallChannel>::Error;
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            use litebox_broker_protocol::message::ProcessRequest;
+
+            let result = match (&request.operation, &mut *self.replies.lock().unwrap()) {
+                (
+                    BrokerOperation::Process(ProcessRequest::StartChild(_)),
+                    VforkReplies::Starts(starts),
+                ) => starts.pop_front(),
+                (
+                    BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(_)),
+                    VforkReplies::RejectInheritance(error),
+                ) => Some(BrokerResult::Error(*error)),
+                (
+                    BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(_)),
+                    VforkReplies::LoseAssociationOnInherit,
+                ) => return Err(Self::Error::AssociationFailed),
+                _ => None,
+            };
+            if let Some(result) = result {
+                return Ok(BrokerResponse {
+                    request_id: request.request_id,
+                    result,
+                });
+            }
+            self.inner.call(request)
+        }
+    }
+
+    /// Runs `test` on a LiteBox-managed thread; unscripted requests go to the in-process broker.
+    fn run_with_vfork_replies(
+        replies: VforkReplies,
+        test: impl FnOnce(&crate::Task<crate::syscalls::tests::TestPlatform>),
+    ) {
+        use crate::syscalls::tests::TestPlatform;
+        use litebox::platform::ThreadProvider;
+        use litebox_broker_core::BrokerCoreLimits;
+
+        let platform = crate::syscalls::tests::test_platform();
+        let limits = BrokerCoreLimits::new(
+            super::super::test_broker::MAX_TEST_BROKER_REFERENCES,
+            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+        );
+        let (litebox, process_id) =
+            super::super::test_broker::litebox_with_channel(platform, limits, |inner| {
+                VforkChannel {
+                    inner,
+                    replies: StdMutex::new(replies),
+                }
+            });
+        let task = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
+            .build()
+            .0
+            .new_test_task();
+        // Saving the parent's vector state needs a LiteBox-managed thread.
+        TestPlatform::run_test_thread(|| test(&task));
+    }
+
+    /// Asks the `vfork` child in `task` to start `/bin/true` in a fresh runner.
+    fn exec_vfork_child(
+        task: &crate::Task<crate::syscalls::tests::TestPlatform>,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) -> Result<usize, litebox_common_linux::errno::Errno> {
+        let program = || alloc::string::String::from("/bin/true");
+        task.transfer_vfork_child(
+            program(),
+            program(),
+            alloc::vec![alloc::ffi::CString::new("true").unwrap()],
+            alloc::vec![],
+            ctx,
+        )
+    }
+
+    /// Returns whether reading `fd`, a nonblocking pipe's read end, finds that no writer remains.
+    fn pipe_has_no_writer(
+        task: &crate::Task<crate::syscalls::tests::TestPlatform>,
+        fd: u32,
+    ) -> bool {
+        let mut byte = [0u8];
+        match task.sys_read(i32::try_from(fd).unwrap(), &mut byte[..], None) {
+            Ok(0) => true,
+            Err(litebox_common_linux::errno::Errno::EAGAIN) => false,
+            result => panic!("unexpected pipe read result {result:?}"),
+        }
+    }
+
+    #[test]
+    fn vfork_exec_rejected_before_start_returns_without_what_it_inherited() {
+        use litebox_common_linux::{OFlags, PtRegs, errno::Errno};
+
+        run_with_vfork_replies(VforkReplies::Starts([].into()), |task| {
+            let mut ctx = PtRegs::default();
+            assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+            let (read_end, write_end) = task.do_pipe2(OFlags::NONBLOCK, |_, _| Ok(())).unwrap();
+
+            // The broker has no launcher, so it rejects the start before taking the child.
+            assert_eq!(exec_vfork_child(task, &mut ctx), Err(Errno::ENOSYS));
+            assert!(task.vfork.borrow().is_some());
+            assert!(!task.is_exiting());
+            // The pending child released its inherited write end.
+            task.sys_close(i32::try_from(write_end).unwrap()).unwrap();
+            assert!(pipe_has_no_writer(task, read_end));
+
+            // The child may still exit, resuming its parent.
+            task.exit_vfork_child(
+                litebox_broker_protocol::process::ProcessExitStatus::Exited { code: 1 },
+                &mut ctx,
+            );
+            assert!(task.vfork.borrow().is_none());
+            assert!(!task.is_exiting());
+        });
+    }
+
+    #[test]
+    fn vfork_exec_retry_inherits_the_descriptors_open_then() {
+        use litebox_broker_protocol::{error::ErrorCode, message::ProcessResponse};
+        use litebox_common_linux::{FcntlArg, FileDescriptorFlags, OFlags, PtRegs, errno::Errno};
+
+        run_with_vfork_replies(
+            VforkReplies::Starts(
+                [
+                    BrokerResult::Error(ErrorCode::ResourceExhausted),
+                    BrokerResult::Process(ProcessResponse::StartChild),
+                ]
+                .into(),
+            ),
+            |task| {
+                let (read_end, write_end) = task.do_pipe2(OFlags::NONBLOCK, |_, _| Ok(())).unwrap();
+                let write_fd = i32::try_from(write_end).unwrap();
+                let (keep_read, keep_write) = task
+                    .do_pipe2(OFlags::NONBLOCK | OFlags::CLOEXEC, |_, _| Ok(()))
+                    .unwrap();
+                let keep_write_fd = i32::try_from(keep_write).unwrap();
+                let mut ctx = PtRegs::default();
+                assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+
+                assert_eq!(exec_vfork_child(task, &mut ctx), Err(Errno::EAGAIN));
+                assert!(task.vfork.borrow().is_some());
+                assert!(!task.is_exiting());
+                // The retry inherits only the descriptors that are still not close-on-exec.
+                task.sys_fcntl(write_fd, FcntlArg::SETFD(FileDescriptorFlags::FD_CLOEXEC))
+                    .unwrap();
+                task.sys_fcntl(keep_write_fd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
+                    .unwrap();
+                let child_pid = exec_vfork_child(task, &mut ctx).unwrap();
+                assert!(child_pid > 0);
+                assert!(task.vfork.borrow().is_none());
+                assert!(!task.is_exiting());
+
+                // After the parent closes both writers, only the one made
+                // inheritable between attempts must still be held by the child.
+                task.sys_close(write_fd).unwrap();
+                task.sys_close(keep_write_fd).unwrap();
+                assert!(pipe_has_no_writer(task, read_end));
+                assert!(!pipe_has_no_writer(task, keep_read));
+            },
+        );
+    }
+
+    #[test]
+    fn vfork_exec_failing_after_the_broker_takes_the_child_ends_the_window() {
+        use litebox_broker_protocol::{error::ErrorCode, message::ProcessResponse};
+        use litebox_common_linux::PtRegs;
+
+        run_with_vfork_replies(
+            VforkReplies::Starts(
+                [BrokerResult::Process(ProcessResponse::ChildConsumed(
+                    ErrorCode::ResourceExhausted,
+                ))]
+                .into(),
+            ),
+            |task| {
+                let mut ctx = PtRegs::default();
+                assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+                assert_eq!(exec_vfork_child(task, &mut ctx), Ok(0));
+                assert!(task.is_exiting());
+            },
+        );
+    }
+
+    #[test]
+    fn losing_the_process_service_during_vfork_inheritance_ends_the_window() {
+        use litebox_common_linux::{OFlags, PtRegs};
+
+        run_with_vfork_replies(VforkReplies::LoseAssociationOnInherit, |task| {
+            task.do_pipe2(OFlags::NONBLOCK, |_, _| Ok(())).unwrap();
+            let mut ctx = PtRegs::default();
+            assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+            assert_eq!(exec_vfork_child(task, &mut ctx), Ok(0));
+            assert!(task.is_exiting());
+        });
+    }
+
+    #[test]
+    fn losing_the_target_during_vfork_inheritance_ends_the_window() {
+        use litebox_broker_protocol::error::ErrorCode;
+        use litebox_common_linux::{OFlags, PtRegs};
+
+        run_with_vfork_replies(
+            VforkReplies::RejectInheritance(ErrorCode::PeerClosed),
+            |task| {
+                task.do_pipe2(OFlags::NONBLOCK, |_, _| Ok(())).unwrap();
+                let mut ctx = PtRegs::default();
+                assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+                assert_eq!(exec_vfork_child(task, &mut ctx), Ok(0));
+                assert!(task.is_exiting());
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_source_during_vfork_inheritance_leaves_the_child_pending() {
+        use litebox_broker_protocol::{error::ErrorCode, process::ProcessExitStatus};
+        use litebox_common_linux::{OFlags, PtRegs, errno::Errno};
+
+        run_with_vfork_replies(
+            VforkReplies::RejectInheritance(ErrorCode::UnknownObject),
+            |task| {
+                task.do_pipe2(OFlags::NONBLOCK, |_, _| Ok(())).unwrap();
+                let mut ctx = PtRegs::default();
+                assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+                assert_eq!(exec_vfork_child(task, &mut ctx), Err(Errno::EBADF));
+                assert!(task.exit_vfork_child(ProcessExitStatus::Exited { code: 1 }, &mut ctx) > 0);
+                assert!(!task.is_exiting());
+            },
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -6773,7 +7021,7 @@ mod fork_tests {
     impl StartRunner for NativeStartupRunner {
         unsafe fn start(
             &self,
-            _child: &PendingChild,
+            _child: &mut PendingChild,
             startup: &[u8],
         ) -> Result<(), ForkError<ProcessError>> {
             let native = crate::decode_native_fork_startup(startup).unwrap();
@@ -6814,10 +7062,10 @@ mod fork_tests {
         );
         let (litebox, _) =
             crate::syscalls::test_broker::litebox_with_channel(platform, limits, StartChannel);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let mut child = litebox.allocate_child_process(None, false).unwrap();
         let launcher = launcher();
         // SAFETY: No native child is created and no guest threads or guest startup state exist.
-        let result = unsafe { launcher.start(&child, b"startup") };
+        let result = unsafe { launcher.start(&mut child, b"startup") };
         STATE.with_borrow(|state| assert_eq!(state.events, expected_events));
         result
     }

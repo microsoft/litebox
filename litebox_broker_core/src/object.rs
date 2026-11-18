@@ -10,6 +10,7 @@ use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
+use crate::authority::SubjectObject;
 use crate::event::EventObject;
 use crate::fs::File;
 use crate::pipe::PipeObject;
@@ -61,6 +62,7 @@ pub(crate) enum ObjectEntry {
     ReadinessQueue(ReadinessQueueObject),
     FutexWaiter(FutexWaiterObject),
     Process(ProcessObject),
+    Subject(SubjectObject),
 }
 
 // Each object kind's module defines its own accessor in an `impl ObjectEntry`
@@ -83,8 +85,7 @@ impl ObjectEntry {
             | Self::Timer(_)
             | Self::ReadinessQueue(_)
             | Self::Process(_) => true,
-            // Signals belong to their process and a futex waiter to its thread.
-            Self::Signals(_) | Self::FutexWaiter(_) => false,
+            Self::Subject(_) | Self::Signals(_) | Self::FutexWaiter(_) => false,
         }
     }
 
@@ -112,7 +113,7 @@ impl ObjectEntry {
             Self::ReadinessQueue(queue) => watch(&|registration| queue.watch(registration)),
             Self::Process(process) => watch(&|registration| process.watch(registration)),
             // A futex waiter publishes through the registration it was created with.
-            Self::Signals(_) | Self::FutexWaiter(_) => Ok(None),
+            Self::Subject(_) | Self::Signals(_) | Self::FutexWaiter(_) => Ok(None),
         }
     }
 
@@ -132,9 +133,10 @@ impl ObjectEntry {
             Self::VsockSocket(socket) => socket.watch(registration),
             Self::Timer(timer) => timer.watch(registration),
             Self::Process(process) => process.watch(registration),
-            Self::Signals(_) | Self::ReadinessQueue(_) | Self::FutexWaiter(_) => {
-                Err(BrokerError::UnsupportedOperation)
-            }
+            Self::Subject(_)
+            | Self::Signals(_)
+            | Self::ReadinessQueue(_)
+            | Self::FutexWaiter(_) => Err(BrokerError::UnsupportedOperation),
         }
     }
 }
@@ -215,6 +217,7 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
             ObjectEntry::ReadinessQueue(queue) => return Ok(queue.readiness()),
             ObjectEntry::FutexWaiter(waiter) => return Ok(waiter.readiness()),
             ObjectEntry::Process(process) => return Ok(process.readiness()),
+            ObjectEntry::Subject(_) => return Err(BrokerError::InvalidRights),
             ObjectEntry::Socket(socket) => socket.resource(),
             ObjectEntry::VsockSocket(socket) => socket.resource(),
         }
@@ -234,7 +237,7 @@ pub(crate) fn get_status_flags(object: &RwLock<ObjectEntry>) -> Result<FileStatu
         ObjectEntry::Socket(socket) => return Ok(socket.get_status_flags()),
         ObjectEntry::VsockSocket(socket) => return Ok(socket.get_status_flags()),
         ObjectEntry::Process(process) => return Ok(process.get_status_flags()),
-        ObjectEntry::Signals(_) | ObjectEntry::FutexWaiter(_) => {
+        ObjectEntry::Subject(_) | ObjectEntry::Signals(_) | ObjectEntry::FutexWaiter(_) => {
             return Err(BrokerError::InvalidRights);
         }
     };
@@ -281,7 +284,7 @@ pub(crate) fn set_status_flags(
             process.set_status_flags(mask, flags);
             return Ok(());
         }
-        ObjectEntry::Signals(_) | ObjectEntry::FutexWaiter(_) => {
+        ObjectEntry::Subject(_) | ObjectEntry::Signals(_) | ObjectEntry::FutexWaiter(_) => {
             return Err(BrokerError::InvalidRights);
         }
     };

@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use crate::authority::RestrictChildAuthorityRequest;
 use crate::error::ErrorCode;
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
@@ -173,7 +174,14 @@ impl BrokerOperation {
                     ..
                 })
                 | ProcessRequest::GetHostNames(GetHostNamesRequest { buffer, .. })
-                | ProcessRequest::SetHostName(SetHostNameRequest { name: buffer, .. }),
+                | ProcessRequest::SetHostName(SetHostNameRequest { name: buffer, .. })
+                | ProcessRequest::GetAuthority(buffer)
+                | ProcessRequest::RestrictAuthority(buffer)
+                | ProcessRequest::RestrictChildAuthority(RestrictChildAuthorityRequest {
+                    terms: buffer,
+                    ..
+                })
+                | ProcessRequest::CreateSubject(buffer),
             )
             | Self::UnixSocket(
                 UnixSocketRequest::Bind(BindUnixSocketRequest {
@@ -209,6 +217,7 @@ impl BrokerOperation {
                 | ProcessRequest::CreateChildrenPidNamespace(_)
                 | ProcessRequest::ExitChild(_)
                 | ProcessRequest::CancelChild(_)
+                | ProcessRequest::ReleaseChildObjects(_)
                 | ProcessRequest::ReportExitStatus(_)
                 | ProcessRequest::SetChildExitRetention(_)
                 | ProcessRequest::SetOrphanAdoption(_)
@@ -516,6 +525,49 @@ wire_enum! {
         /// The broker returns `UnknownObject` if the process is neither, and
         /// `UnsupportedOperation` for a signal number above [`crate::signal::MAX_SIGNAL`].
         SetParentExitSignal(SetParentExitSignalRequest),
+        /// Read a snapshot of the caller's authority, as
+        /// [`crate::authority::EncodedTerms`], into the start of the buffer.
+        ///
+        /// The broker writes the terms only if they fit in the buffer, and
+        /// returns their encoded length either way. The buffer may be at most
+        /// [`crate::authority::MAX_ENCODED_TERMS_SIZE`] long.
+        GetAuthority(SharedBufferSequence),
+        /// Replace the caller's authority with the terms in the buffer, as
+        /// [`crate::authority::EncodedTerms`], if together they restrict it.
+        ///
+        /// A well-formed proposal with invalid terms or one that widens
+        /// authority returns `PolicyDenied` without changing the authority.
+        /// A wire count above [`crate::authority::MAX_AUTHORITY_TERMS`] is a
+        /// malformed request that aborts the association. The encoder instead
+        /// rejects too many distinct canonical terms before sending a request.
+        RestrictAuthority(SharedBufferSequence),
+        /// Replace the authority of the caller's pending child with a
+        /// restriction of it, as [`Self::RestrictAuthority`] does for the
+        /// caller.
+        ///
+        /// The broker also returns `UnknownObject` if the process is not the
+        /// caller's pending child, and `PeerClosed` once it is no longer
+        /// pending.
+        RestrictChildAuthority(RestrictChildAuthorityRequest),
+        /// Register the subject in the buffer, as
+        /// [`crate::authority::EncodedSubject`], for the caller's later
+        /// requests.
+        ///
+        /// The handle has no I/O rights and cannot be duplicated to another
+        /// process. The broker returns `PolicyDenied` if the caller's current
+        /// authority does not admit the subject.
+        CreateSubject(SharedBufferSequence),
+        /// Release every object reference held by this process's pending
+        /// child, all of which this process duplicated into it, so that it may
+        /// duplicate references afresh after a start that did not take the
+        /// child.
+        ///
+        /// Releasing allocates nothing. The broker returns `UnknownObject` if
+        /// no matching child is in the caller's pending slot, or `PeerClosed`
+        /// if the caller or child is shutting down. While a release is in
+        /// progress, another release, duplication into this child, or an
+        /// operation taking the child returns `WouldBlock`.
+        ReleaseChildObjects(ProcessId),
     }
 }
 
@@ -847,6 +899,20 @@ wire_enum! {
         GetParentExitSignal(u32),
         /// The parent-exit signal was set.
         SetParentExitSignal,
+        /// The encoded length of the caller's authority, written to the
+        /// request's buffer if it is no longer than the buffer.
+        GetAuthority(u32),
+        /// The caller's authority was restricted.
+        RestrictAuthority,
+        /// The pending child's authority was restricted.
+        RestrictChildAuthority,
+        /// The subject was registered under this handle.
+        CreateSubject(ObjectHandle),
+        /// A start or exit took the pending child, then failed. Its numeric ID
+        /// no longer selects that allocation; the caller must not cancel or retry it.
+        ChildConsumed(ErrorCode),
+        /// The pending child's object references were released.
+        ReleaseChildObjects,
     }
 }
 

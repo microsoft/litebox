@@ -208,7 +208,7 @@ fn check_process_clones(litebox: &litebox::LiteBox<Platform>) {
     let zero = encode_clone_descriptor(0);
     let pending = encode_clone_descriptor(pending);
     for descriptor in [&replaced[..], &unissued, &zero, &pending[..4]] {
-        let child = litebox
+        let mut child = litebox
             .allocate_child_process(None, false)
             .expect("a child process");
         assert_eq!(

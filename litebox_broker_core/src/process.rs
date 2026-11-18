@@ -10,6 +10,7 @@ use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crate::authority::Authority;
 use crate::fs::FileService;
 use crate::job::Job;
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights, StatusFlags};
@@ -281,6 +282,8 @@ pub struct BrokerProcess {
     state: Mutex<BrokerProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
+    /// Guest authority, installed before publication and only narrowed thereafter.
+    pub(crate) authority: RwLock<Arc<Authority>>,
     /// Handles of the live object references owned by this process.
     references: Mutex<ProcessReferences>,
     /// Authoritative broker threads owned by this process, by their IDs in its
@@ -534,6 +537,8 @@ struct BrokerProcessState {
 /// A child retained until its parent requests startup.
 struct PendingChild {
     process: Arc<BrokerProcess>,
+    /// Taking the child or adding references must wait while destructors run outside the lock.
+    releasing_objects: bool,
     /// Memory image the child starts from, once written.
     image: Option<ChildImage>,
     /// Connection the child's runner associates through.
@@ -627,6 +632,7 @@ impl BrokerProcess {
         parent: Option<&Arc<BrokerProcess>>,
         creator: Option<&Arc<BrokerProcess>>,
         caller_credential: CallerCredential,
+        authority: Arc<Authority>,
     ) -> Self {
         let process_group = creator.map_or_else(
             || ProcessGroup::new(&ids),
@@ -669,6 +675,7 @@ impl BrokerProcess {
                 shutdown: None,
             }),
             caller_credential,
+            authority: RwLock::new(authority),
             references: Mutex::new(ProcessReferences {
                 handles: Vec::new(),
                 pending_handles: 0,
@@ -832,6 +839,7 @@ impl BrokerProcess {
             let child = parent.with_live_owner(|| {
                 self.core.register_process(
                     self.caller_credential,
+                    self.authority(),
                     pid_namespace,
                     &self.fs,
                     &self.job,
@@ -959,6 +967,7 @@ impl BrokerProcess {
                     if identity.is_ok() {
                         state.pending_child_process = Some(PendingChild {
                             process: Arc::clone(&child),
+                            releasing_objects: false,
                             image: None,
                             connection: None,
                         });
@@ -1031,7 +1040,7 @@ impl BrokerProcess {
         child_process_id: ProcessId,
     ) -> Result<ChildWithConnection<Connection>> {
         let mut state = self.state.lock();
-        let pending = self.pending_child(&mut state, child_process_id)?;
+        let pending = self.idle_pending_child(&mut state, child_process_id)?;
         let connection = match pending
             .connection
             .take()
@@ -1054,7 +1063,7 @@ impl BrokerProcess {
     /// Takes the pending child selected by `child_process_id`.
     fn take_pending_child(&self, child_process_id: ProcessId) -> Result<PendingChild> {
         let mut state = self.state.lock();
-        self.pending_child(&mut state, child_process_id)?;
+        self.idle_pending_child(&mut state, child_process_id)?;
         state
             .pending_child_process
             .take()
@@ -1123,22 +1132,40 @@ impl BrokerProcess {
         Ok(pending)
     }
 
+    fn idle_pending_child<'a>(
+        &self,
+        state: &'a mut BrokerProcessState,
+        id: ProcessId,
+    ) -> Result<&'a mut PendingChild> {
+        let pending = self.pending_child(state, id)?;
+        if pending.releasing_objects {
+            return Err(BrokerError::WouldBlock);
+        }
+        Ok(pending)
+    }
+
     /// Records the exit of the pending child selected by `child_process_id`.
     ///
     /// A child may run in this process's runner before starting its own, as a
     /// Linux `vfork` child does until `execve`. If it exits there, it retains
     /// `exit_status`, like a started child after [`Self::complete_exit`]. Its
     /// CPU time is that runner's, so the child reports none of its own.
+    /// An outer error means the child was not taken; an inner error means it
+    /// was taken but recording its exit failed.
     pub fn exit_child_process(
         &self,
         child_process_id: ProcessId,
         exit_status: ProcessExitStatus,
-    ) -> Result<()> {
+    ) -> Result<Result<()>> {
         let child = self.take_child_process(child_process_id)?;
+        Ok(child.finish_pending_exit(exit_status))
+    }
+
+    fn finish_pending_exit(&self, exit_status: ProcessExitStatus) -> Result<()> {
         // The child never had a runner, so its teardown is fully accounted.
-        child.retire(true);
+        self.retire(true);
         let release_thread_ids = {
-            let mut state = child.state.lock();
+            let mut state = self.state.lock();
             // Owner death fails the child if it takes the child lock first.
             if let ProcessStatus::Failed(error) = state.status {
                 return Err(error);
@@ -1149,7 +1176,7 @@ impl BrokerProcess {
                 ProcessRetirement::Retired { release_ids: true }
             )
         };
-        child.finish_exit(exit_status, CpuTime::default(), release_thread_ids)
+        self.finish_exit(exit_status, CpuTime::default(), release_thread_ids)
     }
 
     /// Discards the pending child selected by `child_process_id`, as if it
@@ -1571,7 +1598,8 @@ impl BrokerProcess {
     ///
     /// Returned handles follow the requested order and belong to the child,
     /// which releases them when it terminates. If duplication fails, the
-    /// child receives none of them.
+    /// child receives none of them. `PeerClosed` means the target allocation
+    /// is unavailable; `UnknownObject` refers to a source, not the child.
     ///
     /// Since the child can now change these objects, this process's
     /// references first start publishing readiness through `readiness_sink`,
@@ -1584,29 +1612,65 @@ impl BrokerProcess {
     ) -> Result<Vec<ObjectHandle>> {
         // A registration left behind by a later failure only publishes
         // readiness the process does not need.
-        self.register_readiness(readiness_sink)?;
+        let source_error = |error| match error {
+            BrokerError::PeerClosed => BrokerError::UnknownObject,
+            error => error,
+        };
+        self.register_readiness(readiness_sink)
+            .map_err(source_error)?;
         // Hold the state lock so the child stays pending, since a child
         // removed from its slot may release its references before receiving
         // these.
-        let state = self.state.lock();
-        if !self.accepts_operations(&state) {
-            return Err(BrokerError::PeerClosed);
-        }
-        let child = &state
-            .pending_child_process
-            .as_ref()
-            .filter(|pending| {
-                pending
-                    .process
-                    .process_id_in_namespace(self.pid_namespace())
-                    == Some(child_process_id)
-            })
-            .ok_or(BrokerError::UnknownObject)?
+        let mut state = self.state.lock();
+        let child = &self
+            .idle_pending_child(&mut state, child_process_id)
+            .map_err(|error| match error {
+                BrokerError::UnknownObject => BrokerError::PeerClosed,
+                error => error,
+            })?
             .process;
-        if !child.awaits_startup(&child.state.lock()) {
-            return Err(BrokerError::PeerClosed);
-        }
         self.duplicate_object_references_to(handles, child)
+            .map_err(source_error)
+    }
+
+    /// Releases every object reference held by the pending child selected by
+    /// `child_process_id`, so that this process may duplicate references into
+    /// it afresh after a start that did not take it.
+    ///
+    /// Only [`Self::duplicate_object_references_to_child`] gives a pending
+    /// child references, so these are exactly the ones this process gave it.
+    /// Releasing allocates nothing.
+    pub fn release_child_object_references(&self, child_process_id: ProcessId) -> Result<()> {
+        let mut state = self.state.lock();
+        let pending = self.idle_pending_child(&mut state, child_process_id)?;
+        pending.releasing_objects = true;
+        let key = pending.process.key;
+        loop {
+            // Owner teardown can remove the slot while a destructor runs. Never
+            // continue a release against a different allocation, even if its ID matches.
+            let pending = state
+                .pending_child_process
+                .as_mut()
+                .filter(|pending| pending.process.key == key)
+                .ok_or(BrokerError::PeerClosed)?;
+            let handle = pending.process.references.lock().handles.last().copied();
+            let Some(handle) = handle else {
+                pending.releasing_objects = false;
+                return Ok(());
+            };
+            let reference = match pending.process.remove_object_reference(handle) {
+                Ok(reference) => reference,
+                Err(error) => {
+                    pending.releasing_objects = false;
+                    return Err(error);
+                }
+            };
+            // Object destruction may lock the creator. The slot remains busy,
+            // so no start can observe a partially released table.
+            drop(state);
+            drop(reference);
+            state = self.state.lock();
+        }
     }
 
     /// Returns the process group this process is in, and so its session.
@@ -4674,7 +4738,7 @@ mod tests {
         let changes = lifecycle.changes.load(Ordering::Relaxed);
         let threads = broker.core.active_thread_count.load(Ordering::Relaxed);
 
-        assert_eq!(parent.exit_child_process(process_id, EXITED), Ok(()));
+        assert_eq!(parent.exit_child_process(process_id, EXITED), Ok(Ok(())));
 
         let exit = ChildExit {
             process_id,
@@ -4949,7 +5013,10 @@ mod tests {
         assert_eq!(reserved(), 8);
         child.complete_start().unwrap();
 
-        second.exit_child_process(second_child, EXITED).unwrap();
+        second
+            .exit_child_process(second_child, EXITED)
+            .unwrap()
+            .unwrap();
         assert_eq!(reserved(), 0);
     }
 
@@ -5005,8 +5072,17 @@ mod tests {
 
         assert_eq!(
             parent.duplicate_object_references_to_child(ProcessId(child_id.0 + 1), &[first], &sink),
+            Err(BrokerError::PeerClosed)
+        );
+        assert_eq!(
+            parent.duplicate_object_references_to_child(
+                child_id,
+                &[first, ObjectHandle(u64::MAX)],
+                &sink
+            ),
             Err(BrokerError::UnknownObject)
         );
+        assert_eq!(child.references.lock().handles, []);
         // A signals reference is not duplicable, so the child receives nothing.
         let signals = crate::signal::open(&parent, readiness_sink()).unwrap();
         assert_eq!(
@@ -5028,11 +5104,14 @@ mod tests {
             Ok(ReadinessFlags::WRITE)
         );
 
-        parent.exit_child_process(child_id, EXITED).unwrap();
+        parent
+            .exit_child_process(child_id, EXITED)
+            .unwrap()
+            .unwrap();
         assert_eq!(child.references.lock().handles, []);
         assert_eq!(
             parent.duplicate_object_references_to_child(child_id, &[first], &sink),
-            Err(BrokerError::UnknownObject)
+            Err(BrokerError::PeerClosed)
         );
 
         // A child that fails to start also releases them while its parent still holds it.
@@ -5050,6 +5129,83 @@ mod tests {
             parent.check_readiness(first),
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
         );
+    }
+
+    #[test]
+    fn pending_child_cannot_start_or_inherit_during_reference_release() {
+        use crate::readiness::ReadinessRegistration;
+
+        struct OnDrop<F: Fn()>(F);
+        impl<F: Fn()> Drop for OnDrop<F> {
+            fn drop(&mut self) {
+                (self.0)();
+            }
+        }
+
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let id = parent
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        let event = crate::event::create(&parent, 1, FileOpenFlags::NONE).unwrap();
+        let sink: Arc<dyn ReadinessSink> = readiness_sink();
+        let handles = parent
+            .duplicate_object_references_to_child(id, &[event, event], &sink)
+            .unwrap();
+        let last = handles[1];
+        let observed = Arc::new(AtomicUsize::new(0));
+        let probe = {
+            let parent = Arc::downgrade(&parent);
+            let observed = Arc::clone(&observed);
+            let sink = Arc::clone(&sink);
+            Arc::new(OnDrop(move || {
+                let parent = parent.upgrade().unwrap();
+                assert!(
+                    parent.state.try_lock().is_some(),
+                    "destructors run outside the creator lock"
+                );
+                assert!(matches!(
+                    parent.take_child_process(id),
+                    Err(BrokerError::WouldBlock)
+                ));
+                assert!(matches!(
+                    parent.take_child_process_with_connection::<()>(id),
+                    Err(BrokerError::WouldBlock)
+                ));
+                assert_eq!(
+                    parent.duplicate_object_references_to_child(id, &[event], &sink),
+                    Err(BrokerError::WouldBlock)
+                );
+                assert_eq!(
+                    parent.release_child_object_references(id),
+                    Err(BrokerError::WouldBlock)
+                );
+                observed.fetch_add(1, Ordering::Relaxed);
+            }))
+        };
+        parent
+            .core
+            .references
+            .write()
+            .get_mut(&last)
+            .unwrap()
+            .readiness = Some(ReadinessRegistration::new_with_retirement_guard(
+            last, sink, probe,
+        ));
+
+        parent.release_child_object_references(id).unwrap();
+        assert_eq!(observed.load(Ordering::Relaxed), 1);
+        let child = parent.take_child_process(id).unwrap();
+        assert_eq!(child.references.lock().handles, []);
     }
 
     #[test]

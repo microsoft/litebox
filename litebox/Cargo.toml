@@ -36,6 +36,9 @@ panic_on_unclosed_fd_drop = []
 enforce_singleton_litebox_instance = []
 
 [dev-dependencies]
+# An in-process broker for end-to-end tests of broker-backed APIs.
+litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core", features = ["test-std-platform", "test-support"] }
+litebox_broker_host = { version = "0.1.0", path = "../litebox_broker_host", features = ["test-support"] }
 litebox_broker_local = { version = "0.1.0", path = "../litebox_broker_local", features = ["test-support"] }
 
 [lints]

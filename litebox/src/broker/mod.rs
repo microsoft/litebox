@@ -12,6 +12,9 @@ use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::ThreadId;
+use litebox_broker_protocol::authority::{
+    EncodedSubject, EncodedTerms, MAX_ENCODED_TERMS_SIZE, Term,
+};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::fs::{
@@ -21,7 +24,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    ChildCompletion, ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
     MAX_PROCESS_BOOTSTRAP_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
@@ -89,6 +92,13 @@ pub(crate) trait BrokerControl: Send + Sync {
         child_process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<(), BrokerControlError>;
 
+    /// Releases every object reference [`Self::duplicate_objects_to_child`] gave the pending
+    /// child, which stays pending.
+    fn release_child_objects(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError>;
+
     /// Creates the control connection for a native clone that will start as the pending child,
     /// returning the token under which the broker delivered the runner's end.
     fn request_child_connection(
@@ -100,7 +110,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
         payload: &[u8],
-    ) -> core::result::Result<(), BrokerControlError>;
+    ) -> core::result::Result<ChildCompletion, BrokerControlError>;
 
     /// Starts the logical guest child using an already-created host runner.
     ///
@@ -111,7 +121,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         child_process_id: litebox_broker_protocol::ProcessId,
         runner_descriptor: &[u8],
         payload: &[u8],
-    ) -> core::result::Result<(), BrokerControlError>;
+    ) -> core::result::Result<ChildCompletion, BrokerControlError>;
 
     fn write_child_memory(
         &self,
@@ -124,7 +134,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
         exit_status: ProcessExitStatus,
-    ) -> core::result::Result<(), BrokerControlError>;
+    ) -> core::result::Result<ChildCompletion, BrokerControlError>;
 
     fn duplicate_objects_to_child(
         &self,
@@ -201,6 +211,25 @@ pub(crate) trait BrokerControl: Send + Sync {
         process_id: litebox_broker_protocol::ProcessId,
         signal: u32,
     ) -> core::result::Result<(), BrokerControlError>;
+
+    /// Returns a snapshot of this process's authority terms.
+    fn get_authority(&self) -> core::result::Result<Vec<Term>, BrokerControlError>;
+
+    fn restrict_authority(
+        &self,
+        terms: &EncodedTerms,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn restrict_child_authority(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        terms: &EncodedTerms,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn create_subject(
+        &self,
+        subject: &EncodedSubject,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -1004,6 +1033,13 @@ where
         self.request(|local| local.cancel_child_process(child_process_id))
     }
 
+    fn release_child_objects(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.release_child_objects(child_process_id))
+    }
+
     fn request_child_connection(
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
@@ -1015,7 +1051,7 @@ where
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
         payload: &[u8],
-    ) -> core::result::Result<(), BrokerControlError> {
+    ) -> core::result::Result<ChildCompletion, BrokerControlError> {
         if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -1030,7 +1066,7 @@ where
         child_process_id: litebox_broker_protocol::ProcessId,
         runner_descriptor: &[u8],
         payload: &[u8],
-    ) -> core::result::Result<(), BrokerControlError> {
+    ) -> core::result::Result<ChildCompletion, BrokerControlError> {
         use litebox_broker_protocol::process::{
             MAX_EXISTING_RUNNER_START_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
         };
@@ -1075,7 +1111,7 @@ where
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
         exit_status: ProcessExitStatus,
-    ) -> core::result::Result<(), BrokerControlError> {
+    ) -> core::result::Result<ChildCompletion, BrokerControlError> {
         self.request(|local| local.exit_child_process(child_process_id, exit_status))
     }
 
@@ -1194,6 +1230,44 @@ where
         signal: u32,
     ) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.set_parent_exit_signal(process_id, signal))
+    }
+
+    fn get_authority(&self) -> core::result::Result<Vec<Term>, BrokerControlError> {
+        // One slot holds a typical authority; the retry's maximum always fits.
+        for length in [SHARED_BUFFER_SLOT_SIZE, MAX_ENCODED_TERMS_SIZE] {
+            let lease = self.acquire_shared_buffer(length as usize)?;
+            if let Some(terms) = self.request(|local| local.get_authority(lease.sequence()))? {
+                return Ok(terms);
+            }
+        }
+        panic!("broker authority exceeds its protocol ceiling");
+    }
+
+    fn restrict_authority(
+        &self,
+        terms: &EncodedTerms,
+    ) -> core::result::Result<(), BrokerControlError> {
+        let lease = self.acquire_shared_buffer(terms.as_bytes().len())?;
+        self.request(|local| local.restrict_authority(lease.sequence(), terms))
+    }
+
+    fn restrict_child_authority(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        terms: &EncodedTerms,
+    ) -> core::result::Result<(), BrokerControlError> {
+        let lease = self.acquire_shared_buffer(terms.as_bytes().len())?;
+        self.request(|local| {
+            local.restrict_child_authority(child_process_id, lease.sequence(), terms)
+        })
+    }
+
+    fn create_subject(
+        &self,
+        subject: &EncodedSubject,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        let lease = self.acquire_shared_buffer(subject.as_bytes().len())?;
+        self.request(|local| local.create_subject(lease.sequence(), subject))
     }
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {

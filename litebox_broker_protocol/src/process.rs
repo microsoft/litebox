@@ -21,6 +21,10 @@ pub const MAX_RUNNER_DESCRIPTOR_SIZE: u32 = 4 * 1024;
 pub const MAX_EXISTING_RUNNER_START_SIZE: u32 =
     MAX_RUNNER_DESCRIPTOR_SIZE + MAX_PROCESS_BOOTSTRAP_SIZE;
 
+/// Outcome after the broker took a pending child for start or exit. Even an
+/// error here consumes the allocation, unlike a request rejected before take.
+pub type ChildCompletion = Result<(), crate::error::ErrorCode>;
+
 wire_struct! {
     /// Child startup descriptor transported through the broker protocol.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -500,6 +504,8 @@ wire_struct! {
     /// `handles` holds the caller's handles as consecutive little-endian `u64`
     /// values. On success, the broker overwrites them in place with the child's
     /// handles in the same order. Either every reference is duplicated or none is.
+    /// `PeerClosed` means the caller cannot use this pending child anymore.
+    /// `UnknownObject` means a source reference is unavailable.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct DuplicateObjectsToChildRequest {
         /// Pending child that receives the duplicates.

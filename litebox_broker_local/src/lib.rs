@@ -233,7 +233,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 | ErrorCode::NonBlockingWouldBlock
                 | ErrorCode::PeerClosed
                 | ErrorCode::OutOfMemory
-                | ErrorCode::UnsupportedOperation => Err(BrokerLocalError::Broker(error)),
+                | ErrorCode::UnsupportedOperation
+                | ErrorCode::StaleSubject => Err(BrokerLocalError::Broker(error)),
                 ErrorCode::UnsupportedVersion
                 | ErrorCode::MalformedRequest
                 | ErrorCode::ProtocolState
@@ -551,7 +552,11 @@ mod tests {
 
     #[test]
     fn active_request_returns_recoverable_broker_errors() {
-        for error in [ErrorCode::WouldBlock, ErrorCode::UnsupportedOperation] {
+        for error in [
+            ErrorCode::WouldBlock,
+            ErrorCode::UnsupportedOperation,
+            ErrorCode::StaleSubject,
+        ] {
             let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(error)));
             let local = test_broker_local(channel, noop_shared_memory());
 

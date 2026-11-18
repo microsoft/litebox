@@ -4,6 +4,7 @@
 use super::*;
 use core::time::Duration;
 
+use crate::authority::RestrictChildAuthorityRequest;
 use crate::error::ErrorCode;
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
@@ -639,6 +640,16 @@ fn request_codec_round_trips_all_variants() {
             name: sequence(0, 0),
         })),
         BrokerOperation::Process(ProcessRequest::CopyHostNames(process_id(u32::MAX))),
+        BrokerOperation::Process(ProcessRequest::GetAuthority(largest_sequence)),
+        BrokerOperation::Process(ProcessRequest::RestrictAuthority(sequence(0, 0))),
+        BrokerOperation::Process(ProcessRequest::RestrictChildAuthority(
+            RestrictChildAuthorityRequest {
+                child_process_id: process_id(u32::MAX),
+                terms: largest_sequence,
+            }
+        )),
+        BrokerOperation::Process(ProcessRequest::CreateSubject(sequence(1, 2))),
+        BrokerOperation::Process(ProcessRequest::ReleaseChildObjects(process_id(u32::MAX))),
         BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
             socket_type: SocketType::Stream,
             flags: FileOpenFlags::NONBLOCKING,
@@ -1399,12 +1410,20 @@ fn response_codec_round_trips_all_variants() {
         })),
         BrokerResult::Process(ProcessResponse::SetHostName),
         BrokerResult::Process(ProcessResponse::CopyHostNames),
+        BrokerResult::Process(ProcessResponse::GetAuthority(0)),
+        BrokerResult::Process(ProcessResponse::GetAuthority(u32::MAX)),
+        BrokerResult::Process(ProcessResponse::RestrictAuthority),
+        BrokerResult::Process(ProcessResponse::RestrictChildAuthority),
+        BrokerResult::Process(ProcessResponse::CreateSubject(ObjectHandle(u64::MAX))),
+        BrokerResult::Process(ProcessResponse::ChildConsumed(ErrorCode::ResourceExhausted)),
+        BrokerResult::Process(ProcessResponse::ReleaseChildObjects),
         BrokerResult::Error(ErrorCode::PolicyDenied),
         BrokerResult::Error(ErrorCode::WouldBlock),
         BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
         BrokerResult::Error(ErrorCode::PeerClosed),
         BrokerResult::Error(ErrorCode::OutOfMemory),
         BrokerResult::Error(ErrorCode::Internal),
+        BrokerResult::Error(ErrorCode::StaleSubject),
     ];
     let mut maximum_encoded_size = 0;
 
@@ -2810,6 +2829,97 @@ fn event_add_response_wire_shape_is_pinned() {
             })),
         }),
         [1, 13, 0, 0, 0, 0, 0, 0, 0, 5, 1, 1, 0, 0, 0]
+    );
+}
+
+#[test]
+fn authority_request_wire_shapes_are_pinned() {
+    let encode = |operation| {
+        encode_request(&BrokerRequest {
+            request_id: RequestId(13),
+            operation: BrokerOperation::Process(operation),
+        })
+    };
+    let header = [1, 13, 0, 0, 0, 0, 0, 0, 0, 10];
+    assert_eq!(
+        encode(ProcessRequest::GetAuthority(sequence(2, 3))),
+        [&header[..], &[24, 1, 2, 0, 0, 0, 3, 0, 0, 0]].concat()
+    );
+    assert_eq!(
+        encode(ProcessRequest::RestrictAuthority(sequence(2, 3))),
+        [&header[..], &[25, 1, 2, 0, 0, 0, 3, 0, 0, 0]].concat()
+    );
+    assert_eq!(
+        encode(ProcessRequest::RestrictChildAuthority(
+            RestrictChildAuthorityRequest {
+                child_process_id: ProcessId(5),
+                terms: sequence(2, 3),
+            }
+        )),
+        [&header[..], &[26, 5, 0, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0]].concat()
+    );
+    assert_eq!(
+        encode(ProcessRequest::CreateSubject(sequence(2, 3))),
+        [&header[..], &[27, 1, 2, 0, 0, 0, 3, 0, 0, 0]].concat()
+    );
+}
+
+#[test]
+fn authority_response_wire_shapes_are_pinned() {
+    let encode = |result| {
+        encode_response(&BrokerResponse {
+            request_id: RequestId(13),
+            result,
+        })
+    };
+    let header = [1, 13, 0, 0, 0, 0, 0, 0, 0];
+    assert_eq!(
+        encode(BrokerResult::Process(ProcessResponse::GetAuthority(7))),
+        [&header[..], &[10, 24, 7, 0, 0, 0]].concat()
+    );
+    assert_eq!(
+        encode(BrokerResult::Process(ProcessResponse::RestrictAuthority)),
+        [&header[..], &[10, 25]].concat()
+    );
+    assert_eq!(
+        encode(BrokerResult::Process(
+            ProcessResponse::RestrictChildAuthority
+        )),
+        [&header[..], &[10, 26]].concat()
+    );
+    assert_eq!(
+        encode(BrokerResult::Process(ProcessResponse::CreateSubject(
+            ObjectHandle(9)
+        ))),
+        [&header[..], &[10, 27, 9, 0, 0, 0, 0, 0, 0, 0]].concat()
+    );
+    assert_eq!(
+        encode(BrokerResult::Error(ErrorCode::StaleSubject)),
+        [&header[..], &[18, 13]].concat()
+    );
+    assert_eq!(
+        encode(BrokerResult::Process(ProcessResponse::ChildConsumed(
+            ErrorCode::ResourceExhausted,
+        ))),
+        [&header[..], &[10, 28, 8]].concat()
+    );
+}
+
+#[test]
+fn child_object_release_wire_shapes_are_pinned() {
+    assert_eq!(
+        encode_request(&BrokerRequest {
+            request_id: RequestId(13),
+            operation: BrokerOperation::Process(ProcessRequest::ReleaseChildObjects(ProcessId(5))),
+        }),
+        [1, 13, 0, 0, 0, 0, 0, 0, 0, 10, 28, 5, 0, 0, 0]
+    );
+    assert_eq!(
+        encode_response(&BrokerResponse {
+            request_id: RequestId(13),
+            result: BrokerResult::Process(ProcessResponse::ReleaseChildObjects),
+        }),
+        [1, 13, 0, 0, 0, 0, 0, 0, 0, 10, 29]
     );
 }
 

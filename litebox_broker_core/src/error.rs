@@ -32,6 +32,8 @@ pub enum BrokerError {
     OutOfMemory,
     #[error("unsupported broker operation")]
     UnsupportedOperation,
+    #[error("the process's authority no longer admits this subject")]
+    StaleSubject,
 }
 
 impl BrokerError {
@@ -68,6 +70,7 @@ impl From<BrokerError> for ErrorCode {
             BrokerError::PeerClosed => Self::PeerClosed,
             BrokerError::OutOfMemory => Self::OutOfMemory,
             BrokerError::UnsupportedOperation => Self::UnsupportedOperation,
+            BrokerError::StaleSubject => Self::StaleSubject,
         }
     }
 }

@@ -66,7 +66,7 @@ impl From<ErrorCode> for BrokerObjectError {
             ErrorCode::WouldBlock => Self::WouldBlock,
             ErrorCode::PeerClosed => Self::PeerClosed,
             ErrorCode::ResourceExhausted => Self::ResourceExhausted,
-            ErrorCode::PolicyDenied => Self::PermissionDenied,
+            ErrorCode::PolicyDenied | ErrorCode::StaleSubject => Self::PermissionDenied,
             ErrorCode::OutOfMemory => Self::OutOfMemory,
             ErrorCode::UnsupportedOperation => Self::UnsupportedOperation,
             ErrorCode::UnsupportedVersion
