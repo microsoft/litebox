@@ -76,6 +76,32 @@ fn scopes_and_alternative_terms_do_not_combine() {
 }
 
 #[test]
+fn restriction_requires_both_scopes_to_fit_one_parent_term() {
+    let a = term(user(1));
+    let b = term(user(2));
+    let mut authority = Authority::new([a.clone(), b.clone()]).unwrap();
+    let mixed = Term {
+        access: a.access,
+        identity: b.identity,
+        ..Term::default()
+    };
+    assert_eq!(
+        authority.restrict([mixed]),
+        Err(AuthorityError::NotRestriction)
+    );
+}
+
+#[test]
+fn unmapped_deny_only_principal_does_not_confer_membership() {
+    let authority = Authority::new([term(user(1))]).unwrap();
+    let mut s = subject(user(1));
+    s.deny_only.insert(Principal::UNMAPPED);
+    assert!(authority.admits(&s));
+    s.identities.insert(Principal::UNMAPPED);
+    assert!(!authority.admits(&s));
+}
+
+#[test]
 fn slot_is_not_a_membership_and_deny_only_is_not_optional() {
     let membership = group(1); // Also the primary group.
     let original = Term {

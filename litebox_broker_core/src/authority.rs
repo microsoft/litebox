@@ -61,10 +61,7 @@ impl Authority {
     /// Whether one term admits this whole subject. Callers must also require
     /// the appropriate scope and check the operation against its object.
     pub fn admits(&self, subject: &Subject) -> bool {
-        // All enabled identities and both slots are already bounded by terms.
-        // Extra deny-only identities are not, but even they must be mapped.
-        subject.deny_only.iter().copied().all(mapped)
-            && self.terms.iter().any(|term| admits(term, subject))
+        self.terms.iter().any(|term| admits(term, subject))
     }
 
     /// Whether every term fits in one term of `other`. This compares
