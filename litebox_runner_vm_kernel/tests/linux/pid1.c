@@ -1,10 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Booted as litebox.init: checks that it is process 1 with no parent, and
-// that it adopts and reaps orphans, as Linux init does.
+// Booted as litebox.init: checks that it is process 1 with no parent, that
+// no other process can kill it, and that it adopts and reaps orphans, as Linux
+// init does.
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -21,6 +23,13 @@ static pid_t wait_for_new_parent(pid_t parent) {
 int main(void) {
     pid_t self = getpid();
     pid_t parent = getppid();
+    int status;
+    pid_t sender = fork();
+    if (sender == 0) {
+        _exit(kill(1, SIGTERM) == 0 && kill(1, SIGKILL) == 0 ? 0 : 1);
+    }
+    int survived = sender > 0 && waitpid(sender, &status, 0) == sender && WIFEXITED(status) &&
+                   WEXITSTATUS(status) == 0;
     int fds[2];
     if (pipe(fds) != 0) {
         perror("pipe");
@@ -42,7 +51,6 @@ int main(void) {
         _exit(grandchild < 0);
     }
     close(fds[1]);
-    int status;
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         perror("waitpid");
         return 1;
@@ -55,7 +63,8 @@ int main(void) {
     }
     int reaped = waitpid(-1, &status, 0) == ids[0] && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     int childless = wait(NULL) == -1 && errno == ECHILD;
-    printf("pid %d\nparent %d\norphan's parent %d\nreaped the orphan %d\nno children %d\n", self,
-           parent, ids[1], reaped, childless);
-    return self == 1 && parent == 0 && ids[1] == 1 && reaped && childless ? 0 : 1;
+    printf("pid %d\nparent %d\nsurvived kills %d\norphan's parent %d\nreaped the orphan %d\n"
+           "no children %d\n",
+           self, parent, survived, ids[1], reaped, childless);
+    return self == 1 && parent == 0 && survived && ids[1] == 1 && reaped && childless ? 0 : 1;
 }

@@ -19,6 +19,11 @@ pub const PATH_KEY: &str = "litebox.init";
 /// Init's path without [`PATH_KEY`]: the guest service.
 pub const DEFAULT_PATH: &str = "/.litebox/guest-service";
 
+/// The command line's key that, set to `0`, runs init as an ordinary process, which other
+/// processes can kill.
+#[cfg(debug_assertions)]
+pub const AS_INIT_KEY: &str = "litebox.root_process_as_init";
+
 /// The command line's key that, set to `1`, sets [`ProcessConfig::give_up_once`].
 #[cfg(debug_assertions)]
 pub const REPLAY_KEY: &str = "litebox.replay";

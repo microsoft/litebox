@@ -74,9 +74,12 @@ int main(int argc, char **argv) {
         return argc > 2 ? atoi(argv[2]) : 0;
     }
     if (strcmp(mode, "cat") == 0) return cat();
-    // Kills the guest service, then waits for signals.
+    // Tries to kill the guest service, then waits for signals.
     if (strcmp(mode, "kill-service") == 0) {
-        kill(1, SIGKILL);
+        int sent = kill(1, SIGTERM) == 0 && kill(1, SIGINT) == 0 && kill(1, SIGHUP) == 0 &&
+                   kill(1, SIGKILL) == 0;
+        printf("sent %d\n", sent);
+        fflush(stdout);
         for (;;) pause();
     }
     if (strcmp(mode, "signals") == 0) return signals();

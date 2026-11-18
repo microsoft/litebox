@@ -64,6 +64,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, OnceCell, RefCell};
 use core::convert::Infallible;
+use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
@@ -74,7 +75,7 @@ use litebox_broker_host::{
 };
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
 use litebox_broker_protocol::process::ProcessStartupData;
-use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
+use litebox_broker_protocol::process::{CpuTime, PidNamespaceOptions, ProcessExitStatus};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
 use litebox_broker_protocol::wire;
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -136,6 +137,8 @@ pub struct Config {
     /// the userland broker's `allow_process_duplication`; the kernel then
     /// creates their runner processes (see [`PendingRunnerAssociation`]).
     pub allow_process_duplication: bool,
+    /// The options of the roots' PID namespace.
+    pub pid_namespace: PidNamespaceOptions,
 }
 
 /// The kernel's broker; clones share it.
@@ -192,6 +195,7 @@ impl Broker {
                 .clone()
                 .map(|vsock| vsock as Arc<dyn litebox_broker_core::vsock_socket::VsockProvider>),
             config.allow_process_duplication,
+            config.pid_namespace,
         );
         let job = Job::new(None);
         Self {
@@ -283,13 +287,14 @@ impl Broker {
             PinnedControlRing::new(control_ring_pages).expect("the pages hold the control ring");
         let ring = ControlRing::new(memory, CONTROL_RING_LAYOUT)
             .expect("a pinned control ring has the exact size");
-        Association {
+        let association = Association {
             broker: self.clone(),
             readiness: Arc::new(KernelReadiness::new()),
             launched,
             process: launch
                 .as_ref()
                 .map_or_default(|launch| OnceCell::from(launch.process.clone())),
+            shutdown_requested: Arc::default(),
             exit_status: Cell::new(None),
             launcher: Arc::new(KernelProcessLauncher::default()),
             state: RefCell::new(State::New(
@@ -299,7 +304,11 @@ impl Broker {
             )),
             adoption_response: Cell::new(None),
             submitted: Cell::new(false),
+        };
+        if let Some(process) = association.process.get() {
+            association.install_shutdown(process);
         }
+        association
     }
 
     /// Looks at what changes outside requests: standard streams, timers, the
@@ -398,6 +407,8 @@ pub struct Association {
     /// association, which [`Self::adopt`] gives one. The process's end
     /// completes its exit.
     process: OnceCell<Arc<BrokerProcess>>,
+    /// Set once the broker asks to shut the process down.
+    shutdown_requested: Arc<AtomicBool>,
     /// Once the process ended (see [`Self::exited`]); the association ends
     /// as soon as the worker is not using it.
     exit_status: Cell<Option<ProcessExitStatus>>,
@@ -714,6 +725,7 @@ impl Association {
             && let State::New(_, _, pending @ None) = &mut *state
         {
             let _ = self.process.set(launch.process.clone());
+            self.install_shutdown(&launch.process);
             *pending = Some(launch);
         } else {
             launch.fail(BrokerError::PolicyDenied);
@@ -727,6 +739,20 @@ impl Association {
             // Dropping `launch` failed the start.
             _ => Err(BrokerError::PeerClosed),
         }
+    }
+
+    /// Whether the broker asked to shut the process down (e.g., its PID
+    /// namespace ended), which the kernel does by killing it.
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    fn install_shutdown(&self, process: &BrokerProcess) {
+        let requested = Arc::clone(&self.shutdown_requested);
+        process.install_shutdown(Arc::new(move || {
+            requested.store(true, Ordering::SeqCst);
+            cpu::notify_all();
+        }));
     }
 
     /// The process ended (e.g., it exited, or the kernel killed it) with

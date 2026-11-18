@@ -11,7 +11,6 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use clap::Parser as _;
-use litebox_broker_core::pid_namespace::PidNamespace;
 use litebox_broker_core::{BrokerCoreLimits, BrokerProcess, ObjectRights, PolicyEngine};
 use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
@@ -45,7 +44,7 @@ pub(super) fn run(
     )?;
     // The bridge runs until `run` returns.
     let (core, _vsock) = super::build_broker(policy, limits, &args)?;
-    let pid_namespace = Arc::new(PidNamespace::new(&core)?);
+    let pid_namespace = super::create_pid_namespace(&core, &args)?;
 
     if args.in_process_runner {
         debug_assert!(args.unstable);

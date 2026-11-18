@@ -1375,13 +1375,29 @@ fn a_broker_that_dies_stops_created_execs_and_refuses_more() {
 
 #[test]
 fn a_dead_guest_service_stops_the_broker() {
-    let mut shim = Shim::launch(&process(&["guest", "kill-service"]));
+    let mut shim = Shim::launch(&process(&["guest", "family"]));
     let pid = shim.create().unwrap();
     let members = group_members(pid);
+    let [service] = processes_with(1, pid)[..] else {
+        panic!("the broker has runners other than the guest service's")
+    };
     shim.start("").unwrap();
+    shim.wait_output("c.out", "child\n");
+    let service = rustix::process::Pid::from_raw(service.try_into().unwrap()).unwrap();
+    rustix::process::kill_process(service, rustix::process::Signal::KILL).unwrap();
     assert_eq!(shim.wait(""), 255);
     assert_eq!(members(), 0);
     shim.finish(pid);
+}
+
+#[test]
+fn the_container_cannot_kill_the_guest_service() {
+    let mut shim = Shim::launch(&process(&["guest", "kill-service"]));
+    let pid = shim.create().unwrap();
+    shim.start("").unwrap();
+    shim.wait_output("c.out", "sent 1\n");
+    assert_eq!(shim.run("e1", &["guest", "exit", "5"]).0, 5);
+    shim.kill_and_finish(pid);
 }
 
 /// Stops the runners of `broker`, the test's own broker, the guest service's among them; then

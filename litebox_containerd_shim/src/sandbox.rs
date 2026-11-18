@@ -295,7 +295,12 @@ fn broker_arguments(
     runner: &Path,
 ) {
     command
-        .args(["--unstable", "--allow-process-duplication", "--vsock-uds"])
+        .args([
+            "--unstable",
+            "--allow-process-duplication",
+            "--root-process-as-init",
+            "--vsock-uds",
+        ])
         .arg(state.bridge())
         .arg("--fs-initial-files")
         .arg(state.archive());

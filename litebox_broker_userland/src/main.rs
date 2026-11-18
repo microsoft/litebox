@@ -28,7 +28,7 @@ use litebox_broker_core::random::RandomProvider as _;
 use litebox_broker_core::terminal::TerminalEndpoint;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, BrokerProcess, PolicyEngine, VsockPolicy, job::Job,
+    BrokerCore, BrokerCoreLimits, BrokerError, BrokerProcess, PolicyEngine, VsockPolicy, job::Job,
     pid_namespace::PidNamespace,
 };
 use litebox_broker_core::{
@@ -36,6 +36,8 @@ use litebox_broker_core::{
     SocketPolicyError,
 };
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_protocol::process::PidNamespaceOptions;
 use litebox_broker_protocol::socket::Port;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 use litebox_broker_protocol::vsock_socket::VsockCid;
@@ -188,6 +190,11 @@ struct CliArgs {
         conflicts_with = "in_process_runner"
     )]
     allow_process_duplication: bool,
+    /// Run the root as the guest's init, like Linux's process 1: other guest processes cannot kill
+    /// it, and its exit kills them.
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+    #[arg(long)]
+    root_process_as_init: bool,
     /// Local runner executable to launch.
     #[arg(
         long,
@@ -310,6 +317,19 @@ fn start_vsock_bridge(path: &Path, guest_cid: VsockCid) -> IoResult<HybridVsock>
         .fill(&mut seed)
         .map_err(|_| IoError::other("no randomness for the vsock ports"))?;
     HybridVsock::start(path, guest_cid, u64::from_ne_bytes(seed))
+}
+
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+fn create_pid_namespace(
+    core: &BrokerCore,
+    args: &CliArgs,
+) -> Result<Arc<PidNamespace>, BrokerError> {
+    let options = if args.root_process_as_init {
+        PidNamespaceOptions::INIT
+    } else {
+        PidNamespaceOptions::default()
+    };
+    PidNamespace::with_options(core, options).map(Arc::new)
 }
 
 fn create_file_service<Platform>(

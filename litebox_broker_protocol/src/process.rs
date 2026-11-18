@@ -39,7 +39,7 @@ pub struct ProcessStartupData {
 
 wire_struct! {
     /// How a PID namespace behaves. A namespace that no process created has the
-    /// default options.
+    /// options its host gives it.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     #[non_exhaustive]
     pub struct PidNamespaceOptions {
@@ -55,6 +55,9 @@ wire_struct! {
 }
 
 impl PidNamespaceOptions {
+    /// A namespace whose first process is its init, as in Linux.
+    pub const INIT: Self = Self::new(true, true);
+
     /// Creates options with each behavior on or off.
     #[must_use]
     pub const fn new(ends_with_first_process: bool, first_process_adopts_orphans: bool) -> Self {

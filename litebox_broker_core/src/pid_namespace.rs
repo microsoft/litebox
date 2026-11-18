@@ -90,7 +90,12 @@ impl PidNamespace {
     /// Fails with `ResourceExhausted` if `core` has no namespace IDs left,
     /// since it never reuses one.
     pub fn new(core: &BrokerCore) -> Result<Self> {
-        Self::with_parent(core, None, None)
+        Self::with_options(core, PidNamespaceOptions::default())
+    }
+
+    /// Like [`Self::new`], with `options`.
+    pub fn with_options(core: &BrokerCore, options: PidNamespaceOptions) -> Result<Self> {
+        Self::with_parent(core, None, None, options)
     }
 
     /// Creates an empty namespace nested in `parent` for `creator`, charging it
@@ -117,15 +122,14 @@ impl PidNamespace {
                 limits.max_pid_namespaces_per_job,
             )),
         )?;
-        let mut namespace = Self::with_parent(core, Some(Arc::clone(parent)), Some(quota))?;
-        namespace.options = options;
-        Ok(Arc::new(namespace))
+        Self::with_parent(core, Some(Arc::clone(parent)), Some(quota), options).map(Arc::new)
     }
 
     fn with_parent(
         core: &BrokerCore,
         parent: Option<Arc<PidNamespace>>,
         quota: Option<QuotaReservation>,
+        options: PidNamespaceOptions,
     ) -> Result<Self> {
         let level = match &parent {
             Some(parent) => parent.level + 1,
@@ -143,7 +147,7 @@ impl PidNamespace {
             parent,
             level,
             _quota: quota,
-            options: PidNamespaceOptions::default(),
+            options,
             ended: AtomicBool::new(false),
             id_allocator: Mutex::new(IdAllocator::new(MAX_ALLOCATED_ID)?),
             processes: RwLock::new(HashMap::new()),
@@ -1020,6 +1024,36 @@ mod tests {
         assert_eq!(collect().map(|_| ()), Err(BrokerError::WouldBlock));
         exit(&other);
         assert_eq!(collect().map(|exit| exit.process_id), Ok(first_id));
+    }
+
+    #[test]
+    fn a_top_level_namespace_can_end_with_its_first_root() {
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let options = PidNamespaceOptions::INIT;
+        let pid_namespace = Arc::new(PidNamespace::with_options(&broker.core, options).unwrap());
+        let [first_job, second_job] =
+            [(); 2].map(|()| broker.with_pid_namespace(Arc::clone(&pid_namespace)));
+        let first = create(&first_job, None);
+        let child = create(&first_job, Some(&first));
+        let other_root = create(&second_job, None);
+        for process in [&first, &child, &other_root] {
+            process.complete_start().unwrap();
+        }
+
+        let first_in_namespace =
+            |process: &BrokerProcess| first.process_info(process.id()).unwrap().first_in_namespace;
+        assert_eq!(first_in_namespace(&first), Some(options));
+        assert_eq!(first_in_namespace(&other_root), None);
+
+        exit(&first);
+        assert!(child.shutdown_was_expected());
+        assert!(other_root.shutdown_was_expected());
+        assert_eq!(
+            second_job
+                .create_process(CallerCredential::Unauthenticated)
+                .map(|process| process.id()),
+            Err(BrokerError::PeerClosed)
+        );
     }
 
     #[test]
