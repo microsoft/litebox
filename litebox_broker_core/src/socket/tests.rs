@@ -3672,6 +3672,54 @@ fn check_server_socket_operations(broker: &TestBroker, provider: &TestSocketProv
     process.close_object_reference(auto_bound).unwrap();
 }
 
+#[test]
+fn read_shutdown_reports_pending_udp_error_during_reconnect() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(provider.clone());
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let handle = create(
+        &process,
+        create_udp_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        connect(&process, handle, loopback_address()),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        shutdown(&process, handle, ShutdownMode::Read),
+        Ok(SocketOutcome::Completed(()))
+    );
+    provider.return_next_status(
+        SocketConnectionStatus::Connected,
+        Some(SocketError::ConnectionRefused),
+    );
+
+    // Hold a reconnect that will leave the old peer and its error intact.
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *provider.state.connect_block.lock().unwrap() = Some((started_tx, release_rx));
+    provider.fail_next_connect();
+    std::thread::scope(|scope| {
+        let reconnect = scope.spawn(|| connect(&process, handle, loopback_address()));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let receive = || receive_data_from(&process, handle, 1, ReceiveFromFlags::NONE);
+        let results = [receive(), receive()];
+        release_tx.send(()).unwrap();
+        assert_eq!(reconnect.join().unwrap(), Err(BrokerError::Internal));
+        assert_eq!(
+            results,
+            [
+                Ok(SocketOutcome::Failed(SocketError::ConnectionRefused)),
+                Ok(SocketOutcome::Failed(SocketError::Shutdown)),
+            ]
+        );
+    });
+}
+
 fn check_concurrent_udp_status_does_not_regress_connection(
     broker: &TestBroker,
     provider: &TestSocketProvider,

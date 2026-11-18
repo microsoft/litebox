@@ -2246,7 +2246,7 @@ fn datagram_status(
             socket.resource.port_binding_is_wildcard(),
         )
     };
-    if configuration_in_flight || resource_retired {
+    if resource_retired || (configuration_in_flight && !queue_errors) {
         return Ok((
             PlatformSocketStatus {
                 status,
@@ -2321,7 +2321,9 @@ fn datagram_status(
         if queue_errors && let Some(error) = platform_status.pending_error {
             socket.errors.append(QueuedSocketError::Other(error));
         }
-        if socket.configuration_in_flight {
+        // A bind or reconnect can leave address and peer state in transition,
+        // but an error consumed from the transport still belongs to the socket.
+        if configuration_in_flight || socket.configuration_in_flight {
             return Ok((
                 PlatformSocketStatus {
                     status: socket.connection_status,
