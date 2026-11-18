@@ -3720,6 +3720,47 @@ fn racing_receives_claim_both_pending_udp_errors_before_shutdown() {
 }
 
 #[test]
+fn in_flight_datagram_receive_observes_shutdown_after_retirement() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(provider.clone());
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let handle = create(
+        &process,
+        create_udp_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        connect(&process, handle, loopback_address()),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    let object = process
+        .authorized_object(handle, ObjectRights::WAIT)
+        .unwrap();
+    assert_eq!(
+        shutdown(&process, handle, ShutdownMode::Read),
+        Ok(SocketOutcome::Completed(()))
+    );
+    provider.fail_next_connect_indeterminate();
+    assert_eq!(
+        connect(&process, handle, loopback_address()),
+        Err(BrokerError::Internal)
+    );
+
+    // Resume the transport step of a receive that started before shutdown.
+    assert_eq!(
+        transport_receive_from(
+            &object,
+            &mut [0u8; 1].as_mut_slice(),
+            ReceiveFromFlags::NONE
+        ),
+        Ok(SocketOutcome::Failed(SocketError::Shutdown))
+    );
+}
+
+#[test]
 fn read_shutdown_reports_pending_udp_error_during_reconnect() {
     let provider = Arc::new(TestSocketProvider::default());
     let broker = test_broker(provider.clone());

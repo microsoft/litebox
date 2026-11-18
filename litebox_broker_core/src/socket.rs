@@ -1783,26 +1783,20 @@ fn receive_datagram(
     output: &mut dyn ReadBuffer,
     flags: ReceiveFromFlags,
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
-    let (udp, read_shutdown) = read_socket(object, |socket| {
-        (is_udp(socket.create_request), socket.read_shutdown)
-    })?;
-    if !udp {
+    if !read_socket(object, |socket| is_udp(socket.create_request))? {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if !read_shutdown {
-        if let Some(error) = take_pending_error(object, false) {
-            return Ok(SocketOutcome::Failed(error));
-        }
-        match transport_receive_from(object, output, flags) {
-            Ok(SocketOutcome::Failed(SocketError::Shutdown)) => {}
-            result => return finish_datagram_transfer(object, result),
-        }
+    if let Some(error) = take_pending_error(object, false) {
+        return Ok(SocketOutcome::Failed(error));
     }
-    // Whether the broker or the transport observed shutdown first, an error
-    // that poll has not yet queued takes precedence.
-    Ok(SocketOutcome::Failed(
-        take_pending_error(object, true).unwrap_or(SocketError::Shutdown),
-    ))
+    match transport_receive_from(object, output, flags) {
+        // Whether the broker or the transport observed shutdown first, an
+        // error that poll has not yet queued takes precedence.
+        Ok(SocketOutcome::Failed(SocketError::Shutdown)) => Ok(SocketOutcome::Failed(
+            take_pending_error(object, true).unwrap_or(SocketError::Shutdown),
+        )),
+        result => finish_datagram_transfer(object, result),
+    }
 }
 
 fn transport_receive_from(
@@ -1812,6 +1806,10 @@ fn transport_receive_from(
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
     let length = output.len();
     let state = socket_state(object)?;
+    // A reconnect can retire the transport after reads have been shut down.
+    if state.read_shutdown {
+        return Ok(SocketOutcome::Failed(SocketError::Shutdown));
+    }
     if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
@@ -2424,6 +2422,7 @@ fn socket_resource(
 struct SocketState {
     resource: Arc<SocketResource>,
     resource_retired: bool,
+    read_shutdown: bool,
     nonblocking: bool,
 }
 
@@ -2431,6 +2430,7 @@ fn socket_state(object: &RwLock<ObjectEntry>) -> Result<SocketState> {
     read_socket(object, |socket| SocketState {
         resource: Arc::clone(&socket.resource),
         resource_retired: socket.resource_retired,
+        read_shutdown: socket.read_shutdown,
         nonblocking: socket.status.nonblocking(),
     })
 }
