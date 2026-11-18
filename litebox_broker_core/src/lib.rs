@@ -66,8 +66,9 @@ use object::ObjectReference;
 pub use object::ObjectRights;
 use pid_namespace::{PerNamespaceIds, PidNamespace};
 pub use policy::{
-    DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
-    PolicyProfile, SocketPolicy, SocketPolicyError, VsockPolicy, VsockPortRange,
+    DestinationPortRange, DestinationRule, IcmpEchoDestinationRule, Ipv4Cidr,
+    MAX_DESTINATION_RULES, PolicyEngine, PolicyProfile, SocketPolicy, SocketPolicyError,
+    VsockPolicy, VsockPortRange,
 };
 use process::SharedHostNames;
 pub use process::{

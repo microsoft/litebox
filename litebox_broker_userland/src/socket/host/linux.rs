@@ -49,6 +49,15 @@ impl Host for Linux {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Errno(RustixErrno);
 
+impl Errno {
+    pub(crate) fn ping_unavailable(self) -> bool {
+        matches!(
+            self.0,
+            RustixErrno::ACCESS | RustixErrno::PERM | RustixErrno::PROTONOSUPPORT
+        )
+    }
+}
+
 impl HostErrno for Errno {
     const INTR: Self = Self(RustixErrno::INTR);
     const AGAIN: Self = Self(RustixErrno::AGAIN);
@@ -94,6 +103,30 @@ impl fmt::Display for Errno {
 pub(crate) struct Socket(OwnedFd);
 
 impl Socket {
+    /// Linux ping sockets expose echo messages only. The kernel assigns their
+    /// identifier and checks ping_group_range; there is no raw-socket fallback.
+    pub(crate) fn ping() -> Result<Self, Errno> {
+        Self::open(SocketType::DGRAM, ipproto::ICMP)
+    }
+
+    pub(crate) fn ping_readiness(
+        &self,
+    ) -> Result<litebox_broker_protocol::readiness::ReadinessFlags, Errno> {
+        use litebox_broker_protocol::readiness::ReadinessFlags;
+        let events = self.polled_events(PollFlags::IN | PollFlags::OUT)?;
+        let mut flags = ReadinessFlags::default();
+        if events.contains(PollFlags::IN) {
+            flags = flags | ReadinessFlags::READ;
+        }
+        if events.contains(PollFlags::OUT) {
+            flags = flags | ReadinessFlags::WRITE;
+        }
+        if events.contains(PollFlags::ERR) {
+            flags = flags | ReadinessFlags::ERROR;
+        }
+        Ok(flags)
+    }
+
     fn open(socket_type: SocketType, protocol: Protocol) -> Result<Self, Errno> {
         socket_with(
             AddressFamily::INET,

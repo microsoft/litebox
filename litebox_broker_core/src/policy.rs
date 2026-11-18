@@ -160,6 +160,21 @@ const EMPTY_DESTINATION_RULE: DestinationRule = DestinationRule {
     },
 };
 
+/// Authorizes IPv4 ICMP echo to a network for one broker credential.
+/// ICMP echo identifiers are local socket identifiers, not destination ports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IcmpEchoDestinationRule {
+    /// Principal permitted to send echo requests.
+    pub caller_credential: CallerCredential,
+    /// Authorized guest-visible destination network.
+    pub destination: Ipv4Cidr,
+}
+
+const EMPTY_ECHO_RULE: IcmpEchoDestinationRule = IcmpEchoDestinationRule {
+    caller_credential: EMPTY_DESTINATION_RULE.caller_credential,
+    destination: EMPTY_DESTINATION_RULE.destination,
+};
+
 /// Invalid socket-policy configuration.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -176,22 +191,22 @@ pub enum SocketPolicyError {
 
 /// Bounded static IPv4 destination rules for one transport protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DestinationPolicy {
-    destination_rules: [DestinationRule; MAX_DESTINATION_RULES],
+struct DestinationPolicy<T> {
+    destination_rules: [T; MAX_DESTINATION_RULES],
     destination_rule_count: usize,
 }
 
-impl DestinationPolicy {
-    const fn empty() -> Self {
+impl<T: Copy> DestinationPolicy<T> {
+    const fn empty(filler: T) -> Self {
         Self {
-            destination_rules: [EMPTY_DESTINATION_RULE; MAX_DESTINATION_RULES],
+            destination_rules: [filler; MAX_DESTINATION_RULES],
             destination_rule_count: 0,
         }
     }
 
     /// Returns the configured destination rules.
     #[must_use]
-    pub fn rules(&self) -> &[DestinationRule] {
+    pub fn rules(&self) -> &[T] {
         &self.destination_rules[..self.destination_rule_count]
     }
 }
@@ -202,8 +217,9 @@ impl DestinationPolicy {
 /// enforced by the broker's guest binding namespace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SocketPolicy {
-    tcp: Option<DestinationPolicy>,
-    udp: Option<DestinationPolicy>,
+    tcp: Option<DestinationPolicy<DestinationRule>>,
+    udp: Option<DestinationPolicy<DestinationRule>>,
+    icmp_echo: Option<DestinationPolicy<IcmpEchoDestinationRule>>,
 }
 
 impl SocketPolicy {
@@ -213,15 +229,17 @@ impl SocketPolicy {
         Self {
             tcp: None,
             udp: None,
+            icmp_echo: None,
         }
     }
 
-    /// Creates a policy allowing IPv4 TCP and UDP within the shared guest network.
+    /// Allows IPv4 TCP, UDP, and ICMP echo within the shared guest network.
     #[must_use]
     pub const fn guest_network() -> Self {
         Self {
-            tcp: Some(DestinationPolicy::empty()),
-            udp: Some(DestinationPolicy::empty()),
+            tcp: Some(DestinationPolicy::empty(EMPTY_DESTINATION_RULE)),
+            udp: Some(DestinationPolicy::empty(EMPTY_DESTINATION_RULE)),
+            icmp_echo: Some(DestinationPolicy::empty(EMPTY_ECHO_RULE)),
         }
     }
 
@@ -230,7 +248,7 @@ impl SocketPolicy {
         mut self,
         rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        self.tcp = Some(copy_destination_rules(rules)?);
+        self.tcp = Some(copy_destination_rules(rules, EMPTY_DESTINATION_RULE)?);
         Ok(self)
     }
 
@@ -239,8 +257,23 @@ impl SocketPolicy {
         mut self,
         rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        self.udp = Some(copy_destination_rules(rules)?);
+        self.udp = Some(copy_destination_rules(rules, EMPTY_DESTINATION_RULE)?);
         Ok(self)
+    }
+
+    /// Enables IPv4 ICMP echo, with external access only to these destination networks.
+    pub fn with_icmp_echo_destination_rules(
+        mut self,
+        rules: &[IcmpEchoDestinationRule],
+    ) -> Result<Self, SocketPolicyError> {
+        self.icmp_echo = Some(copy_destination_rules(rules, EMPTY_ECHO_RULE)?);
+        Ok(self)
+    }
+
+    /// Returns the external ICMP echo rules, or `None` when echo sockets are denied.
+    #[must_use]
+    pub fn icmp_echo_destination_rules(&self) -> Option<&[IcmpEchoDestinationRule]> {
+        self.icmp_echo.as_ref().map(DestinationPolicy::rules)
     }
 
     /// Returns the native TCP destination rules, or `None` when TCP is denied.
@@ -255,20 +288,20 @@ impl SocketPolicy {
         self.udp.as_ref().map(DestinationPolicy::rules)
     }
 
-    const fn permits_tcp_socket(self) -> bool {
+    const fn permits_tcp_socket(&self) -> bool {
         self.tcp.is_some()
     }
 
-    const fn permits_udp_socket(self) -> bool {
+    const fn permits_udp_socket(&self) -> bool {
         self.udp.is_some()
     }
 
     fn permits_tcp_destination(
-        self,
+        &self,
         caller_credential: CallerCredential,
         destination: SocketAddrV4,
     ) -> bool {
-        self.tcp.is_some_and(|policy| {
+        self.tcp.as_ref().is_some_and(|policy| {
             is_internal_socket_address(destination)
                 || policy
                     .rules()
@@ -278,11 +311,11 @@ impl SocketPolicy {
     }
 
     fn permits_udp_destination(
-        self,
+        &self,
         caller_credential: CallerCredential,
         destination: SocketAddrV4,
     ) -> bool {
-        self.udp.is_some_and(|policy| {
+        self.udp.as_ref().is_some_and(|policy| {
             is_internal_socket_address(destination)
                 || policy
                     .rules()
@@ -292,16 +325,17 @@ impl SocketPolicy {
     }
 }
 
-fn copy_destination_rules(
-    rules: &[DestinationRule],
-) -> Result<DestinationPolicy, SocketPolicyError> {
+fn copy_destination_rules<T: Copy>(
+    rules: &[T],
+    filler: T,
+) -> Result<DestinationPolicy<T>, SocketPolicyError> {
     if rules.len() > MAX_DESTINATION_RULES {
         return Err(SocketPolicyError::TooManyRules {
             maximum: MAX_DESTINATION_RULES,
             actual: rules.len(),
         });
     }
-    let mut policy = DestinationPolicy::empty();
+    let mut policy = DestinationPolicy::empty(filler);
     policy.destination_rules[..rules.len()].copy_from_slice(rules);
     policy.destination_rule_count = rules.len();
     Ok(policy)
@@ -523,6 +557,7 @@ impl PolicyEngine {
         let permitted = match (request.socket_type, request.protocol) {
             (SocketType::Stream, IpProtocol::Tcp) => self.socket_policy.permits_tcp_socket(),
             (SocketType::Datagram, IpProtocol::Udp) => self.socket_policy.permits_udp_socket(),
+            (SocketType::Datagram, IpProtocol::IcmpEcho) => self.socket_policy.icmp_echo.is_some(),
             _ => false,
         };
         if request.address_family == AddressFamily::Ipv4 && permitted {
@@ -545,6 +580,15 @@ impl PolicyEngine {
             IpProtocol::Udp => self
                 .socket_policy
                 .permits_udp_destination(caller_credential, destination),
+            IpProtocol::IcmpEcho => self.socket_policy.icmp_echo.as_ref().is_some_and(|policy| {
+                is_internal_socket_address(destination)
+                    || policy.rules().iter().any(|rule| {
+                        rule.caller_credential == caller_credential
+                            && rule
+                                .destination
+                                .contains(Ipv4Address(destination.ip().octets()))
+                    })
+            }),
             _ => false,
         };
         if permitted {
@@ -943,6 +987,69 @@ mod tests {
                     IpProtocol::Tcp,
                     denied,
                 ),
+                Err(BrokerError::PolicyDenied)
+            );
+        }
+    }
+
+    #[test]
+    fn icmp_echo_egress_is_bounded_and_scoped_by_network_and_principal() {
+        let caller = CallerCredential::Unauthenticated;
+        let rule = IcmpEchoDestinationRule {
+            caller_credential: caller,
+            destination: cidr([192, 0, 2, 0], 24),
+        };
+        assert!(
+            SocketPolicy::deny()
+                .with_icmp_echo_destination_rules(&[rule; MAX_DESTINATION_RULES + 1])
+                .is_err()
+        );
+        let base = PolicyEngine::with_unauthenticated_rights(ObjectRights::all());
+        let echo = CreateSocketRequest {
+            protocol: IpProtocol::IcmpEcho,
+            ..IPV4_UDP
+        };
+        assert_eq!(
+            base.authorize_socket_create(caller, echo),
+            Err(BrokerError::PolicyDenied)
+        );
+        let policy = base.with_socket_policy(
+            SocketPolicy::deny()
+                .with_icmp_echo_destination_rules(&[rule])
+                .unwrap(),
+        );
+        assert!(policy.authorize_socket_create(caller, echo).is_ok());
+        assert_eq!(
+            policy.authorize_socket_create(
+                caller,
+                CreateSocketRequest {
+                    socket_type: SocketType::Stream,
+                    ..echo
+                }
+            ),
+            Err(BrokerError::PolicyDenied)
+        );
+        let allowed = normalized_destination([192, 0, 2, 254], 0);
+        assert!(
+            policy
+                .authorize_socket_connect(caller, IpProtocol::IcmpEcho, allowed)
+                .is_ok()
+        );
+        for (principal, protocol, destination) in [
+            (caller, IpProtocol::Udp, allowed),
+            (
+                CallerCredential::HostGuaranteed,
+                IpProtocol::IcmpEcho,
+                allowed,
+            ),
+            (
+                caller,
+                IpProtocol::IcmpEcho,
+                normalized_destination([192, 0, 3, 0], 0),
+            ),
+        ] {
+            assert_eq!(
+                policy.authorize_socket_connect(principal, protocol, destination),
                 Err(BrokerError::PolicyDenied)
             );
         }

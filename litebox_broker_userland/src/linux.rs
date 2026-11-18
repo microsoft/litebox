@@ -94,6 +94,7 @@ pub(super) fn run(
         .with_socket_policy(configured_socket_policy(
             &args.allow_tcp_destination,
             &args.allow_udp_destination,
+            &args.allow_icmp_echo_destination,
         )?)
         .with_process_duplication_enabled(args.allow_process_duplication)
         .with_vsock_policy(super::configured_vsock_policy(args.vsock_uds.is_some()));

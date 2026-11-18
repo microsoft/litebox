@@ -177,6 +177,36 @@ const LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
 impl<Platform: ShimPlatform> Task<Platform> {
+    /// Dropping all capabilities is a no-op: LiteBox never grants any.
+    pub(crate) fn sys_capset(
+        &self,
+        header: UserPtrMut<litebox_common_linux::CapHeader>,
+        data: UserPtr<litebox_common_linux::CapData>,
+    ) -> Result<(), Errno> {
+        let mut hdr = header.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+        let words = match hdr.version {
+            LINUX_CAPABILITY_VERSION_1 => 1,
+            LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => 2,
+            _ => {
+                hdr.version = LINUX_CAPABILITY_VERSION_3;
+                header
+                    .write_at_offset::<Platform>(0, hdr)
+                    .ok_or(Errno::EFAULT)?;
+                return Err(Errno::EINVAL);
+            }
+        };
+        if hdr.pid != 0 && i32::try_from(hdr.pid) != Ok(self.sys_gettid()) {
+            return Err(Errno::EPERM);
+        }
+        for i in 0..words {
+            let caps = data.read_at_offset::<Platform>(i).ok_or(Errno::EFAULT)?;
+            if caps.effective | caps.permitted | caps.inheritable != 0 {
+                return Err(Errno::EPERM);
+            }
+        }
+        Ok(())
+    }
+
     /// Handle syscall `capget`.
     ///
     /// Note we don't support capabilities in LiteBox, so this returns empty capabilities.
@@ -240,6 +270,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
 mod tests {
     use crate::syscalls::tests::init_platform;
     use litebox::user_pointers::UserPtrMut;
+
+    #[test]
+    fn capset_only_accepts_empty_sets() {
+        use litebox::user_pointers::UserPtr;
+        use litebox_common_linux::{CapData, CapHeader, errno::Errno};
+        let task = init_platform();
+        let mut header = CapHeader {
+            version: super::LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [const {
+            CapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            }
+        }; 2];
+        let header = UserPtrMut::from_ptr(&raw mut header);
+        assert_eq!(
+            task.sys_capset(header, UserPtr::from_ptr(data.as_ptr())),
+            Ok(())
+        );
+        data[1].permitted = 1;
+        assert_eq!(
+            task.sys_capset(header, UserPtr::from_ptr(data.as_ptr())),
+            Err(Errno::EPERM)
+        );
+    }
 
     #[test]
     fn test_getrandom_requires_broker() {

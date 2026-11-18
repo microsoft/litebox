@@ -2722,6 +2722,8 @@ pub enum PrctlArg {
     SetName(UserPtr<u8>),
     GetName(UserPtrMut<u8>),
     CapBSetRead(usize),
+    GetKeepCaps,
+    SetKeepCaps(bool),
     /// PR_SET_CHILD_SUBREAPER: set whether this process adopts orphaned descendants
     SetChildSubreaper(usize),
     /// PR_GET_CHILD_SUBREAPER: read whether this process adopts orphaned descendants
@@ -3510,6 +3512,9 @@ pub enum SyscallRequest {
         pid: i32,
     },
     Getuid,
+    Setuid {
+        uid: u32,
+    },
     Geteuid,
     Getgid,
     Getegid,
@@ -3523,6 +3528,10 @@ pub enum SyscallRequest {
     CapGet {
         header: UserPtrMut<CapHeader>,
         data: Option<UserPtrMut<CapData>>,
+    },
+    CapSet {
+        header: UserPtrMut<CapHeader>,
+        data: UserPtr<CapData>,
     },
     GetDirent64 {
         fd: i32,
@@ -3970,6 +3979,7 @@ impl SyscallRequest {
             Sysno::setsid => SyscallRequest::Setsid,
             Sysno::getsid => sys_req!(Getsid { pid }),
             Sysno::getuid => SyscallRequest::Getuid,
+            Sysno::setuid => sys_req!(Setuid { uid }),
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
@@ -4032,6 +4042,16 @@ impl SyscallRequest {
                         },
                         PrctlOption::CapBSetRead => SyscallRequest::Prctl {
                             args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetKeepCaps => SyscallRequest::Prctl {
+                            args: PrctlArg::GetKeepCaps,
+                        },
+                        PrctlOption::SetKeepCaps => SyscallRequest::Prctl {
+                            args: PrctlArg::SetKeepCaps(match ctx.sys_req_arg::<usize>(1) {
+                                0 => false,
+                                1 => true,
+                                _ => return Err(errno::Errno::EINVAL),
+                            }),
                         },
                         PrctlOption::SetChildSubreaper => SyscallRequest::Prctl {
                             args: PrctlArg::SetChildSubreaper(ctx.sys_req_arg(1)),
@@ -4243,6 +4263,7 @@ impl SyscallRequest {
             }
             Sysno::sysinfo => sys_req!(Sysinfo { buf:* }),
             Sysno::capget => sys_req!(CapGet { header:*,data:* }),
+            Sysno::capset => sys_req!(CapSet { header:*,data:* }),
             Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
             Sysno::sched_getaffinity => {
                 let pid = ctx.sys_req_arg(0);

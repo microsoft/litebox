@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Datagram I/O on a broker-owned UDP socket.
+//! Datagram I/O on a broker-owned UDP or ICMP echo socket.
 
 use core::net::SocketAddr;
 

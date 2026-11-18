@@ -99,8 +99,19 @@ pub struct PlatformSocketStatus {
 
 #[derive(Default)]
 struct BrokerSocketPortState {
-    guest_tcp: GuestTransportBindingState,
-    guest_udp: GuestTransportBindingState,
+    tcp: GuestTransportBindingState,
+    udp: GuestTransportBindingState,
+    icmp_echo: GuestTransportBindingState,
+}
+
+impl BrokerSocketPortState {
+    fn for_transport(&mut self, transport: GuestTransport) -> &mut GuestTransportBindingState {
+        match transport {
+            GuestTransport::Tcp => &mut self.tcp,
+            GuestTransport::Udp => &mut self.udp,
+            GuestTransport::IcmpEcho => &mut self.icmp_echo,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -178,6 +189,7 @@ impl GuestTransportBindingState {
 enum GuestTransport {
     Tcp,
     Udp,
+    IcmpEcho,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,8 +235,8 @@ impl GuestPortBinding {
 /// Broker-wide authority for guest-visible transport port namespaces.
 ///
 /// Socket resources own reservations. Processes remain ownership, quota, and
-/// teardown domains rather than separate network namespaces. TCP and UDP use
-/// independent port spaces, and guest ports remain independent of host ports.
+/// teardown domains rather than separate network namespaces. TCP ports, UDP
+/// ports, and echo identifiers occupy independent spaces.
 #[derive(Clone, Default)]
 pub(crate) struct BrokerSocketPorts {
     state: Arc<Mutex<BrokerSocketPortState>>,
@@ -241,10 +253,7 @@ impl BrokerSocketPorts {
         }
         let transport = guest_transport(request).ok_or(BrokerError::Internal)?;
         let mut state = self.state.lock();
-        let ports = match transport {
-            GuestTransport::Tcp => &mut state.guest_tcp,
-            GuestTransport::Udp => &mut state.guest_udp,
-        };
+        let ports = state.for_transport(transport);
         let port = if requested_address.port() == 0 {
             ports.allocate_ephemeral(requested_address)?
         } else if ports.conflicts(requested_address) {
@@ -277,10 +286,7 @@ impl BrokerSocketPorts {
 impl Drop for GuestPortBinding {
     fn drop(&mut self) {
         let mut state = self.ports.state.lock();
-        let ports = match self.transport {
-            GuestTransport::Tcp => &mut state.guest_tcp,
-            GuestTransport::Udp => &mut state.guest_udp,
-        };
+        let ports = state.for_transport(self.transport);
         let removed = ports.remove(self.key);
         debug_assert!(removed, "live guest port binding must be registered");
     }
@@ -331,6 +337,12 @@ impl GuestSocketBinding {
     #[must_use]
     pub fn is_tcp(&self) -> bool {
         self.transport == GuestTransport::Tcp
+    }
+
+    /// Returns whether this binding reserves an ICMP echo identifier, not a TCP or UDP port.
+    #[must_use]
+    pub fn is_icmp_echo(&self) -> bool {
+        self.transport == GuestTransport::IcmpEcho
     }
 
     /// Returns whether this binding covers one concrete guest-network address.
@@ -529,9 +541,9 @@ pub trait SocketProvider: Send + Sync {
 pub trait PlatformSocket: Send + Sync {
     /// Binds this socket to a local address and echoes the assigned address.
     ///
-    /// A broker-managed TCP or UDP socket receives a broker-reserved,
-    /// guest-visible address with a nonzero port and must echo it unchanged. A
-    /// UDP bind may be entirely logical and need not allocate a host socket.
+    /// A socket receives a broker-reserved guest address with a nonzero port
+    /// (identifier for ICMP echo) and must return it unchanged. A datagram
+    /// bind may be entirely logical and need not allocate a host socket.
     /// A failed outcome or broker error must leave the socket unbound and
     /// retryable.
     fn bind(&self, binding: GuestSocketBinding) -> Result<SocketOutcome<SocketAddrV4>>;
@@ -593,6 +605,9 @@ pub trait PlatformSocket: Send + Sync {
     /// the socket's connected peer. An explicit destination is normalized but
     /// remains guest-visible; the provider must validate it with
     /// [`normalize_socket_destination`] before choosing a host-socket target.
+    /// Echo always gets an explicit authorized peer with port zero; the provider
+    /// must send to that peer, not the current default. It must restrict payloads
+    /// to ICMP echo requests and keep internal destinations within the guest.
     /// A temporarily full socket returns [`BrokerError::WouldBlock`], and a
     /// socket shut down for writing fails with `Shutdown`. Partial successful
     /// sends are invalid. Resource failures are broker errors rather than
@@ -700,7 +715,7 @@ pub trait PlatformSocket: Send + Sync {
     /// retirement may already have removed.
     fn readiness(&self) -> ReadinessFlags;
 
-    /// Sends to `destination`, which policy denies, as [`Self::send_to`] does, if this socket may
+    /// UDP only. Sends to `destination`, which policy denies, as [`Self::send_to`] does, if this socket may
     /// reply to it anyway, as to a sender of a published port's datagrams, and fails with
     /// `PolicyDenied` otherwise. The check and the send are one step.
     fn send_reply_to(
@@ -782,12 +797,13 @@ pub fn create(
 /// A stream that is listening or has reported its connection fails with
 /// `AlreadyConnected`, and while an earlier attempt is unreported, a stream
 /// reports it as [`check_connect`] does, except that an attempt still in
-/// progress fails with `AlreadyInProgress`. Port zero and the unspecified
-/// address fail with `ConnectionRefused` without changing the socket.
+/// progress fails with `AlreadyInProgress`. For TCP and UDP, port zero and
+/// the unspecified address fail with `ConnectionRefused`. ICMP echo ignores
+/// the destination port.
 /// Otherwise an authorized attempt first binds an unbound socket.
 /// Connect never reports [`SocketConnectionStatus::Failed`]: a failed attempt
 /// is a [`SocketOutcome::Failed`], after which a stream is unconnected but
-/// fails every later attempt the same way. UDP connects complete
+/// fails every later attempt the same way. Datagram connects complete
 /// synchronously, and a failed attempt preserves the previous peer. Policy
 /// denial is also a [`SocketOutcome::Failed`] that preserves existing state.
 pub fn connect(
@@ -796,7 +812,7 @@ pub fn connect(
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
-    let result = if read_socket(&object, |socket| is_udp(socket.create_request))? {
+    let result = if read_socket(&object, |socket| is_datagram(socket.create_request))? {
         connect_datagram(process, &object, address)
     } else {
         connect_stream(process, &object, address)
@@ -831,9 +847,6 @@ fn connect_stream(
             outcome => return Ok(outcome),
         }
     }
-    if is_unaddressable(address) {
-        return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
-    }
     let status = match transport_connect(process, object, address)? {
         SocketOutcome::Completed(status) => status,
         SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
@@ -857,9 +870,6 @@ fn connect_datagram(
     object: &RwLock<ObjectEntry>,
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
-    if is_unaddressable(address) {
-        return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
-    }
     Ok(match transport_connect(process, object, address)? {
         SocketOutcome::Completed(SocketConnectionStatus::Failed(error)) => {
             SocketOutcome::Failed(error)
@@ -887,7 +897,7 @@ pub fn check_connect(
     handle: ObjectHandle,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
-    let result = if read_socket(&object, |socket| is_udp(socket.create_request))? {
+    let result = if read_socket(&object, |socket| is_datagram(socket.create_request))? {
         refresh(&object, true);
         read_socket(&object, |socket| match socket.view() {
             SocketConnectionStatus::Failed(error) => SocketOutcome::Failed(error),
@@ -968,7 +978,7 @@ pub fn set_error(process: &BrokerProcess, handle: ObjectHandle, error: SocketErr
 
 /// Starts a transport connection attempt.
 ///
-/// TCP connected and failed states are terminal. UDP connects complete
+/// TCP connected and failed states are terminal. Datagram connects complete
 /// synchronously, and a failed attempt preserves the previous peer.
 fn transport_connect(
     process: &BrokerProcess,
@@ -977,10 +987,10 @@ fn transport_connect(
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let create_request = read_socket(object, |socket| socket.create_request)?;
 
-    if address.port() == 0 {
+    if create_request.protocol != IpProtocol::IcmpEcho && is_unaddressable(address) {
         return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
     }
-    let destination = match normalize_socket_destination(address) {
+    let destination = match normalize_peer(create_request.protocol, address) {
         Ok(destination) => destination,
         Err(error) => return Ok(SocketOutcome::Failed(error)),
     };
@@ -999,7 +1009,7 @@ fn transport_connect(
         Err(error) => return Err(error),
     }
 
-    if is_udp(create_request) {
+    if is_datagram(create_request) {
         return transport_connect_datagram(process, object, create_request, destination);
     }
 
@@ -1471,7 +1481,7 @@ fn send_datagram(
     flags: SendFlags,
     destination: Option<SocketAddrV4>,
 ) -> Result<SocketOutcome<usize>> {
-    if !read_socket(object, |socket| is_udp(socket.create_request))? {
+    if !read_socket(object, |socket| is_datagram(socket.create_request))? {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
     if let Some(error) = take_pending_error(object, false) {
@@ -1523,12 +1533,28 @@ fn transport_send_to(
     destination: Option<SocketAddrV4>,
 ) -> Result<SocketOutcome<usize>> {
     let length = data.len();
-    let create_request = read_socket(object, |socket| socket.create_request)?;
+    let (create_request, peer) = read_socket(object, |socket| {
+        (socket.create_request, socket.peer_address)
+    })?;
+    // Authorize and pass the same concrete echo peer, even if a concurrent connect
+    // changes the provider's default destination or another principal holds the socket.
+    let destination = if create_request.protocol == IpProtocol::IcmpEcho {
+        let Some(peer) = destination.or(peer) else {
+            return Ok(SocketOutcome::Failed(
+                SocketError::DestinationAddressRequired,
+            ));
+        };
+        Some(peer)
+    } else {
+        destination
+    };
     let destination = match destination {
-        Some(destination) if destination.port() == 0 => {
+        Some(destination)
+            if destination.port() == 0 && create_request.protocol != IpProtocol::IcmpEcho =>
+        {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
-        Some(destination) => match normalize_socket_destination(destination) {
+        Some(destination) => match normalize_peer(create_request.protocol, destination) {
             Ok(destination) => Some(destination),
             Err(error) => return Ok(SocketOutcome::Failed(error)),
         },
@@ -1543,7 +1569,10 @@ fn transport_send_to(
             destination,
         ) {
             Ok(()) => {}
-            Err(BrokerError::PolicyDenied) => reply = true,
+            Err(BrokerError::PolicyDenied) if is_udp(create_request) => reply = true,
+            Err(BrokerError::PolicyDenied) => {
+                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
+            }
             Err(error) => return Err(error),
         }
     }
@@ -1552,7 +1581,7 @@ fn transport_send_to(
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
-        if !is_udp(socket.create_request) {
+        if !is_datagram(socket.create_request) {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         if socket.resource_retired {
@@ -1783,7 +1812,7 @@ fn receive_datagram(
     output: &mut dyn ReadBuffer,
     flags: ReceiveFromFlags,
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
-    if !read_socket(object, |socket| is_udp(socket.create_request))? {
+    if !read_socket(object, |socket| is_datagram(socket.create_request))? {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
     if let Some(error) = take_pending_error(object, false) {
@@ -1902,7 +1931,7 @@ fn would_block_error(error: BrokerError, nonblocking: bool) -> BrokerError {
 
 /// Applies a directional or TCP lifecycle shutdown mode.
 ///
-/// Read, write, and both apply to TCP and UDP and are recorded even when the
+/// Read, write, and both apply to streams and datagrams and are recorded even when the
 /// socket is unconnected, which fails with `NotConnected`; they fail with
 /// `Listening` for a TCP listener. Shutting down a connecting TCP socket may
 /// abort its attempt, leaving it unconnected with the attempt's error
@@ -1914,7 +1943,7 @@ pub fn shutdown(
     mode: ShutdownMode,
 ) -> Result<SocketOutcome<()>> {
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
-    let result = if read_socket(&object, |socket| is_udp(socket.create_request))? {
+    let result = if read_socket(&object, |socket| is_datagram(socket.create_request))? {
         shutdown_datagram(&object, mode)
     } else {
         shutdown_stream(&object, mode)
@@ -2009,7 +2038,7 @@ fn transport_shutdown(
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
-        if is_udp(socket.create_request)
+        if is_datagram(socket.create_request)
             && matches!(mode, ShutdownMode::Abort | ShutdownMode::StopListening)
         {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
@@ -2069,20 +2098,23 @@ fn transport_status(
     object: &RwLock<ObjectEntry>,
     queue_errors: bool,
 ) -> Result<(PlatformSocketStatus, bool)> {
-    let (resource, udp) = read_socket(object, |socket| {
-        (Arc::clone(&socket.resource), is_udp(socket.create_request))
+    let (resource, datagram) = read_socket(object, |socket| {
+        (
+            Arc::clone(&socket.resource),
+            is_datagram(socket.create_request),
+        )
     })?;
     let _error_queries = queue_errors.then(|| resource.error_queries.lock());
-    query_transport_status(object, udp, queue_errors)
+    query_transport_status(object, datagram, queue_errors)
 }
 
 /// With `queue_errors`, the caller holds the socket's error-query lock.
 fn query_transport_status(
     object: &RwLock<ObjectEntry>,
-    udp: bool,
+    datagram: bool,
     queue_errors: bool,
 ) -> Result<(PlatformSocketStatus, bool)> {
-    if udp {
+    if datagram {
         datagram_status(object, queue_errors)
     } else {
         stream_status(object, queue_errors)
@@ -2471,27 +2503,27 @@ fn sync_readiness(object: &RwLock<ObjectEntry>) {
 /// and its transport may have one: a datagram socket, or a stream that is
 /// connecting or, with `include_connected`, connected.
 fn refresh(object: &RwLock<ObjectEntry>, include_connected: bool) {
-    let Ok((resource, udp)) = read_socket(object, |socket| {
-        (socket.resource(), is_udp(socket.create_request))
+    let Ok((resource, datagram)) = read_socket(object, |socket| {
+        (socket.resource(), is_datagram(socket.create_request))
     }) else {
         return;
     };
     let _error_queries = resource.error_queries.lock();
-    refresh_error_queue(object, udp, include_connected);
+    refresh_error_queue(object, datagram, include_connected);
 }
 
 /// Refreshes the queue. The caller must hold the socket's error-query lock.
-fn refresh_error_queue(object: &RwLock<ObjectEntry>, udp: bool, include_connected: bool) {
+fn refresh_error_queue(object: &RwLock<ObjectEntry>, datagram: bool, include_connected: bool) {
     let needed = read_socket(object, |socket| {
         socket.errors.is_empty()
-            && (udp
+            && (datagram
                 || match socket.view() {
                     SocketConnectionStatus::Connecting => true,
                     SocketConnectionStatus::Connected => include_connected,
                     _ => false,
                 })
     });
-    if matches!(needed, Ok(true)) && query_transport_status(object, udp, true).is_err() {
+    if matches!(needed, Ok(true)) && query_transport_status(object, datagram, true).is_err() {
         let _ = write_socket(object, |socket| socket.errors.prepend(SocketError::Other));
     }
 }
@@ -2528,18 +2560,18 @@ fn refresh_after_failure(object: &RwLock<ObjectEntry>) {
 /// that the broker queue was empty. In either mode, taking the last queued
 /// error triggers a check for the next transport error.
 fn take_pending_error(object: &RwLock<ObjectEntry>, check_transport: bool) -> Option<SocketError> {
-    let (resource, udp) = read_socket(object, |socket| {
+    let (resource, datagram) = read_socket(object, |socket| {
         (check_transport || !socket.errors.is_empty())
-            .then(|| (socket.resource(), is_udp(socket.create_request)))
+            .then(|| (socket.resource(), is_datagram(socket.create_request)))
     })
     .ok()??;
     let _error_queries = resource.error_queries.lock();
     if check_transport {
-        refresh_error_queue(object, udp, true);
+        refresh_error_queue(object, datagram, true);
     }
     let error = write_socket(object, |socket| socket.errors.take()).ok()?;
     if error.is_some() {
-        refresh_error_queue(object, udp, true);
+        refresh_error_queue(object, datagram, true);
     }
     error
 }
@@ -2547,8 +2579,11 @@ fn take_pending_error(object: &RwLock<ObjectEntry>, check_transport: bool) -> Op
 /// Brings a socket's readiness up to date before it is reported, queuing a
 /// pending transport error and observing a connection attempt's progress.
 pub(crate) fn refresh_readiness(object: &RwLock<ObjectEntry>) {
-    let Ok((resource, udp)) = read_socket(object, |socket| {
-        (Arc::clone(&socket.resource), is_udp(socket.create_request))
+    let Ok((resource, datagram)) = read_socket(object, |socket| {
+        (
+            Arc::clone(&socket.resource),
+            is_datagram(socket.create_request),
+        )
     }) else {
         return;
     };
@@ -2556,7 +2591,7 @@ pub(crate) fn refresh_readiness(object: &RwLock<ObjectEntry>) {
         .platform_socket
         .readiness()
         .contains(ReadinessFlags::ERROR);
-    if !udp || error {
+    if !datagram || error {
         refresh(object, error);
     }
     sync_readiness(object);
@@ -3026,7 +3061,7 @@ impl SocketObject {
     fn readiness_overlay(&self) -> ReadinessOverlay {
         let view = self.view();
         let mut overlay = ReadinessOverlay::default();
-        if !is_udp(self.create_request) {
+        if !is_datagram(self.create_request) {
             overlay.base = match view {
                 SocketConnectionStatus::Failed(_) => Some(
                     ReadinessFlags::READ
@@ -3266,11 +3301,30 @@ const fn is_udp(request: CreateSocketRequest) -> bool {
     )
 }
 
+const fn is_datagram(request: CreateSocketRequest) -> bool {
+    matches!(
+        (request.socket_type, request.protocol),
+        (SocketType::Datagram, IpProtocol::Udp | IpProtocol::IcmpEcho)
+    )
+}
+
+fn normalize_peer(
+    protocol: IpProtocol,
+    mut peer: SocketAddrV4,
+) -> core::result::Result<SocketAddrV4, SocketError> {
+    if protocol == IpProtocol::IcmpEcho {
+        peer.set_port(0);
+    }
+    normalize_socket_destination(peer)
+}
+
 const fn guest_transport(request: CreateSocketRequest) -> Option<GuestTransport> {
     if is_tcp(request) {
         Some(GuestTransport::Tcp)
     } else if is_udp(request) {
         Some(GuestTransport::Udp)
+    } else if is_datagram(request) {
+        Some(GuestTransport::IcmpEcho)
     } else {
         None
     }

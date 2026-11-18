@@ -32,16 +32,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for a different operation.
     pub fn create_tcp_socket(&self, flags: FileOpenFlags) -> Result<ObjectHandle, Channel::Error> {
-        let response = self.request_socket(SocketRequest::Create(CreateSocketRequest {
-            address_family: AddressFamily::Ipv4,
-            socket_type: SocketType::Stream,
-            protocol: IpProtocol::Tcp,
-            flags,
-        }))?;
-        let SocketResponse::Create(response) = response else {
-            panic!("broker returned unexpected socket create response: {response:?}");
-        };
-        Ok(response.handle)
+        self.create_ipv4_socket(SocketType::Stream, IpProtocol::Tcp, flags)
     }
 
     /// Creates a broker-owned IPv4 UDP datagram socket with the status flags
@@ -51,10 +42,31 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for a different operation.
     pub fn create_udp_socket(&self, flags: FileOpenFlags) -> Result<ObjectHandle, Channel::Error> {
+        self.create_ipv4_socket(SocketType::Datagram, IpProtocol::Udp, flags)
+    }
+
+    /// Creates an IPv4 echo-only datagram socket (not a raw ICMP socket).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn create_icmp_echo_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> Result<ObjectHandle, Channel::Error> {
+        self.create_ipv4_socket(SocketType::Datagram, IpProtocol::IcmpEcho, flags)
+    }
+
+    fn create_ipv4_socket(
+        &self,
+        socket_type: SocketType,
+        protocol: IpProtocol,
+        flags: FileOpenFlags,
+    ) -> Result<ObjectHandle, Channel::Error> {
         let response = self.request_socket(SocketRequest::Create(CreateSocketRequest {
             address_family: AddressFamily::Ipv4,
-            socket_type: SocketType::Datagram,
-            protocol: IpProtocol::Udp,
+            socket_type,
+            protocol,
             flags,
         }))?;
         let SocketResponse::Create(response) = response else {
@@ -104,6 +116,35 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::test_support::test_broker_local;
+
+    #[test]
+    fn icmp_echo_creates_ipv4_datagram() {
+        let handle = ObjectHandle(7);
+        let channel = ScriptedChannel::new([BrokerResult::Socket(SocketResponse::Create(
+            litebox_broker_protocol::socket::CreateSocketResponse { handle },
+        ))]);
+        let local = test_broker_local(
+            channel,
+            Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE)),
+        );
+        assert_eq!(
+            local
+                .create_icmp_echo_socket(FileOpenFlags::NONBLOCKING)
+                .unwrap(),
+            handle
+        );
+        assert!(matches!(
+            local.channel.sent_operations.borrow().as_slice(),
+            [BrokerOperation::Socket(SocketRequest::Create(
+                CreateSocketRequest {
+                    address_family: AddressFamily::Ipv4,
+                    socket_type: SocketType::Datagram,
+                    protocol: IpProtocol::IcmpEcho,
+                    flags: FileOpenFlags::NONBLOCKING,
+                }
+            ))]
+        ));
+    }
 
     #[test]
     fn udp_operations_stage_complete_datagrams() {

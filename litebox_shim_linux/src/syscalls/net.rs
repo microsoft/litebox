@@ -1049,6 +1049,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: ReceiveFlags,
     ) -> Result<usize, Errno> {
         let supported_flags = ReceiveFlags::DONTWAIT
+            | ReceiveFlags::ERRQUEUE
             | ReceiveFlags::PEEK
             | ReceiveFlags::TRUNC
             | ReceiveFlags::WAITALL;
@@ -1071,6 +1072,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         msg_ptr: UserPtrMut<litebox_common_linux::UserMsgHdr>,
         flags: ReceiveFlags,
     ) -> Result<usize, Errno> {
+        if flags.contains(ReceiveFlags::ERRQUEUE) && !matches!(socket, ReceiveSocket::Inet(_)) {
+            return Err(Errno::EINVAL);
+        }
         let msg = msg_ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
 
         // Copy fields out of the packed struct to avoid unaligned references.
@@ -1206,6 +1210,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         timeout: litebox_common_linux::TimeParam,
     ) -> Result<usize, Errno> {
         let supported_flags = ReceiveFlags::DONTWAIT
+            | ReceiveFlags::ERRQUEUE
             | ReceiveFlags::PEEK
             | ReceiveFlags::TRUNC
             | ReceiveFlags::WAITALL

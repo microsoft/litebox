@@ -67,6 +67,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use crate::publish::{Protocol, Publish, Publishing};
 
 mod direct;
+mod echo;
 mod host;
 mod tcp;
 mod udp;
@@ -111,6 +112,10 @@ fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 /// Calls run on the broker's request workers under each socket's own lock and
 /// never wait for network readiness. One event thread turns the host's socket
 /// events into cached readiness.
+///
+/// IPv4 echo datagrams answer guest-network addresses in the provider itself.
+/// For external peers the Linux provider requires the host to permit ping
+/// sockets. Other hosts support virtual echo only; none uses raw sockets.
 pub struct UserlandSocketProvider {
     core: Arc<ProviderCore>,
 }
@@ -149,7 +154,7 @@ impl SocketProvider for UserlandSocketProvider {
         let socket = UserlandSocket::new(&self.core, process_key, kind, readiness)?;
         let mut state = lock(&socket.state);
         self.core.charge_socket(process_key)?;
-        if kind == SocketKind::Udp {
+        if kind != SocketKind::Tcp {
             socket.inbox.lock().set_own(ReadinessFlags::WRITE);
         }
         if let Err(error) = self.core.register(&socket) {
@@ -807,6 +812,7 @@ impl UserlandSocket {
         let transport = match kind {
             SocketKind::Tcp => create_tcp_transport(),
             SocketKind::Udp => SocketTransportState::Udp(UdpSocketState::default()),
+            SocketKind::Echo => SocketTransportState::Echo(echo::EchoSocket::default()),
         };
         Ok(Arc::new(Self {
             id,
@@ -866,6 +872,10 @@ impl UserlandSocket {
             state,
         };
         socket.drain_inbox()?;
+        if socket.kind() == SocketKind::Echo {
+            socket.publish_echo_readiness()?;
+            return Ok(Dispatch::Applied);
+        }
         let mut flags = flags;
         // An ERROR event may be stale by the time the event thread applies it,
         // because a call can consume the error first.
@@ -938,6 +948,7 @@ impl PlatformSocket for UserlandSocket {
         self.call(|socket| {
             Ok(match socket.kind() {
                 SocketKind::Udp => socket.connect_udp_socket(address),
+                SocketKind::Echo => socket.connect_echo(address),
                 SocketKind::Tcp => socket.connect_tcp_destination(address, guest_source_lease),
             })
         })
@@ -1095,6 +1106,7 @@ impl ReceiveFromOutcome {
 enum SocketTransportState {
     Tcp(TcpSocketState),
     Udp(UdpSocketState),
+    Echo(echo::EchoSocket),
 }
 
 /// Socket state guarded by the socket's `state` lock.
@@ -1113,20 +1125,21 @@ impl SocketState {
         match &self.transport {
             SocketTransportState::Tcp(_) => SocketKind::Tcp,
             SocketTransportState::Udp(_) => SocketKind::Udp,
+            SocketTransportState::Echo(_) => SocketKind::Echo,
         }
     }
 
     fn udp_state(&self) -> BrokerResult<&UdpSocketState> {
         match &self.transport {
             SocketTransportState::Udp(udp) => Ok(udp),
-            SocketTransportState::Tcp(_) => Err(BrokerError::Internal),
+            _ => Err(BrokerError::Internal),
         }
     }
 
     fn udp_state_mut(&mut self) -> BrokerResult<&mut UdpSocketState> {
         match &mut self.transport {
             SocketTransportState::Udp(udp) => Ok(udp),
-            SocketTransportState::Tcp(_) => Err(BrokerError::Internal),
+            _ => Err(BrokerError::Internal),
         }
     }
 }
@@ -1135,6 +1148,7 @@ impl SocketState {
 enum SocketKind {
     Tcp,
     Udp,
+    Echo,
 }
 
 /// A socket whose `state` lock is held.
@@ -1186,13 +1200,14 @@ impl<'a> SocketEntry<'a> {
     fn drain_inbox(&mut self) -> BrokerResult<()> {
         match self.kind() {
             SocketKind::Tcp => self.drain_guest_reset(),
-            SocketKind::Udp => Ok(()),
+            SocketKind::Udp | SocketKind::Echo => Ok(()),
         }
     }
 
     /// The host socket an event `token` of this socket refers to.
     fn event_descriptor(&self, token: u64) -> Option<&Socket> {
         match &self.transport {
+            SocketTransportState::Echo(_) => None,
             SocketTransportState::Tcp(tcp) => tcp.descriptor.socket().ok(),
             SocketTransportState::Udp(udp) => udp
                 .native_endpoint
@@ -1212,6 +1227,7 @@ impl<'a> SocketEntry<'a> {
         match self.kind() {
             SocketKind::Tcp => self.retire_tcp(),
             SocketKind::Udp => self.retire_udp(),
+            SocketKind::Echo => self.retire_echo(),
         }
     }
 
@@ -1223,11 +1239,16 @@ impl<'a> SocketEntry<'a> {
         let already_bound = self.guest_local_address.is_some();
         let binding_kind = if binding.is_tcp() {
             SocketKind::Tcp
+        } else if binding.is_icmp_echo() {
+            SocketKind::Echo
         } else {
             SocketKind::Udp
         };
         if !binding.is_valid() || binding_kind != kind {
             return Err(BrokerError::Internal);
+        }
+        if kind == SocketKind::Echo {
+            return Ok(self.bind_echo(binding));
         }
         if kind == SocketKind::Udp {
             return self.bind_udp_socket(binding, already_bound);
@@ -1240,6 +1261,9 @@ impl<'a> SocketEntry<'a> {
         data: RawParts<'_>,
         destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<usize>> {
+        if self.kind() == SocketKind::Echo {
+            return self.send_echo(data, destination);
+        }
         if self.kind() != SocketKind::Udp || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
@@ -1271,6 +1295,9 @@ impl<'a> SocketEntry<'a> {
     fn shutdown_socket(&mut self, mode: ShutdownMode) -> BrokerResult<SocketOutcome<()>> {
         if self.kind() == SocketKind::Tcp {
             return self.shutdown_tcp_socket(mode);
+        }
+        if self.kind() == SocketKind::Echo {
+            return self.shutdown_echo(mode);
         }
         let (shut_read, shut_write) = match mode {
             ShutdownMode::Read => (true, false),
@@ -1305,6 +1332,9 @@ impl<'a> SocketEntry<'a> {
         output: RawParts<'_>,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<ReceiveFromOutcome> {
+        if self.kind() == SocketKind::Echo {
+            return self.receive_echo(output, flags);
+        }
         if let Some(error) = self.take_udp_cached_error() {
             return Ok(ReceiveFromOutcome::Failed(error));
         }
@@ -1526,6 +1556,7 @@ const fn socket_kind(request: CreateSocketRequest) -> Option<SocketKind> {
     ) {
         (AddressFamily::Ipv4, SocketType::Stream, IpProtocol::Tcp) => Some(SocketKind::Tcp),
         (AddressFamily::Ipv4, SocketType::Datagram, IpProtocol::Udp) => Some(SocketKind::Udp),
+        (AddressFamily::Ipv4, SocketType::Datagram, IpProtocol::IcmpEcho) => Some(SocketKind::Echo),
         _ => None,
     }
 }
@@ -1533,6 +1564,7 @@ const fn socket_kind(request: CreateSocketRequest) -> Option<SocketKind> {
 fn status_socket(socket: &mut SocketEntry<'_>) -> BrokerResult<PlatformSocketStatus> {
     match socket.kind() {
         SocketKind::Udp => socket.status_udp_socket(),
+        SocketKind::Echo => socket.status_echo(),
         SocketKind::Tcp => status_tcp_socket(socket),
     }
 }

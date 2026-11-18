@@ -72,6 +72,8 @@ wire_enum! {
         Tcp,
         /// UDP.
         Udp,
+        /// IPv4 ICMP echo requests and replies, without raw packet access.
+        IcmpEcho,
     }
 }
 

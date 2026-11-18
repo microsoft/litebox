@@ -437,14 +437,14 @@ impl SocketState {
     pub(super) fn tcp_state(&self) -> BrokerResult<&TcpSocketState> {
         match &self.transport {
             SocketTransportState::Tcp(tcp) => Ok(tcp),
-            SocketTransportState::Udp(_) => Err(BrokerError::Internal),
+            _ => Err(BrokerError::Internal),
         }
     }
 
     pub(super) fn tcp_state_mut(&mut self) -> BrokerResult<&mut TcpSocketState> {
         match &mut self.transport {
             SocketTransportState::Tcp(tcp) => Ok(tcp),
-            SocketTransportState::Udp(_) => Err(BrokerError::Internal),
+            _ => Err(BrokerError::Internal),
         }
     }
 }

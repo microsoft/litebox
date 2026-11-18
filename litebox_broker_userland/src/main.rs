@@ -32,8 +32,8 @@ use litebox_broker_core::{
     pid_namespace::PidNamespace,
 };
 use litebox_broker_core::{
-    CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
-    SocketPolicyError,
+    CallerCredential, DestinationPortRange, DestinationRule, IcmpEchoDestinationRule, Ipv4Cidr,
+    SocketPolicy, SocketPolicyError,
 };
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
@@ -154,6 +154,10 @@ struct CliArgs {
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 UDP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
     allow_udp_destination: Vec<AllowedDestination>,
+    /// Permit outbound IPv4 ICMP echo requests to this network (repeatable, no port).
+    /// Without this option, echo requests are limited to the guest network.
+    #[arg(long, value_name = "CIDR", value_parser = parse_ipv4_cidr)]
+    allow_icmp_echo_destination: Vec<Ipv4Cidr>,
     /// Publish guest GUEST_PORT, TCP unless `/udp`, at HOST_IP:HOST_PORT (HOST_IP 0.0.0.0 by
     /// default). The broker holds the host port from its start and serves it while a guest socket
     /// listens on, or is bound to, GUEST_PORT. Clients need --allow-tcp-source or
@@ -559,6 +563,7 @@ fn finish_in_process_runner(
 fn configured_socket_policy(
     allowed_tcp_destinations: &[AllowedDestination],
     allowed_udp_destinations: &[AllowedDestination],
+    allowed_echo_destinations: &[Ipv4Cidr],
 ) -> Result<SocketPolicy, SocketPolicyError> {
     let mut policy = SocketPolicy::guest_network();
     if !allowed_tcp_destinations.is_empty() {
@@ -568,6 +573,16 @@ fn configured_socket_policy(
     if !allowed_udp_destinations.is_empty() {
         let rules = destination_rules(allowed_udp_destinations);
         policy = policy.with_udp_destination_rules(&rules)?;
+    }
+    if !allowed_echo_destinations.is_empty() {
+        let rules: Vec<_> = allowed_echo_destinations
+            .iter()
+            .map(|&destination| IcmpEchoDestinationRule {
+                caller_credential: CallerCredential::HostGuaranteed,
+                destination,
+            })
+            .collect();
+        policy = policy.with_icmp_echo_destination_rules(&rules)?;
     }
     Ok(policy)
 }
@@ -829,16 +844,50 @@ mod cli_tests {
     }
 
     #[test]
+    fn echo_cli_accepts_repeated_networks_but_no_ports() {
+        let parse = |destination| {
+            CliArgs::try_parse_from([
+                "broker",
+                "--runner",
+                "runner",
+                "--allow-icmp-echo-destination",
+                "192.0.2.7/32",
+                "--allow-icmp-echo-destination",
+                destination,
+                "--",
+                "ping",
+            ])
+        };
+        assert_eq!(
+            parse("203.0.113.0/24").unwrap().allow_icmp_echo_destination,
+            [
+                parse_ipv4_cidr("192.0.2.7/32").unwrap(),
+                parse_ipv4_cidr("203.0.113.0/24").unwrap()
+            ]
+        );
+        assert!(parse("203.0.113.0/24:7").is_err());
+        assert!(parse("203.0.113.1/24").is_err());
+    }
+
+    #[test]
     fn destination_arguments_extend_the_guest_network_default_by_protocol() {
         assert_eq!(
-            configured_socket_policy(&[], &[]).unwrap(),
+            configured_socket_policy(&[], &[], &[]).unwrap(),
             SocketPolicy::guest_network()
         );
 
         let tcp = "0.0.0.0/0:80".parse::<AllowedDestination>().unwrap();
         let udp = "10.0.2.1/32:53".parse::<AllowedDestination>().unwrap();
         let proxy = "10.0.2.1/32:3128".parse::<AllowedDestination>().unwrap();
-        let policy = configured_socket_policy(&[tcp, proxy], &[udp]).unwrap();
+        let echo = parse_ipv4_cidr("192.0.2.0/24").unwrap();
+        let policy = configured_socket_policy(&[tcp, proxy], &[udp], &[echo]).unwrap();
+        assert_eq!(
+            policy.icmp_echo_destination_rules().unwrap(),
+            &[IcmpEchoDestinationRule {
+                caller_credential: CallerCredential::HostGuaranteed,
+                destination: echo,
+            }]
+        );
         let tcp_rules = policy.tcp_destination_rules().unwrap();
         assert_eq!(tcp_rules.len(), 2);
         assert_eq!(

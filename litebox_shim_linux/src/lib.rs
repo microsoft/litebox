@@ -675,6 +675,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             resource_limits,
             dumpable,
             no_new_privs,
+            keep_caps,
             cwd,
             comm,
             blocked_signals,
@@ -741,6 +742,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             resource_limits,
         );
         thread.no_new_privs.set(no_new_privs);
+        thread.keep_caps.set(keep_caps);
         #[cfg(target_arch = "aarch64")]
         thread.sve_vl_inherit.set(sve_vl_inherit);
         thread.set_forked_init_state(
@@ -1045,6 +1047,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             | PrctlArg::SetDumpable(_)
                             | PrctlArg::GetNoNewPrivs
                             | PrctlArg::SetNoNewPrivs
+                            | PrctlArg::GetKeepCaps
+                            | PrctlArg::SetKeepCaps(_)
                             | PrctlArg::GetPDeathSig(_)
                             | PrctlArg::SetPDeathSig(_),
                     }
@@ -1762,6 +1766,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::Unshare { flags } => self.sys_unshare(flags),
             SyscallRequest::Getsid { pid } => self.sys_getsid(pid),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
+            // Guest credentials are fixed. Accept only a request that leaves them unchanged.
+            SyscallRequest::Setuid { uid } => {
+                if uid == self.sys_getuid() && uid == self.sys_geteuid() {
+                    Ok(0)
+                } else {
+                    Err(Errno::EPERM)
+                }
+            }
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
@@ -1787,6 +1799,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|()| 0)
             }
             SyscallRequest::CapGet { header, data } => syscall!(sys_capget(header, data)),
+            SyscallRequest::CapSet { header, data } => syscall!(sys_capset(header, data)),
             SyscallRequest::GetDirent64 { fd, dirp, count } => {
                 self.sys_getdirent64(fd, dirp, count)
             }
@@ -1908,6 +1921,7 @@ struct VforkState<Platform: ShimPlatform> {
     resource_limits: litebox_common_linux::ResourceLimitValues,
     /// The child's `no_new_privs`, which starts as the calling thread's.
     no_new_privs: bool,
+    keep_caps: bool,
     parent_context: litebox_common_linux::PtRegs,
     /// The parent's floating-point and vector state, which the child may change.
     parent_vector_state: litebox_common_linux::GuestVectorState,

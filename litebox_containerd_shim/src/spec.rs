@@ -28,6 +28,7 @@ pub const SERVED_PATHS: [&str; 3] = ["/dev", "/proc", "/sys"];
 
 const EGRESS_TCP: &str = "io.litebox.egress.tcp";
 const EGRESS_UDP: &str = "io.litebox.egress.udp";
+const EGRESS_ICMP_ECHO: &str = "io.litebox.egress.icmp-echo";
 const INGRESS_TCP: &str = "io.litebox.ingress.tcp";
 const INGRESS_UDP: &str = "io.litebox.ingress.udp";
 /// `[HOST_IP:]HOST_PORT:GUEST_PORT,...`: TCP ports of the broker's network namespace, which is
@@ -89,6 +90,8 @@ pub struct Bind {
 pub struct Egress {
     pub tcp: Vec<Destination>,
     pub udp: Vec<Destination>,
+    /// IPv4 networks allowed to receive ICMP echo requests (no ports).
+    pub icmp_echo: Vec<Cidr>,
 }
 
 /// The networks whose clients published ports admit, as the broker's `--allow-tcp-source` and
@@ -249,7 +252,13 @@ fn egress(annotations: &HashMap<String, String>) -> Result<Egress> {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("io.litebox."))
             && !matches!(
                 key.as_str(),
-                EGRESS_TCP | EGRESS_UDP | INGRESS_TCP | INGRESS_UDP | PUBLISH_TCP | PUBLISH_UDP
+                EGRESS_TCP
+                    | EGRESS_UDP
+                    | EGRESS_ICMP_ECHO
+                    | INGRESS_TCP
+                    | INGRESS_UDP
+                    | PUBLISH_TCP
+                    | PUBLISH_UDP
             )
     }) {
         return Err(invalid(format!("unknown annotation {key:?}")));
@@ -257,6 +266,7 @@ fn egress(annotations: &HashMap<String, String>) -> Result<Egress> {
     Ok(Egress {
         tcp: entries(annotations, EGRESS_TCP, "CIDR:PORT[-PORT]", str::parse)?,
         udp: entries(annotations, EGRESS_UDP, "CIDR:PORT[-PORT]", str::parse)?,
+        icmp_echo: entries(annotations, EGRESS_ICMP_ECHO, "CIDR", str::parse)?,
     })
 }
 
@@ -521,6 +531,11 @@ mod tests {
         let tcp = egress(&annotations(EGRESS_TCP, "10.0.0.0/8:443,192.0.2.1/32:1-9"));
         let listed: Vec<String> = tcp.unwrap().tcp.iter().map(ToString::to_string).collect();
         assert_eq!(listed, ["10.0.0.0/8:443", "192.0.2.1/32:1-9"]);
+        let echo =
+            |value| egress(&annotations(EGRESS_ICMP_ECHO, value)).map(|policy| policy.icmp_echo);
+        assert!(echo("192.0.2.17/32,198.51.100.0/24").is_ok_and(|rules| rules.len() == 2));
+        assert!(echo("192.0.2.0/24:7").is_err());
+        assert!(echo("192.0.2.1/24").is_err());
         assert!(egress(&annotations(EGRESS_UDP, "")).is_ok_and(|e| e == Egress::default()));
         let udp = |value| ingress(&annotations(INGRESS_UDP, value)).map(|ingress| ingress.udp);
         assert!(udp("10.0.2.1/32,0.0.0.0/0").is_ok_and(|udp| udp[1].to_string() == "0.0.0.0/0"));

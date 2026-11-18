@@ -1619,6 +1619,28 @@ fn test_runner_broker_tcp_connection_states_with_rewriter() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn test_runner_icmp_echo() {
+    let target = common::compile("./tests/icmp_echo.c", "icmp_echo", true, false);
+    Runner::new(&target, "icmp_echo").run();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires iputils ping installed"]
+fn test_runner_iputils_ping() {
+    let ping = run_which("ping");
+    let output = Runner::new(&ping, "iputils_ping_rewriter")
+        .arg("-4")
+        .arg("-n")
+        .arg("-c1")
+        .arg("-w2")
+        .arg("127.0.0.1")
+        .output();
+    assert!(String::from_utf8_lossy(&output).contains("1 received"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn test_runner_broker_udp_with_rewriter() {
     use std::net::{Ipv4Addr, UdpSocket};
 

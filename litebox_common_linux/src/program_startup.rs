@@ -177,6 +177,8 @@ pub enum InheritedFdKind {
         /// Stream (TCP) or datagram (UDP).
         socket_type: SocketType,
     },
+    /// An IPv4 ICMP echo datagram socket.
+    IcmpEchoSocket,
     /// A vsock stream socket.
     VsockSocket,
     /// A pidfd.
@@ -206,6 +208,8 @@ pub struct LinuxForkStartup {
     pub dumpable: bool,
     /// Whether the thread calling `fork` has `no_new_privs` set, which the child copies.
     pub no_new_privs: bool,
+    /// The calling thread's keep-capabilities flag; `fork` copies it, `execve` clears it.
+    pub keep_caps: bool,
     /// Absolute working directory.
     pub cwd: String,
     /// Command name.
@@ -519,7 +523,7 @@ impl LinuxForkStartup {
         }
         output.extend_from_slice(self.resource_limits.as_bytes());
         output.push(u8::from(self.dumpable));
-        output.push(u8::from(self.no_new_privs));
+        output.push(u8::from(self.no_new_privs) | (u8::from(self.keep_caps) << 1));
         for count in [self.cwd.len(), self.regions.len(), self.fds.len()] {
             push_u32(
                 &mut output,
@@ -579,7 +583,10 @@ impl LinuxForkStartup {
         let program_break = read_usize(&mut input)?;
         let resource_limits = read_value(&mut input)?;
         let dumpable = read_bool(&mut input)?;
-        let no_new_privs = read_bool(&mut input)?;
+        let flags = read_u8(&mut input)?;
+        if flags & !3 != 0 {
+            return Err(LinuxProgramStartupError::Malformed);
+        }
         let cwd_length = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let region_count = usize::try_from(read_u32(&mut input)?)
@@ -626,7 +633,8 @@ impl LinuxForkStartup {
             umask,
             resource_limits,
             dumpable,
-            no_new_privs,
+            no_new_privs: flags & 1 != 0,
+            keep_caps: flags & 2 != 0,
             cwd,
             comm,
             blocked_signals,
@@ -665,7 +673,8 @@ impl InheritedFd {
                 | InheritedFdKind::Pidfd => 0,
                 InheritedFdKind::Pipe { .. }
                 | InheritedFdKind::UnixSocket { .. }
-                | InheritedFdKind::InetSocket { .. } => size_of::<u8>(),
+                | InheritedFdKind::InetSocket { .. }
+                | InheritedFdKind::IcmpEchoSocket => size_of::<u8>(),
             }
     }
 
@@ -702,6 +711,7 @@ impl InheritedFd {
                 });
             }
             InheritedFdKind::VsockSocket => output.push(VSOCK_SOCKET_TAG),
+            InheritedFdKind::IcmpEchoSocket => output.extend_from_slice(&[INET_SOCKET_TAG, 2]),
             InheritedFdKind::Pidfd => output.push(PIDFD_TAG),
         }
     }
@@ -729,12 +739,15 @@ impl InheritedFd {
             EVENTFD_TAG => InheritedFdKind::Eventfd,
             TIMERFD_TAG => InheritedFdKind::Timerfd,
             EPOLL_TAG => InheritedFdKind::Epoll,
-            INET_SOCKET_TAG => InheritedFdKind::InetSocket {
-                socket_type: match read_u8(input)? {
-                    0 => SocketType::Stream,
-                    1 => SocketType::Datagram,
-                    _ => return Err(LinuxProgramStartupError::Malformed),
+            INET_SOCKET_TAG => match read_u8(input)? {
+                0 => InheritedFdKind::InetSocket {
+                    socket_type: SocketType::Stream,
                 },
+                1 => InheritedFdKind::InetSocket {
+                    socket_type: SocketType::Datagram,
+                },
+                2 => InheritedFdKind::IcmpEchoSocket,
+                _ => return Err(LinuxProgramStartupError::Malformed),
             },
             VSOCK_SOCKET_TAG => InheritedFdKind::VsockSocket,
             PIDFD_TAG => InheritedFdKind::Pidfd,
@@ -1173,6 +1186,11 @@ mod tests {
                     handle: ObjectHandle(17),
                     kind: InheritedFdKind::Pidfd,
                 },
+                InheritedFd {
+                    fd: 15,
+                    handle: ObjectHandle(18),
+                    kind: InheritedFdKind::IcmpEchoSocket,
+                },
             ],
         };
 
@@ -1259,6 +1277,7 @@ mod tests {
             resource_limits: resource_limits(),
             dumpable: false,
             no_new_privs: true,
+            keep_caps: true,
             cwd: "/home/user".into(),
             comm: *b"python3\0\0\0\0\0\0\0\0\0",
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
@@ -1384,7 +1403,7 @@ mod tests {
         assert_eq!(decoded.comm, startup.comm);
         assert_eq!(decoded.signal_actions[0].restorer, 0x5678);
         assert_eq!(decoded.resource_limits, startup.resource_limits);
-        assert!(!decoded.dumpable && decoded.no_new_privs);
+        assert!(!decoded.dumpable && decoded.no_new_privs && decoded.keep_caps);
         #[cfg(target_arch = "aarch64")]
         {
             assert_eq!(decoded.vector_state, startup.vector_state);

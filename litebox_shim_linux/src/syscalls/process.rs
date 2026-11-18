@@ -265,6 +265,8 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     /// processes created by this thread start with a copy, and `execve` keeps it. Nothing else
     /// reads it yet, as LiteBox has no `execve` that grants privileges.
     pub(crate) no_new_privs: Cell<bool>,
+    /// Observable by `PR_GET_KEEPCAPS` even though guest capability sets are empty.
+    pub(crate) keep_caps: Cell<bool>,
     /// Linux `TIF_SVE_VL_INHERIT`: whether the last `PR_SVE_SET_VL` set `PR_SVE_VL_INHERIT`.
     /// Threads and processes created by this thread start with a copy, and `execve` keeps it.
     #[cfg(target_arch = "aarch64")]
@@ -352,6 +354,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             robust_list: Cell::new(None),
             restart_block: Cell::new(None),
             no_new_privs: Cell::new(false),
+            keep_caps: Cell::new(false),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: Cell::new(false),
         }
@@ -371,6 +374,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             // Like Linux, a new thread starts with a copy of the creating thread's.
             restart_block: Cell::new(self.restart_block.get()),
             no_new_privs: Cell::new(self.no_new_privs.get()),
+            keep_caps: Cell::new(self.keep_caps.get()),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: Cell::new(self.sve_vl_inherit.get()),
         })
@@ -1459,6 +1463,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Ok(0)
             }
             PrctlArg::GetNoNewPrivs => Ok(usize::from(self.no_new_privs())),
+            PrctlArg::SetKeepCaps(value) => {
+                match self.vfork.borrow_mut().as_mut() {
+                    Some(vfork) => vfork.keep_caps = value,
+                    None => self.thread.keep_caps.set(value),
+                }
+                Ok(0)
+            }
+            PrctlArg::GetKeepCaps => Ok(usize::from(match self.vfork.borrow().as_ref() {
+                Some(vfork) => vfork.keep_caps,
+                None => self.thread.keep_caps.get(),
+            })),
             #[cfg(target_arch = "aarch64")]
             PrctlArg::SveGetVl => {
                 let flags = if self.thread.sve_vl_inherit.get() {
@@ -1920,6 +1935,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             resource_limits: self.thread.process.limits.get(),
             dumpable: self.thread.process.dumpable.load(Ordering::Relaxed),
             no_new_privs: self.thread.no_new_privs.get(),
+            keep_caps: self.thread.keep_caps.get(),
             cwd,
             comm: self.comm.get(),
             blocked_signals,
@@ -2210,6 +2226,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             child_init_process,
             resource_limits,
             no_new_privs: self.thread.no_new_privs.get(),
+            keep_caps: self.thread.keep_caps.get(),
             parent_context,
             // Callers may keep values in callee-saved vector registers across the call.
             parent_vector_state: self.global.platform.get_guest_vector_state(),
@@ -6560,6 +6577,7 @@ mod fork_tests {
                 resource_limits: task.process().limits.get(),
                 dumpable: true,
                 no_new_privs: false,
+                keep_caps: false,
                 cwd: "/".into(),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN],
                 blocked_signals,

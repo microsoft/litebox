@@ -408,6 +408,12 @@ fn request_codec_round_trips_all_variants() {
             protocol: IpProtocol::Udp,
             flags: FileOpenFlags::NONBLOCKING,
         })),
+        BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
+            address_family: AddressFamily::Ipv4,
+            socket_type: SocketType::Datagram,
+            protocol: IpProtocol::IcmpEcho,
+            flags: FileOpenFlags::NONBLOCKING,
+        })),
         BrokerOperation::Socket(SocketRequest::Bind(BindSocketRequest {
             handle,
             address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),

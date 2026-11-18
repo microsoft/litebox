@@ -329,12 +329,13 @@ fn broker_arguments(
             command.arg(option).arg(destination.to_string());
         }
     }
-    for (option, sources) in [
+    for (option, networks) in [
+        ("--allow-icmp-echo-destination", &plan.egress.icmp_echo),
         ("--allow-tcp-source", &plan.ingress.tcp),
         ("--allow-udp-source", &plan.ingress.udp),
     ] {
-        for source in sources {
-            command.arg(option).arg(source.to_string());
+        for network in networks {
+            command.arg(option).arg(network.to_string());
         }
     }
     for publish in &plan.publish {

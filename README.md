@@ -22,6 +22,23 @@ Example use cases include:
 
 ![LiteBox and related projects](./.figures/litebox.svg)
 
+### IPv4 ping with the userland broker
+
+Guests can use IPv4 datagram ping sockets (`SOCK_DGRAM`, `IPPROTO_ICMP`) to
+send echo requests within the guest network, for example `ping -4 -c 1 127.0.0.1`.
+To permit an external destination, pass
+`--allow-icmp-echo-destination 192.0.2.17/32` to the broker, substituting the
+target's IPv4 address. Repeat the flag for additional networks, or, with the
+containerd shim, set `io.litebox.egress.icmp-echo` to a comma-separated list
+of canonical IPv4 CIDRs. The host gateway (`10.0.2.1`) also requires an explicit
+rule. These rules have no port range and do not grant UDP or raw socket access.
+External echo requires a Linux host that permits the broker's group to create
+ping sockets (`net.ipv4.ping_group_range`); guest loopback needs no host ping socket.
+External echo requires a Linux host whose `net.ipv4.ping_group_range` permits
+the broker's group. Guest loopback does not require that host permission.
+If `iputils` ping tries to discover its source with an external UDP connection,
+use `ping -4 -I 10.0.2.15 -c 1 TARGET` to select the guest address explicitly.
+
 ## Contributing
 
 See the following files for details:

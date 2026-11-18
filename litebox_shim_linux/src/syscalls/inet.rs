@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Internet (IPv4 TCP and UDP) sockets for the Linux shim layer.
+//! Internet (IPv4 TCP, UDP, and ICMP echo) sockets for the Linux shim layer.
 //!
 //! Each socket is a LiteBox [`inet_socket::InetSocket`]. This module translates between Linux
 //! socket calls and LiteBox's guest-neutral internet socket operations.
@@ -31,11 +31,12 @@ use litebox::{
 use litebox_broker_protocol::{
     ObjectHandle,
     fs::FileOpenFlags,
-    socket::{self, SocketType},
+    socket::{self, IpProtocol, SocketType},
 };
 use litebox_common_linux::{
     AddressFamily, IPProtocol, IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags,
     SockType, SocketOption, SocketOptionName, TcpOption, errno::Errno,
+    program_startup::InheritedFdKind,
 };
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -158,27 +159,15 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             log_unsupported!("protocol = {protocol}");
             Errno::EPROTONOSUPPORT
         })?;
-        let socket_type = match ty {
-            SockType::Stream => {
-                if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
-                    return Err(Errno::EINVAL);
-                }
-                SocketType::Stream
-            }
-            SockType::Datagram => {
-                if !matches!(protocol, IPProtocol::Default | IPProtocol::UDP) {
-                    return Err(Errno::EINVAL);
-                }
-                SocketType::Datagram
-            }
-            SockType::Raw => todo!(),
-            SockType::SeqPacket => {
-                log_unsupported!("inet sequenced-packet socket");
-                return Err(Errno::ESOCKTNOSUPPORT);
-            }
-            _ => unimplemented!(),
+        let protocol = match (ty, protocol) {
+            (SockType::Stream, IPProtocol::Default | IPProtocol::TCP) => IpProtocol::Tcp,
+            (SockType::Datagram, IPProtocol::Default | IPProtocol::UDP) => IpProtocol::Udp,
+            (SockType::Datagram, IPProtocol::ICMP) => IpProtocol::IcmpEcho,
+            (SockType::Stream | SockType::Datagram, _) => return Err(Errno::EINVAL),
+            (SockType::Raw, _) => return Err(Errno::EPERM),
+            _ => return Err(Errno::ESOCKTNOSUPPORT),
         };
-        let socket = litebox.create_inet_socket(socket_type, open_flags(flags))?;
+        let socket = litebox.create_inet_socket_with_protocol(protocol, open_flags(flags))?;
         Ok(socket.into())
     }
 
@@ -202,6 +191,15 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
     /// Plans a receive call with `flags`.
     pub(super) fn receive_plan(&self, flags: ReceiveFlags) -> Result<ReceivePlan, Errno> {
         let is_stream = self.is_stream();
+        if flags.contains(ReceiveFlags::ERRQUEUE) {
+            // IP_RECVERR has no backing extended-error queue. Never block on
+            // (or consume) an ordinary datagram in response to MSG_ERRQUEUE.
+            return Err(if is_stream {
+                Errno::EINVAL
+            } else {
+                Errno::EAGAIN
+            });
+        }
         let wait_all = flags.contains(ReceiveFlags::WAITALL)
             && !flags.contains(ReceiveFlags::PEEK)
             && is_stream
@@ -835,16 +833,22 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts an internet socket of type `socket_type` this process inherited
+    /// Adopts the internet socket this process inherited
     /// from its parent as `handle`.
     pub(super) fn adopt_inherited_inet_socket(
         &self,
         handle: ObjectHandle,
-        socket_type: SocketType,
+        kind: InheritedFdKind,
     ) -> Result<InetSocketFd<Platform>, ProcessError> {
-        let socket = self
-            .litebox
-            .adopt_inherited_inet_socket(handle, socket_type)?;
+        let socket = match kind {
+            InheritedFdKind::InetSocket { socket_type } => self
+                .litebox
+                .adopt_inherited_inet_socket(handle, socket_type)?,
+            InheritedFdKind::IcmpEchoSocket => self
+                .litebox
+                .adopt_inherited_inet_socket_with_protocol(handle, IpProtocol::IcmpEcho)?,
+            _ => unreachable!("not an internet socket"),
+        };
         Ok(self
             .litebox
             .descriptor_table_mut()
@@ -910,6 +914,54 @@ mod tests {
     fn close_socket(task: &TestTask, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
             .expect("close socket failed");
+    }
+
+    #[test]
+    fn ping_socket_receives_echo_without_raw_access() {
+        let task = init_platform();
+        let icmp = litebox_common_linux::IPProtocol::ICMP as u8;
+        assert_eq!(
+            task.do_socket(AddressFamily::INET, SockType::Raw, SockFlags::empty(), icmp),
+            Err(Errno::EPERM)
+        );
+        let fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::NONBLOCK,
+                icmp,
+            )
+            .unwrap();
+        let socket = typed_socket(&task, fd);
+        // Echo request, identifier 0, sequence 1, no payload.
+        let request = [8, 0, 0xf7, 0xfe, 0, 0, 0, 1];
+        assert_eq!(
+            task.do_sendto(
+                &socket,
+                &request[..],
+                SendFlags::CONFIRM,
+                Some(loopback_addr(0))
+            ),
+            Ok(request.len())
+        );
+        let mut reply = [0xff; 8];
+        let iov = litebox_common_linux::IoVec {
+            iov_base: UserPtrMut::from_ptr(reply.as_mut_ptr()),
+            iov_len: reply.len(),
+        };
+        let mut msg = litebox_common_linux::UserMsgHdr::new_zeroed();
+        msg.msg_iov = UserPtr::from_ptr(&raw const iov);
+        msg.msg_iovlen = 1;
+        let msg = UserPtrMut::from_ptr(&raw mut msg);
+        let raw_fd = i32::try_from(fd).unwrap();
+        assert_eq!(
+            task.sys_recvmsg(raw_fd, msg, ReceiveFlags::ERRQUEUE | ReceiveFlags::DONTWAIT),
+            Err(Errno::EAGAIN)
+        );
+        assert_eq!(task.sys_recvmsg(raw_fd, msg, ReceiveFlags::empty()), Ok(8));
+        assert_eq!(reply[..2], [0, 0]); // Echo reply, code 0
+        assert_eq!(reply[6..], [0, 1]);
+        close_socket(&task, fd);
     }
 
     #[test]

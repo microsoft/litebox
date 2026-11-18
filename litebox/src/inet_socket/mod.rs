@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-owned IPv4 TCP and UDP sockets.
+//! Broker-owned IPv4 TCP, UDP, and ICMP echo sockets.
 //!
 //! The broker owns each socket's host socket, options, status flags,
 //! connection state, and pending errors, and publishes its readiness, so
@@ -16,7 +16,7 @@ use litebox_broker_protocol::{
     error::ErrorCode,
     fs::{FileOpenFlags, FileStatusFlags},
     socket::{
-        MAX_TCP_LISTEN_BACKLOG, ShutdownMode, SocketConnectionStatus,
+        IpProtocol, MAX_TCP_LISTEN_BACKLOG, ShutdownMode, SocketConnectionStatus,
         SocketError as BrokerSocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
         SocketType,
     },
@@ -57,12 +57,11 @@ pub const MAX_UDP_DATAGRAM_SIZE: usize =
 /// A reference to a broker-owned IPv4 socket, which closes its handle when
 /// dropped.
 ///
-/// A [`SocketType::Stream`] socket is a TCP socket, and a
-/// [`SocketType::Datagram`] socket is a UDP socket.
+/// TCP sockets are streams; UDP and ICMP echo sockets are datagrams.
 pub struct InetSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
-    socket_type: SocketType,
+    protocol: IpProtocol,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
     /// Serializes a TCP socket's receives, since a large peek takes several
@@ -81,12 +80,28 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         socket_type: SocketType,
         flags: FileOpenFlags,
     ) -> Result<InetSocket<Platform>, SocketError> {
+        let protocol = match socket_type {
+            SocketType::Stream => IpProtocol::Tcp,
+            SocketType::Datagram => IpProtocol::Udp,
+            _ => return Err(SocketError::UnsupportedType),
+        };
+        self.create_inet_socket_with_protocol(protocol, flags)
+    }
+
+    /// Creates an IPv4 socket with an explicit protocol. ICMP echo uses
+    /// datagrams and grants no raw socket access.
+    pub fn create_inet_socket_with_protocol(
+        &self,
+        protocol: IpProtocol,
+        flags: FileOpenFlags,
+    ) -> Result<InetSocket<Platform>, SocketError> {
         let broker = self
             .broker_control()
             .ok_or(SocketError::BrokerUnavailable)?;
-        let handle = match socket_type {
-            SocketType::Stream => broker.create_tcp_socket(flags),
-            SocketType::Datagram => broker.create_udp_socket(flags),
+        let handle = match protocol {
+            IpProtocol::Tcp => broker.create_tcp_socket(flags),
+            IpProtocol::Udp => broker.create_udp_socket(flags),
+            IpProtocol::IcmpEcho => broker.create_icmp_echo_socket(flags),
             _ => return Err(SocketError::UnsupportedType),
         }
         .map_err(BrokerObjectError::from)?;
@@ -94,7 +109,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
             broker,
             self.broker_pollable_registry(),
             handle,
-            socket_type,
+            protocol,
         ))
     }
 
@@ -108,12 +123,28 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         handle: ObjectHandle,
         socket_type: SocketType,
     ) -> Result<InetSocket<Platform>, ProcessError> {
+        self.adopt_inherited_inet_socket_with_protocol(
+            handle,
+            match socket_type {
+                SocketType::Stream => IpProtocol::Tcp,
+                SocketType::Datagram => IpProtocol::Udp,
+                _ => return Err(ProcessError::Unavailable),
+            },
+        )
+    }
+
+    /// Adopts a broker handle with the IPv4 protocol recorded by its parent.
+    pub fn adopt_inherited_inet_socket_with_protocol(
+        &self,
+        handle: ObjectHandle,
+        protocol: IpProtocol,
+    ) -> Result<InetSocket<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(InetSocket::new(
             broker,
             self.broker_pollable_registry(),
             handle,
-            socket_type,
+            protocol,
         ))
     }
 }
@@ -123,12 +154,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         broker: Arc<dyn BrokerControl>,
         pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
         handle: ObjectHandle,
-        socket_type: SocketType,
+        protocol: IpProtocol,
     ) -> Self {
         let socket = Self {
             broker,
             handle,
-            socket_type,
+            protocol,
             pollable_registry,
             pollee: Arc::new(Pollee::new()),
             receive_lock: Mutex::new(()),
@@ -146,11 +177,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
 
     /// The socket's type.
     pub fn socket_type(&self) -> SocketType {
-        self.socket_type
+        if self.is_stream() {
+            SocketType::Stream
+        } else {
+            SocketType::Datagram
+        }
+    }
+
+    /// The socket's IPv4 protocol.
+    pub fn protocol(&self) -> IpProtocol {
+        self.protocol
     }
 
     fn is_stream(&self) -> bool {
-        self.socket_type == SocketType::Stream
+        self.protocol == IpProtocol::Tcp
     }
 
     /// Binds the socket to `address`.
@@ -222,7 +262,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
             Arc::clone(&self.broker),
             Arc::clone(&self.pollable_registry),
             accepted.handle,
-            SocketType::Stream,
+            IpProtocol::Tcp,
         ))
     }
 
@@ -331,8 +371,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
 
     /// Attempts to read from the socket without waiting.
     ///
-    /// Returns the number of bytes read, or for a UDP socket, the length of
-    /// the whole datagram, which may exceed `buf`. A UDP socket stores the
+    /// Returns the number of bytes read, or for a datagram socket, the length of
+    /// the whole datagram, which may exceed `buf`. A datagram socket stores the
     /// sender's address in `source_addr` if requested.
     pub fn try_read(
         &self,
@@ -350,7 +390,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         }
     }
 
-    /// Attempts to write to the socket without waiting, sending a UDP
+    /// Attempts to write to the socket without waiting, sending a
     /// datagram to `destination` if provided.
     ///
     /// A TCP socket ignores `destination`.
@@ -360,11 +400,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         flags: SendFlags,
         destination: Option<SocketAddr>,
     ) -> Result<usize, SocketWriteError> {
-        if !flags.is_empty() {
-            unimplemented!()
+        // MSG_CONFIRM is a neighbor-cache hint, not a change to the datagram.
+        if !(flags - SendFlags::CONFIRM).is_empty() {
+            return Err(SocketWriteError::Socket(
+                SocketAsyncError::UnsupportedOperation,
+            ));
         }
         if let Some(addr) = destination
-            && (addr.port() == 0 || addr.ip().is_unspecified())
+            && ((self.protocol != IpProtocol::IcmpEcho && addr.port() == 0)
+                || addr.ip().is_unspecified())
         {
             return Err(SocketWriteError::Unaddressable);
         }

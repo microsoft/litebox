@@ -109,6 +109,60 @@ fn gateway_destinations_require_external_policy() {
 }
 
 #[test]
+fn echo_authorizes_the_concrete_peer_and_has_its_own_identifier_namespace() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let gateway = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 53);
+    let policy = crate::SocketPolicy::guest_network()
+        .with_udp_destination_rules(&[destination_rule(*gateway.ip(), gateway.port())])
+        .unwrap();
+    let broker = test_broker_with_policy(Arc::clone(&provider) as Arc<dyn SocketProvider>, &policy);
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let sink = Arc::new(TestReadinessSink::default());
+    let udp = create(&process, create_udp_request(), sink.clone()).unwrap();
+    let echo = create(
+        &process,
+        CreateSocketRequest {
+            protocol: IpProtocol::IcmpEcho,
+            ..create_udp_request()
+        },
+        sink,
+    )
+    .unwrap();
+    let local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 12345);
+    for socket in [udp, echo] {
+        assert_eq!(
+            bind(&process, socket, local),
+            Ok(SocketOutcome::Completed(local))
+        );
+    }
+
+    let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+    assert_eq!(
+        connect(&process, echo, peer),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        connect(&process, echo, gateway),
+        Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
+    );
+    assert_eq!(
+        send_to(&process, echo, b"x", SendFlags::NONE, Some(gateway)),
+        Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
+    );
+    assert_eq!(get_name(&process, echo, true), Ok(Some(peer)));
+    assert_eq!(
+        send_to(&process, echo, b"x", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(1))
+    );
+    assert_eq!(
+        provider.state.send_destinations.lock().unwrap().as_slice(),
+        [Some(peer)]
+    );
+}
+
+#[test]
 fn gateway_destinations_reach_the_platform_untranslated() {
     let provider = Arc::new(TestSocketProvider::default());
     let tcp_rule = destination_rule(HOST_GATEWAY_IPV4_ADDRESS, 8080);
@@ -998,7 +1052,7 @@ impl PlatformSocket for TestPlatformSocket {
             return Ok(SocketConnectionStatus::Unconnected);
         }
         self.readiness.publish(ReadinessFlags::WRITE);
-        if is_udp(self.create_request) {
+        if is_datagram(self.create_request) {
             Ok(SocketConnectionStatus::Connected)
         } else {
             if self
@@ -1060,6 +1114,16 @@ impl PlatformSocket for TestPlatformSocket {
             .take()
             .unwrap_or(data.len());
         Ok(SocketOutcome::Completed(sent))
+    }
+
+    fn send_reply_to(
+        &self,
+        _: &dyn WriteBuffer,
+        _: SendFlags,
+        _: SocketAddrV4,
+    ) -> Result<SocketOutcome<usize>> {
+        assert!(is_udp(self.create_request), "reply exception is UDP-only");
+        Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
     }
 
     fn receive(

@@ -271,6 +271,11 @@ pub(crate) trait BrokerControl: Send + Sync {
         flags: FileOpenFlags,
     ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
+    fn create_icmp_echo_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
     fn connect_socket(
         &self,
         handle: ObjectHandle,
@@ -1296,6 +1301,13 @@ where
         flags: FileOpenFlags,
     ) -> core::result::Result<ObjectHandle, BrokerControlError> {
         self.request(|local| local.create_udp_socket(flags))
+    }
+
+    fn create_icmp_echo_socket(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.create_icmp_echo_socket(flags))
     }
 
     fn connect_socket(
