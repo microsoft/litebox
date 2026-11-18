@@ -3889,7 +3889,9 @@ impl<P: ShimPlatform> Task<P> {
         &self,
         objects: &mut Vec<litebox::process::InheritableFd<P>>,
     ) -> Result<InheritedCwd, Errno> {
-        objects.push(litebox::process::InheritableFd::File(self.cwd_dir()?));
+        objects.push(litebox::process::InheritableFd::File(
+            self.pinned_cwd_dir()?,
+        ));
         // Same encoded size as the child's eventual handle, for the payload size check.
         Ok(InheritedCwd::File(litebox_broker_protocol::ObjectHandle(0)))
     }

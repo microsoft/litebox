@@ -146,6 +146,8 @@ pub struct OverlayResolvedFile<'a, Platform: RawSyncPrimitivesProvider> {
     locked: NamespaceGuard<'a, Platform>,
 }
 
+/// An owned handle to a directory opened through the overlay. It follows the directory across
+/// renames instead of naming the path it was opened at.
 pub struct OverlayDir<P: RawSyncPrimitivesProvider> {
     location: Arc<DirectoryLocation<P>>,
     // Keep fstat on the underlying directory possible after it has been removed.

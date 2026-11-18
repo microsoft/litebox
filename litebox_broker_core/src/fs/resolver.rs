@@ -1874,7 +1874,6 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
         self.path_only
     }
 
-    /// Symlink-expanded path hint. An anchor or any ancestor may have since been renamed.
     pub(crate) fn path(&self) -> &str {
         &self.path
     }

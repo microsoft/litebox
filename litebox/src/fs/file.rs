@@ -115,7 +115,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         Ok(File::new(self, broker, handle))
     }
 
-    /// Change the permissions of a file. A relative `path` resolves from `dir` if supplied.
+    /// Change the permissions of a file. A relative `path` resolves from `dir`; an absolute path
+    /// ignores `dir`.
     pub fn chmod_file(
         &self,
         context: &Context,
@@ -131,7 +132,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(ChmodError::from)
     }
 
-    /// Change the owner of a file. A relative `path` resolves from `dir` if supplied.
+    /// Change the owner of a file. A relative `path` resolves from `dir`; an absolute path
+    /// ignores `dir`.
     pub fn chown_file(
         &self,
         context: &Context,
@@ -149,7 +151,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Create a symbolic link at `linkpath`, storing `target` verbatim. A relative `linkpath`
-    /// resolves from `dir` if supplied.
+    /// resolves from `dir`; an absolute one ignores `dir`.
     ///
     /// A relative target is interpreted relative to the link's parent when the link is
     /// subsequently followed.
@@ -168,7 +170,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(SymlinkError::from)
     }
 
-    /// Unlink a file. A relative `path` resolves from `dir` if supplied.
+    /// Unlink a file. A relative `path` resolves from `dir`; an absolute path ignores `dir`.
     pub fn unlink_file(
         &self,
         context: &Context,
@@ -184,7 +186,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Rename a file or directory, replacing an existing destination when permitted. Relative
-    /// source and destination paths resolve from `old_dir` and `new_dir` respectively, if supplied.
+    /// source and destination paths resolve from `old_dir` and `new_dir` respectively; absolute
+    /// paths ignore them.
     pub fn rename_file(
         &self,
         context: &Context,
@@ -202,7 +205,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(RenameError::from)
     }
 
-    /// Create a new directory. A relative `path` resolves from `dir` if supplied.
+    /// Create a new directory. A relative `path` resolves from `dir`; an absolute path
+    /// ignores `dir`.
     pub fn mkdir_file(
         &self,
         context: &Context,
@@ -228,7 +232,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(|_| FileError::Io)?
     }
 
-    /// Remove a directory. A relative `path` resolves from `dir` if supplied.
+    /// Remove a directory. A relative `path` resolves from `dir`; an absolute path ignores `dir`.
     pub fn rmdir_file(
         &self,
         context: &Context,
@@ -243,7 +247,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(RmdirError::from)
     }
 
-    /// Obtain the status of a path. A relative `path` resolves from `dir` if supplied.
+    /// Obtain the status of a path. A relative `path` resolves from `dir`; an absolute path
+    /// ignores `dir`.
     ///
     /// If `follow_symlinks` is false, a final symbolic link is described itself.
     pub fn path_file_status(
@@ -262,7 +267,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Read a symbolic link's stored target, without following the final link. A relative `path`
-    /// resolves from `dir` if supplied.
+    /// resolves from `dir`; an absolute path ignores `dir`.
     pub fn read_link_file(
         &self,
         context: &Context,
@@ -544,12 +549,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(SetTimesError::from)
     }
 
-    /// Returns the absolute path of the file, with symbolic links resolved, as of when it was
-    /// opened.
+    /// Returns the absolute path of the file, with symbolic links resolved.
     ///
     /// A directory reports its current path where the backend can determine it, and fails with
-    /// [`FilePathError::NoSuchFileOrDirectory`] once removed. Later renames or removals of a
-    /// regular file are not reflected.
+    /// [`FilePathError::NoSuchFileOrDirectory`] once removed. Any other file keeps the name it was
+    /// opened by, under the current path of the directory it was opened relative to; its own
+    /// later renames or removals are not reflected.
     pub fn path(&self) -> Result<String, FilePathError> {
         self.broker
             .handle_file_path(self.handle)?

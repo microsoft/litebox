@@ -412,7 +412,8 @@ wire_struct! {
     /// Opens or creates a fs object.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct OpenFileRequest {
-        /// Optional directory handle for resolving the path.
+        /// Directory handle the path resolves from: required when it is relative, `None`
+        /// when it is absolute.
         pub dir: Option<ObjectHandle>,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
@@ -593,7 +594,8 @@ wire_struct! {
     /// Reads status by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct PathFileStatusRequest {
-        /// Optional directory handle for resolving the path.
+        /// Directory handle the path resolves from: required when it is relative, `None`
+        /// when it is absolute.
         pub dir: Option<ObjectHandle>,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
@@ -621,7 +623,8 @@ wire_struct! {
     /// Creates a symbolic link by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct SymlinkFileRequest {
-        /// Optional directory handle for resolving the link path.
+        /// Directory handle the link path resolves from: required when it is relative, `None`
+        /// when it is absolute.
         pub dir: Option<ObjectHandle>,
         /// Shared-buffer region containing the UTF-8 linkpath followed by the target verbatim.
         pub buffer: SharedBufferSequence,
@@ -636,7 +639,8 @@ wire_struct! {
     /// Reads the target of a symbolic link by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ReadLinkFileRequest {
-        /// Optional directory handle for resolving the path.
+        /// Directory handle the path resolves from: required when it is relative, `None`
+        /// when it is absolute.
         pub dir: Option<ObjectHandle>,
         /// Shared-buffer region whose first `path_length` bytes hold one UTF-8 path; the
         /// broker replaces its contents with the link's target.
@@ -701,7 +705,8 @@ wire_struct! {
     /// Changes mode bits by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ChmodFileRequest {
-        /// Optional directory handle for resolving the path.
+        /// Directory handle the path resolves from: required when it is relative, `None`
+        /// when it is absolute.
         pub dir: Option<ObjectHandle>,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
@@ -716,7 +721,8 @@ wire_struct! {
     /// Changes ownership by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ChownFileRequest {
-        /// Optional directory handle for resolving the path.
+        /// Directory handle the path resolves from: required when it is relative, `None`
+        /// when it is absolute.
         pub dir: Option<ObjectHandle>,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
@@ -733,7 +739,8 @@ wire_struct! {
     /// Removes a file by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct UnlinkFileRequest {
-        /// Optional directory handle for resolving the path.
+        /// Directory handle the path resolves from: required when it is relative, `None`
+        /// when it is absolute.
         pub dir: Option<ObjectHandle>,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
@@ -746,9 +753,11 @@ wire_struct! {
     /// Renames a file or directory by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct RenameFileRequest {
-        /// Optional directory handle for resolving the old path.
+        /// Directory handle the old path resolves from: required when it is relative, `None`
+        /// when it is absolute.
         pub old_dir: Option<ObjectHandle>,
-        /// Optional directory handle for resolving the new path.
+        /// Directory handle the new path resolves from: required when it is relative, `None`
+        /// when it is absolute.
         pub new_dir: Option<ObjectHandle>,
         /// Shared-buffer region containing the old UTF-8 path followed by the new path.
         pub paths: SharedBufferSequence,
@@ -763,7 +772,8 @@ wire_struct! {
     /// Creates a directory by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MkdirFileRequest {
-        /// Optional directory handle for resolving the path.
+        /// Directory handle the path resolves from: required when it is relative, `None`
+        /// when it is absolute.
         pub dir: Option<ObjectHandle>,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
@@ -789,7 +799,8 @@ wire_struct! {
     /// Removes a directory by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct RmdirFileRequest {
-        /// Optional directory handle for resolving the path.
+        /// Directory handle the path resolves from: required when it is relative, `None`
+        /// when it is absolute.
         pub dir: Option<ObjectHandle>,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,

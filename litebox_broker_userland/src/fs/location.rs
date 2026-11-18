@@ -74,6 +74,23 @@ fn open_directory(path: &Path) -> io::Result<File> {
 }
 
 impl Location {
+    /// Fails unless the caller may search this directory.
+    pub(super) fn check_search(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{Mode, OFlags, openat};
+            openat(
+                &*self.pin,
+                ".",
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        fs::metadata(self.join(".")).map(drop)
+    }
+
     /// The directory's current host name, or `NotFound` once it has been removed.
     pub(super) fn directory_name(&self) -> io::Result<PathBuf> {
         #[cfg(target_os = "linux")]
@@ -150,7 +167,7 @@ impl Location {
     pub(super) fn parent_under(&self, root: &Self) -> io::Result<Option<Self>> {
         self.check_directory()?;
         // Require search permission on the starting directory before granting its parent.
-        fs::metadata(self.path.join("."))?;
+        self.check_search()?;
         if self.path == root.path {
             return Ok(None);
         }
@@ -235,7 +252,7 @@ impl Location {
             if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
                 return Err(super::invalid_path());
             }
-            let _search = openat(&*self.pin, ".", flags, Mode::empty())?;
+            self.check_search()?;
             return Ok(None);
         }
         let parent = Self::opened(Arc::new(File::from(openat(

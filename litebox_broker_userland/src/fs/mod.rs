@@ -512,12 +512,19 @@ impl LocalFs {
     }
 
     fn valid_dir(&self, dir: &LocalDir) -> bool {
-        self.instance_tag.same_instance(&dir.instance_tag)
-            && self
-                .root
-                .host_name()
-                .and_then(|root| dir.location.host_name().map(|name| name.starts_with(root)))
-                .unwrap_or(false)
+        if !self.instance_tag.same_instance(&dir.instance_tag) {
+            return false;
+        }
+        // Every absolute lookup starts from a clone of the root, which is trivially inside itself;
+        // skip the two procfs readlinks.
+        #[cfg(target_os = "linux")]
+        if Arc::ptr_eq(&dir.location.pin, &self.root.pin) {
+            return true;
+        }
+        self.root
+            .host_name()
+            .and_then(|root| dir.location.host_name().map(|name| name.starts_with(root)))
+            .unwrap_or(false)
     }
 
     fn valid_file(&self, file: &LocalFile) -> bool {
@@ -561,18 +568,18 @@ impl LocalFs {
             .or_insert_with(|| self.allocator.next())
     }
 
-    fn status_path_of_type(
+    fn status_location_of_type(
         &self,
-        path: &Location,
+        location: &Location,
         expected: FileType,
     ) -> std::io::Result<FileStatus> {
-        let metadata = path.metadata()?;
+        let metadata = location.metadata()?;
         let actual = host_file_type(&metadata)?;
         // Check before `node` so a replaced object is not assigned a guest inode ID.
         if actual != expected {
             return Err(unsupported_object());
         }
-        status_from_metadata(&metadata, self.node(&metadata, path))
+        status_from_metadata(&metadata, self.node(&metadata, location))
     }
 
     fn status_file(&self, file: &File, identity_path: &Path) -> std::io::Result<FileStatus> {
@@ -588,22 +595,7 @@ impl Backend for LocalFs {
         if !self.valid_dir(dir) {
             return Err(WalkError::Io);
         }
-        #[cfg(target_os = "linux")]
-        {
-            use rustix::fs::{Mode, OFlags, openat};
-            openat(
-                &*dir.location.pin,
-                ".",
-                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map(drop)
-            .map_err(|e| walk_error(e.into()))
-        }
-        #[cfg(not(target_os = "linux"))]
-        fs::metadata(dir.location.join("."))
-            .map(drop)
-            .map_err(walk_error)
+        dir.location.check_search().map_err(walk_error)
     }
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(ResolvedDir::from_typed::<Self>(
@@ -796,6 +788,7 @@ impl Backend for LocalFs {
     }
 
     fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+        guard_path_operations!(self, Err(WalkError::Io));
         let dir = dir.get_typed::<Self>();
         if !self.instance_tag.same_instance(&dir.instance_tag) {
             return Err(WalkError::Io);
@@ -1021,7 +1014,7 @@ impl Backend for LocalFs {
                 if !self.valid_dir(dir) {
                     return Err(FileStatusError::Io);
                 }
-                self.status_path_of_type(&dir.location, FileType::Directory)
+                self.status_location_of_type(&dir.location, FileType::Directory)
                     .map_err(|_| FileStatusError::Io)
             }
             HandleRef::File(file) => {
@@ -1033,7 +1026,7 @@ impl Backend for LocalFs {
                     self.status_file(open, &file.location)
                         .map_err(|_| FileStatusError::Io)
                 } else {
-                    self.status_path_of_type(&file.location, file.file_type)
+                    self.status_location_of_type(&file.location, file.file_type)
                         .map_err(|_| FileStatusError::Io)
                 }
             }
@@ -1042,7 +1035,7 @@ impl Backend for LocalFs {
 
     fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
         guard_path_operations!(self, Err(FileStatusError::Io));
-        let (path, file_type) = match target {
+        let (location, file_type) = match target {
             ResolvedTarget::Dir(dir) => {
                 let dir = dir.get_typed::<Self>();
                 if !self.valid_dir(dir) {
@@ -1058,7 +1051,7 @@ impl Backend for LocalFs {
                 (&file.location, file.file_type)
             }
         };
-        self.status_path_of_type(path, file_type)
+        self.status_location_of_type(location, file_type)
             .map_err(|_| FileStatusError::Io)
     }
 

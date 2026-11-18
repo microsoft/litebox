@@ -95,7 +95,7 @@ fn dot_dot_parents(path: &str) -> Vec<String> {
 
 /// `path` named from the root, which is every guest's working directory, keeping its `.` and
 /// `..` components and any trailing slash for the lookup.
-pub(crate) fn from_cwd(path: &str) -> Cow<'_, str> {
+pub(super) fn from_cwd(path: &str) -> Cow<'_, str> {
     if path.starts_with('/') {
         Cow::Borrowed(path)
     } else {

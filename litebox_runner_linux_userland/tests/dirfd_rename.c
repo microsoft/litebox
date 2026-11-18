@@ -3,9 +3,37 @@
 
 #include "helpers.h"
 
+// Walking from a held directory needs search permission on that directory only, not on its
+// ancestors. Runs in the working directory `tmp`.
+static void test_search_permission(const char *tmp) {
+    // Root can search any directory.
+    if (geteuid() == 0) {
+        return;
+    }
+    TEST_ASSERT(mkdir("perm", 0700) == 0 && mkdir("perm/child", 0700) == 0, "create perm tree");
+    int fd = open("perm/child", O_PATH | O_DIRECTORY);
+    TEST_ASSERT(fd >= 0, "open perm/child");
+    struct stat st;
+
+    TEST_ASSERT(chdir("perm/child") == 0 && chmod("..", 0) == 0, "deny search on ancestor");
+    char cwd[4096];
+    TEST_ASSERT(getcwd(cwd, sizeof(cwd)) != NULL, "getcwd under unsearchable ancestor");
+    int parent = openat(fd, "..", O_PATH | O_DIRECTORY);
+    TEST_ASSERT(parent >= 0, "dot-dot needs search on the start only");
+    TEST_ASSERT(close(parent) == 0 && chmod("..", 0700) == 0 && chdir(tmp) == 0,
+                "restore ancestor");
+
+    TEST_ASSERT(chmod("perm/child", 0) == 0, "deny search on start");
+    expect_errno(openat(fd, "..", O_PATH | O_DIRECTORY), EACCES, "dot-dot without search");
+    expect_errno(fstatat(fd, ".", &st, 0), EACCES, "dot without search");
+    TEST_ASSERT(chmod("perm/child", 0700) == 0 && close(fd) == 0 && rmdir("perm/child") == 0 &&
+                rmdir("perm") == 0, "cleanup perm tree");
+}
+
 int main(void) {
     char tmp[] = "/tmp/lb-dirfd-XXXXXX";
     TEST_ASSERT(mkdtemp(tmp) != NULL && chdir(tmp) == 0, "create working directory");
+    test_search_permission(tmp);
     TEST_ASSERT(mkdir("old", 0700) == 0 && mkdir("old/sub", 0700) == 0, "create subtree");
     int fd = open("old/sub", O_PATH | O_DIRECTORY);
     TEST_ASSERT(fd >= 0, "open directory");
