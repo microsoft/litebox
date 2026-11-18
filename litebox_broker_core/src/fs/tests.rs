@@ -270,7 +270,7 @@ fn private_mount_and_ancestor_rename_have_one_order() {
             (Ok(()), Err(RenameError::Busy)) => {
                 assert!(child.file_status(ROOT, "/work/target", true).is_ok());
             }
-            (Err(FileError::NoSuchFileOrDirectory), Ok(())) => {
+            (Err(FileError::MissingComponent), Ok(())) => {
                 assert!(child.file_status(ROOT, "/moved/target", true).is_ok());
             }
             other => panic!("inconsistent mount and rename: {other:?}"),
