@@ -433,10 +433,6 @@ fn hook_syscalls_in_elf_inner(
             "big-endian AArch64 ELF".into(),
         ));
     }
-    if data == Some(&object::elf::ELFDATA2MSB) && machine == Some(object::elf::EM_RISCV) {
-        return Err(Error::UnsupportedExecutable("big-endian RISC-V ELF".into()));
-    }
-
     // Relocatable object files (.o) must not be patched: they are linker
     // input, not executable code. Rewriting instructions or appending
     // trampoline data would corrupt the object file for the linker.
@@ -453,6 +449,9 @@ fn hook_syscalls_in_elf_inner(
         if e_type == object::elf::ET_REL {
             return Ok(input_binary.to_vec());
         }
+    }
+    if data == Some(&object::elf::ELFDATA2MSB) && machine == Some(object::elf::EM_RISCV) {
+        return Err(Error::UnsupportedExecutable("big-endian RISC-V ELF".into()));
     }
 
     // Make a single mutable, 8-byte-aligned copy of the input binary. This serves as both the

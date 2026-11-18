@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_syscall_rewriter::hook_syscalls_in_elf;
+use litebox_syscall_rewriter::{Error, hook_syscalls_in_elf};
 use litebox_trampoline::{TRAMPOLINE_HEADER_SIZE, decode_trampoline_header, riscv64::GateTls};
 use object::{Object as _, ObjectSection as _};
 use std::{fs, mem::offset_of, path::Path, process::Command};
@@ -13,6 +13,20 @@ fn run(dir: &Path, tool: &str, args: &[&str]) {
         .status()
         .unwrap();
     assert!(status.success(), "{tool} {args:?}: {status}");
+}
+
+#[test]
+fn big_endian_riscv_rejects_executables_but_preserves_linker_inputs() {
+    let mut elf = [0u8; 64];
+    elf[..7].copy_from_slice(b"\x7fELF\x02\x02\x01");
+    elf[18..20].copy_from_slice(&object::elf::EM_RISCV.to_be_bytes());
+    elf[16..18].copy_from_slice(&object::elf::ET_EXEC.to_be_bytes());
+    assert!(matches!(
+        hook_syscalls_in_elf(&elf, None),
+        Err(Error::UnsupportedExecutable(reason)) if reason.contains("big-endian RISC-V")
+    ));
+    elf[16..18].copy_from_slice(&object::elf::ET_REL.to_be_bytes());
+    assert_eq!(hook_syscalls_in_elf(&elf, None).unwrap(), elf);
 }
 
 #[test]
@@ -33,15 +47,16 @@ fn executes_rewritten_gp_tls_and_ecall() {
     let original = fs::read(dir.join("guest.elf")).unwrap();
     let hooked = hook_syscalls_in_elf(&original, None).unwrap();
     assert_eq!(hook_syscalls_in_elf(&hooked, None).unwrap(), hooked);
-    let footer = decode_trampoline_header(&hooked[hooked.len() - TRAMPOLINE_HEADER_SIZE..])
+    let footer_start = hooked.len() - TRAMPOLINE_HEADER_SIZE;
+    let footer = decode_trampoline_header(&hooked[footer_start..])
         .unwrap()
         .unwrap();
     let offset = usize::try_from(footer.file_offset.get()).unwrap();
-    fs::write(
-        dir.join("gates.bin"),
-        &hooked[offset..hooked.len() - TRAMPOLINE_HEADER_SIZE],
-    )
-    .unwrap();
+    let size = usize::try_from(footer.trampoline_size.get()).unwrap();
+    assert_ne!(size, 0);
+    let end = offset.checked_add(size).unwrap();
+    assert_eq!(end, footer_start);
+    fs::write(dir.join("gates.bin"), &hooked[offset..end]).unwrap();
     let file = object::File::parse(&*hooked).unwrap();
     let text = file.section_by_name(".text").unwrap();
     fs::write(dir.join("text.bin"), text.data().unwrap()).unwrap();
