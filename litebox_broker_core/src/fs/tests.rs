@@ -4538,6 +4538,40 @@ mod credentials {
     }
 
     #[test]
+    fn listings_and_static_file_bytes_require_a_readable_entry() {
+        use crate::fs::errors::ReadDirError;
+
+        let carol = Credentials::new(CAROL);
+        let fs = in_mem([
+            ("/dir", dir(ALL, posix(CAROL))),
+            ("/dir/file", file(ALL, posix(CAROL))),
+        ]);
+        for flags in [OFlags::PATH, OFlags::WRONLY, OFlags::RDONLY, OFlags::RDWR] {
+            let directory = fs
+                .open(carol.caller(), "/dir", flags, Mode::empty())
+                .unwrap();
+            let file = fs
+                .open(carol.caller(), "/dir/file", flags, Mode::empty())
+                .unwrap();
+            if flags == OFlags::RDONLY || flags == OFlags::RDWR {
+                assert!(
+                    fs.read_dir(&directory)
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry.name == "file")
+                );
+                assert_eq!(fs.get_static_backing_data(&file), Some(&b"data"[..]));
+            } else {
+                assert!(matches!(
+                    fs.read_dir(&directory),
+                    Err(ReadDirError::NotOpenForReading)
+                ));
+                assert!(fs.get_static_backing_data(&file).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn self_enforcing_mounts_fail_closed() {
         let alice = Credentials::new(ALICE);
         let fs = Resolver::<TestPlatform, _>::with_credentials(
@@ -4613,31 +4647,41 @@ mod credentials {
     fn read_only_devices_refuse_write_opens() {
         use crate::fs::read_only::ReadOnly;
 
-        let devices = || {
-            ReadOnly::new(
-                Devices::new(
-                    InodeAllocators::new().next(),
-                    Arc::new(TestStdioProvider::default()),
-                    Arc::new(TestRandomProvider),
-                )
-                .with_security(device_security()),
+        let overlay = |devices_in_upper| {
+            let allocators = InodeAllocators::new();
+            let devices = Devices::new(
+                allocators.next(),
+                Arc::new(TestStdioProvider::default()),
+                Arc::new(TestRandomProvider),
             )
+            .with_security(device_security());
+            let empty = InMem::<TestPlatform>::new(allocators.next());
+            if devices_in_upper {
+                // The overlay masks the upper's read-only flag; ReadOnly must refuse the open.
+                Overlay::<TestPlatform>::new(ReadOnly::new(devices), empty, allocators.next())
+            } else {
+                // A lower device cannot be copied up, so the overlay refuses the open itself.
+                Overlay::<TestPlatform>::new(empty, devices, allocators.next())
+            }
         };
-        let legacy = Resolver::<TestPlatform, _>::new(devices());
-        let fs = Resolver::<TestPlatform, _>::with_credentials(devices(), profile());
         let carol = Credentials::new(CAROL);
-        for flags in [OFlags::WRONLY, OFlags::RDWR] {
-            assert!(matches!(
-                legacy.open(posix(CAROL), "/null", flags, Mode::empty()),
-                Err(OpenError::ReadOnlyFileSystem)
-            ));
-            assert!(matches!(
-                fs.open(carol.caller(), "/null", flags, Mode::empty()),
-                Err(OpenError::ReadOnlyFileSystem)
-            ));
+        for devices_in_upper in [true, false] {
+            let legacy = Resolver::<TestPlatform, _>::new(overlay(devices_in_upper));
+            let fs =
+                Resolver::<TestPlatform, _>::with_credentials(overlay(devices_in_upper), profile());
+            for flags in [OFlags::WRONLY, OFlags::RDWR] {
+                assert!(matches!(
+                    legacy.open(posix(CAROL), "/null", flags, Mode::empty()),
+                    Err(OpenError::ReadOnlyFileSystem)
+                ));
+                assert!(matches!(
+                    fs.open(carol.caller(), "/null", flags, Mode::empty()),
+                    Err(OpenError::ReadOnlyFileSystem)
+                ));
+            }
+            fs.open(carol.caller(), "/null", OFlags::RDONLY, Mode::empty())
+                .unwrap();
         }
-        fs.open(carol.caller(), "/null", OFlags::RDONLY, Mode::empty())
-            .unwrap();
     }
 
     #[test]

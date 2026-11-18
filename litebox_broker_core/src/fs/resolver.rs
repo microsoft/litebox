@@ -2004,7 +2004,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         &self,
         entry: &ResolverEntry<Backend>,
     ) -> Result<Vec<super::DirEntry>, ReadDirError> {
-        if entry.path_only {
+        if entry.path_only || !entry.read_allowed {
             return Err(ReadDirError::NotOpenForReading);
         }
         let dir = match &entry.handle {
@@ -2125,11 +2125,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// This method returns the (entire) underlying static byte slice if the file's contents are
     /// backed by borrowed static data (e.g., set up via [`super::in_mem::InitialNode::File`]).
     ///
-    /// Returns `None` if no static backing data is available/supported.
+    /// Returns `None` if the entry is not open for reading or has no static backing data.
     pub fn get_static_backing_data(&self, entry: &ResolverEntry<Backend>) -> Option<&'static [u8]> {
         match &entry.handle {
-            Handle::File(file) => self.backend.get_static_backing_data(file),
-            Handle::Dir(_) => None,
+            Handle::File(file) if !entry.path_only && entry.read_allowed => {
+                self.backend.get_static_backing_data(file)
+            }
+            Handle::File(_) | Handle::Dir(_) => None,
         }
     }
 

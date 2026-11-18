@@ -162,7 +162,7 @@ enum OverlayFileLayer {
 /// reads whole lower directories.
 struct ResolvedDir {
     upper: Option<DirHandle>,
-    /// Per lower backend, in precedence order, its directory at this path if any.
+    /// Per lower backend in precedence order, its directory if it contributes to this one.
     lowers: Vec<Option<DirHandle>>,
 }
 
@@ -213,22 +213,40 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         }
     }
 
+    /// An opaque upper is the whole directory: even opening a hidden lower could fail or
+    /// invoke a backend hook. Keep handles only for layers that can contribute entries.
+    fn resolve_layers(
+        &self,
+        upper: Option<DirHandle>,
+        candidates: impl Iterator<Item = usize>,
+        open_lower: impl Fn(usize) -> Result<DirHandle, OpenError>,
+    ) -> Result<ResolvedDir, OpenError> {
+        let mut dir = ResolvedDir {
+            upper,
+            lowers: vec![None; self.lowers.len()],
+        };
+        let mut candidates = candidates.peekable();
+        if candidates.peek().is_some()
+            && let Some(upper) = &dir.upper
+            && self
+                .marker_present(upper, OPAQUE_MARKER)
+                .map_err(|_| OpenError::Io)?
+        {
+            return Ok(dir);
+        }
+        for layer in candidates {
+            dir.lowers[layer] = Some(open_lower(layer)?);
+        }
+        Ok(dir)
+    }
+
     fn resolve_root(&self) -> Result<ResolvedDir, OpenError> {
         let upper = self
             .upper
             .open_dir(self.upper.root().map_err(walk_to_open_error)?, OFlags::PATH)?;
-        let lowers = self
-            .lowers
-            .iter()
-            .map(|lower| {
-                lower
-                    .open_dir(lower.root().map_err(walk_to_open_error)?, OFlags::PATH)
-                    .map(Some)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ResolvedDir {
-            upper: Some(upper),
-            lowers,
+        self.resolve_layers(Some(upper), 0..self.lowers.len(), |layer| {
+            let lower = &self.lowers[layer];
+            lower.open_dir(lower.root().map_err(walk_to_open_error)?, OFlags::PATH)
         })
     }
 
@@ -266,17 +284,11 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             _ => None,
         };
 
-        let mut lowers = Vec::with_capacity(self.lowers.len());
-        for ((layer, lower), parent) in self.lowers.iter().enumerate().zip(&parent.lowers) {
-            let child = match parent {
-                Some(parent) if entry.lower_directories[layer] => {
-                    Some(walk_into_dir(lower.as_ref(), parent, dir_name)?)
-                }
-                _ => None,
-            };
-            lowers.push(child);
-        }
-        Ok(ResolvedDir { upper, lowers })
+        let layers = (0..self.lowers.len()).filter(|&layer| entry.lower_directories[layer]);
+        self.resolve_layers(upper, layers, |layer| {
+            let parent = parent.lowers[layer].as_ref().ok_or(OpenError::Io)?;
+            walk_into_dir(self.lowers[layer].as_ref(), parent, dir_name)
+        })
     }
 
     /// Resolve a logical `path` (relative to the overlay root) to its per-layer directories.
@@ -731,15 +743,6 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     /// self-enforcing lower contributes would reach subjects without any check of that lower's
     /// own permissions.
     fn lowers_broker_owned(&self, dir: &ResolvedDir) -> Result<bool, OpenError> {
-        // As in `entry` and `entries`, an opaque upper supplies the whole directory.
-        if let Some(upper) = &dir.upper
-            && dir.lowers.iter().any(Option::is_some)
-            && self
-                .marker_present(upper, OPAQUE_MARKER)
-                .map_err(|_| OpenError::Io)?
-        {
-            return Ok(true);
-        }
         for (lower, handle) in self.lowers.iter().zip(&dir.lowers) {
             let Some(handle) = handle else {
                 continue;
@@ -1303,6 +1306,9 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             // append open cannot write.
             let writing = !flags.contains(OFlags::PATH)
                 && flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::TRUNC);
+            if writing && status.file_type != FileType::RegularFile {
+                return Err(OpenError::ReadOnlyFileSystem);
+            }
             if let Some(checks) = checks
                 && writing
             {
@@ -1332,9 +1338,6 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 None => self.lowers[layer].open_file(file, flags - OFlags::CREAT)?,
             };
             if writing {
-                if status.file_type != FileType::RegularFile {
-                    return Err(OpenError::ReadOnlyFileSystem);
-                }
                 let upper_dir = self.ensure_upper_dir(&locked, &parent)?;
                 let upper = self.copy_up_file(
                     &locked,

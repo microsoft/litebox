@@ -692,6 +692,49 @@ fn connect_9p_broken(server: &DiodServer, allowed_writes: usize) -> NinePFs<Brok
 // Broken-connection failure tests
 // ---------------------------------------------------------------------------
 
+#[test]
+fn an_opaque_root_stays_available_when_a_lower_mount_is_offline() {
+    use crate::fs::in_mem::{InMem, InitialNode};
+    use crate::fs::overlay::Overlay;
+
+    let allocators = InodeAllocators::new();
+    let server = DiodServer::start();
+    let offline = attach(
+        BrokenTransport::new(server.connect(), 2),
+        &server,
+        allocators.next(),
+    );
+    // Resolving this lower overlay's root requires metadata from the disconnected server.
+    let lower = Overlay::<TestPlatform>::new(
+        offline,
+        InMem::<TestPlatform>::new(allocators.next()),
+        allocators.next(),
+    );
+    let upper = InMem::<TestPlatform>::new_initialized(
+        [(
+            "/.litebox-overlay-opaque",
+            InitialNode::File {
+                mode: Mode::empty(),
+                owner: USER,
+                data: (&[][..]).into(),
+            },
+        )],
+        allocators.next(),
+    );
+    let fs = Resolver::<TestPlatform, _>::new(Overlay::<TestPlatform>::new(
+        upper,
+        lower,
+        allocators.next(),
+    ));
+    let root = fs.open(USER, "/", OFlags::RDONLY, Mode::empty()).unwrap();
+    assert!(
+        fs.read_dir(&root)
+            .unwrap()
+            .iter()
+            .all(|entry| matches!(entry.name.as_str(), "." | ".."))
+    );
+}
+
 /// Opening a file should fail with an I/O-class error when the connection
 /// breaks after the filesystem has been attached.
 #[test]
