@@ -12,7 +12,7 @@ use crate::sync::RawSyncPrimitivesProvider;
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileError, FileUser};
-pub use litebox_broker_protocol::segment::SegmentStatus;
+use litebox_broker_protocol::segment::SegmentStatus;
 use litebox_broker_protocol::segment::{SegmentRequest, SegmentResponse};
 use litebox_platform::time::TimeProvider;
 
@@ -135,7 +135,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
                 size,
             )),
             Err(error) => {
-                self.detach_segment(id)?;
+                // Report the delivery failure; a failed rollback only overcounts until exit.
+                if let Err(rollback) = self.detach_segment(id) {
+                    litebox_util_log::warn!(id, rollback:?; "failed to roll back a segment attach");
+                }
                 Err(match error {
                     SharedObjectReceiveError::UnsupportedByPlatform => SegmentError::Unavailable,
                     SharedObjectReceiveError::OutOfMemory => SegmentError::NoMemory,
@@ -150,7 +153,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         self.segment_done(SegmentRequest::Detach { id })
     }
 
-    /// Accounts for SysV mappings inherited by a pending native fork child.
+    /// Copies this process's attachments to pending child `target`, which inherits its
+    /// address space.
     pub fn inherit_segments(&self, target: ProcessId) -> Result<(), SegmentError> {
         self.segment_done(SegmentRequest::Inherit { target })
     }

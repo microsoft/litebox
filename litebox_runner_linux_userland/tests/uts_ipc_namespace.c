@@ -6,7 +6,8 @@
 // namespace share them, and that a new namespace starts with a copy. Runs as guest root, or, with
 // the argument `unprivileged`, as another user, who can't create namespaces or set the names.
 //
-// The IPC checks here exercise namespace creation alongside the other namespace flags.
+// A new IPC namespace starts without its creator's shared memory segments, though attachments
+// made before the switch stay usable.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -111,6 +112,8 @@ static void segment_namespaces_are_separate(void) {
     if (parent < 0) {
         return;
     }
+    char *attached = shmat(parent, NULL, 0);
+    CHECK(attached != (void *)-1);
     for (int use_clone = 0; use_clone <= 1; ++use_clone) {
         pid_t child = use_clone ? clone_child(CLONE_NEWIPC) : fork();
         if (child == 0) {
@@ -122,12 +125,19 @@ static void segment_namespaces_are_separate(void) {
             if (shmctl(parent, IPC_STAT, &ds) != -1 || errno != EINVAL) {
                 _exit(2);
             }
+            // The inherited attachment still belongs to the old namespace's segment.
+            if (shmdt(attached) != 0) {
+                _exit(4);
+            }
             int local = shmget(key, 1, IPC_CREAT | IPC_EXCL | 0600);
             _exit(local >= 0 && shmctl(local, IPC_RMID, NULL) == 0 ? CHILD_CODE : 3);
         }
         CHECK(child > 0 && exited_with(child, CHILD_CODE));
         CHECK(shmget(key, 0, 0) == parent);
+        struct shmid_ds ds;
+        CHECK(shmctl(parent, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1);
     }
+    CHECK(shmdt(attached) == 0);
     CHECK(shmctl(parent, IPC_RMID, NULL) == 0);
 }
 

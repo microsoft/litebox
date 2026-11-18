@@ -121,7 +121,7 @@ wire_enum! {
         SharedFutex(SharedFutexRequest),
         /// Vsock socket request family.
         VsockSocket(VsockSocketRequest),
-        /// Access a segment in the caller's IPC namespace.
+        /// Keyed shared segment request family.
         Segment(crate::segment::SegmentRequest),
     }
 }

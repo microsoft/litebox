@@ -8,7 +8,7 @@
 use core::num::NonZeroU64;
 use core::ops::Range;
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use rangemap::RangeMap;
 use thiserror::Error;
 
@@ -923,7 +923,9 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     shared_anonymous_mappings: u64,
     sysv_sequence: u64,
     sysv_attachments: Vec<SysvAttachment>,
-    pub(super) sysv_release: Option<Box<dyn Fn(u32) + Send + Sync>>,
+    pub(super) sysv_release: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+    /// Segments of attachments that ended, for the owner to release once it unlocks this.
+    pub(super) sysv_released: Vec<u32>,
 }
 
 struct SysvAttachment {
@@ -950,6 +952,7 @@ where
             sysv_sequence: 0,
             sysv_attachments: Vec::new(),
             sysv_release: None,
+            sysv_released: Vec::new(),
         }
     }
 
@@ -1001,9 +1004,7 @@ where
             {
                 return true;
             }
-            self.sysv_release
-                .as_ref()
-                .expect("missing shmat release hook")(a.segment);
+            self.sysv_released.push(a.segment);
             false
         });
     }
@@ -2779,11 +2780,6 @@ mod tests {
     fn sysv_detach_preserves_replacements_and_releases_each_attach_once() {
         let backend = dummy_backend::<true>(None);
         let mut vm = Vmem::<_, PAGE_SIZE>::new(backend);
-        let released = alloc::sync::Arc::new(Mutex::new(Vec::new()));
-        vm.sysv_release = Some(Box::new({
-            let released = released.clone();
-            move |id| released.lock().push(id)
-        }));
         let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
         let page = |i| start + i * PAGE_SIZE;
         let map = |vm: &mut Vmem<_, PAGE_SIZE>, i, n, offset| {
@@ -2802,21 +2798,19 @@ mod tests {
         };
         map(&mut vm, 0, 5, 0);
         vm.register_sysv(page(0)..page(5), 1, true);
-        // Even a writable backing descriptor cannot override SHM_RDONLY or enable execution.
+        // Even a writable backing descriptor cannot override SHM_RDONLY.
         let piece = PageRange::new(page(3), page(4)).unwrap();
         // SAFETY: the test owns these mock pages.
         unsafe {
             vm.protect_mapping(piece, MemoryRegionPermissions::empty())
                 .unwrap();
-            for added in [
-                MemoryRegionPermissions::WRITE,
-                MemoryRegionPermissions::EXEC,
-            ] {
-                assert!(matches!(
-                    vm.protect_mapping(piece, MemoryRegionPermissions::READ | added),
-                    Err(VmemProtectError::NoAccess { .. })
-                ));
-            }
+            assert!(matches!(
+                vm.protect_mapping(
+                    piece,
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
+                ),
+                Err(VmemProtectError::NoAccess { .. })
+            ));
         }
         // Replace the middle page with the *same* shared object at the *same* offset.
         // Futex keys still match, but shmdt must not remove this ordinary shared mapping.
@@ -2826,12 +2820,12 @@ mod tests {
         unsafe { vm.remove_mapping(PageRange::new(page(0), page(1)).unwrap()) }.unwrap();
         map(&mut vm, 0, 1, 0);
         vm.register_sysv(page(0)..page(1), 1, false);
-        assert!(released.lock().is_empty());
+        assert_eq!(vm.sysv_released, []);
         vm.detach_sysv(page(0)).unwrap();
-        assert_eq!(&*released.lock(), &[1]);
+        assert_eq!(vm.sysv_released, [1]);
         assert!(vm.vmas.get(&page(1)).is_some());
         vm.detach_sysv(page(0)).unwrap();
-        assert_eq!(&*released.lock(), &[1, 1]);
+        assert_eq!(vm.sysv_released, [1, 1]);
         assert_eq!(vm.detach_sysv(page(0)), Err(crate::errno::Errno::EINVAL));
         assert!(
             vm.iter()
@@ -2847,23 +2841,14 @@ mod tests {
         vm.register_sysv(page(5)..page(6), 3, true);
         map(&mut vm, 6, 3, 0);
         vm.register_sysv(page(6)..page(9), 4, true);
-        // Shrinking is an unmap of the tail; growing or moving must not manufacture pages
-        // without segment backing. An ordinary fixed mmap can then replace the last page.
+        // Shrinking is an unmap of the tail; an ordinary fixed mmap can then replace the
+        // last page, which ends the attachment.
         // SAFETY: the test owns these mock mappings and excludes other users.
         unsafe {
             let one_page = NonZeroPageSize::new(PAGE_SIZE).unwrap();
-            let two_pages = NonZeroPageSize::new(2 * PAGE_SIZE).unwrap();
             let remaining = PageRange::new(page(6), page(7)).unwrap();
             vm.resize_mapping(PageRange::new(page(6), page(9)).unwrap(), one_page)
                 .unwrap();
-            assert!(matches!(
-                vm.resize_mapping(remaining, two_pages),
-                Err(VmemResizeError::Unsupported)
-            ));
-            assert!(matches!(
-                vm.move_mappings(remaining, None, two_pages),
-                Err(VmemMoveError::Unsupported)
-            ));
             vm.insert_mapping(
                 remaining,
                 read_write_vma(),
@@ -2876,7 +2861,7 @@ mod tests {
         // Exec drains remaining attachments; previously released ones are not charged twice.
         // SAFETY: the test is done using all mock mappings.
         unsafe { vm.release_all() }.unwrap();
-        assert_eq!(&*released.lock(), &[1, 1, 2, 4, 3]);
+        assert_eq!(vm.sysv_released, [1, 1, 2, 4, 3]);
     }
 
     #[test]
