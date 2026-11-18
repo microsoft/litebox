@@ -15,7 +15,7 @@ _start:
     c.mv gp, a3
     li a7, 172      # getpid
     ecall
-    li t1, 0x1234  # Only the test callback returns this.
+    li t1, -0x1234  # Neither a PID nor a Linux error.
     bne a0, t1, failed
     ld t1, -8(gp)
     bne t0, t1, failed

@@ -29,7 +29,7 @@ _start:
 callback:
     li a0, 172
     bne a7, a0, fail
-    li a0, 0x1234
+    li a0, -0x1234
     jr t0
 fail:
     li a0, 1

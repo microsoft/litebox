@@ -5,6 +5,9 @@
 //! instruction ranges identified by RISC-V ELF mapping symbols. Refuse an
 //! unsupported instruction or unreachable gate rather than leaving a native
 //! syscall or a physical-gp access behind.
+//! Register-selector hints stay in place. A cache-locality hint immediately
+//! before a relocated access may therefore be ineffective, as on hardware
+//! that implements the hint as a no-op.
 
 use super::{Error, Result, TextSectionInfo, append_trampoline_footer, checked_add_u64};
 use alloc::{format, vec::Vec};
