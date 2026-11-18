@@ -958,6 +958,14 @@ impl Inner {
         matches!(*self.state.borrow(), State::Dead(_))
     }
 
+    /// Kills the process if the broker asked to shut it down: see [`Self::die`]
+    /// for what the caller must not do afterward.
+    pub(crate) fn shut_down_if_requested(&self) {
+        if !self.is_dead() && self.broker.shutdown_requested() {
+            self.die(Dead::Killed("shut down by the broker"));
+        }
+    }
+
     /// Logs how the process ended, with its counts, at debug level.
     fn log_end(&self, dead: Dead) {
         let reflected = self.reflected.get();

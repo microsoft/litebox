@@ -33,6 +33,7 @@ mod service;
 
 use core::panic::PanicInfo;
 use litebox_bootloader::Kernel;
+use litebox_broker_protocol::process::PidNamespaceOptions;
 use litebox_common_vm_abi::program::ExitStatus;
 use litebox_hal::{power, serial, serial_println};
 use litebox_platform_vm_kernel::VmKernel;
@@ -68,6 +69,15 @@ fn kernel_main(kernel: Kernel) -> ! {
         .boot_info
         .cmdline_value(init::PATH_KEY)
         .unwrap_or(init::DEFAULT_PATH);
+    #[cfg(debug_assertions)]
+    let as_init = kernel.boot_info.cmdline_value(init::AS_INIT_KEY) != Some("0");
+    #[cfg(not(debug_assertions))]
+    let as_init = true;
+    let pid_namespace = if as_init {
+        PidNamespaceOptions::INIT
+    } else {
+        PidNamespaceOptions::default()
+    };
     let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
         platform: kernel.platform,
         console: devices,
@@ -76,6 +86,7 @@ fn kernel_main(kernel: Kernel) -> ! {
         network: devices.network(),
         vsock: devices.vsock(),
         allow_process_duplication: true,
+        pid_namespace,
     });
     let config = ProcessConfig {
         runner,
@@ -120,6 +131,8 @@ fn run_optee(
             network: devices.network(),
             vsock: devices.vsock(),
             allow_process_duplication: false,
+            // TA instances are independent roots.
+            pid_namespace: PidNamespaceOptions::default(),
         }),
     );
     client::script::run(payload, &mut service);

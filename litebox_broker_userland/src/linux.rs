@@ -14,7 +14,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clap::Parser as _;
-use litebox_broker_core::pid_namespace::PidNamespace;
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::stdio::StdioProvider as _;
 use litebox_broker_core::{BrokerCoreLimits, BrokerProcess, ObjectRights, PolicyEngine};
@@ -114,7 +113,7 @@ pub(super) fn run(
     } else {
         build()?
     };
-    let pid_namespace = Arc::new(PidNamespace::new(&core)?);
+    let pid_namespace = super::create_pid_namespace(&core, &args)?;
 
     if args.in_process_runner {
         debug_assert!(args.unstable);

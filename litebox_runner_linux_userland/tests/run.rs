@@ -1640,6 +1640,29 @@ fn orphans_are_adopted_by_subreapers_and_the_initial_process() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn the_root_is_the_guest_s_init_only_when_the_broker_says_so() {
+    let program = common::compile("./tests/root_init.c", "root_init", true, false);
+
+    let mut runner = Runner::new(&program, "root_init");
+    runner
+        .allow_process_duplication()
+        .broker_arg("--root-process-as-init")
+        .arg("init");
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "root-init failures=0"),
+        "{output}"
+    );
+    assert!(!output.contains("outlived"), "{output}");
+
+    let mut runner = Runner::new(&program, "root_init_ordinary");
+    runner.allow_process_duplication();
+    let output = String::from_utf8(runner.output_expect_failure()).unwrap();
+    assert_eq!(output, "root-init started\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn pid_namespaces_number_and_end_with_their_first_process() {
     let program = common::compile("./tests/pid_namespace.c", "pid_namespace", true, false);
     let mut runner = Runner::new(&program, "pid_namespace");

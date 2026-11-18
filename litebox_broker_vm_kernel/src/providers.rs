@@ -28,6 +28,7 @@ use litebox_broker_core::{
     timer::TimerProvider,
     vsock_socket::VsockProvider,
 };
+use litebox_broker_protocol::process::PidNamespaceOptions;
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
 use litebox_platform_vm_kernel::VmKernel;
 
@@ -133,6 +134,7 @@ pub(crate) fn core(
     external: bool,
     vsock: Option<Arc<dyn VsockProvider>>,
     allow_process_duplication: bool,
+    pid_namespace: PidNamespaceOptions,
 ) -> (Arc<BrokerCore>, Arc<PidNamespace>, Arc<dyn FileService>) {
     let random: Arc<dyn RandomProvider> = Arc::new(HardwareRandom(litebox_hal::rng::hardware()));
     let core = BrokerCore::new(
@@ -151,8 +153,8 @@ pub(crate) fn core(
         timers,
     )
     .unwrap_or_else(|error| panic!("broker core: {error:?}"));
-    let pid_namespace =
-        PidNamespace::new(&core).unwrap_or_else(|error| panic!("PID namespace: {error:?}"));
+    let pid_namespace = PidNamespace::with_options(&core, pid_namespace)
+        .unwrap_or_else(|error| panic!("PID namespace: {error:?}"));
     let fs = file_service(root, shares, stdio, random);
     (core, Arc::new(pid_namespace), fs)
 }

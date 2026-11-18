@@ -421,6 +421,7 @@ impl Shared {
             };
             claimed += 1;
             finish_parked(&claim);
+            claim.shut_down_if_requested();
             started |= claim.spawn_launched(&mut spawned);
             if !started {
                 found.poll(claim, floor, last);

@@ -35,6 +35,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "process_tree_parent.c",
     "regular_file_readiness.c",
     "rlimit_parent.c",
+    "root_init.c",
     "shared_file_mapping.c",
     "sigreturn.c",
     "sigreturn_simd.c",

@@ -39,6 +39,7 @@
 # passes if it exits 0. Only init tests get debug kernels' leak check, as the
 # guest service never exits.
 #   pid1: process 1 adopts and reaps orphans.
+#   init_exit: init's exit kills the other processes.
 #   lifecycle: processes end in each way the other tests end theirs.
 #   writable_root: the root is writable.
 #   console_flood: the console keeps 4 writers' records (check_records).
@@ -152,7 +153,7 @@ counted_log=debug
 [[ ${LITEBOX_LOG:-} != trace ]] || counted_log=trace
 
 # Init tests (see the header): their init's path in the root.
-declare -A INIT_TESTS=([pid1]=/pid1 [writable_root]=/writable_root
+declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writable_root
     [console_flood]=/console_flood [lifecycle]=/lifecycle)
 
 # Why test $1 is skipped with these CPUs or this RAM (see the header), if it

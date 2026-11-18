@@ -296,10 +296,6 @@ pub(super) enum RestartBlock<Instant> {
     },
 }
 
-/// The options of the PID namespaces the shim creates. Like Linux's, each ends with its first
-/// process, which also adopts the orphans that no other ancestor in the namespace adopts.
-const GUEST_PID_NAMESPACE: PidNamespaceOptions = PidNamespaceOptions::new(true, true);
-
 /// The UTS and IPC namespace flags, which need the permission check. A new UTS namespace gets a
 /// copy of its creator's host names (see `ChildRelation::new_host_names`). LiteBox has no IPC
 /// objects, so a new IPC namespace has nothing to scope and is indistinguishable from its
@@ -309,8 +305,8 @@ const UTS_AND_IPC_NAMESPACE_FLAGS: CloneFlags = CloneFlags::NEWUTS.union(CloneFl
 /// How a new child process relates to the process creating it.
 #[derive(Clone, Copy)]
 struct ChildRelation {
-    /// Whether the child is the first process of a new PID namespace, with the options of the
-    /// ones the shim creates (`GUEST_PID_NAMESPACE`).
+    /// Whether the child is the first process of a new PID namespace, with
+    /// `PidNamespaceOptions::INIT`.
     new_pid_namespace: bool,
     /// Whether the child's parent is the creating process's parent.
     sibling: bool,
@@ -1042,7 +1038,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .global
             .litebox
             .allocate_child_process(
-                relation.new_pid_namespace.then_some(GUEST_PID_NAMESPACE),
+                relation
+                    .new_pid_namespace
+                    .then_some(PidNamespaceOptions::INIT),
                 relation.sibling,
             )
             .map_err(|error| match error {
@@ -1139,7 +1137,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             self.global
                 .litebox
-                .create_children_pid_namespace(GUEST_PID_NAMESPACE)
+                .create_children_pid_namespace(PidNamespaceOptions::INIT)
                 .map_err(|error| match error {
                     // The namespace limits, like Linux's nesting and count limits.
                     ProcessError::ResourceExhausted => Errno::ENOSPC,
