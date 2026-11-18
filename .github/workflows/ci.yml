@@ -563,6 +563,14 @@ jobs:
             target/tmp/windows_node_rewriter
           key: ${{ steps.fixture-key.outputs.key }}
           restore-keys: ${{ steps.fixture-key.outputs.prefix }}
+      - name: Set up WSL for the Windows loader tests
+        timeout-minutes: 10
+        uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
+        with:
+          distribution: Ubuntu-24.04
+          use-cache: 'true'
+          set-as-default: 'true'
+          additional-packages: gcc libc6-dev
       - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
       - run: |
           cargo test --locked --verbose --doc ($env:WINDOWS_CRATES -split ' ')

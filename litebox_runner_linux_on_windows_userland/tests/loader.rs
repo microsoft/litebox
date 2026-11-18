@@ -3,176 +3,41 @@
 
 //! Tests for the Windows userland runner.
 //!
-//! **NOTE:** These tests run Linux ELF programs, prebuilt in `tests/test-bins/` (with their
-//! shared libraries) or built at test time.
+//! The C guests build in an x86-64 WSL distribution with GCC and glibc
+//! development files (on Ubuntu: `sudo apt-get install gcc libc6-dev`).
+//! Set `LITEBOX_WSL_DISTRO` to override the default WSL distribution.
+//! The tests run the resulting guests through the native Windows runner.
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
-
-#[expect(
-    unused,
-    reason = "This code snippet is just used to illustrate the source code of the `hello_exec_nolibc` test."
-)]
-const HELLO_WORLD_NOLIBC: &str = r#"
-// gcc tests/test.c -o test -static -nostdlib (-m32)
-#if defined(__x86_64__)
-int write(int fd, const char *buf, int length)
-{
-    int ret;
-
-    asm("mov %1, %%eax\n\t"
-        "mov %2, %%edi\n\t"
-        "mov %3, %%rsi\n\t"
-        "mov %4, %%edx\n\t"
-        "syscall\n\t"
-        "mov %%eax, %0"
-        : "=r" (ret)
-        : "i" (1), // #define SYS_write 1
-          "r" (fd),
-          "r" (buf),
-          "r" (length)
-        : "%eax", "%edi", "%rsi", "%edx");
-
-    return ret;
-}
-
-_Noreturn void exit_group(int code)
-{
-    /* Infinite for-loop since this function can't return */
-    for (;;) {
-        asm("mov %0, %%eax\n\t"
-            "mov %1, %%edi\n\t"
-            "syscall\n\t"
-            :
-            : "i" (231), // #define SYS_exit_group 231
-              "r" (code)
-            : "%eax", "%edi");
-    }
-}
-#elif defined(__i386__)
-int write(int fd, const char *buf, int length)
-{
-    int ret;
-
-    asm("mov %1, %%eax\n\t"
-        "mov %2, %%ebx\n\t"
-        "mov %3, %%ecx\n\t"
-        "mov %4, %%edx\n\t"
-        "int $0x80\n\t"
-        "mov %%eax, %0"
-        : "=r" (ret)
-        : "i" (4), // #define SYS_write 4
-          "g" (fd),
-          "g" (buf),
-          "g" (length)
-        : "%eax", "%ebx", "%ecx", "%edx");
-
-    return ret;
-}
-_Noreturn void exit_group(int code)
-{
-    /* Infinite for-loop since this function can't return */
-    for (;;) {
-        asm("mov %0, %%eax\n\t"
-            "mov %1, %%ebx\n\t"
-            "int $0x80\n\t"
-            :
-            : "i" (252), // #define SYS_exit_group 252
-              "r" (code)
-            : "%eax", "%ebx");
-    }
-}
-#else
-#error "Unsupported architecture"
-#endif
-
-int main() {
-    // use write to print a string
-    write(1, "Hello, World!\n", 14);
-    return 0;
-}
-
-void _start() {
-    exit_group(main());
-}
-"#;
-
-#[expect(
-    unused,
-    reason = "This code snippet is just used to illustrate the source code of the `hello_thread_static/dynamic` test."
-)]
-const HELLO_WORLD: &str = r#"
-// gcc -o hello_world_static hello_world_static.c -static
-#include <stdio.h>
-
-int main() {
-    printf("Hello, World!\n");
-    return 0;
-}
-"#;
-
-#[expect(
-    unused,
-    reason = "This code snippet is just used to illustrate the source code of the `hello_thread_static/dynamic` test."
-)]
-const HELLO_THREAD: &str = r#"
-// gcc hello_thread.c -o hello_thread_static -static
-#include <stdio.h>
-#include <stdlib.h>
-#include <pthread.h>
-
-void* child_thread_func(void* arg) {
-    (void)arg;
-    printf("Hello from child thread.\n");
-    return NULL;
-}
-
-int main(void) {
-    pthread_t tid;
-
-    if (pthread_create(&tid, NULL, child_thread_func, NULL) != 0) {
-        perror("pthread_create");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("Hello from main thread.\n");
-
-    if (pthread_join(tid, NULL) != 0) {
-        perror("pthread_join");
-        exit(EXIT_FAILURE);
-    }
-
-    return 0;
-}
-"#;
 
 #[test]
 fn test_static_linked_prog_with_rewriter() {
     println!("Running statically linked binary + rewriter test...");
-    // Use the already compiled executable from the tests folder (same dir as this file)
-    let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_dir.push("tests/test-bins");
-
     let prog_name = "hello_world_static";
-    let path = test_dir.join(prog_name);
+    let path = build_c_guest(prog_name, "static_rewriter", GuestLinkage::Static);
     let executable_data =
-        litebox_syscall_rewriter::rewrite_binary(&std::fs::read(path).unwrap(), None).unwrap();
+        litebox_syscall_rewriter::rewrite_binary(&std::fs::read(&path).unwrap(), None).unwrap();
 
     let (broker, runner) = build_windows_broker();
-    run_prog_with_windows_broker(&broker, &runner, prog_name, &[], Some(&executable_data));
+    run_prog_with_windows_broker(&broker, &runner, &path, &[], Some(&executable_data));
 }
 
 #[test]
 fn test_programs_with_windows_broker() {
     let (broker, runner) = build_windows_broker();
-    run_prog_with_windows_broker(&broker, &runner, "hello_world_static", &[], None);
-    run_prog_with_windows_broker(&broker, &runner, "pipe_broker", &[], None);
-    run_prog_with_windows_broker(&broker, &runner, "hello_world_dyn", &DYNAMIC_LIBS, None);
-    run_prog_with_windows_broker(&broker, &runner, "hello_thread", &DYNAMIC_LIBS, None);
+    for name in ["hello_world_static", "pipe_broker"] {
+        let guest = build_c_guest(name, "broker", GuestLinkage::Static);
+        run_prog_with_windows_broker(&broker, &runner, &guest, &[], None);
+    }
+    for name in ["hello_world_dyn", "hello_thread"] {
+        let guest = build_c_guest(name, "broker", GuestLinkage::Pie);
+        run_prog_with_windows_broker(&broker, &runner, &guest, &DYNAMIC_LIBS, None);
+    }
 }
 
 /// Runs `fork_parent`, whose children resume from snapshots of their parents' memory.
 ///
-/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/fork_parent.c`.
+/// Built from `litebox_runner_linux_userland/tests/fork_parent.c`.
 #[test]
 fn test_fork_with_windows_broker() {
     let (broker, runner) = build_windows_broker();
@@ -196,7 +61,7 @@ fn test_fork_with_windows_broker() {
 /// Runs `fork_threads_parent`, which forks while sibling threads run guest code, block, and
 /// sleep, and forks from several threads at once.
 ///
-/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/fork_threads_parent.c`.
+/// Built from `litebox_runner_linux_userland/tests/fork_threads_parent.c`.
 #[test]
 fn test_fork_with_threads_with_windows_broker() {
     let (broker, runner) = build_windows_broker();
@@ -213,7 +78,7 @@ fn test_fork_with_threads_with_windows_broker() {
 /// Runs `fork_shared_futex_parent`, whose forked child shares `MAP_SHARED | MAP_ANONYMOUS`
 /// memory and the futexes, mutexes, and semaphores in it with the parent.
 ///
-/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/fork_shared_futex_parent.c`.
+/// Built from `litebox_runner_linux_userland/tests/fork_shared_futex_parent.c`.
 #[test]
 fn test_fork_shared_futex_with_windows_broker() {
     let (broker, runner) = build_windows_broker();
@@ -231,7 +96,7 @@ fn test_fork_shared_futex_with_windows_broker() {
 
 /// Runs `vfork_exec_parent`, whose child execs `vfork_exec_child` in a new runner.
 ///
-/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/vfork_exec_*.c`.
+/// Built from `litebox_runner_linux_userland/tests/vfork_exec_*.c`.
 #[test]
 fn test_vfork_exec_with_windows_broker() {
     let (broker, runner) = build_windows_broker();
@@ -276,7 +141,7 @@ fn reset(stream: std::net::TcpStream) {
 /// sockets: connects, socket options, partial and blocking transfers, peeks, backpressure,
 /// shutdown, resets, faulting receives, and policy denials.
 ///
-/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/tcp_broker.c`.
+/// Built from `litebox_runner_linux_userland/tests/tcp_broker.c`.
 #[test]
 fn test_tcp_with_windows_broker() {
     use std::io::{Read as _, Write as _};
@@ -353,7 +218,7 @@ fn test_tcp_with_windows_broker() {
 /// sockets: unconnected and connected transfers, truncation, vectored and faulting receives,
 /// empty and maximum datagrams, ICMP errors, shutdown, and policy denials.
 ///
-/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/udp_broker.c`.
+/// Built from `litebox_runner_linux_userland/tests/udp_broker.c`.
 #[test]
 fn test_udp_with_windows_broker() {
     use std::net::{Ipv4Addr, UdpSocket};
@@ -410,7 +275,7 @@ fn test_udp_with_windows_broker() {
 /// connected to servers on the host gateway report readiness, receives, sends, connects, and
 /// pending errors through the broker's Windows sockets.
 ///
-/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/tcp_broker_states.c`.
+/// Built from `litebox_runner_linux_userland/tests/tcp_broker_states.c`.
 #[test]
 fn test_tcp_connection_states_with_windows_broker() {
     use std::io::{Read as _, Write as _};
@@ -513,7 +378,7 @@ fn test_tcp_connection_states_with_windows_broker() {
 /// Runs `vsock_hybrid`, whose AF_VSOCK sockets reach host Unix sockets through the broker's
 /// hybrid vsock bridge (`--vsock-uds`), against [`vsock_hybrid_host`], its host end.
 ///
-/// Built at test time from `litebox_runner_vm_kernel/tests/linux/vsock_hybrid.rs`.
+/// Built from `litebox_runner_vm_kernel/tests/linux/vsock_hybrid.rs`.
 #[test]
 fn test_vsock_hybrid_with_windows_broker() {
     use std::io::BufRead as _;
@@ -890,7 +755,7 @@ mod vsock_hybrid_host {
 /// Pages past the end of the file therefore stay accessible instead of raising `SIGBUS`, and
 /// stores to them may survive a shrink. Only the checks of that unsupported behavior may fail.
 ///
-/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/shared_file_mapping.c`.
+/// Built from `litebox_runner_linux_userland/tests/shared_file_mapping.c`.
 #[test]
 fn test_shared_file_mapping_with_windows_broker() {
     const ALLOWED_FAILURES: [&str; 10] = [
@@ -908,11 +773,14 @@ fn test_shared_file_mapping_with_windows_broker() {
         "shared->counter == 0 && bytes[page] == 0",
     ];
     let (broker, runner) = build_windows_broker();
-    let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
     let output = broker_command(
         &broker,
         &runner,
-        &[test_dir.join("shared_file_mapping")],
+        &[build_c_guest(
+            "shared_file_mapping",
+            "broker",
+            GuestLinkage::Static,
+        )],
         &["--unstable", "--allow-process-duplication"],
         &["/bin/shared_file_mapping.hooked"],
     )
@@ -945,6 +813,61 @@ const DYNAMIC_LIBS: [(&str, &str); 2] = [
     ("libc.so.6", "/lib/x86_64-linux-gnu"),
     ("ld-linux-x86-64.so.2", "/lib64"),
 ];
+
+enum GuestLinkage {
+    Static,
+    Pie,
+}
+
+/// Builds the guest `name` in WSL and copies it and any runtime libraries to
+/// `CARGO_TARGET_TMPDIR/wsl-guests/<suite>/<name>/`.
+///
+/// Tests that may run concurrently must not build the same `name` in the same `suite`.
+fn build_c_guest(name: &str, suite: &str, linkage: GuestLinkage) -> std::path::PathBuf {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let source = match name {
+        "hello_world_static" | "hello_world_dyn" => {
+            "litebox_runner_linux_on_windows_userland/tests/hello_world.c".to_owned()
+        }
+        "hello_thread" => {
+            "litebox_runner_linux_on_windows_userland/tests/hello_thread.c".to_owned()
+        }
+        _ => format!("litebox_runner_linux_userland/tests/{name}.c"),
+    };
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("wsl-guests")
+        .join(suite)
+        .join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let guest = dir.join(name);
+    let mut wsl = std::process::Command::new("wsl.exe");
+    if let Some(distro) = std::env::var_os("LITEBOX_WSL_DISTRO") {
+        wsl.arg("--distribution").arg(distro);
+    }
+    let status = wsl
+        .arg("--cd")
+        .arg(repo)
+        .args([
+            "--exec",
+            "bash",
+            "litebox_runner_linux_on_windows_userland/tests/build_windows_linux_guest.sh",
+        ])
+        .arg(source)
+        .arg(&guest)
+        .arg(match linkage {
+            GuestLinkage::Static => "static",
+            GuestLinkage::Pie => "pie",
+        })
+        .status()
+        .expect("failed to start wsl.exe; install WSL and an x86-64 Linux distribution with GCC");
+    assert!(
+        status.success(),
+        "building {name} in WSL failed: {status}; check the WSL distribution, GCC and glibc development files"
+    );
+    guest
+}
 
 fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
     let runner = std::env::var_os("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
@@ -1014,29 +937,29 @@ fn build_vsock_hybrid() -> std::path::PathBuf {
 fn run_prog_with_windows_broker(
     broker: &std::path::Path,
     runner: &std::path::Path,
-    exec_name: &str,
+    guest: &std::path::Path,
     libs: &[(&str, &str)],
     pre_rewritten_exec: Option<&[u8]>,
 ) {
-    let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
+    let exec_name = guest.file_name().unwrap().to_str().unwrap();
     let variant = if pre_rewritten_exec.is_some() {
         "_pre_rewritten"
     } else {
         ""
     };
-    let tar_path = std::path::Path::new(env!("OUT_DIR"))
+    let tar_path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("broker_{exec_name}{variant}_rootfs.tar"));
     let mut tar = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
     let exec_path = format!("bin/{exec_name}.hooked");
     if let Some(executable) = pre_rewritten_exec {
         append_file(&mut tar, executable, &exec_path);
     } else {
-        append_rewritten_file(&mut tar, &test_dir.join(exec_name), &exec_path);
+        append_rewritten_file(&mut tar, guest, &exec_path);
     }
     for (file, prefix) in libs {
         append_rewritten_file(
             &mut tar,
-            &test_dir.join(file),
+            &guest.parent().unwrap().join(file),
             &format!("{}/{file}", prefix.trim_start_matches('/')),
         );
     }
@@ -1076,8 +999,8 @@ fn run_progs_with_process_duplication(
     )
 }
 
-/// Runs the first of `programs` with `arguments` under a broker started with
-/// `broker_arguments`, and returns its standard output. Each program is at
+/// Builds `programs` statically in WSL, then runs the first with `arguments` under a broker
+/// started with `broker_arguments`, and returns its standard output. Each program is at
 /// `/bin/<program>.hooked`.
 fn run_progs_with_broker_arguments(
     broker: &std::path::Path,
@@ -1086,10 +1009,9 @@ fn run_progs_with_broker_arguments(
     broker_arguments: &[&str],
     arguments: &[&str],
 ) -> String {
-    let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
     let programs: Vec<_> = programs
         .iter()
-        .map(|program| test_dir.join(program))
+        .map(|program| build_c_guest(program, "broker", GuestLinkage::Static))
         .collect();
     let output = broker_command(broker, runner, &programs, broker_arguments, arguments)
         .output()
@@ -1117,8 +1039,8 @@ fn broker_command(
         .iter()
         .map(|program| program.file_name().unwrap().to_str().unwrap())
         .collect();
-    let tar_path =
-        std::path::Path::new(env!("OUT_DIR")).join(format!("broker_{}_rootfs.tar", names[0]));
+    let tar_path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("broker_{}_rootfs.tar", names[0]));
     let mut tar = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
     for (program, name) in programs.iter().zip(&names) {
         append_rewritten_file(&mut tar, program, &format!("bin/{name}.hooked"));
@@ -1196,17 +1118,13 @@ fn run_dynamic_linked_prog_with_rewriter(
     cmd_args: &[&str],
     install_files: fn(std::path::PathBuf),
 ) {
-    // Use the already compiled executable from the tests folder (same dir as this file)
-    let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_dir.push("tests/test-bins");
-
     let prog_name = exec_name;
     let prog_name_hooked = format!("{prog_name}.hooked");
 
     let out_path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("dynamic_rewriter_{prog_name}"));
     std::fs::create_dir_all(&out_path).unwrap();
-    let path = test_dir.join(prog_name);
+    let path = build_c_guest(prog_name, "dynamic_rewriter", GuestLinkage::Pie);
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
     // Create tar file containing all dependencies
@@ -1220,7 +1138,7 @@ fn run_dynamic_linked_prog_with_rewriter(
 
     // Rewrite all libraries that are required for initialization
     for (file, prefix) in libs_to_rewrite {
-        let src = test_dir.join(file);
+        let src = path.parent().unwrap().join(file);
         let dst_dir = tar_src_path.join(prefix.trim_start_matches('/'));
         let dst = dst_dir.join(file);
         std::fs::create_dir_all(&dst_dir).unwrap();
@@ -1296,10 +1214,5 @@ fn run_dynamic_linked_prog_with_rewriter(
 #[test]
 fn test_testcase_dynamic_with_rewriter() {
     let exec_name = "hello_world_dyn";
-    let libs_to_rewrite = [
-        ("libc.so.6", "/lib/x86_64-linux-gnu"),
-        ("ld-linux-x86-64.so.2", "/lib64"),
-    ];
-    // Run
-    run_dynamic_linked_prog_with_rewriter(&libs_to_rewrite, exec_name, &[], |_| {});
+    run_dynamic_linked_prog_with_rewriter(&DYNAMIC_LIBS, exec_name, &[], |_| {});
 }
