@@ -95,7 +95,7 @@ fn test_fork_shared_futex_with_windows_broker() {
 }
 
 /// Exercises SysV segment mappings and attachment accounting across fork, exec, and exit.
-/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/shared_memory_segment.c`.
+/// Built from `litebox_runner_linux_userland/tests/shared_memory_segment.c`.
 #[test]
 fn test_sysv_shared_memory_segments_with_windows_broker() {
     let (broker, runner) = build_windows_broker();
