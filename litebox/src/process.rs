@@ -63,6 +63,9 @@ pub enum ProcessError {
     /// The child process is invalid or no longer available.
     #[error("invalid child process")]
     InvalidChild,
+    /// A source reference for inheritance is no longer available.
+    #[error("invalid inheritance source")]
+    InvalidInheritanceSource,
     /// No process has the target process ID.
     #[error("no such process")]
     NoSuchProcess,
@@ -545,12 +548,14 @@ impl PendingChild {
     /// child adopts each handle as the [`InheritableFd`] variant describes and
     /// releases its references when it terminates. If this fails, the child
     /// receives none of them. [`Self::release_inherited`] releases them early.
+    /// Losing the child or the process service invalidates this handle; an
+    /// [`invalid source`](ProcessError::InvalidInheritanceSource) does not.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns fewer handles than were duplicated.
     pub fn inherit<Platform: RawSyncPrimitivesProvider + TimeProvider>(
-        &self,
+        &mut self,
         fds: &[InheritableFd<Platform>],
     ) -> Result<Vec<ObjectHandle>, ProcessError> {
         // `fds` holds the objects, which keeps their handles open until the child has its own.
@@ -572,9 +577,14 @@ impl PendingChild {
         let mut handles = fd_handles.clone();
         handles.sort_unstable();
         handles.dedup();
-        let inherited = self
-            .broker
-            .duplicate_objects_to_child(self.pending_id()?, &handles)?;
+        let process_id = self.pending_id()?;
+        let inherited = match self.broker.duplicate_objects_to_child(process_id, &handles) {
+            Ok(inherited) => inherited,
+            Err(BrokerControlError::Broker(ErrorCode::UnknownObject)) => {
+                return Err(ProcessError::InvalidInheritanceSource);
+            }
+            Err(error) => return Err(self.rejected(error)),
+        };
         Ok(fd_handles
             .iter()
             .map(|handle| {

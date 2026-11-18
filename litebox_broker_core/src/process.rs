@@ -1598,7 +1598,8 @@ impl BrokerProcess {
     ///
     /// Returned handles follow the requested order and belong to the child,
     /// which releases them when it terminates. If duplication fails, the
-    /// child receives none of them.
+    /// child receives none of them. `PeerClosed` means the target allocation
+    /// is unavailable; `UnknownObject` refers to a source, not the child.
     ///
     /// Since the child can now change these objects, this process's
     /// references first start publishing readiness through `readiness_sink`,
@@ -1611,15 +1612,25 @@ impl BrokerProcess {
     ) -> Result<Vec<ObjectHandle>> {
         // A registration left behind by a later failure only publishes
         // readiness the process does not need.
-        self.register_readiness(readiness_sink)?;
+        let source_error = |error| match error {
+            BrokerError::PeerClosed => BrokerError::UnknownObject,
+            error => error,
+        };
+        self.register_readiness(readiness_sink)
+            .map_err(source_error)?;
         // Hold the state lock so the child stays pending, since a child
         // removed from its slot may release its references before receiving
         // these.
         let mut state = self.state.lock();
         let child = &self
-            .idle_pending_child(&mut state, child_process_id)?
+            .idle_pending_child(&mut state, child_process_id)
+            .map_err(|error| match error {
+                BrokerError::UnknownObject => BrokerError::PeerClosed,
+                error => error,
+            })?
             .process;
         self.duplicate_object_references_to(handles, child)
+            .map_err(source_error)
     }
 
     /// Releases every object reference held by the pending child selected by
@@ -5061,8 +5072,17 @@ mod tests {
 
         assert_eq!(
             parent.duplicate_object_references_to_child(ProcessId(child_id.0 + 1), &[first], &sink),
+            Err(BrokerError::PeerClosed)
+        );
+        assert_eq!(
+            parent.duplicate_object_references_to_child(
+                child_id,
+                &[first, ObjectHandle(u64::MAX)],
+                &sink
+            ),
             Err(BrokerError::UnknownObject)
         );
+        assert_eq!(child.references.lock().handles, []);
         // A signals reference is not duplicable, so the child receives nothing.
         let signals = crate::signal::open(&parent, readiness_sink()).unwrap();
         assert_eq!(
@@ -5091,7 +5111,7 @@ mod tests {
         assert_eq!(child.references.lock().handles, []);
         assert_eq!(
             parent.duplicate_object_references_to_child(child_id, &[first], &sink),
-            Err(BrokerError::UnknownObject)
+            Err(BrokerError::PeerClosed)
         );
 
         // A child that fails to start also releases them while its parent still holds it.

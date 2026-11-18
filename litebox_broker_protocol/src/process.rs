@@ -504,6 +504,8 @@ wire_struct! {
     /// `handles` holds the caller's handles as consecutive little-endian `u64`
     /// values. On success, the broker overwrites them in place with the child's
     /// handles in the same order. Either every reference is duplicated or none is.
+    /// `PeerClosed` means the caller cannot use this pending child anymore.
+    /// `UnknownObject` means a source reference is unavailable.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct DuplicateObjectsToChildRequest {
         /// Pending child that receives the duplicates.

@@ -4019,11 +4019,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match started {
             Ok(()) => Ok(self.resume_vfork_parent(ctx)),
             // Staging is atomic, and a rejected start releases what was staged.
-            // A lost process service cannot retry or exit, even if inheritance
-            // failed before the local handle attempted to start.
-            Err(error) if pending && error != ProcessError::ServiceFailed => {
-                Err(Errno::from(error))
-            }
+            Err(error) if pending => Err(Errno::from(error)),
             Err(_) => Ok(self.abort_vfork_window()),
         }
     }
@@ -5456,6 +5452,7 @@ mod tests {
 
     enum VforkReplies {
         Starts(alloc::collections::VecDeque<BrokerResult>),
+        RejectInheritance(litebox_broker_protocol::error::ErrorCode),
         LoseAssociationOnInherit,
     }
 
@@ -5475,6 +5472,10 @@ mod tests {
                     BrokerOperation::Process(ProcessRequest::StartChild(_)),
                     VforkReplies::Starts(starts),
                 ) => starts.pop_front(),
+                (
+                    BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(_)),
+                    VforkReplies::RejectInheritance(error),
+                ) => Some(BrokerResult::Error(*error)),
                 (
                     BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(_)),
                     VforkReplies::LoseAssociationOnInherit,
@@ -5653,6 +5654,41 @@ mod tests {
             assert_eq!(exec_vfork_child(task, &mut ctx), Ok(0));
             assert!(task.is_exiting());
         });
+    }
+
+    #[test]
+    fn losing_the_target_during_vfork_inheritance_ends_the_window() {
+        use litebox_broker_protocol::error::ErrorCode;
+        use litebox_common_linux::{OFlags, PtRegs};
+
+        run_with_vfork_replies(
+            VforkReplies::RejectInheritance(ErrorCode::PeerClosed),
+            |task| {
+                task.do_pipe2(OFlags::NONBLOCK, |_, _| Ok(())).unwrap();
+                let mut ctx = PtRegs::default();
+                assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+                assert_eq!(exec_vfork_child(task, &mut ctx), Ok(0));
+                assert!(task.is_exiting());
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_source_during_vfork_inheritance_leaves_the_child_pending() {
+        use litebox_broker_protocol::{error::ErrorCode, process::ProcessExitStatus};
+        use litebox_common_linux::{OFlags, PtRegs, errno::Errno};
+
+        run_with_vfork_replies(
+            VforkReplies::RejectInheritance(ErrorCode::UnknownObject),
+            |task| {
+                task.do_pipe2(OFlags::NONBLOCK, |_, _| Ok(())).unwrap();
+                let mut ctx = PtRegs::default();
+                assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+                assert_eq!(exec_vfork_child(task, &mut ctx), Err(Errno::EBADF));
+                assert!(task.exit_vfork_child(ProcessExitStatus::Exited { code: 1 }, &mut ctx) > 0);
+                assert!(!task.is_exiting());
+            },
+        );
     }
 
     #[cfg(target_arch = "x86_64")]

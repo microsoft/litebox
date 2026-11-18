@@ -152,6 +152,7 @@ impl From<litebox::process::ProcessError> for Errno {
             litebox::process::ProcessError::Busy
             | litebox::process::ProcessError::ResourceExhausted => Errno::EAGAIN,
             litebox::process::ProcessError::OutOfMemory => Errno::ENOMEM,
+            litebox::process::ProcessError::InvalidInheritanceSource => Errno::EBADF,
             litebox::process::ProcessError::ServiceFailed
             | litebox::process::ProcessError::InvalidChild => Errno::EIO,
             litebox::process::ProcessError::NoSuchProcess
@@ -1012,6 +1013,7 @@ mod tests {
             (ProcessError::OutOfMemory, Errno::ENOMEM),
             (ProcessError::ServiceFailed, Errno::EIO),
             (ProcessError::InvalidChild, Errno::EIO),
+            (ProcessError::InvalidInheritanceSource, Errno::EBADF),
             (ProcessError::NoSuchProcess, Errno::ESRCH),
             (ProcessError::NotControllingTerminal, Errno::ENOTTY),
             (ProcessError::NoSuchProcessGroup, Errno::ESRCH),
