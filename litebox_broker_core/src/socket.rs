@@ -637,9 +637,13 @@ pub trait PlatformSocket: Send + Sync {
     /// [`crate::transfer`]) without waiting for platform readiness.
     ///
     /// The original datagram length is returned even when the caller's buffer
-    /// is smaller, and zero-length datagrams are successful receives. When no
-    /// datagram is available, returns [`BrokerError::WouldBlock`]. The source
-    /// address follows [`PlatformDatagramReceive::source_address`].
+    /// is smaller, and zero-length datagrams are successful receives. The
+    /// source address follows [`PlatformDatagramReceive::source_address`].
+    ///
+    /// Once the transport applies read shutdown, return a pending error or
+    /// `Failed(Shutdown)`, leaving any unconsumed error available through [`Self::status`].
+    /// Otherwise, if neither a datagram nor an error is available, return
+    /// [`BrokerError::WouldBlock`].
     fn receive_from(
         &self,
         output: &mut dyn ReadBuffer,
@@ -946,8 +950,7 @@ pub fn take_error(process: &BrokerProcess, handle: ObjectHandle) -> Result<Optio
     let object = process
         .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     read_socket(&object, |_| ())?;
-    refresh(&object, true);
-    let error = take_pending_error(&object);
+    let error = take_pending_error(&object, true);
     sync_readiness(&object);
     Ok(error)
 }
@@ -1471,7 +1474,7 @@ fn send_datagram(
     if !read_socket(object, |socket| is_udp(socket.create_request))? {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if let Some(error) = take_pending_error(object) {
+    if let Some(error) = take_pending_error(object, false) {
         return Ok(SocketOutcome::Failed(error));
     }
     let (write_shutdown, view) =
@@ -1498,7 +1501,7 @@ fn finish_datagram_transfer<T>(
 ) -> Result<SocketOutcome<T>> {
     match result {
         Err(error @ (BrokerError::WouldBlock | BrokerError::NonBlockingWouldBlock)) => {
-            match take_pending_error(object) {
+            match take_pending_error(object, false) {
                 Some(error) => Ok(SocketOutcome::Failed(error)),
                 None => Err(error),
             }
@@ -1783,18 +1786,15 @@ fn receive_datagram(
     if !read_socket(object, |socket| is_udp(socket.create_request))? {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if let Some(error) = take_pending_error(object) {
+    if let Some(error) = take_pending_error(object, false) {
         return Ok(SocketOutcome::Failed(error));
     }
-    if read_socket(object, |socket| socket.read_shutdown)? {
-        return Ok(SocketOutcome::Failed(SocketError::Shutdown));
-    }
     match transport_receive_from(object, output, flags) {
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
-            if read_socket(object, |socket| socket.read_shutdown)? =>
-        {
-            Ok(SocketOutcome::Failed(SocketError::Shutdown))
-        }
+        // Whether the broker or the transport observed shutdown first, an
+        // error that poll has not yet queued takes precedence.
+        Ok(SocketOutcome::Failed(SocketError::Shutdown)) => Ok(SocketOutcome::Failed(
+            take_pending_error(object, true).unwrap_or(SocketError::Shutdown),
+        )),
         result => finish_datagram_transfer(object, result),
     }
 }
@@ -1806,6 +1806,10 @@ fn transport_receive_from(
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
     let length = output.len();
     let state = socket_state(object)?;
+    // A reconnect can retire the transport after reads have been shut down.
+    if state.read_shutdown {
+        return Ok(SocketOutcome::Failed(SocketError::Shutdown));
+    }
     if state.resource_retired {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
@@ -2069,6 +2073,15 @@ fn transport_status(
         (Arc::clone(&socket.resource), is_udp(socket.create_request))
     })?;
     let _error_queries = queue_errors.then(|| resource.error_queries.lock());
+    query_transport_status(object, udp, queue_errors)
+}
+
+/// With `queue_errors`, the caller holds the socket's error-query lock.
+fn query_transport_status(
+    object: &RwLock<ObjectEntry>,
+    udp: bool,
+    queue_errors: bool,
+) -> Result<(PlatformSocketStatus, bool)> {
     if udp {
         datagram_status(object, queue_errors)
     } else {
@@ -2240,7 +2253,7 @@ fn datagram_status(
             socket.resource.port_binding_is_wildcard(),
         )
     };
-    if configuration_in_flight || resource_retired {
+    if resource_retired || (configuration_in_flight && !queue_errors) {
         return Ok((
             PlatformSocketStatus {
                 status,
@@ -2315,7 +2328,9 @@ fn datagram_status(
         if queue_errors && let Some(error) = platform_status.pending_error {
             socket.errors.append(QueuedSocketError::Other(error));
         }
-        if socket.configuration_in_flight {
+        // A bind or reconnect can leave address and peer state in transition,
+        // but an error consumed from the transport still belongs to the socket.
+        if configuration_in_flight || socket.configuration_in_flight {
             return Ok((
                 PlatformSocketStatus {
                     status: socket.connection_status,
@@ -2407,6 +2422,7 @@ fn socket_resource(
 struct SocketState {
     resource: Arc<SocketResource>,
     resource_retired: bool,
+    read_shutdown: bool,
     nonblocking: bool,
 }
 
@@ -2414,6 +2430,7 @@ fn socket_state(object: &RwLock<ObjectEntry>) -> Result<SocketState> {
     read_socket(object, |socket| SocketState {
         resource: Arc::clone(&socket.resource),
         resource_retired: socket.resource_retired,
+        read_shutdown: socket.read_shutdown,
         nonblocking: socket.status.nonblocking(),
     })
 }
@@ -2454,16 +2471,27 @@ fn sync_readiness(object: &RwLock<ObjectEntry>) {
 /// and its transport may have one: a datagram socket, or a stream that is
 /// connecting or, with `include_connected`, connected.
 fn refresh(object: &RwLock<ObjectEntry>, include_connected: bool) {
+    let Ok((resource, udp)) = read_socket(object, |socket| {
+        (socket.resource(), is_udp(socket.create_request))
+    }) else {
+        return;
+    };
+    let _error_queries = resource.error_queries.lock();
+    refresh_error_queue(object, udp, include_connected);
+}
+
+/// Refreshes the queue. The caller must hold the socket's error-query lock.
+fn refresh_error_queue(object: &RwLock<ObjectEntry>, udp: bool, include_connected: bool) {
     let needed = read_socket(object, |socket| {
         socket.errors.is_empty()
-            && (is_udp(socket.create_request)
+            && (udp
                 || match socket.view() {
                     SocketConnectionStatus::Connecting => true,
                     SocketConnectionStatus::Connected => include_connected,
                     _ => false,
                 })
     });
-    if matches!(needed, Ok(true)) && transport_status(object, true).is_err() {
+    if matches!(needed, Ok(true)) && query_transport_status(object, udp, true).is_err() {
         let _ = write_socket(object, |socket| socket.errors.prepend(SocketError::Other));
     }
 }
@@ -2495,16 +2523,23 @@ fn refresh_after_failure(object: &RwLock<ObjectEntry>) {
     let _ = write_socket(object, |socket| socket.errors.take_connection_failure());
 }
 
-/// Takes a socket's oldest pending error, and then queues the transport's
-/// next one if that emptied the queue.
-fn take_pending_error(object: &RwLock<ObjectEntry>) -> Option<SocketError> {
-    let (error, empty) = write_socket(object, |socket| {
-        let error = socket.errors.take();
-        (error, socket.errors.is_empty())
+/// Takes the oldest queued error. With `check_transport`, first check the
+/// transport if the broker queue is empty; without it, `None` means only
+/// that the broker queue was empty. In either mode, taking the last queued
+/// error triggers a check for the next transport error.
+fn take_pending_error(object: &RwLock<ObjectEntry>, check_transport: bool) -> Option<SocketError> {
+    let (resource, udp) = read_socket(object, |socket| {
+        (check_transport || !socket.errors.is_empty())
+            .then(|| (socket.resource(), is_udp(socket.create_request)))
     })
-    .ok()?;
-    if error.is_some() && empty {
-        refresh(object, true);
+    .ok()??;
+    let _error_queries = resource.error_queries.lock();
+    if check_transport {
+        refresh_error_queue(object, udp, true);
+    }
+    let error = write_socket(object, |socket| socket.errors.take()).ok()?;
+    if error.is_some() {
+        refresh_error_queue(object, udp, true);
     }
     error
 }
@@ -3058,9 +3093,8 @@ pub(crate) struct SocketResource {
     readiness_sink: Arc<SocketReadinessSink>,
     port_binding: Mutex<Option<Arc<GuestPortBinding>>>,
     guest_source_lease: Mutex<Option<GuestSourceLease>>,
-    /// Serializes queries that queue the transport's pending error, so none
-    /// misses an error another has taken from the transport but not yet
-    /// queued.
+    /// Orders transport error queries with operations that claim an error and
+    /// refill the queue. The object lock protects the queue itself.
     error_queries: Mutex<()>,
     /// The account the provider charges this socket to, which drops after the
     /// socket retires.

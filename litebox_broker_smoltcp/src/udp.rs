@@ -341,6 +341,9 @@ impl Udp {
         if let Some(error) = self.pending_error.take() {
             return Ok(SocketOutcome::Failed(error));
         }
+        if self.read_shutdown {
+            return Ok(SocketOutcome::Failed(SocketError::Shutdown));
+        }
         let datagram = self.received.front().ok_or(BrokerError::WouldBlock)?;
         let received = datagram.data.len().min(output.len());
         output.copy_from_slice_at(0, &datagram.data[..received])?;
@@ -357,12 +360,20 @@ impl Udp {
         Ok(SocketOutcome::Completed(received))
     }
 
-    pub(super) fn shutdown(&mut self, mode: ShutdownMode) -> SocketOutcome<()> {
+    pub(super) fn shutdown(
+        &mut self,
+        sockets: &mut Sockets,
+        mode: ShutdownMode,
+    ) -> SocketOutcome<()> {
         match mode {
             ShutdownMode::Read => self.read_shutdown = true,
             ShutdownMode::Write => self.write_shutdown = true,
             ShutdownMode::Both => (self.read_shutdown, self.write_shutdown) = (true, true),
             _ => return SocketOutcome::Failed(SocketError::InvalidArgument),
+        }
+        if self.read_shutdown {
+            self.received = VecDeque::new();
+            sockets.queued -= core::mem::take(&mut self.received_bytes);
         }
         SocketOutcome::Completed(())
     }
