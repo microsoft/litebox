@@ -88,7 +88,7 @@ trait StartRunner: Send + Sync {
     /// Requires the same guarantees as [`ForkLauncher::start`].
     unsafe fn start(
         &self,
-        child: &PendingChild,
+        child: &mut PendingChild,
         startup: &[u8],
     ) -> Result<(), ForkError<ProcessError>>;
 }
@@ -139,7 +139,7 @@ impl<Platform: ProcessProvider, Runner: ForkRunner<Platform>> StartRunner
 {
     unsafe fn start(
         &self,
-        child: &PendingChild,
+        child: &mut PendingChild,
         startup: &[u8],
     ) -> Result<(), ForkError<ProcessError>> {
         let control_channel = self.runner.create_control_channel(child)?;
@@ -231,7 +231,7 @@ impl ForkLauncher {
     /// locks or users that survive only in the copied runtime.
     pub unsafe fn start(
         &self,
-        child: &PendingChild,
+        child: &mut PendingChild,
         startup: &[u8],
     ) -> Result<(), ForkError<ProcessError>> {
         // SAFETY: The caller supplies the pause and snapshot guarantees required by start.
@@ -1686,8 +1686,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> usize {
         let exited = self
             .vfork
-            .borrow()
-            .as_ref()
+            .borrow_mut()
+            .as_mut()
             .expect("vfork child exit lost its child")
             .child
             .exit(exit_status);
@@ -1953,7 +1953,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         startup.encode().map_err(|_| Errno::ENOMEM)?;
 
         // Dropping the pending child on failure discards it.
-        let child = self.allocate_child_process(relation)?;
+        let mut child = self.allocate_child_process(relation)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let handles = child.inherit(&objects).map_err(Errno::from)?;
@@ -1966,7 +1966,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let pidfd = pidfd
             .map(|dest| self.install_child_pidfd(&self.files.borrow(), &child, dest))
             .transpose()?;
-        let started = self.start_forked_child(&child, startup, has_shared_mappings);
+        let started = self.start_forked_child(&mut child, startup, has_shared_mappings);
         if started.is_err()
             && let Some(pidfd) = pidfd
         {
@@ -1980,7 +1980,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// or else from a copy of this process's memory, while the other threads are paused.
     fn start_forked_child(
         &self,
-        child: &PendingChild,
+        child: &mut PendingChild,
         mut startup: LinuxForkStartup,
         has_shared_mappings: bool,
     ) -> Result<(), Errno> {
@@ -3999,8 +3999,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         // The child keeps the references it inherits until it exits, so check the size first.
         startup.encode().map_err(|_| Errno::E2BIG)?;
-        let vfork = self.vfork.borrow();
-        let child = &vfork.as_ref().expect("vfork transfer lost its child").child;
+        let mut vfork = self.vfork.borrow_mut();
+        let child = &mut vfork.as_mut().expect("vfork transfer lost its child").child;
         let handles = child.inherit(&fds).map_err(Errno::from)?;
         for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
             inherited.handle = handle;
@@ -4864,7 +4864,7 @@ mod tests {
         let blocked = SigSet::empty().with(Signal::SIGCHLD);
         run_with_unwatched_signals(blocked, |task| {
             task.set_test_signal_action(Signal::SIGCHLD, SIG_IGN);
-            let child = task
+            let mut child = task
                 .global
                 .litebox
                 .allocate_child_process(None, false)
@@ -4918,7 +4918,7 @@ mod tests {
 
         let platform = crate::syscalls::tests::test_platform();
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let mut child = litebox.allocate_child_process(None, false).unwrap();
         let child_id = child.identity().process_id;
         let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let observer = Arc::new(RecordedEvents::new());
@@ -4986,7 +4986,7 @@ mod tests {
 
         let platform = crate::syscalls::tests::test_platform();
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let mut child = litebox.allocate_child_process(None, false).unwrap();
         let child_id = child.identity().process_id;
         let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let queue = ReadinessQueue::new(&litebox).unwrap();
@@ -6773,7 +6773,7 @@ mod fork_tests {
     impl StartRunner for NativeStartupRunner {
         unsafe fn start(
             &self,
-            _child: &PendingChild,
+            _child: &mut PendingChild,
             startup: &[u8],
         ) -> Result<(), ForkError<ProcessError>> {
             let native = crate::decode_native_fork_startup(startup).unwrap();
@@ -6814,10 +6814,10 @@ mod fork_tests {
         );
         let (litebox, _) =
             crate::syscalls::test_broker::litebox_with_channel(platform, limits, StartChannel);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let mut child = litebox.allocate_child_process(None, false).unwrap();
         let launcher = launcher();
         // SAFETY: No native child is created and no guest threads or guest startup state exist.
-        let result = unsafe { launcher.start(&child, b"startup") };
+        let result = unsafe { launcher.start(&mut child, b"startup") };
         STATE.with_borrow(|state| assert_eq!(state.events, expected_events));
         result
     }

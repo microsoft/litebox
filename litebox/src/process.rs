@@ -6,7 +6,6 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::authority::Term;
 use litebox_broker_protocol::error::ErrorCode;
@@ -100,7 +99,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok(PendingChild {
             broker,
             identity,
-            pending: AtomicBool::new(true),
+            pending: true,
         })
     }
 
@@ -449,11 +448,13 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 ///
 /// Dropping it before it starts or exits discards the child, as if it had
 /// never been created, except that its parent learns it was removed.
+/// Starting or exiting takes an exclusive borrow so no other use of this
+/// allocation can race the broker taking it and reusing its numeric ID.
 pub struct PendingChild {
     broker: Arc<dyn BrokerControl>,
     identity: ProcessIdentity,
     /// Cleared once the broker takes the child for start or exit, even if it fails afterwards.
-    pending: AtomicBool,
+    pending: bool,
 }
 
 impl PendingChild {
@@ -470,9 +471,7 @@ impl PendingChild {
     /// Fails with [`CredentialError::InvalidChild`] once the child has started
     /// or exited.
     pub fn restrict_authority(&mut self, terms: &[Term]) -> Result<(), CredentialError> {
-        // A finished child's numeric ID may have been reused. The exclusive
-        // borrow prevents a concurrent start or exit through this PendingChild.
-        if !*self.pending.get_mut() {
+        if !self.pending {
             return Err(CredentialError::InvalidChild);
         }
         let terms = encode_terms(terms)?;
@@ -487,7 +486,7 @@ impl PendingChild {
     }
 
     /// Starts this pending child process in a fresh runner.
-    pub fn start(&self, payload: &[u8]) -> Result<(), ProcessError> {
+    pub fn start(&mut self, payload: &[u8]) -> Result<(), ProcessError> {
         let outcome = self
             .broker
             .start_child_process(self.pending_id()?, payload)?;
@@ -509,7 +508,7 @@ impl PendingChild {
     /// `runner_descriptor` encodes the host runner's platform-specific identity and, where the
     /// platform needs one, its control endpoint. `payload` contains the guest startup state.
     pub fn start_with_existing_runner(
-        &self,
+        &mut self,
         runner_descriptor: &[u8],
         payload: &[u8],
     ) -> Result<(), ProcessError> {
@@ -590,7 +589,7 @@ impl PendingChild {
 
     /// Records that this pending child process exited without starting a
     /// runner, retaining `exit_status` until it is collected.
-    pub fn exit(&self, exit_status: ProcessExitStatus) -> Result<(), ProcessError> {
+    pub fn exit(&mut self, exit_status: ProcessExitStatus) -> Result<(), ProcessError> {
         let outcome = self
             .broker
             .exit_child_process(self.pending_id()?, exit_status)?;
@@ -599,20 +598,19 @@ impl PendingChild {
 
     fn pending_id(&self) -> Result<ProcessId, ProcessError> {
         self.pending
-            .load(Ordering::Relaxed)
             .then_some(self.identity.process_id)
             .ok_or(ProcessError::InvalidChild)
     }
 
-    fn finish(&self, outcome: ChildCompletion) -> Result<(), ProcessError> {
-        self.pending.store(false, Ordering::Relaxed);
+    fn finish(&mut self, outcome: ChildCompletion) -> Result<(), ProcessError> {
+        self.pending = false;
         outcome.map_err(|error| BrokerControlError::Broker(error).into())
     }
 }
 
 impl Drop for PendingChild {
     fn drop(&mut self) {
-        if self.pending.load(Ordering::Relaxed) {
+        if self.pending {
             // Failure means the child is already gone or the process service failed.
             let _ = self.broker.cancel_child_process(self.identity.process_id);
         }
@@ -840,7 +838,7 @@ impl From<BrokerControlError> for ProcessError {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::AtomicUsize;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use litebox_broker_local::test_support::test_broker_local;
     use litebox_broker_protocol::message::{
@@ -867,7 +865,7 @@ mod tests {
         drop(litebox.allocate_child_process(None, false).unwrap());
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
 
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let mut child = litebox.allocate_child_process(None, false).unwrap();
         child.exit(ProcessExitStatus::Exited { code: 0 }).unwrap();
         drop(child);
         assert_eq!(cancels.load(Ordering::SeqCst), 1);

@@ -534,9 +534,11 @@ wire_enum! {
         /// Replace the caller's authority with the terms in the buffer, as
         /// [`crate::authority::EncodedTerms`], if together they restrict it.
         ///
-        /// The broker returns `PolicyDenied` if the terms are invalid or not a
-        /// restriction, and `ResourceExhausted` if they are too many. Either
-        /// leaves the authority unchanged.
+        /// A well-formed proposal with invalid terms or one that widens
+        /// authority returns `PolicyDenied` without changing the authority.
+        /// A wire count above [`crate::authority::MAX_AUTHORITY_TERMS`] is a
+        /// malformed request that aborts the association. The encoder instead
+        /// rejects too many distinct canonical terms before sending a request.
         RestrictAuthority(SharedBufferSequence),
         /// Replace the authority of the caller's pending child with a
         /// restriction of it, as [`Self::RestrictAuthority`] does for the
