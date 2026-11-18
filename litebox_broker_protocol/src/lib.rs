@@ -19,6 +19,7 @@ extern crate std;
 #[macro_use]
 mod macros;
 
+pub mod authority;
 pub mod error;
 pub mod event;
 pub mod fs;
