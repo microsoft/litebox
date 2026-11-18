@@ -214,6 +214,41 @@ fn a_private_mount_does_not_pin_names_in_an_unrelated_backend() {
     assert!(child.file_status(ROOT, "/work/data", true).is_ok());
 }
 
+#[test]
+fn private_mount_and_ancestor_rename_have_one_order() {
+    use super::errors::RenameError;
+    use litebox_broker_protocol::fs::FileError;
+    use std::{sync::Barrier, thread};
+
+    let parent = Resolver::<TestPlatform, _>::new(
+        super::composer::Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap(),
+    );
+    parent.mkdir(ROOT, "/work", Mode::RWXU).unwrap();
+    parent.mkdir(ROOT, "/work/target", Mode::RWXU).unwrap();
+    let child = parent.copy_mount_view().unwrap();
+    let start = Barrier::new(2);
+    thread::scope(|s| {
+        let mount = s.spawn(|| {
+            start.wait();
+            child.mount_in_mem(ROOT, "/work/target")
+        });
+        start.wait();
+        let rename = parent.rename(ROOT, "/work", "/moved");
+        match (mount.join().unwrap(), rename) {
+            (Ok(()), Err(RenameError::Busy)) => {
+                assert!(child.file_status(ROOT, "/work/target", true).is_ok());
+            }
+            (Err(FileError::NoSuchFileOrDirectory), Ok(())) => {
+                assert!(child.file_status(ROOT, "/moved/target", true).is_ok());
+            }
+            other => panic!("inconsistent mount and rename: {other:?}"),
+        }
+    });
+}
+
 /// The path that `path` opens as, and up to 1 KiB of its content.
 fn read_path<Backend: super::backend::Backend + 'static>(
     fs: &Resolver<TestPlatform, Backend>,

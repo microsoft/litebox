@@ -156,6 +156,8 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         use super::service::file_walk_error;
         use litebox_broker_protocol::fs::FileError;
 
+        let composer = self.composer();
+        let _paths = composer.map(|c| c.mount_paths.write());
         let context = Context::new(user);
         let path = self
             .resolve_path(&context, path, true, false)
@@ -174,8 +176,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             }
             // Overlay walking handles hold its namespace lock; release it before rewalking.
             drop(target);
-            // XXX(jayb): Path-based mount can race renames; refusing foreign sticky ancestors is a
-            // stopgap.
+            // External changes to a backing filesystem are not serialized by the resolver.
             for len in 0..path.components.len() {
                 let components: Vec<_> =
                     path.components[..len].iter().map(String::as_str).collect();
@@ -192,7 +193,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 }
             }
         }
-        let composer = self.composer().ok_or(FileError::NotSupported)?;
+        let composer = composer.ok_or(FileError::NotSupported)?;
         composer
             .mount(&path.to_absolute(), |allocator| {
                 InMem::<Platform>::new_initialized(
@@ -1077,6 +1078,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
     /// Unlink a file
     pub fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
+        let _paths = self.composer().map(|c| c.mount_paths.read());
         let context = Context::new(user);
         let trailing_slash = path.ends_with('/');
         let Some((parent, name)) =
@@ -1199,6 +1201,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         old_path: &str,
         new_path: &str,
     ) -> Result<(), RenameError> {
+        let _paths = self.composer().map(|c| c.mount_paths.read());
         let context = Context::new(user);
         let map_walk_error = |error| match error {
             WalkError::Io => RenameError::Io,
@@ -1343,6 +1346,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
     /// Remove a directory
     pub fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
+        let _paths = self.composer().map(|c| c.mount_paths.read());
         let context = Context::new(user);
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, path)
