@@ -626,6 +626,9 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::CancelChild(child_process_id) => process
             .cancel_child_process(child_process_id)
             .map(|()| ProcessResponse::CancelChild),
+        ProcessRequest::ReleaseChildObjects(child_process_id) => process
+            .release_child_object_references(child_process_id)
+            .map(|()| ProcessResponse::ReleaseChildObjects),
         ProcessRequest::ReportExitStatus(exit_status) => process
             .report_exit_status(exit_status)
             .map(|()| ProcessResponse::ReportExitStatus),
@@ -2409,7 +2412,7 @@ mod tests {
     use litebox_broker_core::{ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy};
     use litebox_broker_protocol::authority::{
         DomainId, EncodedSubject, MAX_AUTHORITY_TERMS, Principal, PrincipalSet, Privileges, Scope,
-        Slots, SortedSet, Subject,
+        Slots, Subject, sorted_set::SortedSet,
     };
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
@@ -2838,6 +2841,7 @@ mod tests {
         active_request_closes_object_reference(&broker);
         active_requests_manage_authority(&broker);
         active_requests_restrict_pending_child_authority(&broker);
+        active_requests_release_pending_child_objects(&broker);
         active_requests_reject_malformed_authority_payloads(&broker);
         active_requests_operate_timers(&broker, &timer_provider);
         active_requests_operate_shared_futexes(&broker);
@@ -4172,6 +4176,85 @@ mod tests {
         assert_eq!(
             restrict_child(child.process_id, &[]),
             Ok(BrokerResult::Error(ErrorCode::UnknownObject))
+        );
+    }
+
+    fn active_requests_release_pending_child_objects(broker: &TestBroker) {
+        let parent = create_process_with_authority(broker, &[]);
+        let shared_buffers = test_shared_buffers();
+        let request =
+            |operation| handle_test_request_with_buffers(&parent, operation, &shared_buffers);
+        let BrokerResult::Pipe(PipeResponse::Create(pipe)) = request(BrokerOperation::Pipe(
+            PipeRequest::Create(CreatePipeRequest {
+                capacity: 64,
+                atomic_write_size: 16,
+                flags: FileOpenFlags::NONE,
+            }),
+        )) else {
+            panic!("expected successful pipe creation");
+        };
+        let child = parent.allocate_child_process(None, false).unwrap();
+        let duplicate = |handle: ObjectHandle| {
+            request(BrokerOperation::Process(
+                ProcessRequest::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
+                    child_process_id: child.process_id,
+                    handles: stage_payload(&shared_buffers, &handle.0.to_le_bytes()),
+                }),
+            ))
+        };
+        let release = |child_process_id| {
+            request(BrokerOperation::Process(
+                ProcessRequest::ReleaseChildObjects(child_process_id),
+            ))
+        };
+        let read = || {
+            request(BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
+                handle: pipe.read_handle,
+                buffer: single_slot_sequence(4, 1),
+            })))
+        };
+        let released = BrokerResult::Process(ProcessResponse::ReleaseChildObjects);
+
+        assert_eq!(
+            duplicate(pipe.write_handle),
+            BrokerResult::Process(ProcessResponse::DuplicateObjectsToChild)
+        );
+        assert_eq!(
+            request(BrokerOperation::CloseObject(pipe.write_handle)),
+            BrokerResult::ObjectClosed
+        );
+        // The pending child keeps the pipe writable until it releases its reference.
+        assert_eq!(read(), BrokerResult::Error(ErrorCode::WouldBlock));
+        assert_eq!(release(child.process_id), released);
+        assert_eq!(
+            read(),
+            BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 0 }))
+        );
+        assert_eq!(release(child.process_id), released);
+        assert_eq!(
+            release(parent.id()),
+            BrokerResult::Error(ErrorCode::UnknownObject)
+        );
+
+        // The child stays pending, so it may receive references afresh and exit.
+        assert_eq!(
+            duplicate(pipe.read_handle),
+            BrokerResult::Process(ProcessResponse::DuplicateObjectsToChild)
+        );
+        assert_eq!(
+            request(BrokerOperation::Process(ProcessRequest::ExitChild(
+                ExitChildProcessRequest {
+                    child_process_id: child.process_id,
+                    exit_status: litebox_broker_protocol::process::ProcessExitStatus::Exited {
+                        code: 0
+                    },
+                }
+            ))),
+            BrokerResult::Process(ProcessResponse::ExitChild)
+        );
+        assert_eq!(
+            release(child.process_id),
+            BrokerResult::Error(ErrorCode::UnknownObject)
         );
     }
 

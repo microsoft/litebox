@@ -485,12 +485,24 @@ impl PendingChild {
             })
     }
 
+    /// Returns whether this handle still refers to a pending allocation.
+    /// This is local state, not a liveness query.
+    pub fn is_pending(&self) -> bool {
+        self.pending
+    }
+
     /// Starts this pending child process in a fresh runner.
+    ///
+    /// If this fails while the child [is still pending](Self::is_pending),
+    /// the broker did not take the child, which holds none of the references
+    /// [`Self::inherit`] gave it, so the caller may inherit and start again,
+    /// or exit it. Otherwise the child is gone.
     pub fn start(&mut self, payload: &[u8]) -> Result<(), ProcessError> {
-        let outcome = self
-            .broker
-            .start_child_process(self.pending_id()?, payload)?;
-        self.finish(outcome)
+        let process_id = self.pending_id()?;
+        match self.broker.start_child_process(process_id, payload) {
+            Ok(outcome) => self.finish(outcome),
+            Err(error) => Err(self.start_rejected(error)),
+        }
     }
 
     /// Asks the broker for the control connection through which a native clone of this runner
@@ -507,17 +519,20 @@ impl PendingChild {
     ///
     /// `runner_descriptor` encodes the host runner's platform-specific identity and, where the
     /// platform needs one, its control endpoint. `payload` contains the guest startup state.
+    /// Failure leaves the child as [`Self::start`] describes.
     pub fn start_with_existing_runner(
         &mut self,
         runner_descriptor: &[u8],
         payload: &[u8],
     ) -> Result<(), ProcessError> {
-        let outcome = self.broker.start_child_with_existing_runner(
-            self.pending_id()?,
-            runner_descriptor,
-            payload,
-        )?;
-        self.finish(outcome)
+        let process_id = self.pending_id()?;
+        match self
+            .broker
+            .start_child_with_existing_runner(process_id, runner_descriptor, payload)
+        {
+            Ok(outcome) => self.finish(outcome),
+            Err(error) => Err(self.start_rejected(error)),
+        }
     }
 
     /// Gives this pending child process its own references to the objects
@@ -529,7 +544,7 @@ impl PendingChild {
     /// Descriptors sharing an open file description get the same handle. The
     /// child adopts each handle as the [`InheritableFd`] variant describes and
     /// releases its references when it terminates. If this fails, the child
-    /// receives none of them.
+    /// receives none of them. [`Self::release_inherited`] releases them early.
     ///
     /// # Panics
     ///
@@ -571,6 +586,27 @@ impl PendingChild {
             .collect())
     }
 
+    /// Releases every reference [`Self::inherit`] gave this pending child, so
+    /// that it may inherit afresh.
+    ///
+    /// On failure the handle is invalidated. If the broker has not already
+    /// lost the child or the association, LiteBox also requests cancellation.
+    pub fn release_inherited(&mut self) -> Result<(), ProcessError> {
+        let process_id = self.pending_id()?;
+        match self.broker.release_child_objects(process_id) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let error = self.rejected(error);
+                if self.pending {
+                    // This allocation might still hold the staged references.
+                    let _ = self.broker.cancel_child_process(process_id);
+                    self.pending = false;
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Writes `data` at `offset` of this pending child process's memory image,
     /// which the child's runner receives when the child starts.
     ///
@@ -590,16 +626,39 @@ impl PendingChild {
     /// Records that this pending child process exited without starting a
     /// runner, retaining `exit_status` until it is collected.
     pub fn exit(&mut self, exit_status: ProcessExitStatus) -> Result<(), ProcessError> {
-        let outcome = self
-            .broker
-            .exit_child_process(self.pending_id()?, exit_status)?;
-        self.finish(outcome)
+        let process_id = self.pending_id()?;
+        match self.broker.exit_child_process(process_id, exit_status) {
+            Ok(outcome) => self.finish(outcome),
+            Err(error) => Err(self.rejected(error)),
+        }
     }
 
     fn pending_id(&self) -> Result<ProcessId, ProcessError> {
         self.pending
             .then_some(self.identity.process_id)
             .ok_or(ProcessError::InvalidChild)
+    }
+
+    fn rejected(&mut self, error: BrokerControlError) -> ProcessError {
+        let error = ProcessError::from(error);
+        if matches!(
+            error,
+            ProcessError::InvalidChild | ProcessError::ServiceFailed
+        ) {
+            // The allocation is gone or its disposition is unknown. Don't send
+            // another request (including cancellation) against its numeric ID.
+            self.pending = false;
+        }
+        error
+    }
+
+    fn start_rejected(&mut self, error: BrokerControlError) -> ProcessError {
+        let error = self.rejected(error);
+        if self.pending {
+            // Roll back before allowing a retry; preserve the original start error.
+            let _ = self.release_inherited();
+        }
+        error
     }
 
     fn finish(&mut self, outcome: ChildCompletion) -> Result<(), ProcessError> {
@@ -838,7 +897,7 @@ impl From<BrokerControlError> for ProcessError {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use litebox_broker_local::test_support::test_broker_local;
     use litebox_broker_protocol::message::{
@@ -856,36 +915,41 @@ mod tests {
 
     #[test]
     fn dropping_a_pending_child_cancels_it() {
-        let cancels = Arc::new(AtomicUsize::new(0));
+        let counts = Arc::new(ChildCounts::default());
         let litebox = LiteBox::new_with_broker_local(
             MockPlatform::new(),
-            test_broker_local(ChildChannel(cancels.clone()), test_shared_memory()),
+            test_broker_local(ChildChannel(counts.clone()), test_shared_memory()),
         );
 
         drop(litebox.allocate_child_process(None, false).unwrap());
-        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.cancels.load(Ordering::SeqCst), 1);
 
         let mut child = litebox.allocate_child_process(None, false).unwrap();
         child.exit(ProcessExitStatus::Exited { code: 0 }).unwrap();
         drop(child);
-        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.cancels.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn child_taken_by_a_failed_launch_is_no_longer_pending() {
-        let cancels = Arc::new(AtomicUsize::new(0));
+        let counts = Arc::new(ChildCounts::default());
         let litebox = LiteBox::new_with_broker_local(
             MockPlatform::new(),
-            test_broker_local(ChildChannel(cancels.clone()), test_shared_memory()),
+            test_broker_local(ChildChannel(counts.clone()), test_shared_memory()),
         );
         let mut child = litebox.allocate_child_process(None, false).unwrap();
         // The same error can occur on either side of the broker taking the child.
         assert_eq!(child.start(&[]), Err(ProcessError::ResourceExhausted));
+        // A child the broker did not take releases what it inherited, and stays pending.
+        assert!(child.is_pending());
+        assert_eq!(counts.releases.load(Ordering::SeqCst), 1);
         child.restrict_authority(&[]).unwrap();
         assert_eq!(
             child.start_with_existing_runner(&[], &[]),
             Err(ProcessError::ResourceExhausted)
         );
+        assert!(!child.is_pending());
+        assert_eq!(counts.releases.load(Ordering::SeqCst), 1);
         let mut replacement = litebox.allocate_child_process(None, false).unwrap();
         assert_eq!(
             child.identity().process_id,
@@ -895,15 +959,56 @@ mod tests {
             child.restrict_authority(&[]),
             Err(CredentialError::InvalidChild)
         );
+        assert_eq!(child.release_inherited(), Err(ProcessError::InvalidChild));
         drop(child);
-        assert_eq!(cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.cancels.load(Ordering::SeqCst), 0);
         replacement.restrict_authority(&[]).unwrap();
         drop(replacement);
-        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.releases.load(Ordering::SeqCst), 1);
     }
 
-    /// Serves one pending child at a time, counting its cancellations.
-    struct ChildChannel(Arc<AtomicUsize>);
+    #[test]
+    fn losing_the_child_during_release_invalidates_it_without_cancelling_by_id() {
+        let counts = Arc::new(ChildCounts::default());
+        counts.fail_releases.store(true, Ordering::SeqCst);
+        let litebox = LiteBox::new_with_broker_local(
+            MockPlatform::new(),
+            test_broker_local(ChildChannel(counts.clone()), test_shared_memory()),
+        );
+
+        let mut child = litebox.allocate_child_process(None, false).unwrap();
+        assert_eq!(child.release_inherited(), Err(ProcessError::InvalidChild));
+        assert!(!child.is_pending());
+        assert_eq!(counts.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            child.exit(ProcessExitStatus::Exited { code: 0 }),
+            Err(ProcessError::InvalidChild)
+        );
+        drop(child);
+        assert_eq!(counts.cancels.load(Ordering::SeqCst), 0);
+
+        // A rejected start reports its own error, even when the child is discarded.
+        let mut child = litebox.allocate_child_process(None, false).unwrap();
+        assert_eq!(child.start(&[]), Err(ProcessError::ResourceExhausted));
+        assert!(!child.is_pending());
+        drop(child);
+        assert_eq!(counts.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.releases.load(Ordering::SeqCst), 2);
+    }
+
+    /// What [`ChildChannel`] observed of its pending child.
+    #[derive(Default)]
+    struct ChildCounts {
+        cancels: AtomicUsize,
+        releases: AtomicUsize,
+        /// Whether the broker reports that the child is no longer pending when asked to release
+        /// its objects.
+        fail_releases: AtomicBool,
+    }
+
+    /// Serves one pending child at a time, counting its cancellations and releases.
+    struct ChildChannel(Arc<ChildCounts>);
 
     impl LocalCallChannel for ChildChannel {
         type Error = ();
@@ -939,8 +1044,18 @@ mod tests {
                     ProcessResponse::ChildConsumed(ErrorCode::ResourceExhausted)
                 }
                 ProcessRequest::CancelChild(process_id) if process_id == child => {
-                    self.0.fetch_add(1, Ordering::SeqCst);
+                    self.0.cancels.fetch_add(1, Ordering::SeqCst);
                     ProcessResponse::CancelChild
+                }
+                ProcessRequest::ReleaseChildObjects(process_id) if process_id == child => {
+                    self.0.releases.fetch_add(1, Ordering::SeqCst);
+                    if self.0.fail_releases.load(Ordering::SeqCst) {
+                        return Ok(BrokerResponse {
+                            request_id: request.request_id,
+                            result: BrokerResult::Error(ErrorCode::PeerClosed),
+                        });
+                    }
+                    ProcessResponse::ReleaseChildObjects
                 }
                 operation => panic!("unexpected process operation {operation:?}"),
             };

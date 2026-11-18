@@ -169,6 +169,20 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
+    /// Releases every object reference that
+    /// [`Self::duplicate_objects_to_child`] gave a pending child created by
+    /// [`Self::allocate_child_process`], keeping the child pending.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn release_child_objects(&self, child_process_id: ProcessId) -> Result<(), Channel::Error> {
+        match self.request_process(ProcessRequest::ReleaseChildObjects(child_process_id))? {
+            ProcessResponse::ReleaseChildObjects => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
     /// Creates the control connection through which a native clone of this runner will
     /// associate as the pending child `child_process_id`, returning the token under which the
     /// broker delivered the runner's end out of band.

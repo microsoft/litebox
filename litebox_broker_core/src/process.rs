@@ -537,6 +537,8 @@ struct BrokerProcessState {
 /// A child retained until its parent requests startup.
 struct PendingChild {
     process: Arc<BrokerProcess>,
+    /// Taking the child or adding references must wait while destructors run outside the lock.
+    releasing_objects: bool,
     /// Memory image the child starts from, once written.
     image: Option<ChildImage>,
     /// Connection the child's runner associates through.
@@ -965,6 +967,7 @@ impl BrokerProcess {
                     if identity.is_ok() {
                         state.pending_child_process = Some(PendingChild {
                             process: Arc::clone(&child),
+                            releasing_objects: false,
                             image: None,
                             connection: None,
                         });
@@ -1037,7 +1040,7 @@ impl BrokerProcess {
         child_process_id: ProcessId,
     ) -> Result<ChildWithConnection<Connection>> {
         let mut state = self.state.lock();
-        let pending = self.pending_child(&mut state, child_process_id)?;
+        let pending = self.idle_pending_child(&mut state, child_process_id)?;
         let connection = match pending
             .connection
             .take()
@@ -1060,7 +1063,7 @@ impl BrokerProcess {
     /// Takes the pending child selected by `child_process_id`.
     fn take_pending_child(&self, child_process_id: ProcessId) -> Result<PendingChild> {
         let mut state = self.state.lock();
-        self.pending_child(&mut state, child_process_id)?;
+        self.idle_pending_child(&mut state, child_process_id)?;
         state
             .pending_child_process
             .take()
@@ -1125,6 +1128,18 @@ impl BrokerProcess {
             .awaits_startup(&pending.process.state.lock())
         {
             return Err(BrokerError::PeerClosed);
+        }
+        Ok(pending)
+    }
+
+    fn idle_pending_child<'a>(
+        &self,
+        state: &'a mut BrokerProcessState,
+        id: ProcessId,
+    ) -> Result<&'a mut PendingChild> {
+        let pending = self.pending_child(state, id)?;
+        if pending.releasing_objects {
+            return Err(BrokerError::WouldBlock);
         }
         Ok(pending)
     }
@@ -1600,25 +1615,51 @@ impl BrokerProcess {
         // Hold the state lock so the child stays pending, since a child
         // removed from its slot may release its references before receiving
         // these.
-        let state = self.state.lock();
-        if !self.accepts_operations(&state) {
-            return Err(BrokerError::PeerClosed);
-        }
-        let child = &state
-            .pending_child_process
-            .as_ref()
-            .filter(|pending| {
-                pending
-                    .process
-                    .process_id_in_namespace(self.pid_namespace())
-                    == Some(child_process_id)
-            })
-            .ok_or(BrokerError::UnknownObject)?
+        let mut state = self.state.lock();
+        let child = &self
+            .idle_pending_child(&mut state, child_process_id)?
             .process;
-        if !child.awaits_startup(&child.state.lock()) {
-            return Err(BrokerError::PeerClosed);
-        }
         self.duplicate_object_references_to(handles, child)
+    }
+
+    /// Releases every object reference held by the pending child selected by
+    /// `child_process_id`, so that this process may duplicate references into
+    /// it afresh after a start that did not take it.
+    ///
+    /// Only [`Self::duplicate_object_references_to_child`] gives a pending
+    /// child references, so these are exactly the ones this process gave it.
+    /// Releasing allocates nothing.
+    pub fn release_child_object_references(&self, child_process_id: ProcessId) -> Result<()> {
+        let mut state = self.state.lock();
+        let pending = self.idle_pending_child(&mut state, child_process_id)?;
+        pending.releasing_objects = true;
+        let key = pending.process.key;
+        loop {
+            // Owner teardown can remove the slot while a destructor runs. Never
+            // continue a release against a different allocation, even if its ID matches.
+            let pending = state
+                .pending_child_process
+                .as_mut()
+                .filter(|pending| pending.process.key == key)
+                .ok_or(BrokerError::PeerClosed)?;
+            let handle = pending.process.references.lock().handles.last().copied();
+            let Some(handle) = handle else {
+                pending.releasing_objects = false;
+                return Ok(());
+            };
+            let reference = match pending.process.remove_object_reference(handle) {
+                Ok(reference) => reference,
+                Err(error) => {
+                    pending.releasing_objects = false;
+                    return Err(error);
+                }
+            };
+            // Object destruction may lock the creator. The slot remains busy,
+            // so no start can observe a partially released table.
+            drop(state);
+            drop(reference);
+            state = self.state.lock();
+        }
     }
 
     /// Returns the process group this process is in, and so its session.
@@ -5068,6 +5109,83 @@ mod tests {
             parent.check_readiness(first),
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
         );
+    }
+
+    #[test]
+    fn pending_child_cannot_start_or_inherit_during_reference_release() {
+        use crate::readiness::ReadinessRegistration;
+
+        struct OnDrop<F: Fn()>(F);
+        impl<F: Fn()> Drop for OnDrop<F> {
+            fn drop(&mut self) {
+                (self.0)();
+            }
+        }
+
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let id = parent
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        let event = crate::event::create(&parent, 1, FileOpenFlags::NONE).unwrap();
+        let sink: Arc<dyn ReadinessSink> = readiness_sink();
+        let handles = parent
+            .duplicate_object_references_to_child(id, &[event, event], &sink)
+            .unwrap();
+        let last = handles[1];
+        let observed = Arc::new(AtomicUsize::new(0));
+        let probe = {
+            let parent = Arc::downgrade(&parent);
+            let observed = Arc::clone(&observed);
+            let sink = Arc::clone(&sink);
+            Arc::new(OnDrop(move || {
+                let parent = parent.upgrade().unwrap();
+                assert!(
+                    parent.state.try_lock().is_some(),
+                    "destructors run outside the creator lock"
+                );
+                assert!(matches!(
+                    parent.take_child_process(id),
+                    Err(BrokerError::WouldBlock)
+                ));
+                assert!(matches!(
+                    parent.take_child_process_with_connection::<()>(id),
+                    Err(BrokerError::WouldBlock)
+                ));
+                assert_eq!(
+                    parent.duplicate_object_references_to_child(id, &[event], &sink),
+                    Err(BrokerError::WouldBlock)
+                );
+                assert_eq!(
+                    parent.release_child_object_references(id),
+                    Err(BrokerError::WouldBlock)
+                );
+                observed.fetch_add(1, Ordering::Relaxed);
+            }))
+        };
+        parent
+            .core
+            .references
+            .write()
+            .get_mut(&last)
+            .unwrap()
+            .readiness = Some(ReadinessRegistration::new_with_retirement_guard(
+            last, sink, probe,
+        ));
+
+        parent.release_child_object_references(id).unwrap();
+        assert_eq!(observed.load(Ordering::Relaxed), 1);
+        let child = parent.take_child_process(id).unwrap();
+        assert_eq!(child.references.lock().handles, []);
     }
 
     #[test]

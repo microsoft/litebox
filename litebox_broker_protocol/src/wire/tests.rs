@@ -649,6 +649,7 @@ fn request_codec_round_trips_all_variants() {
             }
         )),
         BrokerOperation::Process(ProcessRequest::CreateSubject(sequence(1, 2))),
+        BrokerOperation::Process(ProcessRequest::ReleaseChildObjects(process_id(u32::MAX))),
         BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
             socket_type: SocketType::Stream,
             flags: FileOpenFlags::NONBLOCKING,
@@ -1415,6 +1416,7 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::Process(ProcessResponse::RestrictChildAuthority),
         BrokerResult::Process(ProcessResponse::CreateSubject(ObjectHandle(u64::MAX))),
         BrokerResult::Process(ProcessResponse::ChildConsumed(ErrorCode::ResourceExhausted)),
+        BrokerResult::Process(ProcessResponse::ReleaseChildObjects),
         BrokerResult::Error(ErrorCode::PolicyDenied),
         BrokerResult::Error(ErrorCode::WouldBlock),
         BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
@@ -2900,6 +2902,24 @@ fn authority_response_wire_shapes_are_pinned() {
             ErrorCode::ResourceExhausted,
         ))),
         [&header[..], &[10, 28, 8]].concat()
+    );
+}
+
+#[test]
+fn child_object_release_wire_shapes_are_pinned() {
+    assert_eq!(
+        encode_request(&BrokerRequest {
+            request_id: RequestId(13),
+            operation: BrokerOperation::Process(ProcessRequest::ReleaseChildObjects(ProcessId(5))),
+        }),
+        [1, 13, 0, 0, 0, 0, 0, 0, 0, 10, 28, 5, 0, 0, 0]
+    );
+    assert_eq!(
+        encode_response(&BrokerResponse {
+            request_id: RequestId(13),
+            result: BrokerResult::Process(ProcessResponse::ReleaseChildObjects),
+        }),
+        [1, 13, 0, 0, 0, 0, 0, 0, 0, 10, 29]
     );
 }
 

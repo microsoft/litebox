@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+//! Fallibly allocated, ordered sets for credential values.
+
 use alloc::collections::TryReserveError;
 use alloc::vec::{self, Vec};
 use core::{fmt, slice};

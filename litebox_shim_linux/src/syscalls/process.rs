@@ -3954,7 +3954,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Starts the `vfork` child's new program in a fresh runner and resumes the parent.
     ///
     /// The runner inherits the descriptors not marked close-on-exec and the child's pending
-    /// signals. Failures before the transfer return to the child, which may retry or exit.
+    /// signals. Failures that leave the child pending return to the child, which may retry with
+    /// its descriptors at that time, or exit. Other failures end the `vfork` window.
     fn transfer_vfork_child(
         &self,
         path: alloc::string::String,
@@ -4005,16 +4006,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
         for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
             inherited.handle = handle;
         }
-        let payload = startup
-            .encode()
-            .expect("the startup fit with placeholder handles");
-        let started = child.start(&payload);
+        let started = match startup.encode() {
+            Ok(payload) => child.start(&payload),
+            // The startup fit with placeholder handles, so only its allocation failed.
+            Err(_) => child
+                .release_inherited()
+                .and(Err(ProcessError::OutOfMemory)),
+        };
+        let pending = child.is_pending();
         drop(vfork);
-        if started.is_err() {
+        match started {
+            Ok(()) => Ok(self.resume_vfork_parent(ctx)),
+            // The child no longer holds what it inherited, so it may retry or exit.
+            Err(error) if pending => Err(Errno::from(error)),
             // The broker no longer holds a pending child that could retry or exit.
-            return Ok(self.abort_vfork_window());
+            Err(_) => Ok(self.abort_vfork_window()),
         }
-        Ok(self.resume_vfork_parent(ctx))
     }
 
     /// Handle syscall `execve`.
@@ -5441,6 +5448,172 @@ mod tests {
             assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(1)));
             assert_eq!(task.do_prlimit(RlimitResource::CPU, None), Ok(core(1)));
         });
+    }
+
+    /// Answers each `StartChild` with the next of `starts`, or forwards it to the broker, which
+    /// has no launcher and so rejects it without taking the child.
+    struct VforkStartChannel {
+        inner: InProcessBrokerChannel,
+        starts: StdMutex<alloc::vec::Vec<BrokerResult>>,
+    }
+
+    impl LocalCallChannel for VforkStartChannel {
+        type Error = <InProcessBrokerChannel as LocalCallChannel>::Error;
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            use litebox_broker_protocol::message::ProcessRequest;
+
+            if matches!(
+                request.operation,
+                BrokerOperation::Process(ProcessRequest::StartChild(_))
+            ) && let Some(result) = self.starts.lock().unwrap().pop()
+            {
+                return Ok(BrokerResponse {
+                    request_id: request.request_id,
+                    result,
+                });
+            }
+            self.inner.call(request)
+        }
+    }
+
+    /// Runs `test` on a LiteBox-managed thread with a task whose `StartChild` requests get the
+    /// results in `starts`, in order.
+    fn run_with_vfork_starts(
+        starts: alloc::vec::Vec<BrokerResult>,
+        test: impl FnOnce(&crate::Task<crate::syscalls::tests::TestPlatform>),
+    ) {
+        use crate::syscalls::tests::TestPlatform;
+        use litebox::platform::ThreadProvider;
+        use litebox_broker_core::BrokerCoreLimits;
+
+        let platform = crate::syscalls::tests::test_platform();
+        let limits = BrokerCoreLimits::new(
+            super::super::test_broker::MAX_TEST_BROKER_REFERENCES,
+            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+        );
+        let mut starts = starts;
+        starts.reverse();
+        let (litebox, process_id) =
+            super::super::test_broker::litebox_with_channel(platform, limits, |inner| {
+                VforkStartChannel {
+                    inner,
+                    starts: StdMutex::new(starts),
+                }
+            });
+        let task = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
+            .build()
+            .0
+            .new_test_task();
+        // Saving the parent's vector state needs a LiteBox-managed thread.
+        TestPlatform::run_test_thread(|| test(&task));
+    }
+
+    /// Asks the `vfork` child in `task` to start `/bin/true` in a fresh runner.
+    fn exec_vfork_child(
+        task: &crate::Task<crate::syscalls::tests::TestPlatform>,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) -> Result<usize, litebox_common_linux::errno::Errno> {
+        let program = || alloc::string::String::from("/bin/true");
+        task.transfer_vfork_child(
+            program(),
+            program(),
+            alloc::vec![alloc::ffi::CString::new("true").unwrap()],
+            alloc::vec![],
+            ctx,
+        )
+    }
+
+    /// Returns whether reading `fd`, a nonblocking pipe's read end, finds that no writer remains.
+    fn pipe_has_no_writer(
+        task: &crate::Task<crate::syscalls::tests::TestPlatform>,
+        fd: u32,
+    ) -> bool {
+        let mut byte = [0u8];
+        match task.sys_read(i32::try_from(fd).unwrap(), &mut byte[..], None) {
+            Ok(0) => true,
+            Err(litebox_common_linux::errno::Errno::EAGAIN) => false,
+            result => panic!("unexpected pipe read result {result:?}"),
+        }
+    }
+
+    #[test]
+    fn vfork_exec_rejected_before_start_returns_without_what_it_inherited() {
+        use litebox_common_linux::{OFlags, PtRegs, errno::Errno};
+
+        run_with_vfork_starts(alloc::vec![], |task| {
+            let mut ctx = PtRegs::default();
+            assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+            let (read_end, write_end) = task.do_pipe2(OFlags::NONBLOCK, |_, _| Ok(())).unwrap();
+
+            // The broker has no launcher, so it rejects the start before taking the child.
+            assert_eq!(exec_vfork_child(task, &mut ctx), Err(Errno::ENOSYS));
+            assert!(task.vfork.borrow().is_some());
+            assert!(!task.is_exiting());
+            // The pending child released its inherited write end.
+            task.sys_close(i32::try_from(write_end).unwrap()).unwrap();
+            assert!(pipe_has_no_writer(task, read_end));
+
+            // The child may still exit, resuming its parent.
+            task.exit_vfork_child(
+                litebox_broker_protocol::process::ProcessExitStatus::Exited { code: 1 },
+                &mut ctx,
+            );
+            assert!(task.vfork.borrow().is_none());
+            assert!(!task.is_exiting());
+        });
+    }
+
+    #[test]
+    fn vfork_exec_retry_inherits_the_descriptors_open_then() {
+        use litebox_broker_protocol::{error::ErrorCode, message::ProcessResponse};
+        use litebox_common_linux::{FcntlArg, FileDescriptorFlags, OFlags, PtRegs, errno::Errno};
+
+        run_with_vfork_starts(
+            alloc::vec![
+                BrokerResult::Error(ErrorCode::ResourceExhausted),
+                BrokerResult::Process(ProcessResponse::StartChild),
+            ],
+            |task| {
+                let (read_end, write_end) = task.do_pipe2(OFlags::NONBLOCK, |_, _| Ok(())).unwrap();
+                let write_fd = i32::try_from(write_end).unwrap();
+                let mut ctx = PtRegs::default();
+                assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+
+                assert_eq!(exec_vfork_child(task, &mut ctx), Err(Errno::EAGAIN));
+                assert!(task.vfork.borrow().is_some());
+                assert!(!task.is_exiting());
+                // The retry inherits only the descriptors that are still not close-on-exec.
+                task.sys_fcntl(write_fd, FcntlArg::SETFD(FileDescriptorFlags::FD_CLOEXEC))
+                    .unwrap();
+                let child_pid = exec_vfork_child(task, &mut ctx).unwrap();
+                assert!(child_pid > 0);
+                assert!(task.vfork.borrow().is_none());
+                assert!(!task.is_exiting());
+
+                // The started child holds the read end but not the write end.
+                task.sys_close(write_fd).unwrap();
+                assert!(pipe_has_no_writer(task, read_end));
+            },
+        );
+    }
+
+    #[test]
+    fn vfork_exec_failing_after_the_broker_takes_the_child_ends_the_window() {
+        use litebox_broker_protocol::{error::ErrorCode, message::ProcessResponse};
+        use litebox_common_linux::PtRegs;
+
+        run_with_vfork_starts(
+            alloc::vec![BrokerResult::Process(ProcessResponse::ChildConsumed(
+                ErrorCode::ResourceExhausted,
+            ))],
+            |task| {
+                let mut ctx = PtRegs::default();
+                assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
+                assert_eq!(exec_vfork_child(task, &mut ctx), Ok(0));
+                assert!(task.is_exiting());
+            },
+        );
     }
 
     #[cfg(target_arch = "x86_64")]

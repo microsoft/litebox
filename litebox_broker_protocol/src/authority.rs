@@ -21,11 +21,12 @@ use crate::shared_buffer::{
 };
 use crate::wire::{Decoder, Encoder, Wire, WireError};
 
-mod sorted_set;
-pub use sorted_set::SortedSet;
+pub mod sorted_set;
+use sorted_set::SortedSet;
 
 /// Maximum number of distinct canonical terms in an authority or a proposed
-/// restriction. See [`canonical_terms`].
+/// restriction, including subsumed but nonidentical terms. Old and new terms
+/// may coexist during a multithreaded change. See [`canonical_terms`].
 pub const MAX_AUTHORITY_TERMS: usize = 16;
 
 /// Maximum number of exact principals in one set: [`PrincipalSet::exact`],

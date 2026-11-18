@@ -217,6 +217,7 @@ impl BrokerOperation {
                 | ProcessRequest::CreateChildrenPidNamespace(_)
                 | ProcessRequest::ExitChild(_)
                 | ProcessRequest::CancelChild(_)
+                | ProcessRequest::ReleaseChildObjects(_)
                 | ProcessRequest::ReportExitStatus(_)
                 | ProcessRequest::SetChildExitRetention(_)
                 | ProcessRequest::SetOrphanAdoption(_)
@@ -556,6 +557,17 @@ wire_enum! {
         /// process. The broker returns `PolicyDenied` if the caller's current
         /// authority does not admit the subject.
         CreateSubject(SharedBufferSequence),
+        /// Release every object reference held by this process's pending
+        /// child, all of which this process duplicated into it, so that it may
+        /// duplicate references afresh after a start that did not take the
+        /// child.
+        ///
+        /// Releasing allocates nothing. The broker returns `UnknownObject` if
+        /// no matching child is in the caller's pending slot, or `PeerClosed`
+        /// if the caller or child is shutting down. While a release is in
+        /// progress, another release, duplication into this child, or an
+        /// operation taking the child returns `WouldBlock`.
+        ReleaseChildObjects(ProcessId),
     }
 }
 
@@ -899,6 +911,8 @@ wire_enum! {
         /// A start or exit took the pending child, then failed. Its numeric ID
         /// no longer selects that allocation; the caller must not cancel or retry it.
         ChildConsumed(ErrorCode),
+        /// The pending child's object references were released.
+        ReleaseChildObjects,
     }
 }
 

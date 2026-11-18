@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::authority::{DomainId, Privileges, SortedSet};
+use litebox_broker_protocol::authority::{
+    DomainId, MAX_AUTHORITY_TERMS, Privileges, sorted_set::SortedSet,
+};
 
 use super::*;
 
@@ -251,12 +253,13 @@ fn bound_counts_distinct_terms_not_threads_and_never_partially_commits() {
         .unwrap();
     let mut equivalent = broad.clone();
     equivalent.access.owners.exact.try_insert(user(2)).unwrap();
-    let mut authority =
-        Authority::new(core::iter::repeat_n(broad.clone(), MAX_TERMS + 1).chain([equivalent]))
-            .unwrap();
+    let mut authority = Authority::new(
+        core::iter::repeat_n(broad.clone(), MAX_AUTHORITY_TERMS + 1).chain([equivalent]),
+    )
+    .unwrap();
     assert_eq!(authority.terms().len(), 1);
     let before = authority.clone();
-    let narrower = (0..u32::try_from(MAX_TERMS).unwrap()).map(|id| {
+    let narrower = (0..u32::try_from(MAX_AUTHORITY_TERMS).unwrap()).map(|id| {
         let mut t = broad.clone();
         t.access.owners = exact(user(id));
         t
@@ -268,7 +271,7 @@ fn bound_counts_distinct_terms_not_threads_and_never_partially_commits() {
     );
     assert_eq!(authority, before);
     authority.restrict(narrower).unwrap();
-    assert_eq!(authority.terms().len(), MAX_TERMS);
+    assert_eq!(authority.terms().len(), MAX_AUTHORITY_TERMS);
     authority.restrict([]).unwrap();
     assert!(!authority.admits(&subject(user(1))));
     assert_eq!(

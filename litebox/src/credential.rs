@@ -17,7 +17,7 @@ use litebox_broker_protocol::authority::{
 };
 pub use litebox_broker_protocol::authority::{
     DomainId, MAX_AUTHORITY_TERMS, MAX_SET_DOMAINS, MAX_SET_PRINCIPALS, Principal, PrincipalSet,
-    Privileges, Scope, Slots, SortedSet, Subject, Term,
+    Privileges, Scope, Slots, Subject, Term, sorted_set::SortedSet,
 };
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_platform::time::TimeProvider;

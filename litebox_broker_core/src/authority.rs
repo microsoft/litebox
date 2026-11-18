@@ -16,11 +16,6 @@ use thiserror::Error;
 mod process;
 pub(crate) use process::SubjectObject;
 
-/// Maximum number of distinct canonical terms, including subsumed but
-/// nonidentical terms. Allows old and new pairs to coexist during a
-/// multithreaded change.
-pub use litebox_broker_protocol::authority::MAX_AUTHORITY_TERMS as MAX_TERMS;
-
 /// Reason a proposed authority was rejected.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum AuthorityError {

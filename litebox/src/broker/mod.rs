@@ -92,6 +92,13 @@ pub(crate) trait BrokerControl: Send + Sync {
         child_process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<(), BrokerControlError>;
 
+    /// Releases every object reference [`Self::duplicate_objects_to_child`] gave the pending
+    /// child, which stays pending.
+    fn release_child_objects(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError>;
+
     /// Creates the control connection for a native clone that will start as the pending child,
     /// returning the token under which the broker delivered the runner's end.
     fn request_child_connection(
@@ -1024,6 +1031,13 @@ where
         child_process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.cancel_child_process(child_process_id))
+    }
+
+    fn release_child_objects(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.release_child_objects(child_process_id))
     }
 
     fn request_child_connection(
