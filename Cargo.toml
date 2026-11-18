@@ -132,6 +132,9 @@ default-members = [
 # `litebox_bootloader` is excluded because it is empty except on that target
 # (it still builds, as an empty crate, on others).
 
+[workspace.lints.cargo]
+unused_dependencies = "deny"
+
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy
 # but not _too_ ridiculous.

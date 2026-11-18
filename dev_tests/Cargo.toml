@@ -11,9 +11,7 @@ publish = false
 [dev-dependencies]
 anyhow = "1.0.99"
 fs-err = "3.1.2"
+ignore = "0.4.25"
 
 [lints]
 workspace = true
-
-[dependencies]
-ignore = "0.4.25"
