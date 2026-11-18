@@ -563,7 +563,15 @@ jobs:
             target/tmp/windows_node_rewriter
           key: ${{ steps.fixture-key.outputs.key }}
           restore-keys: ${{ steps.fixture-key.outputs.prefix }}
-      - name: Check the default WSL distribution for the Windows loader tests
+      - name: Set up WSL for the Windows loader tests
+        timeout-minutes: 10
+        uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
+        with:
+          distribution: Ubuntu-24.04
+          use-cache: 'true'
+          set-as-default: 'true'
+          additional-packages: gcc libc6-dev
+      - name: Verify the WSL toolchain for the Windows loader tests
         timeout-minutes: 2
         run: |
           wsl.exe --list --verbose
