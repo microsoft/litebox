@@ -894,6 +894,9 @@ wire_enum! {
         RestrictChildAuthority,
         /// The subject was registered under this handle.
         CreateSubject(ObjectHandle),
+        /// A start or exit took the pending child, then failed. Its numeric ID
+        /// no longer selects that allocation; the caller must not cancel or retry it.
+        ChildConsumed(ErrorCode),
     }
 }
 

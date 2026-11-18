@@ -106,6 +106,7 @@ fn authority_error(error: AuthorityError) -> BrokerError {
         AuthorityError::TooManyTerms | AuthorityError::SetTooLarge => {
             BrokerError::ResourceExhausted
         }
+        AuthorityError::OutOfMemory => BrokerError::OutOfMemory,
         AuthorityError::NotRestriction
         | AuthorityError::UnmappedPrincipal
         | AuthorityError::DenyOnlyOverlap

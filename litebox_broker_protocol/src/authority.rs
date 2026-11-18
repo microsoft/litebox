@@ -7,9 +7,10 @@
 //! Term lists and subjects travel in shared buffers, encoded by [`EncodedTerms`]
 //! and [`EncodedSubject`]. Every set has a protocol ceiling, so any authority of
 //! at most [`MAX_AUTHORITY_TERMS`] terms that are [`Term::within_size_limits`]
-//! fits in [`MAX_ENCODED_TERMS_SIZE`] bytes.
+//! fits in [`MAX_ENCODED_TERMS_SIZE`] bytes. Sets are [`SortedSet`]s, so a
+//! peer-sized set never allocates infallibly.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 use thiserror::Error;
@@ -20,7 +21,11 @@ use crate::shared_buffer::{
 };
 use crate::wire::{Decoder, Encoder, Wire, WireError};
 
-/// Maximum number of distinct terms in an authority or a proposed restriction.
+mod sorted_set;
+pub use sorted_set::SortedSet;
+
+/// Maximum number of distinct canonical terms in an authority or a proposed
+/// restriction. See [`canonical_terms`].
 pub const MAX_AUTHORITY_TERMS: usize = 16;
 
 /// Maximum number of exact principals in one set: [`PrincipalSet::exact`],
@@ -101,9 +106,9 @@ impl Principal {
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PrincipalSet {
     /// Individually named principals.
-    pub exact: BTreeSet<Principal>,
+    pub exact: SortedSet<Principal>,
     /// Domains whose every principal is included.
-    pub domains: BTreeSet<DomainId>,
+    pub domains: SortedSet<DomainId>,
 }
 
 impl PrincipalSet {
@@ -170,9 +175,9 @@ pub struct Subject {
     /// Selected primary group, always held.
     pub group: Principal,
     /// Enabled memberships, distinct from the owner and group slots.
-    pub identities: BTreeSet<Principal>,
+    pub identities: SortedSet<Principal>,
     /// Additional principals to match for deny entries, never a membership claim.
-    pub deny_only: BTreeSet<Principal>,
+    pub deny_only: SortedSet<Principal>,
     /// Privileges used for this request.
     pub privileges: Privileges,
 }
@@ -195,11 +200,11 @@ pub struct Term {
     /// Slots available to identity-scoped requests.
     pub identity: Slots,
     /// Memberships that must be present, either enabled or deny-only.
-    pub required: BTreeSet<Principal>,
+    pub required: SortedSet<Principal>,
     /// Memberships that may be enabled in addition to the required ones.
     pub optional: PrincipalSet,
     /// Principals that must always be deny-only.
-    pub deny_only: BTreeSet<Principal>,
+    pub deny_only: SortedSet<Principal>,
     /// Privileges reachable together with this term's identity choices.
     pub privileges: Privileges,
 }
@@ -207,6 +212,13 @@ pub struct Term {
 impl PrincipalSet {
     fn within_size_limits(&self) -> bool {
         self.exact.len() <= MAX_SET_PRINCIPALS && self.domains.len() <= MAX_SET_DOMAINS
+    }
+
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            exact: self.exact.try_clone()?,
+            domains: self.domains.try_clone()?,
+        })
     }
 
     fn encoded_len(&self) -> usize {
@@ -231,6 +243,13 @@ impl PrincipalSet {
 impl Slots {
     fn within_size_limits(&self) -> bool {
         self.owners.within_size_limits() && self.groups.within_size_limits()
+    }
+
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            owners: self.owners.try_clone()?,
+            groups: self.groups.try_clone()?,
+        })
     }
 
     fn encoded_len(&self) -> usize {
@@ -290,6 +309,145 @@ impl Term {
             privileges: Privileges::decode(decoder)?,
         })
     }
+
+    fn enabled_sets(&self) -> [&PrincipalSet; 5] {
+        [
+            &self.access.owners,
+            &self.access.groups,
+            &self.identity.owners,
+            &self.identity.groups,
+            &self.optional,
+        ]
+    }
+
+    /// Checks the term as given, before anything is normalized away.
+    fn validate(&self) -> Result<(), TermsError> {
+        if !self.within_size_limits() {
+            return Err(TermsError::SetTooLarge);
+        }
+        if !Privileges::all().contains(self.privileges)
+            || (self.privileges.contains(Privileges::EXECUTE_ANY)
+                && !self.privileges.contains(Privileges::READ_ANY))
+        {
+            return Err(TermsError::InvalidPrivileges);
+        }
+        if !self
+            .required
+            .iter()
+            .chain(&self.deny_only)
+            .copied()
+            .all(mapped)
+        {
+            return Err(TermsError::UnmappedPrincipal);
+        }
+        if !self.required.is_disjoint(&self.deny_only) {
+            return Err(TermsError::DenyOnlyOverlap);
+        }
+        for set in self.enabled_sets() {
+            if set.domains.contains(&DomainId::UNMAPPED) || !set.exact.iter().copied().all(mapped) {
+                return Err(TermsError::UnmappedPrincipal);
+            }
+            if self.deny_only.iter().any(|p| set.contains(p)) {
+                return Err(TermsError::DenyOnlyOverlap);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops what the rest of a valid term already implies. This neither
+    /// allocates nor changes which subjects the term admits.
+    fn normalize(&mut self) {
+        if self.privileges.contains(Privileges::TRAVERSE_ANY) {
+            self.privileges.insert(Privileges::LOOKUP_ANY);
+        }
+        for set in [
+            &mut self.access.owners,
+            &mut self.access.groups,
+            &mut self.identity.owners,
+            &mut self.identity.groups,
+            &mut self.optional,
+        ] {
+            set.exact.retain(|p| !set.domains.contains(&p.domain));
+        }
+        self.optional.exact.retain(|p| !self.required.contains(p));
+    }
+
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            access: self.access.try_clone()?,
+            identity: self.identity.try_clone()?,
+            required: self.required.try_clone()?,
+            optional: self.optional.try_clone()?,
+            deny_only: self.deny_only.try_clone()?,
+            privileges: self.privileges,
+        })
+    }
+}
+
+fn mapped(p: Principal) -> bool {
+    p.domain != DomainId::UNMAPPED
+}
+
+/// Reason terms cannot form an authority.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum TermsError {
+    /// A term names [`DomainId::UNMAPPED`] or one of its principals.
+    #[error("unmapped principals cannot appear in authority")]
+    UnmappedPrincipal,
+    /// A deny-only principal of a term can also be enabled or selected.
+    #[error("a mandatory deny-only principal can also be enabled")]
+    DenyOnlyOverlap,
+    /// A term has unknown privileges, or [`Privileges::EXECUTE_ANY`] without
+    /// [`Privileges::READ_ANY`].
+    #[error("invalid privilege set")]
+    InvalidPrivileges,
+    /// There are more than [`MAX_AUTHORITY_TERMS`] distinct canonical terms.
+    #[error("too many distinct authority terms")]
+    TooManyTerms,
+    /// A set exceeds [`MAX_SET_PRINCIPALS`] or [`MAX_SET_DOMAINS`].
+    #[error("an authority set exceeds its protocol ceiling")]
+    SetTooLarge,
+    /// The canonical terms could not be allocated.
+    #[error("authority allocation failed")]
+    OutOfMemory,
+}
+
+impl From<TryReserveError> for TermsError {
+    fn from(_: TryReserveError) -> Self {
+        Self::OutOfMemory
+    }
+}
+
+/// Validates `terms`, which may repeat and come in any order, and returns
+/// their distinct canonical forms in ascending order.
+///
+/// Each term is validated as given, so an invalid term is rejected even if
+/// its canonical form would be valid or equal to another term's. A canonical
+/// term admits the same subjects: [`Privileges::TRAVERSE_ANY`] includes
+/// [`Privileges::LOOKUP_ANY`], no exact principal repeats its set's domain
+/// wildcard and no optional principal is also required. At most
+/// [`MAX_AUTHORITY_TERMS`] distinct canonical terms are accepted.
+///
+/// Both LiteBox and the broker apply this; the broker's result is authoritative.
+pub fn canonical_terms(terms: impl IntoIterator<Item = Term>) -> Result<Vec<Term>, TermsError> {
+    let mut distinct = Vec::new();
+    for mut term in terms {
+        term.validate()?;
+        term.normalize();
+        insert_distinct(&mut distinct, term)?;
+    }
+    Ok(distinct)
+}
+
+fn insert_distinct(distinct: &mut Vec<Term>, term: Term) -> Result<(), TermsError> {
+    if let Err(index) = distinct.binary_search(&term) {
+        if distinct.len() == MAX_AUTHORITY_TERMS {
+            return Err(TermsError::TooManyTerms);
+        }
+        distinct.try_reserve(1)?;
+        distinct.insert(index, term);
+    }
+    Ok(())
 }
 
 impl Subject {
@@ -306,7 +464,7 @@ impl Subject {
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuthorityCodecError {
-    /// There are more than [`MAX_AUTHORITY_TERMS`] distinct terms.
+    /// The payload has more than [`MAX_AUTHORITY_TERMS`] terms.
     #[error("too many distinct authority terms")]
     TooManyTerms,
     /// A set exceeds [`MAX_SET_PRINCIPALS`] or [`MAX_SET_DOMAINS`].
@@ -328,7 +486,7 @@ impl From<WireError> for AuthorityCodecError {
 }
 
 /// A list of terms encoded for a shared buffer: a little-endian `u16` count,
-/// then each distinct term in ascending [`Ord`] order.
+/// then each distinct canonical term in ascending [`Ord`] order.
 ///
 /// Each term holds its access and identity slots (owners, then groups),
 /// `required`, `optional`, `deny_only` and `privileges`. A principal set holds
@@ -339,31 +497,21 @@ impl From<WireError> for AuthorityCodecError {
 pub struct EncodedTerms(Vec<u8>);
 
 impl EncodedTerms {
-    /// Encodes the distinct terms of `terms`, which may repeat and come in any
-    /// order.
-    pub fn new<'a>(terms: impl IntoIterator<Item = &'a Term>) -> Result<Self, AuthorityCodecError> {
-        let mut distinct = BTreeSet::new();
+    /// Encodes the [`canonical_terms`] of `terms`, which may repeat and come
+    /// in any order. The recipient must still validate the decoded terms.
+    pub fn new<'a>(terms: impl IntoIterator<Item = &'a Term>) -> Result<Self, TermsError> {
+        let mut distinct = Vec::new();
         for term in terms {
-            if !Privileges::all().contains(term.privileges) {
-                return Err(AuthorityCodecError::Malformed);
-            }
-            if !term.within_size_limits() {
-                return Err(AuthorityCodecError::SetTooLarge);
-            }
-            distinct.insert(term);
-            if distinct.len() > MAX_AUTHORITY_TERMS {
-                return Err(AuthorityCodecError::TooManyTerms);
-            }
+            // Validating first also bounds the copy.
+            term.validate()?;
+            let mut term = term.try_clone()?;
+            term.normalize();
+            insert_distinct(&mut distinct, term)?;
         }
-        let length = COUNT_SIZE
-            + distinct
-                .iter()
-                .map(|term| term.encoded_len())
-                .sum::<usize>();
-        let mut encoder =
-            Encoder::try_with_capacity(length).ok_or(AuthorityCodecError::OutOfMemory)?;
+        let length = COUNT_SIZE + distinct.iter().map(Term::encoded_len).sum::<usize>();
+        let mut encoder = Encoder::try_with_capacity(length).ok_or(TermsError::OutOfMemory)?;
         encode_count(distinct.len(), &mut encoder);
-        for term in distinct {
+        for term in &distinct {
             term.encode(&mut encoder);
         }
         let bytes = encoder.finish();
@@ -378,8 +526,9 @@ impl EncodedTerms {
     }
 }
 
-/// Decodes terms encoded by [`EncodedTerms::new`], accepting only its
-/// canonical form.
+/// Decodes terms encoded by [`EncodedTerms::new`], accepting only strictly
+/// ascending terms and sets. It does not validate the terms; see
+/// [`canonical_terms`].
 pub fn decode_terms(payload: &[u8]) -> Result<Vec<Term>, AuthorityCodecError> {
     if payload.len() > MAX_ENCODED_TERMS_SIZE as usize {
         return Err(AuthorityCodecError::Malformed);
@@ -477,7 +626,7 @@ wire_struct! {
     }
 }
 
-fn principal_list_len(set: &BTreeSet<Principal>) -> usize {
+fn principal_list_len(set: &SortedSet<Principal>) -> usize {
     COUNT_SIZE + set.len() * Principal::MAX_SIZE
 }
 
@@ -487,7 +636,7 @@ fn encode_count(count: usize, encoder: &mut Encoder) {
         .encode(encoder);
 }
 
-fn encode_set<T: Wire>(set: &BTreeSet<T>, encoder: &mut Encoder) {
+fn encode_set<T: Wire>(set: &SortedSet<T>, encoder: &mut Encoder) {
     encode_count(set.len(), encoder);
     for item in set {
         item.encode(encoder);
@@ -497,7 +646,7 @@ fn encode_set<T: Wire>(set: &BTreeSet<T>, encoder: &mut Encoder) {
 fn decode_set<T: Wire + Ord>(
     decoder: &mut Decoder<'_>,
     maximum: usize,
-) -> Result<BTreeSet<T>, AuthorityCodecError> {
+) -> Result<SortedSet<T>, AuthorityCodecError> {
     let count = usize::from(u16::decode(decoder)?);
     if count > maximum {
         return Err(AuthorityCodecError::SetTooLarge);
@@ -505,15 +654,18 @@ fn decode_set<T: Wire + Ord>(
     if count > decoder.remaining() / T::MAX_SIZE {
         return Err(AuthorityCodecError::Malformed);
     }
-    let mut set = BTreeSet::new();
+    let mut items: Vec<T> = Vec::new();
+    items
+        .try_reserve_exact(count)
+        .map_err(|_| AuthorityCodecError::OutOfMemory)?;
     for _ in 0..count {
         let item = T::decode(decoder)?;
-        if set.last().is_some_and(|last| *last >= item) {
+        if items.last().is_some_and(|last| *last >= item) {
             return Err(AuthorityCodecError::Malformed);
         }
-        set.insert(item);
+        items.push(item);
     }
-    Ok(set)
+    Ok(SortedSet::from_ascending(items))
 }
 
 #[cfg(test)]
@@ -534,22 +686,23 @@ mod tests {
         EncodedTerms::new([term]).unwrap().as_bytes()[COUNT_SIZE..].to_vec()
     }
 
-    fn full_principals(domain: u32) -> BTreeSet<Principal> {
-        (0..MAX_SET_PRINCIPALS)
-            .map(|id| principal(domain, u32::try_from(id).unwrap()))
-            .collect()
+    fn full_principals(domain: u32) -> SortedSet<Principal> {
+        SortedSet::try_from_iter(
+            (0..MAX_SET_PRINCIPALS).map(|id| principal(domain, u32::try_from(id).unwrap())),
+        )
+        .unwrap()
     }
 
+    /// Wildcards that cover none of the domains [`full_term`] names exactly.
     fn full_set(domain: u32) -> PrincipalSet {
         PrincipalSet {
             exact: full_principals(domain),
-            domains: (0..MAX_SET_DOMAINS)
-                .map(|domain| DomainId(u32::try_from(domain).unwrap()))
-                .collect(),
+            domains: SortedSet::try_from_iter((100..).take(MAX_SET_DOMAINS).map(DomainId)).unwrap(),
         }
     }
 
-    fn full_term(privileges: u32) -> Term {
+    /// A valid canonical term with every set at its ceiling.
+    fn full_term(variant: u32) -> Term {
         let slots = Slots {
             owners: full_set(1),
             groups: full_set(2),
@@ -560,7 +713,15 @@ mod tests {
             required: full_principals(3),
             optional: full_set(4),
             deny_only: full_principals(5),
-            privileges: Privileges::from_bits(privileges).unwrap(),
+            privileges: Privileges::from_bits(variant << 5).unwrap(),
+        }
+    }
+
+    /// Distinct valid canonical terms.
+    fn small_term(variant: u32) -> Term {
+        Term {
+            privileges: Privileges::from_bits(variant << 5).unwrap(),
+            ..Term::default()
         }
     }
 
@@ -580,12 +741,12 @@ mod tests {
         let term = Term {
             access: Slots {
                 owners: PrincipalSet {
-                    exact: BTreeSet::new(),
-                    domains: BTreeSet::from([DomainId::POSIX_USER]),
+                    exact: SortedSet::new(),
+                    domains: SortedSet::from([DomainId::POSIX_USER]),
                 },
                 groups: PrincipalSet::default(),
             },
-            required: BTreeSet::from([principal(2, 5)]),
+            required: SortedSet::from([principal(2, 5)]),
             privileges: Privileges::READ_ANY | Privileges::SIGNAL_ANY,
             ..Term::default()
         };
@@ -611,8 +772,8 @@ mod tests {
             scope: Scope::Identity,
             owner: principal(1, 1000),
             group: principal(2, 100),
-            identities: BTreeSet::from([principal(2, 5)]),
-            deny_only: BTreeSet::new(),
+            identities: SortedSet::from([principal(2, 5)]),
+            deny_only: SortedSet::new(),
             privileges: Privileges::SIGNAL_ANY,
         };
         let encoded = EncodedSubject::new(&subject).unwrap();
@@ -633,15 +794,15 @@ mod tests {
     #[test]
     fn terms_round_trip_in_canonical_order() {
         let narrow = Term {
-            required: BTreeSet::from([principal(2, 5)]),
+            required: SortedSet::from([principal(2, 5)]),
             ..Term::default()
         };
         let broad = Term {
             optional: PrincipalSet {
-                exact: BTreeSet::from([principal(2, 6), principal(2, 7)]),
-                domains: BTreeSet::from([DomainId::POSIX_GROUP]),
+                exact: SortedSet::from([principal(3, 6), principal(3, 7)]),
+                domains: SortedSet::from([DomainId::POSIX_GROUP]),
             },
-            deny_only: BTreeSet::from([principal(2, 8)]),
+            deny_only: SortedSet::from([principal(4, 8)]),
             privileges: Privileges::all(),
             ..Term::default()
         };
@@ -659,6 +820,7 @@ mod tests {
         let terms: Vec<Term> = (0..MAX_AUTHORITY_TERMS)
             .map(|index| full_term(u32::try_from(index).unwrap()))
             .collect();
+        assert_eq!(canonical_terms(terms.clone()).as_ref(), Ok(&terms));
         let encoded = EncodedTerms::new(&terms).unwrap();
         assert_eq!(encoded.as_bytes().len(), MAX_ENCODED_TERMS_SIZE as usize);
         assert_eq!(decode_terms(encoded.as_bytes()), Ok(terms));
@@ -672,36 +834,105 @@ mod tests {
     #[test]
     fn encoding_rejects_values_over_the_ceilings() {
         let terms: Vec<Term> = (0..=MAX_AUTHORITY_TERMS)
-            .map(|index| Term {
-                privileges: Privileges::from_bits(u32::try_from(index).unwrap()).unwrap(),
-                ..Term::default()
-            })
+            .map(|index| small_term(u32::try_from(index).unwrap()))
             .collect();
-        assert_eq!(
-            EncodedTerms::new(&terms),
-            Err(AuthorityCodecError::TooManyTerms)
-        );
+        assert_eq!(EncodedTerms::new(&terms), Err(TermsError::TooManyTerms));
+        assert_eq!(canonical_terms(terms), Err(TermsError::TooManyTerms));
         // Repeats do not count against the ceiling.
         let repeated = vec![Term::default(); MAX_AUTHORITY_TERMS + 1];
         assert!(EncodedTerms::new(&repeated).is_ok());
 
         let mut term = Term::default();
-        term.identity.groups.domains = (0..=MAX_SET_DOMAINS)
-            .map(|domain| DomainId(u32::try_from(domain).unwrap()))
-            .collect();
+        term.identity.groups.domains =
+            SortedSet::try_from_iter((1..).take(MAX_SET_DOMAINS + 1).map(DomainId)).unwrap();
         assert!(!term.within_size_limits());
-        assert_eq!(
-            EncodedTerms::new([&term]),
-            Err(AuthorityCodecError::SetTooLarge)
-        );
+        assert_eq!(EncodedTerms::new([&term]), Err(TermsError::SetTooLarge));
+        assert_eq!(canonical_terms([term]), Err(TermsError::SetTooLarge));
 
         let mut subject = full_subject();
-        subject.deny_only.insert(principal(4, 0));
+        subject.deny_only.try_insert(principal(4, 0)).unwrap();
         assert!(!subject.within_size_limits());
         assert_eq!(
             EncodedSubject::new(&subject),
             Err(AuthorityCodecError::SetTooLarge)
         );
+    }
+
+    #[test]
+    fn terms_count_once_canonical() {
+        let canonical = Term {
+            access: Slots {
+                owners: PrincipalSet {
+                    exact: SortedSet::new(),
+                    domains: SortedSet::from([DomainId::POSIX_USER]),
+                },
+                groups: PrincipalSet::default(),
+            },
+            required: SortedSet::from([principal(2, 5)]),
+            optional: PrincipalSet {
+                exact: SortedSet::from([principal(2, 6)]),
+                domains: SortedSet::new(),
+            },
+            privileges: Privileges::LOOKUP_ANY | Privileges::TRAVERSE_ANY,
+            ..Term::default()
+        };
+        // Each differs only in what the rest of the term already implies.
+        let redundant: Vec<Term> = (0..=u32::try_from(MAX_AUTHORITY_TERMS).unwrap())
+            .map(|id| {
+                let mut term = canonical.clone();
+                term.access.owners.exact = SortedSet::from([principal(1, id)]);
+                term.optional.exact.try_insert(principal(2, 5)).unwrap();
+                term.privileges = Privileges::TRAVERSE_ANY;
+                term
+            })
+            .collect();
+        assert_eq!(
+            canonical_terms(redundant.clone()),
+            Ok(vec![canonical.clone()])
+        );
+        let encoded = EncodedTerms::new(&redundant).unwrap();
+        assert_eq!(encoded, EncodedTerms::new([&canonical]).unwrap());
+        assert_eq!(decode_terms(encoded.as_bytes()), Ok(vec![canonical]));
+    }
+
+    #[test]
+    fn invalid_terms_are_not_normalized_away() {
+        let valid = Term {
+            access: Slots {
+                owners: PrincipalSet {
+                    exact: SortedSet::new(),
+                    domains: SortedSet::from([DomainId::POSIX_USER]),
+                },
+                groups: PrincipalSet::default(),
+            },
+            ..Term::default()
+        };
+        let mut overlap = valid.clone();
+        overlap.access.owners.exact = SortedSet::from([principal(1, 7)]);
+        overlap.deny_only = SortedSet::from([principal(1, 7)]);
+        let mut required_overlap = valid.clone();
+        required_overlap.required = SortedSet::from([principal(2, 7)]);
+        required_overlap.optional.exact = SortedSet::from([principal(2, 7)]);
+        required_overlap.deny_only = SortedSet::from([principal(2, 7)]);
+        let mut unmapped = valid.clone();
+        unmapped.optional.exact = SortedSet::from([Principal::UNMAPPED]);
+        let mut unmapped_domain = valid.clone();
+        unmapped_domain.identity.groups.domains = SortedSet::from([DomainId::UNMAPPED]);
+        let mut execute = valid.clone();
+        execute.privileges = Privileges::EXECUTE_ANY | Privileges::TRAVERSE_ANY;
+        for (invalid, error) in [
+            (overlap, TermsError::DenyOnlyOverlap),
+            (required_overlap, TermsError::DenyOnlyOverlap),
+            (unmapped, TermsError::UnmappedPrincipal),
+            (unmapped_domain, TermsError::UnmappedPrincipal),
+            (execute, TermsError::InvalidPrivileges),
+        ] {
+            // Valid repeats fill the ceiling, then the invalid term follows.
+            let mut terms = vec![valid.clone(); MAX_AUTHORITY_TERMS];
+            terms.push(invalid);
+            assert_eq!(EncodedTerms::new(&terms), Err(error));
+            assert_eq!(canonical_terms(terms), Err(error));
+        }
     }
 
     #[test]
@@ -713,7 +944,7 @@ mod tests {
         };
         assert_eq!(
             EncodedTerms::new([&term]),
-            Err(AuthorityCodecError::Malformed)
+            Err(TermsError::InvalidPrivileges)
         );
         let mut subject = full_subject();
         subject.privileges = unknown;
@@ -744,7 +975,7 @@ mod tests {
         );
 
         let encoded = EncodedTerms::new([&Term {
-            required: BTreeSet::from([principal(2, 5), principal(2, 6)]),
+            required: SortedSet::from([principal(2, 5), principal(2, 6)]),
             ..Term::default()
         }])
         .unwrap();
@@ -825,8 +1056,8 @@ mod tests {
             scope: Scope::Access,
             owner: principal(1, 1),
             group: principal(2, 2),
-            identities: BTreeSet::from([principal(2, 3)]),
-            deny_only: BTreeSet::new(),
+            identities: SortedSet::from([principal(2, 3)]),
+            deny_only: SortedSet::new(),
             privileges: Privileges::empty(),
         };
         let encoded = EncodedSubject::new(&subject).unwrap();

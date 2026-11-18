@@ -32,7 +32,7 @@ use litebox_broker_core::{
 };
 use litebox_broker_protocol::authority::{
     AuthorityCodecError, EncodedTerms, MAX_ENCODED_SUBJECT_SIZE, MAX_ENCODED_TERMS_SIZE,
-    RestrictChildAuthorityRequest, Term, decode_subject, decode_terms,
+    RestrictChildAuthorityRequest, Term, TermsError, decode_subject, decode_terms,
 };
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
@@ -619,9 +619,10 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::ExitChild(ExitChildProcessRequest {
             child_process_id,
             exit_status,
-        }) => process
-            .exit_child_process(child_process_id, exit_status)
-            .map(|()| ProcessResponse::ExitChild),
+        }) => {
+            let outcome = process.exit_child_process(child_process_id, exit_status)?;
+            return consumed_child_response(outcome, ProcessResponse::ExitChild);
+        }
         ProcessRequest::CancelChild(child_process_id) => process
             .cancel_child_process(child_process_id)
             .map(|()| ProcessResponse::CancelChild),
@@ -719,8 +720,8 @@ fn get_authority<Memory: SharedMemory>(
     validate_shared_buffer(buffer, MAX_ENCODED_TERMS_SIZE)?;
     let authority = process.authority();
     let encoded = EncodedTerms::new(authority.terms()).map_err(|error| match error {
-        AuthorityCodecError::OutOfMemory => RequestFailure::Respond(ErrorCode::OutOfMemory),
-        // The core accepts only authorities within the protocol ceilings.
+        TermsError::OutOfMemory => RequestFailure::Respond(ErrorCode::OutOfMemory),
+        // The core keeps only canonical terms within the protocol ceilings.
         _ => RequestFailure::Abort(ErrorCode::Internal),
     })?;
     let encoded = encoded.as_bytes();
@@ -1299,7 +1300,7 @@ where
                         ProcessStartupData { payload },
                     )
                 })
-                .map(|()| BrokerResult::Process(ProcessResponse::StartChild)),
+                .map(BrokerResult::Process),
         ),
         BrokerOperation::Process(ProcessRequest::StartChildWithExistingRunner(
             StartChildWithExistingRunnerRequest {
@@ -1329,7 +1330,7 @@ where
                         runner_descriptor.to_vec(),
                     )
                 })
-                .map(|()| BrokerResult::Process(ProcessResponse::StartChildWithExistingRunner)),
+                .map(BrokerResult::Process),
         ),
         BrokerOperation::Process(ProcessRequest::WriteChildMemory(WriteChildMemoryRequest {
             child_process_id,
@@ -1394,12 +1395,25 @@ where
     )
 }
 
+/// Preserve fatal association errors, but distinguish recoverable failures
+/// after take from rejections for which the caller still owns a pending child.
+fn consumed_child_response(
+    result: core::result::Result<(), BrokerError>,
+    success: ProcessResponse,
+) -> RequestResult<ProcessResponse> {
+    match result.map_err(RequestFailure::from) {
+        Ok(()) => Ok(success),
+        Err(RequestFailure::Respond(error)) => Ok(ProcessResponse::ChildConsumed(error)),
+        Err(fatal) => Err(fatal),
+    }
+}
+
 fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     launcher: Arc<Launcher>,
     parent: &BrokerProcess,
     child_process_id: ProcessId,
     startup: ProcessStartupData,
-) -> RequestResult<()> {
+) -> RequestResult<ProcessResponse> {
     if !parent.is_running() {
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
@@ -1409,17 +1423,12 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     if parent.is_cancellation_requested() {
         let _ = process.fail_start(BrokerError::PeerClosed, false, true);
         process.retire(true);
-        return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
+        return Ok(ProcessResponse::ChildConsumed(ErrorCode::PeerClosed));
     }
-    launcher
-        .launch(
-            process,
-            ProcessStartupData {
-                payload: startup.payload,
-            },
-            image,
-        )
-        .map_err(RequestFailure::from)
+    consumed_child_response(
+        launcher.launch(process, startup, image),
+        ProcessResponse::StartChild,
+    )
 }
 
 fn start_child_with_existing_runner<Launcher: ProcessLauncher + ?Sized>(
@@ -1428,7 +1437,7 @@ fn start_child_with_existing_runner<Launcher: ProcessLauncher + ?Sized>(
     child_process_id: ProcessId,
     startup: ProcessStartupData,
     runner_descriptor: Vec<u8>,
-) -> RequestResult<()> {
+) -> RequestResult<ProcessResponse> {
     if !parent.is_running() {
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
@@ -1438,17 +1447,18 @@ fn start_child_with_existing_runner<Launcher: ProcessLauncher + ?Sized>(
     if parent.is_cancellation_requested() {
         let _ = process.fail_start(BrokerError::PeerClosed, false, true);
         process.retire(true);
-        return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
+        return Ok(ProcessResponse::ChildConsumed(ErrorCode::PeerClosed));
     }
-    launcher
-        .launch_existing(
+    consumed_child_response(
+        launcher.launch_existing(
             parent.key(),
             process,
             startup,
             runner_descriptor,
             connection,
-        )
-        .map_err(RequestFailure::from)
+        ),
+        ProcessResponse::StartChildWithExistingRunner,
+    )
 }
 
 fn write_shared_buffer<Memory: SharedMemory>(
@@ -2378,7 +2388,6 @@ pub enum ConnectionTermination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::collections::BTreeSet;
     use alloc::vec;
     use core::cell::Cell;
     use core::net::{Ipv4Addr, SocketAddrV4};
@@ -2400,7 +2409,7 @@ mod tests {
     use litebox_broker_core::{ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy};
     use litebox_broker_protocol::authority::{
         DomainId, EncodedSubject, MAX_AUTHORITY_TERMS, Principal, PrincipalSet, Privileges, Scope,
-        Slots, Subject,
+        Slots, SortedSet, Subject,
     };
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
@@ -3931,20 +3940,20 @@ mod tests {
     fn broad_term() -> Term {
         let slots = Slots {
             owners: PrincipalSet {
-                exact: BTreeSet::from([principal(DomainId::POSIX_USER, 1000)]),
-                domains: BTreeSet::new(),
+                exact: SortedSet::from([principal(DomainId::POSIX_USER, 1000)]),
+                domains: SortedSet::new(),
             },
             groups: PrincipalSet {
-                exact: BTreeSet::from([principal(DomainId::POSIX_GROUP, 100)]),
-                domains: BTreeSet::new(),
+                exact: SortedSet::from([principal(DomainId::POSIX_GROUP, 100)]),
+                domains: SortedSet::new(),
             },
         };
         Term {
             access: slots.clone(),
             identity: slots,
             optional: PrincipalSet {
-                exact: BTreeSet::from([principal(DomainId::POSIX_GROUP, 5)]),
-                domains: BTreeSet::new(),
+                exact: SortedSet::from([principal(DomainId::POSIX_GROUP, 5)]),
+                domains: SortedSet::new(),
             },
             privileges: Privileges::SIGNAL_ANY,
             ..Term::default()
@@ -4035,8 +4044,8 @@ mod tests {
             scope: Scope::Identity,
             owner: principal(DomainId::POSIX_USER, 1000),
             group: principal(DomainId::POSIX_GROUP, 100),
-            identities: BTreeSet::from([principal(DomainId::POSIX_GROUP, 5)]),
-            deny_only: BTreeSet::new(),
+            identities: SortedSet::from([principal(DomainId::POSIX_GROUP, 5)]),
+            deny_only: SortedSet::new(),
             privileges: Privileges::SIGNAL_ANY,
         };
         let create_subject = |subject: &Subject| {
@@ -4077,6 +4086,20 @@ mod tests {
         };
         assert_eq!(
             restrict(&[narrow_term(), broader]),
+            Ok(BrokerResult::Error(ErrorCode::PolicyDenied))
+        );
+        assert!(process.authority().terms().eq([&broad_term()]));
+        // The broker validates terms LiteBox refuses to encode: making optional
+        // group 5 also deny-only would otherwise be a restriction.
+        let encoded = EncodedTerms::new([&broad_term()]).unwrap();
+        let (head, tail) = encoded.as_bytes().split_at(length as usize - 6);
+        assert_eq!(tail[..2], [0, 0], "the deny-only set is empty");
+        let overlap = [head, &[1, 0, 2, 0, 0, 0, 5, 0, 0, 0], &tail[2..]].concat();
+        assert_eq!(
+            request(ProcessRequest::RestrictAuthority(stage_payload(
+                &shared_buffers,
+                &overlap
+            ))),
             Ok(BrokerResult::Error(ErrorCode::PolicyDenied))
         );
         assert!(process.authority().terms().eq([&broad_term()]));
@@ -5219,10 +5242,12 @@ mod tests {
 
             fn launch(
                 self: Arc<Self>,
-                _process: Arc<BrokerProcess>,
+                process: Arc<BrokerProcess>,
                 _startup: ProcessStartupData,
                 _image: Option<ChildImage>,
             ) -> core::result::Result<(), BrokerError> {
+                let _ = process.fail_start(BrokerError::UnsupportedOperation, false, true);
+                process.retire(true);
                 Err(BrokerError::UnsupportedOperation)
             }
 
@@ -5333,6 +5358,33 @@ mod tests {
                 BrokerResult::Error(ErrorCode::UnknownObject)
             );
         }
+
+        let launcher = Arc::new(TestLauncher {
+            connects: false,
+            launched: Mutex::new(Vec::new()),
+        });
+        let child = parent
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        let start = || {
+            ProcessRequest::StartChild(StartChildProcessRequest {
+                child_process_id: child,
+                startup: litebox_broker_protocol::process::ProcessStartupDescriptor {
+                    buffer: single_slot_sequence(0, 3),
+                },
+            })
+        };
+        assert_eq!(
+            handle(&launcher, start()),
+            BrokerResult::Process(ProcessResponse::ChildConsumed(
+                ErrorCode::UnsupportedOperation
+            ))
+        );
+        assert_eq!(
+            handle(&launcher, start()),
+            BrokerResult::Error(ErrorCode::UnknownObject)
+        );
     }
 
     fn serve_test_channel<Memory: SharedMemory>(

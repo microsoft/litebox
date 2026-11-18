@@ -12,10 +12,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::authority::{AuthorityCodecError, EncodedSubject, EncodedTerms};
+use litebox_broker_protocol::authority::{
+    AuthorityCodecError, EncodedSubject, EncodedTerms, TermsError,
+};
 pub use litebox_broker_protocol::authority::{
     DomainId, MAX_AUTHORITY_TERMS, MAX_SET_DOMAINS, MAX_SET_PRINCIPALS, Principal, PrincipalSet,
-    Privileges, Scope, Slots, Subject, Term,
+    Privileges, Scope, Slots, SortedSet, Subject, Term,
 };
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_platform::time::TimeProvider;
@@ -40,14 +42,11 @@ pub enum CredentialError {
     /// The current authority no longer admits a previously registered subject.
     #[error("registered subject is no longer admissible")]
     StaleSubject,
-    /// There are more than
-    /// [`MAX_AUTHORITY_TERMS`](litebox_broker_protocol::authority::MAX_AUTHORITY_TERMS)
-    /// distinct terms.
+    /// There are more than [`MAX_AUTHORITY_TERMS`] distinct canonical terms;
+    /// see [`canonical_terms`](litebox_broker_protocol::authority::canonical_terms).
     #[error("too many distinct authority terms")]
     TooManyTerms,
-    /// A set exceeds
-    /// [`MAX_SET_PRINCIPALS`](litebox_broker_protocol::authority::MAX_SET_PRINCIPALS)
-    /// or [`MAX_SET_DOMAINS`](litebox_broker_protocol::authority::MAX_SET_DOMAINS).
+    /// A set exceeds [`MAX_SET_PRINCIPALS`] or [`MAX_SET_DOMAINS`].
     #[error("a credential set is too large")]
     SetTooLarge,
     /// Broker capacity, such as for handles, is exhausted.
@@ -69,9 +68,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok(broker.get_authority()?)
     }
 
-    /// Replaces this process's authority with the distinct `terms`, which may
-    /// repeat and come in any order, if each proposed term fits one current
-    /// term in both scopes. On failure the authority is unchanged.
+    /// Replaces this process's authority with the canonical forms of `terms`,
+    /// which may repeat and come in any order, if each fits one current term
+    /// in both scopes. On failure the authority is unchanged.
+    ///
+    /// Invalid terms fail with [`CredentialError::PolicyDenied`] before
+    /// reaching the broker, which validates the terms it receives again.
     ///
     /// Subjects already registered stay registered; requests naming one the
     /// new authority does not admit fail until it is replaced.
@@ -109,7 +111,14 @@ impl Drop for RegisteredSubject {
 }
 
 pub(crate) fn encode_terms(terms: &[Term]) -> Result<EncodedTerms, CredentialError> {
-    EncodedTerms::new(terms).map_err(encoding_error)
+    EncodedTerms::new(terms).map_err(|error| match error {
+        TermsError::TooManyTerms => CredentialError::TooManyTerms,
+        TermsError::SetTooLarge => CredentialError::SetTooLarge,
+        TermsError::OutOfMemory => CredentialError::OutOfMemory,
+        TermsError::UnmappedPrincipal
+        | TermsError::DenyOnlyOverlap
+        | TermsError::InvalidPrivileges => CredentialError::PolicyDenied,
+    })
 }
 
 fn encoding_error(error: AuthorityCodecError) -> CredentialError {
@@ -144,7 +153,6 @@ impl From<BrokerControlError> for CredentialError {
 mod tests {
     extern crate std;
 
-    use alloc::collections::BTreeSet;
     use alloc::vec;
     use std::sync::Mutex;
 
@@ -300,8 +308,8 @@ mod tests {
 
     fn exact(principals: impl IntoIterator<Item = Principal>) -> PrincipalSet {
         PrincipalSet {
-            exact: principals.into_iter().collect(),
-            domains: BTreeSet::new(),
+            exact: SortedSet::try_from_iter(principals).unwrap(),
+            domains: SortedSet::new(),
         }
     }
 
@@ -313,28 +321,30 @@ mod tests {
         Term {
             access: slots.clone(),
             identity: slots,
-            required: BTreeSet::new(),
+            required: SortedSet::new(),
             optional: exact([group(5)]),
-            deny_only: BTreeSet::new(),
+            deny_only: SortedSet::new(),
             privileges,
         }
     }
 
     /// A term with every set at its ceiling, so two exceed one shared-buffer slot.
     fn largest_term(id: u32) -> Term {
-        let principals = |domain| -> BTreeSet<Principal> {
-            (0..u32::try_from(MAX_SET_PRINCIPALS).unwrap())
-                .map(|offset| Principal {
+        let principals = |domain| {
+            SortedSet::try_from_iter((0..u32::try_from(MAX_SET_PRINCIPALS).unwrap()).map(
+                |offset| Principal {
                     domain: DomainId(domain),
                     id: id + offset,
-                })
-                .collect()
+                },
+            ))
+            .unwrap()
         };
         let set = |domain| PrincipalSet {
             exact: principals(domain),
-            domains: (100..100 + u32::try_from(MAX_SET_DOMAINS).unwrap())
-                .map(DomainId)
-                .collect(),
+            domains: SortedSet::try_from_iter(
+                (100..100 + u32::try_from(MAX_SET_DOMAINS).unwrap()).map(DomainId),
+            )
+            .unwrap(),
         };
         let slots = Slots {
             owners: set(10),
@@ -387,9 +397,10 @@ mod tests {
             .map(|owner| term(owner, Privileges::empty()))
             .collect();
         let mut too_large = term(0, Privileges::empty());
-        too_large.optional.domains = (0..=u32::try_from(MAX_SET_DOMAINS).unwrap())
-            .map(DomainId)
-            .collect();
+        too_large.optional.domains = SortedSet::try_from_iter(
+            (1..=u32::try_from(MAX_SET_DOMAINS).unwrap() + 1).map(DomainId),
+        )
+        .unwrap();
 
         assert_eq!(
             litebox.restrict_authority(&too_many),
@@ -408,6 +419,27 @@ mod tests {
     }
 
     #[test]
+    fn invalid_restrictions_fail_locally() {
+        let (litebox, broker) = litebox_with_broker(Vec::new());
+        let valid = term(1000, Privileges::empty());
+        // Group 5 is optional, so it cannot also be deny-only, even in a term
+        // that is otherwise a repeat.
+        let mut overlap = valid.clone();
+        overlap.deny_only = [group(5)].into();
+
+        assert_eq!(
+            litebox.restrict_authority(&[valid.clone(), overlap.clone()]),
+            Err(CredentialError::PolicyDenied)
+        );
+        let mut child = litebox.allocate_child_process(None, false).unwrap();
+        assert_eq!(
+            child.restrict_authority(&[overlap, valid]),
+            Err(CredentialError::PolicyDenied)
+        );
+        assert_eq!(broker.state.lock().unwrap().credential_requests, 0);
+    }
+
+    #[test]
     fn broker_errors_map_to_credential_errors() {
         let (litebox, broker) = litebox_with_broker(Vec::new());
         let mut child = litebox.allocate_child_process(None, false).unwrap();
@@ -415,8 +447,8 @@ mod tests {
             scope: Scope::Access,
             owner: user(1000),
             group: group(100),
-            identities: BTreeSet::new(),
-            deny_only: BTreeSet::new(),
+            identities: SortedSet::new(),
+            deny_only: SortedSet::new(),
             privileges: Privileges::empty(),
         };
         for (error, expected) in [
@@ -538,7 +570,7 @@ mod tests {
             owner: user(1000),
             group: group(100),
             identities: [group(5)].into(),
-            deny_only: BTreeSet::new(),
+            deny_only: SortedSet::new(),
             privileges: Privileges::SIGNAL_ANY,
         };
         assert_eq!(litebox.authority().unwrap(), broad);
@@ -582,6 +614,29 @@ mod tests {
                 })
                 .unwrap(),
         );
+    }
+
+    #[test]
+    fn in_process_broker_counts_canonical_terms() {
+        let any_group = Term {
+            optional: PrincipalSet {
+                exact: SortedSet::new(),
+                domains: [DomainId::POSIX_GROUP].into(),
+            },
+            ..term(1000, Privileges::empty())
+        };
+        let litebox = litebox_with_in_process_broker(core::slice::from_ref(&any_group));
+        // Each names a group the wildcard already covers.
+        let redundant: Vec<Term> = (0..=u32::try_from(MAX_AUTHORITY_TERMS).unwrap())
+            .map(|id| {
+                let mut term = any_group.clone();
+                term.optional.exact = [group(id)].into();
+                term
+            })
+            .collect();
+
+        litebox.restrict_authority(&redundant).unwrap();
+        assert_eq!(litebox.authority().unwrap(), [any_group]);
     }
 
     #[test]

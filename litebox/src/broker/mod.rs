@@ -24,7 +24,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    ChildCompletion, ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
     MAX_PROCESS_BOOTSTRAP_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
@@ -103,7 +103,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
         payload: &[u8],
-    ) -> core::result::Result<(), BrokerControlError>;
+    ) -> core::result::Result<ChildCompletion, BrokerControlError>;
 
     /// Starts the logical guest child using an already-created host runner.
     ///
@@ -114,7 +114,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         child_process_id: litebox_broker_protocol::ProcessId,
         runner_descriptor: &[u8],
         payload: &[u8],
-    ) -> core::result::Result<(), BrokerControlError>;
+    ) -> core::result::Result<ChildCompletion, BrokerControlError>;
 
     fn write_child_memory(
         &self,
@@ -127,7 +127,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
         exit_status: ProcessExitStatus,
-    ) -> core::result::Result<(), BrokerControlError>;
+    ) -> core::result::Result<ChildCompletion, BrokerControlError>;
 
     fn duplicate_objects_to_child(
         &self,
@@ -1037,7 +1037,7 @@ where
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
         payload: &[u8],
-    ) -> core::result::Result<(), BrokerControlError> {
+    ) -> core::result::Result<ChildCompletion, BrokerControlError> {
         if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -1052,7 +1052,7 @@ where
         child_process_id: litebox_broker_protocol::ProcessId,
         runner_descriptor: &[u8],
         payload: &[u8],
-    ) -> core::result::Result<(), BrokerControlError> {
+    ) -> core::result::Result<ChildCompletion, BrokerControlError> {
         use litebox_broker_protocol::process::{
             MAX_EXISTING_RUNNER_START_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
         };
@@ -1097,7 +1097,7 @@ where
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
         exit_status: ProcessExitStatus,
-    ) -> core::result::Result<(), BrokerControlError> {
+    ) -> core::result::Result<ChildCompletion, BrokerControlError> {
         self.request(|local| local.exit_child_process(child_process_id, exit_status))
     }
 

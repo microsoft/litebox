@@ -7,17 +7,18 @@
 //! Each new term must fit in one old term, in both scopes. This also makes
 //! restriction transitive without depending on any particular object descriptor.
 
-use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 use litebox_broker_protocol::authority::{
-    DomainId, Principal, PrincipalSet, Privileges, Scope, Slots, Subject, Term,
+    Principal, PrincipalSet, Scope, Slots, Subject, Term, TermsError, canonical_terms,
 };
 use thiserror::Error;
 
 mod process;
 pub(crate) use process::SubjectObject;
 
-/// Maximum number of distinct terms, including subsumed but nonidentical
-/// terms. Allows old and new pairs to coexist during a multithreaded change.
+/// Maximum number of distinct canonical terms, including subsumed but
+/// nonidentical terms. Allows old and new pairs to coexist during a
+/// multithreaded change.
 pub use litebox_broker_protocol::authority::MAX_AUTHORITY_TERMS as MAX_TERMS;
 
 /// Reason a proposed authority was rejected.
@@ -35,30 +36,38 @@ pub enum AuthorityError {
     SetTooLarge,
     #[error("proposed authority is not a restriction")]
     NotRestriction,
+    #[error("authority allocation failed")]
+    OutOfMemory,
+}
+
+impl From<TermsError> for AuthorityError {
+    fn from(error: TermsError) -> Self {
+        match error {
+            TermsError::UnmappedPrincipal => Self::UnmappedPrincipal,
+            TermsError::DenyOnlyOverlap => Self::DenyOnlyOverlap,
+            TermsError::InvalidPrivileges => Self::InvalidPrivileges,
+            TermsError::TooManyTerms => Self::TooManyTerms,
+            TermsError::SetTooLarge => Self::SetTooLarge,
+            TermsError::OutOfMemory => Self::OutOfMemory,
+        }
+    }
 }
 
 /// Validated credential authority. Only the broker decides which authority
 /// to assign initially; changing it in place can only narrow it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Authority {
-    terms: BTreeSet<Term>,
+    /// Distinct canonical terms in ascending order.
+    terms: Vec<Term>,
 }
 
 impl Authority {
-    /// Validate and deduplicate terms. An empty authority admits no subjects.
+    /// Validate terms and keep their distinct [`canonical_terms`]. An empty
+    /// authority admits no subjects.
     pub fn new(terms: impl IntoIterator<Item = Term>) -> Result<Self, AuthorityError> {
-        let mut distinct = BTreeSet::new();
-        for mut term in terms {
-            if !term.within_size_limits() {
-                return Err(AuthorityError::SetTooLarge);
-            }
-            validate_and_normalize(&mut term)?;
-            distinct.insert(term);
-            if distinct.len() > MAX_TERMS {
-                return Err(AuthorityError::TooManyTerms);
-            }
-        }
-        Ok(Self { terms: distinct })
+        Ok(Self {
+            terms: canonical_terms(terms)?,
+        })
     }
 
     /// The validated terms; no cross-term subsumption or merging is performed.
@@ -92,51 +101,6 @@ impl Authority {
         *self = proposed;
         Ok(())
     }
-}
-
-fn mapped(p: Principal) -> bool {
-    p.domain != DomainId::UNMAPPED
-}
-
-fn validate_and_normalize(term: &mut Term) -> Result<(), AuthorityError> {
-    if !Privileges::all().contains(term.privileges)
-        || (term.privileges.contains(Privileges::EXECUTE_ANY)
-            && !term.privileges.contains(Privileges::READ_ANY))
-    {
-        return Err(AuthorityError::InvalidPrivileges);
-    }
-    if term.privileges.contains(Privileges::TRAVERSE_ANY) {
-        term.privileges.insert(Privileges::LOOKUP_ANY);
-    }
-    if !term
-        .required
-        .iter()
-        .chain(&term.deny_only)
-        .copied()
-        .all(mapped)
-    {
-        return Err(AuthorityError::UnmappedPrincipal);
-    }
-    if !term.required.is_disjoint(&term.deny_only) {
-        return Err(AuthorityError::DenyOnlyOverlap);
-    }
-    for set in [
-        &mut term.access.owners,
-        &mut term.access.groups,
-        &mut term.identity.owners,
-        &mut term.identity.groups,
-        &mut term.optional,
-    ] {
-        if set.domains.contains(&DomainId::UNMAPPED) || !set.exact.iter().copied().all(mapped) {
-            return Err(AuthorityError::UnmappedPrincipal);
-        }
-        if term.deny_only.iter().any(|p| set.contains(p)) {
-            return Err(AuthorityError::DenyOnlyOverlap);
-        }
-        set.exact.retain(|p| !set.domains.contains(&p.domain));
-    }
-    term.optional.exact.retain(|p| !term.required.contains(p));
-    Ok(())
 }
 
 fn may_enable(term: &Term, p: Principal) -> bool {

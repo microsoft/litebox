@@ -13,14 +13,15 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessRequest, ProcessResponse,
 };
 use litebox_broker_protocol::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostName, HostNameKind,
-    HostNameSizes, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_HOST_NAME_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
-    OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
-    SetParentExitSignalRequest, SetResourceLimitRequest, StartChildProcessRequest,
-    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, ChildCompletion, ChildExit, ChildSelector, CpuTime,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostName, HostNameKind, HostNameSizes, HostNames,
+    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
+    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, OpenProcessHandleRequest,
+    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
+    ResourceKind, ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest,
+    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    ThreadInfo, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
@@ -33,7 +34,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// This call blocks until the child's broker association is active or
     /// launch fails. The caller must retain exclusive ownership of the
-    /// bootstrap sequence until this method returns.
+    /// bootstrap sequence until this method returns. An inner error means the
+    /// child was taken but launch failed.
     ///
     /// # Panics
     ///
@@ -44,7 +46,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         child_process_id: ProcessId,
         buffer: SharedBufferSequence,
         bootstrap: &[u8],
-    ) -> Result<(), Channel::Error> {
+    ) -> Result<ChildCompletion, Channel::Error> {
         if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -54,12 +56,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             child_process_id,
             startup: ProcessStartupDescriptor { buffer },
         }))? {
-            ProcessResponse::StartChild => Ok(()),
+            ProcessResponse::StartChild => Ok(Ok(())),
+            ProcessResponse::ChildConsumed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
-    /// Starts a pending child in an already-created platform runner.
+    /// Starts a pending child in an already-created platform runner. An inner
+    /// error means the child was taken but the runner could not be adopted.
     ///
     /// # Panics
     ///
@@ -70,7 +74,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         runner_descriptor: &[u8],
         bootstrap: &[u8],
-    ) -> Result<(), Channel::Error> {
+    ) -> Result<ChildCompletion, Channel::Error> {
         if runner_descriptor.len() > MAX_RUNNER_DESCRIPTOR_SIZE as usize
             || bootstrap.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize
             || buffer.length() as usize != runner_descriptor.len() + bootstrap.len()
@@ -92,7 +96,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 data: buffer,
             },
         ))? {
-            ProcessResponse::StartChildWithExistingRunner => Ok(()),
+            ProcessResponse::StartChildWithExistingRunner => Ok(Ok(())),
+            ProcessResponse::ChildConsumed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
@@ -130,7 +135,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Records the exit of a pending child created by
-    /// [`Self::allocate_child_process`] that never started.
+    /// [`Self::allocate_child_process`] that never started. An inner error
+    /// means the child was taken but recording its exit failed.
     ///
     /// # Panics
     ///
@@ -139,12 +145,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         child_process_id: ProcessId,
         exit_status: ProcessExitStatus,
-    ) -> Result<(), Channel::Error> {
+    ) -> Result<ChildCompletion, Channel::Error> {
         match self.request_process(ProcessRequest::ExitChild(ExitChildProcessRequest {
             child_process_id,
             exit_status,
         }))? {
-            ProcessResponse::ExitChild => Ok(()),
+            ProcessResponse::ExitChild => Ok(Ok(())),
+            ProcessResponse::ChildConsumed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

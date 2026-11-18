@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use litebox_broker_protocol::authority::{DomainId, Privileges, SortedSet};
+
 use super::*;
 
 const fn user(id: u32) -> Principal {
@@ -41,8 +43,8 @@ fn subject(owner: Principal) -> Subject {
         scope: Scope::Access,
         owner,
         group: group(1),
-        identities: BTreeSet::new(),
-        deny_only: BTreeSet::new(),
+        identities: SortedSet::new(),
+        deny_only: SortedSet::new(),
         privileges: Privileges::empty(),
     }
 }
@@ -95,9 +97,9 @@ fn restriction_requires_both_scopes_to_fit_one_parent_term() {
 fn unmapped_deny_only_principal_does_not_confer_membership() {
     let authority = Authority::new([term(user(1))]).unwrap();
     let mut s = subject(user(1));
-    s.deny_only.insert(Principal::UNMAPPED);
+    s.deny_only.try_insert(Principal::UNMAPPED).unwrap();
     assert!(authority.admits(&s));
-    s.identities.insert(Principal::UNMAPPED);
+    s.identities.try_insert(Principal::UNMAPPED).unwrap();
     assert!(!authority.admits(&s));
 }
 
@@ -112,16 +114,16 @@ fn slot_is_not_a_membership_and_deny_only_is_not_optional() {
     let mut authority = Authority::new([original.clone()]).unwrap();
     let mut s = subject(user(1));
     assert!(!authority.admits(&s));
-    s.identities.insert(membership);
+    s.identities.try_insert(membership).unwrap();
     assert!(authority.admits(&s));
     s.group = group(9);
-    s.identities.insert(group(9));
+    s.identities.try_insert(group(9)).unwrap();
     assert!(!authority.admits(&s));
 
     // Narrow the group slot before moving the mandatory membership to deny-only.
     let mut initial = original;
-    initial.access.groups.exact.insert(group(2));
-    initial.identity.groups.exact.insert(group(2));
+    initial.access.groups.exact.try_insert(group(2)).unwrap();
+    initial.identity.groups.exact.try_insert(group(2)).unwrap();
     authority = Authority::new([initial.clone()]).unwrap();
     let mut filtered = Term {
         access: Slots {
@@ -135,16 +137,16 @@ fn slot_is_not_a_membership_and_deny_only_is_not_optional() {
         ..initial.clone()
     };
     filtered.required.clear();
-    filtered.deny_only.insert(membership);
+    filtered.deny_only.try_insert(membership).unwrap();
     authority.restrict([filtered.clone()]).unwrap();
     let mut filtered_subject = Subject {
         group: group(2),
         ..subject(user(1))
     };
     assert!(!authority.admits(&filtered_subject));
-    filtered_subject.deny_only.insert(membership);
+    filtered_subject.deny_only.try_insert(membership).unwrap();
     assert!(authority.admits(&filtered_subject));
-    filtered_subject.identities.insert(membership);
+    filtered_subject.identities.try_insert(membership).unwrap();
     assert!(!authority.admits(&filtered_subject));
 
     filtered.deny_only.clear();
@@ -161,12 +163,21 @@ fn slot_is_not_a_membership_and_deny_only_is_not_optional() {
 #[test]
 fn restriction_respects_domains_and_preserves_required_identities() {
     let mut parent = term(user(1));
-    parent.access.owners.domains.insert(DomainId::POSIX_USER);
-    parent.optional.domains.insert(DomainId::POSIX_GROUP);
+    parent
+        .access
+        .owners
+        .domains
+        .try_insert(DomainId::POSIX_USER)
+        .unwrap();
+    parent
+        .optional
+        .domains
+        .try_insert(DomainId::POSIX_GROUP)
+        .unwrap();
     let mut authority = Authority::new([parent]).unwrap();
     let mut child = term(user(u32::MAX));
     child.identity.owners = exact(user(1));
-    child.required.insert(group(8));
+    child.required.try_insert(group(8)).unwrap();
 
     let mut wrong_domain = child.clone();
     wrong_domain.access.owners = exact(group(u32::MAX));
@@ -176,7 +187,7 @@ fn restriction_respects_domains_and_preserves_required_identities() {
     );
     authority.restrict([child.clone()]).unwrap();
     child.required.clear();
-    child.optional.exact.insert(group(8));
+    child.optional.exact.try_insert(group(8)).unwrap();
     let before = authority.clone();
     assert_eq!(
         authority.restrict([child]),
@@ -188,12 +199,16 @@ fn restriction_respects_domains_and_preserves_required_identities() {
 #[test]
 fn invalid_terms_are_rejected_even_on_initial_assignment() {
     let mut t = term(user(1));
-    t.identity.owners.domains.insert(DomainId::POSIX_GROUP);
-    t.deny_only.insert(group(77));
+    t.identity
+        .owners
+        .domains
+        .try_insert(DomainId::POSIX_GROUP)
+        .unwrap();
+    t.deny_only.try_insert(group(77)).unwrap();
     assert_eq!(Authority::new([t]), Err(AuthorityError::DenyOnlyOverlap));
 
     let mut t = term(user(1));
-    t.optional.domains.insert(DomainId::UNMAPPED);
+    t.optional.domains.try_insert(DomainId::UNMAPPED).unwrap();
     assert_eq!(Authority::new([t]), Err(AuthorityError::UnmappedPrincipal));
 
     for privileges in [
@@ -228,9 +243,14 @@ fn narrower_directory_search_survives_restriction() {
 #[test]
 fn bound_counts_distinct_terms_not_threads_and_never_partially_commits() {
     let mut broad = term(user(1));
-    broad.access.owners.domains.insert(DomainId::POSIX_USER);
+    broad
+        .access
+        .owners
+        .domains
+        .try_insert(DomainId::POSIX_USER)
+        .unwrap();
     let mut equivalent = broad.clone();
-    equivalent.access.owners.exact.insert(user(2));
+    equivalent.access.owners.exact.try_insert(user(2)).unwrap();
     let mut authority =
         Authority::new(core::iter::repeat_n(broad.clone(), MAX_TERMS + 1).chain([equivalent]))
             .unwrap();
@@ -427,11 +447,15 @@ mod lifecycle {
 
         let broker = broker(BrokerCoreLimits::DEFAULT);
         let mut broad = term(user(7));
-        broad.optional.domains.insert(DomainId::POSIX_GROUP);
+        broad
+            .optional
+            .domains
+            .try_insert(DomainId::POSIX_GROUP)
+            .unwrap();
         let process = root(&broker, [broad.clone()]);
-        let oversized: BTreeSet<_> = (0..=u32::try_from(MAX_SET_PRINCIPALS).unwrap())
-            .map(group)
-            .collect();
+        let oversized =
+            SortedSet::try_from_iter((0..=u32::try_from(MAX_SET_PRINCIPALS).unwrap()).map(group))
+                .unwrap();
         let mut proposal = broad.clone();
         proposal.required.clone_from(&oversized);
         assert_eq!(

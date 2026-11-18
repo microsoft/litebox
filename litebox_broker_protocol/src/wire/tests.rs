@@ -1414,6 +1414,7 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::Process(ProcessResponse::RestrictAuthority),
         BrokerResult::Process(ProcessResponse::RestrictChildAuthority),
         BrokerResult::Process(ProcessResponse::CreateSubject(ObjectHandle(u64::MAX))),
+        BrokerResult::Process(ProcessResponse::ChildConsumed(ErrorCode::ResourceExhausted)),
         BrokerResult::Error(ErrorCode::PolicyDenied),
         BrokerResult::Error(ErrorCode::WouldBlock),
         BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
@@ -2893,6 +2894,12 @@ fn authority_response_wire_shapes_are_pinned() {
     assert_eq!(
         encode(BrokerResult::Error(ErrorCode::StaleSubject)),
         [&header[..], &[18, 13]].concat()
+    );
+    assert_eq!(
+        encode(BrokerResult::Process(ProcessResponse::ChildConsumed(
+            ErrorCode::ResourceExhausted,
+        ))),
+        [&header[..], &[10, 28, 8]].concat()
     );
 }
 

@@ -12,7 +12,7 @@ use litebox_broker_protocol::authority::Term;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    ChildCompletion, ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
@@ -452,7 +452,7 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 pub struct PendingChild {
     broker: Arc<dyn BrokerControl>,
     identity: ProcessIdentity,
-    /// Cleared once the child starts or exits.
+    /// Cleared once the broker takes the child for start or exit, even if it fails afterwards.
     pending: AtomicBool,
 }
 
@@ -488,10 +488,10 @@ impl PendingChild {
 
     /// Starts this pending child process in a fresh runner.
     pub fn start(&self, payload: &[u8]) -> Result<(), ProcessError> {
-        self.broker
-            .start_child_process(self.identity.process_id, payload)?;
-        self.pending.store(false, Ordering::Relaxed);
-        Ok(())
+        let outcome = self
+            .broker
+            .start_child_process(self.pending_id()?, payload)?;
+        self.finish(outcome)
     }
 
     /// Asks the broker for the control connection through which a native clone of this runner
@@ -501,9 +501,7 @@ impl PendingChild {
     /// returns the token under which the caller takes it from its platform. Deployments whose
     /// clones connect otherwise report [`ProcessError::Unavailable`].
     pub fn request_child_connection(&self) -> Result<SharedObjectToken, ProcessError> {
-        Ok(self
-            .broker
-            .request_child_connection(self.identity.process_id)?)
+        Ok(self.broker.request_child_connection(self.pending_id()?)?)
     }
 
     /// Starts this pending child in an already-created platform runner.
@@ -515,13 +513,12 @@ impl PendingChild {
         runner_descriptor: &[u8],
         payload: &[u8],
     ) -> Result<(), ProcessError> {
-        self.broker.start_child_with_existing_runner(
-            self.identity.process_id,
+        let outcome = self.broker.start_child_with_existing_runner(
+            self.pending_id()?,
             runner_descriptor,
             payload,
         )?;
-        self.pending.store(false, Ordering::Relaxed);
-        Ok(())
+        self.finish(outcome)
     }
 
     /// Gives this pending child process its own references to the objects
@@ -563,7 +560,7 @@ impl PendingChild {
         handles.dedup();
         let inherited = self
             .broker
-            .duplicate_objects_to_child(self.identity.process_id, &handles)?;
+            .duplicate_objects_to_child(self.pending_id()?, &handles)?;
         Ok(fd_handles
             .iter()
             .map(|handle| {
@@ -583,7 +580,7 @@ impl PendingChild {
         let mut offset = offset;
         for chunk in data.chunks(MAX_CHILD_MEMORY_WRITE_SIZE as usize) {
             self.broker
-                .write_child_memory(self.identity.process_id, offset, chunk)?;
+                .write_child_memory(self.pending_id()?, offset, chunk)?;
             offset = offset
                 .checked_add(chunk.len() as u64)
                 .ok_or(ProcessError::ResourceExhausted)?;
@@ -594,10 +591,22 @@ impl PendingChild {
     /// Records that this pending child process exited without starting a
     /// runner, retaining `exit_status` until it is collected.
     pub fn exit(&self, exit_status: ProcessExitStatus) -> Result<(), ProcessError> {
-        self.broker
-            .exit_child_process(self.identity.process_id, exit_status)?;
+        let outcome = self
+            .broker
+            .exit_child_process(self.pending_id()?, exit_status)?;
+        self.finish(outcome)
+    }
+
+    fn pending_id(&self) -> Result<ProcessId, ProcessError> {
+        self.pending
+            .load(Ordering::Relaxed)
+            .then_some(self.identity.process_id)
+            .ok_or(ProcessError::InvalidChild)
+    }
+
+    fn finish(&self, outcome: ChildCompletion) -> Result<(), ProcessError> {
         self.pending.store(false, Ordering::Relaxed);
-        Ok(())
+        outcome.map_err(|error| BrokerControlError::Broker(error).into())
     }
 }
 
@@ -864,6 +873,37 @@ mod tests {
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn child_taken_by_a_failed_launch_is_no_longer_pending() {
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let litebox = LiteBox::new_with_broker_local(
+            MockPlatform::new(),
+            test_broker_local(ChildChannel(cancels.clone()), test_shared_memory()),
+        );
+        let mut child = litebox.allocate_child_process(None, false).unwrap();
+        // The same error can occur on either side of the broker taking the child.
+        assert_eq!(child.start(&[]), Err(ProcessError::ResourceExhausted));
+        child.restrict_authority(&[]).unwrap();
+        assert_eq!(
+            child.start_with_existing_runner(&[], &[]),
+            Err(ProcessError::ResourceExhausted)
+        );
+        let mut replacement = litebox.allocate_child_process(None, false).unwrap();
+        assert_eq!(
+            child.identity().process_id,
+            replacement.identity().process_id
+        );
+        assert_eq!(
+            child.restrict_authority(&[]),
+            Err(CredentialError::InvalidChild)
+        );
+        drop(child);
+        assert_eq!(cancels.load(Ordering::SeqCst), 0);
+        replacement.restrict_authority(&[]).unwrap();
+        drop(replacement);
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    }
+
     /// Serves one pending child at a time, counting its cancellations.
     struct ChildChannel(Arc<AtomicUsize>);
 
@@ -885,6 +925,20 @@ mod tests {
                 }
                 ProcessRequest::ExitChild(request) if request.child_process_id == child => {
                     ProcessResponse::ExitChild
+                }
+                ProcessRequest::RestrictChildAuthority(request)
+                    if request.child_process_id == child =>
+                {
+                    ProcessResponse::RestrictChildAuthority
+                }
+                ProcessRequest::StartChild(_) => {
+                    return Ok(BrokerResponse {
+                        request_id: request.request_id,
+                        result: BrokerResult::Error(ErrorCode::ResourceExhausted),
+                    });
+                }
+                ProcessRequest::StartChildWithExistingRunner(_) => {
+                    ProcessResponse::ChildConsumed(ErrorCode::ResourceExhausted)
                 }
                 ProcessRequest::CancelChild(process_id) if process_id == child => {
                     self.0.fetch_add(1, Ordering::SeqCst);

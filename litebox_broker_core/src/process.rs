@@ -1135,16 +1135,22 @@ impl BrokerProcess {
     /// Linux `vfork` child does until `execve`. If it exits there, it retains
     /// `exit_status`, like a started child after [`Self::complete_exit`]. Its
     /// CPU time is that runner's, so the child reports none of its own.
+    /// An outer error means the child was not taken; an inner error means it
+    /// was taken but recording its exit failed.
     pub fn exit_child_process(
         &self,
         child_process_id: ProcessId,
         exit_status: ProcessExitStatus,
-    ) -> Result<()> {
+    ) -> Result<Result<()>> {
         let child = self.take_child_process(child_process_id)?;
+        Ok(child.finish_pending_exit(exit_status))
+    }
+
+    fn finish_pending_exit(&self, exit_status: ProcessExitStatus) -> Result<()> {
         // The child never had a runner, so its teardown is fully accounted.
-        child.retire(true);
+        self.retire(true);
         let release_thread_ids = {
-            let mut state = child.state.lock();
+            let mut state = self.state.lock();
             // Owner death fails the child if it takes the child lock first.
             if let ProcessStatus::Failed(error) = state.status {
                 return Err(error);
@@ -1155,7 +1161,7 @@ impl BrokerProcess {
                 ProcessRetirement::Retired { release_ids: true }
             )
         };
-        child.finish_exit(exit_status, CpuTime::default(), release_thread_ids)
+        self.finish_exit(exit_status, CpuTime::default(), release_thread_ids)
     }
 
     /// Discards the pending child selected by `child_process_id`, as if it
@@ -4680,7 +4686,7 @@ mod tests {
         let changes = lifecycle.changes.load(Ordering::Relaxed);
         let threads = broker.core.active_thread_count.load(Ordering::Relaxed);
 
-        assert_eq!(parent.exit_child_process(process_id, EXITED), Ok(()));
+        assert_eq!(parent.exit_child_process(process_id, EXITED), Ok(Ok(())));
 
         let exit = ChildExit {
             process_id,
@@ -4955,7 +4961,10 @@ mod tests {
         assert_eq!(reserved(), 8);
         child.complete_start().unwrap();
 
-        second.exit_child_process(second_child, EXITED).unwrap();
+        second
+            .exit_child_process(second_child, EXITED)
+            .unwrap()
+            .unwrap();
         assert_eq!(reserved(), 0);
     }
 
@@ -5034,7 +5043,10 @@ mod tests {
             Ok(ReadinessFlags::WRITE)
         );
 
-        parent.exit_child_process(child_id, EXITED).unwrap();
+        parent
+            .exit_child_process(child_id, EXITED)
+            .unwrap()
+            .unwrap();
         assert_eq!(child.references.lock().handles, []);
         assert_eq!(
             parent.duplicate_object_references_to_child(child_id, &[first], &sink),

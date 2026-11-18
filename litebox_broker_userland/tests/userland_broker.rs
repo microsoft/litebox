@@ -342,6 +342,7 @@ fn run_fake_runner(args: &[OsString]) {
                 SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 0).unwrap(),
                 &[],
             )
+            .unwrap()
             .unwrap();
         assert_ne!(failed.process_id.0, failed.initial_thread_id.0);
         let started = local.allocate_child_process(None, false).unwrap();
@@ -355,6 +356,7 @@ fn run_fake_runner(args: &[OsString]) {
                 .unwrap(),
                 bootstrap,
             )
+            .unwrap()
             .unwrap();
         assert_ne!(started.process_id.0, started.initial_thread_id.0);
         wait_for_marker(
