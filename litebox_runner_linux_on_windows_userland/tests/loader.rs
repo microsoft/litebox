@@ -849,7 +849,11 @@ fn build_c_guest(name: &str, suite: &str, linkage: GuestLinkage) -> std::path::P
     let status = wsl
         .arg("--cd")
         .arg(repo)
-        .args(["--exec", "bash", "dev_tools/build_windows_linux_guest.sh"])
+        .args([
+            "--exec",
+            "bash",
+            "litebox_runner_linux_on_windows_userland/tests/build_windows_linux_guest.sh",
+        ])
         .arg(source)
         .arg(&guest)
         .arg(match linkage {

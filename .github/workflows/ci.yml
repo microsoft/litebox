@@ -571,13 +571,6 @@ jobs:
           use-cache: 'true'
           set-as-default: 'true'
           additional-packages: gcc libc6-dev
-      - name: Verify the WSL toolchain for the Windows loader tests
-        timeout-minutes: 2
-        run: |
-          wsl.exe --list --verbose
-          if ($LASTEXITCODE -ne 0) { throw 'Could not list WSL distributions on this runner' }
-          wsl.exe --exec gcc --version
-          if ($LASTEXITCODE -ne 0) { throw 'The default WSL distribution could not start or does not provide GCC' }
       - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
       - run: |
           cargo test --locked --verbose --doc ($env:WINDOWS_CRATES -split ' ')
