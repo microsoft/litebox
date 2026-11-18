@@ -1309,7 +1309,7 @@ impl<'a> SocketEntry<'a> {
             return Ok(ReceiveFromOutcome::Failed(error));
         }
         if self.read_shutdown {
-            return Ok(ReceiveFromOutcome::Failed(SocketError::NotConnected));
+            return Ok(ReceiveFromOutcome::Failed(SocketError::Shutdown));
         }
         let pinned = self.udp_state()?.peeked_origin;
         let next = self.udp_state()?.next_receive_origin;

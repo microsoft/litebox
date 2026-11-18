@@ -341,6 +341,9 @@ impl Udp {
         if let Some(error) = self.pending_error.take() {
             return Ok(SocketOutcome::Failed(error));
         }
+        if self.read_shutdown {
+            return Ok(SocketOutcome::Failed(SocketError::Shutdown));
+        }
         let datagram = self.received.front().ok_or(BrokerError::WouldBlock)?;
         let received = datagram.data.len().min(output.len());
         output.copy_from_slice_at(0, &datagram.data[..received])?;

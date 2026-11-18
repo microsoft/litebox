@@ -1385,9 +1385,41 @@ fn provider_preserves_udp_datagram_semantics() {
             .unwrap()
             .contains(ReadinessFlags::ERROR)
     );
+    while publications.try_recv().is_ok() {}
+    assert_eq!(
+        send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    wait_for_readiness_publication(&publications, handle, ReadinessFlags::ERROR);
+
+    // Receive after the transport shuts down but before the broker records it.
+    let hook = TestHook::install(&provider);
+    let reading_process = Arc::clone(&process);
+    let (observed, results) = channel();
+    hook.act(move |hook, _, point| {
+        if matches!(point, HookPoint::Unlocked(_)) {
+            hook.stop();
+            let receive = || {
+                receive_datagram_into(
+                    &reading_process,
+                    handle,
+                    &mut [0; 1],
+                    ReceiveFromFlags::NONE,
+                )
+            };
+            observed.send([receive(), receive()]).unwrap();
+        }
+    });
     assert_eq!(
         litebox_broker_core::socket::shutdown(&process, handle, ShutdownMode::Read),
         Ok(SocketOutcome::Completed(()))
+    );
+    assert_eq!(
+        results.try_recv().unwrap(),
+        [
+            Ok(SocketOutcome::Failed(SocketError::ConnectionRefused)),
+            Ok(SocketOutcome::Failed(SocketError::Shutdown)),
+        ]
     );
     while publications.try_recv().is_ok() {}
     assert_eq!(

@@ -638,8 +638,10 @@ pub trait PlatformSocket: Send + Sync {
     ///
     /// The original datagram length is returned even when the caller's buffer
     /// is smaller, and zero-length datagrams are successful receives. When no
-    /// datagram is available, returns [`BrokerError::WouldBlock`]. The source
-    /// address follows [`PlatformDatagramReceive::source_address`].
+    /// datagram is available, returns [`BrokerError::WouldBlock`]. Once the
+    /// transport has shut down reading, it returns a pending error or
+    /// `Failed(Shutdown)`, even if the broker has not yet recorded the shutdown.
+    /// The source address follows [`PlatformDatagramReceive::source_address`].
     fn receive_from(
         &self,
         output: &mut dyn ReadBuffer,
@@ -1786,25 +1788,21 @@ fn receive_datagram(
     if !udp {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if read_shutdown {
-        // A transport error can be pending even if poll hasn't queued it.
-        // Check before returning shutdown without calling the transport's receive.
-        refresh(object, true);
-    }
-    if let Some(error) = take_pending_error(object) {
-        return Ok(SocketOutcome::Failed(error));
-    }
-    if read_shutdown {
-        return Ok(SocketOutcome::Failed(SocketError::Shutdown));
-    }
-    match transport_receive_from(object, output, flags) {
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
-            if read_socket(object, |socket| socket.read_shutdown)? =>
-        {
-            Ok(SocketOutcome::Failed(SocketError::Shutdown))
+    if !read_shutdown {
+        if let Some(error) = take_pending_error(object) {
+            return Ok(SocketOutcome::Failed(error));
         }
-        result => finish_datagram_transfer(object, result),
+        match transport_receive_from(object, output, flags) {
+            Ok(SocketOutcome::Failed(SocketError::Shutdown)) => {}
+            result => return finish_datagram_transfer(object, result),
+        }
     }
+    // Whether the broker or the transport observed shutdown first, an error
+    // that poll has not yet queued takes precedence.
+    refresh(object, true);
+    Ok(SocketOutcome::Failed(
+        take_pending_error(object).unwrap_or(SocketError::Shutdown),
+    ))
 }
 
 fn transport_receive_from(
