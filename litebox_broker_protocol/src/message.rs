@@ -121,6 +121,8 @@ wire_enum! {
         SharedFutex(SharedFutexRequest),
         /// Vsock socket request family.
         VsockSocket(VsockSocketRequest),
+        /// Access a segment in the caller's IPC namespace.
+        Segment(crate::segment::SegmentRequest),
     }
 }
 
@@ -204,6 +206,7 @@ impl BrokerOperation {
             | Self::Timer(_)
             | Self::Signal(_)
             | Self::SharedFutex(_)
+            | Self::Segment(_)
             | Self::Process(
                 ProcessRequest::AllocateChild(_)
                 | ProcessRequest::CreateChildrenPidNamespace(_)
@@ -700,6 +703,8 @@ wire_enum! {
         VsockSocket(VsockSocketResponse),
         /// Operation failed with an ABI-neutral broker error.
         Error(ErrorCode),
+        /// Outcome of a shared segment operation.
+        Segment(crate::segment::SegmentResponse),
     }
 }
 

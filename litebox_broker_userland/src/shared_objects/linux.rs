@@ -119,6 +119,24 @@ impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
     fn create(&self) -> Result<SharedFileMemory, StorageError> {
         Ok(create::<Memfd>(memfd()?))
     }
+
+    fn create_segment(&self, len: usize) -> Result<Arc<dyn SharedFileObject>, StorageError> {
+        use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
+        let file = memfd_create(
+            c"litebox-segment",
+            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+        )
+        .map(File::from)
+        .map_err(|error| storage_error::<Memfd>(&error.into()))?;
+        let mut memory = create::<Memfd>(
+            file.try_clone()
+                .map_err(|error| storage_error::<Memfd>(&error))?,
+        );
+        memory.storage.set_len(len)?;
+        fcntl_add_seals(&file, SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)
+            .map_err(|error| storage_error::<Memfd>(&error.into()))?;
+        Ok(memory.object)
+    }
 }
 
 /// Delivers memfds over a runner's shared-object socket.
@@ -140,6 +158,33 @@ impl SharedObjectDelivery for MemfdDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_backing_has_fixed_size_and_attenuated_handles() {
+        use rustix::fs::SealFlags;
+        let object = MemfdFileMemoryProvider.create_segment(8192).unwrap();
+        for writable in [false, true] {
+            let handle = object.host_handle(writable).unwrap();
+            let raw = std::os::fd::RawFd::try_from(handle.raw()).unwrap();
+            // SAFETY: the live HostHandle owns or borrows this descriptor.
+            let fd = unsafe { BorrowedFd::borrow_raw(raw) };
+            assert_eq!(rustix::fs::fstat(fd).unwrap().st_size, 8192);
+            assert!(
+                rustix::fs::fcntl_get_seals(fd)
+                    .unwrap()
+                    .contains(SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)
+            );
+            let access = rustix::fs::fcntl_getfl(fd).unwrap() & rustix::fs::OFlags::ACCMODE;
+            assert_eq!(
+                access,
+                if writable {
+                    rustix::fs::OFlags::RDWR
+                } else {
+                    rustix::fs::OFlags::RDONLY
+                }
+            );
+        }
+    }
 
     #[test]
     fn memfd_memory_reads_writes_and_resizes() {

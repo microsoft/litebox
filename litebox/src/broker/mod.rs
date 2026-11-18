@@ -33,6 +33,7 @@ use litebox_broker_protocol::readiness_queue::{
     MAX_READINESS_QUEUE_EVENTS, READY_EVENT_SIZE, ReadinessQueueError, ReadinessQueueInterest,
     ReadyEvent,
 };
+use litebox_broker_protocol::segment::{SegmentRequest, SegmentResponse};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -73,6 +74,8 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
+    fn segment(&self, request: SegmentRequest) -> Result<SegmentResponse, BrokerControlError>;
+
     fn allocate_child_process(
         &self,
         new_pid_namespace: Option<PidNamespaceOptions>,
@@ -1720,6 +1723,10 @@ where
     ) -> core::result::Result<core::result::Result<MapFileResponse, FileError>, BrokerControlError>
     {
         self.request(|local| local.map_file(handle, end))
+    }
+
+    fn segment(&self, request: SegmentRequest) -> Result<SegmentResponse, BrokerControlError> {
+        self.request(|local| local.segment(request))
     }
 
     fn read_directory(

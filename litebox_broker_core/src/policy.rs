@@ -438,6 +438,7 @@ pub enum PolicyProfile {
 /// Broker policy decision and audit component.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyEngine {
+    pub(crate) segment_user: litebox_broker_protocol::fs::FileUser,
     profile: PolicyProfile,
     socket_policy: SocketPolicy,
     vsock_policy: VsockPolicy,
@@ -449,6 +450,10 @@ impl PolicyEngine {
     pub const fn new(profile: PolicyProfile) -> Self {
         Self {
             profile,
+            segment_user: litebox_broker_protocol::fs::FileUser {
+                user: 65534,
+                group: 65534,
+            },
             socket_policy: SocketPolicy::deny(),
             vsock_policy: VsockPolicy::deny(),
             process_duplication_enabled: false,
@@ -458,6 +463,14 @@ impl PolicyEngine {
     /// Creates a policy engine that denies every operation.
     pub const fn default_deny() -> Self {
         Self::new(PolicyProfile::DefaultDeny)
+    }
+
+    /// Sets the immutable guest credential for keyed shared memory. The
+    /// deployment chooses it; associations cannot supply or override it.
+    #[must_use]
+    pub const fn with_segment_user(mut self, user: litebox_broker_protocol::fs::FileUser) -> Self {
+        self.segment_user = user;
+        self
     }
 
     /// Creates a policy engine with rights for the unauthenticated principal.

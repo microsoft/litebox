@@ -544,6 +544,13 @@ fn handle_request<Memory: SharedMemory>(
             handle_shared_futex_request(process, request, readiness_sink)
                 .map(BrokerResult::SharedFutex)
         }
+        BrokerOperation::Segment(request) => {
+            litebox_broker_core::segment::operate(process, request, None, |_, _, _| {
+                Err(FileError::NoSuchDevice)
+            })
+            .map(BrokerResult::Segment)
+            .map_err(RequestFailure::from)
+        }
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
                 .map(BrokerResult::Socket)

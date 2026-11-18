@@ -162,6 +162,23 @@ impl From<litebox::process::ProcessError> for Errno {
     }
 }
 
+impl From<litebox::segment::SegmentError> for Errno {
+    fn from(error: litebox::segment::SegmentError) -> Self {
+        use litebox::segment::SegmentError;
+        match error {
+            SegmentError::Unavailable => Self::ENOSYS,
+            SegmentError::Exists => Self::EEXIST,
+            SegmentError::Missing => Self::ENOENT,
+            SegmentError::Invalid => Self::EINVAL,
+            SegmentError::AccessDenied => Self::EACCES,
+            SegmentError::NotOwner => Self::EPERM,
+            SegmentError::NoSpace => Self::ENOSPC,
+            SegmentError::NoMemory => Self::ENOMEM,
+            SegmentError::ServiceFailed => Self::EIO,
+        }
+    }
+}
+
 impl From<litebox::fs::errors::PathError> for Errno {
     fn from(value: litebox::fs::errors::PathError) -> Self {
         match value {

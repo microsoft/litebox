@@ -131,6 +131,54 @@ fn mount_decodes_five_arguments_and_nullable_pointers() {
 }
 
 #[test]
+fn sysv_shm_abi_layout() {
+    use core::mem::{align_of, offset_of, size_of};
+
+    assert_eq!(size_of::<IpcPerm>(), 48);
+    assert_eq!(align_of::<IpcPerm>(), 8);
+    assert_eq!(offset_of!(IpcPerm, mode), 20);
+    assert_eq!(offset_of!(IpcPerm, seq), 24);
+    assert_eq!(offset_of!(IpcPerm, reserved), 32);
+    assert_eq!(size_of::<ShmidDs>(), 112);
+    assert_eq!(align_of::<ShmidDs>(), 8);
+    assert_eq!(offset_of!(ShmidDs, shm_segsz), 48);
+    assert_eq!(offset_of!(ShmidDs, shm_atime), 56);
+    assert_eq!(offset_of!(ShmidDs, shm_dtime), 64);
+    assert_eq!(offset_of!(ShmidDs, shm_ctime), 72);
+    assert_eq!(offset_of!(ShmidDs, shm_cpid), 80);
+    assert_eq!(offset_of!(ShmidDs, shm_lpid), 84);
+    assert_eq!(offset_of!(ShmidDs, shm_nattch), 88);
+    assert_eq!(offset_of!(ShmidDs, reserved), 96);
+}
+
+#[test]
+fn sysv_shm_decode() {
+    // Narrow int arguments to 32 bits but keep the entire size/address.
+    let wide = 0x1_0000_1000;
+    let neg_id = 0xffff_fffe;
+    let flags = 0x1_0000_0201;
+    assert!(matches!(
+        decode(Sysno::shmget, [neg_id, wide, flags, 0]),
+        SyscallRequest::Shmget { key: -2, size, shmflg: 0x201 } if size == wide
+    ));
+    assert!(matches!(
+        decode(Sysno::shmat, [neg_id, wide, flags, 0]),
+        SyscallRequest::Shmat { shmid: -2, shmaddr, shmflg: 0x201 } if shmaddr == wide
+    ));
+    assert!(matches!(
+        decode(Sysno::shmdt, [wide, 0, 0, 0]),
+        SyscallRequest::Shmdt { shmaddr } if shmaddr == wide
+    ));
+    for (cmd, addr) in [(IPC_STAT, wide), (IPC_RMID, 0)] {
+        assert!(matches!(
+            decode(Sysno::shmctl, [neg_id, cmd.cast_unsigned() as usize, addr, 0]),
+            SyscallRequest::Shmctl { shmid: -2, cmd: actual_cmd, buf }
+                if actual_cmd == cmd && buf.as_usize() == addr
+        ));
+    }
+}
+
+#[test]
 fn utimensat_decodes_optional_pointers_and_signed_dirfd() {
     for pathname in [0, 0x1234] {
         for times in [0, 0x5678] {

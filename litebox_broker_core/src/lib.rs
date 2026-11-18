@@ -35,6 +35,7 @@ mod quota;
 pub mod random;
 pub mod readiness;
 pub mod readiness_queue;
+pub mod segment;
 pub mod shared_futex;
 pub mod signal;
 pub mod socket;
@@ -345,6 +346,8 @@ pub struct BrokerCore {
     pub(crate) limits: BrokerCoreLimits,
     /// The next [`ProcessKey`] to allocate.
     pub(crate) next_process_key: AtomicU64,
+    segment_limit: Arc<fs::shared_storage::SharedFileLimit>,
+    next_segment_id: core::sync::atomic::AtomicU32,
     /// The next [`PidNamespaceId`](pid_namespace::PidNamespaceId) to allocate.
     pub(crate) next_pid_namespace_id: AtomicU64,
     /// PID namespaces that processes have created and that still exist.
@@ -403,6 +406,8 @@ impl BrokerCore {
             policy,
             limits,
             next_process_key: AtomicU64::new(1),
+            segment_limit: Arc::new(fs::shared_storage::SharedFileLimit::new(256)),
+            next_segment_id: core::sync::atomic::AtomicU32::new(1),
             next_pid_namespace_id: AtomicU64::new(1),
             pid_namespaces: Arc::new(AtomicUsize::new(0)),
             live_processes: AtomicUsize::new(0),
