@@ -38,8 +38,8 @@ fn host_handle(
     })
 }
 
-/// Handles a request to map a file, delivering its shared memory through `delivery`, or returns
-/// `None` for other operations.
+/// Handles file mapping and keyed shared segment requests, delivering shared memory through
+/// `delivery`. Returns `None` for other operations.
 ///
 /// Associations without a delivery leave the request to the broker host, which refuses it.
 pub fn handle_map_file<Delivery: SharedObjectDelivery>(
@@ -47,6 +47,38 @@ pub fn handle_map_file<Delivery: SharedObjectDelivery>(
     process: &BrokerProcess,
     operation: &BrokerOperation,
 ) -> Option<Result<BrokerResult, RequestFailure>> {
+    if let BrokerOperation::Segment(request) = *operation {
+        #[cfg(target_os = "linux")]
+        let provider = Some(
+            &linux::MemfdFileMemoryProvider
+                as &dyn litebox_broker_core::fs::shared_storage::SharedFileMemoryProvider,
+        );
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        let provider = Some(
+            &windows::TempFileMemoryProvider
+                as &dyn litebox_broker_core::fs::shared_storage::SharedFileMemoryProvider,
+        );
+        #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+        let provider = None;
+        return Some(
+            litebox_broker_core::segment::operate(
+                process,
+                request,
+                provider,
+                |object, writable, end| {
+                    delivery.deliver(object, writable, end).map_err(|error| {
+                        if error.kind() == ErrorKind::Unsupported {
+                            FileError::NoSuchDevice
+                        } else {
+                            FileError::NoSpace
+                        }
+                    })
+                },
+            )
+            .map(BrokerResult::Segment)
+            .map_err(RequestFailure::from),
+        );
+    }
     let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle, end })) = *operation else {
         return None;
     };

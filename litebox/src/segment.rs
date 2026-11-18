@@ -1,0 +1,162 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Keyed shared-memory segments, independent of file descriptors and paths.
+
+use crate::LiteBox;
+use crate::broker::error::BrokerControlError;
+use crate::fs::SharedFileObject;
+use crate::platform::SharedObjectProvider;
+use crate::platform::page_mgmt::SharedObjectReceiveError;
+use crate::sync::RawSyncPrimitivesProvider;
+use litebox_broker_protocol::ProcessId;
+use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_protocol::fs::{FileError, FileUser};
+pub use litebox_broker_protocol::segment::SegmentStatus;
+use litebox_broker_protocol::segment::{SegmentRequest, SegmentResponse};
+use litebox_platform::time::TimeProvider;
+
+/// Failure accessing a shared segment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
+pub enum SegmentError {
+    #[error("shared segments unavailable")]
+    Unavailable,
+    #[error("shared segment key already in use")]
+    Exists,
+    #[error("no segment has this key")]
+    Missing,
+    #[error("invalid segment ID or size")]
+    Invalid,
+    #[error("insufficient access rights")]
+    AccessDenied,
+    #[error("not the segment owner")]
+    NotOwner,
+    #[error("shared segment capacity exhausted")]
+    NoSpace,
+    #[error("insufficient memory")]
+    NoMemory,
+    #[error("segment service failed")]
+    ServiceFailed,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
+    fn segment(&self, request: SegmentRequest) -> Result<SegmentResponse, SegmentError> {
+        let control = self.broker_control().ok_or(SegmentError::Unavailable)?;
+        match control.segment(request) {
+            Ok(SegmentResponse::Failed(error)) => Err(match error {
+                FileError::AlreadyExists => SegmentError::Exists,
+                FileError::NoSuchFileOrDirectory => SegmentError::Missing,
+                FileError::InvalidArgument => SegmentError::Invalid,
+                FileError::AccessNotAllowed => SegmentError::AccessDenied,
+                FileError::NotOwner => SegmentError::NotOwner,
+                FileError::NoSpace => SegmentError::NoSpace,
+                FileError::NoSuchDevice | FileError::NotSupported => SegmentError::Unavailable,
+                _ => SegmentError::ServiceFailed,
+            }),
+            Ok(response) => Ok(response),
+            Err(error) => Err(match error {
+                BrokerControlError::Broker(ErrorCode::OutOfMemory) => SegmentError::NoMemory,
+                BrokerControlError::Broker(ErrorCode::ResourceExhausted) => SegmentError::NoSpace,
+                BrokerControlError::Broker(ErrorCode::PolicyDenied) => SegmentError::NotOwner,
+                BrokerControlError::Broker(ErrorCode::UnsupportedOperation) => {
+                    SegmentError::Unavailable
+                }
+                _ => SegmentError::ServiceFailed,
+            }),
+        }
+    }
+
+    fn segment_done(&self, request: SegmentRequest) -> Result<(), SegmentError> {
+        match self.segment(request)? {
+            SegmentResponse::Done => Ok(()),
+            _ => Err(SegmentError::ServiceFailed),
+        }
+    }
+
+    /// Gets the ID belonging to `key`, optionally creating a zero-filled segment.
+    pub fn get_segment(
+        &self,
+        key: i32,
+        size: u64,
+        mode: u16,
+        create: bool,
+        exclusive: bool,
+    ) -> Result<u32, SegmentError> {
+        match self.segment(SegmentRequest::Get {
+            key,
+            size,
+            mode,
+            create,
+            exclusive,
+        })? {
+            SegmentResponse::Id(id) => Ok(id),
+            _ => Err(SegmentError::ServiceFailed),
+        }
+    }
+
+    /// Reads the segment's metadata.
+    pub fn segment_status(&self, id: u32) -> Result<SegmentStatus, SegmentError> {
+        match self.segment(SegmentRequest::Status { id })? {
+            SegmentResponse::Status(status) => Ok(status),
+            _ => Err(SegmentError::ServiceFailed),
+        }
+    }
+
+    /// Changes the segment's owner and permissions.
+    pub fn set_segment(&self, id: u32, owner: FileUser, mode: u16) -> Result<(), SegmentError> {
+        self.segment_done(SegmentRequest::Set { id, owner, mode })
+    }
+
+    /// Removes the segment's key, but keeps existing attachments live.
+    pub fn delete_segment(&self, id: u32) -> Result<(), SegmentError> {
+        self.segment_done(SegmentRequest::Delete { id })
+    }
+
+    /// Obtains backing memory and records an attachment until [`Self::detach_segment`].
+    pub fn attach_segment<Provider: SharedObjectProvider<ALIGN>, const ALIGN: usize>(
+        &self,
+        platform: &Provider,
+        id: u32,
+        writable: bool,
+    ) -> Result<(SharedFileObject<Provider::SharedObject>, u64), SegmentError> {
+        let SegmentResponse::Attached { mapping, size } =
+            self.segment(SegmentRequest::Attach { id, writable })?
+        else {
+            return Err(SegmentError::ServiceFailed);
+        };
+        // SAFETY: Attach delivered this handle to this process; it is consumed only here.
+        match unsafe { platform.take_shared_object(mapping.token) } {
+            Ok(object) => Ok((
+                SharedFileObject {
+                    object,
+                    memory: mapping.memory,
+                    may_write: mapping.writable && writable,
+                },
+                size,
+            )),
+            Err(error) => {
+                self.detach_segment(id)?;
+                Err(match error {
+                    SharedObjectReceiveError::UnsupportedByPlatform => SegmentError::Unavailable,
+                    SharedObjectReceiveError::OutOfMemory => SegmentError::NoMemory,
+                    SharedObjectReceiveError::Io => SegmentError::ServiceFailed,
+                })
+            }
+        }
+    }
+
+    /// Releases an attachment, including one inherited by a child process.
+    pub fn detach_segment(&self, id: u32) -> Result<(), SegmentError> {
+        self.segment_done(SegmentRequest::Detach { id })
+    }
+
+    /// Accounts for SysV mappings inherited by a pending native fork child.
+    pub fn inherit_segments(&self, target: ProcessId) -> Result<(), SegmentError> {
+        self.segment_done(SegmentRequest::Inherit { target })
+    }
+
+    /// Moves this process or its pending child to an empty namespace. Existing attachments live on.
+    pub fn new_segment_namespace(&self, target: ProcessId) -> Result<(), SegmentError> {
+        self.segment_done(SegmentRequest::NewNamespace { target })
+    }
+}

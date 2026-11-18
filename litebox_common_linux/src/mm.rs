@@ -81,6 +81,18 @@ where
         self.vmem.write().platform = platform;
     }
 
+    /// Sets the release hook for SysV attachments in this address space. A native clone
+    /// must bind its own process's hook before changing inherited mappings.
+    /// The hook runs under the mapping lock and must not re-enter this memory manager.
+    pub fn set_sysv_release(&self, release: impl Fn(u32) + Send + Sync + 'static) {
+        self.vmem.write().sysv_release = Some(alloc::boxed::Box::new(release));
+    }
+
+    /// Whether a native fork child will inherit any SysV attachments.
+    pub fn has_sysv_attachments(&self) -> bool {
+        self.vmem.read().has_sysv_attachments()
+    }
+
     /// Create a mapping with the given flags.
     ///
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
@@ -1061,6 +1073,64 @@ where
             AllocationError::UnsupportedByPlatform => MappingError::NotAFile,
             error => MappingError::MapError(error),
         })
+    }
+
+    /// Maps one broker-authorized SysV attachment. A non-null address must be available
+    /// exactly as requested. On failure the caller retains responsibility for broker rollback.
+    pub fn attach_sysv(
+        &self,
+        addr: Option<usize>,
+        len: usize,
+        readonly: bool,
+        mapping: SharedObjectMapping<
+            litebox::platform::page_mgmt::SharedObjectOf<Platform, PAGE_SIZE>,
+        >,
+        id: u32,
+    ) -> Result<UserPtrMut<u8>, Errno>
+    where
+        Platform: litebox::platform::SharedObjectProvider<PAGE_SIZE>,
+    {
+        if mapping.offset != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let len = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::EINVAL)?;
+        let prot = if readonly {
+            ProtFlags::PROT_READ
+        } else {
+            ProtFlags::PROT_READ_WRITE
+        };
+        let mut flags = MapFlags::MAP_SHARED;
+        flags.set(MapFlags::MAP_FIXED_NOREPLACE, addr.is_some());
+        let (flags, addr, length, permissions) =
+            Self::mmap_arguments(addr, len, prot, flags, &MmapPlacement::GUEST)?;
+        let mut vmem = self.vmem.write();
+        if vmem.sysv_release.is_none() {
+            return Err(Errno::ENOSYS);
+        }
+        // SAFETY: shmat never replaces mappings, and vmem holds its lock until the limits
+        // and attachment identity have been recorded.
+        let ptr = unsafe {
+            vmem.create_shared_object_mapping(addr, length, flags, permissions, None, mapping)
+        }
+        .map_err(|error| match error {
+            AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform
+                if addr.is_some() =>
+            {
+                Errno::EINVAL
+            }
+            AllocationError::UnsupportedByPlatform => Errno::ENOSYS,
+            error => error.into(),
+        })?;
+        let base = ptr.as_usize();
+        vmem.register_sysv(base..base + len, id, readonly);
+        Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr))
+    }
+
+    /// Detaches the remaining pages of a SysV attachment originally placed at `base`.
+    pub fn detach_sysv(&self, base: usize) -> Result<(), Errno> {
+        self.vmem.write().detach_sysv(base)
     }
 
     /// Handle syscall `msync`.

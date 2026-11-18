@@ -134,6 +134,34 @@ fn request_codec_round_trips_all_variants() {
     )
     .unwrap();
     let operations = alloc::vec![
+        BrokerOperation::Segment(crate::segment::SegmentRequest::Get {
+            key: -7,
+            size: u64::MAX,
+            mode: 0o620,
+            create: true,
+            exclusive: false
+        }),
+        BrokerOperation::Segment(crate::segment::SegmentRequest::Status { id: 33 }),
+        BrokerOperation::Segment(crate::segment::SegmentRequest::Set {
+            id: 7,
+            owner: FileUser {
+                user: 41,
+                group: 52
+            },
+            mode: 0o114
+        }),
+        BrokerOperation::Segment(crate::segment::SegmentRequest::Delete { id: 63 }),
+        BrokerOperation::Segment(crate::segment::SegmentRequest::Attach {
+            id: 12,
+            writable: true
+        }),
+        BrokerOperation::Segment(crate::segment::SegmentRequest::Detach { id: 89 }),
+        BrokerOperation::Segment(crate::segment::SegmentRequest::NewNamespace {
+            target: ProcessId(28)
+        }),
+        BrokerOperation::Segment(crate::segment::SegmentRequest::Inherit {
+            target: ProcessId(19)
+        }),
         BrokerOperation::Thread(ThreadRequest::Exit(thread_id(17))),
         BrokerOperation::CloseObject(handle),
         BrokerOperation::CheckReadiness(handle),
@@ -1007,6 +1035,33 @@ fn handshake_response_codec_round_trips_all_variants() {
 fn response_codec_round_trips_all_variants() {
     let handle = ObjectHandle(13);
     let results = alloc::vec![
+        BrokerResult::Segment(crate::segment::SegmentResponse::Id(53)),
+        BrokerResult::Segment(crate::segment::SegmentResponse::Status(
+            crate::segment::SegmentStatus {
+                key: -11,
+                size: 271,
+                creator: FileUser::ROOT,
+                owner: FileUser { user: 5, group: 8 },
+                mode: 0o640,
+                creator_pid: 28,
+                last_pid: 9,
+                attachments: 42,
+                created: 8,
+                attached: 17,
+                detached: 4,
+                removed: true,
+            }
+        )),
+        BrokerResult::Segment(crate::segment::SegmentResponse::Attached {
+            mapping: MapFileResponse {
+                memory: SharedMemoryId(1234),
+                token: 56,
+                writable: false
+            },
+            size: 751
+        }),
+        BrokerResult::Segment(crate::segment::SegmentResponse::Done),
+        BrokerResult::Segment(crate::segment::SegmentResponse::Failed(FileError::NotOwner)),
         BrokerResult::Thread(ThreadResponse::Create(thread_id(17))),
         BrokerResult::Thread(ThreadResponse::Exit),
         BrokerResult::ObjectClosed,

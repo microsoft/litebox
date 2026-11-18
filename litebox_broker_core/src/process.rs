@@ -249,6 +249,7 @@ impl ProcessKey {
 /// the caller, then [`BrokerCore`] creates and registers this object before
 /// serving its association.
 pub struct BrokerProcess {
+    pub(crate) segments: Mutex<crate::segment::ProcessSegments>,
     pub(crate) core: Arc<BrokerCore>,
     /// The PID namespace this process's later children get their IDs in, if
     /// not its own (see [`Self::create_namespaces`]).
@@ -640,6 +641,11 @@ impl BrokerProcess {
         let socket_account = Arc::new(SocketAccount::new(&core, key));
         Self {
             core,
+            segments: Mutex::new(
+                creator.map_or_else(crate::segment::ProcessSegments::default, |p| {
+                    p.segments.lock().child()
+                }),
+            ),
             children_namespace: Mutex::new(None),
             fs,
             job,
@@ -3042,6 +3048,7 @@ impl BrokerProcess {
     ///
     /// Calling this method more than once is harmless.
     fn release_references(&self) -> bool {
+        self.segments.lock().close(self);
         let mut invariant_fault = self.references.lock().pending_handles != 0;
         loop {
             let Some(handle) = self.references.lock().handles.pop() else {

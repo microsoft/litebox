@@ -471,6 +471,13 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     /// Build the shim.
     pub fn build(self) -> LinuxShim<Platform> {
         let litebox = Arc::new(self.litebox);
+        // The child's native clone inherits the VMAs but must debit its own broker connection.
+        let segment_client = Arc::clone(&litebox);
+        self.memory_manager.set_sysv_release(move |id| {
+            if segment_client.detach_segment(id).is_err() {
+                litebox_util_log::warn!(id; "failed to release SysV attachment");
+            }
+        });
         let global = Arc::new(GlobalState {
             platform: self.platform,
             mm: self.memory_manager,
@@ -1333,6 +1340,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .sys_mremap(old_addr, old_size, new_size, flags, new_addr)
                 .map(|ptr| ptr.as_usize()),
             SyscallRequest::Munmap { addr, length } => syscall!(sys_munmap(addr, length)),
+            SyscallRequest::Shmget { key, size, shmflg } => syscall!(sys_shmget(key, size, shmflg)),
+            SyscallRequest::Shmat {
+                shmid,
+                shmaddr,
+                shmflg,
+            } => self
+                .sys_shmat(shmid, shmaddr, shmflg)
+                .map(|ptr| ptr.as_usize()),
+            SyscallRequest::Shmdt { shmaddr } => syscall!(sys_shmdt(shmaddr)),
+            SyscallRequest::Shmctl { shmid, cmd, buf } => syscall!(sys_shmctl(shmid, cmd, buf)),
             SyscallRequest::Brk { addr } => self.sys_brk(addr),
             SyscallRequest::Readv { fd, iovec, iovcnt } => self.sys_readv(fd, iovec, iovcnt),
             SyscallRequest::Writev { fd, iovec, iovcnt } => self.sys_writev(fd, iovec, iovcnt),

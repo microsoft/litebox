@@ -65,6 +65,49 @@ pub const STDIN_FILENO: i32 = 0;
 pub const STDOUT_FILENO: i32 = 1;
 pub const STDERR_FILENO: i32 = 2;
 
+// linux/ipc.h and linux/shm.h (SysV shared memory)
+pub const IPC_PRIVATE: i32 = 0;
+pub const IPC_CREAT: i32 = 0o1000;
+pub const IPC_EXCL: i32 = 0o2000;
+pub const IPC_RMID: i32 = 0;
+pub const IPC_SET: i32 = 1;
+pub const IPC_STAT: i32 = 2;
+pub const SHM_RDONLY: i32 = 0o10000;
+pub const SHM_RND: i32 = 0o20000;
+pub const SHM_REMAP: i32 = 0o40000;
+pub const SHM_EXEC: i32 = 0o100000;
+pub const SHM_DEST: i32 = 0o1000;
+
+/// Linux `ipc64_perm` on x86-64 and AArch64.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub struct IpcPerm {
+    pub key: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub cuid: u32,
+    pub cgid: u32,
+    pub mode: u32,
+    pub seq: u16,
+    pub reserved_pad: [u8; 6],
+    pub reserved: [u64; 2],
+}
+
+/// Linux `shmid64_ds` passed to `shmctl` on x86-64 and AArch64.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub struct ShmidDs {
+    pub shm_perm: IpcPerm,
+    pub shm_segsz: u64,
+    pub shm_atime: i64,
+    pub shm_dtime: i64,
+    pub shm_ctime: i64,
+    pub shm_cpid: i32,
+    pub shm_lpid: i32,
+    pub shm_nattch: u64,
+    pub reserved: [u64; 2],
+}
+
 // linux/futex.h
 pub const FUTEX_WAIT: i32 = 0;
 pub const FUTEX_WAKE: i32 = 1;
@@ -3040,6 +3083,24 @@ pub enum SyscallRequest {
         fd: i32,
         offset: usize,
     },
+    Shmget {
+        key: i32,
+        size: usize,
+        shmflg: i32,
+    },
+    Shmat {
+        shmid: i32,
+        shmaddr: usize,
+        shmflg: i32,
+    },
+    Shmdt {
+        shmaddr: usize,
+    },
+    Shmctl {
+        shmid: i32,
+        cmd: i32,
+        buf: UserPtrMut<ShmidDs>,
+    },
     Mprotect {
         addr: UserPtrMut<u8>,
         length: usize,
@@ -3739,6 +3800,14 @@ impl SyscallRequest {
             }),
             Sysno::mprotect => sys_req!(Mprotect { addr:*, length, prot }),
             Sysno::munmap => sys_req!(Munmap { addr:*, length }),
+            Sysno::shmget => sys_req!(Shmget { key, size, shmflg }),
+            Sysno::shmat => sys_req!(Shmat {
+                shmid,
+                shmaddr,
+                shmflg
+            }),
+            Sysno::shmdt => sys_req!(Shmdt { shmaddr }),
+            Sysno::shmctl => sys_req!(Shmctl { shmid, cmd, buf:* }),
             Sysno::brk => sys_req!(Brk { addr:* }),
             Sysno::mremap => sys_req!(Mremap { old_addr:*, old_size, new_size, flags, new_addr }),
             Sysno::rt_sigprocmask => sys_req!(RtSigprocmask {

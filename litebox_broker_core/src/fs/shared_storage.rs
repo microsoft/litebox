@@ -50,6 +50,15 @@ pub struct SharedFileMemory {
 pub trait SharedFileMemoryProvider: Send + Sync {
     /// Creates empty memory.
     fn create(&self) -> Result<SharedFileMemory, StorageError>;
+
+    /// Creates a zero-filled, fixed-length segment, to be exported as a
+    /// mapping only. Providers exporting resizable file handles must also
+    /// prevent recipients from changing the length through those handles.
+    fn create_segment(&self, len: usize) -> Result<Arc<dyn SharedFileObject>, StorageError> {
+        let mut memory = self.create()?;
+        memory.storage.set_len(len)?;
+        Ok(memory.object)
+    }
 }
 
 /// The default for how many files may keep their contents in host shared memory at once.

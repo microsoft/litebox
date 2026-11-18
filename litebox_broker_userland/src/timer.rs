@@ -65,6 +65,13 @@ impl Drop for UserlandTimerProvider {
 }
 
 impl TimerProvider for UserlandTimerProvider {
+    fn unix_seconds(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
     fn now(&self) -> Duration {
         self.scheduler.now()
     }

@@ -175,6 +175,14 @@ struct CliArgs {
     /// Allow using unstable options.
     #[arg(short = 'Z', long = "unstable")]
     unstable: bool,
+    /// Guest user ID for shared-memory permissions; also passed to the Linux runner.
+    #[cfg(target_os = "linux")]
+    #[arg(long, requires = "unstable", value_name = "UID")]
+    guest_uid: Option<u16>,
+    /// Guest group ID for shared-memory permissions; also passed to the Linux runner.
+    #[cfg(target_os = "linux")]
+    #[arg(long, requires = "unstable", value_name = "GID")]
+    guest_gid: Option<u16>,
     /// Run the runner library for this platform as a thread in this broker process.
     ///
     /// This mode does not provide a security boundary between the runner and
@@ -295,6 +303,14 @@ fn build_broker(
     let vsock = (args.vsock_uds.as_deref())
         .map(|path| start_vsock_bridge(path, VsockCid(args.vsock_guest_cid)))
         .transpose()?;
+    #[cfg(target_os = "linux")]
+    let policy = policy.with_segment_user(args.segment_user()?);
+    // The Windows-hosted Linux runner currently runs guests as UID/GID 1000.
+    #[cfg(windows)]
+    let policy = policy.with_segment_user(litebox_broker_protocol::fs::FileUser {
+        user: 1000,
+        group: 1000,
+    });
     let mut builder = BrokerCoreBuilder::new(policy)
         .with_limits(limits)
         .with_publishing(Publishing {
@@ -432,6 +448,48 @@ where
     Ok(Arc::new(Resolver::<Platform, _>::new(backend)))
 }
 
+impl CliArgs {
+    #[cfg(target_os = "linux")]
+    fn segment_user(&self) -> Result<litebox_broker_protocol::fs::FileUser, clap::Error> {
+        // Existing launches may specify --guest-uid/gid among the Linux runner options. Use
+        // the runner's parser on the broker's trusted launch arguments, never on a request.
+        // In particular, a --guest-uid *after* the guest executable is just guest argv.
+        let linux_runner = self.in_process_runner
+            || self.runner.as_ref().and_then(|path| path.file_name())
+                == Some(OsStr::new("litebox_runner_linux_userland"));
+        let (user, group) = if linux_runner {
+            let args = litebox_runner_linux_userland::CliArgs::try_parse_from(
+                [OsString::from("runner")]
+                    .into_iter()
+                    .chain(runner_command_arguments(self, OsStr::new("control"), None)),
+            )?;
+            (args.guest_uid, args.guest_gid)
+        } else {
+            (
+                self.guest_uid.unwrap_or(1000),
+                self.guest_gid.unwrap_or(1000),
+            )
+        };
+        Ok(litebox_broker_protocol::fs::FileUser { user, group })
+    }
+
+    fn configured_runner_arguments(&self) -> Vec<OsString> {
+        let mut arguments = Vec::new();
+        #[cfg(target_os = "linux")]
+        for (flag, id) in [
+            ("--guest-uid", self.guest_uid),
+            ("--guest-gid", self.guest_gid),
+        ] {
+            if let Some(id) = id {
+                arguments.push(OsString::from(flag));
+                arguments.push(id.to_string().into());
+            }
+        }
+        arguments.extend(self.runner_arguments.iter().cloned());
+        arguments
+    }
+}
+
 fn runner_command_arguments(
     args: &CliArgs,
     control_channel: &OsStr,
@@ -446,7 +504,7 @@ fn runner_command_arguments(
         runner_arguments.push(OsString::from("--broker-proxy-url"));
         runner_arguments.push(OsString::from(proxy_url));
     }
-    runner_arguments.extend(args.runner_arguments.iter().cloned());
+    runner_arguments.extend(args.configured_runner_arguments());
     runner_arguments
 }
 
@@ -467,7 +525,7 @@ fn run_runner_instance(
     })?;
     let mut config = litebox_broker_userland::runner::RunnerConfig::new(
         runner_path.clone(),
-        args.runner_arguments.clone(),
+        args.configured_runner_arguments(),
     );
     if let Some(proxy_url) = proxy_url {
         config = config.with_proxy_url(proxy_url.to_owned());
@@ -662,6 +720,34 @@ fn raise_open_file_limit() {
 mod cli_tests {
     use super::*;
     use litebox_broker_protocol::socket::Ipv4Address;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn segment_credentials_do_not_come_from_guest_argv() {
+        let args = CliArgs::try_parse_from([
+            "broker",
+            "--runner",
+            "/bin/litebox_runner_linux_userland",
+            "--unstable",
+            "--guest-uid",
+            "123",
+            "--env",
+            "HOME=/",
+            "--guest-gid",
+            "456",
+            "/guest",
+            "--guest-uid",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.segment_user().unwrap(),
+            litebox_broker_protocol::fs::FileUser {
+                user: 123,
+                group: 456
+            }
+        );
+    }
 
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[test]
