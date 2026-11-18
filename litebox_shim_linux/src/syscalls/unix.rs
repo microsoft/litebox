@@ -138,7 +138,7 @@ impl UnixSocketAddr {
             UnixSocketAddr::Abstract(name) => Ok(UnixSocketAddress::Abstract(name.clone())),
             UnixSocketAddr::Path(path) => {
                 let absolute = task.absolute_name(path.as_str())?;
-                let resolved = task.fs.borrow().context.read().resolve(&absolute);
+                let resolved = litebox::fs::ResolvedPath::new(&absolute);
                 Ok(UnixSocketAddress::Path {
                     path: resolved.to_string(),
                     name: path.as_bytes().to_vec(),

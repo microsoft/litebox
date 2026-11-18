@@ -8,13 +8,13 @@ use crate::event::{
 };
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
-    HandleFilePathRequest, HandleFilePathResponse, HandleFileStatusRequest, IsTerminalFileRequest,
-    LockFileRequest, MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
-    RenameFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
-    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
+    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, RmdirFileRequest,
+    SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SetTimesFileRequest,
+    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -1122,7 +1122,7 @@ wire_enum! {
         /// Timestamp updates completed.
         SetTimes,
         /// Handle-path response.
-        HandlePath(HandleFilePathResponse),
+        HandlePath(FilePathResponse),
         /// Map response.
         Map(MapFileResponse),
         /// Terminal query response.

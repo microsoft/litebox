@@ -1557,6 +1557,7 @@ mod tests {
             .litebox()
             .open_file(
                 &litebox::fs::Context::new(),
+                None,
                 "/image",
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::NONE,
@@ -1921,6 +1922,7 @@ mod tests {
             .litebox
             .open_file(
                 &litebox::fs::Context::new(),
+                None,
                 "/image",
                 FileAccessMode::ReadWrite,
                 FileOpenFlags::NONE,

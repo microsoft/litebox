@@ -2360,11 +2360,11 @@ mod tar_ro {
                 Mode::empty(),
             )
             .unwrap();
-        assert_eq!(fs.handle_path(&bar).unwrap().path, "/bar");
+        assert_eq!(fs.handle_path(&bar).unwrap(), "/bar");
         let up = fs
             .open_at(USER, Some(&bar), "../..", OFlags::PATH, Mode::empty())
             .unwrap();
-        assert_eq!(fs.handle_path(&up).unwrap().path, "/");
+        assert_eq!(fs.handle_path(&up).unwrap(), "/");
         assert!(fs.file_status_at(USER, Some(&bar), "baz", true).is_ok());
     }
 }
@@ -2374,7 +2374,7 @@ mod overlay {
         FileType, InodeAllocator, Mode, OFlags, Overlay, Resolver, SeekWhence, TEST_TAR_FILE,
         TestPlatform, USER, UserInfo,
     };
-    use crate::fs::errors::{FileStatusError, OpenError, PathError, RmdirError};
+    use crate::fs::errors::{FileStatusError, OpenError, PathError, RmdirError, WalkError};
     use crate::fs::in_mem::{InMem, InitialNode};
     use alloc::vec;
     use alloc::vec::Vec;
@@ -3282,11 +3282,14 @@ mod overlay {
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(fs.file_status_at(user, Some(&bar), ".", true).is_ok());
-        assert!(fs.handle_path(&bar).unwrap().unlinked);
+        assert!(matches!(
+            fs.handle_path(&bar),
+            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
         let parent = fs
             .open_at(user, Some(&bar), "..", OFlags::PATH, Mode::empty())
             .unwrap();
-        assert_eq!(fs.handle_path(&parent).unwrap().path, "/");
+        assert_eq!(fs.handle_path(&parent).unwrap(), "/");
     }
 }
 

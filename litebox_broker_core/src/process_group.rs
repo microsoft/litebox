@@ -896,6 +896,7 @@ mod tests {
         let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
         crate::fs::open(
             process,
+            None,
             path,
             FileUser::ROOT,
             access,

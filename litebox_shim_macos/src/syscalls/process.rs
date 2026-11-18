@@ -194,7 +194,7 @@ impl<P: ShimPlatform> Task<P> {
         let status = self
             .global
             .litebox
-            .path_file_status(&context, path, true)
+            .path_file_status(&context, None, &super::file::from_cwd(path), true)
             .map_err(super::file::file_status_error)?;
         let mode = if !mode.intersects(AccessFlags::EXTENDED_MASK) {
             mode

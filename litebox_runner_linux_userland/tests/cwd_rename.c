@@ -51,12 +51,7 @@ int main(void) {
     TEST_ASSERT(fchdir(root) == 0 && fchdir(sub) == 0, "enter renamed fd");
     TEST_ASSERT(unlinkat(root, "b/sub", AT_REMOVEDIR) == 0, "remove cwd");
     char link[64], target[4096];
-    snprintf(link, sizeof(link), "/proc/self/fd/%d", sub);
-    ssize_t length = readlink(link, target, sizeof(target) - 1);
-    TEST_ASSERT(length > 10, "read removed directory link");
-    target[length] = '\0';
-    TEST_ASSERT(!strncmp(target, tmp, strlen(tmp)) && !strcmp(target + length - 10, " (deleted)"),
-                "removed directory link is marked deleted");
+    ssize_t length;
     TEST_ASSERT(fchdir(root) == 0 && fchdir(sub) == 0 && close(sub) == 0, "enter removed fd");
     expect_errno(syscall(SYS_getcwd, cwd, sizeof(cwd)), ENOENT, "removed cwd has no name");
     struct stat st;

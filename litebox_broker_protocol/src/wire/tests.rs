@@ -13,13 +13,13 @@ use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileLockOperation, FileMode,
     FileNodeInfo, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
     FileTimeUpdate, FileTimestamp, FileTimestamps, FileType, FileUser, HandleFilePathRequest,
-    HandleFilePathResponse, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
-    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest, SetTimesFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse,
+    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MapFileRequest,
+    MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, RmdirFileRequest, SeekFileRequest,
+    SeekFileResponse, SetFileTimes, SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    WriteFileResponse,
 };
 use crate::message::{
     BrokerOperation, BrokerResult, EventRequest, EventResponse, FileRequest, FileResponse,
@@ -1289,10 +1289,7 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::File(FileResponse::Mount),
         BrokerResult::File(FileResponse::Rmdir),
         BrokerResult::File(FileResponse::ReadLink(FilePathResponse { length: 31 })),
-        BrokerResult::File(FileResponse::HandlePath(HandleFilePathResponse {
-            length: 41,
-            unlinked: true,
-        })),
+        BrokerResult::File(FileResponse::HandlePath(FilePathResponse { length: 41 })),
         BrokerResult::File(FileResponse::Map(MapFileResponse {
             memory: SharedMemoryId((7 << 64) | 9),
             token: 11,

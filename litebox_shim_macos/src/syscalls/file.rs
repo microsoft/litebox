@@ -4,7 +4,7 @@
 //! Guest descriptor namespace and LiteBox file operations.
 
 use crate::{ShimPlatform, Task};
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 use litebox::{
     LiteBox,
@@ -91,6 +91,16 @@ fn dot_dot_parents(path: &str) -> Vec<String> {
         prefix.push_str(component);
     }
     parents
+}
+
+/// `path` named from the root, which is every guest's working directory, keeping its `.` and
+/// `..` components and any trailing slash for the lookup.
+pub(crate) fn from_cwd(path: &str) -> Cow<'_, str> {
+    if path.starts_with('/') {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(alloc::format!("/{path}"))
+    }
 }
 
 /// `path` relative to the root, which is every guest's working directory,
@@ -289,6 +299,8 @@ impl<P: ShimPlatform> Task<P> {
         if path.as_bytes().contains(&0) {
             return Err(Errno::EINVAL);
         }
+        let path = from_cwd(path);
+        let path = path.as_ref();
         if flags.bits() & !OpenFlags::all().bits() != 0 {
             return Err(Errno::EINVAL);
         }
@@ -338,7 +350,7 @@ impl<P: ShimPlatform> Task<P> {
             if flags.contains(OpenFlags::CREAT) {
                 self.global
                     .litebox
-                    .path_file_status(&context, path, true)
+                    .path_file_status(&context, None, path, true)
                     .map_err(file_status_error)?;
             }
             open_flags = open_flags.union(FileOpenFlags::DIRECTORY);
@@ -354,7 +366,7 @@ impl<P: ShimPlatform> Task<P> {
         let file = self
             .global
             .litebox
-            .open_file(&context, path, access, open_flags, mode)
+            .open_file(&context, None, path, access, open_flags, mode)
             .map_err(open_error)?;
         let mut descriptors = self.global.litebox.descriptor_table_mut();
         let fd = descriptors.insert::<FileSubsystem<P>>(File {
@@ -385,7 +397,7 @@ impl<P: ShimPlatform> Task<P> {
             let status = self
                 .global
                 .litebox
-                .path_file_status(context, &parent, true)
+                .path_file_status(context, None, &parent, true)
                 .map_err(file_status_error)?;
             if status.file_type != FileType::Directory {
                 return Err(Errno::ENOTDIR);
@@ -435,7 +447,7 @@ impl<P: ShimPlatform> Task<P> {
                     let status = self
                         .global
                         .litebox
-                        .path_file_status(context, &resolved, false)
+                        .path_file_status(context, None, &resolved, false)
                         .map_err(file_status_error)?;
                     match status.file_type {
                         FileType::Directory => {}
@@ -533,11 +545,12 @@ impl<P: ShimPlatform> Task<P> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
+        let path = from_cwd(path);
         let context = Self::fs_context(self.params.euid, self.params.egid)?;
         let status = self
             .global
             .litebox
-            .path_file_status(&context, path, follow || path.ends_with('/'))
+            .path_file_status(&context, None, &path, follow || path.ends_with('/'))
             .map_err(file_status_error)?;
         buffer
             .write_at_offset::<P>(0, Stat64::try_from(&status)?)
@@ -860,6 +873,8 @@ impl<P: ShimPlatform> Task<P> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
+        let path = from_cwd(path);
+        let path = path.as_ref();
         // NAMEI_NOFOLLOW_ANY fails on any link, even one named with a trailing slash.
         let follow = options & FSOPT_NOFOLLOW_ANY == 0
             && (options & FSOPT_NOFOLLOW == 0 || path.ends_with('/'));
@@ -875,7 +890,7 @@ impl<P: ShimPlatform> Task<P> {
         let status = self
             .global
             .litebox
-            .path_file_status(&context, path, follow)
+            .path_file_status(&context, None, path, follow)
             .map_err(file_status_error)?;
         if path.ends_with('/') && status.file_type != FileType::Directory {
             return Err(Errno::ENOTDIR);
@@ -1082,6 +1097,7 @@ mod tests {
             .litebox()
             .open_file(
                 &context,
+                None,
                 "/data",
                 FileAccessMode::ReadWrite,
                 FileOpenFlags::NONE,
@@ -1092,6 +1108,7 @@ mod tests {
             .litebox()
             .open_file(
                 &context,
+                None,
                 "/data",
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::NONE,
@@ -1483,6 +1500,7 @@ mod tests {
             .litebox()
             .open_file(
                 &litebox::fs::Context::new(),
+                None,
                 "/lib/libfoo.A.dylib",
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::NONE,

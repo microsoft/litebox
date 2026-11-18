@@ -10,12 +10,12 @@ use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
     FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
     FilePathResponse, FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest,
-    HandleFilePathResponse, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
-    MAX_FILE_TRANSFER_SIZE, MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest,
-    OpenFileName, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest,
-    ReadLinkFileRequest, RenameFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes,
-    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
+    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MAX_FILE_TRANSFER_SIZE,
+    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
+    RenameFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes, SetTimesFileRequest,
+    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -39,7 +39,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         clippy::too_many_arguments,
         reason = "one parameter per open request field, plus the path's shared buffer"
     )]
-    pub fn open_file_at(
+    pub fn open_file(
         &self,
         path_buffer: SharedBufferSequence,
         dir: Option<ObjectHandle>,
@@ -273,7 +273,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
-    pub fn path_file_status_at(
+    pub fn path_file_status(
         &self,
         path_buffer: SharedBufferSequence,
         dir: Option<ObjectHandle>,
@@ -384,7 +384,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
-    pub fn chmod_file_at(
+    pub fn chmod_file(
         &self,
         path_buffer: SharedBufferSequence,
         dir: Option<ObjectHandle>,
@@ -411,7 +411,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
-    pub fn chown_file_at(
+    pub fn chown_file(
         &self,
         path_buffer: SharedBufferSequence,
         dir: Option<ObjectHandle>,
@@ -440,7 +440,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
-    pub fn unlink_file_at(
+    pub fn unlink_file(
         &self,
         path_buffer: SharedBufferSequence,
         dir: Option<ObjectHandle>,
@@ -465,7 +465,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
-    pub fn rename_file_at(
+    pub fn rename_file(
         &self,
         paths_buffer: SharedBufferSequence,
         old_dir: Option<ObjectHandle>,
@@ -502,7 +502,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
-    pub fn mkdir_file_at(
+    pub fn mkdir_file(
         &self,
         path_buffer: SharedBufferSequence,
         dir: Option<ObjectHandle>,
@@ -552,7 +552,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
-    pub fn rmdir_file_at(
+    pub fn rmdir_file(
         &self,
         path_buffer: SharedBufferSequence,
         dir: Option<ObjectHandle>,
@@ -579,7 +579,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
-    pub fn symlink_file_at(
+    pub fn symlink_file(
         &self,
         buffer: SharedBufferSequence,
         target: &str,
@@ -617,7 +617,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation or an invalid target.
-    pub fn read_link_file_at(
+    pub fn read_link_file(
         &self,
         buffer: SharedBufferSequence,
         dir: Option<ObjectHandle>,
@@ -649,7 +649,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-    ) -> Result<FileOperationResult<OpenFileName>, Channel::Error> {
+    ) -> Result<FileOperationResult<String>, Channel::Error> {
         if buffer.length() > SHARED_BUFFER_SLOT_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -657,11 +657,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             handle,
             buffer,
         }))? {
-            FileResponse::HandlePath(HandleFilePathResponse { length, unlinked }) => {
-                Ok(Ok(OpenFileName {
-                    path: self.read_path_response_buffer(buffer, FilePathResponse { length })?,
-                    unlinked,
-                }))
+            FileResponse::HandlePath(response) => {
+                Ok(Ok(self.read_path_response_buffer(buffer, response)?))
             }
             FileResponse::Failed(error) => Ok(Err(error)),
             response => {
@@ -808,7 +805,7 @@ mod tests {
 
         assert_eq!(
             local
-                .open_file_at(
+                .open_file(
                     sequence([0], 5),
                     None,
                     "/file",
@@ -848,7 +845,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .path_file_status_at(sequence([3], 5), None, "/file", ROOT, true)
+                .path_file_status(sequence([3], 5), None, "/file", ROOT, true)
                 .unwrap(),
             Ok(status)
         );
@@ -921,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_at_keeps_each_directory_with_its_path() {
+    fn rename_keeps_each_directory_with_its_path() {
         let channel = ScriptedChannel::new([BrokerResult::File(FileResponse::Rename)]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = test_broker_local(channel, memory.clone());
@@ -931,7 +928,7 @@ mod tests {
 
         assert_eq!(
             local
-                .rename_file_at(paths, old_dir, "old", new_dir, "next", ROOT)
+                .rename_file(paths, old_dir, "old", new_dir, "next", ROOT)
                 .unwrap(),
             Ok(())
         );

@@ -2,10 +2,6 @@
 // Licensed under the MIT license.
 
 //! Broker fs requests, responses, and ABI-neutral values.
-//!
-//! For requests with directory handles, an absolute path uses `None` and a
-//! relative path uses `Some(directory)`. Rename applies this rule independently
-//! to each path. A symlink's target is stored verbatim and has no directory handle.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -659,27 +655,6 @@ wire_struct! {
         /// Length of the path written to the start of the request buffer.
         pub length: u32,
     }
-}
-
-wire_struct! {
-    /// Successful [`HandleFilePathRequest`] response.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct HandleFilePathResponse {
-        /// Length of the path written to the start of the request buffer.
-        pub length: u32,
-        /// The directory is no longer linked into the namespace, so the path is its last recorded
-        /// name rather than a current one.
-        pub unlinked: bool,
-    }
-}
-
-/// Name of an open file, as reported for a [`HandleFilePathRequest`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenFileName {
-    /// Absolute path.
-    pub path: String,
-    /// See [`HandleFilePathResponse::unlinked`].
-    pub unlinked: bool,
 }
 
 wire_struct! {

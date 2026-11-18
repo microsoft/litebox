@@ -504,12 +504,12 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         use litebox_common_linux::program_startup::InheritedCwd;
         let file = match cwd {
             InheritedCwd::Path(path) => {
-                fs.inherit_cwd(path)?;
-                if path == "/" {
-                    return Ok(());
+                if !path.starts_with('/') {
+                    return Err(Errno::EINVAL);
                 }
                 Arc::new(self.0.litebox.open_file(
                     &fs.context.read(),
+                    None,
                     path,
                     FileAccessMode::ReadOnly,
                     FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,

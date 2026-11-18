@@ -809,7 +809,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let mut summary = KeySummary::default();
         for entry in self
             .fs()
-            .read_file_directory(&self.fs_context, &key.path, &key.fd)
+            .read_file_directory(&key.path, &key.fd)
             .map_err(map_read_dir_error)?
         {
             if entry.file_type == FileType::Directory
@@ -829,7 +829,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         };
         let values = self
             .fs()
-            .read_file_directory(&self.fs_context, &values_path, &values_fd)
+            .read_file_directory(&values_path, &values_fd)
             .map_err(map_read_dir_error);
         drop(values_fd);
         for entry in values? {
@@ -890,7 +890,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let mut names = Vec::new();
         for entry in self
             .fs()
-            .read_file_directory(&self.fs_context, &key.path, &key.fd)
+            .read_file_directory(&key.path, &key.fd)
             .map_err(map_read_dir_error)?
         {
             if entry.file_type == FileType::Directory
@@ -942,7 +942,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         };
         let entries = self
             .fs()
-            .read_file_directory(&self.fs_context, &values_path, &values_fd)
+            .read_file_directory(&values_path, &values_fd)
             .map_err(map_read_dir_error);
         drop(values_fd);
         let mut names = Vec::new();
@@ -3280,7 +3280,12 @@ mod tests {
         let broker_fs = litebox;
         assert_eq!(
             broker_fs
-                .path_file_status(&litebox::fs::Context::new(), value_path.as_str(), true)
+                .path_file_status(
+                    &litebox::fs::Context::new(),
+                    None,
+                    value_path.as_str(),
+                    true
+                )
                 .unwrap()
                 .file_type,
             FileType::RegularFile

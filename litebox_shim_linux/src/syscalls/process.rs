@@ -1906,8 +1906,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let (fds, mut objects): (Vec<_>, Vec<_>) =
             self.fds_inherited_across_fork()?.into_iter().unzip();
+        let cwd = self.push_cwd_for_child(&mut objects)?;
         let fs = self.fs.borrow();
-        let cwd = fs.push_cwd_for_child(&mut objects);
         let umask = u32::from(fs.umask().bits());
         drop(fs);
         let (blocked_signals, signal_actions, alternate_signal_stack) = self.signals.fork_state();
@@ -3882,27 +3882,21 @@ const SHEBANG_MAX_RECURSION: u32 = 6;
 /// Maximum length of a shebang line that we inspect. Matches Linux `BINPRM_BUF_SIZE`.
 const SHEBANG_MAX_LINE: usize = 256;
 
-impl<P: ShimPlatform> crate::syscalls::file::FsState<P> {
-    /// Describes the working directory for a child. A held directory is appended to `objects`
-    /// and must stay last until [`assign_pushed_cwd_handle`] takes its inherited handle.
+impl<P: ShimPlatform> Task<P> {
+    /// Appends the working directory to the objects a child inherits. It must stay last until
+    /// [`assign_pushed_cwd_handle`] takes its inherited handle.
     fn push_cwd_for_child(
         &self,
         objects: &mut Vec<litebox::process::InheritableFd<P>>,
-    ) -> InheritedCwd {
-        if let Some(dir) = self.cwd_handle() {
-            objects.push(litebox::process::InheritableFd::File(dir));
-            // Same encoded size as the child's eventual handle, for the payload size check.
-            InheritedCwd::File(litebox_broker_protocol::ObjectHandle(0))
-        } else {
-            InheritedCwd::Path(alloc::string::ToString::to_string(
-                self.context.read().cwd(),
-            ))
-        }
+    ) -> Result<InheritedCwd, Errno> {
+        objects.push(litebox::process::InheritableFd::File(self.cwd_dir()?));
+        // Same encoded size as the child's eventual handle, for the payload size check.
+        Ok(InheritedCwd::File(litebox_broker_protocol::ObjectHandle(0)))
     }
 }
 
 /// Assigns the handle inherited for the object appended by
-/// [`FsState::push_cwd_for_child`](crate::syscalls::file::FsState), which is the last one.
+/// [`Task::push_cwd_for_child`], which is the last one.
 fn assign_pushed_cwd_handle(
     cwd: &mut InheritedCwd,
     handles: &mut Vec<litebox_broker_protocol::ObjectHandle>,
@@ -3995,8 +3989,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<usize, Errno> {
         let (inherited_fds, mut fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
             self.fds_inherited_across_exec()?.into_iter().unzip();
+        let cwd = self.push_cwd_for_child(&mut fds)?;
         let fs = self.fs.borrow();
-        let cwd = fs.push_cwd_for_child(&mut fds);
         let umask = u32::from(fs.umask().bits());
         drop(fs);
         let resource_limits = self
@@ -6519,7 +6513,7 @@ mod fork_tests {
             let renamed = "/renamed-startup-cwd";
             shim.0
                 .litebox
-                .mkdir_file(&fs.context.read(), path, FileMode::RWXU)
+                .mkdir_file(&fs.context.read(), None, path, FileMode::RWXU)
                 .unwrap();
             shim.restore_cwd(
                 &fs,
@@ -6530,7 +6524,7 @@ mod fork_tests {
             .unwrap();
             shim.0
                 .litebox
-                .rename_file(&fs.context.read(), path, renamed)
+                .rename_file(&fs.context.read(), None, path, None, renamed)
                 .unwrap();
             assert_eq!(fs.cwd_handle().unwrap().path().unwrap(), renamed);
         });

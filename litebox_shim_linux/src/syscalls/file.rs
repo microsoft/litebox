@@ -3,11 +3,7 @@
 
 //! Implementation of file related syscalls, e.g., `open`, `read`, `write`, etc.
 
-use alloc::{
-    ffi::CString,
-    string::{String, ToString as _},
-    vec,
-};
+use alloc::{ffi::CString, string::String, vec};
 use litebox::{
     event::{
         Events, IOPollable,
@@ -141,14 +137,9 @@ impl<Platform: ShimPlatform> File<Platform> {
         Ok(self.file.status()?)
     }
 
-    /// Target of the file's `/proc/self/fd` link. Like Linux, an unlinked directory is named by
-    /// its last path with a ` (deleted)` suffix.
-    pub(crate) fn proc_fd_link(&self) -> Result<String, Errno> {
-        let name = self.file.name()?;
-        if name.unlinked {
-            return Ok(alloc::format!("{} (deleted)", name.path));
-        }
-        Ok(name.path)
+    /// The current name of a directory, or the name a file was opened by.
+    pub(crate) fn path(&self) -> Result<String, Errno> {
+        Ok(self.file.path()?)
     }
 
     /// Controls the shared terminal, waiting interruptibly for output-draining operations.
@@ -351,18 +342,6 @@ impl<Platform: ShimPlatform> FsState<Platform> {
     pub(crate) fn set_umask(&self, umask: u32) -> Mode {
         let umask = Mode::from_u32_bits_truncate(umask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
         Mode::from_u32_bits_truncate(self.umask.swap(umask.bits().into(), Ordering::Relaxed))
-    }
-
-    /// Moves to the absolute path `cwd` without checking it, as a program keeps the working
-    /// directory it inherits.
-    pub(crate) fn inherit_cwd(&self, cwd: &str) -> Result<(), Errno> {
-        if !cwd.starts_with('/') {
-            return Err(Errno::EINVAL);
-        }
-        let mut context = self.context.write();
-        let cwd = context.resolve(cwd);
-        context.set_cwd(cwd);
-        Ok(())
     }
 }
 
@@ -1034,22 +1013,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.fs.borrow().umask()
     }
 
-    /// The working directory, pinned by its inherited name on first use.
-    fn cwd_dir(&self) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
+    /// The working directory. A task that was not started with one is at the root.
+    pub(super) fn cwd_dir(&self) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
         let fs = self.fs.borrow();
         if let Some(dir) = fs.cwd_handle() {
             return Ok(dir);
         }
-        let dir = {
-            let context = fs.context.read();
-            self.global.litebox.open_file(
-                &context,
-                &context.cwd().to_string(),
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
-                Mode::empty(),
-            )?
-        };
+        let dir = self.global.litebox.open_file(
+            &fs.context.read(),
+            None,
+            "/",
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+            Mode::empty(),
+        )?;
         Ok(fs.pin_cwd(Arc::new(dir)))
     }
 
@@ -1163,7 +1140,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let file = self
             .global
             .litebox
-            .open_file_at(&context, dir, path, access, open_flags, mode)
+            .open_file(&context, dir, path, access, open_flags, mode)
             .map_err(Errno::from)?;
         if flags.intersects(OFlags::WRONLY | OFlags::RDWR)
             && !flags.contains(OFlags::PATH)
@@ -1267,7 +1244,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let context = fs.context.read();
         self.global
             .litebox
-            .symlink_file_at(target, &context, linkpath.dir.as_deref(), &linkpath.path)
+            .symlink_file(target, &context, linkpath.dir.as_deref(), &linkpath.path)
             .map_err(Errno::from)
     }
 
@@ -1278,7 +1255,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let context = fs.context.read();
         self.global
             .litebox
-            .chmod_file_at(
+            .chmod_file(
                 &context,
                 path.dir.as_deref(),
                 &path.path,
@@ -1473,7 +1450,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let context = fs.context.read();
         self.global
             .litebox
-            .chown_file_at(&context, path.dir.as_deref(), &path.path, owner, group)
+            .chown_file(&context, path.dir.as_deref(), &path.path, owner, group)
             .map_err(Errno::from)
     }
 
@@ -1555,7 +1532,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let context = fs.context.read();
         self.global
             .litebox
-            .rename_file_at(
+            .rename_file(
                 &context,
                 oldpath.dir.as_deref(),
                 &oldpath.path,
@@ -1582,12 +1559,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if flags.contains(AtFlags::AT_REMOVEDIR) {
             self.global
                 .litebox
-                .rmdir_file_at(&context, path.dir.as_deref(), &path.path)
+                .rmdir_file(&context, path.dir.as_deref(), &path.path)
                 .map_err(Errno::from)
         } else {
             self.global
                 .litebox
-                .unlink_file_at(&context, path.dir.as_deref(), &path.path)
+                .unlink_file(&context, path.dir.as_deref(), &path.path)
                 .map_err(Errno::from)
         }
     }
@@ -1954,7 +1931,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let context = fs.context.read();
         self.global
             .litebox
-            .mkdir_file_at(&context, pathname.dir.as_deref(), &pathname.path, mode)
+            .mkdir_file(&context, pathname.dir.as_deref(), &pathname.path, mode)
             .map_err(Errno::from)
     }
 
@@ -2450,7 +2427,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let context = fs.context.read();
             self.global
                 .litebox
-                .path_file_status_at(&context, dir, pathname, follow_symlink)?
+                .path_file_status(&context, dir, pathname, follow_symlink)?
         };
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
@@ -2536,8 +2513,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
         if let Some(fd) = self.proc_self_fd(fullpath) {
             // Like Linux, a non-file descriptor names its kind; the inode numbers match `fstat`.
+            // XXX: a removed directory fails with ENOENT; Linux names it "<path> (deleted)".
             return fd?.dispatch(
-                |fd| self.global.with_file(fd, File::proc_fd_link),
+                |fd| self.global.with_file(fd, File::path),
                 |_fd| Ok("socket:[0]".into()),
                 |_fd| Ok("pipe:[0]".into()),
                 |_fd| Ok("anon_inode:[eventfd]".into()),
@@ -2551,7 +2529,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let fs = self.fs.borrow();
         let context = fs.context.read();
-        Ok(self.global.litebox.read_link_file(&context, fullpath)?)
+        Ok(self
+            .global
+            .litebox
+            .read_link_file(&context, None, fullpath)?)
     }
 
     /// Handle syscall `readlink`
@@ -2574,7 +2555,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let context = fs.context.read();
             self.global
                 .litebox
-                .read_link_file_at(&context, Some(dir), &pathname.path)?
+                .read_link_file(&context, Some(dir), &pathname.path)?
         } else {
             self.do_readlink(&pathname.path)?
         };
@@ -2681,7 +2662,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let context = fs.context.read();
             self.global
                 .litebox
-                .path_file_status(&context, pathname, follow_symlink)?
+                .path_file_status(&context, None, pathname, follow_symlink)?
         };
         T::try_from(status)
     }
@@ -2743,7 +2724,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 let fs = self.fs.borrow();
                 let context = fs.context.read();
-                T::try_from(self.global.litebox.path_file_status_at(
+                T::try_from(self.global.litebox.path_file_status(
                     &context,
                     path.dir.as_deref(),
                     &path.path,

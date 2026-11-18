@@ -164,6 +164,7 @@ fn filesystem_loader_runs_linked_static_macho() {
         .litebox()
         .open_file(
             &litebox::fs::Context::new(),
+            None,
             "/bin/main",
             FileAccessMode::ReadOnly,
             FileOpenFlags::NONE,

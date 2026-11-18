@@ -1157,7 +1157,7 @@ fn nine_p_held_directories_name_and_walk() {
     fs.mkdir(USER, "/d", Mode::RWXU).unwrap();
     fs.mkdir(USER, "/d/sub", Mode::RWXU).unwrap();
     let root = fs.open(USER, "/", OFlags::PATH, Mode::empty()).unwrap();
-    assert_eq!(fs.handle_path(&root).unwrap().path, "/");
+    assert_eq!(fs.handle_path(&root).unwrap(), "/");
     // 9P cannot name other directories, so they report the name they were opened by.
     let sub = fs
         .open(
@@ -1167,8 +1167,7 @@ fn nine_p_held_directories_name_and_walk() {
             Mode::empty(),
         )
         .unwrap();
-    let name = fs.handle_path(&sub).unwrap();
-    assert_eq!((name.path.as_str(), name.unlinked), ("/d/sub", false));
+    assert_eq!(fs.handle_path(&sub).unwrap(), "/d/sub");
     // A directory opened for reading still walks relative paths and lists afterwards.
     drop(
         fs.open_at(

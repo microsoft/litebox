@@ -695,11 +695,11 @@ mod cli_tests {
         .unwrap();
 
         assert!(matches!(
-            fs.mkdir("/rw/new", UserInfo::ROOT, Mode::RWXU),
+            fs.mkdir(None, "/rw/new", UserInfo::ROOT, Mode::RWXU),
             Ok(Ok(()))
         ));
         assert!(matches!(
-            fs.mkdir("/ro/new", UserInfo::ROOT, Mode::RWXU),
+            fs.mkdir(None, "/ro/new", UserInfo::ROOT, Mode::RWXU),
             Ok(Err(FileError::ReadOnlyFs))
         ));
         assert!(writable.path().join("new").is_dir());

@@ -13,7 +13,7 @@ use litebox::fs::errors::ChmodError;
 use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, RmdirError, UnlinkError,
 };
-use litebox::fs::{Context, File};
+use litebox::fs::{Context, File, ResolvedPath};
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags, FileStatus,
 };
@@ -28,8 +28,8 @@ enum Namespace {
 }
 
 impl Namespace {
-    fn resolve_path(self, context: &Context, path: &str) -> Result<String, PathError> {
-        let path = context.resolve(path).to_string();
+    fn resolve_path(self, path: &str) -> Result<String, PathError> {
+        let path = ResolvedPath::new(path).to_string();
         match (self, is_registry_path(&path)) {
             (Self::Regular, false) | (Self::Registry, true) => Ok(path),
             (Self::Regular, true) => Err(PathError::MissingComponent),
@@ -37,8 +37,8 @@ impl Namespace {
         }
     }
 
-    fn hides_registry_entry(self, context: &Context, directory_path: &str) -> bool {
-        self == Self::Regular && context.resolve(directory_path).to_string() == "/"
+    fn hides_registry_entry(self, directory_path: &str) -> bool {
+        self == Self::Regular && ResolvedPath::new(directory_path).to_string() == "/"
     }
 }
 
@@ -63,8 +63,8 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         }
     }
 
-    fn resolve_path(&self, context: &Context, path: &str) -> Result<String, PathError> {
-        self.namespace.resolve_path(context, path)
+    fn resolve_path(&self, path: &str) -> Result<String, PathError> {
+        self.namespace.resolve_path(path)
     }
 
     pub(crate) fn open_file(
@@ -75,19 +75,18 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         flags: FileOpenFlags,
         mode: FileMode,
     ) -> Result<File<Platform>, OpenError> {
-        let path = self.resolve_path(context, path)?;
+        let path = self.resolve_path(path)?;
         self.litebox
-            .open_file(context, path.as_str(), access, flags, mode)
+            .open_file(context, None, path.as_str(), access, flags, mode)
     }
 
     pub(crate) fn read_file_directory(
         &self,
-        context: &Context,
         directory_path: &str,
         file: &File<Platform>,
     ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         let mut entries = file.read_directory()?;
-        if self.namespace.hides_registry_entry(context, directory_path) {
+        if self.namespace.hides_registry_entry(directory_path) {
             entries.retain(|entry| !is_registry_root_name(&entry.name));
         }
         Ok(entries)
@@ -98,8 +97,9 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         context: &Context,
         path: &str,
     ) -> Result<FileStatus, FileStatusError> {
-        let path = self.resolve_path(context, path)?;
-        self.litebox.path_file_status(context, path.as_str(), true)
+        let path = self.resolve_path(path)?;
+        self.litebox
+            .path_file_status(context, None, path.as_str(), true)
     }
 
     #[cfg(test)]
@@ -109,13 +109,13 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         path: &str,
         mode: FileMode,
     ) -> Result<(), ChmodError> {
-        let path = self.resolve_path(context, path)?;
-        self.litebox.chmod_file(context, path.as_str(), mode)
+        let path = self.resolve_path(path)?;
+        self.litebox.chmod_file(context, None, path.as_str(), mode)
     }
 
     pub(crate) fn unlink_file(&self, context: &Context, path: &str) -> Result<(), UnlinkError> {
-        let path = self.resolve_path(context, path)?;
-        self.litebox.unlink_file(context, path.as_str())
+        let path = self.resolve_path(path)?;
+        self.litebox.unlink_file(context, None, path.as_str())
     }
 
     pub(crate) fn mkdir_file(
@@ -124,13 +124,13 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         path: &str,
         mode: FileMode,
     ) -> Result<(), MkdirError> {
-        let path = self.resolve_path(context, path)?;
-        self.litebox.mkdir_file(context, path.as_str(), mode)
+        let path = self.resolve_path(path)?;
+        self.litebox.mkdir_file(context, None, path.as_str(), mode)
     }
 
     pub(crate) fn rmdir_file(&self, context: &Context, path: &str) -> Result<(), RmdirError> {
-        let path = self.resolve_path(context, path)?;
-        self.litebox.rmdir_file(context, path.as_str())
+        let path = self.resolve_path(path)?;
+        self.litebox.rmdir_file(context, None, path.as_str())
     }
 }
 
@@ -150,38 +150,32 @@ mod tests {
 
     #[test]
     fn namespace_path_resolution_is_symmetric() {
-        let context = Context::new();
-
         assert_eq!(
-            Namespace::Regular
-                .resolve_path(&context, "/tmp/../file")
-                .unwrap(),
+            Namespace::Regular.resolve_path("/tmp/../file").unwrap(),
             "/file"
         );
         assert!(matches!(
-            Namespace::Regular.resolve_path(&context, "/tmp/../Registry/machine"),
+            Namespace::Regular.resolve_path("/tmp/../Registry/machine"),
             Err(PathError::MissingComponent)
         ));
         assert_eq!(
             Namespace::Registry
-                .resolve_path(&context, "/tmp/../Registry/machine")
+                .resolve_path("/tmp/../Registry/machine")
                 .unwrap(),
             "/Registry/machine"
         );
         assert!(matches!(
-            Namespace::Registry.resolve_path(&context, "/tmp"),
+            Namespace::Registry.resolve_path("/tmp"),
             Err(PathError::InvalidPathname)
         ));
     }
 
     #[test]
     fn regular_namespace_hides_registry_for_root_aliases() {
-        let context = Context::new();
-
         for path in ["/", "/.", "//", "/tmp/..", "."] {
-            assert!(Namespace::Regular.hides_registry_entry(&context, path));
+            assert!(Namespace::Regular.hides_registry_entry(path));
         }
-        assert!(!Namespace::Regular.hides_registry_entry(&context, "/tmp"));
-        assert!(!Namespace::Registry.hides_registry_entry(&context, "/registry"));
+        assert!(!Namespace::Regular.hides_registry_entry("/tmp"));
+        assert!(!Namespace::Registry.hides_registry_entry("/registry"));
     }
 }

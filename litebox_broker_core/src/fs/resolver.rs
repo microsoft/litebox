@@ -10,7 +10,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use litebox_broker_protocol::fs::{FileLockOperation, OpenFileName};
+use litebox_broker_protocol::fs::FileLockOperation;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::RawSyncPrimitivesProvider;
 
@@ -1673,21 +1673,14 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// Returns the current physical name of a directory, or the name a file was opened by.
     ///
     /// A file opened relative to a directory is named under that directory's current name. An
-    /// unlinked directory reports its recorded name with [`OpenFileName::unlinked`] set.
-    pub fn handle_path(&self, entry: &ResolverEntry<Backend>) -> Result<OpenFileName, WalkError> {
-        let name = |path, unlinked| OpenFileName { path, unlinked };
+    /// unlinked directory has no name.
+    pub fn handle_path(&self, entry: &ResolverEntry<Backend>) -> Result<String, WalkError> {
         match &entry.handle {
-            Handle::Dir(dir) => match self.backend.dir_path(dir) {
-                Ok(Some(components)) => {
-                    Ok(name(ResolvedPath::join(String::new(), &components), false))
-                }
-                Ok(None) => Ok(name(self.opened_name(entry)?, false)),
-                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
-                    Ok(name(entry.path.clone(), true))
-                }
-                Err(error) => Err(error),
+            Handle::Dir(dir) => match self.backend.dir_path(dir)? {
+                Some(components) => Ok(ResolvedPath::join(String::new(), &components)),
+                None => self.opened_name(entry),
             },
-            Handle::File(_) => Ok(name(self.opened_name(entry)?, false)),
+            Handle::File(_) => self.opened_name(entry),
         }
     }
 
@@ -1935,7 +1928,7 @@ mod tests {
         let mode = Mode::RWXU;
         let open = |path| fs.open(user, path, OFlags::PATH, mode).unwrap();
         for path in ["/", "/bridge", "/bridge/fs", "/bridge/fs/nested"] {
-            assert_eq!(fs.handle_path(&open(path)).unwrap().path, path);
+            assert_eq!(fs.handle_path(&open(path)).unwrap(), path);
         }
         fs.mkdir(user, "/bridge/fs/old", mode).unwrap();
         fs.mkdir(user, "/bridge/fs/old/child", mode).unwrap();
@@ -1955,11 +1948,11 @@ mod tests {
         fs.rename(user, "/bridge/fs/old", "/bridge/fs/moved")
             .unwrap();
         fs.mkdir(user, "/bridge/fs/old", mode).unwrap();
-        assert_eq!(fs.handle_path(&dir).unwrap().path, "/bridge/fs/moved/child");
-        assert_eq!(fs.handle_path(&file).unwrap().path, "/bridge/fs/old/file");
+        assert_eq!(fs.handle_path(&dir).unwrap(), "/bridge/fs/moved/child");
+        assert_eq!(fs.handle_path(&file).unwrap(), "/bridge/fs/old/file");
         // A file opened relative to a directory is named under the directory's current name.
         assert_eq!(
-            fs.handle_path(&anchored).unwrap().path,
+            fs.handle_path(&anchored).unwrap(),
             "/bridge/fs/moved/anchored"
         );
 
@@ -1976,13 +1969,10 @@ mod tests {
         );
         fs.rmdir(user, "/bridge/fs/promoted").unwrap();
         fs.mkdir(user, "/bridge/fs/promoted", mode).unwrap();
-        assert_eq!(
-            fs.handle_path(&dir).unwrap(),
-            OpenFileName {
-                path: "/bridge/fs/old/child".into(),
-                unlinked: true
-            }
-        );
+        assert!(matches!(
+            fs.handle_path(&dir),
+            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
     }
 
     #[test]
@@ -2005,13 +1995,10 @@ mod tests {
         let parent = fs
             .open_at(user, Some(&child), "..", OFlags::PATH, mode)
             .unwrap();
-        assert_eq!(
-            fs.handle_path(&parent).unwrap(),
-            OpenFileName {
-                path: "/parent".into(),
-                unlinked: true
-            }
-        );
+        assert!(matches!(
+            fs.handle_path(&parent),
+            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
         assert!(
             fs.open_at(user, Some(&parent), "nested", OFlags::PATH, mode)
                 .is_err()
@@ -2019,7 +2006,7 @@ mod tests {
         let nested = fs
             .open_at(user, Some(&parent), "../nested", OFlags::PATH, mode)
             .unwrap();
-        assert_eq!(fs.handle_path(&nested).unwrap().path, "/nested");
+        assert_eq!(fs.handle_path(&nested).unwrap(), "/nested");
     }
 
     #[test]
@@ -2201,7 +2188,7 @@ mod tests {
         let up = fs
             .open_at(user, Some(&m), "..", OFlags::PATH, mode)
             .unwrap();
-        assert_eq!(fs.handle_path(&up).unwrap().path, "/");
+        assert_eq!(fs.handle_path(&up).unwrap(), "/");
         let outer = fs
             .open_at(user, Some(&m), "../outer", OFlags::PATH, mode)
             .unwrap();
@@ -2212,7 +2199,7 @@ mod tests {
         let top = fs
             .open_at(user, Some(&m), "../../..", OFlags::PATH, mode)
             .unwrap();
-        assert_eq!(fs.handle_path(&top).unwrap().path, "/");
+        assert_eq!(fs.handle_path(&top).unwrap(), "/");
     }
 
     #[test]
