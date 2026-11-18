@@ -5,7 +5,7 @@
 //!
 //! To run locally, put LLVM's `bin` directory on PATH and run
 //! `bash dev_tools/setup_windows_linux_sysroot.sh` from the repository root.
-//! To use an existing Debian x86-64 sysroot instead, set `LITEBOX_LINUX_SYSROOT`.
+//! To use an existing Debian x86-64 sysroot with `libgcc-12-dev` instead, set `LITEBOX_LINUX_SYSROOT`.
 //! Each test cross-compiles its own guests; neither Docker nor WSL is required.
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -837,6 +837,12 @@ fn build_c_guest(name: &str, suite: &str, flags: &[&str]) -> std::path::PathBuf 
     std::fs::create_dir_all(&dir).unwrap();
     let guest = dir.join(name);
     let root = linux_sysroot();
+    let gcc = root.join("usr/lib/gcc/x86_64-linux-gnu/12");
+    assert!(
+        gcc.join("libgcc.a").is_file(),
+        "Linux sysroot is missing libgcc-12-dev at {}",
+        gcc.display()
+    );
     let mut clang = std::process::Command::new("clang");
     clang
         .args([
@@ -846,10 +852,7 @@ fn build_c_guest(name: &str, suite: &str, flags: &[&str]) -> std::path::PathBuf 
             "-static-libgcc",
         ])
         .arg(format!("--sysroot={}", root.display()))
-        .arg(format!(
-            "--gcc-install-dir={}/usr/lib/gcc/x86_64-linux-gnu/12",
-            root.display()
-        ));
+        .arg(format!("--gcc-install-dir={}", gcc.display()));
     let status = clang
         .args(flags)
         .arg(source)

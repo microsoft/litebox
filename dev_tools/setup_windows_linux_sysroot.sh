@@ -1,12 +1,18 @@
-#!/usr/bin/env bash
+#! /bin/bash
+
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
 # Requires curl, llvm-ar, tar, awk, and GNU coreutils.
 set -euo pipefail
+recipe=$(sha256sum < "$0")
 cd "$(dirname "$0")/.."
 mkdir -p target
 if [[ -d target/linux-sysroot ]]; then
+    if [[ ! -f target/linux-sysroot/.recipe || $(<target/linux-sysroot/.recipe) != "$recipe" ]]; then
+        echo "Existing target/linux-sysroot does not match this recipe; move it aside and rerun setup." >&2
+        exit 1
+    fi
     echo "Using existing target/linux-sysroot"
     exit 0
 fi
@@ -31,4 +37,5 @@ PACKAGES
 # libc.so's linker script expects the loader at /lib64 as well.
 mkdir -p root/lib64
 cp root/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 root/lib64/
+printf '%s\n' "$recipe" > root/.recipe
 mv -T root ../linux-sysroot
