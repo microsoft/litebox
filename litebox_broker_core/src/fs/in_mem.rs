@@ -458,6 +458,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         ))
     }
 
+    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        // Search permissions are enforced by the resolver.
+        Ok(())
+    }
+
     fn walking_dir_at<'a>(&'a self, dir: &super::backend::DirHandle) -> Option<ResolvedDir<'a>> {
         Some(Self::resolved_dir(InMemDirHandle {
             dir: dir.get_typed::<Self>().dir.clone(),
@@ -465,7 +470,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }))
     }
 
-    fn dir_path(&self, dir: &super::backend::DirHandle) -> Result<Vec<String>, WalkError> {
+    fn dir_path(&self, dir: &super::backend::DirHandle) -> Result<Option<Vec<String>>, WalkError> {
         let _rename = self.rename_lock.lock();
         let mut child = dir.get_typed::<Self>().dir.clone();
         let mut path = Vec::new();
@@ -488,7 +493,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             child = parent;
         }
         path.reverse();
-        Ok(path)
+        Ok(Some(path))
     }
 
     fn parent_dir(

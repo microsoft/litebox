@@ -74,33 +74,25 @@ fn open_directory(path: &Path) -> io::Result<File> {
 }
 
 impl Location {
-    /// Ask the kernel for the directory's name without reopening any of its ancestors.
+    /// The directory's current host name, or `NotFound` once it has been removed.
     pub(super) fn directory_name(&self) -> io::Result<PathBuf> {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::MetadataExt;
-            #[cfg(target_os = "linux")]
-            let (file, name) = (&self.pin, self.host_name()?);
-            #[cfg(target_os = "macos")]
-            let (file, name) = {
-                use std::os::unix::ffi::OsStringExt;
-                let file = &self.directory.file;
-                let path = rustix::fs::getpath(file)?;
-                (
-                    file,
-                    PathBuf::from(std::ffi::OsString::from_vec(path.into_bytes())),
-                )
-            };
-            // Linux's procfs suffix " (deleted)" can also be part of a legitimate name.
-            if file.metadata()?.nlink() == 0 {
+            // Ask the kernel without reopening any ancestor. Its procfs suffix " (deleted)" can
+            // also be part of a legitimate name.
+            let name = self.host_name()?;
+            if self.pin.metadata()?.nlink() == 0 {
                 return Err(io::ErrorKind::NotFound.into());
             }
             Ok(name)
         }
-        #[cfg(windows)]
+        // Other hosts name directories by path. Windows holds the directory and its ancestors
+        // without FILE_SHARE_DELETE; other Unix hosts reject a stale name for every operation,
+        // so a moved directory has no name.
+        #[cfg(not(target_os = "linux"))]
         {
-            // The directory and all its ancestors are held without FILE_SHARE_DELETE.
-            Ok(self.path.clone())
+            self.host_name()
         }
     }
 }
@@ -220,6 +212,8 @@ impl Location {
         self.pin.metadata()
     }
 
+    /// The kernel's name for the pinned file, for containment checks. Unlike
+    /// [`Self::directory_name`], an unlinked directory keeps a ` (deleted)` suffix.
     pub(super) fn host_name(&self) -> io::Result<PathBuf> {
         fs::read_link(&self.path)
     }
@@ -250,7 +244,8 @@ impl Location {
             flags,
             Mode::empty(),
         )?)));
-        if !parent.host_name()?.starts_with(root.host_name()?) {
+        // A root moved since `root_name` was read fails this check closed.
+        if !parent.host_name()?.starts_with(&root_name) {
             return Err(super::invalid_path());
         }
         Ok(Some(parent))
@@ -297,19 +292,18 @@ fn directory_pins_preclude_ancestor_replacement() {
 impl Location {
     fn lock_dir(path: &Path) -> io::Result<Arc<File>> {
         use super::win_flags::{
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
         };
-        use std::os::windows::fs::MetadataExt as _;
         use std::os::windows::fs::OpenOptionsExt as _;
-        let pin = fs::OpenOptions::new()
-            // A metadata-only open does not participate in the I/O manager's sharing check.
-            .access_mode(FILE_TRAVERSE)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        let meta = pin.metadata()?;
-        if !meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        let (pin, metadata) = super::open_no_reparse(
+            fs::OpenOptions::new()
+                // A metadata-only open does not participate in the I/O manager's sharing check.
+                .access_mode(FILE_TRAVERSE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE),
+            FILE_FLAG_BACKUP_SEMANTICS,
+            path,
+        )?;
+        if !metadata.is_dir() {
             return Err(super::invalid_path());
         }
         Ok(Arc::new(pin))

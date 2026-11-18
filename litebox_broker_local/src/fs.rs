@@ -10,10 +10,10 @@ use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
     FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
     FilePathResponse, FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest,
-    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MAX_FILE_TRANSFER_SIZE,
-    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes,
+    HandleFilePathResponse, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
+    MAX_FILE_TRANSFER_SIZE, MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest,
+    OpenFileName, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest,
+    ReadLinkFileRequest, RenameFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes,
     SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
     UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
 };
@@ -29,31 +29,16 @@ type FileOperationResult<T> = core::result::Result<T, FileError>;
 type DirectoryReadResult = FileOperationResult<(Vec<FileDirectoryEntry>, Option<u64>)>;
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Opens an absolute fs path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn open_file(
-        &self,
-        path_buffer: SharedBufferSequence,
-        path: &str,
-        user: FileUser,
-        access: FileAccessMode,
-        flags: FileOpenFlags,
-        mode: FileMode,
-    ) -> Result<FileOperationResult<ObjectHandle>, Channel::Error> {
-        self.open_file_at(path_buffer, None, path, user, access, flags, mode)
-    }
-
     /// Opens an optionally anchored fs path.
     ///
     /// # Panics
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per open request field, plus the path's shared buffer"
+    )]
     pub fn open_file_at(
         &self,
         path_buffer: SharedBufferSequence,
@@ -282,22 +267,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Returns status for an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn path_file_status(
-        &self,
-        path_buffer: SharedBufferSequence,
-        path: &str,
-        user: FileUser,
-        follow_symlinks: bool,
-    ) -> Result<FileOperationResult<FileStatus>, Channel::Error> {
-        self.path_file_status_at(path_buffer, None, path, user, follow_symlinks)
-    }
-
     /// Returns status for an optionally anchored path.
     ///
     /// # Panics
@@ -409,22 +378,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Changes mode bits for an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn chmod_file(
-        &self,
-        path_buffer: SharedBufferSequence,
-        path: &str,
-        user: FileUser,
-        mode: FileMode,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.chmod_file_at(path_buffer, None, path, user, mode)
-    }
-
     /// Changes mode bits for an optionally anchored path.
     ///
     /// # Panics
@@ -450,23 +403,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file chmod response: {response:?}"),
         }
-    }
-
-    /// Changes ownership for an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn chown_file(
-        &self,
-        path_buffer: SharedBufferSequence,
-        path: &str,
-        acting_user: FileUser,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.chown_file_at(path_buffer, None, path, acting_user, user, group)
     }
 
     /// Changes ownership for an optionally anchored path.
@@ -498,21 +434,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Removes a file at an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn unlink_file(
-        &self,
-        path_buffer: SharedBufferSequence,
-        path: &str,
-        user: FileUser,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.unlink_file_at(path_buffer, None, path, user)
-    }
-
     /// Removes a file at an optionally anchored path.
     ///
     /// # Panics
@@ -536,22 +457,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file unlink response: {response:?}"),
         }
-    }
-
-    /// Renames a file or directory between absolute paths.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn rename_file(
-        &self,
-        paths_buffer: SharedBufferSequence,
-        old_path: &str,
-        new_path: &str,
-        user: FileUser,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.rename_file_at(paths_buffer, None, old_path, None, new_path, user)
     }
 
     /// Renames a file or directory between optionally anchored paths.
@@ -589,22 +494,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file rename response: {response:?}"),
         }
-    }
-
-    /// Creates a directory at an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn mkdir_file(
-        &self,
-        path_buffer: SharedBufferSequence,
-        path: &str,
-        user: FileUser,
-        mode: FileMode,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.mkdir_file_at(path_buffer, None, path, user, mode)
     }
 
     /// Creates a directory at an optionally anchored path.
@@ -657,21 +546,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Removes a directory at an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn rmdir_file(
-        &self,
-        path_buffer: SharedBufferSequence,
-        path: &str,
-        user: FileUser,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.rmdir_file_at(path_buffer, None, path, user)
-    }
-
     /// Removes a directory at an optionally anchored path.
     ///
     /// # Panics
@@ -695,24 +569,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file rmdir response: {response:?}"),
         }
-    }
-
-    /// Creates a symbolic link at an absolute `linkpath`, storing `target` verbatim.
-    ///
-    /// `buffer` must exactly fit the linkpath followed by the target, within one slot.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn symlink_file(
-        &self,
-        buffer: SharedBufferSequence,
-        target: &str,
-        linkpath: &str,
-        user: FileUser,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.symlink_file_at(buffer, target, None, linkpath, user)
     }
 
     /// Creates a symbolic link at an optionally anchored `linkpath`, storing `target` verbatim.
@@ -753,23 +609,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Reads the target of the symbolic link at an absolute path.
-    ///
-    /// `buffer` carries the path to the broker and the target back, so it must fit both.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation or an invalid target.
-    pub fn read_link_file(
-        &self,
-        buffer: SharedBufferSequence,
-        path: &str,
-        user: FileUser,
-    ) -> Result<FileOperationResult<String>, Channel::Error> {
-        self.read_link_file_at(buffer, None, path, user)
-    }
-
     /// Reads the target of the symbolic link at an optionally anchored path.
     ///
     /// `buffer` carries the path to the broker and the target back, so it must fit both.
@@ -800,37 +639,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Resolves an absolute path to its physical location, following symbolic links.
-    ///
-    /// `buffer` carries the path to the broker and the resolved path back, so it must fit both.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation or an invalid path.
-    pub fn resolve_file_path(
-        &self,
-        buffer: SharedBufferSequence,
-        path: &str,
-        user: FileUser,
-    ) -> Result<FileOperationResult<String>, Channel::Error> {
-        let path_length = self.write_path_query_buffer(buffer, path)?;
-        match self.request_file(FileRequest::ResolvePath(ResolvePathFileRequest {
-            buffer,
-            path_length,
-            user,
-        }))? {
-            FileResponse::ResolvePath(response) => {
-                Ok(Ok(self.read_path_response_buffer(buffer, response)?))
-            }
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => {
-                panic!("broker returned unexpected file resolve-path response: {response:?}")
-            }
-        }
-    }
-
-    /// Reads the current physical absolute path of a directory, or the open-time name of a file.
+    /// Reads the name of an open file; see [`HandleFilePathRequest`].
     ///
     /// # Panics
     ///
@@ -840,7 +649,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-    ) -> Result<FileOperationResult<String>, Channel::Error> {
+    ) -> Result<FileOperationResult<OpenFileName>, Channel::Error> {
         if buffer.length() > SHARED_BUFFER_SLOT_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -848,8 +657,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             handle,
             buffer,
         }))? {
-            FileResponse::HandlePath(response) => {
-                Ok(Ok(self.read_path_response_buffer(buffer, response)?))
+            FileResponse::HandlePath(HandleFilePathResponse { length, unlinked }) => {
+                Ok(Ok(OpenFileName {
+                    path: self.read_path_response_buffer(buffer, FilePathResponse { length })?,
+                    unlinked,
+                }))
             }
             FileResponse::Failed(error) => Ok(Err(error)),
             response => {
@@ -996,8 +808,9 @@ mod tests {
 
         assert_eq!(
             local
-                .open_file(
+                .open_file_at(
                     sequence([0], 5),
+                    None,
                     "/file",
                     ROOT,
                     FileAccessMode::ReadWrite,
@@ -1035,7 +848,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .path_file_status(sequence([3], 5), "/file", ROOT, true)
+                .path_file_status_at(sequence([3], 5), None, "/file", ROOT, true)
                 .unwrap(),
             Ok(status)
         );

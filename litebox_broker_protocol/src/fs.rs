@@ -653,26 +653,33 @@ wire_struct! {
 }
 
 wire_struct! {
-    /// Resolves a path to its physical location, following symbolic links.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct ResolvePathFileRequest {
-        /// Shared-buffer region whose first `path_length` bytes hold one absolute UTF-8 path; the
-        /// broker replaces its contents with the resolved absolute path.
-        pub buffer: SharedBufferSequence,
-        /// Length of the path at the start of `buffer`.
-        pub path_length: u32,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
-    }
-}
-
-wire_struct! {
     /// Successful response carrying a path written to the request's shared buffer.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct FilePathResponse {
         /// Length of the path written to the start of the request buffer.
         pub length: u32,
     }
+}
+
+wire_struct! {
+    /// Successful [`HandleFilePathRequest`] response.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct HandleFilePathResponse {
+        /// Length of the path written to the start of the request buffer.
+        pub length: u32,
+        /// The directory is no longer linked into the namespace, so the path is its last recorded
+        /// name rather than a current one.
+        pub unlinked: bool,
+    }
+}
+
+/// Name of an open file, as reported for a [`HandleFilePathRequest`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenFileName {
+    /// Absolute path.
+    pub path: String,
+    /// See [`HandleFilePathResponse::unlinked`].
+    pub unlinked: bool,
 }
 
 wire_struct! {
@@ -685,7 +692,7 @@ wire_struct! {
 }
 
 wire_struct! {
-    /// Reads the current physical absolute path of a directory, or the open-time name of a file.
+    /// Reads the current physical absolute path of a directory, or the name of a file as opened.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct HandleFilePathRequest {
         /// Broker-owned file handle.

@@ -107,18 +107,19 @@ pub trait Backend: Send + Sync + Any {
 
     /// Current physical name, as components relative to this backend's root (empty at root).
     /// Use the directory identity without requiring permission to search or list ancestors.
-    /// A directory no longer linked into this namespace has no name.
-    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError>;
+    ///
+    /// A directory no longer linked into this namespace has no name and must return
+    /// [`super::errors::PathError::NoSuchFileOrDirectory`]. Returns `Ok(None)` if the backend cannot determine
+    /// the current name of a live directory; callers then fall back to a recorded name.
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError>;
 
     /// Walk up from an owned directory, returning `None` at this backend's root.
     /// Implementations must not follow `..` beyond their exported subtree.
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError>;
 
     /// Authorize consuming a dot component when the backend, rather than the resolver,
-    /// enforces search permissions. Unrestricted backends need no additional check.
-    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
-        Ok(())
-    }
+    /// enforces search permissions ([`PermissionCheck::ByBackend`]). Wrappers must forward this.
+    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError>;
 
     /// Open the already-resolved file after resolver authorization, validating `flags`.
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError>;

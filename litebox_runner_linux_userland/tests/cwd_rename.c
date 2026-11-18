@@ -3,6 +3,7 @@
 
 #include "helpers.h"
 #include <pthread.h>
+#include <sys/un.h>
 
 static void *enter_parent(void *unused) {
     (void)unused;
@@ -22,6 +23,25 @@ int main(void) {
     char cwd[4096], expect[4096];
     snprintf(expect, sizeof(expect), "%s/b/sub", tmp);
     TEST_ASSERT(getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, expect), "getcwd after rename");
+    struct stat cwd_st, sub_st;
+    TEST_ASSERT(fstat(sub, &sub_st) == 0 && fstatat(AT_FDCWD, "", &cwd_st, AT_EMPTY_PATH) == 0 &&
+                cwd_st.st_ino == sub_st.st_ino, "empty path names the renamed cwd");
+    TEST_ASSERT(syscall(SYS_faccessat2, AT_FDCWD, "", X_OK, AT_EMPTY_PATH) == 0,
+                "empty path access checks the renamed cwd");
+    const struct timespec times[2] = {{1000, 0}, {2000, 0}};
+    TEST_ASSERT(syscall(SYS_utimensat, AT_FDCWD, "", times, AT_EMPTY_PATH) == 0 &&
+                fstat(sub, &sub_st) == 0 && sub_st.st_mtime == 2000,
+                "empty path sets times on the renamed cwd");
+    int server = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = {.sun_family = AF_UNIX, .sun_path = "rel.sock"};
+    TEST_ASSERT(server >= 0 && bind(server, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
+                listen(server, 1) == 0, "bind a relative socket name");
+    int client = socket(AF_UNIX, SOCK_STREAM, 0);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/b/sub/rel.sock", tmp);
+    TEST_ASSERT(client >= 0 && connect(client, (struct sockaddr *)&addr, sizeof(addr)) == 0,
+                "relative socket name follows the renamed cwd");
+    TEST_ASSERT(close(client) == 0 && close(server) == 0 &&
+                unlinkat(root, "b/sub/rel.sock", 0) == 0, "remove socket");
     TEST_ASSERT(mkdir("created", 0700) == 0 && unlinkat(root, "b/sub/created", AT_REMOVEDIR) == 0,
                 "relative creation targets original cwd");
     TEST_ASSERT(symlink("../..", "up") == 0 && chdir("up") == 0,
@@ -30,6 +50,13 @@ int main(void) {
     TEST_ASSERT(unlinkat(root, "b/sub/up", 0) == 0, "remove relative symlink");
     TEST_ASSERT(fchdir(root) == 0 && fchdir(sub) == 0, "enter renamed fd");
     TEST_ASSERT(unlinkat(root, "b/sub", AT_REMOVEDIR) == 0, "remove cwd");
+    char link[64], target[4096];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", sub);
+    ssize_t length = readlink(link, target, sizeof(target) - 1);
+    TEST_ASSERT(length > 10, "read removed directory link");
+    target[length] = '\0';
+    TEST_ASSERT(!strncmp(target, tmp, strlen(tmp)) && !strcmp(target + length - 10, " (deleted)"),
+                "removed directory link is marked deleted");
     TEST_ASSERT(fchdir(root) == 0 && fchdir(sub) == 0 && close(sub) == 0, "enter removed fd");
     expect_errno(syscall(SYS_getcwd, cwd, sizeof(cwd)), ENOENT, "removed cwd has no name");
     struct stat st;
@@ -43,6 +70,13 @@ int main(void) {
                 getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, tmp), "leave removed parent");
     TEST_ASSERT(fchdir(root) == 0 && close(root) == 0 && rmdir("a/sub") == 0 &&
                 rmdir("a") == 0 && chdir("/") == 0 && rmdir(tmp) == 0, "cleanup");
+    int top = open("/tmp", O_PATH | O_DIRECTORY);
+    TEST_ASSERT(top >= 0, "open directory for its fd link");
+    snprintf(link, sizeof(link), "proc/self/fd/%d", top);
+    length = readlink(link, target, sizeof(target) - 1);
+    TEST_ASSERT(length == 4 && !memcmp(target, "/tmp", 4), "relative fd link from root");
+    TEST_ASSERT(stat(link, &cwd_st) == 0 && fstat(top, &sub_st) == 0 &&
+                cwd_st.st_ino == sub_st.st_ino && close(top) == 0, "relative fd stat from root");
     puts("All cwd rename tests passed.");
     return 0;
 }

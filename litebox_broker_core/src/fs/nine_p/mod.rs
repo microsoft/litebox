@@ -57,6 +57,8 @@ pub struct NineP<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read +
     /// Handed out (shared) by [`Backend::root`](super::backend::Backend::root), so it must never
     /// be `Tlopen`ed or `Tlcreate`d.
     root: Arc<OwnedFid<Platform, T>>,
+    /// Qid path of [`Self::root`], identifying the export root without a round trip.
+    root_qid_path: u64,
     /// Device id reported in every [`NodeInfo`](super::NodeInfo) from this backend; inode numbers
     /// come from the server's qids instead.
     device_id: u64,
@@ -88,12 +90,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         inode_allocator: super::inode_allocator::InodeAllocator,
     ) -> Result<Self, Error> {
         let client = Arc::new(client::Client::new(transport, msize)?);
-        let (_qid, fid) = client.attach(username, path)?;
+        let (qid, fid) = client.attach(username, path)?;
         Ok(Self {
             root: Arc::new(OwnedFid {
                 fid,
                 client: Arc::clone(&client),
             }),
+            root_qid_path: qid.path,
             client,
             device_id: inode_allocator.device_id(),
             unlinkat_supported: AtomicBool::new(true),
@@ -350,35 +353,29 @@ where
         ))
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
         let attr = self
             .client
             .getattr(&dir.get_typed::<Self>().fid.fid, fcall::GetattrMask::NLINK)?;
         if attr.valid.contains(fcall::GetattrMask::NLINK) && attr.stat.nlink == 0 {
             return Err(PathError::NoSuchFileOrDirectory.into());
         }
-        if attr.qid.path
-            == self
-                .client
-                .getattr(&self.root.fid, fcall::GetattrMask::NLINK)?
-                .qid
-                .path
-        {
-            return Ok(Vec::new());
+        if attr.qid.path == self.root_qid_path {
+            return Ok(Some(Vec::new()));
         }
-        // 9P2000.L cannot request the current name of a fid. Do not return an obsolete
-        // walk string or open and enumerate ancestors (which requires extra permissions).
-        Err(WalkError::Io)
+        // 9P2000.L cannot request the current name of a fid, and enumerating ancestors would
+        // require extra permissions.
+        Ok(None)
     }
 
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
         let dir = &dir.get_typed::<Self>().fid.fid;
-        if self.client.getattr(dir, fcall::GetattrMask::ALL)?.qid.path
-            == self
-                .client
-                .getattr(&self.root.fid, fcall::GetattrMask::ALL)?
-                .qid
-                .path
+        if self
+            .client
+            .getattr(dir, fcall::GetattrMask::NLINK)?
+            .qid
+            .path
+            == self.root_qid_path
         {
             return Ok(None);
         }
@@ -998,7 +995,9 @@ impl From<Error> for ReadDirError {
     fn from(e: Error) -> Self {
         match e {
             Error::Remote(errno) => match errno {
-                ENOENT | ENOTDIR => ReadDirError::NotADirectory,
+                // Reading an open directory fails with ENOENT once it has been removed.
+                ENOENT => ReadDirError::Removed,
+                ENOTDIR => ReadDirError::NotADirectory,
                 _ => ReadDirError::Io,
             },
             Error::Io | Error::InvalidResponse | Error::InvalidPathname | Error::Broker(_) => {

@@ -38,7 +38,8 @@ const HEADER_SIZE: usize = size_of::<u8>()
 pub enum InheritedCwd {
     /// Absolute startup path, for launchers without an open working directory.
     Path(String),
-    /// File reference in the child's broker object table.
+    /// File reference in the child's broker object table. It may equal an inherited
+    /// descriptor's handle, in which case both share that one reference.
     File(ObjectHandle),
 }
 

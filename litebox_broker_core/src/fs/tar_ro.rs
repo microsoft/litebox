@@ -107,7 +107,7 @@ impl super::backend::BackendHandles for TarRo {
 }
 
 impl super::backend::Backend for TarRo {
-    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
         let mut child = dir.get_typed::<Self>().idx;
         let mut path = Vec::new();
         while let Some(parent) = self.tar_index.dirs[child].parent {
@@ -122,13 +122,18 @@ impl super::backend::Backend for TarRo {
             child = parent;
         }
         path.reverse();
-        Ok(path)
+        Ok(Some(path))
     }
 
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
         Ok(self.tar_index.dirs[dir.get_typed::<Self>().idx]
             .parent
             .map(|idx| DirHandle::from_typed::<Self>(TarRoDirHandle { idx })))
+    }
+
+    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        // Search permissions are enforced by the resolver.
+        Ok(())
     }
 
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {

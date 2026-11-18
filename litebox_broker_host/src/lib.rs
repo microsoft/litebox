@@ -34,11 +34,11 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
-    FilePathResponse, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
-    LockFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, MountFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    FilePathResponse, HandleFilePathRequest, HandleFilePathResponse, HandleFileStatusRequest,
+    IsTerminalFileRequest, LockFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
+    MountFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    ReadLinkFileRequest, RenameFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
     SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
     UnlinkFileRequest, WriteFileRequest, WriteFileResponse, encode_directory_entries_chunk,
 };
@@ -932,11 +932,15 @@ fn handle_file_request<Memory: SharedMemory>(
         }
         FileRequest::HandlePath(HandleFilePathRequest { handle, buffer }) => {
             validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
-            let path = litebox_broker_core::fs::handle_path(process, handle)
+            let name = litebox_broker_core::fs::handle_path(process, handle)
                 .map_err(RequestFailure::from)?;
+            let unlinked = name.as_ref().is_ok_and(|name| name.unlinked);
             Ok(
-                match write_file_path_response(shared_buffers, buffer, path)? {
-                    Ok(response) => FileResponse::HandlePath(response),
+                match write_file_path_response(shared_buffers, buffer, name.map(|name| name.path))?
+                {
+                    Ok(FilePathResponse { length }) => {
+                        FileResponse::HandlePath(HandleFilePathResponse { length, unlinked })
+                    }
                     Err(error) => FileResponse::Failed(error),
                 },
             )
@@ -1105,24 +1109,6 @@ fn handle_file_request<Memory: SharedMemory>(
             Ok(
                 match write_file_path_response(shared_buffers, buffer, target)? {
                     Ok(response) => FileResponse::ReadLink(response),
-                    Err(error) => FileResponse::Failed(error),
-                },
-            )
-        }
-        FileRequest::ResolvePath(ResolvePathFileRequest {
-            buffer,
-            path_length,
-            user,
-        }) => {
-            let path = read_file_path_prefix(shared_buffers, buffer, path_length)?;
-            if !path.starts_with('/') {
-                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
-            }
-            let resolved = litebox_broker_core::fs::resolve_path(process, &path, user)
-                .map_err(RequestFailure::from)?;
-            Ok(
-                match write_file_path_response(shared_buffers, buffer, resolved)? {
-                    Ok(response) => FileResponse::ResolvePath(response),
                     Err(error) => FileResponse::Failed(error),
                 },
             )
@@ -3459,7 +3445,10 @@ mod tests {
 
         assert_eq!(
             handle_path(64),
-            BrokerResult::File(FileResponse::HandlePath(FilePathResponse { length: 11 }))
+            BrokerResult::File(FileResponse::HandlePath(HandleFilePathResponse {
+                length: 11,
+                unlinked: false
+            }))
         );
         let mut output = [0; 11];
         shared_buffers

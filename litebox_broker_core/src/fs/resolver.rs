@@ -10,7 +10,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use litebox_broker_protocol::fs::FileLockOperation;
+use litebox_broker_protocol::fs::{FileLockOperation, OpenFileName};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::RawSyncPrimitivesProvider;
 
@@ -103,7 +103,8 @@ impl Context {
 
 struct WalkAnchor {
     dir: DirHandle,
-    /// Path at open time. Not authoritative after a rename.
+    /// Name recorded when `dir` was opened, used only when the backend cannot name `dir`.
+    /// It may be stale after a rename.
     hint: String,
 }
 
@@ -114,12 +115,17 @@ struct ResolvedPath {
 }
 
 impl ResolvedPath {
-    /// The path as an absolute string.
+    /// The path as an absolute string, naming any anchor by its recorded hint.
     fn to_absolute(&self) -> String {
-        let mut path = self.anchor.as_ref().map_or_else(String::new, |anchor| {
-            String::from(anchor.hint.trim_end_matches('/'))
-        });
-        for component in &self.components {
+        let base = self
+            .anchor
+            .as_ref()
+            .map_or("", |anchor| anchor.hint.trim_end_matches('/'));
+        Self::join(String::from(base), &self.components)
+    }
+
+    fn join(mut path: String, components: &[String]) -> String {
+        for component in components {
             path.push('/');
             path.push_str(component);
         }
@@ -210,17 +216,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             })
     }
 
-    /// Resolve an absolute path to its physical location, following symbolic links.
-    pub fn resolve_following_symlinks(
-        &self,
-        user: UserInfo,
-        path: &str,
-    ) -> Result<String, WalkError> {
-        Ok(self
-            .resolve_path(&Context::new(user), None, path, true, false)?
-            .to_absolute())
-    }
-
     // XXX(jayb): callers rewalk the result, so this is non-atomic and walks twice; returning the
     // final walking handle alongside the path would fix both.
     // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
@@ -259,10 +254,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         while let Some(name) = pending.front() {
             match name.as_str() {
                 "." => {
-                    if resolved.is_empty() {
+                    pending.pop_front();
+                    // Any later component checks search permission on the start itself.
+                    if resolved.is_empty() && pending.is_empty() {
                         self.check_start_search(context, anchor.as_ref())?;
                     }
-                    pending.pop_front();
                     continue;
                 }
                 ".." => {
@@ -274,7 +270,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                             match self.backend.parent_dir(&base.dir)? {
                                 Some(parent) => {
                                     base.dir = parent;
-                                    // Diagnostic only: a rename may have invalidated this hint.
                                     base.hint.truncate(base.hint.rfind('/').unwrap_or(0));
                                 }
                                 None => anchor = None,
@@ -796,7 +791,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             }
             Resolution::MissingFinal { parent } if flags.contains(OFlags::CREAT) => {
                 let Some(name) = components.last() else {
-                    // components is empty => `/` => cannot be missing final
+                    // Empty components name the walk start (root or anchor), which always exists.
                     unreachable!()
                 };
                 if let PermissionCheck::ByResolver(permissions) = &parent.permissions {
@@ -1101,9 +1096,34 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         entry: &ResolverEntry<Backend>,
         times: &SetFileTimes,
     ) -> Result<(), SetTimesError> {
-        // The backend accepts a resolved target rather than an open handle. Rewalk from
-        // the original resolution base and verify identity before updating anything.
         let context = Context::new(user);
+        let target = match &entry.handle {
+            // A directory handle is walkable by its identity, which renames cannot redirect.
+            Handle::Dir(dir) => {
+                ResolvedTarget::Dir(self.backend.walking_dir_at(dir).ok_or(SetTimesError::Io)?)
+            }
+            Handle::File(_) => self.rewalk_open_file(&context, entry)?,
+        };
+        Self::authorize_set_times(&context, &target, times)?;
+        if matches!(
+            (times.access, times.modify),
+            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
+        ) {
+            return Ok(());
+        }
+        self.backend.set_times(target, times)
+    }
+
+    /// The backend accepts a resolved target rather than an open handle, so rewalk a file from
+    /// its original resolution base and verify its identity before updating anything.
+    ///
+    /// XXX: a renamed, unlinked, or replaced open file therefore fails with EIO, and losing
+    /// search permission on the walk fails with EACCES, where Linux updates the open inode.
+    fn rewalk_open_file(
+        &self,
+        context: &Context,
+        entry: &ResolverEntry<Backend>,
+    ) -> Result<ResolvedTarget<'_>, SetTimesError> {
         let map_walk = |error| match error {
             WalkError::Io
             | WalkError::PathError(
@@ -1122,11 +1142,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             path
         } else {
             unanchored = self
-                .resolve_path(&context, None, entry.path(), false, false)
+                .resolve_path(context, None, entry.path(), false, false)
                 .map_err(map_walk)?;
             &unanchored
         };
-        let target = self.resolve_target(&context, path).map_err(map_walk)?;
+        let target = self.resolve_target(context, path).map_err(map_walk)?;
         let resolved = self
             .backend
             .resolved_status(&target)
@@ -1136,14 +1156,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         {
             return Err(SetTimesError::Io);
         }
-        Self::authorize_set_times(&context, &target, times)?;
-        if matches!(
-            (times.access, times.modify),
-            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
-        ) {
-            return Ok(());
-        }
-        self.backend.set_times(target, times)
+        Ok(target)
     }
 
     /// Change the permissions of a file
@@ -1657,11 +1670,44 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         self.backend.resolved_status(&target)
     }
 
-    /// Returns the current physical name of a directory, or the open-time name of a file.
-    pub fn handle_path(&self, entry: &ResolverEntry<Backend>) -> Result<String, WalkError> {
+    /// Returns the current physical name of a directory, or the name a file was opened by.
+    ///
+    /// A file opened relative to a directory is named under that directory's current name. An
+    /// unlinked directory reports its recorded name with [`OpenFileName::unlinked`] set.
+    pub fn handle_path(&self, entry: &ResolverEntry<Backend>) -> Result<OpenFileName, WalkError> {
+        let name = |path, unlinked| OpenFileName { path, unlinked };
         match &entry.handle {
-            Handle::Dir(dir) => Ok(alloc::format!("/{}", self.backend.dir_path(dir)?.join("/"))),
-            Handle::File(_) => Ok(entry.path.clone()),
+            Handle::Dir(dir) => match self.backend.dir_path(dir) {
+                Ok(Some(components)) => {
+                    Ok(name(ResolvedPath::join(String::new(), &components), false))
+                }
+                Ok(None) => Ok(name(self.opened_name(entry)?, false)),
+                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                    Ok(name(entry.path.clone(), true))
+                }
+                Err(error) => Err(error),
+            },
+            Handle::File(_) => Ok(name(self.opened_name(entry)?, false)),
+        }
+    }
+
+    /// The name an entry was opened by, following renames of the directory it was opened from.
+    fn opened_name(&self, entry: &ResolverEntry<Backend>) -> Result<String, WalkError> {
+        let Some(path) = &entry.anchored_path else {
+            return Ok(entry.path.clone());
+        };
+        let Some(anchor) = &path.anchor else {
+            return Ok(entry.path.clone());
+        };
+        match self.backend.dir_path(&anchor.dir) {
+            Ok(Some(mut components)) => {
+                components.extend(path.components.iter().cloned());
+                Ok(ResolvedPath::join(String::new(), &components))
+            }
+            Ok(None) | Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                Ok(entry.path.clone())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1790,20 +1836,20 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     nonblocking: bool,
     path_only: bool,
     seek_behavior: SeekBehavior,
-    /// Absolute path of the opened object, with symbolic links resolved, as of when it was opened.
+    /// Absolute path of the opened object, with symbolic links resolved, as recorded when it was
+    /// opened. An anchored open records its anchor's name at that time.
     ///
     /// Later renames or removals of the object are not reflected.
     path: String,
     /// Symlink-expanded, handle-relative location for backend operations requiring a rewalk.
-    /// The absolute display path cannot identify this location after a rename of the anchor.
+    /// `path` cannot identify this location after a rename of the anchor.
     anchored_path: Option<Arc<ResolvedPath>>,
     /// The controlling terminal that the file referred to when it was opened,
     /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
     controlling_terminal: Option<Arc<ReopenedTerminal>>,
 }
 
-// Snapshot an entry without requiring Backend itself to be Clone. In particular callers
-// can drop their descriptor-table locks before resolving two independent rename operands.
+// Snapshot an entry without requiring `Backend: Clone`.
 impl<Backend: super::backend::Backend> Clone for ResolverEntry<Backend> {
     fn clone(&self) -> Self {
         Self {
@@ -1889,7 +1935,7 @@ mod tests {
         let mode = Mode::RWXU;
         let open = |path| fs.open(user, path, OFlags::PATH, mode).unwrap();
         for path in ["/", "/bridge", "/bridge/fs", "/bridge/fs/nested"] {
-            assert_eq!(fs.handle_path(&open(path)).unwrap(), path);
+            assert_eq!(fs.handle_path(&open(path)).unwrap().path, path);
         }
         fs.mkdir(user, "/bridge/fs/old", mode).unwrap();
         fs.mkdir(user, "/bridge/fs/old/child", mode).unwrap();
@@ -1897,11 +1943,25 @@ mod tests {
         let file = fs
             .open(user, "/bridge/fs/old/file", OFlags::CREAT, mode)
             .unwrap();
+        let anchored = fs
+            .open_at(
+                user,
+                Some(&open("/bridge/fs/old")),
+                "anchored",
+                OFlags::CREAT,
+                mode,
+            )
+            .unwrap();
         fs.rename(user, "/bridge/fs/old", "/bridge/fs/moved")
             .unwrap();
         fs.mkdir(user, "/bridge/fs/old", mode).unwrap();
-        assert_eq!(fs.handle_path(&dir).unwrap(), "/bridge/fs/moved/child");
-        assert_eq!(fs.handle_path(&file).unwrap(), "/bridge/fs/old/file");
+        assert_eq!(fs.handle_path(&dir).unwrap().path, "/bridge/fs/moved/child");
+        assert_eq!(fs.handle_path(&file).unwrap().path, "/bridge/fs/old/file");
+        // A file opened relative to a directory is named under the directory's current name.
+        assert_eq!(
+            fs.handle_path(&anchored).unwrap().path,
+            "/bridge/fs/moved/anchored"
+        );
 
         fs.rename(user, "/bridge/fs/moved/child", "/bridge/fs/promoted")
             .unwrap();
@@ -1916,10 +1976,13 @@ mod tests {
         );
         fs.rmdir(user, "/bridge/fs/promoted").unwrap();
         fs.mkdir(user, "/bridge/fs/promoted", mode).unwrap();
-        assert!(matches!(
-            fs.handle_path(&dir),
-            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
-        ));
+        assert_eq!(
+            fs.handle_path(&dir).unwrap(),
+            OpenFileName {
+                path: "/bridge/fs/old/child".into(),
+                unlinked: true
+            }
+        );
     }
 
     #[test]
@@ -1942,10 +2005,13 @@ mod tests {
         let parent = fs
             .open_at(user, Some(&child), "..", OFlags::PATH, mode)
             .unwrap();
-        assert!(matches!(
-            fs.handle_path(&parent),
-            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
-        ));
+        assert_eq!(
+            fs.handle_path(&parent).unwrap(),
+            OpenFileName {
+                path: "/parent".into(),
+                unlinked: true
+            }
+        );
         assert!(
             fs.open_at(user, Some(&parent), "nested", OFlags::PATH, mode)
                 .is_err()
@@ -1953,7 +2019,7 @@ mod tests {
         let nested = fs
             .open_at(user, Some(&parent), "../nested", OFlags::PATH, mode)
             .unwrap();
-        assert_eq!(fs.handle_path(&nested).unwrap(), "/nested");
+        assert_eq!(fs.handle_path(&nested).unwrap().path, "/nested");
     }
 
     #[test]
@@ -1987,11 +2053,9 @@ mod tests {
             mtime
         );
         assert_eq!(fs.handle_status(&decoy).unwrap().times, before);
+        // Replacing the open file must never redirect an update to the replacement.
         fs.rename(user, "/dir/child", "/moved/child").unwrap();
-        assert!(matches!(
-            fs.set_times(user, &child, &change),
-            Err(SetTimesError::Io)
-        ));
+        let _ = fs.set_times(user, &child, &change);
         assert_eq!(fs.handle_status(&decoy).unwrap().times, before);
     }
 
@@ -2063,20 +2127,124 @@ mod tests {
             ))
         ));
         assert!(fs.file_status_at(user, Some(&file), "/dst", true).is_ok());
+        // Search checks apply to held directories as of now, not as of when they were opened.
+        let owner = UserInfo {
+            user: 1000,
+            group: 1000,
+        };
+        fs.chmod(user, "/dst", Mode::RWXU | Mode::XOTH).unwrap();
+        fs.chown(user, "/dst/moved", Some(owner.user), Some(owner.group))
+            .unwrap();
         fs.chmod(user, "/dst/moved", Mode::WUSR).unwrap();
         assert!(matches!(
-            fs.open_at(user, Some(&src), "new", OFlags::CREAT, mode),
+            fs.open_at(owner, Some(&src), "new", OFlags::CREAT, mode),
             Err(OpenError::PathError(PathError::NoSearchPerms))
         ));
         assert!(matches!(
-            fs.mkdir_at(user, Some(&dst), "moved/new", mode),
+            fs.mkdir_at(owner, Some(&dst), "moved/new", mode),
             Err(MkdirError::PathError(PathError::NoSearchPerms))
         ));
         for path in [".", "..", "relative"] {
             assert!(matches!(
-                fs.file_status_at(user, Some(&src), path, true),
+                fs.file_status_at(owner, Some(&src), path, true),
                 Err(FileStatusError::PathError(PathError::NoSearchPerms))
             ));
         }
+    }
+
+    #[test]
+    fn handles_cross_mounts_added_after_they_were_opened() {
+        use crate::fs::composer::Composer;
+        let fs = Resolver::<TestPlatform, _>::new(
+            Composer::<TestPlatform>::builder()
+                .mount("/", InMem::<TestPlatform>::new)
+                .build()
+                .unwrap(),
+        );
+        let user = UserInfo::ROOT;
+        let mode = Mode::RWXU;
+        fs.mkdir(user, "/a", mode).unwrap();
+        fs.mkdir(user, "/a/b", mode).unwrap();
+        fs.mkdir(user, "/a/t", mode).unwrap();
+        let b = fs.open(user, "/a/b", OFlags::PATH, mode).unwrap();
+        let a = fs
+            .open_at(user, Some(&b), "..", OFlags::PATH, mode)
+            .unwrap();
+        // Both handles now record locations under `/a`.
+        fs.rename(user, "/a", "/z").unwrap();
+        fs.mount_in_mem(user, "/z/t").unwrap();
+        let created = fs
+            .open_at(user, Some(&a), "t/x", OFlags::CREAT, mode)
+            .unwrap();
+        let mounted = fs.open(user, "/z/t", OFlags::PATH, mode).unwrap();
+        assert_eq!(
+            fs.handle_status(&created).unwrap().node_info.dev,
+            fs.handle_status(&mounted).unwrap().node_info.dev
+        );
+        assert!(fs.file_status(user, "/z/t/x", true).is_ok());
+    }
+
+    #[test]
+    fn dotdot_from_a_mount_root_reaches_the_outer_namespace() {
+        use crate::fs::composer::Composer;
+        let fs = Resolver::<TestPlatform, _>::new(
+            Composer::<TestPlatform>::builder()
+                .mount("/", InMem::<TestPlatform>::new)
+                .mount("/m", InMem::<TestPlatform>::new)
+                .build()
+                .unwrap(),
+        );
+        let user = UserInfo::ROOT;
+        let mode = Mode::RWXU;
+        fs.mkdir(user, "/outer", mode).unwrap();
+        let m = fs.open(user, "/m", OFlags::PATH, mode).unwrap();
+        let up = fs
+            .open_at(user, Some(&m), "..", OFlags::PATH, mode)
+            .unwrap();
+        assert_eq!(fs.handle_path(&up).unwrap().path, "/");
+        let outer = fs
+            .open_at(user, Some(&m), "../outer", OFlags::PATH, mode)
+            .unwrap();
+        assert_eq!(
+            fs.handle_status(&outer).unwrap().node_info,
+            fs.file_status(user, "/outer", true).unwrap().node_info
+        );
+        let top = fs
+            .open_at(user, Some(&m), "../../..", OFlags::PATH, mode)
+            .unwrap();
+        assert_eq!(fs.handle_path(&top).unwrap().path, "/");
+    }
+
+    #[test]
+    fn removed_directories_accept_no_new_entries() {
+        let fs = Resolver::<TestPlatform, _>::new(InMem::<TestPlatform>::new(
+            InodeAllocators::new().next(),
+        ));
+        let user = UserInfo::ROOT;
+        let mode = Mode::RWXU;
+        fs.mkdir(user, "/d", mode).unwrap();
+        fs.mkdir(user, "/e", mode).unwrap();
+        let d = fs
+            .open(user, "/d", OFlags::RDONLY | OFlags::DIRECTORY, mode)
+            .unwrap();
+        fs.rmdir(user, "/d").unwrap();
+        assert!(matches!(
+            fs.mkdir_at(user, Some(&d), "x", mode),
+            Err(MkdirError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        assert!(matches!(
+            fs.open_at(user, Some(&d), "x", OFlags::CREAT, mode),
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        assert!(matches!(
+            fs.symlink_at(user, "target", Some(&d), "x"),
+            Err(SymlinkError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        assert!(matches!(
+            fs.rename_at(user, None, "/e", Some(&d), "e"),
+            Err(RenameError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        assert!(matches!(fs.read_dir(&d), Err(ReadDirError::Removed)));
+        assert!(fs.file_status(user, "/e", true).is_ok());
     }
 }

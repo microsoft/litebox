@@ -340,11 +340,16 @@ impl BackendHandles for Devices {
 }
 
 impl Backend for Devices {
-    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
-        Ok(match dir.get_typed::<Self>() {
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+        Ok(Some(match dir.get_typed::<Self>() {
             DeviceDirHandle::Root => Vec::new(),
             DeviceDirHandle::Pts => alloc::vec!["pts".into()],
-        })
+        }))
+    }
+
+    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        // Device directories are searchable by everyone.
+        Ok(())
     }
 
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {

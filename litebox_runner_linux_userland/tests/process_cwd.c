@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -23,6 +24,12 @@ int main(int argc, char **argv) {
         check_detached();
         return 0;
     }
+    if (argc == 3 && !strcmp(argv[1], "child-fd")) {
+        // The cwd shares the inherited descriptor's reference but must outlive it.
+        assert(close(atoi(argv[2])) == 0);
+        check_detached();
+        return 0;
+    }
     assert(argc == 3 && argv[1][0] == '/' && argv[2][0] == '/');
     assert(mkdir(argv[2], 0700) == 0);
     int fd = open(argv[2], O_PATH | O_DIRECTORY);
@@ -36,6 +43,16 @@ int main(int argc, char **argv) {
         check_detached();
         execv(args[0], args);
         _exit(111);
+    }
+    assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    char fd_arg[16];
+    snprintf(fd_arg, sizeof(fd_arg), "%d", fd);
+    char *fd_args[] = {argv[1], "child-fd", fd_arg, NULL};
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        execv(fd_args[0], fd_args);
+        _exit(113);
     }
     assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     assert(close(fd) == 0); // vfork/exec now has no descriptor naming the cwd.

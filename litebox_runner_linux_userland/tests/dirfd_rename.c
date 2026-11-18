@@ -10,6 +10,8 @@ int main(void) {
     int fd = open("old/sub", O_PATH | O_DIRECTORY);
     TEST_ASSERT(fd >= 0, "open directory");
     create_test_file("old/sub/original", 0600);
+    int file = openat(fd, "original", O_RDONLY);
+    TEST_ASSERT(file >= 0, "open file through directory fd");
 
     TEST_ASSERT(rename("old", "new") == 0, "rename ancestor");
     TEST_ASSERT(mkdir("old", 0700) == 0 && mkdir("old/sub", 0700) == 0, "replace subtree");
@@ -19,6 +21,9 @@ int main(void) {
     TEST_ASSERT(utimensat(fd, "original", times, 0) == 0, "set times through moved ancestor");
     TEST_ASSERT(stat("new/sub/original", &st) == 0 && st.st_mtime == 23456,
                 "timestamps changed on original inode");
+    const struct timespec later[2] = {{34567, 0}, {45678, 0}};
+    TEST_ASSERT(futimens(file, later) == 0 && stat("new/sub/original", &st) == 0 &&
+                st.st_mtime == 45678 && close(file) == 0, "set times on file under renamed parent");
     TEST_ASSERT(mkdirat(fd, "created", 0700) == 0, "create through directory fd");
     TEST_ASSERT(stat("new/sub/created", &st) == 0, "creation lands in original directory");
     expect_errno(stat("old/sub/created", &st), ENOENT, "replacement is untouched");

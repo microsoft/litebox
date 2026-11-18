@@ -191,7 +191,7 @@ impl Backend for ShareFs {
         self.0.walking_dir_at(dir)
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
         self.0.dir_path(dir)
     }
 

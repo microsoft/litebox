@@ -28,7 +28,7 @@ fn directory_path_uses_fd_without_searching_or_listing_ancestors() {
     fs::set_permissions(root.join("new"), fs::Permissions::from_mode(0o000)).unwrap();
     let path = local.dir_path(&held);
     fs::set_permissions(root.join("new"), fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(path.unwrap(), ["new", "sub (deleted)"]);
+    assert_eq!(path.unwrap().unwrap(), ["new", "sub (deleted)"]);
     fs::remove_dir(root.join("new/sub (deleted)")).unwrap();
     assert!(matches!(
         local.dir_path(&held),
@@ -193,4 +193,20 @@ fn legacy_timestamps_only_update_pinned_non_links() {
             Err(rustix::io::Errno::NOTSUP)
         );
     }
+}
+
+#[test]
+fn absolute_link_targets_cannot_climb_out_of_the_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("export");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("x"), b"decoy").unwrap();
+    fs::write(temp.path().join("x"), b"outside").unwrap();
+    let canonical = fs::canonicalize(&root).unwrap();
+    symlink(canonical.join("../x"), root.join("escape")).unwrap();
+    symlink(canonical.join("x"), root.join("inside")).unwrap();
+    let local = LocalFs::new(&root, InodeAllocators::new().next()).unwrap();
+    let dir = local.root().unwrap();
+    assert!(local.read_link_at(&dir, "escape").is_err());
+    assert_eq!(local.read_link_at(&dir, "inside").unwrap(), "x");
 }

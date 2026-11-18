@@ -17,7 +17,7 @@ use litebox_broker_protocol::event::ConsumeEventResponse;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
     FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, MapFileResponse,
-    SetFileTimes,
+    OpenFileName, SetFileTimes,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
@@ -546,12 +546,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         user: FileUser,
     ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError>;
 
-    fn resolve_file_path(
-        &self,
-        path: &str,
-        user: FileUser,
-    ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError>;
-
     fn handle_file_status(
         &self,
         handle: ObjectHandle,
@@ -567,7 +561,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn handle_file_path(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError>;
+    ) -> core::result::Result<core::result::Result<OpenFileName, FileError>, BrokerControlError>;
 
     fn is_terminal_file(
         &self,
@@ -1791,15 +1785,6 @@ where
         self.request(|local| local.read_link_file_at(lease.sequence(), dir, path, user))
     }
 
-    fn resolve_file_path(
-        &self,
-        path: &str,
-        user: FileUser,
-    ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError> {
-        let lease = self.acquire_file_path_result_buffer(path)?;
-        self.request(|local| local.resolve_file_path(lease.sequence(), path, user))
-    }
-
     fn handle_file_status(
         &self,
         handle: ObjectHandle,
@@ -1819,7 +1804,8 @@ where
     fn handle_file_path(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError> {
+    ) -> core::result::Result<core::result::Result<OpenFileName, FileError>, BrokerControlError>
+    {
         let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
         self.request(|local| local.handle_file_path(handle, lease.sequence()))
     }

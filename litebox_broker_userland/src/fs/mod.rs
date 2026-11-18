@@ -427,21 +427,35 @@ fn readonly_for_mode(mode: Mode) -> bool {
     !mode.intersects(Mode::WUSR | Mode::WGRP | Mode::WOTH)
 }
 
+/// Opens `path` itself rather than a reparse point's target, and rejects reparse points, so
+/// that links and junctions cannot redirect a host operation outside the export.
+#[cfg(windows)]
+fn open_no_reparse(
+    options: &mut OpenOptions,
+    flags: u32,
+    path: &Path,
+) -> std::io::Result<(File, fs::Metadata)> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let file = options
+        .custom_flags(flags | win_flags::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & win_flags::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(invalid_path());
+    }
+    Ok((file, metadata))
+}
+
 fn set_permissions_path(path: &Path, mode: Mode) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        use win_flags::{
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
-        };
-        let file = OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)?;
-        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(invalid_path());
-        }
+        use std::os::windows::fs::OpenOptionsExt;
+        use win_flags::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES};
+        let (file, _) = open_no_reparse(
+            OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES),
+            FILE_FLAG_BACKUP_SEMANTICS,
+            path,
+        )?;
         set_permissions_file(&file, mode)
     }
     #[cfg(unix)]
@@ -457,20 +471,14 @@ fn open_regular(path: &Location, readable: bool, writable: bool) -> std::io::Res
     options.read(readable).write(writable);
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.custom_flags(win_flags::FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        let meta = file.metadata()?;
-        if !meta.is_file() || meta.file_attributes() & win_flags::FILE_ATTRIBUTE_REPARSE_POINT != 0
-        {
+        let (file, metadata) = open_no_reparse(&mut options, 0, path)?;
+        if !metadata.is_file() {
             return Err(invalid_path());
         }
+        Ok(file)
     }
-    Ok(file)
+    #[cfg(not(windows))]
+    options.open(path)
 }
 
 #[cfg(windows)]
@@ -787,7 +795,7 @@ impl Backend for LocalFs {
         ))
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
         let dir = dir.get_typed::<Self>();
         if !self.instance_tag.same_instance(&dir.instance_tag) {
             return Err(WalkError::Io);
@@ -798,7 +806,8 @@ impl Backend for LocalFs {
             .map_err(|_| PathError::NoSuchFileOrDirectory)?
             .iter()
             .map(|part| part.to_str().map(String::from).ok_or(WalkError::Io))
-            .collect()
+            .collect::<Result<_, _>>()
+            .map(Some)
     }
 
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
@@ -890,10 +899,15 @@ impl Backend for LocalFs {
         if !self.valid_dir(&dir) {
             return Err(ReadDirError::Io);
         }
-        let entries = fs::read_dir(&dir.location).map_err(|_| ReadDirError::Io)?;
+        // Like Linux, a host listing of a removed directory fails with ENOENT.
+        let removed = |error: std::io::Error| match error.kind() {
+            std::io::ErrorKind::NotFound => ReadDirError::Removed,
+            _ => ReadDirError::Io,
+        };
+        let entries = fs::read_dir(&dir.location).map_err(removed)?;
         let mut result = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|_| ReadDirError::Io)?;
+            let entry = entry.map_err(removed)?;
             let name = entry.file_name();
             let Some(text) = name.to_str() else {
                 continue;

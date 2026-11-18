@@ -9,7 +9,8 @@ use core::any::Any;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
-    FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, SetFileTimes,
+    FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, OpenFileName,
+    SetFileTimes,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
@@ -120,7 +121,7 @@ trait OpenFile: Send + Sync {
     fn lock(self: Arc<Self>, operation: FileLockOperation) -> ServiceResult<()>;
     fn read_directory(&self) -> ServiceResult<Vec<FileDirectoryEntry>>;
     fn handle_status(&self) -> ServiceResult<FileStatus>;
-    fn handle_path(&self) -> ServiceResult<String>;
+    fn handle_path(&self) -> ServiceResult<OpenFileName>;
     fn get_status_flags(&self) -> FileStatusFlags;
     fn set_status_flags(&self, mask: FileOpenFlags, flags: FileOpenFlags) -> Result<()>;
     fn set_times(&self, user: FileUser, times: &SetFileTimes) -> ServiceResult<()>;
@@ -154,7 +155,10 @@ mod private {
 
         /// Opens `path`, binding a file that refers to the opener's controlling terminal to
         /// `controlling_terminal()`.
-        #[allow(clippy::too_many_arguments)]
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "one parameter per open request field, plus the terminal binding"
+        )]
         fn open_at(
             self: Arc<Self>,
             _directory: Option<&File>,
@@ -184,10 +188,6 @@ mod private {
             _path: &str,
             _user: FileUser,
         ) -> ServiceResult<String> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn resolve_path(&self, _path: &str, _user: FileUser) -> ServiceResult<String> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -383,10 +383,6 @@ where
             Resolver::read_link_at(self, user, self.directory_entry(directory)?.as_ref(), path)
                 .map_err(file_walk_error),
         )
-    }
-
-    fn resolve_path(&self, path: &str, user: FileUser) -> ServiceResult<String> {
-        Ok(Resolver::resolve_following_symlinks(self, user, path).map_err(file_walk_error))
     }
 
     fn chmod_at(
@@ -660,7 +656,7 @@ where
         Ok(Ok(status))
     }
 
-    fn handle_path(&self) -> ServiceResult<String> {
+    fn handle_path(&self) -> ServiceResult<OpenFileName> {
         let entry = self.entry.read();
         Ok(self.resolver.handle_path(&entry).map_err(file_walk_error))
     }
@@ -712,15 +708,9 @@ where
     }
 }
 
-/// Opens an absolute path and installs its broker-owned open state in `process`.
-///
-/// If reads or writes of the file can fail with [`BrokerError::WouldBlock`], the new reference
-/// publishes the file's readiness through `readiness_sink`. A file that refers to the opener's
-/// controlling terminal refers to the controlling terminal of `process`'s session. Unless `flags`
-/// contain [`FileOpenFlags::NO_CONTROLLING_TERMINAL`], opening a terminal for reading makes it the
-/// controlling terminal of the session that `process` leads, if that session has none and the
-/// terminal controls no other session.
-pub fn open(
+/// [`open_at`] with an absolute path.
+#[cfg(test)]
+pub(crate) fn open(
     process: &BrokerProcess,
     path: &str,
     user: FileUser,
@@ -741,9 +731,19 @@ pub fn open(
     )
 }
 
-/// Like [`open`], but resolves a relative `path` from `directory` when supplied.
-/// With no directory, `path` must be absolute.
-#[allow(clippy::too_many_arguments)]
+/// Opens a path and installs its broker-owned open state in `process`, resolving a relative
+/// `path` from `directory`. With no directory, `path` must be absolute.
+///
+/// If reads or writes of the file can fail with [`BrokerError::WouldBlock`], the new reference
+/// publishes the file's readiness through `readiness_sink`. A file that refers to the opener's
+/// controlling terminal refers to the controlling terminal of `process`'s session. Unless `flags`
+/// contain [`FileOpenFlags::NO_CONTROLLING_TERMINAL`], opening a terminal for reading makes it the
+/// controlling terminal of the session that `process` leads, if that session has none and the
+/// terminal controls no other session.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per open request field, plus the readiness sink"
+)]
 pub fn open_at(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -789,7 +789,7 @@ fn readable(access: FileAccessMode) -> bool {
 /// Opens `path` for broker-internal use, returning the open file and its
 /// status without installing a reference.
 ///
-/// Requires the same rights as [`open`]. Dropping the file can reach the
+/// Requires the same rights as [`open_at`]. Dropping the file can reach the
 /// backend, so callers drop it outside their locks.
 pub(crate) fn open_without_reference(
     process: &BrokerProcess,
@@ -929,8 +929,12 @@ pub fn handle_status(
     file.state.handle_status()
 }
 
-/// Returns the physical absolute path of an open directory, or the open-time name of a file.
-pub fn handle_path(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<String>> {
+/// Returns the name of an open file; see
+/// [`HandleFilePathRequest`](litebox_broker_protocol::fs::HandleFilePathRequest).
+pub fn handle_path(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+) -> Result<FileResult<OpenFileName>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     file.state.handle_path()
 }
@@ -989,8 +993,9 @@ pub fn terminal_control(
     terminal.control(operation)
 }
 
-/// Returns status for an absolute path.
-pub fn path_status(
+/// [`path_status_at`] with an absolute path.
+#[cfg(test)]
+pub(crate) fn path_status(
     process: &BrokerProcess,
     path: &str,
     user: FileUser,
@@ -999,7 +1004,8 @@ pub fn path_status(
     path_status_at(process, None, path, user, follow_symlinks)
 }
 
-/// Like [`path_status`], with an optional directory for a relative path.
+/// Returns status for a path, resolving a relative `path` from `directory`.
+/// With no directory, `path` must be absolute.
 pub fn path_status_at(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -1013,16 +1019,8 @@ pub fn path_status_at(
     })
 }
 
-/// Reads the target of the symbolic link at an absolute path.
-pub fn read_link(
-    process: &BrokerProcess,
-    path: &str,
-    user: FileUser,
-) -> Result<FileResult<String>> {
-    read_link_at(process, None, path, user)
-}
-
-/// Like [`read_link`], with an optional directory for a relative path.
+/// Reads the target of a symbolic link, resolving a relative `path` from `directory`.
+/// With no directory, `path` must be absolute.
 pub fn read_link_at(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -1033,19 +1031,6 @@ pub fn read_link_at(
     with_directory(process, directory, path, |dir| {
         process.fs.read_link_at(dir, path, user)
     })
-}
-
-/// Resolves an absolute path to its physical location, following symbolic links.
-pub fn resolve_path(
-    process: &BrokerProcess,
-    path: &str,
-    user: FileUser,
-) -> Result<FileResult<String>> {
-    process.require_object_rights(ObjectRights::WAIT)?;
-    if let Err(error) = validate_path(None, path) {
-        return Ok(Err(error));
-    }
-    process.fs.resolve_path(path, user)
 }
 
 /// Changes timestamps through an open file or directory, regardless of its access mode.
@@ -1060,8 +1045,9 @@ pub fn set_times(
     file.state.set_times(user, times)
 }
 
-/// Changes mode bits for an absolute path.
-pub fn chmod(
+/// [`chmod_at`] with an absolute path.
+#[cfg(test)]
+pub(crate) fn chmod(
     process: &BrokerProcess,
     path: &str,
     user: FileUser,
@@ -1070,7 +1056,8 @@ pub fn chmod(
     chmod_at(process, None, path, user, mode)
 }
 
-/// Like [`chmod`], with an optional directory for a relative path.
+/// Changes mode bits, resolving a relative `path` from `directory`.
+/// With no directory, `path` must be absolute.
 pub fn chmod_at(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -1084,18 +1071,8 @@ pub fn chmod_at(
     })
 }
 
-/// Changes ownership for an absolute path.
-pub fn chown(
-    process: &BrokerProcess,
-    path: &str,
-    acting_user: FileUser,
-    user: Option<u16>,
-    group: Option<u16>,
-) -> Result<FileResult<()>> {
-    chown_at(process, None, path, acting_user, user, group)
-}
-
-/// Like [`chown`], with an optional directory for a relative path.
+/// Changes ownership, resolving a relative `path` from `directory`.
+/// With no directory, `path` must be absolute.
 pub fn chown_at(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -1110,12 +1087,18 @@ pub fn chown_at(
     })
 }
 
-/// Removes a file at an absolute path.
-pub fn unlink(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
+/// [`unlink_at`] with an absolute path.
+#[cfg(test)]
+pub(crate) fn unlink(
+    process: &BrokerProcess,
+    path: &str,
+    user: FileUser,
+) -> Result<FileResult<()>> {
     unlink_at(process, None, path, user)
 }
 
-/// Like [`unlink`], with an optional directory for a relative path.
+/// Removes a file, resolving a relative `path` from `directory`.
+/// With no directory, `path` must be absolute.
 pub fn unlink_at(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -1128,8 +1111,9 @@ pub fn unlink_at(
     })
 }
 
-/// Renames a file or directory between absolute paths.
-pub fn rename(
+/// [`rename_at`] between absolute paths.
+#[cfg(test)]
+pub(crate) fn rename(
     process: &BrokerProcess,
     old_path: &str,
     new_path: &str,
@@ -1138,7 +1122,8 @@ pub fn rename(
     rename_at(process, None, old_path, None, new_path, user)
 }
 
-/// Like [`rename`], with independent optional directories for the old and new paths.
+/// Renames a file or directory. Each relative path resolves from its own optional directory;
+/// a path with no directory must be absolute.
 pub fn rename_at(
     process: &BrokerProcess,
     old_directory: Option<ObjectHandle>,
@@ -1157,17 +1142,8 @@ pub fn rename_at(
     })
 }
 
-/// Creates a directory at an absolute path.
-pub fn mkdir(
-    process: &BrokerProcess,
-    path: &str,
-    user: FileUser,
-    mode: FileMode,
-) -> Result<FileResult<()>> {
-    mkdir_at(process, None, path, user, mode)
-}
-
-/// Like [`mkdir`], with an optional directory for a relative path.
+/// Creates a directory, resolving a relative `path` from `directory`.
+/// With no directory, `path` must be absolute.
 pub fn mkdir_at(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -1190,17 +1166,8 @@ pub fn mount_in_mem(process: &BrokerProcess, path: &str, user: FileUser) -> Resu
     process.fs.mount_in_mem(path, user)
 }
 
-/// Creates a symbolic link at an absolute path, storing `target` without resolving it.
-pub fn symlink(
-    process: &BrokerProcess,
-    target: &str,
-    linkpath: &str,
-    user: FileUser,
-) -> Result<FileResult<()>> {
-    symlink_at(process, target, None, linkpath, user)
-}
-
-/// Like [`symlink`], with an optional directory for a relative `linkpath`.
+/// Creates a symbolic link storing `target` without resolving it, resolving a relative
+/// `linkpath` from `directory`. With no directory, `linkpath` must be absolute.
 pub fn symlink_at(
     process: &BrokerProcess,
     target: &str,
@@ -1214,12 +1181,8 @@ pub fn symlink_at(
     })
 }
 
-/// Removes a directory at an absolute path.
-pub fn rmdir(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
-    rmdir_at(process, None, path, user)
-}
-
-/// Like [`rmdir`], with an optional directory for a relative path.
+/// Removes a directory, resolving a relative `path` from `directory`.
+/// With no directory, `path` must be absolute.
 pub fn rmdir_at(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,

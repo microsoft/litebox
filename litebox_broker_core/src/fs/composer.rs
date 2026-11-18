@@ -332,6 +332,36 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         self.initialized_mount(index).backend.as_ref()
     }
 
+    /// Namespace location of a directory inside `mount`, used to find mount crossings below it.
+    ///
+    /// `recorded` is the location seen when the handle was created. It is only trusted when no
+    /// mount is nested below `mount` or when the backend cannot name the directory, since a
+    /// rename or a later runtime mount can make it stale.
+    fn current_route(
+        &self,
+        mount: &Mount,
+        recorded: Vec<String>,
+        dir: &DirHandle,
+    ) -> Result<Vec<String>, WalkError> {
+        if !self.initialized_mounts().any(|(_, other)| {
+            other.path.len() > mount.path.len() && other.path.starts_with(&mount.path)
+        }) {
+            return Ok(recorded);
+        }
+        let mut route = mount.path.clone();
+        match mount.backend.dir_path(dir) {
+            Ok(Some(path)) => route.extend(path),
+            Ok(None) => return Ok(recorded),
+            // An unlinked directory still supports `..`; an empty component cannot match any
+            // mount path.
+            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                route.push(String::new());
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(route)
+    }
+
     fn mount_relation(&self, path: &[String]) -> MountRelation {
         MountRelation::of(self.initialized_mounts().map(|(_, mount)| mount), path)
     }
@@ -562,24 +592,27 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         }
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
         match &dir.get_typed::<Self>().inner {
-            ComposerDirHandleInner::Virtual { path } => Ok(path.clone()),
+            ComposerDirHandleInner::Virtual { path } => Ok(Some(path.clone())),
             ComposerDirHandleInner::Mounted {
                 mount_index,
                 handle,
                 ..
             } => {
                 let mount = self.initialized_mount(*mount_index);
+                let Some(suffix) = mount.backend.dir_path(handle)? else {
+                    return Ok(None);
+                };
                 let mut path = mount.path.clone();
-                path.extend(mount.backend.dir_path(handle)?);
+                path.extend(suffix);
                 // An external rename can move the backing directory under a nested mount.
                 if self.initialized_mounts().any(|(_, other)| {
                     other.path.len() > mount.path.len() && path.starts_with(&other.path)
                 }) {
                     return Err(PathError::NoSuchFileOrDirectory.into());
                 }
-                Ok(path)
+                Ok(Some(path))
             }
         }
     }
@@ -588,26 +621,17 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         let mount_path = match &dir.get_typed::<Self>().inner {
             ComposerDirHandleInner::Virtual { path } => path,
             ComposerDirHandleInner::Mounted {
+                path,
                 mount_index,
                 handle,
-                ..
             } => {
                 let mount = self.initialized_mount(*mount_index);
                 if let Some(parent) = mount.backend.parent_dir(handle)? {
-                    // Only nested mounts need a route. An unnamed parent still supports `..`;
-                    // an empty component cannot match any configured mount path.
-                    let mut route = mount.path.clone();
-                    if self.initialized_mounts().any(|(_, other)| {
-                        other.path.len() > route.len() && other.path.starts_with(&route)
-                    }) {
-                        match mount.backend.dir_path(&parent) {
-                            Ok(path) => route.extend(path),
-                            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
-                                route.push(String::new());
-                            }
-                            Err(error) => return Err(error),
-                        }
+                    let mut recorded = path.clone();
+                    if recorded.len() > mount.path.len() {
+                        recorded.pop();
                     }
+                    let route = self.current_route(mount, recorded, &parent)?;
                     return Ok(Some(DirHandle::from_typed::<Self>(ComposerDirHandle {
                         inner: ComposerDirHandleInner::Mounted {
                             path: route,
@@ -851,19 +875,20 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 path,
                 mount_index,
                 handle,
-            } => self
-                .backend(*mount_index)
-                .walking_dir_at(handle)
-                .map(|handle| {
+            } => {
+                let mount = self.initialized_mount(*mount_index);
+                let path = self.current_route(mount, path.clone(), handle).ok()?;
+                mount.backend.walking_dir_at(handle).map(|handle| {
                     self.resolved_dir(
                         ComposerWalkingDirHandleInner::Mounted {
-                            path: path.clone(),
+                            path,
                             mount_index: *mount_index,
                             target: ResolvedTarget::Dir(handle),
                         }
                         .into(),
                     )
-                }),
+                })
+            }
         }
     }
 
@@ -909,7 +934,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 mount_index,
                 handle,
             } => {
-                let entries = self.backend(mount_index).list_dir_at(handle)?;
+                let mount = self.initialized_mount(mount_index);
+                let path = self
+                    .current_route(mount, path, &handle)
+                    .map_err(|_| ReadDirError::Io)?;
+                let entries = mount.backend.list_dir_at(handle)?;
                 Ok(self.merge_mount_children(entries, &path))
             }
         }

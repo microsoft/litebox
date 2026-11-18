@@ -1907,7 +1907,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let (fds, mut objects): (Vec<_>, Vec<_>) =
             self.fds_inherited_across_fork()?.into_iter().unzip();
         let fs = self.fs.borrow();
-        let cwd = fs.cwd_for_child(&mut objects);
+        let cwd = fs.push_cwd_for_child(&mut objects);
         let umask = u32::from(fs.umask().bits());
         drop(fs);
         let (blocked_signals, signal_actions, alternate_signal_stack) = self.signals.fork_state();
@@ -1955,7 +1955,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let mut handles = child.inherit(&objects).map_err(Errno::from)?;
-        finish_cwd_transfer(&mut startup.cwd, &mut handles);
+        assign_pushed_cwd_handle(&mut startup.cwd, &mut handles);
         for (forked, handle) in startup.fds.iter_mut().zip(handles) {
             forked.inherited.handle = handle;
         }
@@ -3883,7 +3883,12 @@ const SHEBANG_MAX_RECURSION: u32 = 6;
 const SHEBANG_MAX_LINE: usize = 256;
 
 impl<P: ShimPlatform> crate::syscalls::file::FsState<P> {
-    fn cwd_for_child(&self, objects: &mut Vec<litebox::process::InheritableFd<P>>) -> InheritedCwd {
+    /// Describes the working directory for a child. A held directory is appended to `objects`
+    /// and must stay last until [`assign_pushed_cwd_handle`] takes its inherited handle.
+    fn push_cwd_for_child(
+        &self,
+        objects: &mut Vec<litebox::process::InheritableFd<P>>,
+    ) -> InheritedCwd {
         if let Some(dir) = self.cwd_handle() {
             objects.push(litebox::process::InheritableFd::File(dir));
             // Same encoded size as the child's eventual handle, for the payload size check.
@@ -3896,7 +3901,9 @@ impl<P: ShimPlatform> crate::syscalls::file::FsState<P> {
     }
 }
 
-fn finish_cwd_transfer(
+/// Assigns the handle inherited for the object appended by
+/// [`FsState::push_cwd_for_child`](crate::syscalls::file::FsState), which is the last one.
+fn assign_pushed_cwd_handle(
     cwd: &mut InheritedCwd,
     handles: &mut Vec<litebox_broker_protocol::ObjectHandle>,
 ) {
@@ -3989,7 +3996,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let (inherited_fds, mut fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
             self.fds_inherited_across_exec()?.into_iter().unzip();
         let fs = self.fs.borrow();
-        let cwd = fs.cwd_for_child(&mut fds);
+        let cwd = fs.push_cwd_for_child(&mut fds);
         let umask = u32::from(fs.umask().bits());
         drop(fs);
         let resource_limits = self
@@ -4023,7 +4030,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let vfork = self.vfork.borrow();
         let child = &vfork.as_ref().expect("vfork transfer lost its child").child;
         let mut handles = child.inherit(&fds).map_err(Errno::from)?;
-        finish_cwd_transfer(&mut startup.cwd, &mut handles);
+        assign_pushed_cwd_handle(&mut startup.cwd, &mut handles);
         for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
             inherited.handle = handle;
         }

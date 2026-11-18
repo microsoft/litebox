@@ -14,7 +14,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode as Mode,
     FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
-    MAX_FILE_TRANSFER_SIZE, SetFileTimes,
+    MAX_FILE_TRANSFER_SIZE, OpenFileName, SetFileTimes,
 };
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
@@ -50,13 +50,6 @@ pub struct SharedFileObject<Object> {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    // XXX: lexical normalization diverges from Linux once symlinks exist: `link/..` names the
-    // link's parent rather than its target's, and dropping a trailing slash means `link/` neither
-    // forces the link to be followed nor requires a directory.
-    fn broker_path(context: &Context, path: &str) -> String {
-        context.resolve(path).to_string()
-    }
-
     fn broker_path_at<'p>(
         broker: &Arc<dyn BrokerControl>,
         context: &Context,
@@ -208,7 +201,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Like [`Self::symlink_file`], with an optional directory for a relative `linkpath`.
-    /// The stored target is never resolved at creation time.
     pub fn symlink_file_at(
         &self,
         target: &str,
@@ -302,22 +294,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
 
     /// Mount a fresh in-memory filesystem at a directory path.
     pub fn mount_in_mem(&self, context: &Context, path: &str) -> Result<(), FileError> {
-        if path.is_empty() {
-            return Err(FileError::NoSuchFileOrDirectory);
-        }
-        // Preserve dot components and trailing slashes for the broker's target validation.
-        let path = if path.starts_with('/') {
-            String::from(path)
-        } else {
-            let mut absolute = context.cwd().to_string();
-            if !absolute.ends_with('/') {
-                absolute.push('/');
-            }
-            absolute.push_str(path);
-            absolute
-        };
-        self.broker_control()
-            .ok_or(FileError::Io)?
+        let broker = self.broker_control().ok_or(FileError::Io)?;
+        let (_, path) = Self::broker_path_at(&broker, context, None, path)?;
+        broker
             .mount_in_mem(&path, context.acting_user())
             .map_err(|_| FileError::Io)?
     }
@@ -388,22 +367,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .read_link_file_at(dir, &path, context.acting_user())
             .map_err(|_| WalkError::Io)?
             .map_err(WalkError::from)
-    }
-
-    /// Resolve a path to its physical location, following symbolic links.
-    pub fn resolve_file_path(
-        &self,
-        context: &Context,
-        path: &str,
-    ) -> Result<ResolvedPath, WalkError> {
-        let path = Self::broker_path(context, path);
-        let resolved = self
-            .broker_control()
-            .ok_or(WalkError::Io)?
-            .resolve_file_path(&path, context.acting_user())
-            .map_err(|_| WalkError::Io)?
-            .map_err(WalkError::from)?;
-        Ok(Context::new().resolve(&resolved))
     }
 }
 
@@ -688,8 +651,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
 
     /// Returns the current physical absolute pathname for a directory, or
     /// [`FilePathError::NoSuchFileOrDirectory`] if it no longer has a name.
-    /// For other files, returns the symlink-expanded name recorded at open time.
+    /// For other files, returns the symlink-expanded name it was opened by.
     pub fn path(&self) -> Result<String, FilePathError> {
+        let name = self.name()?;
+        if name.unlinked {
+            return Err(FilePathError::NoSuchFileOrDirectory);
+        }
+        Ok(name.path)
+    }
+
+    /// Like [`Self::path`], but reports an unlinked directory by its last recorded name.
+    pub fn name(&self) -> Result<OpenFileName, FilePathError> {
         self.broker
             .handle_file_path(self.handle)?
             .map_err(|error| match error {

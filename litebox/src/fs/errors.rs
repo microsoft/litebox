@@ -348,8 +348,7 @@ pub enum FileStatusError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`crate::LiteBox::read_link_file`] and
-/// [`crate::LiteBox::resolve_file_path`].
+/// Possible errors from [`crate::LiteBox::read_link_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum WalkError {

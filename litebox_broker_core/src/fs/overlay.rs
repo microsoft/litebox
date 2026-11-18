@@ -1216,13 +1216,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         }
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
         let _namespace = self.namespace.lock();
         dir.get_typed::<Self>()
             .location
             .lock()
             .as_ref()
             .cloned()
+            .map(Some)
             .map_err(|_| PathError::NoSuchFileOrDirectory.into())
     }
 
@@ -1242,6 +1243,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         self.open_dir(parent, OFlags::PATH)
             .map(Some)
             .map_err(open_to_walk_error)
+    }
+
+    fn check_search(&self, _dir: &ScopedDir<'_>) -> Result<(), WalkError> {
+        // Merged directories report their permissions to the resolver.
+        Ok(())
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {

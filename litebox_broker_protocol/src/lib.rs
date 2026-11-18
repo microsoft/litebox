@@ -104,5 +104,6 @@ pub struct ProtocolVersion(pub u16);
 
 /// Current broker protocol version.
 ///
-/// Version 2 adds optional directory handles to filesystem path requests.
+/// Version 2 adds optional directory handles to filesystem path requests and reports whether a
+/// handle's directory is unlinked.
 pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(2);

@@ -921,6 +921,7 @@ fn open_error(error: OpenError) -> Errno {
 fn file_path_error(error: FilePathError) -> Errno {
     match error {
         FilePathError::ClosedFd => Errno::EBADF,
+        FilePathError::NoSuchFileOrDirectory => Errno::ENOENT,
         _ => Errno::EIO,
     }
 }

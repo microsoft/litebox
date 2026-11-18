@@ -66,7 +66,7 @@ impl<B: Backend> Backend for ReadOnly<B> {
         self.inner.check_search(dir)
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
         self.inner.dir_path(dir)
     }
 

@@ -1149,3 +1149,55 @@ fn test_nine_p_append_mode_changes_after_open() {
     assert_eq!(std::fs::read_to_string(&host_path).unwrap(), "xbc");
     drop(fd);
 }
+
+#[test]
+fn nine_p_held_directories_name_and_walk() {
+    let server = DiodServer::start();
+    let fs = connect_9p(&server);
+    fs.mkdir(USER, "/d", Mode::RWXU).unwrap();
+    fs.mkdir(USER, "/d/sub", Mode::RWXU).unwrap();
+    let root = fs.open(USER, "/", OFlags::PATH, Mode::empty()).unwrap();
+    assert_eq!(fs.handle_path(&root).unwrap().path, "/");
+    // 9P cannot name other directories, so they report the name they were opened by.
+    let sub = fs
+        .open(
+            USER,
+            "/d/sub",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap();
+    let name = fs.handle_path(&sub).unwrap();
+    assert_eq!((name.path.as_str(), name.unlinked), ("/d/sub", false));
+    // A directory opened for reading still walks relative paths and lists afterwards.
+    drop(
+        fs.open_at(
+            USER,
+            Some(&sub),
+            "f",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RWXU,
+        )
+        .unwrap(),
+    );
+    assert!(
+        fs.read_dir(&sub)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name == "f")
+    );
+    let parent = fs
+        .open_at(USER, Some(&sub), "..", OFlags::PATH, Mode::empty())
+        .unwrap();
+    assert_eq!(
+        fs.handle_status(&parent).unwrap().node_info,
+        fs.file_status(USER, "/d", true).unwrap().node_info
+    );
+    let above_root = fs
+        .open_at(USER, Some(&root), "../d", OFlags::PATH, Mode::empty())
+        .unwrap();
+    assert_eq!(
+        fs.handle_status(&above_root).unwrap().node_info,
+        fs.file_status(USER, "/d", true).unwrap().node_info
+    );
+}

@@ -8,13 +8,13 @@ use crate::event::{
 };
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
-    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
-    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    HandleFilePathRequest, HandleFilePathResponse, HandleFileStatusRequest, IsTerminalFileRequest,
+    LockFileRequest, MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest,
+    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
+    RenameFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
+    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -155,7 +155,6 @@ impl BrokerOperation {
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. })
                 | FileRequest::HandlePath(HandleFilePathRequest { buffer, .. })
                 | FileRequest::ReadLink(ReadLinkFileRequest { buffer, .. })
-                | FileRequest::ResolvePath(ResolvePathFileRequest { buffer, .. })
                 | FileRequest::Symlink(SymlinkFileRequest { buffer, .. }),
             )
             | Self::Process(
@@ -1069,8 +1068,7 @@ wire_enum! {
         HandleStatus(HandleFileStatusRequest),
         /// Change access and modification times by open handle.
         SetTimes(SetTimesFileRequest),
-        /// Read the absolute path of an open file, with symbolic links resolved, as of when it was
-        /// opened.
+        /// Read the name of an open file; see [`HandleFilePathRequest`].
         HandlePath(HandleFilePathRequest),
         /// Determine whether an open file is connected to a terminal.
         IsTerminal(IsTerminalFileRequest),
@@ -1088,8 +1086,6 @@ wire_enum! {
         Rmdir(RmdirFileRequest),
         /// Read a symbolic link's target by path.
         ReadLink(ReadLinkFileRequest),
-        /// Resolve a path to its physical location.
-        ResolvePath(ResolvePathFileRequest),
         /// Create a symbolic link with an opaque target.
         Symlink(SymlinkFileRequest),
         /// Rename a file or directory by path.
@@ -1126,7 +1122,7 @@ wire_enum! {
         /// Timestamp updates completed.
         SetTimes,
         /// Handle-path response.
-        HandlePath(FilePathResponse),
+        HandlePath(HandleFilePathResponse),
         /// Map response.
         Map(MapFileResponse),
         /// Terminal query response.
@@ -1145,8 +1141,6 @@ wire_enum! {
         Rmdir,
         /// Symbolic-link target response.
         ReadLink(FilePathResponse),
-        /// Resolved-path response.
-        ResolvePath(FilePathResponse),
         /// Symbolic-link creation completed.
         Symlink,
         /// Rename completed.

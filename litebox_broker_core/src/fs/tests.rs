@@ -2348,6 +2348,25 @@ mod tar_ro {
             ("size", "4 bytes"),
         ])));
     }
+
+    #[test]
+    fn held_directories_are_named_by_their_place_in_the_archive() {
+        let fs = tar_ro_fs(TEST_TAR_FILE.into());
+        let bar = fs
+            .open(
+                USER,
+                "/bar",
+                OFlags::PATH | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        assert_eq!(fs.handle_path(&bar).unwrap().path, "/bar");
+        let up = fs
+            .open_at(USER, Some(&bar), "../..", OFlags::PATH, Mode::empty())
+            .unwrap();
+        assert_eq!(fs.handle_path(&up).unwrap().path, "/");
+        assert!(fs.file_status_at(USER, Some(&bar), "baz", true).is_ok());
+    }
 }
 
 mod overlay {
@@ -3234,6 +3253,40 @@ mod overlay {
 
         rx.recv_timeout(Duration::from_secs(2))
             .expect("copy-up deadlocked");
+    }
+
+    #[test]
+    fn held_merged_directories_follow_copy_up_and_whiteouts() {
+        let fs = overlay_fs(upper([]));
+        // The tar's entries belong to the acting user.
+        let user = ACTING_USER;
+        let bar = fs
+            .open(
+                user,
+                "/bar",
+                OFlags::PATH | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        assert!(fs.file_status_at(user, Some(&bar), "baz", true).is_ok());
+        // Creating through the held directory copies it up without hiding lower entries.
+        fs.mkdir_at(user, Some(&bar), "new", ALL_PERMS).unwrap();
+        assert!(fs.file_status(user, "/bar/new", true).is_ok());
+        assert!(fs.file_status_at(user, Some(&bar), "baz", true).is_ok());
+        // Once removed, the held directory must not revive whited-out lower entries.
+        fs.unlink(user, "/bar/baz").unwrap();
+        fs.rmdir(user, "/bar/new").unwrap();
+        fs.rmdir(user, "/bar").unwrap();
+        assert!(matches!(
+            fs.file_status_at(user, Some(&bar), "baz", true),
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        assert!(fs.file_status_at(user, Some(&bar), ".", true).is_ok());
+        assert!(fs.handle_path(&bar).unwrap().unlinked);
+        let parent = fs
+            .open_at(user, Some(&bar), "..", OFlags::PATH, Mode::empty())
+            .unwrap();
+        assert_eq!(fs.handle_path(&parent).unwrap().path, "/");
     }
 }
 
