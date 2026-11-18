@@ -9,14 +9,15 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessRequest, ProcessResponse,
 };
 use litebox_broker_protocol::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostName, HostNameKind,
-    HostNameSizes, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_HOST_NAME_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
-    OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
-    SetParentExitSignalRequest, SetResourceLimitRequest, StartChildProcessRequest,
-    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildProcessFlags, ChildSelector, CpuTime,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostName, HostNameKind, HostNameSizes, HostNames,
+    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
+    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, OpenProcessHandleRequest,
+    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
+    ResourceKind, ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest,
+    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    ThreadInfo, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
@@ -269,7 +270,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// unless `new_pid_namespace` gives options, in which case it is the first
     /// process of a new namespace with those options, nested in this
     /// process's. The child's parent is this process, or this process's
-    /// parent if `sibling` is set.
+    /// parent with [`ChildProcessFlags::SIBLING`]. With [`ChildProcessFlags::PRIVATE_MOUNT_VIEW`]
+    /// it gets its own copy of this process's mount layout.
     ///
     /// # Panics
     ///
@@ -277,11 +279,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn allocate_child_process(
         &self,
         new_pid_namespace: Option<PidNamespaceOptions>,
-        sibling: bool,
+        flags: ChildProcessFlags,
     ) -> Result<ProcessIdentity, Channel::Error> {
         match self.request_process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace,
-            sibling,
+            flags,
         }))? {
             ProcessResponse::AllocateChild(child) => Ok(child),
             response => panic!("broker returned unexpected process response: {response:?}"),

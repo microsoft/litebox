@@ -14,6 +14,7 @@ use litebox_broker_protocol::fs::FileLockOperation;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::RawSyncPrimitivesProvider;
 
+use super::composer::Composer;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SeekError, SetTimesError,
@@ -55,19 +56,21 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             _sync: PhantomData,
         }
     }
-}
 
-impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform, super::composer::Composer<Platform>> {
+    fn composer(&self) -> Option<&Composer<Platform>> {
+        (&self.backend as &dyn core::any::Any).downcast_ref()
+    }
+
     /// Resolve paths against a private copy of the mount layout. Locks on shared files
     /// still conflict across views. Existing open descriptions keep their original resolver.
     /// Copies share the runtime mount budget; copying the layout consumes no mount slots.
     #[must_use]
-    pub fn copy_mount_view(&self) -> Self {
-        Self {
-            backend: self.backend.copy_mount_view(),
+    pub(super) fn copy_mount_view(&self) -> Option<Resolver<Platform, Composer<Platform>>> {
+        Some(Resolver {
+            backend: self.composer()?.copy_mount_view(),
             flocks: Arc::clone(&self.flocks),
             _sync: PhantomData,
-        }
+        })
     }
 }
 
@@ -148,7 +151,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         user: UserInfo,
         path: &str,
     ) -> Result<(), litebox_broker_protocol::fs::FileError> {
-        use super::composer::{Composer, MountError};
+        use super::composer::MountError;
         use super::in_mem::{InMem, InitialNode};
         use super::service::file_walk_error;
         use litebox_broker_protocol::fs::FileError;
@@ -189,9 +192,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 }
             }
         }
-        let composer = (&self.backend as &dyn core::any::Any)
-            .downcast_ref::<Composer<Platform>>()
-            .ok_or(FileError::NotSupported)?;
+        let composer = self.composer().ok_or(FileError::NotSupported)?;
         composer
             .mount(&path.to_absolute(), |allocator| {
                 InMem::<Platform>::new_initialized(

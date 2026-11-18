@@ -332,6 +332,7 @@ impl FutexWaiter {
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
+    use litebox_broker_protocol::process::ChildProcessFlags;
 
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -369,7 +370,9 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let memory = super::issue_shared_memory_id(&parent).unwrap();
-        let child = parent.create_child(parent.pid_namespace(), false).unwrap();
+        let child = parent
+            .create_child(parent.pid_namespace(), ChildProcessFlags::empty())
+            .unwrap();
         Fixture {
             broker,
             parent,

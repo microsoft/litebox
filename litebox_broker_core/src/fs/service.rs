@@ -138,6 +138,11 @@ mod private {
     };
 
     pub trait Service: Send + Sync {
+        /// Copy the mount layout without duplicating the filesystems or their locks.
+        fn copy_mount_view(&self) -> crate::Result<Arc<dyn super::FileService>> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
         /// Opens `path`, binding a file that refers to the opener's controlling terminal to
         /// `controlling_terminal()`.
         fn open(
@@ -231,6 +236,11 @@ where
     Backend: super::backend::Backend + 'static,
     Platform: RawSyncPrimitivesProvider,
 {
+    fn copy_mount_view(&self) -> Result<Arc<dyn FileService>> {
+        let view = Resolver::copy_mount_view(self).ok_or(BrokerError::UnsupportedOperation)?;
+        Ok(Arc::new(view))
+    }
+
     fn open(
         self: Arc<Self>,
         path: &str,

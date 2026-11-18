@@ -134,7 +134,7 @@ fn copied_mount_views_share_files_and_locks_but_not_new_mounts() {
     let mut original = parent
         .open(ROOT, file, OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
         .unwrap();
-    let child = parent.copy_mount_view();
+    let child = parent.copy_mount_view().unwrap();
     let mut opened = child.open(ROOT, file, OFlags::RDWR, Mode::empty()).unwrap();
 
     let owner: Arc<dyn Send + Sync> = Arc::new(());
