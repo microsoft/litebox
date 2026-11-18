@@ -12,6 +12,8 @@ use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+use litebox_broker_protocol::authority::{DomainId, Principal};
+
 use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
     TruncateError, UnlinkError, WriteError,
@@ -270,6 +272,50 @@ fn overlay_authorizes_logical_targets_even_with_a_self_enforcing_lower() {
     assert_eq!(fs.handle_status(&fd).unwrap().size, 17);
     drop(fd);
     assert_eq!(std::fs::read(&file).unwrap(), b"server-owned data");
+}
+
+#[test]
+fn overlay_copy_up_keeps_the_owners_a_self_enforcing_lower_reports() {
+    use crate::fs::UserInfo;
+    use crate::fs::in_mem::{InMem, InitialNode};
+    use crate::fs::overlay::Overlay;
+    use std::os::unix::fs::MetadataExt;
+
+    let server = DiodServer::start();
+    let file = server.export_path().join("owned-file");
+    std::fs::write(&file, b"data").unwrap();
+    let metadata = std::fs::metadata(&file).unwrap();
+    let owner = UserInfo {
+        user: u16::try_from(metadata.uid()).unwrap(),
+        group: u16::try_from(metadata.gid()).unwrap(),
+    };
+    let allocators = InodeAllocators::new();
+    let upper = InMem::<TestPlatform>::new_initialized(
+        [(
+            "/",
+            InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: UserInfo::ROOT,
+            },
+        )],
+        allocators.next(),
+    );
+    let fs = Resolver::<TestPlatform, _>::new(Overlay::<TestPlatform>::new(
+        upper,
+        attach(server.connect(), &server, allocators.next()),
+        allocators.next(),
+    ));
+
+    // The chmod copies the file up, stamping it with the owners the server reported.
+    fs.chmod(owner, "/owned-file", Mode::RWXU).unwrap();
+    let status = fs.file_status(owner, "/owned-file", true).unwrap();
+    assert_eq!(status.mode, Mode::RWXU);
+    assert_eq!(status.owner, Principal::posix_user(metadata.uid()));
+    assert_eq!(status.group, Principal::posix_group(metadata.gid()));
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().mode() & 0o777,
+        metadata.mode() & 0o777
+    );
 }
 
 #[test]
@@ -963,11 +1009,16 @@ fn test_nine_p_chown() {
         .expect("file_status failed");
 
     // Change group to the same value (chown to a different uid/gid requires root)
+    let legacy_id = |principal: Principal, domain| {
+        principal
+            .id_in(domain)
+            .and_then(|id| u16::try_from(id).ok())
+    };
     fs.chown(
         USER,
         "/chown_test.txt",
-        Some(status_before.owner.user),
-        Some(status_before.owner.group),
+        legacy_id(status_before.owner, DomainId::POSIX_USER),
+        legacy_id(status_before.group, DomainId::POSIX_GROUP),
     )
     .expect("chown failed");
 
@@ -975,8 +1026,8 @@ fn test_nine_p_chown() {
     let status_after = fs
         .file_status(USER, "/chown_test.txt", true)
         .expect("file_status failed after chown");
-    assert_eq!(status_after.owner.user, status_before.owner.user);
-    assert_eq!(status_after.owner.group, status_before.owner.group);
+    assert_eq!(status_after.owner, status_before.owner);
+    assert_eq!(status_after.group, status_before.group);
 }
 
 #[test]
@@ -1148,4 +1199,44 @@ fn test_nine_p_append_mode_changes_after_open() {
     fs.write(&mut fd, b"x", None).unwrap();
     assert_eq!(std::fs::read_to_string(&host_path).unwrap(), "xbc");
     drop(fd);
+}
+
+#[test]
+fn test_nine_p_status_keeps_server_ids() {
+    use super::fcall::{GetattrMask, Qid, QidType, Rgetattr, Stat, Time};
+
+    let time = Time { sec: 0, nsec: 0 };
+    let mut attr = Rgetattr {
+        valid: GetattrMask::BASIC,
+        qid: Qid {
+            typ: QidType::FILE,
+            version: 0,
+            path: 7,
+        },
+        stat: Stat {
+            mode: 0o640,
+            uid: 100_000,
+            gid: u32::MAX,
+            nlink: 1,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime: time,
+            mtime: time,
+            ctime: time,
+            btime: time,
+            generation: 0,
+            data_version: 0,
+        },
+    };
+    let status = super::rgetattr_to_file_status(&attr, 1).unwrap();
+    assert_eq!(status.owner, Principal::posix_user(100_000));
+    assert_eq!(status.group, Principal::posix_group(u32::MAX));
+
+    // Ids the server does not report are unknown rather than root.
+    attr.valid = GetattrMask::MODE | GetattrMask::GID;
+    let status = super::rgetattr_to_file_status(&attr, 1).unwrap();
+    assert_eq!(status.owner, Principal::UNMAPPED);
+    assert_eq!(status.group, Principal::posix_group(u32::MAX));
 }

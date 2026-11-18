@@ -1106,7 +1106,10 @@ mod tests {
         // The session's members reach it as `/dev/tty`, and it signals the
         // session's foreground group.
         let tty = open(&member, "/dev/tty", FileOpenFlags::NONE);
-        assert_eq!(crate::fs::write(&member, tty, b"tty", None), Ok(Ok(3)));
+        assert_eq!(
+            crate::fs::write(&member, tty, None, b"tty", None),
+            Ok(Ok(3))
+        );
         assert_eq!(other.terminal_writes(), [b"tty".to_vec()]);
         let handles = [&leader, &member, &root, &second].map(|process| signals(process));
         other.post_terminal_events(TerminalEvents::INTERRUPT);
@@ -1258,7 +1261,7 @@ mod tests {
         // `/dev/tty` reaches the subsidiary, and the manager's input signals
         // the foreground group.
         let tty = open(&job, "/dev/tty", FileOpenFlags::NONE);
-        assert_eq!(crate::fs::write(&job, tty, b"out", None), Ok(Ok(3)));
+        assert_eq!(crate::fs::write(&job, tty, None, b"out", None), Ok(Ok(3)));
         let mut output = [0; 8];
         assert_eq!(
             crate::fs::read(&root, manager, &mut output, None),
@@ -1266,7 +1269,10 @@ mod tests {
         );
         assert_eq!(&output[..3], b"out");
         let handles = [&leader, &job].map(|process| signals(process));
-        assert_eq!(crate::fs::write(&root, manager, b"\x03", None), Ok(Ok(1)));
+        assert_eq!(
+            crate::fs::write(&root, manager, None, b"\x03", None),
+            Ok(Ok(1))
+        );
         assert_not_signalled(&leader, handles[0]);
         assert_signalled(&job, handles[1], TerminalEvents::INTERRUPT);
 

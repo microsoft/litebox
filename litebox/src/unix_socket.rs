@@ -151,9 +151,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     pub fn bind(
         &self,
         address: &UnixSocketAddress,
-        user: FileUser,
+        caller: impl Into<crate::fs::Caller>,
         mode: FileMode,
     ) -> Result<(), UnixSocketError> {
+        let user = legacy_file_user(caller)?;
         flatten(
             self.broker
                 .bind_unix_socket(self.handle, address, user, mode),
@@ -176,9 +177,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         &self,
         cx: &WaitContext<'_, Platform>,
         address: &UnixSocketAddress,
-        user: FileUser,
+        caller: impl Into<crate::fs::Caller>,
         nonblock: bool,
     ) -> Result<(), UnixSocketError> {
+        let user = legacy_file_user(caller)?;
         self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
             self.broker.connect_unix_socket(self.handle, address, user)
         })
@@ -224,9 +226,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         cx: &WaitContext<'_, Platform>,
         address: Option<&UnixSocketAddress>,
         data: impl WriteBuffer,
-        user: FileUser,
+        caller: impl Into<crate::fs::Caller>,
         nonblock: bool,
     ) -> Result<usize, UnixSocketError> {
+        let user = legacy_file_user(caller)?;
         if self.socket_type != SocketType::Stream {
             return self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
                 self.broker
@@ -407,6 +410,14 @@ fn flatten<R>(
     result: Result<Result<R, ProtocolError>, BrokerControlError>,
 ) -> Result<R, UnixSocketError> {
     result?.map_err(UnixSocketError::Socket)
+}
+
+// Socket requests still carry numerical IDs. Never lower a registered subject to those IDs.
+fn legacy_file_user(caller: impl Into<crate::fs::Caller>) -> Result<FileUser, UnixSocketError> {
+    match caller.into() {
+        crate::fs::Caller::Legacy(user) => Ok(user),
+        crate::fs::Caller::Subject(_) => Err(UnixSocketError::Unsupported),
+    }
 }
 
 impl From<BrokerControlError> for UnixSocketError {

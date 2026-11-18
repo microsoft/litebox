@@ -70,4 +70,10 @@ impl FileSystemProfile {
     pub fn admits_guest_descriptor(&self, descriptor: &SecurityDescriptor) -> bool {
         self.forms.contains(descriptor.form().into())
     }
+
+    /// Whether this service may use the descriptor already stored on an object.
+    #[must_use]
+    pub fn honors(&self, descriptor: &SecurityDescriptor) -> bool {
+        descriptor.trusted_initial || self.admits_guest_descriptor(descriptor)
+    }
 }

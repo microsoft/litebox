@@ -10,4 +10,7 @@
 pub mod errors;
 mod file;
 
-pub use file::{Context, File, ResolvedPath, SharedFileObject};
+pub use file::{Caller, Context, File, ResolvedPath, SharedFileObject};
+
+/// File security metadata to update together; omitted fields retain their current values.
+pub type SecurityUpdate = litebox_broker_protocol::fs::FileSecurityUpdate;

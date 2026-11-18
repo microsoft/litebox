@@ -12,21 +12,24 @@ use alloc::vec::Vec;
 use core::convert::Infallible;
 use core::marker::PhantomData;
 
+use litebox_broker_protocol::authority::Principal;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+    Backend, BackendHandles, CreationMetadata, DirHandle, EntryRemoval, EntryRename, FileHandle,
+    HandleRef, OpenChecks, PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile,
+    ResolvedTarget, SeekBehavior, status_descriptor,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError,
-    UnlinkError, WalkError, WriteError,
+    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SetSecurityError,
+    SetTimesError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::shared_storage::SharedFile;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags};
+use crate::descriptor::SecurityDescriptor;
 use crate::readiness::ReadinessSource;
 use thiserror::Error;
 
@@ -352,6 +355,98 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         Ok(path)
     }
 
+    /// Run `op` with the backend of the mounted directory `dir`, its mount index, the path of
+    /// `name` in it and its directory in that backend, unless `name` is or contains a mount point
+    /// or `dir` is virtual, which fail with `read_only`.
+    fn in_mounted_dir<'a, T, E>(
+        &self,
+        dir: ResolvedDir<'a>,
+        name: &str,
+        read_only: E,
+        op: impl FnOnce(&dyn Backend, usize, Vec<String>, ResolvedDir<'a>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        match dir.into_typed::<Self>().inner {
+            ComposerWalkingDirHandleInner::Virtual { .. } => Err(read_only),
+            ComposerWalkingDirHandleInner::Mounted {
+                path,
+                mount_index,
+                target,
+            } => {
+                let ResolvedTarget::Dir(handle) = target else {
+                    unreachable!()
+                };
+                let path = self.checked_child_path(path, name, read_only)?;
+                op(self.backend(mount_index), mount_index, path, handle)
+            }
+        }
+    }
+
+    /// The mount index of `target` and the target in that mount's backend; a virtual directory
+    /// fails with `read_only`.
+    fn mounted_target<E>(
+        target: ResolvedTarget<'_>,
+        read_only: E,
+    ) -> Result<(usize, ResolvedTarget<'_>), E> {
+        match target {
+            ResolvedTarget::File(h) => {
+                let h = h.into_typed::<Self>();
+                Ok((h.mount_index, h.target))
+            }
+            ResolvedTarget::Dir(h) => match h.into_typed::<Self>().inner {
+                ComposerWalkingDirHandleInner::Virtual { .. } => Err(read_only),
+                ComposerWalkingDirHandleInner::Mounted {
+                    mount_index,
+                    target,
+                    ..
+                } => Ok((mount_index, target)),
+            },
+        }
+    }
+
+    /// The mount that a rename between `old_dir` and `new_dir` happens in, and both directories in
+    /// its backend.
+    fn rename_mount(
+        &self,
+        old_dir: DirHandle,
+        old_name: &str,
+        new_dir: DirHandle,
+        new_name: &str,
+    ) -> Result<(usize, DirHandle, DirHandle), RenameError> {
+        if [old_name, new_name].iter().any(|name| {
+            name.is_empty() || matches!(*name, "." | "..") || name.contains(['/', '\0'])
+        }) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let old_dir = old_dir.into_typed::<Self>().inner;
+        let new_dir = new_dir.into_typed::<Self>().inner;
+        for (dir, name) in [(&old_dir, old_name), (&new_dir, new_name)] {
+            let path = match dir {
+                ComposerDirHandleInner::Virtual { path }
+                | ComposerDirHandleInner::Mounted { path, .. } => path,
+            };
+            self.checked_child_path(path.clone(), name, RenameError::Busy)?;
+        }
+        match (old_dir, new_dir) {
+            (
+                ComposerDirHandleInner::Mounted {
+                    mount_index: old_mount,
+                    handle: old_handle,
+                    ..
+                },
+                ComposerDirHandleInner::Mounted {
+                    mount_index: new_mount,
+                    handle: new_handle,
+                    ..
+                },
+            ) if old_mount == new_mount => Ok((old_mount, old_handle, new_handle)),
+            (ComposerDirHandleInner::Virtual { .. }, ComposerDirHandleInner::Virtual { .. }) => {
+                Err(RenameError::ReadOnlyFileSystem)
+            }
+            // Different mounts are EXDEV even if they share a backend device.
+            _ => Err(RenameError::CrossDevice),
+        }
+    }
+
     /// Returns child names from mount paths only; mounted backend contents are not inspected.
     fn immediate_mount_children(&self, path: &[String]) -> Vec<String> {
         let mut children = vec![];
@@ -400,11 +495,10 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         let permissions = match &dir.inner {
             ComposerWalkingDirHandleInner::Virtual { path } => {
                 let status = self.virtual_dir_status(path);
-                PermissionCheck::ByResolver(PermissionInfo {
-                    mode: status.mode,
-                    owner: status.owner,
-                    on_read_only_fs: true,
-                })
+                PermissionCheck::ByResolver(PermissionInfo::new(
+                    status_descriptor(&status).from_trusted_configuration(),
+                    true,
+                ))
             }
             ComposerWalkingDirHandleInner::Mounted { target, .. } => match target {
                 ResolvedTarget::Dir(handle) => handle.permissions.clone(),
@@ -428,7 +522,8 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
             // rwxr-xr-x for virtual dirs
             mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
             size: super::DEFAULT_DIRECTORY_SIZE,
-            owner: UserInfo::ROOT,
+            owner: Principal::posix_user(0),
+            group: Principal::posix_group(0),
             node_info,
             times: None,
             blksize: super::DEFAULT_DIRECTORY_SIZE,
@@ -613,6 +708,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     let ResolvedTarget::Dir(handle) = target else {
                         unreachable!()
                     };
+                    if let PermissionCheck::ByBackend = handle.permissions {
+                        // Lets resolvers that never trust a self-enforcing backend refuse to search
+                        // it, which it otherwise wouldn't be told about.
+                        authorize_dir_lookup(&PermissionInfo::backend_enforced()).map_err(fail)?;
+                    }
                     let child_path = append_components(path.clone(), &[component]);
                     let relation = self.mount_relation(&child_path);
                     let backend = self.backend(mount_index);
@@ -795,6 +895,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 self.backend(*mount_index).read_link_at(handle, name)
             }
         }
+    }
+
+    fn read_resolved_link(&self, file: &ResolvedFile<'_>) -> Result<String, WalkError> {
+        let file = file.get_typed::<Self>();
+        let ResolvedTarget::File(target) = &file.target else {
+            return Err(WalkError::Io);
+        };
+        self.backend(file.mount_index).read_resolved_link(target)
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
@@ -1047,41 +1155,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         new_dir: DirHandle,
         new_name: &str,
     ) -> Result<(), RenameError> {
-        if [old_name, new_name].iter().any(|name| {
-            name.is_empty() || matches!(*name, "." | "..") || name.contains(['/', '\0'])
-        }) {
-            return Err(PathError::InvalidPathname.into());
-        }
-        let old_dir = old_dir.into_typed::<Self>().inner;
-        let new_dir = new_dir.into_typed::<Self>().inner;
-        for (dir, name) in [(&old_dir, old_name), (&new_dir, new_name)] {
-            let path = match dir {
-                ComposerDirHandleInner::Virtual { path }
-                | ComposerDirHandleInner::Mounted { path, .. } => path,
-            };
-            self.checked_child_path(path.clone(), name, RenameError::Busy)?;
-        }
-        match (old_dir, new_dir) {
-            (
-                ComposerDirHandleInner::Mounted {
-                    mount_index: old_mount,
-                    handle: old_handle,
-                    ..
-                },
-                ComposerDirHandleInner::Mounted {
-                    mount_index: new_mount,
-                    handle: new_handle,
-                    ..
-                },
-            ) if old_mount == new_mount => self
-                .backend(old_mount)
-                .rename_at(old_handle, old_name, new_handle, new_name),
-            (ComposerDirHandleInner::Virtual { .. }, ComposerDirHandleInner::Virtual { .. }) => {
-                Err(RenameError::ReadOnlyFileSystem)
-            }
-            // Different mounts are EXDEV even if they share a backend device.
-            _ => Err(RenameError::CrossDevice),
-        }
+        let (mount_index, old_handle, new_handle) =
+            self.rename_mount(old_dir, old_name, new_dir, new_name)?;
+        self.backend(mount_index)
+            .rename_at(old_handle, old_name, new_handle, new_name)
     }
 
     fn set_times(
@@ -1149,11 +1226,186 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
             },
         }
     }
+
+    fn create_file_checked(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, OpenError>,
+    ) -> Result<FileHandle, OpenError> {
+        self.in_mounted_dir(
+            parent,
+            name,
+            OpenError::ReadOnlyFileSystem,
+            |backend, mount_index, _, handle| {
+                backend
+                    .create_file_checked(handle, name, authorize)
+                    .map(|handle| {
+                        FileHandle::from_typed::<Self>(ComposerFileHandle {
+                            mount_index,
+                            handle,
+                        })
+                    })
+            },
+        )
+    }
+
+    fn symlink_checked(
+        &self,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        target: &str,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, SymlinkError>,
+    ) -> Result<(), SymlinkError> {
+        self.in_mounted_dir(
+            dir,
+            name,
+            SymlinkError::ReadOnlyFileSystem,
+            |backend, _, _, handle| backend.symlink_checked(handle, name, target, authorize),
+        )
+    }
+
+    fn mkdir_checked(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, MkdirError>,
+    ) -> Result<DirHandle, MkdirError> {
+        self.in_mounted_dir(
+            parent,
+            name,
+            MkdirError::ReadOnlyFileSystem,
+            |backend, mount_index, path, handle| {
+                backend
+                    .mkdir_checked(handle, name, authorize)
+                    .map(|handle| {
+                        DirHandle::from_typed::<Self>(
+                            ComposerDirHandleInner::Mounted {
+                                path,
+                                mount_index,
+                                handle,
+                            }
+                            .into(),
+                        )
+                    })
+            },
+        )
+    }
+
+    fn unlink_checked(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&EntryRemoval<'_>) -> Result<(), UnlinkError>,
+    ) -> Result<(), UnlinkError> {
+        self.in_mounted_dir(
+            parent,
+            name,
+            UnlinkError::ReadOnlyFileSystem,
+            |backend, _, _, handle| backend.unlink_checked(handle, name, authorize),
+        )
+    }
+
+    fn rmdir_checked(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&EntryRemoval<'_>) -> Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
+        self.in_mounted_dir(
+            parent,
+            name,
+            RmdirError::ReadOnlyFileSystem,
+            |backend, _, _, handle| backend.rmdir_checked(handle, name, authorize),
+        )
+    }
+
+    fn rename_checked(
+        &self,
+        old_dir: DirHandle,
+        old_name: &str,
+        new_dir: DirHandle,
+        new_name: &str,
+        authorize: &dyn Fn(&EntryRename<'_>) -> Result<(), RenameError>,
+    ) -> Result<(), RenameError> {
+        let (mount_index, old_handle, new_handle) =
+            self.rename_mount(old_dir, old_name, new_dir, new_name)?;
+        self.backend(mount_index)
+            .rename_checked(old_handle, old_name, new_handle, new_name, authorize)
+    }
+
+    fn set_times_checked(
+        &self,
+        target: ResolvedTarget<'_>,
+        times: &super::SetFileTimes,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), SetTimesError>,
+    ) -> Result<(), SetTimesError> {
+        let (mount_index, target) =
+            Self::mounted_target(target, SetTimesError::ReadOnlyFileSystem)?;
+        self.backend(mount_index)
+            .set_times_checked(target, times, authorize)
+    }
+
+    fn update_security(
+        &self,
+        target: ResolvedTarget<'_>,
+        update: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, SetSecurityError>,
+    ) -> Result<(), SetSecurityError> {
+        let (mount_index, target) =
+            Self::mounted_target(target, SetSecurityError::ReadOnlyFileSystem)?;
+        self.backend(mount_index).update_security(target, update)
+    }
+
+    fn open_file_checked(
+        &self,
+        file: ResolvedFile<'_>,
+        flags: OFlags,
+        checks: &OpenChecks<'_>,
+    ) -> Result<FileHandle, OpenError> {
+        let ComposerResolvedFile {
+            mount_index,
+            target,
+        } = file.into_typed::<Self>();
+        let ResolvedTarget::File(handle) = target else {
+            unreachable!()
+        };
+        let handle = self
+            .backend(mount_index)
+            .open_file_checked(handle, flags, checks)?;
+        Ok(FileHandle::from_typed::<Self>(ComposerFileHandle {
+            mount_index,
+            handle,
+        }))
+    }
+
+    fn write_checked(
+        &self,
+        h: &FileHandle,
+        buf: &dyn WriteBuffer,
+        offset: usize,
+        content_change: &dyn Fn(&mut SecurityDescriptor),
+    ) -> Result<usize, WriteError> {
+        let h = h.get_typed::<Self>();
+        self.backend(h.mount_index)
+            .write_checked(&h.handle, buf, offset, content_change)
+    }
+
+    fn truncate_checked(
+        &self,
+        h: &FileHandle,
+        length: usize,
+        content_change: &dyn Fn(&mut SecurityDescriptor),
+    ) -> Result<(), TruncateError> {
+        let h = h.get_typed::<Self>();
+        self.backend(h.mount_index)
+            .truncate_checked(&h.handle, length, content_change)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::UserInfo;
     use crate::fs::in_mem::{InMem, InitialNode};
     use crate::test_platform::TestPlatform;
 

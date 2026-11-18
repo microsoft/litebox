@@ -523,9 +523,9 @@ fn lookup(
         Ok(opened) => opened,
         Err(error) => return Ok(Err(UnixSocketError::File(error))),
     };
-    let write = if user.user == status.owner.user {
+    let write = if user.user_principal() == status.owner {
         FileMode::WUSR
-    } else if user.group == status.owner.group {
+    } else if user.group_principal() == status.group {
         FileMode::WGRP
     } else {
         FileMode::WOTH

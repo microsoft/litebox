@@ -59,6 +59,8 @@ pub enum ReadError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum WriteError {
+    #[error("filesystem subject is no longer admissible")]
+    StaleSubject,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("file descriptor does not point to a file")]
@@ -116,6 +118,8 @@ pub enum SeekError {
 /// Possible errors from [`super::File::truncate`].
 #[derive(Error, Debug)]
 pub enum TruncateError {
+    #[error("filesystem subject is no longer admissible")]
+    StaleSubject,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("file descriptor points to a directory")]
@@ -187,6 +191,8 @@ pub enum ChmodError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChownError {
+    #[error("the file service cannot represent the requested owner or group")]
+    InvalidOwner,
     #[error(
         "the effective UID does not match the owner of the file, \
          and the process is not privileged"
@@ -242,6 +248,8 @@ pub enum SymlinkError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum UnlinkError {
+    #[error("the caller owns neither the restricted directory nor the entry")]
+    NotOwner,
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
     #[error("pathname is a directory")]
@@ -258,6 +266,8 @@ pub enum UnlinkError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum RenameError {
+    #[error("the caller owns neither the restricted directory nor the entry")]
+    NotOwner,
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
     #[error("the path is in use by the system")]
@@ -300,6 +310,8 @@ pub enum MkdirError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum RmdirError {
+    #[error("the caller owns neither the restricted directory nor the entry")]
+    NotOwner,
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
     #[error(
@@ -413,6 +425,9 @@ pub enum StatusFlagsError {
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {
+    /// The caller must select a subject admitted by its current authority.
+    #[error("filesystem subject is no longer admissible")]
+    StaleSubject,
     #[error("too many symbolic links encountered")]
     TooManySymlinks,
     #[error("no such file or directory")]

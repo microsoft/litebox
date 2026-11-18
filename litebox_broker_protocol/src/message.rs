@@ -8,12 +8,12 @@ use crate::event::{
     CreateEventRequest, CreateEventResponse,
 };
 use crate::fs::{
-    ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
-    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest,
-    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    FileError, FilePathResponse, FileStatus, FileStatusFlags, HandleFilePathRequest,
+    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MapFileRequest,
+    MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileSecurityRequest,
     SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
     TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
@@ -147,8 +147,7 @@ impl BrokerOperation {
                 | FileRequest::Write(WriteFileRequest { buffer, .. })
                 | FileRequest::ReadDirectory(ReadDirectoryRequest { buffer, .. })
                 | FileRequest::PathStatus(PathFileStatusRequest { path: buffer, .. })
-                | FileRequest::Chmod(ChmodFileRequest { path: buffer, .. })
-                | FileRequest::Chown(ChownFileRequest { path: buffer, .. })
+                | FileRequest::SetSecurity(SetFileSecurityRequest { path: buffer, .. })
                 | FileRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
                 | FileRequest::Rename(RenameFileRequest { paths: buffer, .. })
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
@@ -1142,10 +1141,8 @@ wire_enum! {
         IsTerminal(IsTerminalFileRequest),
         /// Control the shared terminal backing an open file.
         TerminalControl(TerminalControlFileRequest),
-        /// Change mode bits by path.
-        Chmod(ChmodFileRequest),
-        /// Change ownership by path.
-        Chown(ChownFileRequest),
+        /// Change security metadata by path.
+        SetSecurity(SetFileSecurityRequest),
         /// Remove a file by path.
         Unlink(UnlinkFileRequest),
         /// Create a directory by path.
@@ -1199,10 +1196,8 @@ wire_enum! {
         IsTerminal(bool),
         /// Terminal-control response.
         TerminalControl(TerminalResponse),
-        /// Mode change completed.
-        Chmod,
-        /// Ownership change completed.
-        Chown,
+        /// Security metadata change completed.
+        SetSecurity,
         /// File removal completed.
         Unlink,
         /// Directory creation completed.

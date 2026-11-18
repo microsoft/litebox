@@ -6,9 +6,12 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::authority::Scope;
+use litebox_broker_protocol::fs::FileSecurityUpdate;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
-    FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, SetFileTimes,
+    FileAccessMode, FileCaller, FileDirectoryEntry, FileError, FileLockOperation, FileMode,
+    FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, MAX_FILE_TRANSFER_SIZE,
+    SetFileTimes,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
@@ -21,7 +24,7 @@ use super::errors::{
     ReadDirError, ReadError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
     TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::resolver::{Resolver, ResolverEntry};
+use super::resolver::{Caller, Resolver, ResolverEntry};
 use super::shared_storage::{SharedFileMapping, SharedMapping};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
@@ -31,6 +34,34 @@ use crate::{BrokerError, BrokerProcess, Result};
 /// Guest-visible result of a broker file operation.
 pub type FileResult<T> = core::result::Result<T, FileError>;
 type ServiceResult<T> = Result<FileResult<T>>;
+
+fn with_file_caller<T>(
+    process: &BrokerProcess,
+    caller: impl Into<FileCaller>,
+    operation: impl FnOnce(Caller<'_>) -> ServiceResult<T>,
+) -> ServiceResult<T> {
+    match caller.into() {
+        FileCaller::Legacy(user) => operation(Caller::User(user)),
+        FileCaller::Subject(handle) => with_file_subject(process, handle, operation),
+    }
+}
+
+fn with_file_subject<T>(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    operation: impl FnOnce(Caller<'_>) -> ServiceResult<T>,
+) -> ServiceResult<T> {
+    match process.with_subject_authority(handle, Some(Scope::Access), |subject, authority| {
+        operation(Caller::Subject { subject, authority })
+    }) {
+        Ok(result) => result,
+        Err(BrokerError::StaleSubject) => Ok(Err(FileError::StaleSubject)),
+        Err(BrokerError::InvalidRights | BrokerError::UnknownObject) => {
+            Ok(Err(FileError::AccessNotAllowed))
+        }
+        Err(error) => Err(error),
+    }
+}
 
 /// One broker-owned open file description, shared by all references to it.
 #[derive(Clone)]
@@ -55,7 +86,7 @@ impl File {
         input: &dyn WriteBuffer,
         offset: Option<u64>,
     ) -> ServiceResult<usize> {
-        self.state.write(input, offset)
+        self.state.write(None, input, offset)
     }
 
     pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
@@ -112,9 +143,19 @@ impl ObjectEntry {
 
 trait OpenFile: Send + Sync {
     fn read(&self, output: &mut dyn ReadBuffer, offset: Option<u64>) -> ServiceResult<usize>;
-    fn write(&self, input: &dyn WriteBuffer, offset: Option<u64>) -> ServiceResult<usize>;
+    fn write(
+        &self,
+        caller: Option<Caller<'_>>,
+        input: &dyn WriteBuffer,
+        offset: Option<u64>,
+    ) -> ServiceResult<usize>;
     fn seek(&self, offset: i64, whence: FileSeekWhence) -> ServiceResult<u64>;
-    fn truncate(&self, length: u64, reset_offset: bool) -> ServiceResult<()>;
+    fn truncate(
+        &self,
+        caller: Option<Caller<'_>>,
+        length: u64,
+        reset_offset: bool,
+    ) -> ServiceResult<()>;
     fn map_shared(&self) -> ServiceResult<SharedMapping>;
     fn lock(self: Arc<Self>, operation: FileLockOperation) -> ServiceResult<()>;
     fn read_directory(&self) -> ServiceResult<Vec<FileDirectoryEntry>>;
@@ -122,7 +163,7 @@ trait OpenFile: Send + Sync {
     fn handle_path(&self) -> String;
     fn get_status_flags(&self) -> FileStatusFlags;
     fn set_status_flags(&self, mask: FileOpenFlags, flags: FileOpenFlags) -> Result<()>;
-    fn set_times(&self, user: FileUser, times: &SetFileTimes) -> ServiceResult<()>;
+    fn set_times(&self, user: Caller<'_>, times: &SetFileTimes) -> ServiceResult<()>;
 }
 
 struct ResolverFile<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend> {
@@ -133,8 +174,8 @@ struct ResolverFile<Platform: RawSyncPrimitivesProvider, Backend: super::backend
 
 mod private {
     use super::{
-        Arc, BrokerError, File, FileAccessMode, FileMode, FileOpenFlags, FileStatus, FileUser,
-        ServiceResult, String, TerminalEndpoint,
+        Arc, BrokerError, Caller, File, FileAccessMode, FileMode, FileOpenFlags,
+        FileSecurityUpdate, FileStatus, ServiceResult, String, TerminalEndpoint,
     };
 
     pub trait Service: Send + Sync {
@@ -143,7 +184,7 @@ mod private {
         fn open(
             self: Arc<Self>,
             _path: &str,
-            _user: FileUser,
+            _user: Caller<'_>,
             _access: FileAccessMode,
             _flags: FileOpenFlags,
             _mode: FileMode,
@@ -155,55 +196,50 @@ mod private {
         fn path_status(
             &self,
             _path: &str,
-            _user: FileUser,
+            _user: Caller<'_>,
             _follow_symlinks: bool,
         ) -> ServiceResult<FileStatus> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn read_link(&self, _path: &str, _user: FileUser) -> ServiceResult<String> {
+        fn read_link(&self, _path: &str, _user: Caller<'_>) -> ServiceResult<String> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn resolve_path(&self, _path: &str, _user: FileUser) -> ServiceResult<String> {
+        fn resolve_path(&self, _path: &str, _user: Caller<'_>) -> ServiceResult<String> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn chmod(&self, _path: &str, _user: FileUser, _mode: FileMode) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn chown(
+        fn set_security(
             &self,
             _path: &str,
-            _acting_user: FileUser,
-            _user: Option<u16>,
-            _group: Option<u16>,
+            _caller: Caller<'_>,
+            _update: FileSecurityUpdate,
         ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn unlink(&self, _path: &str, _user: FileUser) -> ServiceResult<()> {
+        fn unlink(&self, _path: &str, _user: Caller<'_>) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn rename(&self, _old_path: &str, _new_path: &str, _user: FileUser) -> ServiceResult<()> {
+        fn rename(&self, _old_path: &str, _new_path: &str, _user: Caller<'_>) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn mkdir(&self, _path: &str, _user: FileUser, _mode: FileMode) -> ServiceResult<()> {
+        fn mkdir(&self, _path: &str, _user: Caller<'_>, _mode: FileMode) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn mount_in_mem(&self, _path: &str, _user: FileUser) -> ServiceResult<()> {
+        fn mount_in_mem(&self, _path: &str, _user: Caller<'_>) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn symlink(&self, _target: &str, _linkpath: &str, _user: FileUser) -> ServiceResult<()> {
+        fn symlink(&self, _target: &str, _linkpath: &str, _user: Caller<'_>) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn rmdir(&self, _path: &str, _user: FileUser) -> ServiceResult<()> {
+        fn rmdir(&self, _path: &str, _user: Caller<'_>) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
     }
@@ -234,7 +270,7 @@ where
     fn open(
         self: Arc<Self>,
         path: &str,
-        user: FileUser,
+        user: Caller<'_>,
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: FileMode,
@@ -266,7 +302,7 @@ where
     fn path_status(
         &self,
         path: &str,
-        user: FileUser,
+        user: Caller<'_>,
         follow_symlinks: bool,
     ) -> ServiceResult<FileStatus> {
         let mut status = match Resolver::file_status(self, user, path, follow_symlinks) {
@@ -277,49 +313,84 @@ where
         Ok(Ok(status))
     }
 
-    fn read_link(&self, path: &str, user: FileUser) -> ServiceResult<String> {
+    fn read_link(&self, path: &str, user: Caller<'_>) -> ServiceResult<String> {
         Ok(Resolver::read_link(self, user, path).map_err(file_walk_error))
     }
 
-    fn resolve_path(&self, path: &str, user: FileUser) -> ServiceResult<String> {
+    fn resolve_path(&self, path: &str, user: Caller<'_>) -> ServiceResult<String> {
         Ok(Resolver::resolve_following_symlinks(self, user, path).map_err(file_walk_error))
     }
 
-    fn chmod(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
-        Ok(Resolver::chmod(self, user, path, mode & FileMode::SUPPORTED).map_err(file_chmod_error))
-    }
-
-    fn chown(
+    fn set_security(
         &self,
         path: &str,
-        acting_user: FileUser,
-        user: Option<u16>,
-        group: Option<u16>,
+        caller: Caller<'_>,
+        update: FileSecurityUpdate,
     ) -> ServiceResult<()> {
-        Ok(Resolver::chown(self, acting_user, path, user, group).map_err(file_chown_error))
+        use super::errors::SetSecurityError;
+        use litebox_broker_protocol::authority::{DomainId, Principal};
+
+        match caller {
+            Caller::Subject { .. } => {
+                Ok(self
+                    .update_security(caller, path, update)
+                    .map_err(|error| match error {
+                        SetSecurityError::NotPermitted => FileError::NotOwner,
+                        SetSecurityError::ReadOnlyFileSystem => FileError::ReadOnlyFs,
+                        SetSecurityError::UnsupportedForm => FileError::NotSupported,
+                        SetSecurityError::WrongKind => FileError::InvalidArgument,
+                        SetSecurityError::PathError(error) => file_path_error(error),
+                        SetSecurityError::IsSymlink | SetSecurityError::Io => FileError::Io,
+                    }))
+            }
+            Caller::User(user) => {
+                // Legacy backends have independent chmod/chown operations, not an atomic
+                // combined update. Never substitute a representable but different principal.
+                if let Some(mode) = update.mode {
+                    if update.owner.is_some() || update.group.is_some() {
+                        return Ok(Err(FileError::NotSupported));
+                    }
+                    return Ok(self.chmod(user, path, mode).map_err(file_chmod_error));
+                }
+                let id = |principal: Option<Principal>, domain| {
+                    principal
+                        .map(|p| super::backend::posix_id(p, domain).ok_or(()))
+                        .transpose()
+                };
+                let (Ok(owner), Ok(group)) = (
+                    id(update.owner, DomainId::POSIX_USER),
+                    id(update.group, DomainId::POSIX_GROUP),
+                ) else {
+                    return Ok(Err(FileError::InvalidArgument));
+                };
+                Ok(self
+                    .chown(user, path, owner, group)
+                    .map_err(file_chown_error))
+            }
+        }
     }
 
-    fn unlink(&self, path: &str, user: FileUser) -> ServiceResult<()> {
+    fn unlink(&self, path: &str, user: Caller<'_>) -> ServiceResult<()> {
         Ok(Resolver::unlink(self, user, path).map_err(file_unlink_error))
     }
 
-    fn rename(&self, old_path: &str, new_path: &str, user: FileUser) -> ServiceResult<()> {
+    fn rename(&self, old_path: &str, new_path: &str, user: Caller<'_>) -> ServiceResult<()> {
         Ok(Resolver::rename(self, user, old_path, new_path).map_err(file_rename_error))
     }
 
-    fn mkdir(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
+    fn mkdir(&self, path: &str, user: Caller<'_>, mode: FileMode) -> ServiceResult<()> {
         Ok(Resolver::mkdir(self, user, path, mode & FileMode::SUPPORTED).map_err(file_mkdir_error))
     }
 
-    fn mount_in_mem(&self, path: &str, user: FileUser) -> ServiceResult<()> {
+    fn mount_in_mem(&self, path: &str, user: Caller<'_>) -> ServiceResult<()> {
         Ok(Resolver::mount_in_mem(self, user, path))
     }
 
-    fn symlink(&self, target: &str, linkpath: &str, user: FileUser) -> ServiceResult<()> {
+    fn symlink(&self, target: &str, linkpath: &str, user: Caller<'_>) -> ServiceResult<()> {
         Ok(Resolver::symlink(self, user, target, linkpath).map_err(file_symlink_error))
     }
 
-    fn rmdir(&self, path: &str, user: FileUser) -> ServiceResult<()> {
+    fn rmdir(&self, path: &str, user: Caller<'_>) -> ServiceResult<()> {
         Ok(Resolver::rmdir(self, user, path).map_err(file_rmdir_error))
     }
 }
@@ -362,7 +433,12 @@ where
         Ok(Ok(read))
     }
 
-    fn write(&self, input: &dyn WriteBuffer, offset: Option<u64>) -> ServiceResult<usize> {
+    fn write(
+        &self,
+        caller: Option<Caller<'_>>,
+        input: &dyn WriteBuffer,
+        offset: Option<u64>,
+    ) -> ServiceResult<usize> {
         let Ok(offset) = checked_offset(offset, input.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
@@ -373,7 +449,7 @@ where
                 return Ok(Err(FileError::AccessNotAllowed));
             }
             self.resolver
-                .write_without_position_update(&entry, input, offset)
+                .write_entry(caller, &entry, input, offset)
                 .map(|(written, _)| written)
         } else {
             drop(entry);
@@ -381,7 +457,8 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.resolver.write(&mut entry, input, offset)
+            self.resolver
+                .write_updating_position(caller, &mut entry, input, offset)
         };
         let written = match written {
             Ok(written) => written,
@@ -420,7 +497,12 @@ where
         Ok(Ok(u64::try_from(offset).map_err(|_| BrokerError::Internal)?))
     }
 
-    fn truncate(&self, length: u64, reset_offset: bool) -> ServiceResult<()> {
+    fn truncate(
+        &self,
+        caller: Option<Caller<'_>>,
+        length: u64,
+        reset_offset: bool,
+    ) -> ServiceResult<()> {
         let Ok(length) = usize::try_from(length) else {
             return Ok(Err(FileError::InvalidOffset));
         };
@@ -431,13 +513,13 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.resolver.truncate(&mut entry, length, true)
+            self.resolver
+                .truncate_updating_position(caller, &mut entry, length, true)
         } else {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.resolver
-                .truncate_without_position_update(&entry, length)
+            self.resolver.truncate_entry(caller, &entry, length)
         };
         Ok(truncate.map_err(file_truncate_error))
     }
@@ -525,7 +607,7 @@ where
         Ok(())
     }
 
-    fn set_times(&self, user: FileUser, times: &SetFileTimes) -> ServiceResult<()> {
+    fn set_times(&self, user: Caller<'_>, times: &SetFileTimes) -> ServiceResult<()> {
         let entry = self.entry.read();
         Ok(self
             .resolver
@@ -545,7 +627,7 @@ where
 pub fn open(
     process: &BrokerProcess,
     path: &str,
-    user: FileUser,
+    user: impl Into<FileCaller>,
     access: FileAccessMode,
     flags: FileOpenFlags,
     mode: FileMode,
@@ -556,9 +638,7 @@ pub fn open(
         return Ok(Err(error));
     }
     let reference = process.reserve_object_reference(rights)?;
-    let file = match Arc::clone(&process.fs).open(path, user, access, flags, mode, &|| {
-        crate::process_group::controlling_terminal(process)
-    })? {
+    let file = match open_as(process, path, user, access, flags, mode)? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
@@ -579,6 +659,21 @@ fn readable(access: FileAccessMode) -> bool {
     matches!(access, FileAccessMode::ReadOnly | FileAccessMode::ReadWrite)
 }
 
+fn open_as(
+    process: &BrokerProcess,
+    path: &str,
+    caller: impl Into<FileCaller>,
+    access: FileAccessMode,
+    flags: FileOpenFlags,
+    mode: FileMode,
+) -> ServiceResult<File> {
+    with_file_caller(process, caller, |caller| {
+        Arc::clone(&process.fs).open(path, caller, access, flags, mode, &|| {
+            crate::process_group::controlling_terminal(process)
+        })
+    })
+}
+
 /// Opens `path` for broker-internal use, returning the open file and its
 /// status without installing a reference.
 ///
@@ -587,7 +682,7 @@ fn readable(access: FileAccessMode) -> bool {
 pub(crate) fn open_without_reference(
     process: &BrokerProcess,
     path: &str,
-    user: FileUser,
+    user: impl Into<FileCaller>,
     access: FileAccessMode,
     flags: FileOpenFlags,
     mode: FileMode,
@@ -596,9 +691,7 @@ pub(crate) fn open_without_reference(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    let file = match Arc::clone(&process.fs).open(path, user, access, flags, mode, &|| {
-        crate::process_group::controlling_terminal(process)
-    })? {
+    let file = match open_as(process, path, user, access, flags, mode)? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
@@ -633,6 +726,7 @@ pub fn read(
 pub fn write(
     process: &BrokerProcess,
     handle: ObjectHandle,
+    subject: Option<ObjectHandle>,
     input: &dyn WriteBuffer,
     offset: Option<u64>,
 ) -> Result<FileResult<usize>> {
@@ -640,7 +734,12 @@ pub fn write(
         return Err(BrokerError::ResourceExhausted);
     }
     let file = file(process, handle, ObjectRights::WRITE)?;
-    file.write(input, offset)
+    match subject {
+        Some(subject) => with_file_subject(process, subject, |caller| {
+            file.state.write(Some(caller), input, offset)
+        }),
+        None => file.write(input, offset),
+    }
 }
 
 /// Repositions the shared offset of a broker-owned open file.
@@ -658,11 +757,17 @@ pub fn seek(
 pub fn truncate(
     process: &BrokerProcess,
     handle: ObjectHandle,
+    subject: Option<ObjectHandle>,
     length: u64,
     reset_offset: bool,
 ) -> Result<FileResult<()>> {
     let file = file(process, handle, ObjectRights::WRITE)?;
-    file.state.truncate(length, reset_offset)
+    match subject {
+        Some(subject) => with_file_subject(process, subject, |caller| {
+            file.state.truncate(Some(caller), length, reset_offset)
+        }),
+        None => file.state.truncate(None, length, reset_offset),
+    }
 }
 
 /// Returns the host shared object holding a broker-owned open file's contents, so that the
@@ -787,90 +892,85 @@ pub fn terminal_control(
 pub fn path_status(
     process: &BrokerProcess,
     path: &str,
-    user: FileUser,
+    user: impl Into<FileCaller>,
     follow_symlinks: bool,
 ) -> Result<FileResult<FileStatus>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.path_status(path, user, follow_symlinks)
+    with_file_caller(process, user, |caller| {
+        process.fs.path_status(path, caller, follow_symlinks)
+    })
 }
 
 /// Reads the target of the symbolic link at an absolute path.
 pub fn read_link(
     process: &BrokerProcess,
     path: &str,
-    user: FileUser,
+    user: impl Into<FileCaller>,
 ) -> Result<FileResult<String>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.read_link(path, user)
+    with_file_caller(process, user, |caller| process.fs.read_link(path, caller))
 }
 
 /// Resolves an absolute path to its physical location, following symbolic links.
 pub fn resolve_path(
     process: &BrokerProcess,
     path: &str,
-    user: FileUser,
+    user: impl Into<FileCaller>,
 ) -> Result<FileResult<String>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.resolve_path(path, user)
+    with_file_caller(process, user, |caller| {
+        process.fs.resolve_path(path, caller)
+    })
 }
 
 /// Changes timestamps through an open file or directory, regardless of its access mode.
 pub fn set_times(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    user: FileUser,
+    user: impl Into<FileCaller>,
     times: &SetFileTimes,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    file.state.set_times(user, times)
+    with_file_caller(process, user, |caller| file.state.set_times(caller, times))
 }
 
-/// Changes mode bits for an absolute path.
-pub fn chmod(
+/// Updates the security metadata of the object at an absolute path.
+pub fn set_security(
     process: &BrokerProcess,
     path: &str,
-    user: FileUser,
-    mode: FileMode,
+    caller: impl Into<FileCaller>,
+    update: FileSecurityUpdate,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.chmod(path, user, mode)
-}
-
-/// Changes ownership for an absolute path.
-pub fn chown(
-    process: &BrokerProcess,
-    path: &str,
-    acting_user: FileUser,
-    user: Option<u16>,
-    group: Option<u16>,
-) -> Result<FileResult<()>> {
-    process.require_object_rights(ObjectRights::WRITE)?;
-    if let Err(error) = validate_path(path) {
-        return Ok(Err(error));
-    }
-    process.fs.chown(path, acting_user, user, group)
+    with_file_caller(process, caller, |caller| {
+        process.fs.set_security(path, caller, update)
+    })
 }
 
 /// Removes a file at an absolute path.
-pub fn unlink(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
+pub fn unlink(
+    process: &BrokerProcess,
+    path: &str,
+    user: impl Into<FileCaller>,
+) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.unlink(path, user)
+    with_file_caller(process, user, |caller| process.fs.unlink(path, caller))
 }
 
 /// Renames a file or directory between absolute paths.
@@ -878,36 +978,44 @@ pub fn rename(
     process: &BrokerProcess,
     old_path: &str,
     new_path: &str,
-    user: FileUser,
+    user: impl Into<FileCaller>,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(old_path).and_then(|()| validate_path(new_path)) {
         return Ok(Err(error));
     }
-    process.fs.rename(old_path, new_path, user)
+    with_file_caller(process, user, |caller| {
+        process.fs.rename(old_path, new_path, caller)
+    })
 }
 
 /// Creates a directory at an absolute path.
 pub fn mkdir(
     process: &BrokerProcess,
     path: &str,
-    user: FileUser,
+    user: impl Into<FileCaller>,
     mode: FileMode,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.mkdir(path, user, mode)
+    with_file_caller(process, user, |caller| process.fs.mkdir(path, caller, mode))
 }
 
 /// Mounts a fresh in-memory filesystem on an existing directory at an absolute path.
-pub fn mount_in_mem(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
+pub fn mount_in_mem(
+    process: &BrokerProcess,
+    path: &str,
+    user: impl Into<FileCaller>,
+) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.mount_in_mem(path, user)
+    with_file_caller(process, user, |caller| {
+        process.fs.mount_in_mem(path, caller)
+    })
 }
 
 /// Creates a symbolic link at an absolute path, storing `target` without resolving it.
@@ -915,22 +1023,28 @@ pub fn symlink(
     process: &BrokerProcess,
     target: &str,
     linkpath: &str,
-    user: FileUser,
+    user: impl Into<FileCaller>,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(linkpath) {
         return Ok(Err(error));
     }
-    process.fs.symlink(target, linkpath, user)
+    with_file_caller(process, user, |caller| {
+        process.fs.symlink(target, linkpath, caller)
+    })
 }
 
 /// Removes a directory at an absolute path.
-pub fn rmdir(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
+pub fn rmdir(
+    process: &BrokerProcess,
+    path: &str,
+    user: impl Into<FileCaller>,
+) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    process.fs.rmdir(path, user)
+    with_file_caller(process, user, |caller| process.fs.rmdir(path, caller))
 }
 
 fn open_required_rights(access: FileAccessMode, flags: FileOpenFlags) -> Result<ObjectRights> {
@@ -1131,6 +1245,7 @@ fn file_chown_error(error: ChownError) -> FileError {
 fn file_unlink_error(error: UnlinkError) -> FileError {
     match error {
         UnlinkError::NoWritePerms => FileError::NoWritePermissions,
+        UnlinkError::NotOwner => FileError::NotOwner,
         UnlinkError::IsADirectory => FileError::IsDirectory,
         UnlinkError::ReadOnlyFileSystem => FileError::ReadOnlyFs,
         UnlinkError::PathError(error) => file_path_error(error),
@@ -1152,6 +1267,7 @@ fn file_symlink_error(error: SymlinkError) -> FileError {
 fn file_rename_error(error: RenameError) -> FileError {
     match error {
         RenameError::NoWritePerms => FileError::NoWritePermissions,
+        RenameError::NotOwner => FileError::NotOwner,
         RenameError::Busy => FileError::Busy,
         RenameError::CrossDevice => FileError::CrossDevice,
         RenameError::InvalidArgument => FileError::InvalidArgument,
@@ -1177,6 +1293,7 @@ fn file_mkdir_error(error: MkdirError) -> FileError {
 fn file_rmdir_error(error: RmdirError) -> FileError {
     match error {
         RmdirError::NoWritePerms => FileError::NoWritePermissions,
+        RmdirError::NotOwner => FileError::NotOwner,
         RmdirError::Busy => FileError::Busy,
         RmdirError::NotEmpty => FileError::NotEmpty,
         RmdirError::NotADirectory => FileError::NotDirectory,
@@ -1212,6 +1329,7 @@ pub(super) fn file_walk_error(error: WalkError) -> FileError {
 mod tests {
     use super::*;
     use core::num::NonZeroU64;
+    use litebox_broker_protocol::authority::Principal;
     use litebox_broker_protocol::fs::{FileNodeInfo, FileType};
 
     #[test]
@@ -1220,7 +1338,8 @@ mod tests {
             file_type: FileType::RegularFile,
             mode: FileMode::from_bits_retain(0o100644),
             size: u64::MAX,
-            owner: FileUser::ROOT,
+            owner: Principal::posix_user(u32::MAX),
+            group: Principal::UNMAPPED,
             node_info: FileNodeInfo {
                 dev: u64::MAX,
                 ino: u64::MAX - 1,

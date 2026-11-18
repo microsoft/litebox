@@ -11,6 +11,7 @@ use bitflags::bitflags;
 use thiserror::Error;
 
 use crate::ObjectHandle;
+use crate::authority::Principal;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 
 /// Maximum number of shared-buffer slots used by one file read or write.
@@ -39,6 +40,34 @@ wire_struct! {
 impl FileUser {
     /// The root user.
     pub const ROOT: Self = Self { user: 0, group: 0 };
+
+    /// The POSIX user principal that `self.user` names.
+    pub fn user_principal(self) -> Principal {
+        Principal::posix_user(u32::from(self.user))
+    }
+
+    /// The POSIX group principal that `self.group` names.
+    pub fn group_principal(self) -> Principal {
+        Principal::posix_group(u32::from(self.group))
+    }
+}
+
+wire_enum! {
+    /// Identity presented for a filesystem operation. The file service, not
+    /// the request, determines which kind of caller it accepts.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum FileCaller {
+        /// Numerical IDs for a legacy file service with no credential authority.
+        Legacy(FileUser),
+        /// A process-private, registered Access subject.
+        Subject(ObjectHandle),
+    }
+}
+
+impl From<FileUser> for FileCaller {
+    fn from(user: FileUser) -> Self {
+        Self::Legacy(user)
+    }
 }
 
 wire_enum! {
@@ -129,8 +158,11 @@ wire_struct! {
         pub mode: FileMode,
         /// Object size in bytes.
         pub size: u64,
-        /// Owner identity.
-        pub owner: FileUser,
+        /// Owner, exactly as the file service stores it. Guests choose how to present
+        /// principals that their ABI cannot name.
+        pub owner: Principal,
+        /// Owning group, exactly as the file service stores it.
+        pub group: Principal,
         /// Device and inode identity.
         pub node_info: FileNodeInfo,
         /// Preferred fs I/O block size.
@@ -216,6 +248,9 @@ wire_enum! {
         CrossDevice,
         #[error("invalid argument")]
         InvalidArgument,
+        /// A restriction revoked the subject selected for this operation.
+        #[error("filesystem subject is no longer admissible")]
+        StaleSubject,
     }
 }
 
@@ -414,8 +449,8 @@ wire_struct! {
     pub struct OpenFileRequest {
         /// Shared-buffer region containing one absolute UTF-8 path.
         pub path: SharedBufferSequence,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
         /// Requested access mode.
         pub access: FileAccessMode,
         /// Open flags.
@@ -462,6 +497,8 @@ wire_struct! {
     pub struct WriteFileRequest {
         /// Broker-owned file handle.
         pub handle: ObjectHandle,
+        /// Current writer's Access subject; absent only on a legacy file service.
+        pub subject: Option<ObjectHandle>,
         /// Shared-buffer source sequence.
         pub buffer: SharedBufferSequence,
         /// Explicit offset, or `None` to use and update the shared position.
@@ -506,6 +543,8 @@ wire_struct! {
     pub struct TruncateFileRequest {
         /// Broker-owned file handle.
         pub handle: ObjectHandle,
+        /// Current writer's Access subject; absent only on a legacy file service.
+        pub subject: Option<ObjectHandle>,
         /// New file length.
         pub length: u64,
         /// Whether to reset the shared position to zero.
@@ -593,8 +632,8 @@ wire_struct! {
     pub struct PathFileStatusRequest {
         /// Shared-buffer region containing one absolute UTF-8 path.
         pub path: SharedBufferSequence,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
         /// Whether a final symbolic link is followed rather than described itself.
         pub follow_symlinks: bool,
     }
@@ -606,8 +645,8 @@ wire_struct! {
     pub struct SetTimesFileRequest {
         /// Broker-owned file handle.
         pub handle: ObjectHandle,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
         /// Requested timestamp updates.
         pub times: SetFileTimes,
     }
@@ -621,8 +660,8 @@ wire_struct! {
         pub buffer: SharedBufferSequence,
         /// Length of the linkpath at the start of `buffer`; the remaining bytes are the target.
         pub path_length: u32,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
     }
 }
 
@@ -635,8 +674,8 @@ wire_struct! {
         pub buffer: SharedBufferSequence,
         /// Length of the path at the start of `buffer`.
         pub path_length: u32,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
     }
 }
 
@@ -649,8 +688,8 @@ wire_struct! {
         pub buffer: SharedBufferSequence,
         /// Length of the path at the start of `buffer`.
         pub path_length: u32,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
     }
 }
 
@@ -704,30 +743,28 @@ wire_struct! {
 }
 
 wire_struct! {
-    /// Changes mode bits by path.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct ChmodFileRequest {
-        /// Shared-buffer region containing one absolute UTF-8 path.
-        pub path: SharedBufferSequence,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
-        /// New mode bits.
-        pub mode: FileMode,
+    /// Atomic changes to a file's descriptor. Omitted fields keep their current values.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct FileSecurityUpdate {
+        /// New owner, without translation or substitution by the file service.
+        pub owner: Option<Principal>,
+        /// New group.
+        pub group: Option<Principal>,
+        /// Replace access with a Mode descriptor; otherwise preserve the current form.
+        pub mode: Option<FileMode>,
     }
 }
 
 wire_struct! {
-    /// Changes ownership by path.
+    /// Changes security metadata on the object at an absolute path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct ChownFileRequest {
+    pub struct SetFileSecurityRequest {
         /// Shared-buffer region containing one absolute UTF-8 path.
         pub path: SharedBufferSequence,
-        /// Caller identity for permission checks.
-        pub acting_user: FileUser,
-        /// New user ID, if changed.
-        pub user: Option<u16>,
-        /// New group ID, if changed.
-        pub group: Option<u16>,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
+        /// Fields to change together.
+        pub update: FileSecurityUpdate,
     }
 }
 
@@ -737,8 +774,8 @@ wire_struct! {
     pub struct UnlinkFileRequest {
         /// Shared-buffer region containing one absolute UTF-8 path.
         pub path: SharedBufferSequence,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
     }
 }
 
@@ -750,8 +787,8 @@ wire_struct! {
         pub paths: SharedBufferSequence,
         /// Length of the old path at the start of `paths`.
         pub old_path_length: u32,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
     }
 }
 
@@ -761,8 +798,8 @@ wire_struct! {
     pub struct MkdirFileRequest {
         /// Shared-buffer region containing one absolute UTF-8 path.
         pub path: SharedBufferSequence,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
         /// New directory mode.
         pub mode: FileMode,
     }
@@ -774,8 +811,8 @@ wire_struct! {
     pub struct MountFileRequest {
         /// Shared-buffer region containing one absolute UTF-8 path.
         pub path: SharedBufferSequence,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
     }
 }
 
@@ -785,8 +822,8 @@ wire_struct! {
     pub struct RmdirFileRequest {
         /// Shared-buffer region containing one absolute UTF-8 path.
         pub path: SharedBufferSequence,
-        /// Caller identity for permission checks.
-        pub user: FileUser,
+        /// Caller whose access is checked by the file service.
+        pub caller: FileCaller,
     }
 }
 

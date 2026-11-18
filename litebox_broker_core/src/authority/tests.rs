@@ -341,7 +341,13 @@ mod lifecycle {
             Err(BrokerError::PolicyDenied)
         );
         assert!(process.with_subject(lost, None, |_| ()).is_ok());
-        process.restrict_authority(vec![a]).unwrap();
+        process
+            .with_subject_authority(kept, Some(Scope::Access), |s, snapshot| {
+                process.restrict_authority(vec![a]).unwrap();
+                assert!(snapshot.admits(s));
+                assert!(snapshot.admits(&subject(user(8))));
+            })
+            .unwrap();
         assert_eq!(
             process.with_subject(kept, Some(Scope::Access), |s| s.owner),
             Ok(user(7))

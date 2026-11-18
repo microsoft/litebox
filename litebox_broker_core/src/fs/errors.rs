@@ -198,6 +198,8 @@ pub enum ChownError {
 /// Possible errors from [`super::resolver::Resolver::unlink`]
 #[derive(Error, Debug)]
 pub enum UnlinkError {
+    #[error("the caller owns neither the restricted directory nor the entry")]
+    NotOwner,
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
     #[error("pathname is a directory")]
@@ -230,6 +232,8 @@ pub enum SymlinkError {
 /// Possible errors from [`super::resolver::Resolver::rename`].
 #[derive(Error, Debug)]
 pub enum RenameError {
+    #[error("the caller owns neither the restricted directory nor the entry")]
+    NotOwner,
     #[error("a parent directory does not allow write permission")]
     NoWritePerms,
     #[error("the path is a root, mount point, or otherwise busy")]
@@ -270,6 +274,8 @@ pub enum MkdirError {
 /// Possible errors from [`super::resolver::Resolver::rmdir`]
 #[derive(Error, Debug)]
 pub enum RmdirError {
+    #[error("the caller owns neither the restricted directory nor the entry")]
+    NotOwner,
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
     #[error(
@@ -282,6 +288,26 @@ pub enum RmdirError {
     NotADirectory,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`super::resolver::Resolver::set_security`] and
+/// [`super::backend::Backend::update_security`].
+#[derive(Error, Debug)]
+pub enum SetSecurityError {
+    #[error("the caller may not make this security change")]
+    NotPermitted,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("the file service cannot store this descriptor")]
+    UnsupportedForm,
+    #[error("the descriptor does not match the object's kind")]
+    WrongKind,
+    #[error("the named file is a symbolic link")]
+    IsSymlink,
     #[error("I/O error")]
     Io,
     #[error(transparent)]

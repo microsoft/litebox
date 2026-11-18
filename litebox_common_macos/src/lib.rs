@@ -13,6 +13,8 @@ pub mod mach;
 pub mod shared_cache;
 pub mod syscall;
 
+use litebox_broker_protocol::authority::{DomainId, Principal};
+
 pub use litebox::user_pointers;
 pub use syscall::SyscallRequest;
 
@@ -162,6 +164,21 @@ mod file_type {
     pub const SYMBOLIC_LINK: u16 = 0o120_000;
 }
 
+/// The id Darwin presents for an owner or group it cannot map: that of its `_unknown` user and
+/// group.
+pub const UNKNOWN_ID: u32 = 99;
+
+/// The Darwin id that `principal` names in `domain` ([`DomainId::POSIX_USER`] or
+/// [`DomainId::POSIX_GROUP`]), if any; `(uid_t)-1` is not one.
+pub fn darwin_id(principal: Principal, domain: DomainId) -> Option<u32> {
+    principal.id_in(domain).filter(|&id| id != u32::MAX)
+}
+
+/// The id Darwin presents for `principal` in `domain`: its [`darwin_id`], or [`UNKNOWN_ID`].
+pub fn presented_id(principal: Principal, domain: DomainId) -> u32 {
+    darwin_id(principal, domain).unwrap_or(UNKNOWN_ID)
+}
+
 impl TryFrom<&litebox_broker_protocol::fs::FileStatus> for Stat64 {
     type Error = errno::Errno;
 
@@ -184,8 +201,8 @@ impl TryFrom<&litebox_broker_protocol::fs::FileStatus> for Stat64 {
             mode: kind | (status.mode.bits() & 0o7777),
             nlink: 1,
             ino: status.node_info.ino,
-            uid: u32::from(status.owner.user),
-            gid: u32::from(status.owner.group),
+            uid: presented_id(status.owner, DomainId::POSIX_USER),
+            gid: presented_id(status.group, DomainId::POSIX_GROUP),
             rdev: status.node_info.rdev.map_or(0, |rdev| {
                 litebox::utils::TruncateExt::<u32>::trunc(rdev.get()).cast_signed()
             }),

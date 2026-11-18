@@ -26,19 +26,47 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    PermissionInfo, Resolution, ResolvedDir as ScopedDir, ResolvedFile, ResolvedTarget,
-    SeekBehavior,
+    AuthorizeRemoval, AuthorizeRename, Backend, BackendHandles, CreationMetadata, DirHandle,
+    EntryRemoval, EntryRename, FileHandle, HandleRef, OpenChecks, PermissionCheck, PermissionInfo,
+    Resolution, ResolvedDir as ScopedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+    status_descriptor,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError,
-    UnlinkError, WalkError, WriteError,
+    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SetSecurityError,
+    SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::shared_storage::SharedFile;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use crate::descriptor::SecurityDescriptor;
 use crate::readiness::ReadinessSource;
+
+/// The overlay's permission information for an object that its owning layer protects with
+/// `permissions` and reports `status` for. Descriptors that a layer reports through
+/// [`PermissionCheck::ByBackend`] are not broker-owned (see [`PermissionInfo::reported_posix`]).
+fn layered_permissions(permissions: &PermissionCheck, status: &FileStatus) -> PermissionCheck {
+    PermissionCheck::ByResolver(match broker_descriptor(permissions) {
+        Some(descriptor) => PermissionInfo::new(descriptor.clone(), false),
+        None => PermissionInfo::reported_posix(status, false),
+    })
+}
+
+/// What the upper copy of a lower object, which its layer protects with `permissions` and reports
+/// `status` for, is created with.
+fn copy_up_metadata(permissions: &PermissionCheck, status: &FileStatus) -> CreationMetadata {
+    match broker_descriptor(permissions) {
+        Some(descriptor) => CreationMetadata::new(descriptor.clone()),
+        None => CreationMetadata::new(status_descriptor(status)),
+    }
+}
+
+fn broker_descriptor(permissions: &PermissionCheck) -> Option<&SecurityDescriptor> {
+    match permissions {
+        PermissionCheck::ByResolver(info) => info.broker_descriptor(),
+        PermissionCheck::ByBackend => None,
+    }
+}
 
 /// The reserved namespace prefix; no overlay-visible name may start with it.
 const MARKER_PREFIX: &str = ".litebox-overlay-";
@@ -260,22 +288,19 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         locked: NamespaceGuard<'a, Platform>,
     ) -> Result<ScopedDir<'a>, OpenError> {
         let (_, backend, handle) = self.owning_dir(&resolved).ok_or(OpenError::Io)?;
+        let dir = ResolvedTarget::Dir(backend.walking_dir_at(handle).ok_or(OpenError::Io)?);
         let status = backend
-            .resolved_status(&ResolvedTarget::Dir(
-                backend.walking_dir_at(handle).ok_or(OpenError::Io)?,
-            ))
+            .resolved_status(&dir)
             .map_err(file_status_to_open_error)?;
+        let permissions = layered_permissions(dir.permissions(), &status);
+        drop(dir);
         Ok(ScopedDir::from_typed::<Self>(
             OverlayWalkingDir {
                 path,
                 resolved,
                 locked,
             },
-            PermissionCheck::ByResolver(PermissionInfo {
-                mode: status.mode,
-                owner: status.owner,
-                on_read_only_fs: false,
-            }),
+            permissions,
         ))
     }
 
@@ -286,6 +311,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     // XXX(jayb): holding the namespace lock across a whole-file byte copy blocks every other
     // namespace operation for as long as the copy takes. Ideally, we would avoid this by doing an
     // atomic link/rename, would need to update `Backend` for that.
+    #[expect(clippy::too_many_arguments)]
     fn copy_up_file(
         &self,
         _guard: &NamespaceGuard<'_, Platform>,
@@ -293,16 +319,14 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         name: &str,
         lower: (usize, &FileHandle),
         status: &FileStatus,
+        metadata: CreationMetadata,
         truncate: bool,
     ) -> Result<FileHandle, OpenError> {
         let (layer, lower) = lower;
         let upper = self.upper.create_file_at(
             self.upper.walking_dir_at(upper_dir).ok_or(OpenError::Io)?,
             name,
-            CreationMetadata {
-                mode: status.mode,
-                owner: status.owner,
-            },
+            metadata,
         )?;
         let copied = if truncate {
             Ok(())
@@ -383,6 +407,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         layer: usize,
         name: &str,
         status: &FileStatus,
+        metadata: CreationMetadata,
     ) -> Result<DirHandle, OpenError> {
         let lower_dir = self.resolve_dir(parent)?;
         let lower_dir = lower_dir.lowers[layer]
@@ -399,10 +424,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 self.upper.walking_dir_at(&upper_dir).ok_or(OpenError::Io)?,
                 name,
                 &link,
-                CreationMetadata {
-                    mode: status.mode,
-                    owner: status.owner,
-                },
+                metadata,
             )
             .map_err(|error| match error {
                 SymlinkError::PathError(error) => OpenError::PathError(error),
@@ -507,6 +529,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 let status = self.lowers[layer]
                     .resolved_status(&target)
                     .map_err(file_status_to_open_error)?;
+                let metadata = copy_up_metadata(target.permissions(), &status);
                 let upper_dir = match status.file_type {
                     FileType::RegularFile => {
                         let ResolvedTarget::File(file) = target else {
@@ -521,13 +544,14 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                             &name,
                             (layer, &lower),
                             &status,
+                            metadata,
                             false,
                         )?;
                         upper_dir
                     }
                     FileType::SymbolicLink => {
                         drop(target);
-                        self.copy_up_symlink(&locked, &parent, layer, &name, &status)?
+                        self.copy_up_symlink(&locked, &parent, layer, &name, &status, metadata)?
                     }
                     _ => return Err(OpenError::ReadOnlyFileSystem),
                 };
@@ -566,10 +590,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         self.upper.create_file_at(
             self.upper.walking_dir_at(dir).ok_or(OpenError::Io)?,
             marker,
-            CreationMetadata {
-                mode: Mode::empty(),
-                owner: UserInfo::ROOT,
-            },
+            CreationMetadata::posix(FileType::RegularFile, Mode::empty(), UserInfo::ROOT),
         )?;
         Ok(())
     }
@@ -648,15 +669,15 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         let status = backend
             .status(HandleRef::Dir(handle))
             .map_err(file_status_to_open_error)?;
+        let lower = ResolvedTarget::Dir(backend.walking_dir_at(handle).ok_or(OpenError::Io)?);
+        let metadata = copy_up_metadata(lower.permissions(), &status);
+        drop(lower);
         let child = self
             .upper
             .mkdir_at(
                 self.upper.walking_dir_at(parent).ok_or(OpenError::Io)?,
                 name,
-                CreationMetadata {
-                    mode: status.mode,
-                    owner: status.owner,
-                },
+                metadata,
             )
             .map_err(|error| match error {
                 MkdirError::PathError(error) => OpenError::PathError(error),
@@ -684,6 +705,572 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                         .map(|handle| (Some(layer), lower.as_ref(), handle))
                 },
             ),
+        }
+    }
+
+    /// The broker-owned descriptor of the overlay directory `dir`, as the layer owning it stores
+    /// it; directories whose layer enforces its own permissions have none.
+    fn dir_descriptor(&self, dir: &ResolvedDir) -> Result<SecurityDescriptor, OpenError> {
+        let (_, backend, handle) = self.owning_dir(dir).ok_or(OpenError::Io)?;
+        let dir = ResolvedTarget::Dir(backend.walking_dir_at(handle).ok_or(OpenError::Io)?);
+        broker_descriptor(dir.permissions())
+            .cloned()
+            .ok_or(OpenError::Io)
+    }
+
+    /// The broker-owned descriptor of the object that `entry`, named `name` in `dir`, refers to.
+    fn entry_descriptor(
+        &self,
+        dir: &ResolvedDir,
+        name: &str,
+        entry: &ResolvedEntry,
+    ) -> Result<SecurityDescriptor, OpenError> {
+        if entry.entry.file_type == FileType::Directory {
+            return self.dir_descriptor(&self.resolve_child_dir(dir, name, entry)?);
+        }
+        let (backend, parent) = if entry.upper {
+            (self.upper.as_ref(), dir.upper.as_ref())
+        } else {
+            let layer = entry.lower.ok_or(OpenError::Io)?;
+            (self.lowers[layer].as_ref(), dir.lowers[layer].as_ref())
+        };
+        let parent = parent
+            .and_then(|dir| backend.walking_dir_at(dir))
+            .ok_or(OpenError::Io)?;
+        let Resolution::Found(target) = backend
+            .resolve(parent, &[name], &|_| Ok(()))
+            .map_err(|error| walk_to_open_error(error.error))?
+        else {
+            return Err(OpenError::Io);
+        };
+        broker_descriptor(target.permissions())
+            .cloned()
+            .ok_or(OpenError::Io)
+    }
+
+    /// Run `authorize` on the removal of `entry`, named `name`, from `dir`.
+    fn authorize_removal<E>(
+        &self,
+        dir: &ResolvedDir,
+        name: &str,
+        entry: &ResolvedEntry,
+        authorize: &dyn Fn(&EntryRemoval<'_>) -> Result<(), E>,
+    ) -> Result<Result<(), E>, OpenError> {
+        Ok(authorize(&EntryRemoval {
+            parent: &self.dir_descriptor(dir)?,
+            entry: &self.entry_descriptor(dir, name, entry)?,
+        }))
+    }
+
+    /// The metadata of a new entry in `dir` that `authorize` allows, mapping lookup failures with
+    /// `map`.
+    fn checked_metadata<E>(
+        &self,
+        dir: &ResolvedDir,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, E>,
+        map: impl FnOnce(OpenError) -> E,
+    ) -> Result<CreationMetadata, E> {
+        let parent = self.dir_descriptor(dir).map_err(map)?;
+        authorize(&parent).map(CreationMetadata::new)
+    }
+
+    /// Create the file `name` in `dir`, with the metadata `metadata` computes from the directory
+    /// once the name is known to be free.
+    fn create_file(
+        &self,
+        dir: ScopedDir<'_>,
+        name: &str,
+        metadata: impl FnOnce(&ResolvedDir) -> Result<CreationMetadata, OpenError>,
+    ) -> Result<FileHandle, OpenError> {
+        if !valid(name) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let OverlayWalkingDir {
+            path,
+            resolved,
+            locked,
+        } = dir.into_typed::<Self>();
+        if self.entry(&resolved, name)?.is_some() {
+            return Err(OpenError::AlreadyExists);
+        }
+        let metadata = metadata(&resolved)?;
+        let upper = self.ensure_upper_dir(&locked, &path)?;
+        let file = self.upper.create_file_at(
+            self.upper.walking_dir_at(&upper).ok_or(OpenError::Io)?,
+            name,
+            metadata,
+        )?;
+        if let Err(error) = self.remove_marker(&locked, &upper, &whiteout(name)) {
+            let _rollback_result = self
+                .upper
+                .walking_dir_at(&upper)
+                .ok_or(UnlinkError::Io)
+                .and_then(|dir| self.upper.unlink_at(dir, name));
+            return Err(unlink_to_open_error(error));
+        }
+        Ok(FileHandle::from_typed::<Self>(OverlayFile {
+            layer: OverlayFileLayer::Upper(file),
+        }))
+    }
+
+    /// Create the symbolic link `name` to `target` in `dir`, as [`Self::create_file`] does.
+    fn symlink(
+        &self,
+        dir: ScopedDir<'_>,
+        name: &str,
+        target: &str,
+        metadata: impl FnOnce(&ResolvedDir) -> Result<CreationMetadata, SymlinkError>,
+    ) -> Result<(), SymlinkError> {
+        if !valid(name) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let OverlayWalkingDir {
+            path,
+            resolved,
+            locked,
+        } = dir.into_typed::<Self>();
+        if self
+            .entry(&resolved, name)
+            .map_err(open_to_symlink_error)?
+            .is_some()
+        {
+            return Err(SymlinkError::AlreadyExists);
+        }
+        let metadata = metadata(&resolved)?;
+        let upper = self
+            .ensure_upper_dir(&locked, &path)
+            .map_err(open_to_symlink_error)?;
+        self.upper.symlink_at(
+            self.upper.walking_dir_at(&upper).ok_or(SymlinkError::Io)?,
+            name,
+            target,
+            metadata,
+        )?;
+        // Like a regular file, a replacement link clears its whiteout but
+        // needs no opaque marker: only directories can merge with lower entries.
+        if let Err(error) = self.remove_marker(&locked, &upper, &whiteout(name)) {
+            let _rollback_result = self
+                .upper
+                .walking_dir_at(&upper)
+                .ok_or(UnlinkError::Io)
+                .and_then(|dir| self.upper.unlink_at(dir, name));
+            return Err(open_to_symlink_error(unlink_to_open_error(error)));
+        }
+        Ok(())
+    }
+
+    /// Create the directory `name` in `dir`, as [`Self::create_file`] does.
+    fn mkdir(
+        &self,
+        dir: ScopedDir<'_>,
+        name: &str,
+        metadata: impl FnOnce(&ResolvedDir) -> Result<CreationMetadata, MkdirError>,
+    ) -> Result<DirHandle, MkdirError> {
+        if !valid(name) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let OverlayWalkingDir {
+            mut path,
+            resolved,
+            locked,
+        } = dir.into_typed::<Self>();
+        if self
+            .entry(&resolved, name)
+            .map_err(open_to_mkdir_error)?
+            .is_some()
+        {
+            return Err(MkdirError::AlreadyExists);
+        }
+        let metadata = metadata(&resolved)?;
+        let upper = self
+            .ensure_upper_dir(&locked, &path)
+            .map_err(open_to_mkdir_error)?;
+        let whiteout = whiteout(name);
+        let recreated = self
+            .marker_present(&upper, &whiteout)
+            .map_err(|_| MkdirError::Io)?;
+        let child = self.upper.mkdir_at(
+            self.upper.walking_dir_at(&upper).ok_or(MkdirError::Io)?,
+            name,
+            metadata,
+        )?;
+
+        // A directory recreated over a whiteout must not re-merge with the lower directory it
+        // replaces, so it starts out opaque.
+        let cleared = if recreated {
+            self.create_marker(&locked, &child, OPAQUE_MARKER)
+                .and_then(|()| {
+                    self.remove_marker(&locked, &upper, &whiteout)
+                        .map_err(unlink_to_open_error)
+                })
+                .map_err(open_to_mkdir_error)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = cleared {
+            let _rollback_marker = self.clear_markers(&locked, &child);
+            let _rollback_dir = self
+                .upper
+                .walking_dir_at(&upper)
+                .ok_or(RmdirError::Io)
+                .and_then(|dir| self.upper.rmdir_at(dir, name));
+            return Err(error);
+        }
+
+        path.push(String::from(name));
+        Ok(DirHandle::from_typed::<Self>(OverlayDir { path }))
+    }
+
+    /// Unlink `name` from `dir`, once `authorize` (if any) allows the removal.
+    fn unlink(
+        &self,
+        dir: ScopedDir<'_>,
+        name: &str,
+        authorize: Option<AuthorizeRemoval<'_, UnlinkError>>,
+    ) -> Result<(), UnlinkError> {
+        if !valid(name) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let OverlayWalkingDir {
+            path,
+            resolved,
+            locked,
+        } = dir.into_typed::<Self>();
+        let entry = self
+            .entry(&resolved, name)
+            .map_err(open_to_unlink_error)?
+            .ok_or(PathError::NoSuchFileOrDirectory)?;
+        if let Some(authorize) = authorize {
+            self.authorize_removal(&resolved, name, &entry, authorize)
+                .map_err(open_to_unlink_error)??;
+        }
+        if entry.entry.file_type == FileType::Directory {
+            return Err(UnlinkError::IsADirectory);
+        }
+        // The whiteout goes in before the upper entry comes out, so a failure part-way through can
+        // never reveal the lower entry.
+        let upper = match entry.lower {
+            Some(_) => {
+                let upper = self
+                    .ensure_upper_dir(&locked, &path)
+                    .map_err(open_to_unlink_error)?;
+                self.create_marker(&locked, &upper, &whiteout(name))
+                    .map_err(open_to_unlink_error)?;
+                upper
+            }
+            None => resolved.upper.ok_or(UnlinkError::Io)?,
+        };
+        if entry.upper {
+            self.upper.unlink_at(
+                self.upper.walking_dir_at(&upper).ok_or(UnlinkError::Io)?,
+                name,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Remove the directory `name` from `dir`, once `authorize` (if any) allows the removal.
+    fn rmdir(
+        &self,
+        dir: ScopedDir<'_>,
+        name: &str,
+        authorize: Option<AuthorizeRemoval<'_, RmdirError>>,
+    ) -> Result<(), RmdirError> {
+        if !valid(name) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let OverlayWalkingDir {
+            path,
+            resolved,
+            locked,
+        } = dir.into_typed::<Self>();
+        let entry = self
+            .entry(&resolved, name)
+            .map_err(open_to_rmdir_error)?
+            .ok_or(PathError::NoSuchFileOrDirectory)?;
+        if let Some(authorize) = authorize {
+            self.authorize_removal(&resolved, name, &entry, authorize)
+                .map_err(open_to_rmdir_error)??;
+        }
+        if entry.entry.file_type != FileType::Directory {
+            return Err(RmdirError::NotADirectory);
+        }
+        let child = self
+            .resolve_child_dir(&resolved, name, &entry)
+            .map_err(open_to_rmdir_error)?;
+        if !self
+            .entries(&child)
+            .map_err(open_to_rmdir_error)?
+            .is_empty()
+        {
+            return Err(RmdirError::NotEmpty);
+        }
+
+        // As in `unlink_at`, hide the lower directory before removing the upper one.
+        let upper = match entry.lower {
+            Some(_) => {
+                let upper = self
+                    .ensure_upper_dir(&locked, &path)
+                    .map_err(open_to_rmdir_error)?;
+                self.create_marker(&locked, &upper, &whiteout(name))
+                    .map_err(open_to_rmdir_error)?;
+                upper
+            }
+            None => resolved.upper.ok_or(RmdirError::Io)?,
+        };
+        if let Some(child) = &child.upper {
+            let cleared = self
+                .clear_markers(&locked, child)
+                .map_err(unlink_to_open_error)
+                .map_err(open_to_rmdir_error)?;
+            if let Err(error) = self.upper.rmdir_at(
+                self.upper.walking_dir_at(&upper).ok_or(RmdirError::Io)?,
+                name,
+            ) {
+                for marker in cleared {
+                    let _rollback_marker = self.create_marker(&locked, child, &marker);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rename `old_name` in `old_dir` to `new_name` in `new_dir`, once `authorize` (if any)
+    /// allows it.
+    fn rename(
+        &self,
+        old_dir: DirHandle,
+        old_name: &str,
+        new_dir: DirHandle,
+        new_name: &str,
+        authorize: Option<AuthorizeRename<'_>>,
+    ) -> Result<(), RenameError> {
+        if [old_name, new_name].iter().any(|name| {
+            !valid(name)
+                || name.is_empty()
+                || matches!(*name, "." | "..")
+                || name.contains(['/', '\0'])
+        }) {
+            return Err(PathError::InvalidPathname.into());
+        }
+        let old_path = old_dir.into_typed::<Self>().path;
+        let new_path = new_dir.into_typed::<Self>().path;
+        let locked = self.namespace.lock();
+        let old_dir = self.resolve_dir(&old_path).map_err(open_to_rename_error)?;
+        let source = self
+            .entry(&old_dir, old_name)
+            .map_err(open_to_rename_error)?
+            .ok_or(PathError::NoSuchFileOrDirectory)?;
+        let directory = source.entry.file_type == FileType::Directory;
+        if old_path == new_path && old_name == new_name {
+            return Ok(());
+        }
+        let mut source_path = old_path.clone();
+        source_path.push(String::from(old_name));
+        if directory && new_path.starts_with(&source_path) {
+            return Err(RenameError::InvalidArgument);
+        }
+        let mut destination_path = new_path.clone();
+        destination_path.push(String::from(new_name));
+        if old_path.starts_with(&destination_path) {
+            return Err(RenameError::NotEmpty);
+        }
+        let new_dir = self.resolve_dir(&new_path).map_err(open_to_rename_error)?;
+        let destination = self
+            .entry(&new_dir, new_name)
+            .map_err(open_to_rename_error)?;
+        if let Some(authorize) = authorize {
+            let descriptors = (|| {
+                let replaced = destination
+                    .as_ref()
+                    .map(|entry| self.entry_descriptor(&new_dir, new_name, entry))
+                    .transpose()?;
+                Ok((
+                    self.dir_descriptor(&old_dir)?,
+                    self.dir_descriptor(&new_dir)?,
+                    self.entry_descriptor(&old_dir, old_name, &source)?,
+                    replaced,
+                ))
+            })()
+            .map_err(open_to_rename_error)?;
+            let (old_parent, new_parent, source, replaced) = &descriptors;
+            authorize(&EntryRename {
+                old_parent,
+                new_parent,
+                same_parent: old_path == new_path,
+                source,
+                replaced: replaced.as_ref(),
+            })?;
+        }
+        if let Some(destination) = &destination {
+            match (
+                directory,
+                destination.entry.file_type == FileType::Directory,
+            ) {
+                (true, false) => return Err(RenameError::NotADirectory),
+                (false, true) => return Err(RenameError::IsADirectory),
+                (true, true) => {
+                    let child = self
+                        .resolve_child_dir(&new_dir, new_name, destination)
+                        .map_err(open_to_rename_error)?;
+                    if !self
+                        .entries(&child)
+                        .map_err(open_to_rename_error)?
+                        .is_empty()
+                    {
+                        return Err(RenameError::NotEmpty);
+                    }
+                    // XXX(jayb): a logically empty destination can still hold hidden markers;
+                    // handle this by clearing them (with rollback) as Linux overlayfs does. Until
+                    // then, refuse like an overlayfs that cannot redirect directories, which
+                    // callers such as `mv` handle by copying.
+                    if let Some(upper) = &child.upper
+                        && self
+                            .upper
+                            .list_dir_at(upper.clone())
+                            .map_err(|_| RenameError::Io)?
+                            .iter()
+                            .any(|entry| !valid(&entry.name))
+                    {
+                        return Err(RenameError::CrossDevice);
+                    }
+                }
+                (false, false) => {}
+            }
+        }
+        // Never emulate rename with copy/delete: lower-backed sources and directories with lower
+        // contributions at either endpoint cannot be moved atomically, so refuse them (as above)
+        // before changing anything.
+        if !source.upper
+            || (directory
+                && (source.lower.is_some()
+                    || destination
+                        .as_ref()
+                        .is_some_and(|entry| entry.lower.is_some())))
+        {
+            return Err(RenameError::CrossDevice);
+        }
+        let old_upper = old_dir.upper.ok_or(RenameError::Io)?;
+        let new_upper = self
+            .ensure_upper_dir(&locked, &new_path)
+            .map_err(open_to_rename_error)?;
+        if source.lower.is_some() {
+            // XXX(jayb): hide the old lower entry before moving its upper replacement; not atomic,
+            // so fix as part of broader atomicity fixups. Failure leaves the source visible
+            // because an upper entry takes precedence over whiteouts. Keep any destination
+            // whiteout so moving away cannot reveal its lower.
+            self.create_marker(&locked, &old_upper, &whiteout(old_name))
+                .map_err(open_to_rename_error)?;
+        }
+        self.upper
+            .rename_at(old_upper, old_name, new_upper, new_name)
+    }
+
+    /// Open `file`, admitting the open and applying the content change of `checks` (if any) as
+    /// [`Backend::open_file_checked`] does.
+    fn open(
+        &self,
+        file: ResolvedFile<'_>,
+        flags: OFlags,
+        checks: Option<&OpenChecks<'_>>,
+    ) -> Result<FileHandle, OpenError> {
+        if flags.contains(OFlags::DIRECTORY) {
+            return Err(PathError::ComponentNotADirectory.into());
+        }
+        let OverlayResolvedFile {
+            parent,
+            name,
+            layer,
+            target,
+            locked,
+        } = file.into_typed::<Self>();
+        let layer = if let Some(layer) = layer {
+            let status = self.lowers[layer]
+                .resolved_status(&target)
+                .map_err(file_status_to_open_error)?;
+            let truncate = !flags.contains(OFlags::PATH) && flags.contains(OFlags::TRUNC);
+            let writing = !flags.contains(OFlags::PATH)
+                && flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::APPEND | OFlags::TRUNC);
+            if let Some(checks) = checks
+                && writing
+            {
+                // Copying up reads the lower file for the overlay rather than for the opener, so
+                // admit the opener here; `locked` keeps the descriptor current.
+                (checks.admit)(broker_descriptor(target.permissions()).ok_or(OpenError::Io)?)?;
+            }
+            let metadata = match checks {
+                // The copy-up is the truncation, so its copy carries the changed descriptor.
+                Some(checks) if truncate => {
+                    let mut descriptor = broker_descriptor(target.permissions())
+                        .ok_or(OpenError::Io)?
+                        .clone();
+                    (checks.content_change)(&mut descriptor);
+                    CreationMetadata::new(descriptor)
+                }
+                _ => copy_up_metadata(target.permissions(), &status),
+            };
+            let ResolvedTarget::File(file) = target else {
+                unreachable!()
+            };
+            let file = match checks {
+                _ if writing => self.lowers[layer].open_file(file, OFlags::RDONLY)?,
+                Some(checks) => {
+                    self.lowers[layer].open_file_checked(file, flags - OFlags::CREAT, checks)?
+                }
+                None => self.lowers[layer].open_file(file, flags - OFlags::CREAT)?,
+            };
+            if writing {
+                if status.file_type != FileType::RegularFile {
+                    return Err(OpenError::ReadOnlyFileSystem);
+                }
+                let upper_dir = self.ensure_upper_dir(&locked, &parent)?;
+                let upper = self.copy_up_file(
+                    &locked,
+                    &upper_dir,
+                    &name,
+                    (layer, &file),
+                    &status,
+                    metadata,
+                    truncate,
+                )?;
+                OverlayFileLayer::Upper(upper)
+            } else {
+                let node = self.map_node(&mut self.state.lock().ids, Some(layer), status.node_info);
+                OverlayFileLayer::Lower {
+                    layer,
+                    handle: file,
+                    node,
+                }
+            }
+        } else {
+            let ResolvedTarget::File(file) = target else {
+                unreachable!()
+            };
+            OverlayFileLayer::Upper(match checks {
+                Some(checks) => self.upper.open_file_checked(file, flags, checks)?,
+                None => self.upper.open_file(file, flags)?,
+            })
+        };
+        Ok(FileHandle::from_typed::<Self>(OverlayFile { layer }))
+    }
+
+    /// Run `f` against the upper handle of an open `file` that may change its contents: the one it
+    /// was opened with or copied up to since. A lower-backed handle is read-only.
+    fn with_upper_file<R, E>(
+        &self,
+        h: &FileHandle,
+        read_only: E,
+        f: impl FnOnce(&FileHandle) -> Result<R, E>,
+    ) -> Result<R, E> {
+        let file = h.get_typed::<Self>();
+        if let Some(upper) = self.migrated(file) {
+            return f(&upper);
+        }
+        match &file.layer {
+            OverlayFileLayer::Upper(handle) => f(handle),
+            // A writable open copies up first, so a lower-backed handle is read-only.
+            OverlayFileLayer::Lower { .. } => Err(read_only),
         }
     }
 
@@ -947,6 +1534,53 @@ fn unlink_to_open_error(error: UnlinkError) -> OpenError {
     }
 }
 
+fn open_to_symlink_error(error: OpenError) -> SymlinkError {
+    match error {
+        OpenError::PathError(error) => SymlinkError::PathError(error),
+        OpenError::AlreadyExists => SymlinkError::AlreadyExists,
+        OpenError::ReadOnlyFileSystem => SymlinkError::ReadOnlyFileSystem,
+        OpenError::NoWritePerms => SymlinkError::NoWritePerms,
+        _ => SymlinkError::Io,
+    }
+}
+
+fn open_to_mkdir_error(error: OpenError) -> MkdirError {
+    match error {
+        OpenError::PathError(error) => MkdirError::PathError(error),
+        OpenError::AlreadyExists => MkdirError::AlreadyExists,
+        OpenError::ReadOnlyFileSystem => MkdirError::ReadOnlyFileSystem,
+        OpenError::NoWritePerms => MkdirError::NoWritePerms,
+        _ => MkdirError::Io,
+    }
+}
+
+fn open_to_unlink_error(error: OpenError) -> UnlinkError {
+    match error {
+        OpenError::PathError(error) => UnlinkError::PathError(error),
+        OpenError::ReadOnlyFileSystem => UnlinkError::ReadOnlyFileSystem,
+        OpenError::NoWritePerms => UnlinkError::NoWritePerms,
+        _ => UnlinkError::Io,
+    }
+}
+
+fn open_to_rmdir_error(error: OpenError) -> RmdirError {
+    match error {
+        OpenError::PathError(error) => RmdirError::PathError(error),
+        OpenError::ReadOnlyFileSystem => RmdirError::ReadOnlyFileSystem,
+        OpenError::NoWritePerms => RmdirError::NoWritePerms,
+        _ => RmdirError::Io,
+    }
+}
+
+fn open_to_rename_error(error: OpenError) -> RenameError {
+    match error {
+        OpenError::PathError(error) => RenameError::PathError(error),
+        OpenError::ReadOnlyFileSystem => RenameError::ReadOnlyFileSystem,
+        OpenError::NoWritePerms | OpenError::AccessNotAllowed => RenameError::NoWritePerms,
+        _ => RenameError::Io,
+    }
+}
+
 fn walk_to_open_error(error: WalkError) -> OpenError {
     match error {
         WalkError::PathError(error) => OpenError::PathError(error),
@@ -996,7 +1630,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 error,
             };
             let PermissionCheck::ByResolver(permissions) = &current.permissions else {
-                unreachable!()
+                unreachable!("overlay directories are authorized by the resolver")
             };
             authorize_dir_lookup(permissions).map_err(fail)?;
             if !valid(name) {
@@ -1067,11 +1701,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 .map_err(file_status_to_open_error)
                 .map_err(open_to_walk_error)
                 .map_err(fail)?;
-            let permissions = PermissionCheck::ByResolver(PermissionInfo {
-                mode: status.mode,
-                owner: status.owner,
-                on_read_only_fs: false,
-            });
+            let permissions = layered_permissions(target.permissions(), &status);
             return Ok(Resolution::Found(ResolvedTarget::File(
                 ResolvedFile::from_typed::<Self>(
                     OverlayResolvedFile {
@@ -1087,6 +1717,16 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             )));
         }
         Ok(Resolution::Found(ResolvedTarget::Dir(current)))
+    }
+
+    fn read_resolved_link(&self, file: &ResolvedFile<'_>) -> Result<String, WalkError> {
+        let file = file.get_typed::<Self>();
+        let ResolvedTarget::File(target) = &file.target else {
+            return Err(WalkError::Io);
+        };
+        file.layer
+            .map_or(self.upper.as_ref(), |layer| self.lowers[layer].as_ref())
+            .read_resolved_link(target)
     }
 
     fn read_link_at(&self, dir: &ScopedDir<'_>, name: &str) -> Result<String, WalkError> {
@@ -1130,60 +1770,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
-        if flags.contains(OFlags::DIRECTORY) {
-            return Err(PathError::ComponentNotADirectory.into());
-        }
-        let OverlayResolvedFile {
-            parent,
-            name,
-            layer,
-            target,
-            locked,
-        } = file.into_typed::<Self>();
-        let layer = if let Some(layer) = layer {
-            let status = self.lowers[layer]
-                .resolved_status(&target)
-                .map_err(file_status_to_open_error)?;
-            let ResolvedTarget::File(file) = target else {
-                unreachable!()
-            };
-            let writing = !flags.contains(OFlags::PATH)
-                && flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::APPEND | OFlags::TRUNC);
-            let lower_flags = if writing {
-                OFlags::RDONLY
-            } else {
-                flags - OFlags::CREAT
-            };
-            let file = self.lowers[layer].open_file(file, lower_flags)?;
-            if writing {
-                if status.file_type != FileType::RegularFile {
-                    return Err(OpenError::ReadOnlyFileSystem);
-                }
-                let upper_dir = self.ensure_upper_dir(&locked, &parent)?;
-                let upper = self.copy_up_file(
-                    &locked,
-                    &upper_dir,
-                    &name,
-                    (layer, &file),
-                    &status,
-                    flags.contains(OFlags::TRUNC),
-                )?;
-                OverlayFileLayer::Upper(upper)
-            } else {
-                let node = self.map_node(&mut self.state.lock().ids, Some(layer), status.node_info);
-                OverlayFileLayer::Lower {
-                    layer,
-                    handle: file,
-                    node,
-                }
-            }
-        } else {
-            let ResolvedTarget::File(file) = target else {
-                unreachable!()
-            };
-            OverlayFileLayer::Upper(self.upper.open_file(file, flags)?)
-        };
-        Ok(FileHandle::from_typed::<Self>(OverlayFile { layer }))
+        self.open(file, flags, None)
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
@@ -1222,26 +1809,15 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         buf: &dyn WriteBuffer,
         offset: usize,
     ) -> Result<usize, WriteError> {
-        let file = h.get_typed::<Self>();
-        if let Some(upper) = self.migrated(file) {
-            return self.upper.write(&upper, buf, offset);
-        }
-        match &file.layer {
-            OverlayFileLayer::Upper(handle) => self.upper.write(handle, buf, offset),
-            // A writable open copies up first, so a lower-backed handle is read-only.
-            OverlayFileLayer::Lower { .. } => Err(WriteError::NotForWriting),
-        }
+        self.with_upper_file(h, WriteError::NotForWriting, |upper| {
+            self.upper.write(upper, buf, offset)
+        })
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
-        let file = h.get_typed::<Self>();
-        if let Some(upper) = self.migrated(file) {
-            return self.upper.truncate(&upper, length);
-        }
-        match &file.layer {
-            OverlayFileLayer::Upper(handle) => self.upper.truncate(handle, length),
-            OverlayFileLayer::Lower { .. } => Err(TruncateError::NotForWriting),
-        }
+        self.with_upper_file(h, TruncateError::NotForWriting, |upper| {
+            self.upper.truncate(upper, length)
+        })
     }
 
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
@@ -1309,34 +1885,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
-        if !valid(name) {
-            return Err(PathError::InvalidPathname.into());
-        }
-        let OverlayWalkingDir {
-            path,
-            resolved,
-            locked,
-        } = dir.into_typed::<Self>();
-        if self.entry(&resolved, name)?.is_some() {
-            return Err(OpenError::AlreadyExists);
-        }
-        let upper = self.ensure_upper_dir(&locked, &path)?;
-        let file = self.upper.create_file_at(
-            self.upper.walking_dir_at(&upper).ok_or(OpenError::Io)?,
-            name,
-            metadata,
-        )?;
-        if let Err(error) = self.remove_marker(&locked, &upper, &whiteout(name)) {
-            let _rollback_result = self
-                .upper
-                .walking_dir_at(&upper)
-                .ok_or(UnlinkError::Io)
-                .and_then(|dir| self.upper.unlink_at(dir, name));
-            return Err(unlink_to_open_error(error));
-        }
-        Ok(FileHandle::from_typed::<Self>(OverlayFile {
-            layer: OverlayFileLayer::Upper(file),
-        }))
+        self.create_file(dir, name, |_| Ok(metadata))
     }
 
     fn symlink_at(
@@ -1346,50 +1895,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         target: &str,
         metadata: CreationMetadata,
     ) -> Result<(), SymlinkError> {
-        fn open_to_symlink_error(error: OpenError) -> SymlinkError {
-            match error {
-                OpenError::PathError(error) => SymlinkError::PathError(error),
-                OpenError::AlreadyExists => SymlinkError::AlreadyExists,
-                OpenError::ReadOnlyFileSystem => SymlinkError::ReadOnlyFileSystem,
-                OpenError::NoWritePerms => SymlinkError::NoWritePerms,
-                _ => SymlinkError::Io,
-            }
-        }
-        if !valid(name) {
-            return Err(PathError::InvalidPathname.into());
-        }
-        let OverlayWalkingDir {
-            path,
-            resolved,
-            locked,
-        } = dir.into_typed::<Self>();
-        if self
-            .entry(&resolved, name)
-            .map_err(open_to_symlink_error)?
-            .is_some()
-        {
-            return Err(SymlinkError::AlreadyExists);
-        }
-        let upper = self
-            .ensure_upper_dir(&locked, &path)
-            .map_err(open_to_symlink_error)?;
-        self.upper.symlink_at(
-            self.upper.walking_dir_at(&upper).ok_or(SymlinkError::Io)?,
-            name,
-            target,
-            metadata,
-        )?;
-        // Like a regular file, a replacement link clears its whiteout but
-        // needs no opaque marker: only directories can merge with lower entries.
-        if let Err(error) = self.remove_marker(&locked, &upper, &whiteout(name)) {
-            let _rollback_result = self
-                .upper
-                .walking_dir_at(&upper)
-                .ok_or(UnlinkError::Io)
-                .and_then(|dir| self.upper.unlink_at(dir, name));
-            return Err(open_to_symlink_error(unlink_to_open_error(error)));
-        }
-        Ok(())
+        self.symlink(dir, name, target, |_| Ok(metadata))
     }
 
     fn mkdir_at(
@@ -1398,178 +1904,15 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
-        fn open_to_mkdir_error(error: OpenError) -> MkdirError {
-            match error {
-                OpenError::PathError(error) => MkdirError::PathError(error),
-                OpenError::AlreadyExists => MkdirError::AlreadyExists,
-                OpenError::ReadOnlyFileSystem => MkdirError::ReadOnlyFileSystem,
-                OpenError::NoWritePerms => MkdirError::NoWritePerms,
-                _ => MkdirError::Io,
-            }
-        }
-        if !valid(name) {
-            return Err(PathError::InvalidPathname.into());
-        }
-        let OverlayWalkingDir {
-            mut path,
-            resolved,
-            locked,
-        } = dir.into_typed::<Self>();
-        if self
-            .entry(&resolved, name)
-            .map_err(open_to_mkdir_error)?
-            .is_some()
-        {
-            return Err(MkdirError::AlreadyExists);
-        }
-        let upper = self
-            .ensure_upper_dir(&locked, &path)
-            .map_err(open_to_mkdir_error)?;
-        let whiteout = whiteout(name);
-        let recreated = self
-            .marker_present(&upper, &whiteout)
-            .map_err(|_| MkdirError::Io)?;
-        let child = self.upper.mkdir_at(
-            self.upper.walking_dir_at(&upper).ok_or(MkdirError::Io)?,
-            name,
-            metadata,
-        )?;
-
-        // A directory recreated over a whiteout must not re-merge with the lower directory it
-        // replaces, so it starts out opaque.
-        let cleared = if recreated {
-            self.create_marker(&locked, &child, OPAQUE_MARKER)
-                .and_then(|()| {
-                    self.remove_marker(&locked, &upper, &whiteout)
-                        .map_err(unlink_to_open_error)
-                })
-                .map_err(open_to_mkdir_error)
-        } else {
-            Ok(())
-        };
-        if let Err(error) = cleared {
-            let _rollback_marker = self.clear_markers(&locked, &child);
-            let _rollback_dir = self
-                .upper
-                .walking_dir_at(&upper)
-                .ok_or(RmdirError::Io)
-                .and_then(|dir| self.upper.rmdir_at(dir, name));
-            return Err(error);
-        }
-
-        path.push(String::from(name));
-        Ok(DirHandle::from_typed::<Self>(OverlayDir { path }))
+        self.mkdir(dir, name, |_| Ok(metadata))
     }
 
     fn unlink_at(&self, dir: ScopedDir<'_>, name: &str) -> Result<(), UnlinkError> {
-        fn open_to_unlink_error(error: OpenError) -> UnlinkError {
-            match error {
-                OpenError::PathError(error) => UnlinkError::PathError(error),
-                OpenError::ReadOnlyFileSystem => UnlinkError::ReadOnlyFileSystem,
-                OpenError::NoWritePerms => UnlinkError::NoWritePerms,
-                _ => UnlinkError::Io,
-            }
-        }
-        if !valid(name) {
-            return Err(PathError::InvalidPathname.into());
-        }
-        let OverlayWalkingDir {
-            path,
-            resolved,
-            locked,
-        } = dir.into_typed::<Self>();
-        let entry = self
-            .entry(&resolved, name)
-            .map_err(open_to_unlink_error)?
-            .ok_or(PathError::NoSuchFileOrDirectory)?;
-        if entry.entry.file_type == FileType::Directory {
-            return Err(UnlinkError::IsADirectory);
-        }
-        // The whiteout goes in before the upper entry comes out, so a failure part-way through can
-        // never reveal the lower entry.
-        let upper = match entry.lower {
-            Some(_) => {
-                let upper = self
-                    .ensure_upper_dir(&locked, &path)
-                    .map_err(open_to_unlink_error)?;
-                self.create_marker(&locked, &upper, &whiteout(name))
-                    .map_err(open_to_unlink_error)?;
-                upper
-            }
-            None => resolved.upper.ok_or(UnlinkError::Io)?,
-        };
-        if entry.upper {
-            self.upper.unlink_at(
-                self.upper.walking_dir_at(&upper).ok_or(UnlinkError::Io)?,
-                name,
-            )?;
-        }
-        Ok(())
+        self.unlink(dir, name, None)
     }
 
     fn rmdir_at(&self, dir: ScopedDir<'_>, name: &str) -> Result<(), RmdirError> {
-        fn open_to_rmdir_error(error: OpenError) -> RmdirError {
-            match error {
-                OpenError::PathError(error) => RmdirError::PathError(error),
-                OpenError::ReadOnlyFileSystem => RmdirError::ReadOnlyFileSystem,
-                OpenError::NoWritePerms => RmdirError::NoWritePerms,
-                _ => RmdirError::Io,
-            }
-        }
-        if !valid(name) {
-            return Err(PathError::InvalidPathname.into());
-        }
-        let OverlayWalkingDir {
-            path,
-            resolved,
-            locked,
-        } = dir.into_typed::<Self>();
-        let entry = self
-            .entry(&resolved, name)
-            .map_err(open_to_rmdir_error)?
-            .ok_or(PathError::NoSuchFileOrDirectory)?;
-        if entry.entry.file_type != FileType::Directory {
-            return Err(RmdirError::NotADirectory);
-        }
-        let child = self
-            .resolve_child_dir(&resolved, name, &entry)
-            .map_err(open_to_rmdir_error)?;
-        if !self
-            .entries(&child)
-            .map_err(open_to_rmdir_error)?
-            .is_empty()
-        {
-            return Err(RmdirError::NotEmpty);
-        }
-
-        // As in `unlink_at`, hide the lower directory before removing the upper one.
-        let upper = match entry.lower {
-            Some(_) => {
-                let upper = self
-                    .ensure_upper_dir(&locked, &path)
-                    .map_err(open_to_rmdir_error)?;
-                self.create_marker(&locked, &upper, &whiteout(name))
-                    .map_err(open_to_rmdir_error)?;
-                upper
-            }
-            None => resolved.upper.ok_or(RmdirError::Io)?,
-        };
-        if let Some(child) = &child.upper {
-            let cleared = self
-                .clear_markers(&locked, child)
-                .map_err(unlink_to_open_error)
-                .map_err(open_to_rmdir_error)?;
-            if let Err(error) = self.upper.rmdir_at(
-                self.upper.walking_dir_at(&upper).ok_or(RmdirError::Io)?,
-                name,
-            ) {
-                for marker in cleared {
-                    let _rollback_marker = self.create_marker(&locked, child, &marker);
-                }
-                return Err(error);
-            }
-        }
-        Ok(())
+        self.rmdir(dir, name, None)
     }
 
     fn rename_at(
@@ -1579,107 +1922,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         new_dir: DirHandle,
         new_name: &str,
     ) -> Result<(), RenameError> {
-        fn open_to_rename_error(error: OpenError) -> RenameError {
-            match error {
-                OpenError::PathError(error) => RenameError::PathError(error),
-                OpenError::ReadOnlyFileSystem => RenameError::ReadOnlyFileSystem,
-                OpenError::NoWritePerms | OpenError::AccessNotAllowed => RenameError::NoWritePerms,
-                _ => RenameError::Io,
-            }
-        }
-        if [old_name, new_name].iter().any(|name| {
-            !valid(name)
-                || name.is_empty()
-                || matches!(*name, "." | "..")
-                || name.contains(['/', '\0'])
-        }) {
-            return Err(PathError::InvalidPathname.into());
-        }
-        let old_path = old_dir.into_typed::<Self>().path;
-        let new_path = new_dir.into_typed::<Self>().path;
-        let locked = self.namespace.lock();
-        let old_dir = self.resolve_dir(&old_path).map_err(open_to_rename_error)?;
-        let source = self
-            .entry(&old_dir, old_name)
-            .map_err(open_to_rename_error)?
-            .ok_or(PathError::NoSuchFileOrDirectory)?;
-        let directory = source.entry.file_type == FileType::Directory;
-        if old_path == new_path && old_name == new_name {
-            return Ok(());
-        }
-        let mut source_path = old_path.clone();
-        source_path.push(String::from(old_name));
-        if directory && new_path.starts_with(&source_path) {
-            return Err(RenameError::InvalidArgument);
-        }
-        let mut destination_path = new_path.clone();
-        destination_path.push(String::from(new_name));
-        if old_path.starts_with(&destination_path) {
-            return Err(RenameError::NotEmpty);
-        }
-        let new_dir = self.resolve_dir(&new_path).map_err(open_to_rename_error)?;
-        let destination = self
-            .entry(&new_dir, new_name)
-            .map_err(open_to_rename_error)?;
-        if let Some(destination) = &destination {
-            match (
-                directory,
-                destination.entry.file_type == FileType::Directory,
-            ) {
-                (true, false) => return Err(RenameError::NotADirectory),
-                (false, true) => return Err(RenameError::IsADirectory),
-                (true, true) => {
-                    let child = self
-                        .resolve_child_dir(&new_dir, new_name, destination)
-                        .map_err(open_to_rename_error)?;
-                    if !self
-                        .entries(&child)
-                        .map_err(open_to_rename_error)?
-                        .is_empty()
-                    {
-                        return Err(RenameError::NotEmpty);
-                    }
-                    // XXX(jayb): a logically empty destination can still hold hidden markers;
-                    // handle this by clearing them (with rollback) as Linux overlayfs does.
-                    if let Some(upper) = &child.upper
-                        && self
-                            .upper
-                            .list_dir_at(upper.clone())
-                            .map_err(|_| RenameError::Io)?
-                            .iter()
-                            .any(|entry| !valid(&entry.name))
-                    {
-                        unimplemented!("rename over a directory with hidden overlay markers");
-                    }
-                }
-                (false, false) => {}
-            }
-        }
-        // Never emulate rename with copy/delete: lower-backed sources and directories with lower
-        // contributions at either endpoint cannot be moved atomically.
-        if !source.upper
-            || (directory
-                && (source.lower.is_some()
-                    || destination
-                        .as_ref()
-                        .is_some_and(|entry| entry.lower.is_some())))
-        {
-            unimplemented!("rename of lower-backed overlay entries");
-        }
-        let old_upper = old_dir.upper.ok_or(RenameError::Io)?;
-        let new_upper = self
-            .ensure_upper_dir(&locked, &new_path)
-            .map_err(open_to_rename_error)?;
-        if source.lower.is_some() {
-            // XXX(jayb): hide the old lower entry before moving its upper replacement; not atomic,
-            // so fix as part of broader atomicity fixups. Failure leaves the source visible
-            // because an upper entry takes precedence over whiteouts. Keep any destination
-            // whiteout so moving away cannot reveal its lower.
-            self.create_marker(&locked, &old_upper, &whiteout(old_name))
-                .map_err(open_to_rename_error)?;
-        }
-        self.upper
-            .rename_at(old_upper, old_name, new_upper, new_name)
+        self.rename(old_dir, old_name, new_dir, new_name, None)
     }
 
     fn set_times(
@@ -1733,5 +1976,146 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 OpenError::ReadOnlyFileSystem => ChownError::ReadOnlyFileSystem,
                 _ => ChownError::Io,
             })?
+    }
+
+    fn create_file_checked(
+        &self,
+        parent: ScopedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, OpenError>,
+    ) -> Result<FileHandle, OpenError> {
+        self.create_file(parent, name, |dir| {
+            self.checked_metadata(dir, authorize, core::convert::identity)
+        })
+    }
+
+    fn symlink_checked(
+        &self,
+        dir: ScopedDir<'_>,
+        name: &str,
+        target: &str,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, SymlinkError>,
+    ) -> Result<(), SymlinkError> {
+        self.symlink(dir, name, target, |dir| {
+            self.checked_metadata(dir, authorize, open_to_symlink_error)
+        })
+    }
+
+    fn mkdir_checked(
+        &self,
+        parent: ScopedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, MkdirError>,
+    ) -> Result<DirHandle, MkdirError> {
+        self.mkdir(parent, name, |dir| {
+            self.checked_metadata(dir, authorize, open_to_mkdir_error)
+        })
+    }
+
+    fn unlink_checked(
+        &self,
+        parent: ScopedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&EntryRemoval<'_>) -> Result<(), UnlinkError>,
+    ) -> Result<(), UnlinkError> {
+        self.unlink(parent, name, Some(authorize))
+    }
+
+    fn rmdir_checked(
+        &self,
+        parent: ScopedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&EntryRemoval<'_>) -> Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
+        self.rmdir(parent, name, Some(authorize))
+    }
+
+    fn rename_checked(
+        &self,
+        old_dir: DirHandle,
+        old_name: &str,
+        new_dir: DirHandle,
+        new_name: &str,
+        authorize: &dyn Fn(&EntryRename<'_>) -> Result<(), RenameError>,
+    ) -> Result<(), RenameError> {
+        self.rename(old_dir, old_name, new_dir, new_name, Some(authorize))
+    }
+
+    fn set_times_checked(
+        &self,
+        target: ResolvedTarget<'_>,
+        times: &super::SetFileTimes,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), super::errors::SetTimesError>,
+    ) -> Result<(), super::errors::SetTimesError> {
+        use super::{FileTimeUpdate, errors::SetTimesError};
+        if matches!(
+            (times.access, times.modify),
+            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
+        ) {
+            return Ok(());
+        }
+        // Authorize before copying up; the namespace lock that `target` holds keeps its
+        // descriptor current, and the upper backend checks its copy again.
+        authorize(broker_descriptor(target.permissions()).ok_or(SetTimesError::Io)?)?;
+        self.with_upper(target, |target| {
+            self.upper.set_times_checked(target, times, authorize)
+        })
+        .map_err(|error| match error {
+            OpenError::PathError(error) => SetTimesError::PathError(error),
+            OpenError::ReadOnlyFileSystem => SetTimesError::ReadOnlyFileSystem,
+            _ => SetTimesError::Io,
+        })?
+    }
+
+    fn update_security(
+        &self,
+        target: ResolvedTarget<'_>,
+        update: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, SetSecurityError>,
+    ) -> Result<(), SetSecurityError> {
+        if let ResolvedTarget::File(file) = &target
+            && file.file_type == FileType::SymbolicLink
+        {
+            return Err(SetSecurityError::IsSymlink);
+        }
+        // As in `set_times_checked`.
+        update(broker_descriptor(target.permissions()).ok_or(SetSecurityError::Io)?)?;
+        self.with_upper(target, |target| self.upper.update_security(target, update))
+            .map_err(|error| match error {
+                OpenError::PathError(error) => SetSecurityError::PathError(error),
+                OpenError::ReadOnlyFileSystem => SetSecurityError::ReadOnlyFileSystem,
+                _ => SetSecurityError::Io,
+            })?
+    }
+
+    fn open_file_checked(
+        &self,
+        file: ResolvedFile<'_>,
+        flags: OFlags,
+        checks: &OpenChecks<'_>,
+    ) -> Result<FileHandle, OpenError> {
+        self.open(file, flags, Some(checks))
+    }
+
+    fn write_checked(
+        &self,
+        h: &FileHandle,
+        buf: &dyn WriteBuffer,
+        offset: usize,
+        content_change: &dyn Fn(&mut SecurityDescriptor),
+    ) -> Result<usize, WriteError> {
+        self.with_upper_file(h, WriteError::NotForWriting, |upper| {
+            self.upper.write_checked(upper, buf, offset, content_change)
+        })
+    }
+
+    fn truncate_checked(
+        &self,
+        h: &FileHandle,
+        length: usize,
+        content_change: &dyn Fn(&mut SecurityDescriptor),
+    ) -> Result<(), TruncateError> {
+        self.with_upper_file(h, TruncateError::NotForWriting, |upper| {
+            self.upper.truncate_checked(upper, length, content_change)
+        })
     }
 }

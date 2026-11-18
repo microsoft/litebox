@@ -167,7 +167,8 @@ impl From<litebox::fs::errors::PathError> for Errno {
     fn from(value: litebox::fs::errors::PathError) -> Self {
         match value {
             litebox::fs::errors::PathError::NoSuchFileOrDirectory => Errno::ENOENT,
-            litebox::fs::errors::PathError::NoSearchPerms => Errno::EACCES,
+            litebox::fs::errors::PathError::NoSearchPerms
+            | litebox::fs::errors::PathError::StaleSubject => Errno::EACCES,
             litebox::fs::errors::PathError::InvalidPathname => Errno::EINVAL,
             litebox::fs::errors::PathError::MissingComponent => Errno::ENOENT,
             litebox::fs::errors::PathError::ComponentNotADirectory => Errno::ENOTDIR,
@@ -219,6 +220,7 @@ impl From<litebox::fs::errors::ChownError> for Errno {
     fn from(value: litebox::fs::errors::ChownError) -> Self {
         match value {
             litebox::fs::errors::ChownError::NotTheOwner => Errno::EPERM,
+            litebox::fs::errors::ChownError::InvalidOwner => Errno::EINVAL,
             litebox::fs::errors::ChownError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::ChownError::Io => Errno::EIO,
             litebox::fs::errors::ChownError::PathError(path_error) => path_error.into(),
@@ -231,6 +233,7 @@ impl From<litebox::fs::errors::UnlinkError> for Errno {
     fn from(value: litebox::fs::errors::UnlinkError) -> Self {
         match value {
             litebox::fs::errors::UnlinkError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::UnlinkError::NotOwner => Errno::EPERM,
             litebox::fs::errors::UnlinkError::IsADirectory => Errno::EISDIR,
             litebox::fs::errors::UnlinkError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::UnlinkError::Io => Errno::EIO,
@@ -244,6 +247,7 @@ impl From<litebox::fs::errors::RenameError> for Errno {
     fn from(value: litebox::fs::errors::RenameError) -> Self {
         match value {
             litebox::fs::errors::RenameError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::RenameError::NotOwner => Errno::EPERM,
             litebox::fs::errors::RenameError::Busy => Errno::EBUSY,
             litebox::fs::errors::RenameError::CrossDevice => Errno::EXDEV,
             litebox::fs::errors::RenameError::InvalidArgument => Errno::EINVAL,
@@ -262,6 +266,7 @@ impl From<litebox::fs::errors::RmdirError> for Errno {
     fn from(value: litebox::fs::errors::RmdirError) -> Self {
         match value {
             litebox::fs::errors::RmdirError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::RmdirError::NotOwner => Errno::EPERM,
             litebox::fs::errors::RmdirError::Busy => Errno::EBUSY,
             litebox::fs::errors::RmdirError::NotEmpty => Errno::ENOTEMPTY,
             litebox::fs::errors::RmdirError::NotADirectory => Errno::ENOTDIR,
@@ -296,6 +301,7 @@ impl From<litebox::fs::errors::WriteError> for Errno {
         match value {
             litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::WriteError::NotForWriting => Errno::EBADF,
+            litebox::fs::errors::WriteError::StaleSubject => Errno::EACCES,
             litebox::fs::errors::WriteError::WouldBlock => Errno::EAGAIN,
             litebox::fs::errors::WriteError::WaitError(e) => match e {
                 litebox::event::wait::WaitError::Interrupted => Errno::ERESTARTSYS,
@@ -969,6 +975,7 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
     fn from(value: litebox::fs::errors::TruncateError) -> Self {
         match value {
             litebox::fs::errors::TruncateError::IsDirectory => Errno::EISDIR,
+            litebox::fs::errors::TruncateError::StaleSubject => Errno::EACCES,
             litebox::fs::errors::TruncateError::NotForWriting => Errno::EACCES,
             litebox::fs::errors::TruncateError::NotOpenForWriting => Errno::EBADF,
             litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,

@@ -21,7 +21,7 @@ use litebox::{
 };
 use litebox_broker_protocol::{
     ObjectHandle,
-    fs::{FileMode as Mode, FileUser},
+    fs::FileMode as Mode,
     socket::SocketType,
     unix_socket::{UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketName},
 };
@@ -224,7 +224,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     pub(super) fn bind(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         let address = addr.to_address(task)?;
         let mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO) & !task.fs.borrow().umask();
-        self.socket.bind(&address, acting_user(task), mode)?;
+        self.socket.bind(&address, file_caller(task), mode)?;
         Ok(())
     }
 
@@ -236,7 +236,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     pub(super) fn connect(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         let address = addr.to_address(task)?;
         self.socket
-            .connect(&task.wait_cx(), &address, acting_user(task), false)?;
+            .connect(&task.wait_cx(), &address, file_caller(task), false)?;
         Ok(())
     }
 
@@ -281,7 +281,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
             &task.wait_cx(),
             address.as_ref(),
             buf,
-            acting_user(task),
+            file_caller(task),
             flags.contains(SendFlags::DONTWAIT),
         )?)
     }
@@ -497,8 +497,8 @@ fn socket_type(sock_type: SockType, protocol: u8) -> Result<SocketType, Errno> {
     }
 }
 
-fn acting_user<Platform: ShimPlatform>(task: &Task<Platform>) -> FileUser {
-    task.fs.borrow().context.read().acting_user()
+fn file_caller<Platform: ShimPlatform>(task: &Task<Platform>) -> litebox::fs::Caller {
+    task.fs.borrow().context.read().caller().clone()
 }
 
 #[cfg(test)]

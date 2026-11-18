@@ -162,14 +162,14 @@ fn fs_mount_wire_shape_is_pinned() {
         request_id: RequestId(13),
         operation: BrokerOperation::File(FileRequest::Mount(MountFileRequest {
             path: SharedBufferSequence::new(&[SharedBufferSlotIndex(2)], 3).unwrap(),
-            user: FileUser { user: 5, group: 7 },
+            caller: FileUser { user: 5, group: 7 }.into(),
         })),
     };
     let encoded = encode_request(&request);
     assert_eq!(
         encoded,
         [
-            1, 13, 0, 0, 0, 0, 0, 0, 0, 9, 23, 1, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0
+            1, 13, 0, 0, 0, 0, 0, 0, 0, 9, 22, 1, 2, 0, 0, 0, 3, 0, 0, 0, 0, 5, 0, 7, 0
         ]
     );
     assert_eq!(decode_request(&encoded).unwrap(), request);
@@ -185,6 +185,6 @@ fn fs_mount_wire_shape_is_pinned() {
         result: BrokerResult::File(FileResponse::Mount),
     };
     let encoded = encode_response(&response);
-    assert_eq!(encoded, [1, 13, 0, 0, 0, 0, 0, 0, 0, 9, 24]);
+    assert_eq!(encoded, [1, 13, 0, 0, 0, 0, 0, 0, 0, 9, 23]);
     assert_eq!(decode_response(&encoded).unwrap(), response);
 }

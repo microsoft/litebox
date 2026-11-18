@@ -5875,7 +5875,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(crate::fs::write(&source, file, b"abcdef", None), Ok(Ok(6)));
+        assert_eq!(
+            crate::fs::write(&source, file, None, b"abcdef", None),
+            Ok(Ok(6))
+        );
         assert_eq!(
             crate::fs::seek(&source, file, 0, FileSeekWhence::RelativeToBeginning),
             Ok(Ok(0))
@@ -6016,7 +6019,7 @@ mod tests {
         let write_only_random = Arc::clone(&broker.fs)
             .open(
                 "/dev/urandom",
-                ROOT,
+                ROOT.into(),
                 FileAccessMode::WriteOnly,
                 FileOpenFlags::NONE,
                 FileMode::default(),
@@ -6032,7 +6035,7 @@ mod tests {
         let read_only_null = Arc::clone(&broker.fs)
             .open(
                 "/dev/null",
-                ROOT,
+                ROOT.into(),
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::NONE,
                 FileMode::default(),
@@ -6060,11 +6063,11 @@ mod tests {
             .duplicate_object_reference_to(stdout, &target, ObjectRights::WRITE)
             .unwrap();
         assert_eq!(
-            crate::fs::write(&source, stdout, b"source", None),
+            crate::fs::write(&source, stdout, None, b"source", None),
             Ok(Ok(6))
         );
         assert_eq!(
-            crate::fs::write(&target, duplicated_stdout, b"target", None),
+            crate::fs::write(&target, duplicated_stdout, None, b"target", None),
             Ok(Ok(6))
         );
         assert_eq!(
