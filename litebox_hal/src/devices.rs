@@ -86,6 +86,14 @@ impl ConsoleDevice {
         }
     }
 
+    /// Whether the device took all output queued so far.
+    pub fn is_drained(&mut self) -> bool {
+        match &mut self.0 {
+            Backend::Virtio(device) => device.is_drained(),
+            Backend::Serial => true,
+        }
+    }
+
     /// Whether received input is waiting.
     pub fn has_input(&mut self) -> bool {
         match &mut self.0 {

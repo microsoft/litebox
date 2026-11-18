@@ -151,8 +151,13 @@ impl Inner {
             worker: Cell::new(None),
             pending_clone: RefCell::new(None),
             next_clone: Cell::new(1),
+            // As a child's (see `ProcessConfig::give_up_once`).
             #[cfg(debug_assertions)]
-            give_ups: Default::default(),
+            give_ups: crate::GiveUp::each_kind(
+                self.started_runner_config
+                    .as_ref()
+                    .is_some_and(|config| config.give_up_once),
+            ),
         })
     }
 

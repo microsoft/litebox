@@ -17,7 +17,7 @@ use litebox_guest_service_protocol::guest_service::{
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 use ttrpc::context;
 
-use crate::programs::{Entry, ExitStatus, RECORD_SIZE, Run, TERMINAL_COLUMNS, TERMINAL_ROWS};
+use crate::programs::{Entry, ExitStatus, Run, TERMINAL_COLUMNS, TERMINAL_ROWS};
 
 /// The container's init process's exec ID.
 const INIT: &str = "";
@@ -344,33 +344,6 @@ fn check(run: &Run, outcome: &Outcome) -> Result<()> {
             String::from_utf8_lossy(actual)
         );
     }
-    if let Some(expected) = run.expect_stdout_records {
-        check_records(&outcome.stdout, expected)?;
-    }
-    Ok(())
-}
-
-/// Checks that `stdout` is `writers` writers' `records` records each (see
-/// `expect_stdout_records` in the [`programs`](crate::programs) docs).
-fn check_records(stdout: &[u8], [writers, records]: [usize; 2]) -> Result<()> {
-    let mut next = vec![0; writers];
-    for (at, record) in stdout.chunks(RECORD_SIZE).enumerate() {
-        let writer = (0..writers).find(|&writer| {
-            let expected = format!("w{writer} {}", next[writer]);
-            record == format!("{expected:<width$}\n", width = RECORD_SIZE - 1).as_bytes()
-        });
-        let Some(writer) = writer else {
-            bail!(
-                "stdout's record {at} was {:?}, no writer's next",
-                String::from_utf8_lossy(record)
-            );
-        };
-        next[writer] += 1;
-    }
-    ensure!(
-        next.iter().all(|&written| written == records),
-        "stdout had {next:?} records per writer, expected {records}"
-    );
     Ok(())
 }
 

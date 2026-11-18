@@ -202,6 +202,9 @@ static int collect(const char *port) {
 }
 
 int main(int argc, char *argv[]) {
+    // Its output is in order with its children's on any standard output
+    // (e.g., a pipe, which would buffer it fully).
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc > 1 && strcmp(argv[1], "exec") == 0) {
         char *exits[] = {"/args", "exit", "7", NULL};
         printf("exec\n");

@@ -182,6 +182,12 @@ impl VirtioConsole {
         written
     }
 
+    /// Whether the device took all output queued so far: it returned every transmit buffer.
+    pub fn is_drained(&mut self) -> bool {
+        self.reclaim_transmitted();
+        !self.transmit_buffers.any_lent()
+    }
+
     /// Whether [`Self::read`] would return data.
     pub fn has_input(&mut self) -> bool {
         self.collect_received();
@@ -287,6 +293,21 @@ mod tests {
         device_returns(&console.transmit, 2, 2, 0);
         assert!(console.arm_room_interrupt());
         assert!(!console.transmit.asks_to_interrupt());
+    }
+
+    /// Drained once the device returned every transmit buffer, not before.
+    #[test]
+    fn drained_once_the_device_returns_every_transmit_buffer() {
+        let registers = Registers::new();
+        let mut console = console(&registers);
+        assert!(console.is_drained(), "nothing queued");
+        let output = [b'x'; 2 * TRANSMIT_BUFFER_SIZE];
+        assert_eq!(console.write(&output), output.len());
+        assert!(!console.is_drained());
+        device_returns(&console.transmit, 0, 0, 0);
+        assert!(!console.is_drained(), "one buffer still with the device");
+        device_returns(&console.transmit, 1, 1, 0);
+        assert!(console.is_drained());
     }
 
     /// A full queue that `can_write` finds first, before any write fails: it

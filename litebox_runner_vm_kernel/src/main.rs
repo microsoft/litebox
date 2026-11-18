@@ -1,25 +1,20 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! QEMU guest kernel: a [service](service::Service) in ring-3 runner
-//! processes, and a [client](client) for it, chosen by the payload:
-//! - With `programs.json`: standalone programs in `runner.elf` processes
-//!   ([`service::program`]), e.g., Linux programs in
-//!   `litebox_runner_linux_on_vm_userland`, driven by [`client::program`].
-//! - Otherwise: OP-TEE TAs in `litebox_runner_optee_on_vm_userland`
-//!   processes, one per TA instance ([`service::optee`]), driven by a test
-//!   client ([`client::script`]).
+//! QEMU guest kernel, hosting ring-3 runner processes, chosen by the payload:
+//! - With [`init::RUNNER`]: [`init`], e.g., the guest service.
+//! - Otherwise, with the `optee` feature: OP-TEE TAs, one per TA instance
+//!   (`service::optee`), driven by a test client (`client::script`).
 //!
-//! QEMU exits with 33 if all tests pass, 65 otherwise. Runner processes'
-//! standard streams are the VM's console device, if there is one, their
-//! sockets reach the VM's network device, if there is one, and their vsock
-//! sockets the host through the VM's socket device, if there is one;
-//! programs also see the host directories of virtio-9p devices, read-only, at
-//! their mount tags ([`devices`]).
+//! QEMU exits with 33 if init exits with 0 or the OP-TEE tests pass, and 65
+//! otherwise. Runner processes' standard streams are the VM's console
+//! device, if there is one, their sockets reach the VM's network device, if
+//! there is one, and their vsock sockets the host through the VM's socket
+//! device, if there is one; programs also see the host directories of
+//! virtio-9p devices, read-only, at their mount tags ([`devices`]).
 //!
-//! Every CPU runs the processes ([`litebox_shim_vm_kernel::sched`]); the boot
-//! CPU also runs the client and service, the others only the processes
-//! ([`cpu_main`]).
+//! Every CPU runs the processes ([`litebox_shim_vm_kernel::sched`],
+//! [`cpu_main`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -28,17 +23,22 @@
 
 extern crate alloc;
 
+#[cfg(feature = "optee")]
 mod client;
 mod devices;
+mod init;
 mod payload;
+#[cfg(feature = "optee")]
 mod service;
 
 use core::panic::PanicInfo;
 use litebox_bootloader::Kernel;
+use litebox_common_vm_abi::program::ExitStatus;
 use litebox_hal::{power, serial, serial_println};
 use litebox_platform_vm_kernel::VmKernel;
 use litebox_platform_vm_kernel::cpu::CpuId;
 use litebox_platform_vm_kernel::providers::set_platform_root_key;
+use litebox_shim_vm_kernel::ProcessConfig;
 use litebox_shim_vm_kernel::sched::Scheduler;
 
 litebox_bootloader::entry!(kernel_main, &SerialLogger);
@@ -55,50 +55,85 @@ fn kernel_main(kernel: Kernel) -> ! {
     let scheduler = SCHEDULER.call_once(|| Scheduler::new(devices));
     kernel.start_cpus(devices, cpu_main);
     let wall_clock = devices::wall_clock(kernel.platform, kernel.clock);
-    let broker = |console, shares, allow_process_duplication| {
+    let Some(runner) = payload.file(init::RUNNER) else {
+        #[cfg(feature = "optee")]
+        run_optee(&kernel, &payload, devices, scheduler, wall_clock);
+        #[cfg(not(feature = "optee"))]
+        panic!(
+            "payload has no {}, and the kernel has no OP-TEE support",
+            init::RUNNER
+        );
+    };
+    let path = kernel
+        .boot_info
+        .cmdline_value(init::PATH_KEY)
+        .unwrap_or(init::DEFAULT_PATH);
+    let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
+        platform: kernel.platform,
+        console: devices,
+        root: payload.file("rootfs.tar"),
+        shares: devices.shares(),
+        network: devices.network(),
+        vsock: devices.vsock(),
+        allow_process_duplication: true,
+    });
+    let config = ProcessConfig {
+        runner,
+        images: &[],
+        identity: [0; litebox_common_vm_abi::IDENTITY_LEN],
+        clock_khz: kernel.clock.khz(),
+        wall_clock,
+        timer: devices,
+        started_runner: Some(runner),
+        #[cfg(debug_assertions)]
+        give_up_once: kernel.boot_info.cmdline_value(init::REPLAY_KEY) == Some("1"),
+    };
+    let status = init::run(scheduler, kernel.platform, &broker, &config, path);
+    print_slices(scheduler);
+    devices.drain_console();
+    power::exit(status == Ok(ExitStatus::Exited { code: 0 }))
+}
+
+/// Runs the OP-TEE tests of `payload` (see the crate's docs), and powers off.
+#[cfg(feature = "optee")]
+fn run_optee(
+    kernel: &Kernel,
+    payload: &payload::Payload,
+    devices: &'static devices::Devices,
+    scheduler: &Scheduler,
+    wall_clock: litebox_common_vm_abi::WallClock,
+) -> ! {
+    let mut service = service::optee::Optee::new(
+        scheduler.clone(),
+        kernel.platform,
+        kernel.clock,
+        wall_clock,
+        devices,
+        payload,
         litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
             platform: kernel.platform,
-            console,
-            root: payload.file("rootfs.tar"),
-            shares,
-            network: devices.network(),
-            vsock: devices.vsock(),
-            allow_process_duplication,
-        })
-    };
-    if let Some(programs) = payload.file("programs.json") {
-        let stdio: &'static client::program::Stdio =
-            alloc::boxed::Box::leak(alloc::boxed::Box::new(client::program::Stdio::new(devices)));
-        let mut service = service::program::Programs::new(
-            scheduler.clone(),
-            kernel.platform,
-            kernel.clock,
-            wall_clock,
-            devices,
-            &payload,
-            // Programs may start child processes.
-            broker(stdio, devices.shares(), true),
-        );
-        client::program::run(programs, &mut service, stdio);
-    } else {
-        let mut service = service::optee::Optee::new(
-            scheduler.clone(),
-            kernel.platform,
-            kernel.clock,
-            wall_clock,
-            devices,
-            &payload,
+            console: devices,
+            root: None,
             // No shares: TA storage (OP-TEE secure storage) needs a file
             // system of its own, not provided yet.
-            broker(devices, alloc::vec::Vec::new(), false),
-        );
-        client::script::run(&payload, &mut service);
-    }
+            shares: alloc::vec::Vec::new(),
+            network: devices.network(),
+            vsock: devices.vsock(),
+            allow_process_duplication: false,
+        }),
+    );
+    client::script::run(payload, &mut service);
+    print_slices(scheduler);
     // Whatever the log level, for the test scripts.
+    serial_println!("[litebox] ALL TESTS PASSED");
+    devices.drain_console();
+    power::exit(true)
+}
+
+/// Prints what each CPU ran, for the test scripts.
+fn print_slices(scheduler: &Scheduler) {
     serial_println!("[litebox] slices run per CPU: {:?}", scheduler.slices());
     serial_println!("[litebox] threads parked per CPU: {:?}", scheduler.parks());
-    serial_println!("[litebox] ALL TESTS PASSED");
-    power::exit(true)
 }
 
 /// Each other CPU's kernel, once online: it runs the processes.
@@ -127,8 +162,6 @@ impl log::Log for SerialLogger {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial::panic_print(format_args!(
-        "[litebox] PANIC: {info}\n[litebox] TESTS FAILED\n"
-    ));
+    serial::panic_print(format_args!("[litebox] PANIC: {info}\n"));
     power::exit(false)
 }

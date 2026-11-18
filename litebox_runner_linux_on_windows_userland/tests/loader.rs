@@ -481,9 +481,9 @@ mod vsock_hybrid_host {
     use std::time::{Duration, Instant};
 
     // As vsock_hybrid.rs's.
-    const PORT: u32 = 1024;
-    const SIGNAL_PORT: u32 = 1025;
-    const UNUSED_PORT: u32 = 1026;
+    const PORT: u32 = 4000;
+    const SIGNAL_PORT: u32 = 4001;
+    const UNUSED_PORT: u32 = 4002;
     const HOST_ECHO_PORT: u32 = 2000;
     const HOST_REFUSING_PORT: u32 = 2001;
     const MESSAGE: usize = 64;

@@ -97,6 +97,10 @@ const _: () = {
 /// [`Devices::armed`]: the timer is in a state no deadline matches.
 const ARMED_UNKNOWN: u64 = u64::MAX;
 
+/// Printed once the vsock device runs, for host tools to connect only then: vhost-device-vsock
+/// (0.3.0) stops serving the device on a connection made while QEMU starts it.
+pub const VSOCK_STARTED: &str = "[litebox] vsock device started";
+
 pub struct Devices {
     platform: &'static VmKernel,
     apic: LocalApic,
@@ -157,7 +161,10 @@ impl Devices {
             }
         };
         match &vsock {
-            Some(device) => litebox_util_log::info!(device:% = device; "vsock"),
+            Some(device) => {
+                litebox_util_log::info!(device:% = device; "vsock");
+                litebox_hal::serial_println!("{VSOCK_STARTED}");
+            }
             None => litebox_util_log::info!("no vsock device: no host AF_VSOCK connections"),
         }
         let devices: &'static Self = Box::leak(Box::new(Self {
@@ -177,6 +184,19 @@ impl Devices {
             devices.on_interrupt(vector)
         })));
         devices
+    }
+
+    /// Waits, up to a second, until the host took the console's output, lost at power-off.
+    pub fn drain_console(&self) {
+        const TIMEOUT: Duration = Duration::from_secs(1);
+        let deadline = self
+            .platform
+            .now()
+            .checked_add(TIMEOUT)
+            .expect("the clock is far from overflowing");
+        while !self.console.lock().is_drained() && self.platform.now() < deadline {
+            cpu::relax();
+        }
     }
 
     /// The network device, if any, for the broker's sockets.

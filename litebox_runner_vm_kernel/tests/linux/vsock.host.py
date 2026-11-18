@@ -3,13 +3,17 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-"""Host end of vsock.c: usage `vsock.host.py CID CONSOLE`.
+"""Host end of vsock.c: usage `vsock.host.py PATH OUTPUT`.
 
-Once the guest prints `ready` to the console file CONSOLE, connects to its
-listeners for vsock.c's scenarios, in order, and once to a port nothing
-listens on, which must be refused; then sends the guest two host ports, one
-listening and one refusing, and serves its connections. Exits 0 if all went
-as expected.
+Hybrid vsock, over Unix sockets only: the guest's port P is reached by
+connecting to PATH and sending `CONNECT P\\n` (reply `OK <port>\\n`, or a
+close if refused), and the host's port P is the Unix socket PATH_P. No
+half-close: a message's length tells where it ends, and either side's close
+ends a connection. Once the guest prints `ready` to the run's output file OUTPUT,
+connects to its listeners for vsock.c's scenarios, in order, and once to a
+port nothing listens on, which must be refused; then sends the guest two host
+ports, one listening and one refusing, and serves its connections. Exits 0 if
+all went as expected.
 """
 
 import os
@@ -17,11 +21,15 @@ import socket
 import sys
 import time
 
-PORT = 1024
-UNUSED_PORT = 1026
-NONBLOCKING_PORT = 1027
-HOST_PORTS_PORT = 1028
+# As vsock.json's port, and vsock.c's offsets from it.
+PORT = 3000
+UNUSED_PORT = PORT + 2
+NONBLOCKING_PORT = PORT + 3
+HOST_PORTS_PORT = PORT + 4
+HOST_ECHO_PORT = 3100
+HOST_REFUSING_PORT = 3101
 # As vsock.c's.
+NAME_LEN = 64
 BULK = 2 * 1024 * 1024
 SLOW = 256 * 1024
 CHURN = 40
@@ -37,15 +45,22 @@ LATER = b"later"
 BACKPRESSURE = 1024 * 1024
 ACCEPT4 = b"accept4"
 CLIENT_BULK = 1024 * 1024
-# The receive buffer, and the pause between receives, of slow readers.
+# Each receive's size, and the pause before it, of slow readers.
 SLOW_BUFFER = 4096
 SLOW_PAUSE = 0.001
 # Each step's; the run script's TIMEOUT bounds the whole.
 STEP_TIMEOUT = 60
 
+PATH = None
+
 
 def pattern(length):
     return bytes((i * 7 + i // 4096) & 0xFF for i in range(length))
+
+
+def name(text):
+    """`text`, NUL-padded to NAME_LEN bytes."""
+    return text.encode().ljust(NAME_LEN, b"\0")
 
 
 def wait_ready(console, deadline):
@@ -60,13 +75,22 @@ def wait_ready(console, deadline):
     raise TimeoutError("the guest never printed `ready`")
 
 
-def connect(cid, port, slow=False):
-    s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+def connect(port):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(STEP_TIMEOUT)
-    if slow:
-        # The credit it gives the guest.
-        s.setsockopt(socket.AF_VSOCK, socket.SO_VM_SOCKETS_BUFFER_SIZE, SLOW_BUFFER)
-    s.connect((cid, port))
+    s.connect(PATH)
+    s.sendall(f"CONNECT {port}\n".encode())
+    # One byte at a time: what follows the line is the guest's.
+    reply = b""
+    while not reply.endswith(b"\n"):
+        byte = s.recv(1)
+        if not byte:
+            s.close()
+            raise ConnectionRefusedError(f"port {port} refused the connection")
+        reply += byte
+    if not reply.startswith(b"OK ") or not reply[3:-1].isdigit():
+        s.close()
+        raise AssertionError(f"reply {reply!r} to CONNECT {port}")
     return s
 
 
@@ -102,94 +126,93 @@ def check_data(received, expected):
         raise AssertionError(f"received data differs at byte {first}")
 
 
-def concurrent(cid):
-    sockets = [connect(cid, PORT) for _ in range(2)]
-    messages = [f"hello from connection {i}\n".encode() * (i + 1) for i in range(2)]
+def check_eof(s):
+    data = s.recv(1)
+    if data:
+        raise AssertionError(f"{data!r} instead of EOF")
+
+
+def concurrent():
+    sockets = [connect(PORT) for _ in range(2)]
+    messages = [name(f"hello from connection {i}") for i in range(2)]
     # Both open before either sends.
     for s, message in reversed(list(zip(sockets, messages))):
         s.sendall(message)
-        s.shutdown(socket.SHUT_WR)
     for s, message in zip(sockets, messages):
-        echo = read_to_eof(s)
-        if echo != message:
-            raise AssertionError(f"echo {echo!r}, expected {message!r}")
+        check_data(read_exactly(s, NAME_LEN), message)
+        check_eof(s)
         s.close()
 
 
-def refused(cid):
+def refused():
     try:
-        connect(cid, UNUSED_PORT).close()
-    except ConnectionResetError:
+        connect(UNUSED_PORT).close()
+    except (ConnectionRefusedError, ConnectionResetError):
         return
     raise AssertionError(f"connected to port {UNUSED_PORT}, where nothing listens")
 
 
-def churn(cid):
+def churn():
     for i in range(CHURN):
-        s = connect(cid, PORT)
+        s = connect(PORT)
         kind = i % 3
         if kind == 0:
-            message = f"ping {i}".encode()
-            s.sendall(message)
-            s.shutdown(socket.SHUT_WR)
-            expected = message
+            expected = name(f"ping {i}")
+            s.sendall(expected)
         elif kind == 1:
-            expected = f"hello {i}".encode()
+            expected = name(f"hello {i}")
         else:
-            s.sendall(f"abort {i}".encode())
+            s.sendall(name(f"abort {i}"))
             s.close()
             continue
-        received = read_to_eof(s)
-        if received != expected:
-            raise AssertionError(f"connection {i}: {received!r}, expected {expected!r}")
+        check_data(read_exactly(s, NAME_LEN), expected)
+        check_eof(s)
         s.close()
 
 
-def send_until_broken_pipe(s):
+def send_until_closed(s):
     deadline = time.monotonic() + STEP_TIMEOUT
     while time.monotonic() < deadline:
         try:
             s.send(b"more")
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             return
         time.sleep(0.01)
     raise AssertionError("sends after the guest closed did not fail")
 
 
-def after_close(cid):
+def after_close():
     for _ in range(AFTER_CLOSE):
-        s = connect(cid, PORT)
+        s = connect(PORT)
         s.sendall(REQUEST)
         # The guest replies and closes meanwhile, while this end does not
-        # read: the reply fits in this end's buffer, beyond which, as in
-        # Linux, the guest buffers nothing.
+        # read: the reply fits in this end's buffer.
         time.sleep(0.2)
-        send_until_broken_pipe(s)
+        send_until_closed(s)
         check_data(read_to_eof(s, slow=True), pattern(REPLY))
         s.close()
 
 
-def bulk(cid, size, slow):
-    s = connect(cid, PORT, slow)
+def bulk(size, slow):
+    s = connect(PORT)
     data = pattern(size)
     s.sendall(data)
-    check_data(read_to_eof(s, slow), data)
-    # The guest waits for this before it ends.
+    check_data(read_exactly(s, size, slow), data)
+    # The guest waits for this, and the close, before it ends.
     s.sendall(ACK)
     s.close()
 
 
-def local_shutdown(cid):
-    s = connect(cid, PORT)
+def local_shutdown():
+    s = connect(PORT)
     s.sendall(QUEUED)
-    reply = read_to_eof(s)
-    if reply != REPLIED:
-        raise AssertionError(f"reply {reply!r} after the guest shut down receiving")
+    check_data(read_exactly(s, len(REPLIED)), REPLIED)
+    check_eof(s)
     s.close()
 
 
-def nonblocking(cid):
-    s = connect(cid, NONBLOCKING_PORT, slow=True)
+def nonblocking():
+    s = connect(NONBLOCKING_PORT)
     s.sendall(pattern(FIRST))
     # The guest finds no more data before this.
     check_data(read_exactly(s, len(GO)), GO)
@@ -197,96 +220,94 @@ def nonblocking(cid):
     check_data(read_exactly(s, BACKPRESSURE, slow=True), pattern(BACKPRESSURE))
     s.sendall(ACK)
     s.close()
-    s = connect(cid, NONBLOCKING_PORT)
+    s = connect(NONBLOCKING_PORT)
     s.sendall(ACCEPT4)
-    s.shutdown(socket.SHUT_WR)
-    echo = read_to_eof(s)
-    if echo != ACCEPT4:
-        raise AssertionError(f"accept4 echo {echo!r}")
+    check_data(read_exactly(s, len(ACCEPT4)), ACCEPT4)
+    check_eof(s)
     s.close()
 
 
 def host_sockets():
-    """A listener on an ephemeral host port, and a socket bound to another
+    """PATH_HOST_ECHO_PORT, listening, and PATH_HOST_REFUSING_PORT, bound
     without listening, which refuses connections."""
-    listener = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.settimeout(STEP_TIMEOUT)
-    listener.bind((socket.VMADDR_CID_ANY, socket.VMADDR_PORT_ANY))
+    listener.bind(f"{PATH}_{HOST_ECHO_PORT}")
     listener.listen(8)
-    refuser = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-    refuser.bind((socket.VMADDR_CID_ANY, socket.VMADDR_PORT_ANY))
+    refuser = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    refuser.bind(f"{PATH}_{HOST_REFUSING_PORT}")
     return listener, refuser
 
 
-def accept_guest(cid, listener):
-    s, (peer_cid, peer_port) = listener.accept()
+def accept_guest(listener):
+    s, _ = listener.accept()
     s.settimeout(STEP_TIMEOUT)
-    if peer_cid != cid:
-        raise AssertionError(f"a connection from CID {peer_cid}, not {cid}")
-    return s, peer_port
+    return s
 
 
-def check_name(received, name, peer_port):
-    """Checks the guest's `NAME PORT`, its own port, against its peer."""
-    expected = f"{name} {peer_port}".encode()
-    if received != expected:
-        raise AssertionError(f"{received!r} from port {peer_port}, expected {expected!r}")
+def check_name(received, prefix):
+    """Checks the guest's `NAME PORT`, NUL-padded."""
+    text = received.rstrip(b"\0").decode(errors="replace")
+    words = text.split(" ")
+    if len(words) != 2 or words[0] != prefix or not words[1].isdigit():
+        raise AssertionError(f"name {received!r}, expected `{prefix} PORT`")
 
 
-def echo_guest(cid, listener, name):
-    s, peer_port = accept_guest(cid, listener)
-    message = read_to_eof(s)
-    check_name(message, name, peer_port)
+def echo_guest(listener, prefix):
+    s = accept_guest(listener)
+    message = read_exactly(s, NAME_LEN)
+    check_name(message, prefix)
     s.sendall(message)
     s.close()
 
 
-def serve_guest(cid, listener, refuser):
-    s = connect(cid, HOST_PORTS_PORT)
-    ports = (listener.getsockname()[1], refuser.getsockname()[1])
-    s.sendall(" ".join(map(str, ports)).encode())
-    s.shutdown(socket.SHUT_WR)
-    if read_to_eof(s):
-        raise AssertionError("the guest sent data on the ports connection")
+def serve_guest(listener):
+    s = connect(HOST_PORTS_PORT)
+    s.sendall(f"{HOST_ECHO_PORT} {HOST_REFUSING_PORT}".encode())
     s.close()
-    echo_guest(cid, listener, "blocking")
-    echo_guest(cid, listener, "retry")
-    echo_guest(cid, listener, "nonblocking")
-    echo_guest(cid, listener, "nonblocking-retry")
-    s, _ = accept_guest(cid, listener)
-    check_data(read_to_eof(s), pattern(CLIENT_BULK))
+    echo_guest(listener, "blocking")
+    echo_guest(listener, "retry")
+    echo_guest(listener, "nonblocking")
+    echo_guest(listener, "nonblocking-retry")
+    s = accept_guest(listener)
+    check_data(read_exactly(s, CLIENT_BULK), pattern(CLIENT_BULK))
     s.sendall(pattern(CLIENT_BULK))
     s.close()
-    connections = [accept_guest(cid, listener) for _ in range(2)]
-    for i, (s, peer_port) in enumerate(connections):
-        message = read_to_eof(s)
-        check_name(message, f"concurrent{i}", peer_port)
+    connections = [accept_guest(listener) for _ in range(2)]
+    for i, s in enumerate(connections):
+        message = read_exactly(s, NAME_LEN)
+        check_name(message, f"concurrent{i}")
         s.sendall(message)
         s.close()
 
 
 def main():
+    global PATH
     if len(sys.argv) != 3:
         print(__doc__, file=sys.stderr)
         return 2
-    cid, console = int(sys.argv[1]), sys.argv[2]
+    PATH, console = sys.argv[1], sys.argv[2]
     timeout = int(os.environ.get("TIMEOUT", "120"))
     # Before the guest can connect.
     listener, refuser = host_sockets()
-    wait_ready(console, time.monotonic() + timeout)
     try:
-        concurrent(cid)
-        refused(cid)
-        churn(cid)
-        after_close(cid)
-        bulk(cid, BULK, slow=False)
-        bulk(cid, SLOW, slow=True)
-        local_shutdown(cid)
-        nonblocking(cid)
-        serve_guest(cid, listener, refuser)
+        wait_ready(console, time.monotonic() + timeout)
+        concurrent()
+        refused()
+        churn()
+        after_close()
+        bulk(BULK, slow=False)
+        bulk(SLOW, slow=True)
+        local_shutdown()
+        nonblocking()
+        serve_guest(listener)
     except (AssertionError, OSError) as error:
         print(f"FAIL: {error!r}")
         return 1
+    finally:
+        for s, port in ((listener, HOST_ECHO_PORT), (refuser, HOST_REFUSING_PORT)):
+            s.close()
+            os.unlink(f"{PATH}_{port}")
     return 0
 
 

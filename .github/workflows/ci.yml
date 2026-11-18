@@ -59,6 +59,7 @@ jobs:
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox_runner_optee_on_linux_userland
           (cd litebox_runner_optee_on_qemu && ../.github/tools/github_actions_run_cargo clippy --all-features)
           (cd litebox_runner_vm_kernel && ../.github/tools/github_actions_run_cargo clippy --all-features)
+          (cd litebox_runner_vm_kernel && ../.github/tools/github_actions_run_cargo clippy)
           # Without RUSTFLAGS, which would replace the runner's codegen flags, as
           # `dev_tools/run_optee_on_vm_userland.sh` builds it.
           (cd litebox_runner_optee_on_vm_userland && env -u RUSTFLAGS ../.github/tools/github_actions_run_cargo clippy --all-features -- -D warnings)
@@ -171,16 +172,6 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
-      - name: Enable vhost-vsock
-        # For the vsock tests of run_linux_on_vm_userland.sh, which
-        # REQUIRE_VSOCK makes fail rather than skip without it.
-        run: |
-          sudo modprobe vhost_vsock
-          echo 'KERNEL=="vhost-vsock", MODE="0666", OPTIONS+="static_node=vhost-vsock"' | sudo tee /etc/udev/rules.d/99-vhost-vsock.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=vhost-vsock
-          sudo udevadm settle
-          test -r /dev/vhost-vsock -a -w /dev/vhost-vsock
       - name: Restore vhost-device-vsock
         id: vhost-device-vsock
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -188,12 +179,13 @@ jobs:
           path: ~/vhost-device-vsock
           key: vhost-device-vsock-${{ env.VHOST_DEVICE_VSOCK_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: Install vhost-device-vsock
-        # The vhost-user daemon whose host side is hybrid vsock, for the hybrid
-        # vsock tests of run_linux_on_vm_userland.sh; it has no release binaries.
+        # The VM scripts' vsock device; it has no release binaries.
         if: steps.vhost-device-vsock.outputs.cache-hit != 'true'
         run: |
           env -u RUSTFLAGS cargo install --locked --root ~/vhost-device-vsock \
             vhost-device-vsock --version "$VHOST_DEVICE_VSOCK_VERSION"
+      - name: Put vhost-device-vsock on the PATH
+        run: echo "$HOME/vhost-device-vsock/bin" >> "$GITHUB_PATH"
       - name: Run OP-TEE TAs in a QEMU VM (KVM)
         # Also builds the runner.
         run: |
@@ -209,29 +201,10 @@ jobs:
         run: |
           QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
-      - name: Run static and dynamic Linux programs in a QEMU VM with stacked runners (KVM)
-        # Also builds the kernel and userland runners.
-        run: |
-          REQUIRE_VSOCK=1 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
-            ./dev_tools/run_linux_on_vm_userland.sh
-      - name: Run Linux programs over hybrid vsock in a QEMU VM with stacked runners (KVM)
-        # The VM's vsock device is vhost-device-vsock's, whose host side is Unix
-        # sockets, as with Firecracker and Cloud Hypervisor.
-        run: |
-          VSOCK_BACKEND=vhost-user VHOST_DEVICE_VSOCK="$HOME/vhost-device-vsock/bin/vhost-device-vsock" \
-            REQUIRE_VSOCK=1 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
-            ./dev_tools/run_linux_on_vm_userland.sh -t vsock_hybrid
-      - name: Run Linux programs in a QEMU VM with stacked runners on 2 CPUs (KVM)
-        # Processes run on every CPU; the suite also checks that the other CPU
-        # ran some.
-        run: |
-          REQUIRE_VSOCK=1 QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
-            ./dev_tools/run_linux_on_vm_userland.sh
-      - name: Run Linux programs in a QEMU VM with stacked runners with RAM above 4 GiB on 2 CPUs (KVM)
-        # Also smoke-tests SMP with RAM above 4 GiB in the heap.
+      - name: Run static and dynamic Linux programs in a QEMU VM with stacked runners on 2 CPUs with RAM above 4 GiB (KVM)
         run: |
           QEMU_MEM=6G QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
-            ./dev_tools/run_linux_on_vm_userland.sh -t highmem -t smp
+            ./dev_tools/run_linux_on_vm_userland.sh
       - name: Run threaded Linux programs in a QEMU VM with stacked runners on 4 CPUs, release (KVM)
         # TODO: The pthread test hangs here at times, with a process's threads
         # running at once on 4 CPUs. It is left out until the lost wakeup that

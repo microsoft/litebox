@@ -72,7 +72,7 @@ REWRITER="$(target_dir "$REPO_DIR")/debug/litebox_syscall_rewriter"
 
 echo "[*] building litebox_runner_vm_kernel and litebox_runner_optee_on_vm_userland ($profile)"
 # shellcheck disable=SC2086 # CARGO_BUILD is a command line
-(cd "$KERNEL_DIR" && $CARGO_BUILD "${cargo_flags[@]}")
+(cd "$KERNEL_DIR" && $CARGO_BUILD "${cargo_flags[@]}" --features optee)
 # RUSTFLAGS would replace the codegen flags in its .cargo/config.toml.
 # shellcheck disable=SC2086
 (cd "$USERLAND_DIR" && env -u RUSTFLAGS $CARGO_BUILD "${cargo_flags[@]}")

@@ -3,12 +3,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-"""Host end of vsock_hybrid.rs: usage `vsock_hybrid.host.py PATH CONSOLE`.
+"""Host end of vsock_hybrid.rs: usage `vsock_hybrid.host.py PATH OUTPUT`.
 
 Hybrid vsock, over Unix sockets only: the guest's port P is reached by
 connecting to PATH and sending `CONNECT P\\n` (reply `OK <port>\\n`, or a
 close if refused), and the host's port P is the Unix socket PATH_P. Once the
-guest prints `ready` to the console file CONSOLE, runs vsock_hybrid.rs's
+guest prints `ready` to the run's output file OUTPUT, runs vsock_hybrid.rs's
 scenarios in order, then serves the guest's connects. No half-close. Exits 0
 if all went as expected.
 """
@@ -19,9 +19,9 @@ import sys
 import time
 
 # As vsock_hybrid.rs's.
-PORT = 1024
-SIGNAL_PORT = 1025
-UNUSED_PORT = 1026
+PORT = 4000
+SIGNAL_PORT = 4001
+UNUSED_PORT = 4002
 HOST_ECHO_PORT = 2000
 HOST_REFUSING_PORT = 2001
 MESSAGE = 64

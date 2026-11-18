@@ -1,17 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Checks the virtual init (see litebox_broker_vm_kernel), which every run
-// (see init.json) has, whether first, later, or concurrent: this process's
-// parent is init (process 1), it leads its own session and process group,
-// and an orphan, whose parent exits before it, is init's child, not this
-// process's. It prints each check, and exits 0 only if all hold (for
-// concurrent runs, which print to the same streams).
+// Checks that every run (see init.json) is a child of process 1, the guest
+// service, leads its own session and process group, and that an orphan of
+// its descendants becomes process 1's child. It prints each check, and exits
+// 0 only if all hold.
 //
 // The orphan comes from a chain of spawned processes: this one starts a
 // child ("middle <fd>"), which starts the orphan ("orphan <fd> <parent>")
-// and exits at once; the orphan writes its new parent to <fd>, a pipe this
-// process reads.
+// and exits at once; the orphan writes its new parent's ID to <fd>, a pipe
+// this process reads.
 
 #include <errno.h>
 #include <spawn.h>
@@ -56,7 +54,7 @@ int main(int argc, char **argv) {
 
     pid_t self = getpid();
     pid_t parent = getppid();
-    int leader = self != 1 && getsid(0) == self && getpgrp() == self;
+    int leader = getsid(0) == self && getpgrp() == self;
 
     int fds[2];
     if (pipe(fds) != 0) {
@@ -72,13 +70,15 @@ int main(int argc, char **argv) {
         perror("waitpid");
         return 1;
     }
+    // The orphan's new parent.
     pid_t adopter = 0;
     if (read(fds[0], &adopter, sizeof adopter) != sizeof adopter) {
         perror("read");
         return 1;
     }
+    int adopted = adopter == 1;
     int childless = wait(NULL) == -1 && errno == ECHILD;
-    printf("parent %d\nleader %d\norphan's parent %d\nno children %d\n", parent, leader,
-           adopter, childless);
-    return parent == 1 && leader && adopter == 1 && childless ? 0 : 1;
+    printf("parent %d\nleader %d\nprocess 1 adopted the orphan %d\nno children %d\n", parent,
+           leader, adopted, childless);
+    return parent == 1 && leader && adopted && childless ? 0 : 1;
 }

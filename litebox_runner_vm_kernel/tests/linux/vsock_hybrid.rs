@@ -18,8 +18,8 @@ use core::panic::PanicInfo;
 use core::ptr;
 
 // As vsock_hybrid.host.py's.
-const PORT: u32 = 1024;
-const SIGNAL_PORT: u32 = 1025;
+const PORT: u32 = 4000;
+const SIGNAL_PORT: u32 = 4001;
 const HOST_ECHO_PORT: u32 = 2000;
 const HOST_REFUSING_PORT: u32 = 2001;
 const MESSAGE: usize = 64;

@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The first boot module: a tar of named files. Services and clients take the
-//! files they need; `rootfs.tar`, if any, is the broker's read-only root.
+//! The first boot module: a tar of named files. The kernel takes the files it
+//! needs; `rootfs.tar`, if any, is the broker's root's read-only layer.
 
 use alloc::collections::BTreeMap;
 use litebox_bootloader::handoff::BootInfo;
@@ -49,6 +49,7 @@ impl Payload {
     }
 
     /// Files whose names start with `prefix`, as (the rest of the name, data).
+    #[cfg(feature = "optee")]
     pub fn files_under<'a>(
         &'a self,
         prefix: &'a str,
