@@ -1364,7 +1364,6 @@ fn provider_preserves_udp_datagram_semantics() {
         Ok(SocketOutcome::Completed(7))
     );
     // Leave the error with the transport so that the failed send queues it.
-    // A guest cannot arrange this: waiting for the error queues it.
     wait_for_readiness_publication(&publications, handle, ReadinessFlags::ERROR);
     assert_eq!(
         send_datagram(
@@ -1385,6 +1384,25 @@ fn provider_preserves_udp_datagram_semantics() {
             .check_readiness(handle)
             .unwrap()
             .contains(ReadinessFlags::ERROR)
+    );
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(&process, handle, ShutdownMode::Read),
+        Ok(SocketOutcome::Completed(()))
+    );
+    while publications.try_recv().is_ok() {}
+    assert_eq!(
+        send_datagram(&process, handle, b"refused", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(7))
+    );
+    // Leave the error with the transport rather than querying broker readiness.
+    wait_for_readiness_publication(&publications, handle, ReadinessFlags::ERROR);
+    assert_eq!(
+        receive_datagram_into(&process, handle, &mut packet, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(
+        receive_datagram_into(&process, handle, &mut packet, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Failed(SocketError::Shutdown))
     );
     assert_eq!(
         litebox_broker_core::socket::connect(&process, handle, server_address),

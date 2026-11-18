@@ -1780,13 +1780,21 @@ fn receive_datagram(
     output: &mut dyn ReadBuffer,
     flags: ReceiveFromFlags,
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
-    if !read_socket(object, |socket| is_udp(socket.create_request))? {
+    let (udp, read_shutdown) = read_socket(object, |socket| {
+        (is_udp(socket.create_request), socket.read_shutdown)
+    })?;
+    if !udp {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+    }
+    if read_shutdown {
+        // A transport error can be pending even if poll hasn't queued it.
+        // Check before returning shutdown without calling the transport's receive.
+        refresh(object, true);
     }
     if let Some(error) = take_pending_error(object) {
         return Ok(SocketOutcome::Failed(error));
     }
-    if read_socket(object, |socket| socket.read_shutdown)? {
+    if read_shutdown {
         return Ok(SocketOutcome::Failed(SocketError::Shutdown));
     }
     match transport_receive_from(object, output, flags) {
