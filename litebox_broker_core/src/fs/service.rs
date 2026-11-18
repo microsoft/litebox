@@ -4,7 +4,6 @@
 //! Broker-authoritative file operations.
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::any::Any;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
@@ -33,26 +32,39 @@ use crate::{BrokerError, BrokerProcess, Result};
 pub type FileResult<T> = core::result::Result<T, FileError>;
 type ServiceResult<T> = Result<FileResult<T>>;
 
-/// Behaviorless type-erasure envelope for one broker-owned [`ResolverEntry`].
-///
-/// This does not introduce another open-file-description layer. The erased resolver entry remains
-/// the only per-open semantic state. The surrounding lock serializes shared position and append
-/// updates across duplicated broker references, while operations that cannot update position use
-/// shared access so blocking device I/O does not prevent status and other stateless operations.
+/// One broker-owned open file description, shared by all references to it.
 #[derive(Clone)]
 pub struct File {
-    state: Arc<dyn Any + Send + Sync>,
+    state: Arc<dyn OpenFile>,
     /// Readiness of a file whose reads or writes can fail with `WouldBlock`.
     readiness: Option<Arc<dyn ReadinessSource>>,
     terminal: Option<Arc<dyn TerminalEndpoint>>,
 }
 
 impl File {
-    fn state<State: Any + Send + Sync>(&self) -> Result<&State> {
-        self.state
-            .as_ref()
-            .downcast_ref()
-            .ok_or(BrokerError::Internal)
+    pub(crate) fn read(
+        &self,
+        output: &mut dyn ReadBuffer,
+        offset: Option<u64>,
+    ) -> ServiceResult<usize> {
+        self.state.read(output, offset)
+    }
+
+    pub(crate) fn write(
+        &self,
+        input: &dyn WriteBuffer,
+        offset: Option<u64>,
+    ) -> ServiceResult<usize> {
+        self.state.write(input, offset)
+    }
+
+    pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
+        self.state.get_status_flags()
+    }
+
+    /// Fails with [`BrokerError::InvalidRights`] for a file opened only for path-based operations.
+    pub(crate) fn set_status_flags(&self, mask: FileOpenFlags, flags: FileOpenFlags) -> Result<()> {
+        self.state.set_status_flags(mask, flags)
     }
 
     /// Returns a registration that publishes this file's readiness changes through
@@ -98,19 +110,38 @@ impl ObjectEntry {
     }
 }
 
+trait OpenFile: Send + Sync {
+    fn read(&self, output: &mut dyn ReadBuffer, offset: Option<u64>) -> ServiceResult<usize>;
+    fn write(&self, input: &dyn WriteBuffer, offset: Option<u64>) -> ServiceResult<usize>;
+    fn seek(&self, offset: i64, whence: FileSeekWhence) -> ServiceResult<u64>;
+    fn truncate(&self, length: u64, reset_offset: bool) -> ServiceResult<()>;
+    fn map_shared(&self) -> ServiceResult<SharedMapping>;
+    fn lock(self: Arc<Self>, operation: FileLockOperation) -> ServiceResult<()>;
+    fn read_directory(&self) -> ServiceResult<Vec<FileDirectoryEntry>>;
+    fn handle_status(&self) -> ServiceResult<FileStatus>;
+    fn handle_path(&self) -> String;
+    fn get_status_flags(&self) -> FileStatusFlags;
+    fn set_status_flags(&self, mask: FileOpenFlags, flags: FileOpenFlags) -> Result<()>;
+    fn set_times(&self, user: FileUser, times: &SetFileTimes) -> ServiceResult<()>;
+}
+
+struct ResolverFile<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend> {
+    // Shared access lets status and other operations proceed during position-independent I/O.
+    entry: RwLock<Platform, ResolverEntry<Backend>>,
+    resolver: Arc<Resolver<Platform, Backend>>,
+}
+
 mod private {
     use super::{
-        Arc, BrokerError, File, FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation,
-        FileMode, FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, ReadBuffer,
-        Result, ServiceResult, SetFileTimes, SharedMapping, String, TerminalEndpoint, Vec,
-        WriteBuffer,
+        Arc, BrokerError, File, FileAccessMode, FileMode, FileOpenFlags, FileStatus, FileUser,
+        ServiceResult, String, TerminalEndpoint,
     };
 
     pub trait Service: Send + Sync {
         /// Opens `path`, binding a file that refers to the opener's controlling terminal to
         /// `controlling_terminal()`.
         fn open(
-            &self,
+            self: Arc<Self>,
             _path: &str,
             _user: FileUser,
             _access: FileAccessMode,
@@ -118,65 +149,6 @@ mod private {
             _mode: FileMode,
             _controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
         ) -> ServiceResult<File> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn read(
-            &self,
-            _file: &File,
-            _output: &mut dyn ReadBuffer,
-            _offset: Option<u64>,
-        ) -> ServiceResult<usize> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn write(
-            &self,
-            _file: &File,
-            _input: &dyn WriteBuffer,
-            _offset: Option<u64>,
-        ) -> ServiceResult<usize> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn seek(&self, _file: &File, _offset: i64, _whence: FileSeekWhence) -> ServiceResult<u64> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn truncate(&self, _file: &File, _length: u64, _reset_offset: bool) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn map_shared(&self, _file: &File) -> ServiceResult<SharedMapping> {
-            Ok(Err(FileError::NoSuchDevice))
-        }
-
-        fn lock(&self, _file: &File, _operation: FileLockOperation) -> ServiceResult<()> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn read_directory(&self, _file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn handle_status(&self, _file: &File) -> ServiceResult<FileStatus> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn handle_path(&self, _file: &File) -> ServiceResult<String> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn get_status_flags(&self, _file: &File) -> Result<FileStatusFlags> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn set_status_flags(
-            &self,
-            _file: &File,
-            _mask: FileOpenFlags,
-            _flags: FileOpenFlags,
-        ) -> Result<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -194,15 +166,6 @@ mod private {
         }
 
         fn resolve_path(&self, _path: &str, _user: FileUser) -> ServiceResult<String> {
-            Err(BrokerError::UnsupportedOperation)
-        }
-
-        fn set_times(
-            &self,
-            _file: &File,
-            _user: FileUser,
-            _times: &SetFileTimes,
-        ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -246,16 +209,19 @@ mod private {
     }
 }
 
-/// Object-safe broker-wide file service.
+/// Object-safe filesystem used for a broker process's path operations and opens.
 ///
 /// Implementations are sealed so every broker-owned open state is created and interpreted by
 /// broker core. Construct a [`Resolver`] for a real fs, or use
-/// [`UnsupportedFileService`] when file operations are intentionally unavailable.
+/// [`UnsupportedFileService`] when opens and path operations are intentionally unavailable.
 pub trait FileService: private::Service {}
 
 impl<Service: private::Service> FileService for Service {}
 
-/// File service for broker configurations that intentionally expose no file operations.
+/// A file service that rejects opens and path operations.
+///
+/// This does not disable operations on open file handles transferred from another process;
+/// they remain subject to the receiver's handle rights.
 pub struct UnsupportedFileService;
 
 impl private::Service for UnsupportedFileService {}
@@ -266,7 +232,7 @@ where
     Platform: RawSyncPrimitivesProvider,
 {
     fn open(
-        &self,
+        self: Arc<Self>,
         path: &str,
         user: FileUser,
         access: FileAccessMode,
@@ -275,8 +241,7 @@ where
         controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
     ) -> ServiceResult<File> {
         let flags = open_flags(access, flags)?;
-        let entry = match Resolver::open_with_controlling_terminal(
-            self,
+        let entry = match self.open_with_controlling_terminal(
             user,
             path,
             flags,
@@ -286,233 +251,16 @@ where
             Ok(entry) => entry,
             Err(error) => return Ok(Err(file_open_error(error))),
         };
-        let readiness = Resolver::readiness_source(self, &entry);
-        let terminal = Resolver::terminal(self, &entry);
+        let readiness = self.readiness_source(&entry);
+        let terminal = self.terminal(&entry);
         Ok(Ok(File {
-            state: Arc::new(RwLock::<Platform, _>::new(entry)),
+            state: Arc::new(ResolverFile {
+                entry: RwLock::new(entry),
+                resolver: self,
+            }),
             readiness,
             terminal,
         }))
-    }
-
-    fn read(
-        &self,
-        file: &File,
-        output: &mut dyn ReadBuffer,
-        offset: Option<u64>,
-    ) -> ServiceResult<usize> {
-        let Ok(offset) = checked_offset(offset, output.len()) else {
-            return Ok(Err(FileError::InvalidOffset));
-        };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
-        let entry = state.read();
-        let nonblocking = entry.is_nonblocking();
-        let read = if offset.is_some() || !entry.uses_position() {
-            if entry.is_path_only() {
-                return Ok(Err(FileError::AccessNotAllowed));
-            }
-            self.read_without_position_update(&entry, output, offset)
-                .map(|(read, _)| read)
-        } else {
-            drop(entry);
-            let mut entry = state.write();
-            if entry.is_path_only() {
-                return Ok(Err(FileError::AccessNotAllowed));
-            }
-            Resolver::read(self, &mut entry, output, offset)
-        };
-        let read = match read {
-            Ok(read) => read,
-            Err(ReadError::WouldBlock) => return Err(BrokerError::would_block(nonblocking)),
-            Err(ReadError::Broker(error)) => return Err(error),
-            Err(error) => return Ok(Err(file_read_error(error))),
-        };
-        if read > output.len() {
-            return Err(BrokerError::Internal);
-        }
-        Ok(Ok(read))
-    }
-
-    fn write(
-        &self,
-        file: &File,
-        input: &dyn WriteBuffer,
-        offset: Option<u64>,
-    ) -> ServiceResult<usize> {
-        let Ok(offset) = checked_offset(offset, input.len()) else {
-            return Ok(Err(FileError::InvalidOffset));
-        };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
-        let entry = state.read();
-        let nonblocking = entry.is_nonblocking();
-        let written = if offset.is_some() || !entry.uses_position() {
-            if entry.is_path_only() {
-                return Ok(Err(FileError::AccessNotAllowed));
-            }
-            self.write_without_position_update(&entry, input, offset)
-                .map(|(written, _)| written)
-        } else {
-            drop(entry);
-            let mut entry = state.write();
-            if entry.is_path_only() {
-                return Ok(Err(FileError::AccessNotAllowed));
-            }
-            Resolver::write(self, &mut entry, input, offset)
-        };
-        let written = match written {
-            Ok(written) => written,
-            Err(WriteError::WouldBlock) => return Err(BrokerError::would_block(nonblocking)),
-            Err(WriteError::Broker(error)) => return Err(error),
-            Err(error) => return Ok(Err(file_write_error(error))),
-        };
-        if written > input.len() {
-            return Err(BrokerError::Internal);
-        }
-        Ok(Ok(written))
-    }
-
-    fn seek(&self, file: &File, offset: i64, whence: FileSeekWhence) -> ServiceResult<u64> {
-        let Ok(offset) = isize::try_from(offset) else {
-            return Ok(Err(FileError::InvalidOffset));
-        };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
-        let entry = state.read();
-        let seek = if entry.uses_position() {
-            drop(entry);
-            let mut entry = state.write();
-            if entry.is_path_only() {
-                return Ok(Err(FileError::AccessNotAllowed));
-            }
-            Resolver::seek(self, &mut entry, offset, whence)
-        } else {
-            if entry.is_path_only() {
-                return Ok(Err(FileError::AccessNotAllowed));
-            }
-            Resolver::<Platform, Backend>::seek_without_position_update(&entry)
-        };
-        let offset = match seek {
-            Ok(offset) => offset,
-            Err(error) => return Ok(Err(file_seek_error(error))),
-        };
-        Ok(Ok(u64::try_from(offset).map_err(|_| BrokerError::Internal)?))
-    }
-
-    fn truncate(&self, file: &File, length: u64, reset_offset: bool) -> ServiceResult<()> {
-        let Ok(length) = usize::try_from(length) else {
-            return Ok(Err(FileError::InvalidOffset));
-        };
-        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
-        let entry = state.read();
-        let truncate = if reset_offset && entry.uses_position() {
-            drop(entry);
-            let mut entry = state.write();
-            if entry.is_path_only() {
-                return Ok(Err(FileError::AccessNotAllowed));
-            }
-            Resolver::truncate(self, &mut entry, length, true)
-        } else {
-            if entry.is_path_only() {
-                return Ok(Err(FileError::AccessNotAllowed));
-            }
-            self.truncate_without_position_update(&entry, length)
-        };
-        Ok(truncate.map_err(file_truncate_error))
-    }
-
-    fn map_shared(&self, file: &File) -> ServiceResult<SharedMapping> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
-        Ok(Resolver::map_shared(self, &entry).map_err(file_map_shared_error))
-    }
-
-    fn lock(&self, file: &File, operation: FileLockOperation) -> ServiceResult<()> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
-        if entry.is_path_only() {
-            return Ok(Err(FileError::PathOnly));
-        }
-        Ok(Resolver::lock(self, &entry, &file.state, operation)?.map_err(file_status_error))
-    }
-
-    fn read_directory(&self, file: &File) -> ServiceResult<Vec<FileDirectoryEntry>> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
-        if entry.is_path_only() {
-            return Ok(Err(FileError::AccessNotAllowed));
-        }
-        if !entry.allows_read() {
-            return Ok(Err(FileError::NotForReading));
-        }
-        let entries = match Resolver::read_dir(self, &entry) {
-            Ok(entries) => entries,
-            Err(error) => return Ok(Err(file_read_directory_error(error))),
-        };
-        Ok(Ok(entries))
-    }
-
-    fn handle_status(&self, file: &File) -> ServiceResult<FileStatus> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
-        let mut status = match Resolver::handle_status(self, &entry) {
-            Ok(status) => status,
-            Err(error) => return Ok(Err(file_status_error(error))),
-        };
-        mask_status_mode(&mut status);
-        Ok(Ok(status))
-    }
-
-    fn handle_path(&self, file: &File) -> ServiceResult<String> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
-        Ok(Ok(String::from(entry.path())))
-    }
-
-    fn get_status_flags(&self, file: &File) -> Result<FileStatusFlags> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
-        let access = match (entry.allows_read(), entry.allows_write()) {
-            (true, true) => FileAccessMode::ReadWrite,
-            (false, true) => FileAccessMode::WriteOnly,
-            _ => FileAccessMode::ReadOnly,
-        };
-        let mut flags = FileOpenFlags::NONE;
-        for (set, flag) in [
-            (entry.is_nonblocking(), FileOpenFlags::NONBLOCKING),
-            (entry.is_append(), FileOpenFlags::APPEND),
-            (entry.is_path_only(), FileOpenFlags::PATH),
-        ] {
-            if set {
-                flags = flags | flag;
-            }
-        }
-        Ok(FileStatusFlags { access, flags })
-    }
-
-    fn set_status_flags(
-        &self,
-        file: &File,
-        mask: FileOpenFlags,
-        flags: FileOpenFlags,
-    ) -> Result<()> {
-        let mut entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .write();
-        if entry.is_path_only() {
-            return Err(BrokerError::InvalidRights);
-        }
-        if mask.contains(FileOpenFlags::NONBLOCKING) {
-            entry.set_nonblocking(flags.contains(FileOpenFlags::NONBLOCKING));
-        }
-        if mask.contains(FileOpenFlags::APPEND) {
-            entry.set_append(flags.contains(FileOpenFlags::APPEND));
-        }
-        Ok(())
     }
 
     fn path_status(
@@ -535,13 +283,6 @@ where
 
     fn resolve_path(&self, path: &str, user: FileUser) -> ServiceResult<String> {
         Ok(Resolver::resolve_following_symlinks(self, user, path).map_err(file_walk_error))
-    }
-
-    fn set_times(&self, file: &File, user: FileUser, times: &SetFileTimes) -> ServiceResult<()> {
-        let entry = file
-            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
-            .read();
-        Ok(Resolver::set_times(self, user, &entry, times).map_err(file_set_times_error))
     }
 
     fn chmod(&self, path: &str, user: FileUser, mode: FileMode) -> ServiceResult<()> {
@@ -583,6 +324,216 @@ where
     }
 }
 
+impl<Platform, Backend> OpenFile for ResolverFile<Platform, Backend>
+where
+    Backend: super::backend::Backend,
+    Platform: RawSyncPrimitivesProvider,
+{
+    fn read(&self, output: &mut dyn ReadBuffer, offset: Option<u64>) -> ServiceResult<usize> {
+        let Ok(offset) = checked_offset(offset, output.len()) else {
+            return Ok(Err(FileError::InvalidOffset));
+        };
+        let entry = self.entry.read();
+        let nonblocking = entry.is_nonblocking();
+        let read = if offset.is_some() || !entry.uses_position() {
+            if entry.is_path_only() {
+                return Ok(Err(FileError::AccessNotAllowed));
+            }
+            self.resolver
+                .read_without_position_update(&entry, output, offset)
+                .map(|(read, _)| read)
+        } else {
+            drop(entry);
+            let mut entry = self.entry.write();
+            if entry.is_path_only() {
+                return Ok(Err(FileError::AccessNotAllowed));
+            }
+            self.resolver.read(&mut entry, output, offset)
+        };
+        let read = match read {
+            Ok(read) => read,
+            Err(ReadError::WouldBlock) => return Err(BrokerError::would_block(nonblocking)),
+            Err(ReadError::Broker(error)) => return Err(error),
+            Err(error) => return Ok(Err(file_read_error(error))),
+        };
+        if read > output.len() {
+            return Err(BrokerError::Internal);
+        }
+        Ok(Ok(read))
+    }
+
+    fn write(&self, input: &dyn WriteBuffer, offset: Option<u64>) -> ServiceResult<usize> {
+        let Ok(offset) = checked_offset(offset, input.len()) else {
+            return Ok(Err(FileError::InvalidOffset));
+        };
+        let entry = self.entry.read();
+        let nonblocking = entry.is_nonblocking();
+        let written = if offset.is_some() || !entry.uses_position() {
+            if entry.is_path_only() {
+                return Ok(Err(FileError::AccessNotAllowed));
+            }
+            self.resolver
+                .write_without_position_update(&entry, input, offset)
+                .map(|(written, _)| written)
+        } else {
+            drop(entry);
+            let mut entry = self.entry.write();
+            if entry.is_path_only() {
+                return Ok(Err(FileError::AccessNotAllowed));
+            }
+            self.resolver.write(&mut entry, input, offset)
+        };
+        let written = match written {
+            Ok(written) => written,
+            Err(WriteError::WouldBlock) => return Err(BrokerError::would_block(nonblocking)),
+            Err(WriteError::Broker(error)) => return Err(error),
+            Err(error) => return Ok(Err(file_write_error(error))),
+        };
+        if written > input.len() {
+            return Err(BrokerError::Internal);
+        }
+        Ok(Ok(written))
+    }
+
+    fn seek(&self, offset: i64, whence: FileSeekWhence) -> ServiceResult<u64> {
+        let Ok(offset) = isize::try_from(offset) else {
+            return Ok(Err(FileError::InvalidOffset));
+        };
+        let entry = self.entry.read();
+        let seek = if entry.uses_position() {
+            drop(entry);
+            let mut entry = self.entry.write();
+            if entry.is_path_only() {
+                return Ok(Err(FileError::AccessNotAllowed));
+            }
+            self.resolver.seek(&mut entry, offset, whence)
+        } else {
+            if entry.is_path_only() {
+                return Ok(Err(FileError::AccessNotAllowed));
+            }
+            Resolver::<Platform, Backend>::seek_without_position_update(&entry)
+        };
+        let offset = match seek {
+            Ok(offset) => offset,
+            Err(error) => return Ok(Err(file_seek_error(error))),
+        };
+        Ok(Ok(u64::try_from(offset).map_err(|_| BrokerError::Internal)?))
+    }
+
+    fn truncate(&self, length: u64, reset_offset: bool) -> ServiceResult<()> {
+        let Ok(length) = usize::try_from(length) else {
+            return Ok(Err(FileError::InvalidOffset));
+        };
+        let entry = self.entry.read();
+        let truncate = if reset_offset && entry.uses_position() {
+            drop(entry);
+            let mut entry = self.entry.write();
+            if entry.is_path_only() {
+                return Ok(Err(FileError::AccessNotAllowed));
+            }
+            self.resolver.truncate(&mut entry, length, true)
+        } else {
+            if entry.is_path_only() {
+                return Ok(Err(FileError::AccessNotAllowed));
+            }
+            self.resolver
+                .truncate_without_position_update(&entry, length)
+        };
+        Ok(truncate.map_err(file_truncate_error))
+    }
+
+    fn map_shared(&self) -> ServiceResult<SharedMapping> {
+        let entry = self.entry.read();
+        Ok(self
+            .resolver
+            .map_shared(&entry)
+            .map_err(file_map_shared_error))
+    }
+
+    fn lock(self: Arc<Self>, operation: FileLockOperation) -> ServiceResult<()> {
+        let entry = self.entry.read();
+        if entry.is_path_only() {
+            return Ok(Err(FileError::PathOnly));
+        }
+        let owner = Arc::downgrade(&self);
+        Ok(self
+            .resolver
+            .lock(&entry, owner, operation)?
+            .map_err(file_status_error))
+    }
+
+    fn read_directory(&self) -> ServiceResult<Vec<FileDirectoryEntry>> {
+        let entry = self.entry.read();
+        if entry.is_path_only() {
+            return Ok(Err(FileError::AccessNotAllowed));
+        }
+        if !entry.allows_read() {
+            return Ok(Err(FileError::NotForReading));
+        }
+        let entries = match self.resolver.read_dir(&entry) {
+            Ok(entries) => entries,
+            Err(error) => return Ok(Err(file_read_directory_error(error))),
+        };
+        Ok(Ok(entries))
+    }
+
+    fn handle_status(&self) -> ServiceResult<FileStatus> {
+        let entry = self.entry.read();
+        let mut status = match self.resolver.handle_status(&entry) {
+            Ok(status) => status,
+            Err(error) => return Ok(Err(file_status_error(error))),
+        };
+        mask_status_mode(&mut status);
+        Ok(Ok(status))
+    }
+
+    fn handle_path(&self) -> String {
+        String::from(self.entry.read().path())
+    }
+
+    fn get_status_flags(&self) -> FileStatusFlags {
+        let entry = self.entry.read();
+        let access = match (entry.allows_read(), entry.allows_write()) {
+            (true, true) => FileAccessMode::ReadWrite,
+            (false, true) => FileAccessMode::WriteOnly,
+            _ => FileAccessMode::ReadOnly,
+        };
+        let mut flags = FileOpenFlags::NONE;
+        for (set, flag) in [
+            (entry.is_nonblocking(), FileOpenFlags::NONBLOCKING),
+            (entry.is_append(), FileOpenFlags::APPEND),
+            (entry.is_path_only(), FileOpenFlags::PATH),
+        ] {
+            if set {
+                flags = flags | flag;
+            }
+        }
+        FileStatusFlags { access, flags }
+    }
+
+    fn set_status_flags(&self, mask: FileOpenFlags, flags: FileOpenFlags) -> Result<()> {
+        let mut entry = self.entry.write();
+        if entry.is_path_only() {
+            return Err(BrokerError::InvalidRights);
+        }
+        if mask.contains(FileOpenFlags::NONBLOCKING) {
+            entry.set_nonblocking(flags.contains(FileOpenFlags::NONBLOCKING));
+        }
+        if mask.contains(FileOpenFlags::APPEND) {
+            entry.set_append(flags.contains(FileOpenFlags::APPEND));
+        }
+        Ok(())
+    }
+
+    fn set_times(&self, user: FileUser, times: &SetFileTimes) -> ServiceResult<()> {
+        let entry = self.entry.read();
+        Ok(self
+            .resolver
+            .set_times(user, &entry, times)
+            .map_err(file_set_times_error))
+    }
+}
+
 /// Opens an absolute path and installs its broker-owned open state in `process`.
 ///
 /// If reads or writes of the file can fail with [`BrokerError::WouldBlock`], the new reference
@@ -605,7 +556,7 @@ pub fn open(
         return Ok(Err(error));
     }
     let reference = process.reserve_object_reference(rights)?;
-    let file = match process.fs.open(path, user, access, flags, mode, &|| {
+    let file = match Arc::clone(&process.fs).open(path, user, access, flags, mode, &|| {
         crate::process_group::controlling_terminal(process)
     })? {
         Ok(file) => file,
@@ -645,13 +596,13 @@ pub(crate) fn open_without_reference(
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    let file = match process.fs.open(path, user, access, flags, mode, &|| {
+    let file = match Arc::clone(&process.fs).open(path, user, access, flags, mode, &|| {
         crate::process_group::controlling_terminal(process)
     })? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
-    let status = match process.fs.handle_status(&file)? {
+    let status = match file.state.handle_status()? {
         Ok(status) => status,
         Err(error) => return Ok(Err(error)),
     };
@@ -672,7 +623,7 @@ pub fn read(
         return Err(BrokerError::ResourceExhausted);
     }
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.fs.read(&file, output, offset)
+    file.read(output, offset)
 }
 
 /// Writes bytes to a broker-owned open file.
@@ -689,7 +640,7 @@ pub fn write(
         return Err(BrokerError::ResourceExhausted);
     }
     let file = file(process, handle, ObjectRights::WRITE)?;
-    process.fs.write(&file, input, offset)
+    file.write(input, offset)
 }
 
 /// Repositions the shared offset of a broker-owned open file.
@@ -700,7 +651,7 @@ pub fn seek(
     whence: FileSeekWhence,
 ) -> Result<FileResult<u64>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.seek(&file, offset, whence)
+    file.state.seek(offset, whence)
 }
 
 /// Changes the length of a broker-owned open file.
@@ -711,7 +662,7 @@ pub fn truncate(
     reset_offset: bool,
 ) -> Result<FileResult<()>> {
     let file = file(process, handle, ObjectRights::WRITE)?;
-    process.fs.truncate(&file, length, reset_offset)
+    file.state.truncate(length, reset_offset)
 }
 
 /// Returns the host shared object holding a broker-owned open file's contents, so that the
@@ -729,7 +680,7 @@ pub fn map_shared(
     let SharedMapping {
         file: shared,
         writable: file_writable,
-    } = match process.fs.map_shared(&file)? {
+    } = match file.state.map_shared()? {
         Ok(mapping) => mapping,
         Err(error) => return Ok(Err(error)),
     };
@@ -750,7 +701,7 @@ pub fn lock(
     operation: FileLockOperation,
 ) -> ServiceResult<()> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.lock(&file, operation)
+    file.state.lock(operation)
 }
 
 /// Returns a fresh enumeration of a broker-owned open directory.
@@ -759,7 +710,7 @@ pub fn read_directory(
     handle: ObjectHandle,
 ) -> Result<FileResult<Vec<FileDirectoryEntry>>> {
     let file = file(process, handle, ObjectRights::WAIT)?;
-    process.fs.read_directory(&file)
+    file.state.read_directory()
 }
 
 /// Returns status for a broker-owned open object.
@@ -768,14 +719,14 @@ pub fn handle_status(
     handle: ObjectHandle,
 ) -> Result<FileResult<FileStatus>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.handle_status(&file)
+    file.state.handle_status()
 }
 
 /// Returns the absolute path of a broker-owned open object, with symbolic links resolved, as of
 /// when it was opened.
 pub fn handle_path(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<String>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.handle_path(&file)
+    Ok(Ok(file.state.handle_path()))
 }
 
 /// Returns whether a broker-owned open object refers to a terminal, which it does exactly when it
@@ -804,7 +755,7 @@ pub(crate) fn handle_terminal_access(
     let Some(terminal) = file.terminal.clone() else {
         return Ok(None);
     };
-    let readable = readable(process.fs.get_status_flags(&file)?.access);
+    let readable = readable(file.get_status_flags().access);
     drop(file);
     Ok(Some((terminal, readable)))
 }
@@ -822,7 +773,7 @@ pub fn terminal_control(
 ) -> Result<FileResult<TerminalResponse>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     let Some(terminal) = &file.terminal else {
-        let flags = process.fs.get_status_flags(&file)?.flags;
+        let flags = file.get_status_flags().flags;
         return Ok(Err(if flags.contains(FileOpenFlags::PATH) {
             FileError::PathOnly
         } else {
@@ -830,23 +781,6 @@ pub fn terminal_control(
         }));
     };
     terminal.control(operation)
-}
-
-/// Returns the access mode and status flags of a broker-owned open file.
-pub(crate) fn get_status_flags(process: &BrokerProcess, file: &File) -> Result<FileStatusFlags> {
-    process.fs.get_status_flags(file)
-}
-
-/// Changes the status flags in `mask` of a broker-owned open file to their values in `flags`.
-///
-/// Fails with [`BrokerError::InvalidRights`] for a file opened only for path-based operations.
-pub(crate) fn set_status_flags(
-    process: &BrokerProcess,
-    file: &File,
-    mask: FileOpenFlags,
-    flags: FileOpenFlags,
-) -> Result<()> {
-    process.fs.set_status_flags(file, mask, flags)
 }
 
 /// Returns status for an absolute path.
@@ -898,7 +832,7 @@ pub fn set_times(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.set_times(&file, user, times)
+    file.state.set_times(user, times)
 }
 
 /// Changes mode bits for an absolute path.

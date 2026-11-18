@@ -22,7 +22,7 @@ use crate::socket::SocketObject;
 use crate::timer::TimerObject;
 use crate::unix_socket::UnixSocketObject;
 use crate::vsock_socket::VsockSocketObject;
-use crate::{BrokerError, BrokerProcess, ProcessKey, Result};
+use crate::{BrokerError, ProcessKey, Result};
 
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.
@@ -223,10 +223,7 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
 }
 
 /// Returns the access mode and status flags of an object.
-pub(crate) fn get_status_flags(
-    process: &BrokerProcess,
-    object: &RwLock<ObjectEntry>,
-) -> Result<FileStatusFlags> {
+pub(crate) fn get_status_flags(object: &RwLock<ObjectEntry>) -> Result<FileStatusFlags> {
     let file = match &*object.read() {
         ObjectEntry::File(file) => file.clone(),
         ObjectEntry::Event(event) => return Ok(event.get_status_flags()),
@@ -241,12 +238,11 @@ pub(crate) fn get_status_flags(
             return Err(BrokerError::InvalidRights);
         }
     };
-    crate::fs::get_status_flags(process, &file)
+    Ok(file.get_status_flags())
 }
 
 /// Changes the status flags in `mask` of an object to their values in `flags`.
 pub(crate) fn set_status_flags(
-    process: &BrokerProcess,
     object: &RwLock<ObjectEntry>,
     mask: FileOpenFlags,
     flags: FileOpenFlags,
@@ -289,5 +285,5 @@ pub(crate) fn set_status_flags(
             return Err(BrokerError::InvalidRights);
         }
     };
-    crate::fs::set_status_flags(process, &file, mask, flags)
+    file.set_status_flags(mask, flags)
 }
