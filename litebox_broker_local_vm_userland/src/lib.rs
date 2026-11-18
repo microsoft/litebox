@@ -96,7 +96,7 @@ impl LocalSetupChannel for KernelBrokerSetup {
         &mut self,
         request: &BrokerHandshakeRequest,
     ) -> Result<(), ChannelError> {
-        let frame = wire::encode_handshake_request(request.clone());
+        let frame = wire::encode_handshake_request(request);
         self.request = Some(WireFrame::new(&frame).ok_or(ChannelError::Oversized)?);
         Ok(())
     }
@@ -123,7 +123,7 @@ impl Rings {
     /// One call in flight, so responses arrive in order.
     fn call(&mut self, request: BrokerRequest) -> Result<BrokerResponse, ChannelError> {
         let request_id = request.request_id;
-        let frame = wire::encode_request(request);
+        let frame = wire::encode_request(&request);
         loop {
             match self
                 .requests
@@ -769,7 +769,7 @@ mod tests {
     }
 
     fn readiness(handle: u64) -> Vec<u8> {
-        wire::encode_notification(BrokerNotification::Readiness(ReadinessNotification {
+        wire::encode_notification(&BrokerNotification::Readiness(ReadinessNotification {
             handle: ObjectHandle(handle),
             readiness: ReadinessFlags::READ,
         }))

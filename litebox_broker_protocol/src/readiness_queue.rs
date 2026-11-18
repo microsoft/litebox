@@ -35,91 +35,105 @@ bitflags! {
     }
 }
 
-/// What a readiness queue entry watches and how it reports it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReadinessQueueInterest {
-    /// Target readiness to report. Other target readiness is ignored.
-    pub readiness: ReadinessFlags,
-    /// Reporting mode.
-    pub flags: ReadinessQueueEntryFlags,
-    /// Caller-chosen value returned with each of the entry's events.
-    pub token: u64,
+wire_struct! {
+    /// What a readiness queue entry watches and how it reports it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ReadinessQueueInterest {
+        /// Target readiness to report. Other target readiness is ignored.
+        pub readiness: ReadinessFlags,
+        /// Reporting mode.
+        pub flags: ReadinessQueueEntryFlags,
+        /// Caller-chosen value returned with each of the entry's events.
+        pub token: u64,
+    }
 }
 
-/// Response to a readiness queue create request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateReadinessQueueResponse {
-    /// Created queue handle.
-    pub handle: ObjectHandle,
+wire_struct! {
+    /// Response to a readiness queue create request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreateReadinessQueueResponse {
+        /// Created queue handle.
+        pub handle: ObjectHandle,
+    }
 }
 
-/// Request to add an entry to a readiness queue.
-///
-/// Fails with [`ReadinessQueueError::AlreadyRegistered`] if the queue has an
-/// entry for `target` and `key`. The broker returns `UnsupportedOperation` if
-/// `target` has no readiness to watch or is itself a readiness queue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AddReadinessQueueEntryRequest {
-    /// Queue handle.
-    pub queue: ObjectHandle,
-    /// Object to watch.
-    pub target: ObjectHandle,
-    /// Caller-chosen key distinguishing entries for the same object.
-    pub key: u64,
-    /// Watched readiness and reporting mode.
-    pub interest: ReadinessQueueInterest,
+wire_struct! {
+    /// Request to add an entry to a readiness queue.
+    ///
+    /// Fails with [`ReadinessQueueError::AlreadyRegistered`] if the queue has an
+    /// entry for `target` and `key`. The broker returns `UnsupportedOperation` if
+    /// `target` has no readiness to watch or is itself a readiness queue.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct AddReadinessQueueEntryRequest {
+        /// Queue handle.
+        pub queue: ObjectHandle,
+        /// Object to watch.
+        pub target: ObjectHandle,
+        /// Caller-chosen key distinguishing entries for the same object.
+        pub key: u64,
+        /// Watched readiness and reporting mode.
+        pub interest: ReadinessQueueInterest,
+    }
 }
 
-/// Request to replace an entry's interest, re-enabling a disabled one-shot
-/// entry.
-///
-/// Fails with [`ReadinessQueueError::NotRegistered`] if the queue has no entry
-/// for `target` and `key`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ModifyReadinessQueueEntryRequest {
-    /// Queue handle.
-    pub queue: ObjectHandle,
-    /// Watched object.
-    pub target: ObjectHandle,
-    /// Key the entry was added with.
-    pub key: u64,
-    /// New watched readiness and reporting mode.
-    pub interest: ReadinessQueueInterest,
+wire_struct! {
+    /// Request to replace an entry's interest, re-enabling a disabled one-shot
+    /// entry.
+    ///
+    /// Fails with [`ReadinessQueueError::NotRegistered`] if the queue has no entry
+    /// for `target` and `key`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ModifyReadinessQueueEntryRequest {
+        /// Queue handle.
+        pub queue: ObjectHandle,
+        /// Watched object.
+        pub target: ObjectHandle,
+        /// Key the entry was added with.
+        pub key: u64,
+        /// New watched readiness and reporting mode.
+        pub interest: ReadinessQueueInterest,
+    }
 }
 
-/// Request to remove an entry from a readiness queue.
-///
-/// Fails with [`ReadinessQueueError::NotRegistered`] if the queue has no entry
-/// for `target` and `key`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RemoveReadinessQueueEntryRequest {
-    /// Queue handle.
-    pub queue: ObjectHandle,
-    /// Watched object.
-    pub target: ObjectHandle,
-    /// Key the entry was added with.
-    pub key: u64,
+wire_struct! {
+    /// Request to remove an entry from a readiness queue.
+    ///
+    /// Fails with [`ReadinessQueueError::NotRegistered`] if the queue has no entry
+    /// for `target` and `key`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RemoveReadinessQueueEntryRequest {
+        /// Queue handle.
+        pub queue: ObjectHandle,
+        /// Watched object.
+        pub target: ObjectHandle,
+        /// Key the entry was added with.
+        pub key: u64,
+    }
 }
 
-/// Request to take ready events from a readiness queue without waiting.
-///
-/// The broker writes up to `buffer.length() / READY_EVENT_SIZE` encoded
-/// [`ReadyEvent`]s to `buffer`. The buffer length must be a nonzero multiple
-/// of [`READY_EVENT_SIZE`] holding at most [`MAX_READINESS_QUEUE_EVENTS`]
-/// events. Waiters wait for the queue's `READ` readiness instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TakeReadyRequest {
-    /// Queue handle.
-    pub queue: ObjectHandle,
-    /// Destination for the encoded events.
-    pub buffer: SharedBufferSequence,
+wire_struct! {
+    /// Request to take ready events from a readiness queue without waiting.
+    ///
+    /// The broker writes up to `buffer.length() / READY_EVENT_SIZE` encoded
+    /// [`ReadyEvent`]s to `buffer`. The buffer length must be a nonzero multiple
+    /// of [`READY_EVENT_SIZE`] holding at most [`MAX_READINESS_QUEUE_EVENTS`]
+    /// events. Waiters wait for the queue's `READ` readiness instead.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TakeReadyRequest {
+        /// Queue handle.
+        pub queue: ObjectHandle,
+        /// Destination for the encoded events.
+        pub buffer: SharedBufferSequence,
+    }
 }
 
-/// Response to a take-ready request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TakeReadyResponse {
-    /// Number of events written to the request's buffer, possibly zero.
-    pub count: u32,
+wire_struct! {
+    /// Response to a take-ready request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TakeReadyResponse {
+        /// Number of events written to the request's buffer, possibly zero.
+        pub count: u32,
+    }
 }
 
 /// One ready entry reported by a readiness queue.
@@ -155,14 +169,16 @@ impl ReadyEvent {
     }
 }
 
-/// Readiness queue operation failure that is meaningful to the guest ABI.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ReadinessQueueError {
-    #[error("the queue already has an entry for the object and key")]
-    AlreadyRegistered,
-    #[error("the queue has no entry for the object and key")]
-    NotRegistered,
+wire_enum! {
+    /// Readiness queue operation failure that is meaningful to the guest ABI.
+    #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum ReadinessQueueError {
+        #[error("the queue already has an entry for the object and key")]
+        AlreadyRegistered,
+        #[error("the queue has no entry for the object and key")]
+        NotRegistered,
+    }
 }
 
 #[cfg(test)]

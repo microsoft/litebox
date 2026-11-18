@@ -1950,7 +1950,7 @@ mod tests {
             request_id: RequestId(13),
             operation: BrokerOperation::CloseObject(ObjectHandle(17)),
         };
-        let encoded = encode_request(request.clone());
+        let encoded = encode_request(&request);
         let frames = [
             (
                 encoded[..encoded.len() - 1].to_vec(),
@@ -1965,7 +1965,7 @@ mod tests {
                 WireError::TrailingBytes,
             ),
             (
-                encode_handshake_request(BrokerHandshakeRequest {
+                encode_handshake_request(&BrokerHandshakeRequest {
                     protocol_version: ProtocolVersion(1),
                 }),
                 WireError::WrongMessagePhase,

@@ -237,7 +237,7 @@ impl<Memory: WaitableSharedMemory<Error = Error>> ControlRingHostCallLane<Memory
 
     /// Serializes and sends the response to this lane's last request.
     pub fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Error> {
-        let frame = encode_response(response.clone());
+        let frame = encode_response(response);
         self.association
             .publish(&mut self.lane.response_producer, &frame)
     }
@@ -261,7 +261,7 @@ impl<Memory: WaitableSharedMemory<Error = Error>> HostNotificationChannel
     type Error = Error;
 
     fn send_notification(&mut self, notification: &BrokerNotification) -> Result<(), Error> {
-        let frame = encode_notification(notification.clone());
+        let frame = encode_notification(notification);
         self.association.publish(&mut self.producer, &frame)
     }
 }

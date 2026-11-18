@@ -266,7 +266,7 @@ impl<Memory: WaitableSharedMemory<Error = Error>> LocalAssociation<Memory> {
         request: BrokerRequest,
     ) -> Result<BrokerResponse, Error> {
         let request_id = request.request_id;
-        let request_frame = encode_request(request);
+        let request_frame = encode_request(&request);
         let producer = &mut lane.request_producer;
         loop {
             let write_status = self

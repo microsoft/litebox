@@ -16,6 +16,9 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+#[macro_use]
+mod macros;
+
 pub mod error;
 pub mod event;
 pub mod fs;

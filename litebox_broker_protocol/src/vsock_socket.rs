@@ -49,64 +49,78 @@ impl VsockPort {
 /// Maximum listen backlog accepted by the broker protocol.
 pub const MAX_VSOCK_LISTEN_BACKLOG: u32 = 4096;
 
-/// A vsock address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct VsockAddress {
-    /// Context ID.
-    pub cid: VsockCid,
-    /// Port.
-    pub port: VsockPort,
+wire_struct! {
+    /// A vsock address.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct VsockAddress {
+        /// Context ID.
+        pub cid: VsockCid,
+        /// Port.
+        pub port: VsockPort,
+    }
 }
 
-/// Request to create an unbound, unconnected vsock socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateVsockSocketRequest {
-    /// Socket type.
-    pub socket_type: SocketType,
-    /// Initial status flags, within [`FileOpenFlags::STATUS`].
-    pub flags: FileOpenFlags,
+wire_struct! {
+    /// Request to create an unbound, unconnected vsock socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreateVsockSocketRequest {
+        /// Socket type.
+        pub socket_type: SocketType,
+        /// Initial status flags, within [`FileOpenFlags::STATUS`].
+        pub flags: FileOpenFlags,
+    }
 }
 
-/// Request to bind a vsock socket to a local address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BindVsockSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// [`VsockCid::ANY`] or the guest's CID, and a port or
-    /// [`VsockPort::ANY`].
-    pub address: VsockAddress,
+wire_struct! {
+    /// Request to bind a vsock socket to a local address.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct BindVsockSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// [`VsockCid::ANY`] or the guest's CID, and a port or
+        /// [`VsockPort::ANY`].
+        pub address: VsockAddress,
+    }
 }
 
-/// Request to connect a vsock socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectVsockSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Address to connect to.
-    pub address: VsockAddress,
+wire_struct! {
+    /// Request to connect a vsock socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ConnectVsockSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Address to connect to.
+        pub address: VsockAddress,
+    }
 }
 
-/// Request to receive stream bytes into shared memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReceiveVsockSocketRequest {
-    /// Socket handle.
-    pub handle: ObjectHandle,
-    /// Leased shared-buffer region to receive the bytes.
-    pub buffer: SharedBufferSequence,
+wire_struct! {
+    /// Request to receive stream bytes into shared memory.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReceiveVsockSocketRequest {
+        /// Socket handle.
+        pub handle: ObjectHandle,
+        /// Leased shared-buffer region to receive the bytes.
+        pub buffer: SharedBufferSequence,
+    }
 }
 
-/// Response containing one accepted vsock socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AcceptVsockSocketResponse {
-    /// Handle naming the accepted socket.
-    pub handle: ObjectHandle,
-    /// Address of the connecting peer.
-    pub remote_address: VsockAddress,
+wire_struct! {
+    /// Response containing one accepted vsock socket.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct AcceptVsockSocketResponse {
+        /// Handle naming the accepted socket.
+        pub handle: ObjectHandle,
+        /// Address of the connecting peer.
+        pub remote_address: VsockAddress,
+    }
 }
 
-/// Response containing a vsock socket address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetVsockSocketNameResponse {
-    /// Requested address, or `None` if the socket has none.
-    pub address: Option<VsockAddress>,
+wire_struct! {
+    /// Response containing a vsock socket address.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct GetVsockSocketNameResponse {
+        /// Requested address, or `None` if the socket has none.
+        pub address: Option<VsockAddress>,
+    }
 }

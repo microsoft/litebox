@@ -15,54 +15,66 @@ pub const MAX_PIPE_TRANSFER_SIZE: u32 = 32 * 1024;
 
 const _: () = assert!(MAX_PIPE_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
 
-/// Request to create a broker-owned byte pipe.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreatePipeRequest {
-    /// Maximum number of buffered bytes.
-    pub capacity: u64,
-    /// Maximum write size that must be accepted atomically.
-    pub atomic_write_size: u64,
-    /// Initial status flags of both endpoints, within [`FileOpenFlags::STATUS`].
-    pub flags: FileOpenFlags,
+wire_struct! {
+    /// Request to create a broker-owned byte pipe.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreatePipeRequest {
+        /// Maximum number of buffered bytes.
+        pub capacity: u64,
+        /// Maximum write size that must be accepted atomically.
+        pub atomic_write_size: u64,
+        /// Initial status flags of both endpoints, within [`FileOpenFlags::STATUS`].
+        pub flags: FileOpenFlags,
+    }
 }
 
-/// Response to a pipe create request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreatePipeResponse {
-    /// Handle for the read endpoint.
-    pub read_handle: ObjectHandle,
-    /// Handle for the write endpoint.
-    pub write_handle: ObjectHandle,
+wire_struct! {
+    /// Response to a pipe create request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreatePipeResponse {
+        /// Handle for the read endpoint.
+        pub read_handle: ObjectHandle,
+        /// Handle for the write endpoint.
+        pub write_handle: ObjectHandle,
+    }
 }
 
-/// Request to read bytes from a pipe endpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadPipeRequest {
-    /// Read endpoint handle.
-    pub handle: ObjectHandle,
-    /// Leased shared-buffer region to receive the bytes.
-    pub buffer: SharedBufferSequence,
+wire_struct! {
+    /// Request to read bytes from a pipe endpoint.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReadPipeRequest {
+        /// Read endpoint handle.
+        pub handle: ObjectHandle,
+        /// Leased shared-buffer region to receive the bytes.
+        pub buffer: SharedBufferSequence,
+    }
 }
 
-/// Response describing bytes read into shared memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadPipeResponse {
-    /// Number of bytes placed in the read region.
-    pub read: u32,
+wire_struct! {
+    /// Response describing bytes read into shared memory.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReadPipeResponse {
+        /// Number of bytes placed in the read region.
+        pub read: u32,
+    }
 }
 
-/// Request to write bytes staged in shared memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WritePipeRequest {
-    /// Write endpoint handle.
-    pub handle: ObjectHandle,
-    /// Leased shared-buffer region containing the staged bytes.
-    pub buffer: SharedBufferSequence,
+wire_struct! {
+    /// Request to write bytes staged in shared memory.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WritePipeRequest {
+        /// Write endpoint handle.
+        pub handle: ObjectHandle,
+        /// Leased shared-buffer region containing the staged bytes.
+        pub buffer: SharedBufferSequence,
+    }
 }
 
-/// Response describing a completed pipe write.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WritePipeResponse {
-    /// Number of bytes appended to the pipe.
-    pub written: u32,
+wire_struct! {
+    /// Response describing a completed pipe write.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WritePipeResponse {
+        /// Number of bytes appended to the pipe.
+        pub written: u32,
+    }
 }

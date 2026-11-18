@@ -496,7 +496,7 @@ impl HostSetupChannel for UnixStreamHostSetupChannel {
     fn send_handshake_response(&mut self, response: &BrokerHandshakeResponse) -> IoResult<()> {
         write_setup_frame(
             &mut self.stream,
-            &encode_handshake_response(response.clone()),
+            &encode_handshake_response(response),
             self.setup_deadline,
         )?;
         self.negotiated = matches!(response, BrokerHandshakeResponse::Negotiated { .. });
@@ -1176,7 +1176,7 @@ mod tests {
             let id = u64::try_from(index).unwrap();
             write_payload(
                 &mut local.lanes[index].request_producer,
-                &encode_request(request(id)),
+                &encode_request(&request(id)),
             );
             let HostReceive::Message(received) = lane.recv_request().unwrap() else {
                 panic!("expected ring request");
@@ -1311,7 +1311,7 @@ mod tests {
         let (mut lane, _shutdown, mut local, _peer) = activate_host_lane();
         write_payload(
             &mut local.lanes[0].request_producer,
-            &encode_handshake_request(BrokerHandshakeRequest {
+            &encode_handshake_request(&BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             }),
         );
@@ -1332,7 +1332,7 @@ mod tests {
     fn host_setup_rejects_active_frames_and_requires_negotiation() {
         let (mut peer_stream, host_stream) = UnixStream::pair().unwrap();
         let mut channel = UnixStreamHostSetupChannel::from_accepted(host_stream);
-        write_setup_frame(&mut peer_stream, &encode_request(request(0)), None).unwrap();
+        write_setup_frame(&mut peer_stream, &encode_request(&request(0)), None).unwrap();
         assert_eq!(
             channel.recv_handshake_request().unwrap(),
             HostReceive::ProtocolViolation
