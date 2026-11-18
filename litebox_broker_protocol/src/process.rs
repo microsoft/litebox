@@ -45,6 +45,8 @@ wire_struct! {
         pub process_id: ProcessId,
         /// Give the caller's future children a new PID namespace. Only valid for the caller itself.
         pub children_pid_namespace: Option<PidNamespaceOptions>,
+        /// Move the target into a new, empty shared-segment namespace.
+        pub new_segment_namespace: bool,
         /// Give the target a private copy of its host names.
         pub copy_host_names: bool,
     }

@@ -109,9 +109,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     ///
     /// Fails with [`ProcessError::InvalidChild`] if the target is neither,
     /// with [`ProcessError::Unavailable`] if this process's children already
-    /// go to another PID namespace, and with
-    /// [`ProcessError::ResourceExhausted`] at a namespace count or nesting
-    /// limit.
+    /// go to another PID namespace, with [`ProcessError::ResourceExhausted`]
+    /// at a namespace count or nesting limit, and with
+    /// [`ProcessError::PolicyDenied`] if this process may not create a segment
+    /// namespace.
     pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.create_namespaces(request)?)

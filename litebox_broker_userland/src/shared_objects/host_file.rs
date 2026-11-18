@@ -74,6 +74,12 @@ pub(super) fn create<H: HostFile>(file: File) -> SharedFileMemory {
     }
 }
 
+/// Creates the exportable view of an already initialized host file.
+#[cfg(target_os = "linux")]
+pub(super) fn exportable<H: HostFile>(file: File) -> Arc<dyn SharedFileObject> {
+    Arc::new(HostFileObject::<H>(Arc::new(file), PhantomData))
+}
+
 /// A file's contents in a host file of kind `H`, as the file system reads and writes them.
 ///
 /// The file owns its storage, so each change has the storage to itself.

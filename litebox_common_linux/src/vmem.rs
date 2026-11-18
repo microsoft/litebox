@@ -8,7 +8,7 @@
 use core::num::NonZeroU64;
 use core::ops::Range;
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use rangemap::RangeMap;
 use thiserror::Error;
 
@@ -197,12 +197,23 @@ enum Sharing {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SharedMemoryView {
     memory: SharedMemoryId,
-    /// One `shmat`, not the segment ID: two attaches of the same memory are independent.
-    attachment: Option<NonZeroU64>,
+    attachment: Option<SysvView>,
     /// Address that offset zero of the memory maps at, which stays the same as the area splits.
     /// It wraps around for a mapping placed below its offset in the memory.
     base: usize,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SysvView {
+    /// One `shmat`, not the segment ID: two attaches of the same memory are independent.
+    identity: NonZeroU64,
+    /// Equal permissions do not re-merge distinct SysV VMAs when that would remove a
+    /// VMA with a close callback.
+    piece: NonZeroU64,
+}
+
+type SysvAttachmentKey = (usize, NonZeroU64);
+type SysvAdjust = Arc<dyn Fn(u32, i64) + Send + Sync>;
 
 /// What a [`VmArea`]'s pages are to other mappings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -922,16 +933,16 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     /// The number of shared anonymous mappings created, which numbers each of their areas.
     shared_anonymous_mappings: u64,
     sysv_sequence: u64,
-    sysv_attachments: Vec<SysvAttachment>,
-    pub(super) sysv_release: Option<Arc<dyn Fn(u32) + Send + Sync>>,
-    /// Segments of attachments that ended, for the owner to release once it unlocks this.
-    pub(super) sysv_released: Vec<u32>,
+    sysv_attachments: BTreeMap<SysvAttachmentKey, SysvAttachment>,
+    pub(super) sysv_adjust: Option<SysvAdjust>,
+    /// Net changes to publish while the owner still holds the VMA write lock.
+    pub(super) sysv_deltas: BTreeMap<u32, i64>,
 }
 
 struct SysvAttachment {
-    identity: NonZeroU64,
     segment: u32,
-    range: Range<usize>,
+    end: usize,
+    pieces: i64,
 }
 
 impl<Platform, const ALIGN: usize> Vmem<Platform, ALIGN>
@@ -950,9 +961,9 @@ where
             reservations: Platform::Reservations::default(),
             shared_anonymous_mappings: 0,
             sysv_sequence: 0,
-            sysv_attachments: Vec::new(),
-            sysv_release: None,
-            sysv_released: Vec::new(),
+            sysv_attachments: BTreeMap::new(),
+            sysv_adjust: None,
+            sysv_deltas: BTreeMap::new(),
         }
     }
 
@@ -966,70 +977,118 @@ where
         !self.sysv_attachments.is_empty()
     }
 
-    /// Marks a just-created, offset-zero shared object mapping as one `shmat`. Only this
-    /// mapping's pages get the identity, even when mmap coalesced it with adjacent areas.
-    pub(super) fn register_sysv(&mut self, range: Range<usize>, segment: u32, readonly: bool) {
+    fn next_sysv_id(&mut self) -> NonZeroU64 {
         self.sysv_sequence = self
             .sysv_sequence
             .checked_add(1)
-            .expect("exhausted shmat IDs");
-        let identity = NonZeroU64::new(self.sysv_sequence).unwrap();
+            .expect("exhausted SysV VMA IDs");
+        NonZeroU64::new(self.sysv_sequence).unwrap()
+    }
+
+    /// Marks a just-created, offset-zero shared object mapping as one `shmat`. Only this
+    /// mapping's pages get the identity, even when mmap coalesced it with adjacent areas.
+    pub(super) fn register_sysv(&mut self, range: Range<usize>, segment: u32, readonly: bool) {
+        let identity = self.next_sysv_id();
         let mut vma = *self.vmas.get(&range.start).unwrap();
         let Sharing::Named(ref mut view) = vma.sharing else {
             unreachable!("shmat must map a shared object");
         };
         debug_assert_eq!(view.base, range.start);
-        view.attachment = Some(identity);
+        view.attachment = Some(SysvView {
+            identity,
+            piece: identity,
+        });
         vma.flags.remove(VmFlags::VM_MAYEXEC);
         if readonly {
             vma.flags.remove(VmFlags::VM_MAYWRITE);
         }
         self.vmas.insert(range.clone(), vma);
-        self.sysv_attachments.push(SysvAttachment {
-            identity,
-            segment,
-            range,
-        });
+        self.sysv_attachments.insert(
+            (range.start, identity),
+            SysvAttachment {
+                segment,
+                end: range.end,
+                pieces: 1,
+            },
+        );
+    }
+
+    /// Include the neighbors of the changed interval so that fragments just outside it
+    /// are counted after a split, and neighbors are counted before possible coalescing.
+    fn count_sysv_pieces(
+        &self,
+        changed: &Range<usize>,
+        counts: &mut BTreeMap<SysvAttachmentKey, i64>,
+        delta: i64,
+    ) {
+        if self.sysv_attachments.is_empty() {
+            return;
+        }
+        let window = changed.start.saturating_sub(1)..changed.end.saturating_add(1);
+        for (_, vma) in self.vmas.overlapping(window) {
+            if let Some(view) = vma.shared_memory()
+                && let Some(attachment) = view.attachment
+            {
+                *counts.entry((view.base, attachment.identity)).or_default() += delta;
+            }
+        }
+    }
+
+    fn snapshot_sysv(&self, changed: &Range<usize>) -> BTreeMap<SysvAttachmentKey, i64> {
+        let mut counts = BTreeMap::new();
+        self.count_sysv_pieces(changed, &mut counts, -1);
+        counts
     }
 
     // Called even on failed host operations: a replacement or teardown can fail after
     // unmapping pages. The surviving VMAs, not the syscall's return value, are authoritative.
-    fn reap_sysv(&mut self, changed: &Range<usize>) {
-        self.sysv_attachments.retain(|a| {
-            if a.range.start >= changed.end
-                || changed.start >= a.range.end
-                || self.vmas.overlapping(&a.range).any(|(_, vma)| {
-                    vma.shared_memory().and_then(|view| view.attachment) == Some(a.identity)
-                })
-            {
-                return true;
+    fn reconcile_sysv(
+        &mut self,
+        changed: &Range<usize>,
+        mut counts: BTreeMap<SysvAttachmentKey, i64>,
+    ) {
+        if counts.is_empty() {
+            return;
+        }
+        self.count_sysv_pieces(changed, &mut counts, 1);
+        for (key, delta) in counts.into_iter().filter(|(_, delta)| *delta != 0) {
+            let attachment = self.sysv_attachments.get_mut(&key).unwrap();
+            attachment.pieces += delta;
+            debug_assert!(attachment.pieces >= 0);
+            *self.sysv_deltas.entry(attachment.segment).or_default() += delta;
+            if attachment.pieces == 0 {
+                self.sysv_attachments.remove(&key);
             }
-            self.sysv_released.push(a.segment);
-            false
-        });
+        }
     }
 
     /// Removes only the surviving fragments of one attachment, never replacement pages.
-    pub(super) fn detach_sysv(&mut self, base: usize) -> Result<(), crate::errno::Errno>
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no surviving fragment of the selected attachment is in use
+    /// by a Rust borrow or other host operation that requires the mapping to remain valid.
+    pub(super) unsafe fn detach_sysv(&mut self, base: usize) -> Result<(), crate::errno::Errno>
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
-        let a = self
+        let (&(_, identity), a) = self
             .sysv_attachments
-            .iter()
-            .rfind(|a| a.range.start == base)
+            .range((base, NonZeroU64::MIN)..=(base, NonZeroU64::MAX))
+            .next_back()
             .ok_or(crate::errno::Errno::EINVAL)?;
         let pieces: Vec<_> = self
             .vmas
-            .overlapping(&a.range)
+            .overlapping(base..a.end)
             .filter(|(_, vma)| {
-                vma.shared_memory().and_then(|view| view.attachment) == Some(a.identity)
+                vma.shared_memory()
+                    .and_then(|view| view.attachment)
+                    .is_some_and(|view| view.identity == identity)
             })
             .map(|(range, _)| PageRange::new(range.start, range.end).unwrap())
             .collect();
         for piece in pieces {
-            // SAFETY: shmdt authorizes unmapping this attachment, and the write lock excludes
-            // other VMA changes between lookup and removal.
+            // SAFETY: The caller excludes host users of every selected fragment.
             unsafe { self.remove_mapping(piece) }?;
         }
         Ok(())
@@ -1091,12 +1150,13 @@ where
         if range.end > Platform::TASK_ADDR_MAX {
             return Err(VmemUnmapError::InvalidRange(range));
         }
+        let before = self.snapshot_sysv(&range);
         // SAFETY: The caller excludes all users of the removed range.
         let result = unsafe {
             self.reservations
                 .unmap(self.platform, &mut self.vmas, range.clone())
         };
-        self.reap_sysv(&range);
+        self.reconcile_sysv(&range, before);
         result.map_err(VmemUnmapError::UnmapError)
     }
 
@@ -1109,12 +1169,14 @@ where
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
+        let range = 0..usize::MAX;
+        let before = self.snapshot_sysv(&range);
         // SAFETY: The caller relinquishes every owned extent without remaining users.
         let result = unsafe { self.reservations.release_all(&mut self.vmas, self.platform) };
         if result.is_ok() {
             self.vmas.clear();
         }
-        self.reap_sysv(&(0..usize::MAX));
+        self.reconcile_sysv(&range, before);
         result
     }
 
@@ -1208,6 +1270,9 @@ where
     {
         let platform_fixed_address_behavior =
             self.platform_placement(&suggested_range.into(), fixed_address_behavior)?;
+        let range = suggested_range.into();
+        let before = (platform_fixed_address_behavior == FixedAddressBehavior::Replace)
+            .then(|| self.snapshot_sysv(&range));
         // SAFETY: The caller authorizes replacement, and the checks above preserve external gaps.
         // Other requests target VMA gaps selected by the caller.
         let result = unsafe {
@@ -1215,15 +1280,15 @@ where
                 self.platform,
                 &mut self.vmas,
                 MmapRequest {
-                    range: suggested_range.into(),
+                    range: range.clone(),
                     options: mapping_options(vma, populate_pages_immediately),
                     vma,
                     behavior: platform_fixed_address_behavior,
                 },
             )
         };
-        if platform_fixed_address_behavior == FixedAddressBehavior::Replace {
-            self.reap_sysv(&suggested_range.into());
+        if let Some(before) = before {
+            self.reconcile_sysv(&range, before);
         }
         result.map_err(address_in_use_as_platform_collision)
     }
@@ -1773,20 +1838,47 @@ where
                 });
             }
             let intersection = range.start.max(r.start)..range.end.min(r.end);
-            mappings_to_change.push((intersection, *vma));
+            mappings_to_change.push((r.clone(), intersection, *vma));
         }
         if mappings_to_change.is_empty() {
             return Ok(());
         }
 
+        let before = self.snapshot_sysv(&range);
         // SAFETY: The range has complete VMA coverage and the caller excludes conflicting access.
-        unsafe { self.reservations.protect(self.platform, range, permissions) }
-            .map_err(VmemProtectError::ProtectError)?;
-        for (intersection, mut vma) in mappings_to_change {
+        unsafe {
+            self.reservations
+                .protect(self.platform, range.clone(), permissions)
+        }
+        .map_err(VmemProtectError::ProtectError)?;
+        for (original, intersection, mut vma) in mappings_to_change {
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
             vma.flags = VmArea::new(new_flags, vma.is_file_backed).flags;
+            if let Sharing::Named(ref mut view) = vma.sharing
+                && let Some(ref mut attachment) = view.attachment
+                && intersection != original
+            {
+                // Linux may extend a neighbor into a partial VMA without closing the
+                // original VMA. Otherwise the newly protected slice needs its own VMA.
+                let adjacent = if intersection.start == original.start {
+                    intersection.start.checked_sub(1)
+                } else if intersection.end == original.end {
+                    Some(intersection.end)
+                } else {
+                    None
+                };
+                let neighbor_piece = adjacent
+                    .and_then(|addr| self.vmas.get(&addr))
+                    .filter(|neighbor| neighbor.flags == vma.flags)
+                    .and_then(VmArea::shared_memory)
+                    .and_then(|neighbor| neighbor.attachment)
+                    .filter(|neighbor| neighbor.identity == attachment.identity)
+                    .map(|neighbor| neighbor.piece);
+                attachment.piece = neighbor_piece.unwrap_or_else(|| self.next_sysv_id());
+            }
             self.vmas.insert(intersection, vma);
         }
+        self.reconcile_sysv(&range, before);
 
         Ok(())
     }
@@ -2777,11 +2869,15 @@ mod tests {
     }
 
     #[test]
-    fn sysv_detach_preserves_replacements_and_releases_each_attach_once() {
+    fn sysv_detach_preserves_replacements_and_counts_surviving_vmas() {
         let backend = dummy_backend::<true>(None);
         let mut vm = Vmem::<_, PAGE_SIZE>::new(backend);
         let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
         let page = |i| start + i * PAGE_SIZE;
+        let detach = |vm: &mut Vmem<_, PAGE_SIZE>, addr| {
+            // SAFETY: the test owns all simulated fragments and has no live users.
+            unsafe { vm.detach_sysv(addr) }
+        };
         let map = |vm: &mut Vmem<_, PAGE_SIZE>, i, n, offset| {
             // SAFETY: the test owns this whole mock address space.
             unsafe {
@@ -2811,7 +2907,12 @@ mod tests {
                 ),
                 Err(VmemProtectError::NoAccess { .. })
             ));
+            vm.protect_mapping(piece, MemoryRegionPermissions::READ)
+                .unwrap();
         }
+        // Splitting the middle adds two VMAs. Restoring the original permissions does
+        // not close either of the split VMAs.
+        assert_eq!(core::mem::take(&mut vm.sysv_deltas), [(1, 2)].into());
         // Replace the middle page with the *same* shared object at the *same* offset.
         // Futex keys still match, but shmdt must not remove this ordinary shared mapping.
         map(&mut vm, 2, 1, 2 * PAGE_SIZE);
@@ -2820,13 +2921,13 @@ mod tests {
         unsafe { vm.remove_mapping(PageRange::new(page(0), page(1)).unwrap()) }.unwrap();
         map(&mut vm, 0, 1, 0);
         vm.register_sysv(page(0)..page(1), 1, false);
-        assert_eq!(vm.sysv_released, []);
-        vm.detach_sysv(page(0)).unwrap();
-        assert_eq!(vm.sysv_released, [1]);
+        assert!(vm.sysv_deltas.is_empty());
+        detach(&mut vm, page(0)).unwrap();
+        assert_eq!(core::mem::take(&mut vm.sysv_deltas), [(1, -1)].into());
         assert!(vm.vmas.get(&page(1)).is_some());
-        vm.detach_sysv(page(0)).unwrap();
-        assert_eq!(vm.sysv_released, [1, 1]);
-        assert_eq!(vm.detach_sysv(page(0)), Err(crate::errno::Errno::EINVAL));
+        detach(&mut vm, page(0)).unwrap();
+        assert_eq!(core::mem::take(&mut vm.sysv_deltas), [(1, -3)].into());
+        assert_eq!(detach(&mut vm, page(0)), Err(crate::errno::Errno::EINVAL));
         assert!(
             vm.iter()
                 .map(|(r, _)| r.clone())
@@ -2836,7 +2937,7 @@ mod tests {
         map(&mut vm, 4, 1, 0);
         vm.register_sysv(page(4)..page(5), 2, true);
         map(&mut vm, 4, 1, 0);
-        assert_eq!(vm.detach_sysv(page(4)), Err(crate::errno::Errno::EINVAL));
+        assert_eq!(detach(&mut vm, page(4)), Err(crate::errno::Errno::EINVAL));
         map(&mut vm, 5, 1, 0);
         vm.register_sysv(page(5)..page(6), 3, true);
         map(&mut vm, 6, 3, 0);
@@ -2857,11 +2958,42 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(vm.detach_sysv(page(6)), Err(crate::errno::Errno::EINVAL));
+        assert_eq!(detach(&mut vm, page(6)), Err(crate::errno::Errno::EINVAL));
         // Exec drains remaining attachments; previously released ones are not charged twice.
         // SAFETY: the test is done using all mock mappings.
         unsafe { vm.release_all() }.unwrap();
-        assert_eq!(vm.sysv_released, [1, 1, 2, 4, 3]);
+        assert_eq!(vm.sysv_deltas, [(2, -1), (3, -1), (4, -1)].into());
+
+        map(&mut vm, 0, 3, 0);
+        vm.register_sysv(page(0)..page(3), 1, false);
+        vm.sysv_deltas.clear();
+        // SAFETY: the test owns the pages; no one else uses them.
+        unsafe { vm.remove_mapping(PageRange::new(page(1), page(2)).unwrap()) }.unwrap();
+        assert_eq!(core::mem::take(&mut vm.sysv_deltas), [(1, 1)].into());
+        detach(&mut vm, page(0)).unwrap();
+        assert_eq!(vm.sysv_deltas, [(1, -2)].into());
+
+        map(&mut vm, 0, 4, 0);
+        vm.register_sysv(page(0)..page(4), 1, false);
+        vm.sysv_deltas.clear();
+        // SAFETY: the test owns these pages and there are no concurrent accesses.
+        unsafe {
+            vm.protect_mapping(
+                PageRange::new(page(0), page(1)).unwrap(),
+                MemoryRegionPermissions::empty(),
+            )
+            .unwrap();
+            // Extending the protected area into just the edge of its neighbor need
+            // not close either of the existing VMAs or open a third VMA.
+            vm.protect_mapping(
+                PageRange::new(page(1), page(2)).unwrap(),
+                MemoryRegionPermissions::empty(),
+            )
+            .unwrap();
+        }
+        assert_eq!(core::mem::take(&mut vm.sysv_deltas), [(1, 1)].into());
+        detach(&mut vm, page(0)).unwrap();
+        assert_eq!(vm.sysv_deltas, [(1, -2)].into());
     }
 
     #[test]

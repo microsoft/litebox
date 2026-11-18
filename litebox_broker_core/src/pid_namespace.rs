@@ -369,6 +369,7 @@ mod tests {
         process.create_namespaces(litebox_broker_protocol::process::CreateNamespacesRequest {
             process_id: process.id(),
             children_pid_namespace: Some(options),
+            new_segment_namespace: false,
             copy_host_names: false,
         })
     }

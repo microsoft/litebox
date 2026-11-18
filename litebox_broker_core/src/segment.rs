@@ -12,14 +12,16 @@ use spin::{Mutex, MutexGuard};
 
 use crate::{
     BrokerError, BrokerProcess,
-    fs::shared_storage::{SharedFileMemoryProvider, SharedFileObject},
+    fs::shared_storage::{SegmentStorageError, SharedFileMemoryProvider, SharedFileObject},
     object::ObjectRights,
     pid_namespace::PerNamespaceIds,
 };
 use litebox_broker_protocol::{
     ProcessId,
     fs::{FileError as E, FileUser, MapFileResponse},
-    segment::{SegmentRequest as Request, SegmentResponse as Response, SegmentStatus},
+    segment::{
+        SegmentAttachId, SegmentRequest as Request, SegmentResponse as Response, SegmentStatus,
+    },
     shared_futex::SharedMemoryId,
 };
 
@@ -99,6 +101,7 @@ impl Drop for SegmentId {
 
 struct Segment {
     status: SegmentStatus,
+    pending: u64,
     /// Page-rounded length of `backing`.
     length: u64,
     creator: Arc<PerNamespaceIds>,
@@ -109,6 +112,10 @@ struct Segment {
 }
 
 impl Segment {
+    fn ready_to_delete(&self) -> bool {
+        self.status.removed && self.status.attachments == 0 && self.pending == 0
+    }
+
     fn access(&self, user: FileUser, required: u16) -> Result<(), E> {
         let s = &self.status;
         let shift = if user.user == s.owner.user || user.user == s.creator.user {
@@ -138,30 +145,51 @@ impl Segment {
 }
 
 type Entry = Arc<Mutex<Segment>>;
-type Namespace = Mutex<BTreeMap<u32, Entry>>;
+type Namespace = Mutex<Registry>;
 
-#[derive(Clone)]
-struct Attachment {
-    namespace: Weak<Namespace>,
-    entry: Entry,
-    count: u32,
+#[derive(Default)]
+struct Registry {
+    segments: BTreeMap<u32, Entry>,
+    keys: BTreeMap<i32, u32>,
 }
 
-impl Attachment {
-    fn subtract(&self, process: &BrokerProcess, id: u32, count: u32) {
+#[derive(Clone)]
+struct SegmentRef {
+    id: u32,
+    namespace: Weak<Namespace>,
+    entry: Entry,
+}
+
+impl SegmentRef {
+    fn update_and_prune(&self, update: impl FnOnce(&mut Segment)) {
         let namespace = self.namespace.upgrade();
         let mut registry = namespace.as_ref().map(|ns| ns.lock());
         let mut entry = self.entry.lock();
-        entry.status.attachments -= u64::from(count);
-        entry.last = Some(Arc::clone(&process.ids));
-        entry.status.detached = process.core.timer_provider.unix_seconds();
-        if entry.status.removed
-            && entry.status.attachments == 0
+        update(&mut entry);
+        if entry.ready_to_delete()
             && let Some(registry) = &mut registry
         {
-            registry.remove(&id);
+            registry.segments.remove(&self.id);
         }
     }
+
+    fn cancel(&self) {
+        self.update_and_prune(|entry| entry.pending -= 1);
+    }
+
+    fn subtract(&self, process: &BrokerProcess, count: u64) {
+        self.update_and_prune(|entry| {
+            entry.status.attachments -= count;
+            entry.last = Some(Arc::clone(&process.ids));
+            entry.status.detached = process.core.timer_provider.unix_seconds();
+        });
+    }
+}
+
+#[derive(Clone)]
+struct Attachment {
+    segment: SegmentRef,
+    count: u64,
 }
 
 #[derive(Default)]
@@ -171,11 +199,17 @@ pub(crate) struct ProcessSegments {
     // unrelated segments in an otherwise dead namespace.
     namespace: Arc<Namespace>,
     attachments: BTreeMap<u32, Attachment>,
+    pending: BTreeMap<SegmentAttachId, SegmentRef>,
+    last_attach_id: u64,
     inherited: bool,
     closed: bool,
 }
 
 impl ProcessSegments {
+    pub(crate) fn reset_namespace(&mut self) {
+        self.namespace = Arc::default();
+    }
+
     pub(crate) fn child(&self) -> Self {
         Self {
             namespace: Arc::clone(&self.namespace),
@@ -186,10 +220,13 @@ impl ProcessSegments {
     pub(crate) fn close(&mut self, process: &BrokerProcess) {
         if !self.closed {
             self.closed = true;
-            for (id, a) in core::mem::take(&mut self.attachments) {
-                a.subtract(process, id, a.count);
+            for (_, reservation) in core::mem::take(&mut self.pending) {
+                reservation.cancel();
             }
-            self.namespace = Arc::default();
+            for (_, a) in core::mem::take(&mut self.attachments) {
+                a.segment.subtract(process, a.count);
+            }
+            self.reset_namespace();
         }
     }
 }
@@ -217,7 +254,7 @@ type Outcome = Result<Response, Failure>;
 
 /// Handles a segment request. `provider` creates empty storage and `deliver`
 /// lends a handle to this association only, attenuated to the requested
-/// rights. An attachment is recorded only when delivery succeeds.
+/// rights. An attachment is recorded only when the process confirms it.
 pub fn operate(
     process: &BrokerProcess,
     request: Request,
@@ -242,7 +279,10 @@ pub fn operate(
         Request::Set { id, owner, mode } => caller.set(id, owner, mode),
         Request::Delete { id } => caller.delete(id),
         Request::Attach { id, writable } => caller.attach(id, writable, deliver),
-        Request::Detach { id } => caller.detach(id),
+        Request::ConfirmAttach { attachment } => caller.confirm_attach(attachment),
+        Request::CancelAttach { attachment } => caller.cancel_attach(attachment),
+        Request::Detach { id } => caller.adjust_attachments(id, -1),
+        Request::AdjustAttachments { id, delta } => caller.adjust_attachments(id, delta),
         Request::NewNamespace { target } => caller.new_namespace(target),
         Request::Inherit { target } => caller.inherit(target),
     };
@@ -260,7 +300,7 @@ fn with_segment<R>(
     f: impl FnOnce(&Entry, &mut Segment) -> Result<R, Failure>,
 ) -> Result<R, Failure> {
     let registry = namespace.lock();
-    let entry = Arc::clone(registry.get(&id).ok_or(E::InvalidArgument)?);
+    let entry = Arc::clone(registry.segments.get(&id).ok_or(E::InvalidArgument)?);
     let mut segment = entry.lock();
     drop(registry);
     f(&entry, &mut segment)
@@ -306,18 +346,17 @@ impl Caller<'_> {
         let local = self.segments()?;
         let mut registry = local.namespace.lock();
         if key != 0 {
-            for (id, entry) in registry.iter() {
+            if let Some(&id) = registry.keys.get(&key) {
+                let entry = &registry.segments[&id];
                 let s = entry.lock();
-                if !s.status.removed && s.status.key == key {
-                    if create && exclusive {
-                        return Err(E::AlreadyExists.into());
-                    }
-                    if size > s.status.size {
-                        return Err(E::InvalidArgument.into());
-                    }
-                    s.access(self.user, (mode | mode >> 3 | mode >> 6) & 7)?;
-                    return Ok(Response::Id(*id));
+                if create && exclusive {
+                    return Err(E::AlreadyExists.into());
                 }
+                if size > s.status.size {
+                    return Err(E::InvalidArgument.into());
+                }
+                s.access(self.user, (mode | mode >> 3 | mode >> 6) & 7)?;
+                return Ok(Response::Id(id));
             }
             if !create {
                 return Err(E::NoSuchFileOrDirectory.into());
@@ -332,10 +371,15 @@ impl Caller<'_> {
         let length = size.next_multiple_of(PAGE_SIZE);
         let backing = provider
             .create_segment(usize::try_from(length).map_err(|_| E::InvalidArgument)?)
-            .map_err(|_| E::NoSpace)?;
+            .map_err(|error| match error {
+                SegmentStorageError::NoSpace => Failure::Segment(E::NoSpace),
+                SegmentStorageError::OutOfMemory => Failure::Broker(BrokerError::OutOfMemory),
+                SegmentStorageError::Io => Failure::Segment(E::Io),
+                SegmentStorageError::Unsupported => Failure::Segment(E::NoSuchDevice),
+            })?;
         let memory = crate::shared_futex::issue_shared_memory_id(self.process)?;
         let number = id.id;
-        registry.insert(
+        registry.segments.insert(
             number,
             Arc::new(Mutex::new(Segment {
                 status: SegmentStatus {
@@ -352,6 +396,7 @@ impl Caller<'_> {
                     detached: 0,
                     removed: false,
                 },
+                pending: 0,
                 length,
                 creator: Arc::clone(&self.process.ids),
                 last: None,
@@ -360,6 +405,9 @@ impl Caller<'_> {
                 _id: id,
             })),
         );
+        if key != 0 {
+            registry.keys.insert(key, number);
+        }
         Ok(Response::Id(number))
     }
 
@@ -396,14 +444,15 @@ impl Caller<'_> {
     fn delete(&self, id: u32) -> Outcome {
         let local = self.segments()?;
         let mut registry = local.namespace.lock();
-        let entry = Arc::clone(registry.get(&id).ok_or(E::InvalidArgument)?);
+        let entry = Arc::clone(registry.segments.get(&id).ok_or(E::InvalidArgument)?);
         let mut s = entry.lock();
         self.require_write()?;
         s.control(self.user)?;
+        registry.keys.remove(&s.status.key);
         s.status.removed = true;
         s.status.key = 0;
-        if s.status.attachments == 0 {
-            registry.remove(&id);
+        if s.ready_to_delete() {
+            registry.segments.remove(&id);
         }
         Ok(Response::Done)
     }
@@ -415,32 +464,35 @@ impl Caller<'_> {
         deliver: impl FnOnce(&dyn SharedFileObject, bool, u64) -> Result<u64, E>,
     ) -> Outcome {
         let mut local = self.segments()?;
+        if local.pending.len() >= self.process.core.limits.max_threads_per_process {
+            return Err(E::NoSpace.into());
+        }
         let namespace = Arc::clone(&local.namespace);
         with_segment(&namespace, id, |entry, s| {
             if writable {
                 self.require_write()?;
             }
             s.access(self.user, if writable { 6 } else { 4 })?;
-            let count = local
+            s.status
                 .attachments
-                .get(&id)
-                .map_or(0, |a| a.count)
-                .checked_add(1)
+                .checked_add(s.pending)
+                .and_then(|total| total.checked_add(1))
                 .ok_or(E::NoSpace)?;
+            let attachment =
+                SegmentAttachId(local.last_attach_id.checked_add(1).ok_or(E::NoSpace)?);
             let token = deliver(&*s.backing, writable, s.length)?;
-            s.status.attachments += 1;
-            s.status.attached = self.now();
-            s.last = Some(Arc::clone(&self.process.ids));
-            local
-                .attachments
-                .entry(id)
-                .or_insert_with(|| Attachment {
+            local.last_attach_id = attachment.0;
+            s.pending += 1;
+            local.pending.insert(
+                attachment,
+                SegmentRef {
+                    id,
                     namespace: Arc::downgrade(&namespace),
                     entry: Arc::clone(entry),
-                    count: 0,
-                })
-                .count = count;
-            Ok(Response::Attached {
+                },
+            );
+            Ok(Response::AttachPrepared {
+                attachment,
                 mapping: MapFileResponse {
                     memory: s.memory,
                     token,
@@ -451,13 +503,61 @@ impl Caller<'_> {
         })
     }
 
-    fn detach(&self, id: u32) -> Outcome {
+    fn confirm_attach(&self, attachment: SegmentAttachId) -> Outcome {
+        let mut local = self.segments()?;
+        let segment = local
+            .pending
+            .remove(&attachment)
+            .ok_or(E::InvalidArgument)?;
+        {
+            let mut s = segment.entry.lock();
+            s.pending -= 1;
+            s.status.attachments += 1;
+            s.status.attached = self.now();
+            s.last = Some(Arc::clone(&self.process.ids));
+        }
+        local
+            .attachments
+            .entry(segment.id)
+            .or_insert(Attachment { segment, count: 0 })
+            .count += 1;
+        Ok(Response::Done)
+    }
+
+    fn cancel_attach(&self, attachment: SegmentAttachId) -> Outcome {
+        let mut local = self.segments()?;
+        local
+            .pending
+            .remove(&attachment)
+            .ok_or(E::InvalidArgument)?
+            .cancel();
+        Ok(Response::Done)
+    }
+
+    fn adjust_attachments(&self, id: u32, delta: i64) -> Outcome {
         let mut local = self.segments()?;
         let a = local.attachments.get_mut(&id).ok_or(E::InvalidArgument)?;
-        a.subtract(self.process, id, 1);
-        a.count -= 1;
-        if a.count == 0 {
-            local.attachments.remove(&id);
+        match delta.cmp(&0) {
+            core::cmp::Ordering::Greater => {
+                let mut s = a.segment.entry.lock();
+                let count = delta.cast_unsigned();
+                s.status
+                    .attachments
+                    .checked_add(s.pending)
+                    .and_then(|total| total.checked_add(count))
+                    .ok_or(E::NoSpace)?;
+                s.status.attachments += count;
+                a.count += count;
+            }
+            core::cmp::Ordering::Less => {
+                let count = delta.unsigned_abs();
+                a.count = a.count.checked_sub(count).ok_or(E::InvalidArgument)?;
+                a.segment.subtract(self.process, count);
+                if a.count == 0 {
+                    local.attachments.remove(&id);
+                }
+            }
+            core::cmp::Ordering::Equal => return Err(E::InvalidArgument.into()),
         }
         Ok(Response::Done)
     }
@@ -466,7 +566,7 @@ impl Caller<'_> {
         if !self.can_write || self.user.user != 0 {
             return Err(E::NotOwner.into());
         }
-        let reset = |p: &BrokerProcess| p.segments.lock().namespace = Arc::default();
+        let reset = |p: &BrokerProcess| p.segments.lock().reset_namespace();
         if target == self.process.id() {
             reset(self.process);
         } else {
@@ -481,13 +581,32 @@ impl Caller<'_> {
         process.with_pending_child(target, |child| {
             let parent = process.segments.lock();
             let mut dest = child.segments.lock();
-            if parent.closed || dest.closed || dest.inherited {
+            if parent.closed
+                || dest.closed
+                || dest.inherited
+                || !dest.attachments.is_empty()
+                || !dest.pending.is_empty()
+            {
                 return Err(E::InvalidArgument.into());
             }
-            let now = self.now();
+            // Validate every count before making the first change. Hold segment
+            // locks in ID order so concurrent inheritance cannot invalidate the checks.
+            let mut inherited = alloc::vec::Vec::new();
+            inherited
+                .try_reserve_exact(parent.attachments.len())
+                .map_err(|_| BrokerError::OutOfMemory)?;
             for (id, a) in &parent.attachments {
-                let mut s = a.entry.lock();
-                s.status.attachments += u64::from(a.count);
+                let s = a.segment.entry.lock();
+                s.status
+                    .attachments
+                    .checked_add(s.pending)
+                    .and_then(|total| total.checked_add(a.count))
+                    .ok_or(E::NoSpace)?;
+                inherited.push((id, a, s));
+            }
+            let now = self.now();
+            for (id, a, mut s) in inherited {
+                s.status.attachments += a.count;
                 s.status.attached = now;
                 // Linux credits fork's implicit attaches to the forking process.
                 s.last = Some(Arc::clone(&process.ids));
@@ -570,6 +689,31 @@ mod tests {
         s
     }
 
+    fn prepare(
+        p: &BrokerProcess,
+        id: u32,
+        writable: bool,
+    ) -> (SegmentAttachId, MapFileResponse, u64) {
+        let Response::AttachPrepared {
+            attachment,
+            mapping,
+            size,
+        } = call(p, Request::Attach { id, writable })
+        else {
+            panic!("prepare attach failed")
+        };
+        (attachment, mapping, size)
+    }
+
+    fn attach(p: &BrokerProcess, id: u32, writable: bool) -> (MapFileResponse, u64) {
+        let (attachment, mapping, size) = prepare(p, id, writable);
+        assert_eq!(
+            call(p, Request::ConfirmAttach { attachment }),
+            Response::Done
+        );
+        (mapping, size)
+    }
+
     #[test]
     fn segment_lifetime_across_namespaces_and_fork() {
         let (broker, parent) = setup(FileUser::ROOT);
@@ -591,15 +735,13 @@ mod tests {
             call(&other, Request::Status { id }),
             Response::Failed(E::InvalidArgument)
         );
-        let attach = Request::Attach { id, writable: true };
+        let request = Request::Attach { id, writable: true };
         assert_eq!(
-            operate(&parent, attach, Some(&Provider), |_, _, _| Err(E::NoSpace)).unwrap(),
+            operate(&parent, request, Some(&Provider), |_, _, _| Err(E::NoSpace)).unwrap(),
             Response::Failed(E::NoSpace)
         );
         assert_eq!(status(&parent, id).attachments, 0);
-        let Response::Attached { mapping, size } = call(&parent, attach) else {
-            panic!("attach failed")
-        };
+        let (mapping, size) = attach(&parent, id, true);
         assert_eq!(size, 123);
         assert!(mapping.writable);
         let child_id = parent
@@ -619,15 +761,7 @@ mod tests {
         assert_eq!(inherited.attachments, 2);
         // Linux: fork's implicit attach runs as the parent (ipc/shm.c `shm_open`).
         assert_eq!(inherited.last_pid, parent.id().0);
-        let Response::Attached { mapping: ro, .. } = call(
-            &child,
-            Request::Attach {
-                id,
-                writable: false,
-            },
-        ) else {
-            panic!("child attach failed")
-        };
+        let (ro, _) = attach(&child, id, false);
         assert_eq!(mapping.memory, ro.memory);
         assert!(!ro.writable);
         assert_eq!(
@@ -706,16 +840,8 @@ mod tests {
             call(&p, Request::Attach { id, writable: true }),
             Response::Failed(E::AccessNotAllowed)
         );
-        assert!(matches!(
-            call(
-                &p,
-                Request::Attach {
-                    id,
-                    writable: false
-                }
-            ),
-            Response::Attached { .. }
-        ));
+        let (mapping, _) = attach(&p, id, false);
+        assert!(!mapping.writable);
         assert_eq!(
             call(
                 &p,
@@ -738,10 +864,7 @@ mod tests {
     fn cancelled_fork_child_returns_inherited_attachments() {
         let (_broker, parent) = setup(FileUser::ROOT);
         let id = create(&parent, 0);
-        assert!(matches!(
-            call(&parent, Request::Attach { id, writable: true }),
-            Response::Attached { .. }
-        ));
+        attach(&parent, id, true);
         let child_id = parent
             .allocate_child_process(None, false)
             .unwrap()
@@ -753,6 +876,189 @@ mod tests {
         assert_eq!(status(&parent, id).attachments, 2);
         parent.cancel_child_process(child_id).unwrap();
         assert_eq!(status(&parent, id).attachments, 1);
+    }
+
+    #[test]
+    fn provisional_attachment_cancel_preserves_metadata() {
+        let (_broker, p) = setup(FileUser::ROOT);
+        let id = create(&p, 41);
+        let before = status(&p, id);
+        let request = Request::Attach { id, writable: true };
+        assert_eq!(
+            operate(&p, request, Some(&Provider), |_, _, _| Err(E::Io)).unwrap(),
+            Response::Failed(E::Io)
+        );
+        assert_eq!(status(&p, id), before);
+        let (first, _, _) = prepare(&p, id, true);
+        let (second, _, _) = prepare(&p, id, true);
+        assert_ne!(first, second);
+        assert_eq!(status(&p, id), before);
+        assert_eq!(
+            call(&p, Request::CancelAttach { attachment: first }),
+            Response::Done
+        );
+        assert_eq!(status(&p, id), before);
+        assert_eq!(
+            call(&p, Request::ConfirmAttach { attachment: first }),
+            Response::Failed(E::InvalidArgument)
+        );
+        assert_eq!(
+            call(&p, Request::ConfirmAttach { attachment: second }),
+            Response::Done
+        );
+        let after = status(&p, id);
+        assert_eq!(after.attachments, 1);
+        assert_eq!(after.last_pid, p.id().0);
+        assert_eq!(after.detached, before.detached);
+    }
+
+    #[test]
+    fn provisional_attachment_pins_removed_segment_until_cancel() {
+        let (_broker, p) = setup(FileUser::ROOT);
+        let id = create(&p, 51);
+        let (attachment, _, _) = prepare(&p, id, false);
+        assert_eq!(call(&p, Request::Delete { id }), Response::Done);
+        let replacement = create(&p, 51);
+        assert_ne!(id, replacement);
+        assert_eq!(status(&p, id).attachments, 0);
+        assert_eq!(
+            call(&p, Request::CancelAttach { attachment }),
+            Response::Done
+        );
+        assert_eq!(
+            call(&p, Request::Status { id }),
+            Response::Failed(E::InvalidArgument)
+        );
+        assert_eq!(
+            call(&p, get(51, 0, false, false)),
+            Response::Id(replacement)
+        );
+    }
+
+    #[test]
+    fn child_does_not_inherit_pending_attach_and_owner_exit_cancels_it() {
+        let (_broker, parent) = setup(FileUser::ROOT);
+        let id = create(&parent, 53);
+        let (attachment, _, _) = prepare(&parent, id, true);
+        let child_id = parent
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        assert_eq!(
+            call(&parent, Request::Inherit { target: child_id }),
+            Response::Done
+        );
+        let child = parent.take_child_process(child_id).unwrap();
+        child.complete_start().unwrap();
+        assert_eq!(
+            call(&child, Request::ConfirmAttach { attachment }),
+            Response::Failed(E::InvalidArgument)
+        );
+        assert_eq!(call(&parent, Request::Delete { id }), Response::Done);
+        assert_eq!(status(&child, id).attachments, 0);
+        parent.cleanup(true);
+        assert_eq!(
+            call(&child, Request::Status { id }),
+            Response::Failed(E::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn owner_death_releases_taken_failed_child_attachments() {
+        let (_broker, parent) = setup(FileUser::ROOT);
+        let id = create(&parent, 61);
+        attach(&parent, id, true);
+        let child_id = parent
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        assert_eq!(
+            call(&parent, Request::Inherit { target: child_id }),
+            Response::Done
+        );
+        let child = parent.take_child_process(child_id).unwrap();
+        assert_eq!(status(&parent, id).attachments, 2);
+        parent.handle_owner_death();
+        assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
+        assert_eq!(status(&parent, id).attachments, 1);
+    }
+
+    #[test]
+    fn adjusts_confirmed_attachment_counts() {
+        let (_broker, p) = setup(FileUser::ROOT);
+        let id = create(&p, 71);
+        attach(&p, id, true);
+        let before = status(&p, id);
+        assert_eq!(
+            call(&p, Request::AdjustAttachments { id, delta: 1 }),
+            Response::Done
+        );
+        assert_eq!(
+            status(&p, id),
+            SegmentStatus {
+                attachments: 2,
+                ..before
+            }
+        );
+        assert_eq!(
+            call(&p, Request::AdjustAttachments { id, delta: -3 }),
+            Response::Failed(E::InvalidArgument)
+        );
+        assert_eq!(
+            call(&p, Request::AdjustAttachments { id, delta: -2 }),
+            Response::Done
+        );
+        assert_eq!(status(&p, id).attachments, 0);
+    }
+
+    #[test]
+    fn segment_storage_errors_preserve_classification() {
+        struct FailingProvider(SegmentStorageError);
+        impl SharedFileMemoryProvider for FailingProvider {
+            fn create(&self) -> Result<SharedFileMemory, StorageError> {
+                unreachable!("segment creation uses the fixed-length provider method")
+            }
+
+            fn create_segment(
+                &self,
+                _: usize,
+            ) -> Result<Arc<dyn SharedFileObject>, SegmentStorageError> {
+                Err(self.0)
+            }
+        }
+
+        let (_broker, p) = setup(FileUser::ROOT);
+        let request = get(81, 123, true, true);
+        for (error, expected) in [
+            (
+                SegmentStorageError::NoSpace,
+                Ok(Response::Failed(E::NoSpace)),
+            ),
+            (
+                SegmentStorageError::OutOfMemory,
+                Err(BrokerError::OutOfMemory),
+            ),
+            (SegmentStorageError::Io, Ok(Response::Failed(E::Io))),
+            (
+                SegmentStorageError::Unsupported,
+                Ok(Response::Failed(E::NoSuchDevice)),
+            ),
+        ] {
+            assert_eq!(
+                operate(
+                    &p,
+                    request,
+                    Some(&FailingProvider(error)),
+                    |_, _, _| unreachable!()
+                ),
+                expected
+            );
+            assert_eq!(
+                call(&p, get(81, 0, false, false)),
+                Response::Failed(E::NoSuchFileOrDirectory)
+            );
+        }
+        create(&p, 81);
     }
 
     #[test]

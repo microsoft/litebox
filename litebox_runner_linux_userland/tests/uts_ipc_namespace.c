@@ -114,9 +114,27 @@ static void segment_namespaces_are_separate(void) {
     }
     char *attached = shmat(parent, NULL, 0);
     CHECK(attached != (void *)-1);
+    if (attached == (void *)-1) {
+        CHECK(shmctl(parent, IPC_RMID, NULL) == 0);
+        return;
+    }
+    attached[0] = 's';
     for (int use_clone = 0; use_clone <= 1; ++use_clone) {
+        int detached[2], release[2];
+        if (pipe(detached) != 0) {
+            CHECK(0);
+            break;
+        }
+        if (pipe(release) != 0) {
+            CHECK(0);
+            close(detached[0]);
+            close(detached[1]);
+            break;
+        }
         pid_t child = use_clone ? clone_child(CLONE_NEWIPC) : fork();
         if (child == 0) {
+            close(detached[0]);
+            close(release[1]);
             if ((!use_clone && unshare(CLONE_NEWIPC) != 0) ||
                 shmget(key, 0, 0) != -1 || errno != ENOENT) {
                 _exit(1);
@@ -126,16 +144,32 @@ static void segment_namespaces_are_separate(void) {
                 _exit(2);
             }
             // The inherited attachment still belongs to the old namespace's segment.
-            if (shmdt(attached) != 0) {
+            if (attached[0] != 's' || shmdt(attached) != 0) {
                 _exit(4);
+            }
+            char byte = 'd';
+            if (write(detached[1], &byte, 1) != 1 || read(release[0], &byte, 1) != 1) {
+                _exit(5);
             }
             int local = shmget(key, 1, IPC_CREAT | IPC_EXCL | 0600);
             _exit(local >= 0 && shmctl(local, IPC_RMID, NULL) == 0 ? CHILD_CODE : 3);
         }
+        close(detached[1]);
+        close(release[0]);
+        if (child > 0) {
+            char byte;
+            if (read(detached[0], &byte, 1) == 1) {
+                struct shmid_ds ds;
+                CHECK(shmget(key, 0, 0) == parent);
+                CHECK(shmctl(parent, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1);
+                CHECK(write(release[1], &byte, 1) == 1);
+            } else {
+                CHECK(0);
+            }
+        }
+        close(detached[0]);
+        close(release[1]);
         CHECK(child > 0 && exited_with(child, CHILD_CODE));
-        CHECK(shmget(key, 0, 0) == parent);
-        struct shmid_ds ds;
-        CHECK(shmctl(parent, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1);
     }
     CHECK(shmdt(attached) == 0);
     CHECK(shmctl(parent, IPC_RMID, NULL) == 0);
@@ -529,8 +563,11 @@ int main(int argc, char **argv) {
     self_path = argv[0];
     // A write to a pipe whose reader failed and exited fails rather than ending this program.
     signal(SIGPIPE, SIG_IGN);
+    if (argc == 2 && strcmp(argv[1], "segments") == 0) {
+        segment_namespaces_are_separate();
+        return failures != 0;
+    }
     clone_creates_namespaces();
-    segment_namespaces_are_separate();
     unshare_creates_namespaces();
     set_and_read_names();
     children_share_the_names();

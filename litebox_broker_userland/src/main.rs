@@ -214,6 +214,10 @@ struct CliArgs {
         conflicts_with = "in_process_runner"
     )]
     runner: Option<PathBuf>,
+    /// Argument and credential contract for the configured runner, independent of its path.
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_enum, default_value_t = RunnerKind::Linux, conflicts_with = "in_process_runner")]
+    runner_kind: RunnerKind,
     /// Run the runners and the egress proxy as this host user (the GID defaults to the UID; neither
     /// may be 0 or 4294967295), who must be able to traverse `TMPDIR`, where the runners' control
     /// sockets go.
@@ -476,9 +480,7 @@ impl CliArgs {
 
     #[cfg(target_os = "linux")]
     fn runs_linux_runner(&self) -> bool {
-        self.in_process_runner
-            || self.runner.as_ref().and_then(|path| path.file_name())
-                == Some(OsStr::new("litebox_runner_linux_userland"))
+        self.runner_kind == RunnerKind::Linux
     }
 
     fn configured_runner_arguments(&self) -> Vec<OsString> {
@@ -498,6 +500,15 @@ impl CliArgs {
         arguments.extend(self.runner_arguments.iter().cloned());
         arguments
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum RunnerKind {
+    /// Use the Linux runner's CLI and derive broker-side credentials from it.
+    Linux,
+    /// Forward opaque runner arguments; broker credential options configure the broker only.
+    Custom,
 }
 
 fn runner_command_arguments(
@@ -765,7 +776,7 @@ mod cli_tests {
         let args = CliArgs::try_parse_from([
             "broker",
             "--runner",
-            "/bin/litebox_runner_linux_userland",
+            "/bin/renamed-litebox",
             "--guest-uid",
             "0",
             "/guest",
@@ -782,6 +793,8 @@ mod cli_tests {
             "broker",
             "--runner",
             "/bin/other_runner",
+            "--runner-kind",
+            "custom",
             "--guest-uid",
             "5",
             "/guest",

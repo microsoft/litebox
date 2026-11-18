@@ -870,8 +870,16 @@ impl BrokerProcess {
     /// `UnsupportedOperation` if the request asks for a children's PID
     /// namespace for a pending child or while this process's children already
     /// go to another one. Returns `ResourceExhausted` if that namespace can't
-    /// be created.
+    /// be created, and `PolicyDenied` for a new segment namespace unless the
+    /// segment user is root and the process may write.
     pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<()> {
+        if request.new_segment_namespace {
+            // Use the broker's segment principal and rights, not a guest credential.
+            self.require_object_rights(ObjectRights::WAIT | ObjectRights::WRITE)?;
+            if self.core.policy.segment_user.user != 0 {
+                return Err(BrokerError::PolicyDenied);
+            }
+        }
         if request.children_pid_namespace.is_some() && request.process_id != self.id() {
             return Err(BrokerError::UnsupportedOperation);
         }
@@ -908,6 +916,9 @@ impl BrokerProcess {
             let previous = core::mem::replace(&mut *shared, Arc::new(copy));
             drop(shared);
             drop(previous);
+        }
+        if request.new_segment_namespace {
+            target.segments.lock().reset_namespace();
         }
         Ok(())
     }
@@ -2307,8 +2318,10 @@ impl BrokerProcess {
                 }
             }
         }
-        // Like a failed start, a failed child's threads end.
+        // Like a failed start, a failed child releases inherited attachments
+        // and its threads end.
         for child in &failed_children {
+            child.segments.lock().close(child);
             child.end_threads(false);
         }
         if !failed_children.is_empty() {
@@ -4433,7 +4446,8 @@ mod tests {
     fn failed_pid_namespace_reservation_keeps_host_names_shared() {
         let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
+                .with_process_duplication_enabled(true)
+                .with_segment_user(ROOT),
         )
         .with_limits(BrokerCoreLimits {
             max_pid_namespaces_per_process: 0,
@@ -4450,6 +4464,7 @@ mod tests {
             root.create_namespaces(CreateNamespacesRequest {
                 process_id: root.id(),
                 children_pid_namespace: Some(PidNamespaceOptions::default()),
+                new_segment_namespace: true,
                 copy_host_names: true,
             }),
             Err(BrokerError::ResourceExhausted),
@@ -4498,6 +4513,7 @@ mod tests {
         root.create_namespaces(CreateNamespacesRequest {
             process_id: child_id,
             children_pid_namespace: None,
+            new_segment_namespace: false,
             copy_host_names: true,
         })
         .unwrap();

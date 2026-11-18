@@ -473,7 +473,7 @@ enum WaitTarget<Platform: ShimPlatform> {
 }
 
 /// Keeps the other threads of a process paused for `fork` until dropped.
-struct ForkPause<'a, Platform: ShimPlatform> {
+pub(super) struct ForkPause<'a, Platform: ShimPlatform> {
     process: &'a ProcessState<Platform>,
 }
 
@@ -1059,6 +1059,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .create_namespaces(CreateNamespacesRequest {
                     process_id: child.identity().process_id,
                     children_pid_namespace: None,
+                    new_segment_namespace: false,
                     copy_host_names: true,
                 })?;
         }
@@ -1126,7 +1127,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         self.check_admin()?;
         let new_pid = flags.contains(CloneFlags::NEWPID);
-        let copy_host_names = flags.contains(CloneFlags::NEWUTS);
         if new_pid {
             // A `vfork` child makes its requests as its parent, whose children this would change.
             if self.vfork.borrow().is_some() {
@@ -1140,32 +1140,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return Err(Errno::EINVAL);
             }
         }
-        if new_pid || copy_host_names {
-            // One request, so that a failure leaves every namespace unchanged.
-            match self
-                .global
-                .litebox
-                .create_namespaces(CreateNamespacesRequest {
-                    process_id: ProcessId(self.own_pid_for_requests().cast_unsigned()),
-                    children_pid_namespace: new_pid.then_some(PidNamespaceOptions::INIT),
-                    copy_host_names,
-                }) {
-                Ok(()) => {}
-                // If LiteBox can't change host names, they are fixed, so there is nothing to copy.
-                Err(ProcessError::Unavailable) if !new_pid => {}
-                // The namespace limits, like Linux's nesting and count limits.
-                Err(ProcessError::ResourceExhausted) => return Err(Errno::ENOSPC),
-                Err(error) => return Err(error.into()),
-            }
+        match self
+            .global
+            .litebox
+            .create_namespaces(CreateNamespacesRequest {
+                process_id: ProcessId(self.own_pid_for_requests().cast_unsigned()),
+                children_pid_namespace: new_pid.then_some(PidNamespaceOptions::INIT),
+                new_segment_namespace: flags.contains(CloneFlags::NEWIPC),
+                copy_host_names: flags.contains(CloneFlags::NEWUTS),
+            }) {
+            Ok(()) => {}
+            // Without the services, host names are fixed and there are no segments.
+            Err(ProcessError::Unavailable) if !new_pid => return Ok(0),
+            // The namespace limits, like Linux's nesting and count limits.
+            Err(ProcessError::ResourceExhausted) => return Err(Errno::ENOSPC),
+            Err(error) => return Err(error.into()),
         }
         if new_pid {
             self.thread
                 .process
                 .pid_namespace_unshared
                 .store(true, Ordering::Relaxed);
-        }
-        if flags.contains(CloneFlags::NEWIPC) {
-            self.new_segment_namespace(ProcessId(self.own_pid_for_requests().cast_unsigned()))?;
         }
         Ok(0)
     }
@@ -1267,7 +1262,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Fails with `ERESTARTNOINTR` if a signal or an exit interrupts the wait for them to pause,
     /// so `fork` restarts once the signal is handled, as Linux's does if a signal arrives while
     /// it duplicates the process.
-    fn pause_other_threads(&self) -> Result<ForkPause<'_, Platform>, Errno> {
+    pub(super) fn pause_other_threads(&self) -> Result<ForkPause<'_, Platform>, Errno> {
         let process = &self.thread.process;
         loop {
             let mut inner = process.inner.lock();
@@ -4342,6 +4337,31 @@ mod tests {
         BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, ThreadRequest,
     };
     use litebox_broker_transport::channel::LocalCallChannel;
+
+    #[test]
+    fn denied_segment_namespace_keeps_pid_namespace_unchanged() {
+        use crate::syscalls::tests::TestPlatform;
+        use litebox::platform::ThreadProvider;
+        use litebox_common_linux::{CloneFlags, errno::Errno};
+
+        let platform = crate::syscalls::tests::test_platform();
+        TestPlatform::run_test_thread(|| {
+            // The test task is guest root, but the broker's segment principal is not.
+            let (litebox, process_id) = crate::syscalls::test_broker::litebox(platform);
+            let shim =
+                crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id).build();
+            let task = shim.0.new_test_task();
+            assert_eq!(
+                task.sys_unshare(CloneFlags::NEWPID | CloneFlags::NEWIPC | CloneFlags::NEWUTS),
+                Err(Errno::EPERM),
+            );
+            assert!(!task.pid_namespace_unshared());
+            // A second PID unshare would be rejected by the broker if it had
+            // changed its children namespace despite the error.
+            assert_eq!(task.sys_unshare(CloneFlags::NEWPID), Ok(0));
+            assert!(task.pid_namespace_unshared());
+        });
+    }
 
     struct ForkRecordingChannel {
         inner: InProcessBrokerChannel,

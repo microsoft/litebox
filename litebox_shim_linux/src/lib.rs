@@ -475,11 +475,11 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // The hook must not keep this LiteBox alive with the memory manager; once it is gone, the
         // broker has released all of this process's attachments.
         let segment_client = Arc::downgrade(&litebox);
-        self.memory_manager.set_sysv_release(move |id| {
+        self.memory_manager.set_sysv_adjust(move |id, delta| {
             if let Some(litebox) = segment_client.upgrade()
-                && litebox.detach_segment(id).is_err()
+                && let Err(error) = litebox.adjust_segment_attachments(id, delta)
             {
-                litebox_util_log::warn!(id; "failed to release SysV attachment");
+                litebox_util_log::warn!(id, delta, error:?; "failed to update shared segment attachment count");
             }
         });
         let global = Arc::new(GlobalState {
@@ -1075,6 +1075,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Setsid
                     | SyscallRequest::Getsid { .. }
                     | SyscallRequest::Unshare { .. }
+                    // The segment handlers reject these without touching parent state.
+                    | SyscallRequest::Shmget { .. }
+                    | SyscallRequest::Shmat { .. }
+                    | SyscallRequest::Shmdt { .. }
+                    | SyscallRequest::Shmctl { .. }
                     | SyscallRequest::Uname { .. }
                     | SyscallRequest::Sethostname { .. }
                     | SyscallRequest::Setdomainname { .. }
