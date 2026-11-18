@@ -551,9 +551,9 @@ jobs:
           $prefix = "windows-oci-rootfs-v1-${{ runner.os }}-${{ runner.arch }}-${env:ImageOS}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}-"
           "prefix=$prefix" >> $env:GITHUB_OUTPUT
           "key=${prefix}${{ hashFiles('litebox_packager/**', 'litebox_syscall_rewriter/**', 'litebox_trampoline/**', 'litebox_common_windows/**', 'litebox_runner_linux_on_windows_userland/tests/**') }}" >> $env:GITHUB_OUTPUT
-      - name: Clear Windows test fixtures and sysroot before restore
+      - name: Clear Windows test fixtures before restore
         run: |
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/tmp/windows_python_rewriter, target/tmp/windows_node_rewriter, target/linux-sysroot
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/tmp/windows_python_rewriter, target/tmp/windows_node_rewriter
       - name: Restore Windows OCI test fixtures
         id: fixture-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -563,17 +563,24 @@ jobs:
             target/tmp/windows_node_rewriter
           key: ${{ steps.fixture-key.outputs.key }}
           restore-keys: ${{ steps.fixture-key.outputs.prefix }}
-      - name: Restore Linux sysroot for the Windows loader tests
-        id: sysroot-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target/linux-sysroot
-          key: linux-sysroot-${{ runner.os }}-${{ hashFiles('dev_tools/setup_windows_linux_sysroot.sh') }}
-      - name: Install Linux sysroot for the Windows loader tests
-        shell: bash
+      - name: Set up WSL for the Windows loader tests
+        timeout-minutes: 10
         run: |
-          PATH="/c/Program Files/LLVM/bin:$PATH" bash dev_tools/setup_windows_linux_sysroot.sh
-          echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+          $distro = 'LiteBox-Ubuntu'
+          $rootfs = Join-Path $env:RUNNER_TEMP 'ubuntu-base-24.04.4-base-amd64.tar.gz'
+          curl.exe --fail --location --retry 3 --output $rootfs `
+            'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.4/release/ubuntu-base-24.04.4-base-amd64.tar.gz'
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download the Ubuntu root filesystem' }
+          if ((Get-FileHash -Algorithm SHA256 $rootfs).Hash -ne 'c1e67ef7b17a6300e136118bd1dc04725009cb376c1aad10abcf8cd453628d58') {
+            throw 'Ubuntu root filesystem checksum mismatch'
+          }
+          wsl.exe --import $distro (Join-Path $env:RUNNER_TEMP $distro) $rootfs --version 2
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to import the Ubuntu WSL distribution' }
+          wsl.exe --distribution $distro --user root --exec apt-get update
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to update packages in WSL' }
+          wsl.exe --distribution $distro --user root --exec env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc libc6-dev
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to install GCC and glibc development files in WSL' }
+          "LITEBOX_WSL_DISTRO=$distro" >> $env:GITHUB_ENV
       - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
       - run: |
           cargo test --locked --verbose --doc ($env:WINDOWS_CRATES -split ' ')
@@ -594,21 +601,11 @@ jobs:
             target/tmp/windows_python_rewriter
             target/tmp/windows_node_rewriter
           key: ${{ steps.fixture-key.outputs.key }}
-      - name: Save Linux sysroot for the Windows loader tests
-        if: >-
-          success() && steps.sysroot-cache.outputs.cache-hit != 'true' &&
-          github.event_name == 'push' &&
-          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ulitebox')
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target/linux-sysroot
-          key: ${{ steps.sysroot-cache.outputs.cache-primary-key }}
-      - name: Remove Windows test fixtures and sysroot
+      - name: Remove Windows test fixtures
         if: always()
-        # Fixtures and the sysroot are cached separately above; keep them out of rust-cache,
-        # whose cleanup would otherwise save the sysroot without its files.
+        # Fixtures are cached separately above; keep them out of rust-cache.
         run: |
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/tmp/windows_python_rewriter, target/tmp/windows_node_rewriter, target/linux-sysroot
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/tmp/windows_python_rewriter, target/tmp/windows_node_rewriter
 
   build_and_test_snp:
     name: Build and Test SNP

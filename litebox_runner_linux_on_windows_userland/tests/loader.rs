@@ -3,11 +3,10 @@
 
 //! Tests for the Windows userland runner.
 //!
-//! To run locally, put LLVM's `bin` directory on PATH and run
-//! `bash dev_tools/setup_windows_linux_sysroot.sh` from the repository root.
-//! To use an existing Debian x86-64 sysroot with `libgcc-12-dev` instead,
-//! set `LITEBOX_LINUX_SYSROOT`.
-//! Each test cross-compiles its own guests; neither Docker nor WSL is required.
+//! The C guests build in an x86-64 WSL distribution with GCC and glibc
+//! development files (on Ubuntu: `sudo apt-get install gcc libc6-dev`).
+//! Set `LITEBOX_WSL_DISTRO` to override the default WSL distribution.
+//! The tests run the resulting guests through the native Windows runner.
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
@@ -15,7 +14,7 @@
 fn test_static_linked_prog_with_rewriter() {
     println!("Running statically linked binary + rewriter test...");
     let prog_name = "hello_world_static";
-    let path = build_c_guest(prog_name, "static_rewriter", &["-static"]);
+    let path = build_c_guest(prog_name, "static_rewriter", GuestLinkage::Static);
     let executable_data =
         litebox_syscall_rewriter::rewrite_binary(&std::fs::read(&path).unwrap(), None).unwrap();
 
@@ -27,11 +26,11 @@ fn test_static_linked_prog_with_rewriter() {
 fn test_programs_with_windows_broker() {
     let (broker, runner) = build_windows_broker();
     for name in ["hello_world_static", "pipe_broker"] {
-        let guest = build_c_guest(name, "broker", &["-static"]);
+        let guest = build_c_guest(name, "broker", GuestLinkage::Static);
         run_prog_with_windows_broker(&broker, &runner, &guest, &[], None);
     }
     for name in ["hello_world_dyn", "hello_thread"] {
-        let guest = build_c_guest(name, "broker", &["-fPIE", "-pie"]);
+        let guest = build_c_guest(name, "broker", GuestLinkage::Pie);
         run_prog_with_windows_broker(&broker, &runner, &guest, &DYNAMIC_LIBS, None);
     }
 }
@@ -777,7 +776,11 @@ fn test_shared_file_mapping_with_windows_broker() {
     let output = broker_command(
         &broker,
         &runner,
-        &[build_c_guest("shared_file_mapping", "broker", &["-static"])],
+        &[build_c_guest(
+            "shared_file_mapping",
+            "broker",
+            GuestLinkage::Static,
+        )],
         &["--unstable", "--allow-process-duplication"],
         &["/bin/shared_file_mapping.hooked"],
     )
@@ -811,64 +814,54 @@ const DYNAMIC_LIBS: [(&str, &str); 2] = [
     ("ld-linux-x86-64.so.2", "/lib64"),
 ];
 
-fn linux_sysroot() -> std::path::PathBuf {
-    let root = std::env::var_os("LITEBOX_LINUX_SYSROOT").map_or_else(
-        || std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/linux-sysroot"),
-        std::path::PathBuf::from,
-    );
-    assert!(
-        root.is_dir(),
-        "Linux sysroot not found at {}; run bash dev_tools/setup_windows_linux_sysroot.sh or set LITEBOX_LINUX_SYSROOT",
-        root.display()
-    );
-    root
+enum GuestLinkage {
+    Static,
+    Pie,
 }
 
-/// The directory of the sysroot's shared libraries, such as those in [`DYNAMIC_LIBS`].
-fn linux_sysroot_libs() -> std::path::PathBuf {
-    linux_sysroot().join("lib/x86_64-linux-gnu")
-}
-
-/// Cross-compiles the guest `name` with `flags` into `CARGO_TARGET_TMPDIR/<suite>/<name>`.
+/// Builds the guest `name` in WSL and copies it and any runtime libraries to
+/// `CARGO_TARGET_TMPDIR/wsl-guests/<suite>/<name>/`.
 ///
 /// Tests that may run concurrently must not build the same `name` in the same `suite`.
-fn build_c_guest(name: &str, suite: &str, flags: &[&str]) -> std::path::PathBuf {
-    let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+fn build_c_guest(name: &str, suite: &str, linkage: GuestLinkage) -> std::path::PathBuf {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
     let source = match name {
-        "hello_world_static" | "hello_world_dyn" => tests.join("hello_world.c"),
-        "hello_thread" => tests.join("hello_thread.c"),
-        _ => tests.join(format!(
-            "../../litebox_runner_linux_userland/tests/{name}.c"
-        )),
+        "hello_world_static" | "hello_world_dyn" => {
+            "litebox_runner_linux_on_windows_userland/tests/hello_world.c".to_owned()
+        }
+        "hello_thread" => {
+            "litebox_runner_linux_on_windows_userland/tests/hello_thread.c".to_owned()
+        }
+        _ => format!("litebox_runner_linux_userland/tests/{name}.c"),
     };
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(suite);
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("wsl-guests")
+        .join(suite)
+        .join(name);
     std::fs::create_dir_all(&dir).unwrap();
     let guest = dir.join(name);
-    let root = linux_sysroot();
-    let gcc = root.join("usr/lib/gcc/x86_64-linux-gnu/12");
-    assert!(
-        gcc.join("libgcc.a").is_file(),
-        "Linux sysroot is missing libgcc-12-dev at {}",
-        gcc.display()
-    );
-    let mut clang = std::process::Command::new("clang");
-    clang
-        .args([
-            "--target=x86_64-linux-gnu",
-            "-fuse-ld=lld",
-            "-pthread",
-            "-static-libgcc",
-        ])
-        .arg(format!("--sysroot={}", root.display()))
-        .arg(format!("--gcc-install-dir={}", gcc.display()));
-    let status = clang
-        .args(flags)
+    let mut wsl = std::process::Command::new("wsl.exe");
+    if let Some(distro) = std::env::var_os("LITEBOX_WSL_DISTRO") {
+        wsl.arg("--distribution").arg(distro);
+    }
+    let status = wsl
+        .arg("--cd")
+        .arg(repo)
+        .args(["--exec", "bash", "dev_tools/build_windows_linux_guest.sh"])
         .arg(source)
-        .arg("-o")
         .arg(&guest)
+        .arg(match linkage {
+            GuestLinkage::Static => "static",
+            GuestLinkage::Pie => "pie",
+        })
         .status()
-        .expect("failed to run clang");
-    assert!(status.success(), "cross-compiling {name} failed: {status}");
+        .expect("failed to start wsl.exe; install WSL and an x86-64 Linux distribution with GCC");
+    assert!(
+        status.success(),
+        "building {name} in WSL failed: {status}; check the WSL distribution, GCC and glibc development files"
+    );
     guest
 }
 
@@ -959,11 +952,10 @@ fn run_prog_with_windows_broker(
     } else {
         append_rewritten_file(&mut tar, guest, &exec_path);
     }
-    let sysroot_libs = linux_sysroot_libs();
     for (file, prefix) in libs {
         append_rewritten_file(
             &mut tar,
-            &sysroot_libs.join(file),
+            &guest.parent().unwrap().join(file),
             &format!("{}/{file}", prefix.trim_start_matches('/')),
         );
     }
@@ -1003,7 +995,7 @@ fn run_progs_with_process_duplication(
     )
 }
 
-/// Cross-compiles `programs` statically, then runs the first with `arguments` under a broker
+/// Builds `programs` statically in WSL, then runs the first with `arguments` under a broker
 /// started with `broker_arguments`, and returns its standard output. Each program is at
 /// `/bin/<program>.hooked`.
 fn run_progs_with_broker_arguments(
@@ -1015,7 +1007,7 @@ fn run_progs_with_broker_arguments(
 ) -> String {
     let programs: Vec<_> = programs
         .iter()
-        .map(|program| build_c_guest(program, "broker", &["-static"]))
+        .map(|program| build_c_guest(program, "broker", GuestLinkage::Static))
         .collect();
     let output = broker_command(broker, runner, &programs, broker_arguments, arguments)
         .output()
@@ -1128,7 +1120,7 @@ fn run_dynamic_linked_prog_with_rewriter(
     let out_path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("dynamic_rewriter_{prog_name}"));
     std::fs::create_dir_all(&out_path).unwrap();
-    let path = build_c_guest(prog_name, "dynamic_rewriter", &["-fPIE", "-pie"]);
+    let path = build_c_guest(prog_name, "dynamic_rewriter", GuestLinkage::Pie);
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
     // Create tar file containing all dependencies
@@ -1141,9 +1133,8 @@ fn run_dynamic_linked_prog_with_rewriter(
     std::fs::create_dir_all(tar_src_path.join("out")).unwrap();
 
     // Rewrite all libraries that are required for initialization
-    let sysroot_libs = linux_sysroot_libs();
     for (file, prefix) in libs_to_rewrite {
-        let src = sysroot_libs.join(file);
+        let src = path.parent().unwrap().join(file);
         let dst_dir = tar_src_path.join(prefix.trim_start_matches('/'));
         let dst = dst_dir.join(file);
         std::fs::create_dir_all(&dst_dir).unwrap();
