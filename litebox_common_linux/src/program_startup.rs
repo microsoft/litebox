@@ -13,7 +13,7 @@ use core::ops::Range;
 use litebox::pipes::HalfPipeType;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
-use litebox_broker_protocol::socket::SocketType;
+use litebox_broker_protocol::socket::{IpProtocol, SocketType};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::GuestVectorState;
@@ -174,11 +174,9 @@ pub enum InheritedFdKind {
     Epoll,
     /// An IPv4 socket.
     InetSocket {
-        /// Stream (TCP) or datagram (UDP).
-        socket_type: SocketType,
+        /// TCP, UDP, or ICMP echo.
+        protocol: IpProtocol,
     },
-    /// An IPv4 ICMP echo datagram socket.
-    IcmpEchoSocket,
     /// A vsock stream socket.
     VsockSocket,
     /// A pidfd.
@@ -673,8 +671,7 @@ impl InheritedFd {
                 | InheritedFdKind::Pidfd => 0,
                 InheritedFdKind::Pipe { .. }
                 | InheritedFdKind::UnixSocket { .. }
-                | InheritedFdKind::InetSocket { .. }
-                | InheritedFdKind::IcmpEchoSocket => size_of::<u8>(),
+                | InheritedFdKind::InetSocket { .. } => size_of::<u8>(),
             }
     }
 
@@ -702,16 +699,16 @@ impl InheritedFd {
             InheritedFdKind::Eventfd => output.push(EVENTFD_TAG),
             InheritedFdKind::Timerfd => output.push(TIMERFD_TAG),
             InheritedFdKind::Epoll => output.push(EPOLL_TAG),
-            InheritedFdKind::InetSocket { socket_type } => {
+            InheritedFdKind::InetSocket { protocol } => {
                 output.push(INET_SOCKET_TAG);
-                output.push(match socket_type {
-                    SocketType::Stream => 0,
-                    SocketType::Datagram => 1,
-                    _ => unreachable!("IPv4 sockets are streams or datagrams"),
+                output.push(match protocol {
+                    IpProtocol::Tcp => 0,
+                    IpProtocol::Udp => 1,
+                    IpProtocol::IcmpEcho => 2,
+                    _ => unreachable!("LiteBox creates no other IPv4 protocol"),
                 });
             }
             InheritedFdKind::VsockSocket => output.push(VSOCK_SOCKET_TAG),
-            InheritedFdKind::IcmpEchoSocket => output.extend_from_slice(&[INET_SOCKET_TAG, 2]),
             InheritedFdKind::Pidfd => output.push(PIDFD_TAG),
         }
     }
@@ -739,15 +736,13 @@ impl InheritedFd {
             EVENTFD_TAG => InheritedFdKind::Eventfd,
             TIMERFD_TAG => InheritedFdKind::Timerfd,
             EPOLL_TAG => InheritedFdKind::Epoll,
-            INET_SOCKET_TAG => match read_u8(input)? {
-                0 => InheritedFdKind::InetSocket {
-                    socket_type: SocketType::Stream,
+            INET_SOCKET_TAG => InheritedFdKind::InetSocket {
+                protocol: match read_u8(input)? {
+                    0 => IpProtocol::Tcp,
+                    1 => IpProtocol::Udp,
+                    2 => IpProtocol::IcmpEcho,
+                    _ => return Err(LinuxProgramStartupError::Malformed),
                 },
-                1 => InheritedFdKind::InetSocket {
-                    socket_type: SocketType::Datagram,
-                },
-                2 => InheritedFdKind::IcmpEchoSocket,
-                _ => return Err(LinuxProgramStartupError::Malformed),
             },
             VSOCK_SOCKET_TAG => InheritedFdKind::VsockSocket,
             PIDFD_TAG => InheritedFdKind::Pidfd,
@@ -1166,7 +1161,7 @@ mod tests {
                     fd: 11,
                     handle: ObjectHandle(14),
                     kind: InheritedFdKind::InetSocket {
-                        socket_type: SocketType::Stream,
+                        protocol: IpProtocol::Tcp,
                     },
                 },
                 InheritedFd {
@@ -1189,7 +1184,9 @@ mod tests {
                 InheritedFd {
                     fd: 15,
                     handle: ObjectHandle(18),
-                    kind: InheritedFdKind::IcmpEchoSocket,
+                    kind: InheritedFdKind::InetSocket {
+                        protocol: IpProtocol::IcmpEcho,
+                    },
                 },
             ],
         };
@@ -1366,7 +1363,7 @@ mod tests {
                         fd: 8,
                         handle: ObjectHandle(13),
                         kind: InheritedFdKind::InetSocket {
-                            socket_type: SocketType::Datagram,
+                            protocol: IpProtocol::Udp,
                         },
                     },
                     close_on_exec: false,

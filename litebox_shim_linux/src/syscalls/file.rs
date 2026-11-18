@@ -550,10 +550,10 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
-                InheritedFdKind::InetSocket { .. } | InheritedFdKind::IcmpEchoSocket => {
+                InheritedFdKind::InetSocket { protocol } => {
                     self.install_inherited_fd(litebox, first_fd, raw_fd, || {
                         global
-                            .adopt_inherited_inet_socket(handle, inherited.kind)
+                            .adopt_inherited_inet_socket(handle, protocol)
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
@@ -967,14 +967,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         Ok(alloc::sync::Arc::clone(socket.inet_socket()))
                     })?;
                     (
-                        if socket.protocol()
-                            == litebox_broker_protocol::socket::IpProtocol::IcmpEcho
-                        {
-                            InheritedFdKind::IcmpEchoSocket
-                        } else {
-                            InheritedFdKind::InetSocket {
-                                socket_type: socket.socket_type(),
-                            }
+                        InheritedFdKind::InetSocket {
+                            protocol: socket.protocol(),
                         },
                         InheritableFd::InetSocket(socket),
                     )

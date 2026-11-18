@@ -85,6 +85,14 @@ wire_enum! {
 }
 
 impl IpProtocol {
+    /// The socket type that carries this protocol.
+    pub const fn socket_type(self) -> SocketType {
+        match self {
+            Self::Tcp => SocketType::Stream,
+            Self::Udp | Self::IcmpEcho => SocketType::Datagram,
+        }
+    }
+
     /// Maximum IPv4 datagram message size, or `None` for a stream.
     pub const fn max_datagram_size(self) -> Option<u32> {
         match self {
@@ -134,7 +142,8 @@ wire_enum! {
         Broadcast,
         /// Whether Nagle's algorithm is disabled, which only TCP sockets support.
         NoDelay,
-        /// Whether a datagram socket requested extended error reporting.
+        /// Whether a datagram socket requested extended error reporting. The
+        /// broker records the request; it supplies no extended error queue.
         ReceiveExtendedErrors,
     }
 }
@@ -157,8 +166,7 @@ wire_enum! {
         Broadcast(bool),
         /// [`SocketOptionName::NoDelay`].
         NoDelay(bool),
-        /// [`SocketOptionName::ReceiveExtendedErrors`]. Records the request;
-        /// it does not imply the transport supplies an extended error queue.
+        /// [`SocketOptionName::ReceiveExtendedErrors`].
         ReceiveExtendedErrors(bool),
     }
 }

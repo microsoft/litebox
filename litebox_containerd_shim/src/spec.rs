@@ -91,7 +91,6 @@ pub struct Bind {
 pub struct Egress {
     pub tcp: Vec<Destination>,
     pub udp: Vec<Destination>,
-    /// IPv4 networks allowed to receive ICMP echo requests (no ports).
     pub icmp_echo: Vec<Cidr>,
 }
 

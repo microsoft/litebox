@@ -316,7 +316,7 @@ impl Udp {
     ) -> BrokerResult<SocketOutcome<usize>> {
         let handle = self.external.ok_or(BrokerError::Internal)?;
         if data.len() > MAX_EXTERNAL_DATAGRAM {
-            return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+            return Ok(SocketOutcome::Failed(SocketError::MessageTooLong));
         }
         // smoltcp cannot take back a datagram it has queued, so the payload is
         // staged first: one whose copy faults is not sent.

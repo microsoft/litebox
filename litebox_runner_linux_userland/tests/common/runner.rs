@@ -462,18 +462,18 @@ impl Runner {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
+        let group = -libc::pid_t::try_from(pid).unwrap();
         // SAFETY: the unreaped child leads our private process group.
-        unsafe { libc::kill(-libc::pid_t::try_from(pid).unwrap(), libc::SIGKILL) };
+        unsafe { libc::kill(group, libc::SIGKILL) };
         let status = child.wait().unwrap();
-        result.unwrap();
         stdout.rewind().unwrap();
         let mut bytes = Vec::new();
         stdout.read_to_end(&mut bytes).unwrap();
-        assert!(
-            status.success(),
-            "{status}: {}",
-            String::from_utf8_lossy(&bytes)
-        );
+        let output = String::from_utf8_lossy(&bytes);
+        if let Err(error) = result {
+            panic!("{error}; output so far: {output}");
+        }
+        assert!(status.success(), "{status}: {output}");
         bytes
     }
 

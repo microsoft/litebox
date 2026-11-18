@@ -113,9 +113,7 @@ fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 /// never wait for network readiness. One event thread turns the host's socket
 /// events into cached readiness.
 ///
-/// IPv4 echo datagrams answer guest-network addresses in the provider itself.
-/// For external peers the Linux provider requires the host to permit ping
-/// sockets. Other hosts support virtual echo only; none uses raw sockets.
+/// ICMP echo sockets are described in the `echo` module.
 pub struct UserlandSocketProvider {
     core: Arc<ProviderCore>,
 }
@@ -873,7 +871,7 @@ impl UserlandSocket {
         };
         socket.drain_inbox()?;
         if socket.kind() == SocketKind::Echo {
-            socket.refresh_echo();
+            socket.refresh_echo()?;
             return Ok(Dispatch::Applied);
         }
         let mut flags = flags;
@@ -1093,6 +1091,17 @@ enum ReceiveFromOutcome {
 }
 
 impl ReceiveFromOutcome {
+    /// Copies as much of `datagram` from `source` as fits into `output`.
+    fn copy_out(output: RawParts<'_>, datagram: &[u8], source_address: SocketAddrV4) -> Self {
+        let received = output.len().min(datagram.len());
+        output.copy_from_slice(&datagram[..received]);
+        Self::Received {
+            received,
+            datagram_length: datagram.len(),
+            source_address,
+        }
+    }
+
     /// Returns how many bytes the receive copied into its output.
     fn received(&self) -> usize {
         match self {
@@ -1248,7 +1257,7 @@ impl<'a> SocketEntry<'a> {
             return Err(BrokerError::Internal);
         }
         if kind == SocketKind::Echo {
-            return Ok(self.bind_echo(binding));
+            return self.bind_echo(binding);
         }
         if kind == SocketKind::Udp {
             return self.bind_udp_socket(binding, already_bound);
@@ -1297,7 +1306,7 @@ impl<'a> SocketEntry<'a> {
             return self.shutdown_tcp_socket(mode);
         }
         if self.kind() == SocketKind::Echo {
-            return Ok(self.shutdown_echo(mode));
+            return self.shutdown_echo(mode);
         }
         let (shut_read, shut_write) = match mode {
             ShutdownMode::Read => (true, false),

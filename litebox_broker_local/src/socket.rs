@@ -17,7 +17,7 @@ use litebox_broker_protocol::socket::{
     ReceiveFromSocketResponse, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags,
     SendSocketRequest, SendToSocketRequest, SetSocketErrorRequest, SetSocketOptionRequest,
     ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketOptionName,
-    SocketOptionValue, SocketType, TakeSocketErrorRequest,
+    SocketOptionValue, TakeSocketErrorRequest,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -25,47 +25,21 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Creates a broker-owned IPv4 TCP stream socket with the status flags
-    /// `flags`.
+    /// Creates a broker-owned IPv4 socket for `protocol`, on the socket type
+    /// that carries it, with the status flags `flags`. An ICMP echo socket is
+    /// echo-only, not a raw ICMP socket.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for a different operation.
-    pub fn create_tcp_socket(&self, flags: FileOpenFlags) -> Result<ObjectHandle, Channel::Error> {
-        self.create_ipv4_socket(SocketType::Stream, IpProtocol::Tcp, flags)
-    }
-
-    /// Creates a broker-owned IPv4 UDP datagram socket with the status flags
-    /// `flags`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a response for a different operation.
-    pub fn create_udp_socket(&self, flags: FileOpenFlags) -> Result<ObjectHandle, Channel::Error> {
-        self.create_ipv4_socket(SocketType::Datagram, IpProtocol::Udp, flags)
-    }
-
-    /// Creates an IPv4 echo-only datagram socket (not a raw ICMP socket).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a response for a different operation.
-    pub fn create_icmp_echo_socket(
+    pub fn create_inet_socket(
         &self,
-        flags: FileOpenFlags,
-    ) -> Result<ObjectHandle, Channel::Error> {
-        self.create_ipv4_socket(SocketType::Datagram, IpProtocol::IcmpEcho, flags)
-    }
-
-    fn create_ipv4_socket(
-        &self,
-        socket_type: SocketType,
         protocol: IpProtocol,
         flags: FileOpenFlags,
     ) -> Result<ObjectHandle, Channel::Error> {
         let response = self.request_socket(SocketRequest::Create(CreateSocketRequest {
             address_family: AddressFamily::Ipv4,
-            socket_type,
+            socket_type: protocol.socket_type(),
             protocol,
             flags,
         }))?;
@@ -111,6 +85,7 @@ mod tests {
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferSlotIndex,
     };
+    use litebox_broker_protocol::socket::SocketType;
     use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -129,7 +104,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .create_icmp_echo_socket(FileOpenFlags::NONBLOCKING)
+                .create_inet_socket(IpProtocol::IcmpEcho, FileOpenFlags::NONBLOCKING)
                 .unwrap(),
             handle
         );
@@ -166,7 +141,9 @@ mod tests {
         let local = test_broker_local(channel, memory.clone());
 
         assert_eq!(
-            local.create_udp_socket(FileOpenFlags::NONE).unwrap(),
+            local
+                .create_inet_socket(IpProtocol::Udp, FileOpenFlags::NONE)
+                .unwrap(),
             handle
         );
         assert_eq!(
@@ -606,11 +583,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }))? {
             SocketResponse::SendTo(response) => {
                 let sent = response.sent as usize;
-                assert_eq!(sent, data.len(), "broker returned partial UDP send");
+                assert_eq!(sent, data.len(), "broker returned partial datagram send");
                 Ok(Ok(sent))
             }
             SocketResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected UDP send response: {response:?}"),
+            response => panic!("broker returned unexpected datagram send response: {response:?}"),
         }
     }
 
@@ -671,11 +648,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             SocketResponse::ReceiveFrom(response) => {
                 assert!(
                     response.received <= buffer.length(),
-                    "broker returned oversized UDP receive"
+                    "broker returned oversized datagram receive"
                 );
                 assert!(
                     response.received <= response.datagram_length,
-                    "broker returned inconsistent UDP receive lengths"
+                    "broker returned inconsistent datagram receive lengths"
                 );
                 assert!(
                     response.datagram_length <= MAX_DATAGRAM_TRANSFER_SIZE,
@@ -686,7 +663,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 Ok(Ok(response))
             }
             SocketResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected UDP receive response: {response:?}"),
+            response => {
+                panic!("broker returned unexpected datagram receive response: {response:?}")
+            }
         }
     }
 

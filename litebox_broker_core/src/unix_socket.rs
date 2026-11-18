@@ -465,7 +465,7 @@ pub fn set_option(
     value: SocketOptionValue,
 ) -> Result<()> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
-    lease.socket.state.lock().options.set(value)
+    lease.socket.state.lock().options.set(value, false)
 }
 
 /// Returns one stored option of a Unix socket.
@@ -478,7 +478,7 @@ pub fn get_option(
         process
             .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?,
     )?;
-    lease.socket.state.lock().options.get(name)
+    lease.socket.state.lock().options.get(name, false)
 }
 
 /// Returns the rights and status flags of a new socket with the status flags

@@ -801,7 +801,8 @@ fn external_udp_goes_through_the_gateway() {
     assert_eq!(datagram.data, b"answer");
     assert_eq!(datagram.source_address, host_address);
 
-    // Externally, datagrams must fit a frame.
+    // Externally, datagrams must fit a frame; Linux reports a datagram
+    // over the path MTU as EMSGSIZE.
     assert_eq!(
         core_socket::send_to(
             &process,
@@ -810,7 +811,7 @@ fn external_udp_goes_through_the_gateway() {
             SendFlags::NONE,
             Some(host_address)
         ),
-        Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
+        Ok(SocketOutcome::Failed(SocketError::MessageTooLong))
     );
 }
 

@@ -198,10 +198,10 @@ impl<Platform: ShimPlatform> VsockSocket<Platform> {
     pub(super) fn new(
         litebox: &litebox::LiteBox<Platform>,
         ty: SockType,
-        protocol: u8,
+        protocol: i32,
         flags: SockFlags,
     ) -> Result<Self, Errno> {
-        if protocol != 0 && protocol != PF_VSOCK {
+        if protocol != 0 && protocol != i32::from(PF_VSOCK) {
             return Err(Errno::EPROTONOSUPPORT);
         }
         let SockType::Stream = ty else {

@@ -177,7 +177,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     pub(super) fn new(
         litebox: &litebox::LiteBox<Platform>,
         sock_type: SockType,
-        protocol: u8,
+        protocol: i32,
         flags: SockFlags,
     ) -> Result<Self, Errno> {
         let socket =
@@ -190,7 +190,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     pub(super) fn new_connected_pair(
         litebox: &litebox::LiteBox<Platform>,
         sock_type: SockType,
-        protocol: u8,
+        protocol: i32,
         flags: SockFlags,
     ) -> Result<(Self, Self), Errno> {
         let (first, second) = litebox
@@ -484,8 +484,11 @@ impl<Platform: ShimPlatform> IOPollable for UnixSocket<Platform> {
 }
 
 /// The socket type of a Unix socket of type `sock_type` for `protocol`.
-fn socket_type(sock_type: SockType, protocol: u8) -> Result<SocketType, Errno> {
-    UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
+fn socket_type(sock_type: SockType, protocol: i32) -> Result<SocketType, Errno> {
+    u8::try_from(protocol)
+        .ok()
+        .and_then(|protocol| UnixProtocol::try_from(protocol).ok())
+        .ok_or(Errno::EPROTONOSUPPORT)?;
     match sock_type {
         SockType::Stream => Ok(SocketType::Stream),
         SockType::Datagram => Ok(SocketType::Datagram),

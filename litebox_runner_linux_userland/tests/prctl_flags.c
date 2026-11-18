@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Checks the dumpable and no_new_privs flags of `prctl`: their defaults, invalid arguments, and
-// how threads, fork, vfork and execve carry them. Like Linux, dumpable belongs to the process and
-// a vfork child shares its parent's, while no_new_privs belongs to each thread and can't be
-// cleared. Usage: prctl_flags [exec-child NO_NEW_PRIVS]; an exec-child exits 0 if it is dumpable
-// and its no_new_privs is NO_NEW_PRIVS.
+// Checks the dumpable, no_new_privs, and keepcaps flags of `prctl`: their defaults, invalid
+// arguments, and how threads, fork, vfork and execve carry them. Like Linux, dumpable belongs to
+// the process and a vfork child shares its parent's, while no_new_privs belongs to each thread and
+// can't be cleared, and execve clears keepcaps. Usage: prctl_flags [exec-child NO_NEW_PRIVS]; an
+// exec-child exits 0 if it is dumpable, its no_new_privs is NO_NEW_PRIVS, and keepcaps is clear.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -122,12 +122,13 @@ static void threads_share_dumpable(void) {
 }
 
 static int vfork_child_sets_flags(void *arg) {
-    // A launcher may drop credentials before exec. Whether or not it succeeds,
-    // that request must not terminate the waiting parent.
+    // A launcher may drop credentials before exec. Keeping its own uid and dropping every
+    // capability succeed, as on Linux, without terminating the waiting parent.
     struct __user_cap_header_struct caps = {.version = _LINUX_CAPABILITY_VERSION_3};
     struct __user_cap_data_struct empty[2] = {0};
-    syscall(SYS_setuid, *(uid_t *)arg);
-    syscall(SYS_capset, &caps, empty);
+    if (syscall(SYS_setuid, *(uid_t *)arg) != 0 || syscall(SYS_capset, &caps, empty) != 0) {
+        _exit(3);
+    }
     if (dumpable() != 0 || no_new_privs() != 0) {
         _exit(1);
     }
@@ -142,6 +143,7 @@ static int vfork_child_sets_flags(void *arg) {
 static void vfork_child_shares_only_dumpable(void) {
     CHECK(set_dumpable(0));
     uid_t uid = getuid();
+    CHECK(syscall(SYS_setuid, uid) == 0);
     pid_t child = clone(vfork_child_sets_flags, vfork_stack + sizeof vfork_stack,
                         CLONE_VM | CLONE_VFORK | SIGCHLD, &uid);
     CHECK(child > 0 && exited_with(child, 0));
@@ -224,8 +226,8 @@ static void no_new_privs_sticks_to_its_thread(void) {
     close(release[1]);
 }
 
-// A forked child copies both flags; a new program, whether run in place or by `posix_spawn`,
-// keeps no_new_privs and is dumpable.
+// A forked child copies all three flags; a new program, whether run in place or by
+// `posix_spawn`, keeps no_new_privs, is dumpable, and has keepcaps clear.
 static void fork_and_execve_carry_the_flags(void) {
     CHECK(set_dumpable(0));
     CHECK(pr(PR_SET_KEEPCAPS, 1, 0, 0, 0) == 0);

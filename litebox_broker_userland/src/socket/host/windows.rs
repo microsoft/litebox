@@ -17,7 +17,7 @@ use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
 
 use litebox_broker_core::BrokerError;
-use litebox_broker_protocol::socket::MAX_DATAGRAM_TRANSFER_SIZE;
+use litebox_broker_protocol::socket::MAX_UDP_DATAGRAM_SIZE;
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Type};
@@ -30,9 +30,9 @@ use windows_sys::Win32::Networking::WinSock::{
     WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED,
     WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR, WSAEINVAL,
     WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN,
-    WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAID_WSARECVMSG, WSAIoctl,
-    WSAMSG, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendMsg, WSASendTo, getsockopt,
-    ioctlsocket, setsockopt,
+    WSAEPROTONOSUPPORT, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError,
+    WSAID_WSARECVMSG, WSAIoctl, WSAMSG, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend,
+    WSASendMsg, WSASendTo, getsockopt, ioctlsocket, setsockopt,
 };
 use windows_sys::core::GUID;
 
@@ -64,7 +64,7 @@ impl Host for Windows {
 static INHERITABLE: RwLock<()> = RwLock::new(());
 
 /// The length of the longest datagram a UDP socket receives.
-const MAX_DATAGRAM_LENGTH: usize = MAX_DATAGRAM_TRANSFER_SIZE as usize;
+const MAX_DATAGRAM_LENGTH: usize = MAX_UDP_DATAGRAM_SIZE as usize;
 
 /// The most errors of sends past a connected socket's peer that a receive
 /// drops before it fails with `AGAIN`. Tests use a bound they can exceed
@@ -102,6 +102,10 @@ impl HostErrno for Errno {
             _ => None,
         }
     }
+
+    fn ping_unavailable(self) -> bool {
+        self == Self::PROTONOSUPPORT
+    }
 }
 
 impl Errno {
@@ -109,6 +113,7 @@ impl Errno {
     const NOBUFS: Self = Self(WSAENOBUFS);
     const AFNOSUPPORT: Self = Self(WSAEAFNOSUPPORT);
     const NETRESET: Self = Self(WSAENETRESET);
+    const PROTONOSUPPORT: Self = Self(WSAEPROTONOSUPPORT);
     const MFILE: Self = Self(WSAEMFILE);
     /// `ERROR_OUTOFMEMORY`, which some calls report instead of
     /// [`Self::NOMEM`].
@@ -337,6 +342,12 @@ impl HostSocket for Socket {
         report_icmp_errors(raw_socket(&socket), SIO_UDP_CONNRESET, false)?;
         report_icmp_errors(raw_socket(&socket), SIO_UDP_NETRESET, false)?;
         Ok(Self::new(Source::Udp(UdpSocket::from_std(socket.into()))))
+    }
+
+    /// Winsock has no unprivileged ICMP echo socket, so external echo is
+    /// unavailable on Windows.
+    fn ping() -> Result<Self, Errno> {
+        Err(Errno::PROTONOSUPPORT)
     }
 
     /// With `SO_EXCLUSIVEADDRUSE`, without which a socket bound to a specific address could share
@@ -705,6 +716,30 @@ impl HostSocket for Socket {
             return Err(Errno::last());
         }
         Ok(seconds == u32::MAX)
+    }
+
+    fn events(&self) -> Result<SocketEvents, Errno> {
+        let mut sockets = [WSAPOLLFD {
+            fd: self.raw(),
+            events: POLLRDNORM | POLLWRNORM,
+            revents: 0,
+        }];
+        // SAFETY: `sockets` outlives the call, which polls without waiting
+        // and writes only the entries' `revents`.
+        if unsafe { WSAPoll(sockets.as_mut_ptr(), 1, 0) } == SOCKET_ERROR {
+            return Err(Errno::last());
+        }
+        let mut events = SocketEvents::empty();
+        for (flag, event) in [
+            (POLLRDNORM, SocketEvents::READABLE),
+            (POLLWRNORM, SocketEvents::WRITABLE),
+            (POLLERR, SocketEvents::ERROR),
+        ] {
+            if sockets[0].revents & flag != 0 {
+                events |= event;
+            }
+        }
+        Ok(events)
     }
 
     fn set_no_delay(&self, value: bool) -> Result<(), Errno> {

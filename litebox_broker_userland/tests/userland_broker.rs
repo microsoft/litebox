@@ -18,7 +18,9 @@ use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferSequence, SharedBufferSlotIndex,
 };
 #[cfg(target_os = "linux")]
-use litebox_broker_protocol::socket::{ReceiveFromFlags, SendFlags, SocketConnectionStatus};
+use litebox_broker_protocol::socket::{
+    IpProtocol, ReceiveFromFlags, SendFlags, SocketConnectionStatus,
+};
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_broker_transport::control_ring::{ControlRing, ControlRingLayout};
 #[cfg(target_os = "linux")]
@@ -262,7 +264,9 @@ fn run_fake_runner(args: &[OsString]) {
         let tcp_port = args[4].to_str().unwrap().parse::<u16>().unwrap();
         let udp_port = args[5].to_str().unwrap().parse::<u16>().unwrap();
         let gateway = std::net::Ipv4Addr::new(10, 0, 2, 1);
-        let handle = local.create_tcp_socket(FileOpenFlags::NONE).unwrap();
+        let handle = local
+            .create_inet_socket(IpProtocol::Tcp, FileOpenFlags::NONE)
+            .unwrap();
         let mut status = local
             .connect_socket(handle, std::net::SocketAddrV4::new(gateway, tcp_port))
             .unwrap()
@@ -275,7 +279,9 @@ fn run_fake_runner(args: &[OsString]) {
         assert_eq!(status, SocketConnectionStatus::Connected);
         local.close_object(handle).unwrap();
 
-        let handle = local.create_udp_socket(FileOpenFlags::NONE).unwrap();
+        let handle = local
+            .create_inet_socket(IpProtocol::Udp, FileOpenFlags::NONE)
+            .unwrap();
         let request = b"gateway request";
         assert_eq!(
             local

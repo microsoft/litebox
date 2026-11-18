@@ -2722,7 +2722,9 @@ pub enum PrctlArg {
     SetName(UserPtr<u8>),
     GetName(UserPtrMut<u8>),
     CapBSetRead(usize),
+    /// PR_GET_KEEPCAPS: read the calling thread's keep-capabilities flag
     GetKeepCaps,
+    /// PR_SET_KEEPCAPS: set the calling thread's keep-capabilities flag, which `execve` clears
     SetKeepCaps(bool),
     /// PR_SET_CHILD_SUBREAPER: set whether this process adopts orphaned descendants
     SetChildSubreaper(usize),
@@ -3185,12 +3187,14 @@ pub enum SyscallRequest {
     Socket {
         domain: u32,
         type_and_flags: u32,
-        protocol: u8,
+        /// The full protocol number, which each address family validates.
+        protocol: i32,
     },
     Socketpair {
         domain: u32,
         type_and_flags: u32,
-        protocol: u8,
+        /// The full protocol number, which each address family validates.
+        protocol: i32,
         sockvec: UserPtrMut<u32>,
     },
     Connect {
@@ -3865,14 +3869,12 @@ impl SyscallRequest {
             Sysno::socket => sys_req!(Socket {
                 domain,
                 type_and_flags,
-                protocol: {
-                    u8::try_from(ctx.sys_req_arg::<i32>(2)).map_err(|_| errno::Errno::EINVAL)?
-                },
+                protocol,
             }),
             Sysno::socketpair => sys_req!(Socketpair {
                 domain,
                 type_and_flags,
-                protocol: { u8::try_from(ctx.sys_req_arg::<i32>(2)).map_err(|_| errno::Errno::EINVAL)? },
+                protocol,
                 sockvec: *,
             }),
             Sysno::connect => sys_req!(Connect { sockfd, sockaddr:*, addrlen }),

@@ -50,9 +50,6 @@ use errors::{
 pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
 /// Maximum bytes one socket receive syscall stages before returning.
 pub const SOCKET_RECEIVE_OPERATION_SIZE: usize = 0x80_000;
-/// Maximum payload size of one IPv4 UDP datagram.
-pub const MAX_UDP_DATAGRAM_SIZE: usize =
-    litebox_broker_protocol::socket::MAX_UDP_DATAGRAM_SIZE as usize;
 
 /// A reference to a broker-owned IPv4 socket, which closes its handle when
 /// dropped.
@@ -72,25 +69,12 @@ pub struct InetSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    /// Creates an unbound, unconnected IPv4 socket.
+    /// Creates an unbound, unconnected IPv4 socket for `protocol`, on the
+    /// socket type that carries it. An ICMP echo socket is echo-only, not a
+    /// raw ICMP socket.
     ///
     /// `flags` must be within [`FileOpenFlags::STATUS`].
     pub fn create_inet_socket(
-        &self,
-        socket_type: SocketType,
-        flags: FileOpenFlags,
-    ) -> Result<InetSocket<Platform>, SocketError> {
-        let protocol = match socket_type {
-            SocketType::Stream => IpProtocol::Tcp,
-            SocketType::Datagram => IpProtocol::Udp,
-            _ => return Err(SocketError::UnsupportedType),
-        };
-        self.create_inet_socket_with_protocol(protocol, flags)
-    }
-
-    /// Creates an IPv4 socket with an explicit protocol. ICMP echo uses
-    /// datagrams and grants no raw socket access.
-    pub fn create_inet_socket_with_protocol(
         &self,
         protocol: IpProtocol,
         flags: FileOpenFlags,
@@ -98,13 +82,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         let broker = self
             .broker_control()
             .ok_or(SocketError::BrokerUnavailable)?;
-        let handle = match protocol {
-            IpProtocol::Tcp => broker.create_tcp_socket(flags),
-            IpProtocol::Udp => broker.create_udp_socket(flags),
-            IpProtocol::IcmpEcho => broker.create_icmp_echo_socket(flags),
-            _ => return Err(SocketError::UnsupportedType),
-        }
-        .map_err(BrokerObjectError::from)?;
+        let handle = broker
+            .create_inet_socket(protocol, flags)
+            .map_err(|error| match BrokerObjectError::from(error) {
+                // The broker's providers need not offer every protocol.
+                BrokerObjectError::UnsupportedOperation => SocketError::UnsupportedProtocol,
+                error => error.into(),
+            })?;
         Ok(InetSocket::new(
             broker,
             self.broker_pollable_registry(),
@@ -113,29 +97,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         ))
     }
 
-    /// Adopts an inherited TCP stream or UDP datagram socket. For ICMP echo,
-    /// use [`Self::adopt_inherited_inet_socket_with_protocol`].
+    /// Takes ownership of an inherited handle with the IPv4 protocol recorded
+    /// by its parent.
     ///
     /// The socket owns `handle`, so callers adopt each handle once and share
     /// the socket for every other use.
     pub fn adopt_inherited_inet_socket(
-        &self,
-        handle: ObjectHandle,
-        socket_type: SocketType,
-    ) -> Result<InetSocket<Platform>, ProcessError> {
-        self.adopt_inherited_inet_socket_with_protocol(
-            handle,
-            match socket_type {
-                SocketType::Stream => IpProtocol::Tcp,
-                SocketType::Datagram => IpProtocol::Udp,
-                _ => return Err(ProcessError::Unavailable),
-            },
-        )
-    }
-
-    /// Takes ownership of an inherited handle with the IPv4 protocol recorded
-    /// by its parent. Adopt each handle only once.
-    pub fn adopt_inherited_inet_socket_with_protocol(
         &self,
         handle: ObjectHandle,
         protocol: IpProtocol,

@@ -54,7 +54,7 @@ enum ReceiveSocket<Platform: ShimPlatform> {
     Vsock(EntryHandle<Platform, VsockSocketSubsystem<Platform>>),
 }
 
-/// How a receive call receives from its socket, which the socket's family decides.
+/// How a receive call receives from its socket, which the socket's family and protocol decide.
 pub(super) struct ReceivePlan {
     /// Whether the call receives until it fills its buffer (`MSG_WAITALL`).
     pub(super) wait_all: bool,
@@ -382,7 +382,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         domain: u32,
         type_and_flags: u32,
-        protocol: u8,
+        protocol: i32,
     ) -> Result<u32, Errno> {
         let (ty, flags) = parse_type_and_flags(type_and_flags)?;
         let domain = AddressFamily::try_from(domain).map_err(|_| {
@@ -396,7 +396,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         domain: AddressFamily,
         ty: SockType,
         flags: SockFlags,
-        protocol: u8,
+        protocol: i32,
     ) -> Result<u32, Errno> {
         let files = self.files.borrow();
         let file = match domain {
@@ -446,7 +446,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         domain: u32,
         type_and_flags: u32,
-        protocol: u8,
+        protocol: i32,
         sockvec: UserPtrMut<u32>,
     ) -> Result<(), Errno> {
         let (ty, flags) = parse_type_and_flags(type_and_flags)?;
@@ -470,7 +470,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         domain: AddressFamily,
         ty: SockType,
         flags: SockFlags,
-        protocol: u8,
+        protocol: i32,
         publish: impl FnOnce(u32, u32) -> Result<(), Errno>,
     ) -> Result<(u32, u32), Errno> {
         match domain {

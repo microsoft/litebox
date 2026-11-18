@@ -724,19 +724,24 @@ fn a_container_runs_and_reports_its_exit(backend: Backend) {
     std::fs::write(first.join("sh"), "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(first.join("sh"), std::fs::Permissions::from_mode(0o641)).unwrap();
     shim.configure(|spec| {
-        spec["annotations"] = serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80-81"});
+        spec["annotations"] = serde_json::json!({
+            "io.litebox.egress.tcp": "10.1.0.0/16:80-81",
+            "io.litebox.egress.icmp-echo": "192.0.2.0/24",
+        });
     });
     let pid = shim.create().unwrap();
-    // The init's pid is the broker's, which allows the annotation's egress; or QEMU's, whose
-    // payload does.
+    // The init's pid is the broker's, which allows the annotations' egress (that it started shows
+    // it accepts their flags); or QEMU's, whose payload does.
     let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap();
     match backend {
         Backend::Userland => {
             assert!(cmdline.contains("litebox-broker-userland"), "{cmdline}");
-            assert!(
-                cmdline.contains("--allow-tcp-destination\u{0}10.1.0.0/16:80-81\u{0}"),
-                "{cmdline}"
-            );
+            for flag in [
+                "--allow-tcp-destination\u{0}10.1.0.0/16:80-81\u{0}",
+                "--allow-icmp-echo-destination\u{0}192.0.2.0/24\u{0}",
+            ] {
+                assert!(cmdline.contains(flag), "{cmdline}");
+            }
         }
         Backend::Vm => {
             assert!(cmdline.contains("qemu-system-x86_64"), "{cmdline}");

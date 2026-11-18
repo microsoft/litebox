@@ -508,9 +508,17 @@ fn request_codec_round_trips_all_variants() {
             handle,
             value: SocketOptionValue::Linger(None),
         })),
+        BrokerOperation::Socket(SocketRequest::SetOption(SetSocketOptionRequest {
+            handle,
+            value: SocketOptionValue::ReceiveExtendedErrors(true),
+        })),
         BrokerOperation::Socket(SocketRequest::GetOption(GetSocketOptionRequest {
             handle,
             name: SocketOptionName::NoDelay
+        })),
+        BrokerOperation::Socket(SocketRequest::GetOption(GetSocketOptionRequest {
+            handle,
+            name: SocketOptionName::ReceiveExtendedErrors
         })),
         BrokerOperation::Socket(SocketRequest::GetOption(GetSocketOptionRequest {
             handle,
@@ -1188,6 +1196,9 @@ fn response_codec_round_trips_all_variants() {
         })),
         BrokerResult::Socket(SocketResponse::GetOption(GetSocketOptionResponse {
             value: SocketOptionValue::SendTimeout(Some(core::time::Duration::new(5, 6)))
+        })),
+        BrokerResult::Socket(SocketResponse::GetOption(GetSocketOptionResponse {
+            value: SocketOptionValue::ReceiveExtendedErrors(true)
         })),
         BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
             status: SocketConnectionStatus::Connecting

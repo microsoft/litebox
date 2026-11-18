@@ -265,7 +265,8 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     /// processes created by this thread start with a copy, and `execve` keeps it. Nothing else
     /// reads it yet, as LiteBox has no `execve` that grants privileges.
     pub(crate) no_new_privs: Cell<bool>,
-    /// Observable by `PR_GET_KEEPCAPS` even though guest capability sets are empty.
+    /// Linux keep-capabilities flag (`PR_SET_KEEPCAPS`). Threads and `fork` copy it, and
+    /// `execve` clears it. Guest capability sets are empty, so nothing else reads it.
     pub(crate) keep_caps: Cell<bool>,
     /// Linux `TIF_SVE_VL_INHERIT`: whether the last `PR_SVE_SET_VL` set `PR_SVE_VL_INHERIT`.
     /// Threads and processes created by this thread start with a copy, and `execve` keeps it.

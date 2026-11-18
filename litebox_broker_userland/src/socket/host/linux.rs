@@ -49,15 +49,6 @@ impl Host for Linux {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Errno(RustixErrno);
 
-impl Errno {
-    pub(crate) fn ping_unavailable(self) -> bool {
-        matches!(
-            self.0,
-            RustixErrno::ACCESS | RustixErrno::PERM | RustixErrno::PROTONOSUPPORT
-        )
-    }
-}
-
 impl HostErrno for Errno {
     const INTR: Self = Self(RustixErrno::INTR);
     const AGAIN: Self = Self(RustixErrno::AGAIN);
@@ -86,6 +77,14 @@ impl HostErrno for Errno {
             _ => None,
         }
     }
+
+    /// Linux denies ping sockets to groups outside `net.ipv4.ping_group_range`.
+    fn ping_unavailable(self) -> bool {
+        matches!(
+            self.0,
+            RustixErrno::ACCESS | RustixErrno::PERM | RustixErrno::PROTONOSUPPORT
+        )
+    }
 }
 
 impl fmt::Debug for Errno {
@@ -104,42 +103,6 @@ impl fmt::Display for Errno {
 pub(crate) struct Socket(OwnedFd);
 
 impl Socket {
-    /// Linux ping sockets expose echo messages only. The kernel assigns their
-    /// identifier and checks ping_group_range; there is no raw-socket fallback.
-    pub(crate) fn ping() -> Result<Self, Errno> {
-        Self::open(SocketType::DGRAM, ipproto::ICMP)
-    }
-
-    pub(crate) fn ping_readiness(
-        &self,
-    ) -> Result<litebox_broker_protocol::readiness::ReadinessFlags, Errno> {
-        use litebox_broker_protocol::readiness::ReadinessFlags;
-        let events = self.polled_events(PollFlags::IN | PollFlags::OUT)?;
-        let mut flags = ReadinessFlags::default();
-        if events.contains(PollFlags::IN) {
-            flags = flags | ReadinessFlags::READ;
-        }
-        if events.contains(PollFlags::OUT) {
-            flags = flags | ReadinessFlags::WRITE;
-        }
-        if events.contains(PollFlags::ERR) {
-            flags = flags | ReadinessFlags::ERROR;
-        }
-        Ok(flags)
-    }
-
-    /// Consume SO_ERROR after the caller has already observed POLLERR.
-    pub(crate) fn take_polled_error(&self) -> Result<Option<Errno>, Errno> {
-        let error = sockopt::socket_error(&self.0).map_err(Errno)?.err();
-        Ok(error.map(|error| {
-            if error == RustixErrno::PIPE {
-                Errno::CONNRESET
-            } else {
-                Errno(error)
-            }
-        }))
-    }
-
     fn open(socket_type: SocketType, protocol: Protocol) -> Result<Self, Errno> {
         socket_with(
             AddressFamily::INET,
@@ -178,6 +141,10 @@ impl HostSocket for Socket {
 
     fn udp() -> Result<Self, Errno> {
         Self::open(SocketType::DGRAM, ipproto::UDP)
+    }
+
+    fn ping() -> Result<Self, Errno> {
+        Self::open(SocketType::DGRAM, ipproto::ICMP)
     }
 
     /// `SO_REUSEADDR` lets the bind take a port whose connections linger in `TIME_WAIT`; it stays
@@ -336,9 +303,16 @@ impl HostSocket for Socket {
         if !self.error_pending()? {
             return Ok(None);
         }
-        // Linux records a reset of a connection whose peer ended its stream
-        // as `EPIPE`, which the contract reserves for sends.
-        self.take_polled_error()
+        let error = sockopt::socket_error(&self.0).map_err(Errno)?.err();
+        Ok(error.map(|error| {
+            // Linux records a reset of a connection whose peer ended its
+            // stream as `EPIPE`, which the contract reserves for sends.
+            if error == RustixErrno::PIPE {
+                Errno::CONNRESET
+            } else {
+                Errno(error)
+            }
+        }))
     }
 
     fn error_pending(&self) -> Result<bool, Errno> {
@@ -362,6 +336,21 @@ impl HostSocket for Socket {
             Err(RustixErrno::NOTCONN) => Ok(true),
             Err(error) => Err(Errno(error)),
         }
+    }
+
+    fn events(&self) -> Result<SocketEvents, Errno> {
+        let polled = self.polled_events(PollFlags::IN | PollFlags::OUT)?;
+        let mut events = SocketEvents::empty();
+        for (flag, event) in [
+            (PollFlags::IN, SocketEvents::READABLE),
+            (PollFlags::OUT, SocketEvents::WRITABLE),
+            (PollFlags::ERR, SocketEvents::ERROR),
+        ] {
+            if polled.contains(flag) {
+                events |= event;
+            }
+        }
+        Ok(events)
     }
 
     fn set_no_delay(&self, value: bool) -> Result<(), Errno> {

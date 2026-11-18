@@ -177,24 +177,39 @@ const LINUX_CAPABILITY_VERSION_2: u32 = 0x20071026; /* deprecated - use v3 */
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
 impl<Platform: ShimPlatform> Task<Platform> {
+    /// Returns how many data words the capability version in `header` uses.
+    ///
+    /// For an unknown version, writes back the preferred one, as Linux does,
+    /// and returns `None`.
+    fn negotiate_capability_version(
+        header: UserPtrMut<litebox_common_linux::CapHeader>,
+    ) -> Result<Option<isize>, Errno> {
+        let version = header.cast::<u32>();
+        match version.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)? {
+            LINUX_CAPABILITY_VERSION_1 => Ok(Some(1)),
+            LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => Ok(Some(2)),
+            _ => {
+                version
+                    .write_at_offset::<Platform>(0, LINUX_CAPABILITY_VERSION_3)
+                    .ok_or(Errno::EFAULT)?;
+                Ok(None)
+            }
+        }
+    }
+
     /// Dropping all capabilities is a no-op: LiteBox never grants any.
     pub(crate) fn sys_capset(
         &self,
         header: UserPtrMut<litebox_common_linux::CapHeader>,
         data: UserPtr<litebox_common_linux::CapData>,
     ) -> Result<(), Errno> {
-        let fields = header.cast::<u32>();
-        let words = match fields.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)? {
-            LINUX_CAPABILITY_VERSION_1 => 1,
-            LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => 2,
-            _ => {
-                fields
-                    .write_at_offset::<Platform>(0, LINUX_CAPABILITY_VERSION_3)
-                    .ok_or(Errno::EFAULT)?;
-                return Err(Errno::EINVAL);
-            }
+        let Some(words) = Self::negotiate_capability_version(header)? else {
+            return Err(Errno::EINVAL);
         };
-        let pid = fields.read_at_offset::<Platform>(1).ok_or(Errno::EFAULT)?;
+        let pid = header
+            .cast::<u32>()
+            .read_at_offset::<Platform>(1)
+            .ok_or(Errno::EFAULT)?;
         if pid != 0 && i32::try_from(pid) != Ok(self.sys_gettid()) {
             return Err(Errno::EPERM);
         }
@@ -215,54 +230,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
         header: UserPtrMut<litebox_common_linux::CapHeader>,
         data: Option<UserPtrMut<litebox_common_linux::CapData>>,
     ) -> Result<(), Errno> {
-        let hdr = header.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        match hdr.version {
-            LINUX_CAPABILITY_VERSION_1 => {
-                if let Some(data_ptr) = data {
-                    let cap = litebox_common_linux::CapData {
-                        effective: 0,
-                        permitted: 0,
-                        inheritable: 0,
-                    };
-                    data_ptr
-                        .write_at_offset::<Platform>(0, cap)
-                        .ok_or(Errno::EFAULT)?;
-                }
+        let Some(words) = Self::negotiate_capability_version(header)? else {
+            // Probing the preferred version with no data succeeds.
+            return if data.is_none() {
                 Ok(())
-            }
-            LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => {
-                if let Some(data_ptr) = data {
-                    let cap = litebox_common_linux::CapData {
-                        effective: 0,
-                        permitted: 0,
-                        inheritable: 0,
-                    };
-                    data_ptr
-                        .write_at_offset::<Platform>(0, cap.clone())
-                        .ok_or(Errno::EFAULT)?;
-                    data_ptr
-                        .write_at_offset::<Platform>(1, cap)
-                        .ok_or(Errno::EFAULT)?;
-                }
-                Ok(())
-            }
-            _ => {
-                header
-                    .write_at_offset::<Platform>(
-                        0,
-                        litebox_common_linux::CapHeader {
-                            version: LINUX_CAPABILITY_VERSION_3,
-                            pid: hdr.pid,
-                        },
-                    )
+            } else {
+                Err(Errno::EINVAL)
+            };
+        };
+        if let Some(data_ptr) = data {
+            for i in 0..words {
+                let empty = litebox_common_linux::CapData {
+                    effective: 0,
+                    permitted: 0,
+                    inheritable: 0,
+                };
+                data_ptr
+                    .write_at_offset::<Platform>(i, empty)
                     .ok_or(Errno::EFAULT)?;
-                if data.is_none() {
-                    Ok(())
-                } else {
-                    Err(Errno::EINVAL)
-                }
             }
         }
+        Ok(())
     }
 }
 

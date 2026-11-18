@@ -917,13 +917,8 @@ impl SocketEntry<'_> {
             let Some(datagram) = inbox.udp.queue.front() else {
                 return Ok(None);
             };
-            let received = output.len().min(datagram.payload.len());
-            output.copy_from_slice(&datagram.payload[..received]);
-            let outcome = ReceiveFromOutcome::Received {
-                received,
-                datagram_length: datagram.payload.len(),
-                source_address: datagram.source_address,
-            };
+            let outcome =
+                ReceiveFromOutcome::copy_out(output, &datagram.payload, datagram.source_address);
             let consumed = if peek {
                 None
             } else {

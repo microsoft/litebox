@@ -307,10 +307,16 @@ int main(int argc, char **argv) {
         return 2;
     }
     fflush(stdout);
+    // Name each case on stderr as it starts, so a watchdog timeout shows which one hung.
+    fprintf(stderr, "inet-fork: tcp\n");
     int tcp = tcp_listener();
+    fprintf(stderr, "inet-fork: udp\n");
     int udp = udp_shared();
+    fprintf(stderr, "inet-fork: orphan\n");
     int orphan = orphaned_socket();
+    fprintf(stderr, "inet-fork: exec\n");
     int exec = exec_child(argv[1]);
+    fprintf(stderr, "inet-fork: echo\n");
     int echo = exec_echo(argv[1]);
     printf("inet-fork tcp=%d udp=%d orphan=%d exec=%d echo=%d\n", tcp, udp, orphan, exec, echo);
     return tcp + udp + orphan + exec + echo;

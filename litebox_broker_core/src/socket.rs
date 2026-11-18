@@ -218,7 +218,7 @@ impl GuestPortBinding {
 
     /// Retains a TCP source binding across queued and accepted connection lifetimes.
     ///
-    /// UDP datagrams snapshot source metadata when sent and need no lease.
+    /// Datagrams snapshot source metadata when sent and need no lease.
     fn source_lease_for(self: &Arc<Self>, destination: SocketAddrV4) -> Option<GuestSourceLease> {
         if self.transport != GuestTransport::Tcp {
             return None;
@@ -667,7 +667,7 @@ pub trait PlatformSocket: Send + Sync {
 
     /// Applies a directional or TCP lifecycle shutdown mode.
     ///
-    /// UDP supports read, write, and both. TCP additionally supports aborting
+    /// Datagram sockets support read, write, and both. TCP additionally supports aborting
     /// a connection and stopping a listener. For `StopListening`, completion
     /// or `Failed(NotConnected)` means the listener is stopped; any other
     /// failure must leave the listener active and retryable.
@@ -1011,7 +1011,16 @@ fn transport_connect(
     }
 
     if is_datagram(create_request) {
-        return transport_connect_datagram(process, object, create_request, destination);
+        // Like Linux, report the port the peer was named with, though echo
+        // ignores it.
+        let named_peer = SocketAddrV4::new(*destination.ip(), address.port());
+        return transport_connect_datagram(
+            process,
+            object,
+            create_request,
+            destination,
+            named_peer,
+        );
     }
 
     let (resource, needs_bind) = {
@@ -1483,15 +1492,10 @@ fn send_datagram(
     destination: Option<SocketAddrV4>,
 ) -> Result<SocketOutcome<usize>> {
     let request = read_socket(object, |socket| socket.create_request)?;
-    if !is_datagram(request) {
+    let Some(maximum) = datagram_limit(request) else {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
-    }
-    if data.len()
-        > request
-            .protocol
-            .max_datagram_size()
-            .expect("datagram protocol") as usize
-    {
+    };
+    if data.len() > maximum {
         return Err(BrokerError::UnsupportedOperation);
     }
     if let Some(error) = take_pending_error(object, false) {
@@ -1546,31 +1550,12 @@ fn transport_send_to(
     let (create_request, peer) = read_socket(object, |socket| {
         (socket.create_request, socket.peer_address)
     })?;
-    // Authorize and pass the same concrete echo peer, even if a concurrent connect
-    // changes the provider's default destination or another principal holds the socket.
-    let destination = if create_request.protocol == IpProtocol::IcmpEcho {
-        let Some(peer) = destination.or(peer) else {
-            return Ok(SocketOutcome::Failed(
-                SocketError::DestinationAddressRequired,
-            ));
-        };
-        Some(peer)
-    } else {
-        destination
+    let destination = match resolve_datagram_destination(create_request.protocol, destination, peer)
+    {
+        Ok(destination) => destination,
+        Err(error) => return Ok(SocketOutcome::Failed(error)),
     };
-    let destination = match destination {
-        Some(destination)
-            if destination.port() == 0 && create_request.protocol != IpProtocol::IcmpEcho =>
-        {
-            return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
-        }
-        Some(destination) => match normalize_peer(create_request.protocol, destination) {
-            Ok(destination) => Some(destination),
-            Err(error) => return Ok(SocketOutcome::Failed(error)),
-        },
-        None => None,
-    };
-    // A destination that policy denies may still take a reply, which the platform checks.
+    // A UDP destination that policy denies may still take a reply, which the platform checks.
     let mut reply = false;
     if let Some(destination) = destination {
         match process.core.policy.authorize_socket_destination(
@@ -1823,13 +1808,9 @@ fn receive_datagram(
     flags: ReceiveFromFlags,
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
     let request = read_socket(object, |socket| socket.create_request)?;
-    if !is_datagram(request) {
+    let Some(maximum) = datagram_limit(request) else {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
-    }
-    let maximum = request
-        .protocol
-        .max_datagram_size()
-        .expect("datagram protocol") as usize;
+    };
     if output.len() > maximum {
         return Err(BrokerError::UnsupportedOperation);
     }
@@ -1880,7 +1861,7 @@ fn transport_receive_from(
 ///
 /// The transport implements a TCP socket's `NoDelay` and `KeepAlive`; the
 /// broker stores the other options, and fails with `UnsupportedOperation` for
-/// `NoDelay` on a datagram socket.
+/// `NoDelay` on a datagram socket and `ReceiveExtendedErrors` on a stream.
 pub fn set_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1891,14 +1872,10 @@ pub fn set_option(
     let ObjectEntry::Socket(socket) = &mut *object else {
         return Err(BrokerError::InvalidRights);
     };
-    if let SocketOptionValue::ReceiveExtendedErrors(enabled) = value
-        && is_datagram(socket.create_request)
-    {
-        socket.receive_extended_errors = enabled;
-        return Ok(());
-    }
     if !is_tcp_option(socket.create_request, value.name()) {
-        return socket.options.set(value);
+        return socket
+            .options
+            .set(value, is_datagram(socket.create_request));
     }
     if socket.resource_retired {
         return Err(BrokerError::Internal);
@@ -1920,13 +1897,8 @@ pub fn get_option(
     let ObjectEntry::Socket(socket) = &*object else {
         return Err(BrokerError::InvalidRights);
     };
-    if name == SocketOptionName::ReceiveExtendedErrors && is_datagram(socket.create_request) {
-        return Ok(SocketOptionValue::ReceiveExtendedErrors(
-            socket.receive_extended_errors,
-        ));
-    }
     if !is_tcp_option(socket.create_request, name) {
-        return socket.options.get(name);
+        return socket.options.get(name, is_datagram(socket.create_request));
     }
     if socket.resource_retired {
         return Err(BrokerError::Internal);
@@ -2667,6 +2639,7 @@ fn transport_connect_datagram(
     object: &spin::RwLock<ObjectEntry>,
     create_request: CreateSocketRequest,
     destination: SocketAddrV4,
+    named_peer: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let (resource, previous_status, needs_bind) = {
         let mut object = object.write();
@@ -2719,7 +2692,7 @@ fn transport_connect_datagram(
     }
     match resource.platform_socket.connect(destination, None) {
         Ok(SocketConnectionStatus::Connected) => {
-            finish_datagram_connect(object, SocketConnectionStatus::Connected, Some(destination));
+            finish_datagram_connect(object, SocketConnectionStatus::Connected, Some(named_peer));
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
         }
         Ok(SocketConnectionStatus::Failed(error)) => {
@@ -2931,6 +2904,10 @@ fn finish_retired_configuration(
 /// Options a socket stores without its transport implementing them, which
 /// every reference to the socket shares.
 #[derive(Clone, Copy, Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent socket option"
+)]
 pub(crate) struct SocketOptions {
     receive_timeout: Option<Duration>,
     send_timeout: Option<Duration>,
@@ -2938,11 +2915,14 @@ pub(crate) struct SocketOptions {
     reuse_address: bool,
     keep_alive: bool,
     broadcast: bool,
+    receive_extended_errors: bool,
 }
 
 impl SocketOptions {
-    /// Stores a protocol-independent option.
-    pub(crate) fn set(&mut self, value: SocketOptionValue) -> Result<()> {
+    /// Stores `value`, failing with `UnsupportedOperation` for `NoDelay`,
+    /// which only a TCP transport implements, and for
+    /// `ReceiveExtendedErrors` unless the socket is an IPv4 `datagram` one.
+    pub(crate) fn set(&mut self, value: SocketOptionValue, datagram: bool) -> Result<()> {
         match value {
             SocketOptionValue::ReceiveTimeout(timeout) => self.receive_timeout = timeout,
             SocketOptionValue::SendTimeout(timeout) => self.send_timeout = timeout,
@@ -2950,6 +2930,9 @@ impl SocketOptions {
             SocketOptionValue::ReuseAddress(value) => self.reuse_address = value,
             SocketOptionValue::KeepAlive(value) => self.keep_alive = value,
             SocketOptionValue::Broadcast(value) => self.broadcast = value,
+            SocketOptionValue::ReceiveExtendedErrors(value) if datagram => {
+                self.receive_extended_errors = value;
+            }
             SocketOptionValue::NoDelay(_) | SocketOptionValue::ReceiveExtendedErrors(_) => {
                 return Err(BrokerError::UnsupportedOperation);
             }
@@ -2957,8 +2940,9 @@ impl SocketOptions {
         Ok(())
     }
 
-    /// Returns the stored value of a protocol-independent option.
-    pub(crate) fn get(&self, name: SocketOptionName) -> Result<SocketOptionValue> {
+    /// Returns the stored value of the option `name`, failing as
+    /// [`Self::set`] does.
+    pub(crate) fn get(&self, name: SocketOptionName, datagram: bool) -> Result<SocketOptionValue> {
         Ok(match name {
             SocketOptionName::ReceiveTimeout => {
                 SocketOptionValue::ReceiveTimeout(self.receive_timeout)
@@ -2968,6 +2952,9 @@ impl SocketOptions {
             SocketOptionName::ReuseAddress => SocketOptionValue::ReuseAddress(self.reuse_address),
             SocketOptionName::KeepAlive => SocketOptionValue::KeepAlive(self.keep_alive),
             SocketOptionName::Broadcast => SocketOptionValue::Broadcast(self.broadcast),
+            SocketOptionName::ReceiveExtendedErrors if datagram => {
+                SocketOptionValue::ReceiveExtendedErrors(self.receive_extended_errors)
+            }
             SocketOptionName::NoDelay | SocketOptionName::ReceiveExtendedErrors => {
                 return Err(BrokerError::UnsupportedOperation);
             }
@@ -2985,7 +2972,6 @@ pub(crate) struct SocketObject {
     status: StatusFlags,
     /// Options other than those [`is_tcp_option`] selects.
     options: SocketOptions,
-    receive_extended_errors: bool,
     /// The transport's connection state, which [`Self::view`] refines.
     connection_status: SocketConnectionStatus,
     local_address: Option<SocketAddrV4>,
@@ -3018,7 +3004,6 @@ impl SocketObject {
             create_request,
             status,
             options: SocketOptions::default(),
-            receive_extended_errors: false,
             connection_status: SocketConnectionStatus::Unconnected,
             local_address: None,
             peer_address: None,
@@ -3342,6 +3327,19 @@ const fn is_datagram(request: CreateSocketRequest) -> bool {
     )
 }
 
+/// Returns the longest datagram a socket created by `request` carries, or
+/// `None` if it is not a datagram socket.
+fn datagram_limit(request: CreateSocketRequest) -> Option<usize> {
+    if !is_datagram(request) {
+        return None;
+    }
+    request
+        .protocol
+        .max_datagram_size()
+        .map(|size| size as usize)
+}
+
+/// Normalizes a peer, dropping the port that echo ignores.
 fn normalize_peer(
     protocol: IpProtocol,
     mut peer: SocketAddrV4,
@@ -3352,15 +3350,38 @@ fn normalize_peer(
     normalize_socket_destination(peer)
 }
 
+/// Resolves where a datagram send goes, given the `requested` destination
+/// and the socket's `connected` peer.
+///
+/// Echo always resolves an explicit peer, so policy authorizes the same
+/// concrete peer the provider sends to, even if a concurrent connect changes
+/// the provider's default destination or another principal holds the socket.
+/// A UDP destination needs a nonzero port; `None` sends to the transport's
+/// connected peer.
+fn resolve_datagram_destination(
+    protocol: IpProtocol,
+    requested: Option<SocketAddrV4>,
+    connected: Option<SocketAddrV4>,
+) -> core::result::Result<Option<SocketAddrV4>, SocketError> {
+    if protocol == IpProtocol::IcmpEcho {
+        let peer = requested
+            .or(connected)
+            .ok_or(SocketError::DestinationAddressRequired)?;
+        return normalize_peer(protocol, peer).map(Some);
+    }
+    match requested {
+        Some(destination) if destination.port() == 0 => Err(SocketError::InvalidArgument),
+        Some(destination) => normalize_socket_destination(destination).map(Some),
+        None => Ok(None),
+    }
+}
+
 const fn guest_transport(request: CreateSocketRequest) -> Option<GuestTransport> {
-    if is_tcp(request) {
-        Some(GuestTransport::Tcp)
-    } else if is_udp(request) {
-        Some(GuestTransport::Udp)
-    } else if is_datagram(request) {
-        Some(GuestTransport::IcmpEcho)
-    } else {
-        None
+    match (request.socket_type, request.protocol) {
+        (SocketType::Stream, IpProtocol::Tcp) => Some(GuestTransport::Tcp),
+        (SocketType::Datagram, IpProtocol::Udp) => Some(GuestTransport::Udp),
+        (SocketType::Datagram, IpProtocol::IcmpEcho) => Some(GuestTransport::IcmpEcho),
+        _ => None,
     }
 }
 

@@ -140,9 +140,11 @@ fn echo_authorizes_the_concrete_peer_and_has_its_own_identifier_namespace() {
         );
     }
 
+    // Echo ignores the port it is connected with, but reports it, as Linux does.
+    let named = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7);
     let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
     assert_eq!(
-        connect(&process, echo, peer),
+        connect(&process, echo, named),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
     assert_eq!(
@@ -154,7 +156,7 @@ fn echo_authorizes_the_concrete_peer_and_has_its_own_identifier_namespace() {
         send_to(&process, echo, &request, SendFlags::NONE, Some(gateway)),
         Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
     );
-    assert_eq!(get_name(&process, echo, true), Ok(Some(peer)));
+    assert_eq!(get_name(&process, echo, true), Ok(Some(named)));
     assert_eq!(
         send_to(&process, echo, &request, SendFlags::NONE, None),
         Ok(SocketOutcome::Completed(request.len()))

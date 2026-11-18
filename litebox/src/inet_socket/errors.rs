@@ -17,8 +17,8 @@ use thiserror::Error;
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SocketError {
-    #[error("Unsupported socket type")]
-    UnsupportedType,
+    #[error("The broker does not support this protocol")]
+    UnsupportedProtocol,
     #[error("Brokered networking is unavailable")]
     BrokerUnavailable,
     #[error("Socket resources are exhausted")]

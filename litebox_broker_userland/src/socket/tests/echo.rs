@@ -89,7 +89,7 @@ fn echo_filtered_batch_posts_continuation_without_publishing_read() {
             socket
                 .call(|entry| {
                     entry.install_echo_test_host(host, peer, [0, 1]);
-                    entry.refresh_echo();
+                    entry.refresh_echo().unwrap();
                     assert_eq!(entry.inbox().own, ReadinessFlags::WRITE);
                     Ok(())
                 })
@@ -190,7 +190,111 @@ fn echo_loopback_peek_truncation_and_connect() {
 }
 
 #[test]
-fn echo_rejects_non_requests_and_does_not_answer_external_addresses() {
+fn echo_drops_loopback_replies_beyond_its_queue_but_not_requests() {
+    use crate::socket::echo::MAX_REPLIES;
+
+    with_echo(&SocketPolicy::guest_network(), |process, handle, _| {
+        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        let mut request = REQUEST;
+        for sequence in 0..=MAX_REPLIES {
+            request[7] = u8::try_from(sequence).unwrap();
+            assert_eq!(
+                send_datagram(process, handle, &request, SendFlags::NONE, Some(peer)),
+                Ok(SocketOutcome::Completed(request.len()))
+            );
+        }
+        let mut reply = [0; REPLY.len()];
+        for sequence in 0..MAX_REPLIES {
+            assert_eq!(
+                receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
+                Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                    received: REPLY.len(),
+                    datagram_length: REPLY.len(),
+                    source_address: peer,
+                }))
+            );
+            assert_eq!(usize::from(reply[7]), sequence);
+        }
+        assert_eq!(
+            receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
+            Err(BrokerError::NonBlockingWouldBlock)
+        );
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn echo_reports_a_host_error_once() {
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
+    with_echo_provider(
+        &SocketPolicy::guest_network(),
+        Arc::clone(&provider),
+        |process, handle, publications| {
+            let local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0x1234);
+            assert_eq!(
+                core_socket::bind(process, handle, local),
+                Ok(SocketOutcome::Completed(local))
+            );
+
+            // Stand in for a ping socket that an ICMP error reached with a
+            // UDP socket whose datagram a closed loopback port refused.
+            let closed = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let std::net::SocketAddr::V4(closed_address) = closed.local_addr().unwrap() else {
+                unreachable!()
+            };
+            drop(closed);
+            let host = Socket::udp().unwrap();
+            host.connect(closed_address).unwrap();
+            let mut probe = REQUEST;
+            let parts = [litebox_platform::buffer::RawBytes::from(
+                probe.as_mut_slice(),
+            )];
+            host.send(RawParts::from(&parts), None).unwrap();
+            let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+            while !host.events().unwrap().contains(SocketEvents::ERROR) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no ICMP error arrived"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            let peer = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 0);
+            let socket = read_lock(&provider.core.registry)
+                .sockets
+                .values()
+                .next()
+                .unwrap()
+                .upgrade()
+                .unwrap();
+            socket
+                .call(|entry| {
+                    entry.install_echo_test_host(host, peer, [0, 1]);
+                    entry.refresh_echo().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            wait_for_readiness(
+                publications,
+                handle,
+                ReadinessFlags::WRITE | ReadinessFlags::ERROR,
+            );
+            let mut reply = [0; REPLY.len()];
+            assert_eq!(
+                receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
+                Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+            );
+            assert_eq!(process.check_readiness(handle), Ok(ReadinessFlags::WRITE));
+            assert_eq!(
+                receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
+                Err(BrokerError::NonBlockingWouldBlock)
+            );
+        },
+    );
+}
+
+#[test]
+fn echo_rejects_non_requests_and_unauthorized_external_destinations() {
     with_echo(&SocketPolicy::guest_network(), |process, handle, _| {
         let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
         for invalid in [&REQUEST[..7], &[3; 8], &[8, 1, 0, 0, 0, 0, 0, 0]] {
@@ -214,7 +318,7 @@ fn echo_rejects_non_requests_and_does_not_answer_external_addresses() {
 }
 
 #[cfg(target_os = "linux")]
-fn native_loopback_echo() -> std::io::Result<()> {
+fn probe_native_loopback_echo() -> std::io::Result<()> {
     // Independent of the provider: opening a ping socket alone doesn't mean
     // the host will actually answer. Bound both directions of the probe.
     let socket: UdpSocket = socket2::Socket::new(
@@ -240,17 +344,29 @@ fn native_loopback_echo() -> std::io::Result<()> {
     ))
 }
 
+/// Exercises a real host ping socket, which a namespace of the test's own
+/// can permit without changing the host.
 #[cfg(target_os = "linux")]
 #[test]
 fn echo_gateway_roundtrip_and_connected_reconnect() {
-    if let Err(error) = native_loopback_echo() {
-        eprintln!("skipping gateway echo: native Linux loopback ping prerequisite failed: {error}");
-        return;
-    }
-    let rule = litebox_broker_core::IcmpEchoDestinationRule {
-        caller_credential: CallerCredential::Unauthenticated,
-        destination: Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
-    };
+    in_network_namespace(
+        "echo::echo_gateway_roundtrip_and_connected_reconnect",
+        || {
+            ip("link set lo up");
+            // A new network namespace denies ping sockets to every group.
+            std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0 0").unwrap();
+            probe_native_loopback_echo().unwrap();
+            echo_gateway_roundtrip_and_connected_reconnect_with_ping_sockets();
+        },
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn echo_gateway_roundtrip_and_connected_reconnect_with_ping_sockets() {
+    let rule = litebox_broker_core::IcmpEchoDestinationRule::new(
+        CallerCredential::Unauthenticated,
+        Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
+    );
     let policy = SocketPolicy::guest_network()
         .with_icmp_echo_destination_rules(&[rule])
         .unwrap();
@@ -304,5 +420,63 @@ fn echo_gateway_roundtrip_and_connected_reconnect() {
             );
             assert_eq!(reply, REPLY);
         }
+    });
+}
+
+/// Like a Linux ping socket, an echo socket keeps its host replies, queued
+/// or still to come, when it connects elsewhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn echo_reconnect_keeps_host_replies() {
+    in_network_namespace("echo::echo_reconnect_keeps_host_replies", || {
+        ip("link set lo up");
+        let other = Ipv4Addr::new(198, 51, 100, 1);
+        ip(&format!("addr add {other}/32 dev lo"));
+        std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0 0").unwrap();
+        let rules = [HOST_GATEWAY_IPV4_ADDRESS, other].map(|ip| {
+            litebox_broker_core::IcmpEchoDestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address(ip.octets()), 32).unwrap(),
+            )
+        });
+        let policy = SocketPolicy::guest_network()
+            .with_icmp_echo_destination_rules(&rules)
+            .unwrap();
+        with_echo(&policy, |process, handle, publications| {
+            let gateway = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 0);
+            let local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0x1234);
+            assert_eq!(
+                core_socket::bind(process, handle, local),
+                Ok(SocketOutcome::Completed(local))
+            );
+            // The provider stages one host reply at a time, so the second
+            // stays queued in the host socket across the connect.
+            let mut request = REQUEST;
+            for sequence in 1..=2 {
+                request[7] = sequence;
+                assert_eq!(
+                    send_datagram(process, handle, &request, SendFlags::NONE, Some(gateway)),
+                    Ok(SocketOutcome::Completed(request.len()))
+                );
+            }
+            wait_until_ready(process, publications, handle, ReadinessFlags::READ);
+            assert_eq!(
+                core_socket::connect(process, handle, SocketAddrV4::new(other, 0)),
+                Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+            );
+            for sequence in 1..=2 {
+                wait_until_ready(process, publications, handle, ReadinessFlags::READ);
+                let mut reply = [0; REPLY.len()];
+                assert_eq!(
+                    receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
+                    Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                        received: REPLY.len(),
+                        datagram_length: REPLY.len(),
+                        source_address: gateway,
+                    }))
+                );
+                assert_eq!(reply[7], sequence);
+            }
+        });
     });
 }

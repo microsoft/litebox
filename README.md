@@ -32,8 +32,9 @@ target's IPv4 address. Repeat the flag for additional networks, or, with the
 containerd shim, set `io.litebox.egress.icmp-echo` to a comma-separated list
 of canonical IPv4 CIDRs. The host gateway (`10.0.2.1`) also requires an explicit
 rule. These rules have no port range and do not grant UDP or raw socket access.
-External echo requires a Linux host that permits the broker's group to create
-ping sockets (`net.ipv4.ping_group_range`); guest loopback needs no host ping socket.
+External echo requires a Linux host whose network namespace for the broker permits
+the broker's group to create ping sockets (`net.ipv4.ping_group_range`, which a new
+namespace disables); guest loopback needs no host ping socket.
 If `iputils` ping tries to discover its source with an external UDP connection,
 use `ping -4 -I 10.0.2.15 -c 1 TARGET` to select the guest address explicitly.
 

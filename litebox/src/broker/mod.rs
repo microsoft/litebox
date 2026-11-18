@@ -37,7 +37,7 @@ use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::socket::{
-    AcceptSocketResponse, MAX_DATAGRAM_TRANSFER_SIZE, MAX_SOCKET_TRANSFER_SIZE,
+    AcceptSocketResponse, IpProtocol, MAX_DATAGRAM_TRANSFER_SIZE, MAX_SOCKET_TRANSFER_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
     ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
     SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
@@ -261,18 +261,9 @@ pub(crate) trait BrokerControl: Send + Sync {
         output: &mut dyn ReadBuffer,
     ) -> core::result::Result<(), BrokerControlError>;
 
-    fn create_tcp_socket(
+    fn create_inet_socket(
         &self,
-        flags: FileOpenFlags,
-    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
-
-    fn create_udp_socket(
-        &self,
-        flags: FileOpenFlags,
-    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
-
-    fn create_icmp_echo_socket(
-        &self,
+        protocol: IpProtocol,
         flags: FileOpenFlags,
     ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -1289,25 +1280,12 @@ where
         self.request(|local| local.fill_random(lease.sequence(), output))
     }
 
-    fn create_tcp_socket(
+    fn create_inet_socket(
         &self,
+        protocol: IpProtocol,
         flags: FileOpenFlags,
     ) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(|local| local.create_tcp_socket(flags))
-    }
-
-    fn create_udp_socket(
-        &self,
-        flags: FileOpenFlags,
-    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(|local| local.create_udp_socket(flags))
-    }
-
-    fn create_icmp_echo_socket(
-        &self,
-        flags: FileOpenFlags,
-    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(|local| local.create_icmp_echo_socket(flags))
+        self.request(|local| local.create_inet_socket(protocol, flags))
     }
 
     fn connect_socket(

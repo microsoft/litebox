@@ -546,7 +546,9 @@ impl From<litebox::fs::errors::StatusFlagsError> for Errno {
 impl From<litebox::inet_socket::errors::SocketError> for Errno {
     fn from(value: litebox::inet_socket::errors::SocketError) -> Self {
         match value {
-            litebox::inet_socket::errors::SocketError::UnsupportedType => Errno::ESOCKTNOSUPPORT,
+            litebox::inet_socket::errors::SocketError::UnsupportedProtocol => {
+                Errno::EPROTONOSUPPORT
+            }
             litebox::inet_socket::errors::SocketError::BrokerUnavailable => Errno::EAFNOSUPPORT,
             litebox::inet_socket::errors::SocketError::ResourceExhausted => Errno::ENOBUFS,
             litebox::inet_socket::errors::SocketError::PermissionDenied => Errno::EACCES,

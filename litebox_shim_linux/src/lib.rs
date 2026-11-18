@@ -1018,15 +1018,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // that fails to decode has already returned its error above, since nothing ran.
         let is_vfork_child = self.vfork.borrow().is_some();
         if is_vfork_child
-            && matches!(
-                &request,
-                SyscallRequest::Setuid { .. } | SyscallRequest::CapSet { .. }
-            )
-        {
-            // These handlers use the current task's credentials, not the vfork child's.
-            return Err(Errno::ENOSYS);
-        }
-        if is_vfork_child
             && !matches!(
                 &request,
                 SyscallRequest::Exit { .. }
@@ -1051,6 +1042,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Getrlimit { .. }
                     | SyscallRequest::Setrlimit { .. }
                     | SyscallRequest::Prlimit { pid: 0, .. }
+                    // Guest credentials are fixed and the child shares its parent's, so these
+                    // succeed only as no-ops.
+                    | SyscallRequest::Setuid { .. }
+                    | SyscallRequest::CapSet { .. }
                     | SyscallRequest::Prctl {
                         args: PrctlArg::GetDumpable
                             | PrctlArg::SetDumpable(_)

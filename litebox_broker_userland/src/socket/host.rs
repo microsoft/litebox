@@ -7,7 +7,7 @@
 //! it relies on:
 //! - [`Host`], a host's family of types;
 //! - [`HostErrno`], the host's error codes;
-//! - [`HostSocket`], a nonblocking IPv4 TCP or UDP socket;
+//! - [`HostSocket`], a nonblocking IPv4 TCP, UDP, or ping socket;
 //! - [`HostPoller`], which watches host sockets for [`Interest`]s, and
 //!   [`HostWaiter`] and [`HostEventBuffer`], with which the event thread
 //!   collects the [`SocketEvents`] they raise and the poller's wakes.
@@ -99,9 +99,13 @@ pub(crate) trait HostErrno:
 
     /// Maps an error that reports the host out of a resource to the broker's.
     fn broker_resource_error(self) -> Option<BrokerError>;
+
+    /// Reports whether [`HostSocket::ping`] failed because the host offers
+    /// the broker no ping sockets, rather than for a transient reason.
+    fn ping_unavailable(self) -> bool;
 }
 
-/// A nonblocking IPv4 TCP or UDP host socket.
+/// A nonblocking IPv4 TCP, UDP, or ICMP echo (ping) host socket.
 ///
 /// # TCP errors
 ///
@@ -128,6 +132,15 @@ pub(crate) trait HostErrno:
 /// error that the poller reports on a UDP socket as [`SocketEvents::ERROR`]
 /// stays until a call or [`Self::take_error`] takes it, and
 /// [`Self::error_pending`] reports it until then.
+///
+/// # Ping sockets
+///
+/// A ping socket sends and receives ICMP echo messages without an IP
+/// header. The host assigns its echo identifier and checksum, and grants no
+/// raw socket access. Unlike a UDP socket's, its
+/// [`Self::receive_datagram`] may return only the length it copied, and the
+/// provider watches it with [`Interest::Stream`] and samples it with
+/// [`Self::events`].
 pub(crate) trait HostSocket: Sized + Send {
     type Errno;
 
@@ -136,6 +149,11 @@ pub(crate) trait HostSocket: Sized + Send {
 
     /// Opens a UDP socket.
     fn udp() -> Result<Self, Self::Errno>;
+
+    /// Opens a ping socket. Fails with an error that
+    /// [`HostErrno::ping_unavailable`] reports if the host has none for the
+    /// broker.
+    fn ping() -> Result<Self, Self::Errno>;
 
     /// Opens a TCP socket listening at `address` with room for [`LISTEN_BACKLOG`] connections,
     /// which keeps every other socket off the port.
@@ -255,6 +273,10 @@ pub(crate) trait HostSocket: Sized + Send {
 
     /// Reports whether a TCP connect is still in progress.
     fn connect_pending(&self) -> Result<bool, Self::Errno>;
+
+    /// Reports which of [`SocketEvents::READABLE`], [`SocketEvents::WRITABLE`],
+    /// and [`SocketEvents::ERROR`] a ping socket raises now, without waiting.
+    fn events(&self) -> Result<SocketEvents, Self::Errno>;
 
     /// Sets whether a TCP socket sends small segments without delay.
     ///
@@ -419,7 +441,7 @@ impl BitOrAssign for SocketEvents {
 /// The events a poller reports for a host socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Interest {
-    /// Every change in a stream's readiness, once per change.
+    /// Every change in a stream's or ping socket's readiness, once per change.
     Stream,
     /// Each requested event once present. After reporting one, the socket
     /// need report nothing more until its interest is set again, though it

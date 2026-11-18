@@ -35,7 +35,6 @@ use litebox_broker_protocol::{
 use litebox_common_linux::{
     AddressFamily, IPProtocol, IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags,
     SockType, SocketOption, SocketOptionName, TcpOption, errno::Errno,
-    program_startup::InheritedFdKind,
 };
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -143,18 +142,29 @@ pub(super) fn write_sockaddr<Platform: ShimPlatform>(
     Ok(bytes.len())
 }
 
+/// Linux's `IPPROTO_MAX`: one past the largest IP protocol number.
+const IPPROTO_MAX: i32 = 263;
+
 impl<Platform: ShimPlatform> InetSocket<Platform> {
     /// Creates a socket of type `ty` for `protocol`, where zero selects the type's default.
     pub(super) fn new(
         litebox: &litebox::LiteBox<Platform>,
         ty: SockType,
-        protocol: u8,
+        protocol: i32,
         flags: SockFlags,
     ) -> Result<Self, Errno> {
-        let protocol = IPProtocol::try_from(protocol).map_err(|_| {
-            log_unsupported!("protocol = {protocol}");
-            Errno::EPROTONOSUPPORT
-        })?;
+        // Like Linux, reject a number outside the IP protocol space as
+        // invalid, and one inside it that has no socket as unsupported.
+        if !(0..IPPROTO_MAX).contains(&protocol) {
+            return Err(Errno::EINVAL);
+        }
+        let protocol = u8::try_from(protocol)
+            .ok()
+            .and_then(|protocol| IPProtocol::try_from(protocol).ok())
+            .ok_or_else(|| {
+                log_unsupported!("protocol = {protocol}");
+                Errno::EPROTONOSUPPORT
+            })?;
         let protocol = match (ty, protocol) {
             (SockType::Stream, IPProtocol::Default | IPProtocol::TCP) => IpProtocol::Tcp,
             (SockType::Datagram, IPProtocol::Default | IPProtocol::UDP) => IpProtocol::Udp,
@@ -163,7 +173,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             (SockType::Raw, _) => return Err(Errno::EPERM),
             _ => return Err(Errno::ESOCKTNOSUPPORT),
         };
-        let socket = litebox.create_inet_socket_with_protocol(protocol, open_flags(flags))?;
+        let socket = litebox.create_inet_socket(protocol, open_flags(flags))?;
         Ok(socket.into())
     }
 
@@ -188,13 +198,10 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
     pub(super) fn receive_plan(&self, flags: ReceiveFlags) -> Result<ReceivePlan, Errno> {
         let is_stream = self.is_stream();
         if flags.contains(ReceiveFlags::ERRQUEUE) {
-            // IP_RECVERR has no backing extended-error queue. Never block on
-            // (or consume) an ordinary datagram in response to MSG_ERRQUEUE.
-            return Err(if is_stream {
-                Errno::EINVAL
-            } else {
-                Errno::EAGAIN
-            });
+            // IP_RECVERR has no backing extended-error queue, which Linux
+            // reports for any IP socket as EAGAIN. Never block on (or consume)
+            // ordinary data in response to MSG_ERRQUEUE.
+            return Err(Errno::EAGAIN);
         }
         let wait_all = flags.contains(ReceiveFlags::WAITALL)
             && !flags.contains(ReceiveFlags::PEEK)
@@ -467,7 +474,8 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             PEEK,
         );
         receive_flags.set(inet_socket::ReceiveFlags::WAITALL, wait_all);
-        // `MSG_TRUNC` reports a datagram's full length, but discards stream data.
+        // `MSG_TRUNC` reads a datagram's full length (see `report_full_length_on_trunc`), but
+        // discards stream data.
         if flags.contains(ReceiveFlags::TRUNC) {
             receive_flags.insert(if is_stream {
                 inet_socket::ReceiveFlags::DISCARD
@@ -747,13 +755,15 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                     if self.is_stream() {
                         return Err(Errno::EOPNOTSUPP);
                     }
-                    let socket::SocketOptionValue::ReceiveExtendedErrors(enabled) = self
+                    match self
                         .socket
                         .get_option(socket::SocketOptionName::ReceiveExtendedErrors)?
-                    else {
-                        return Err(Errno::EIO);
-                    };
-                    u32::from(enabled)
+                    {
+                        socket::SocketOptionValue::ReceiveExtendedErrors(enabled) => {
+                            u32::from(enabled)
+                        }
+                        value => unreachable!("{value:?} is not IP_RECVERR"),
+                    }
                 }
                 _ => return Err(Errno::EOPNOTSUPP),
             },
@@ -846,17 +856,9 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     pub(super) fn adopt_inherited_inet_socket(
         &self,
         handle: ObjectHandle,
-        kind: InheritedFdKind,
+        protocol: IpProtocol,
     ) -> Result<InetSocketFd<Platform>, ProcessError> {
-        let socket = match kind {
-            InheritedFdKind::InetSocket { socket_type } => self
-                .litebox
-                .adopt_inherited_inet_socket(handle, socket_type)?,
-            InheritedFdKind::IcmpEchoSocket => self
-                .litebox
-                .adopt_inherited_inet_socket_with_protocol(handle, IpProtocol::IcmpEcho)?,
-            _ => unreachable!("not an internet socket"),
-        };
+        let socket = self.litebox.adopt_inherited_inet_socket(handle, protocol)?;
         Ok(self
             .litebox
             .descriptor_table_mut()
@@ -927,7 +929,7 @@ mod tests {
     #[test]
     fn ping_socket_receives_echo() {
         let task = init_platform();
-        let icmp = litebox_common_linux::IPProtocol::ICMP as u8;
+        let icmp = litebox_common_linux::IPProtocol::ICMP as i32;
         let fd = task
             .do_socket(
                 AddressFamily::INET,
@@ -1437,7 +1439,7 @@ mod tests {
                 } else {
                     SockFlags::empty()
                 },
-                litebox_common_linux::IPProtocol::UDP as u8,
+                litebox_common_linux::IPProtocol::UDP as i32,
             )
             .expect("failed to create server socket");
         let server_fd = typed_socket(task, raw_server_fd);
@@ -1458,7 +1460,7 @@ mod tests {
                 AddressFamily::INET,
                 SockType::Datagram,
                 SockFlags::empty(),
-                litebox_common_linux::IPProtocol::UDP as u8,
+                litebox_common_linux::IPProtocol::UDP as i32,
             )
             .expect("failed to create client socket");
         let client_fd = typed_socket(task, raw_client_fd);
@@ -1587,7 +1589,7 @@ mod tests {
                 AddressFamily::INET,
                 SockType::Datagram,
                 SockFlags::empty(),
-                litebox_common_linux::IPProtocol::UDP as u8,
+                litebox_common_linux::IPProtocol::UDP as i32,
             )
             .expect("failed to create client socket");
         let client_fd = typed_socket(&task, raw_client_fd);
