@@ -20,6 +20,7 @@ extern crate std;
 
 pub mod authority;
 mod channel;
+pub mod descriptor;
 mod error;
 pub mod event;
 pub mod fs;
