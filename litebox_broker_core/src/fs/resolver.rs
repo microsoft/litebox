@@ -801,8 +801,8 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             .union(OFlags::APPEND)
             .union(OFlags::PATH);
 
-        if flags.intersects(CURRENTLY_SUPPORTED_OFLAGS.complement()) {
-            unimplemented!("{flags:?}")
+        if !CURRENTLY_SUPPORTED_OFLAGS.contains(flags) {
+            return Err(OpenError::InvalidFlags);
         }
         let path_only = flags.contains(OFlags::PATH);
         if path_only {
@@ -811,6 +811,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         }
 
+        let (read_allowed, write_allowed) = match flags & (OFlags::WRONLY | OFlags::RDWR) {
+            OFlags::RDONLY => (true, false),
+            OFlags::WRONLY => (false, true),
+            OFlags::RDWR => (true, true),
+            _ => return Err(OpenError::InvalidFlags),
+        };
         let path = self
             .resolve_path(
                 &context,
@@ -822,9 +828,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 WalkError::Io => OpenError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
-        let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
-        let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
         let append_mode = flags.contains(OFlags::APPEND);
         let nonblocking = flags.contains(OFlags::NONBLOCK);
         let entry = |handle, seek_behavior| ResolverEntry {
@@ -2149,12 +2152,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         }
     }
 
-    /// Returns the host shared object holding an open file's contents, for a `MAP_SHARED`
-    /// mapping, and whether it may be mapped writable.
+    /// Returns the right to map the host shared object holding an open file's contents, for a
+    /// `MAP_SHARED` mapping.
     ///
     /// The file must be open for reading, and the object may be mapped writable exactly when the
     /// file is open for writing too, as Linux allows of a shared mapping that `mprotect` may
-    /// later make writable.
+    /// later make writable. Holders of the returned right can only narrow it.
     ///
     /// On a resolver built with [`Self::with_credentials`], the object may never be mapped
     /// writable: stores through a mapping change contents without the resolver, so nothing would
@@ -2176,10 +2179,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             return Err(MapSharedError::NotForReading);
         }
         let file = self.backend.map_shared(file)?;
-        Ok(super::shared_storage::SharedMapping {
+        Ok(super::shared_storage::SharedMapping::new(
             file,
-            writable: entry.write_allowed && self.profile.is_none(),
-        })
+            entry.write_allowed && self.profile.is_none(),
+        ))
     }
 }
 

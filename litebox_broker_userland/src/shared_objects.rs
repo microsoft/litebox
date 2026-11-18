@@ -7,32 +7,30 @@ use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 
 use litebox_broker_core::BrokerProcess;
 use litebox_broker_core::fs::errors::MapSharedError;
-use litebox_broker_core::fs::shared_storage::{HostHandle, SharedFileObject};
+use litebox_broker_core::fs::shared_storage::{HostHandle, SharedMapping};
 use litebox_broker_host::RequestFailure;
 use litebox_broker_protocol::fs::{FileError, MapFileRequest, MapFileResponse};
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 
 /// Delivers host shared objects to the runner of one association.
 pub trait SharedObjectDelivery: Send + Sync {
-    /// Delivers `object` to the runner, readable and, if `writable` is set, writable, returning
-    /// the token the runner takes it with. The runner maps it up to `end`, a byte offset that
-    /// may lie past the end of the file.
+    /// Delivers the object `mapping` allows mapping to the runner, readable and, if `mapping`
+    /// allows it, writable, returning the token the runner takes it with. The runner maps it up
+    /// to `end`, a byte offset that may lie past the end of the file.
     ///
-    /// Fails with [`ErrorKind::Unsupported`] if this deployment cannot deliver `object` at all,
-    /// which the runner sees as a file it cannot share.
-    fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64>;
+    /// Fails with [`ErrorKind::Unsupported`] if this deployment cannot deliver the object at
+    /// all, which the runner sees as a file it cannot share.
+    fn deliver(&self, mapping: &SharedMapping, end: u64) -> IoResult<u64>;
 }
 
-/// Returns `object`'s host handle for delivering it with `writable` rights.
+/// Returns a host handle for delivering the object `mapping` allows mapping up to `end`, with
+/// only the rights it allows.
 #[cfg_attr(
     not(any(target_os = "linux", all(windows, target_arch = "x86_64"))),
     expect(dead_code, reason = "only deployments that deliver objects use this")
 )]
-fn host_handle(
-    object: &dyn SharedFileObject,
-    writable: bool,
-) -> IoResult<Box<dyn HostHandle + '_>> {
-    object.host_handle(writable).map_err(|error| match error {
+fn host_handle(mapping: &SharedMapping, end: u64) -> IoResult<Box<dyn HostHandle + '_>> {
+    mapping.host_handle(end).map_err(|error| match error {
         MapSharedError::Unsupported => IoError::new(ErrorKind::Unsupported, error),
         error => IoError::other(error),
     })
@@ -53,11 +51,11 @@ pub fn handle_map_file<Delivery: SharedObjectDelivery>(
     let response = match litebox_broker_core::fs::map_shared(process, handle) {
         Err(error) => return Some(Err(RequestFailure::from(error))),
         Ok(Err(error)) => FileResponse::Failed(error),
-        Ok(Ok(mapping)) => match delivery.deliver(&*mapping.object, mapping.writable, end) {
+        Ok(Ok(mapping)) => match delivery.deliver(mapping.mapping(), end) {
             Ok(token) => FileResponse::Map(MapFileResponse {
-                memory: mapping.memory_id,
+                memory: mapping.memory_id(),
                 token,
-                writable: mapping.writable,
+                writable: mapping.writable(),
             }),
             Err(error) => {
                 litebox_util_log::warn!(error:% = error; "failed to deliver a shared file");

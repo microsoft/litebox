@@ -770,8 +770,11 @@ pub fn truncate(
     }
 }
 
-/// Returns the host shared object holding a broker-owned open file's contents, so that the
-/// caller can map the file `MAP_SHARED`, and the ID naming it for futexes.
+/// Returns the right to map the host shared object holding a broker-owned open file's contents,
+/// so that the caller can map the file `MAP_SHARED`, and the ID naming it for futexes.
+///
+/// The object may be mapped writable only if both the file and the reference `handle` allow
+/// writing.
 ///
 /// Fails with [`FileError::NoSuchDevice`] if the file system cannot share the file's pages.
 pub fn map_shared(
@@ -782,19 +785,12 @@ pub fn map_shared(
     let handle_writable = process
         .authorized_object(handle, ObjectRights::WRITE)
         .is_ok();
-    let SharedMapping {
-        file: shared,
-        writable: file_writable,
-    } = match file.state.map_shared()? {
-        Ok(mapping) => mapping,
+    let mapping = match file.state.map_shared()? {
+        Ok(mapping) => mapping.restrict(handle_writable),
         Err(error) => return Ok(Err(error)),
     };
-    let memory_id = shared.memory_id(|| crate::shared_futex::issue_shared_memory_id(process))?;
-    Ok(Ok(SharedFileMapping {
-        memory_id,
-        object: Arc::clone(shared.object()),
-        writable: handle_writable && file_writable,
-    }))
+    let memory_id = mapping.memory_id(|| crate::shared_futex::issue_shared_memory_id(process))?;
+    Ok(Ok(SharedFileMapping::new(memory_id, mapping)))
 }
 
 /// Applies an advisory whole-file lock to a broker-owned open file description.
@@ -1145,6 +1141,7 @@ fn file_path_error(error: PathError) -> FileError {
 
 fn file_open_error(error: OpenError) -> FileError {
     match error {
+        OpenError::InvalidFlags => FileError::InvalidArgument,
         OpenError::AccessNotAllowed => FileError::AccessNotAllowed,
         OpenError::NoWritePerms => FileError::NoWritePermissions,
         OpenError::ReadOnlyFileSystem => FileError::ReadOnlyFs,

@@ -3751,7 +3751,7 @@ mod shared_mapping {
     use super::{InMem, InodeAllocators, Mode, OFlags, ROOT, Resolver, TestPlatform, USER};
     use crate::fs::errors::{MapSharedError, OpenError, StorageError, TruncateError, WriteError};
     use crate::fs::in_mem::InitialNode;
-    use crate::fs::shared_storage::test_memory::VecMemoryProvider;
+    use crate::fs::shared_storage::test_memory::{VecMemoryProvider, exported_writable};
     use crate::fs::shared_storage::{
         DEFAULT_MAX_SHARED_FILES, SharedFileLimit, SharedFileMemory, SharedMapping,
     };
@@ -3782,11 +3782,8 @@ mod shared_mapping {
             .unwrap();
         fs.write(&mut fd, b"hello", None).unwrap();
 
-        let SharedMapping {
-            file: mapping,
-            writable,
-        } = fs.map_shared(&fd).unwrap();
-        assert!(writable);
+        let mapping = fs.map_shared(&fd).unwrap();
+        assert!(mapping.writable());
         let memory = provider.last();
         assert_eq!(memory.contents(), b"hello");
 
@@ -3821,19 +3818,19 @@ mod shared_mapping {
         let fd = fs
             .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
             .unwrap();
-        let SharedMapping {
-            file: again,
-            writable,
-        } = fs.map_shared(&fd).unwrap();
-        assert!(!writable);
-        assert!(Arc::ptr_eq(&again, &mapping));
+        let again = fs.map_shared(&fd).unwrap();
+        assert!(!again.writable());
+        assert!(Arc::ptr_eq(again.file(), mapping.file()));
 
         let fd = fs
             .open(ROOT, "/file", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
             .unwrap();
         assert_eq!(memory.contents(), b"");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 0);
-        assert!(Arc::ptr_eq(&fs.map_shared(&fd).unwrap().file, &mapping));
+        assert!(Arc::ptr_eq(
+            fs.map_shared(&fd).unwrap().file(),
+            mapping.file()
+        ));
     }
 
     #[test]
@@ -3876,7 +3873,7 @@ mod shared_mapping {
                 .unwrap()
         };
         let (first, second, third) = (open("/first"), open("/second"), open("/third"));
-        let mapping = fs.map_shared(&first).unwrap().file;
+        let mapping = fs.map_shared(&first).unwrap();
         fs.map_shared(&second).unwrap();
         assert_eq!(limit.live(), 2);
         assert!(matches!(
@@ -3960,7 +3957,7 @@ mod shared_mapping {
             .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
             .unwrap();
         let upper = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
-        let mapping = fs.map_shared(&upper).unwrap().file;
+        let mapping = fs.map_shared(&upper).unwrap();
         let bytes = provider.last().contents();
         assert_eq!(bytes.len(), 8);
 
@@ -3968,12 +3965,9 @@ mod shared_mapping {
         let mut read = vec![0; 8];
         assert_eq!(fs.read(&mut lower, &mut read, Some(0)).unwrap(), 8);
         assert_eq!(read, bytes);
-        let SharedMapping {
-            file: followed,
-            writable,
-        } = fs.map_shared(&lower).unwrap();
-        assert!(!writable);
-        assert!(Arc::ptr_eq(&followed, &mapping));
+        let followed = fs.map_shared(&lower).unwrap();
+        assert!(!followed.writable());
+        assert!(Arc::ptr_eq(followed.file(), mapping.file()));
 
         let mut reopened = fs
             .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
@@ -3981,8 +3975,8 @@ mod shared_mapping {
         assert_eq!(fs.read(&mut reopened, &mut read, Some(0)).unwrap(), 8);
         assert_eq!(read, bytes);
         assert!(Arc::ptr_eq(
-            &fs.map_shared(&reopened).unwrap().file,
-            &mapping
+            fs.map_shared(&reopened).unwrap().file(),
+            mapping.file()
         ));
     }
 
@@ -4096,6 +4090,56 @@ mod shared_mapping {
         assert_eq!(memory.contents(), b"testfoo\n\0\0ab");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 12);
     }
+
+    #[test]
+    fn mapping_rights_bound_the_exported_object_and_only_narrow() {
+        let (fs, _provider) = shared_in_mem();
+        let fs = Resolver::<TestPlatform, _>::new(fs);
+        let writer = fs
+            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        let reader = fs
+            .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let exported_writable =
+            |mapping: &SharedMapping| exported_writable(&*mapping.host_handle(4096).unwrap());
+
+        let mapping = fs.map_shared(&writer).unwrap();
+        assert!(mapping.writable() && exported_writable(&mapping));
+        let narrowed = mapping.clone().restrict(false);
+        assert!(!narrowed.writable() && !exported_writable(&narrowed));
+        let widened = narrowed.restrict(true);
+        assert!(!widened.writable() && !exported_writable(&widened));
+        let read_only = fs.map_shared(&reader).unwrap();
+        assert!(!read_only.writable() && !exported_writable(&read_only));
+        let kept = read_only.restrict(true);
+        assert!(!kept.writable() && !exported_writable(&kept));
+        // The original right is unchanged by narrowing a copy of it.
+        assert!(mapping.writable() && exported_writable(&mapping));
+    }
+
+    #[test]
+    fn unchecked_truncation_may_shrink_mapped_files_non_atomically() {
+        let provider = Arc::new(VecMemoryProvider::new(false).refusing_atomic_shrink());
+        let fs = Resolver::<TestPlatform, _>::new(
+            InMem::<TestPlatform>::new(InodeAllocators::new().next()).with_shared_memory(
+                provider.clone(),
+                Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+            ),
+        );
+        let mut fd = fs
+            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .unwrap();
+        fs.write(&mut fd, b"hello", None).unwrap();
+        fs.map_shared(&fd).unwrap();
+        let memory = provider.last();
+
+        fs.truncate(&mut fd, 2, false).unwrap();
+        assert_eq!(memory.contents(), b"he");
+        fs.open(ROOT, "/file", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .unwrap();
+        assert_eq!(memory.contents(), b"");
+    }
 }
 
 /// Resolvers that authorize subjects through broker-owned descriptors.
@@ -4116,7 +4160,7 @@ mod credentials {
     };
     use crate::fs::in_mem::InitialNode;
     use crate::fs::resolver::{Caller, ResolverEntry};
-    use crate::fs::shared_storage::test_memory::VecMemoryProvider;
+    use crate::fs::shared_storage::test_memory::{VecMemoryProvider, exported_writable};
     use crate::fs::shared_storage::{DEFAULT_MAX_SHARED_FILES, SharedFileLimit};
     use crate::fs::{FileTimeUpdate, FileTimestamp, SetFileTimes};
     use crate::random::TestRandomProvider;
@@ -4514,6 +4558,18 @@ mod credentials {
             fs.unlink(finder.caller(), "/drop/file"),
             Err(UnlinkError::NoWritePerms)
         ));
+    }
+
+    #[test]
+    fn invalid_open_flags_are_rejected_before_path_resolution() {
+        let carol = Credentials::new(CAROL);
+        let fs = in_mem([("/", dir(ALL, posix(CAROL)))]);
+        for flags in [OFlags::WRONLY | OFlags::RDWR, OFlags::ASYNC] {
+            assert!(matches!(
+                fs.open(carol.caller(), "/missing/file", flags, Mode::empty()),
+                Err(OpenError::InvalidFlags)
+            ));
+        }
     }
 
     #[test]
@@ -5236,7 +5292,64 @@ mod credentials {
         fs.write_as(alice.caller(), &mut entry, b"data", None)
             .unwrap();
         let mapping = fs.map_shared(&entry).unwrap();
-        assert!(!mapping.writable);
+        assert!(!mapping.writable());
+        assert!(!exported_writable(&*mapping.host_handle(4).unwrap()));
+    }
+
+    #[test]
+    fn checked_truncation_of_mapped_files_changes_all_or_nothing() {
+        let (alice, bob) = (Credentials::new(ALICE), Credentials::new(BOB));
+        let manager = Credentials::with_privileges(ALICE, Privileges::MANAGE_ELEVATION);
+        // The memory can be shrunk while mapped only by a fallback that could fail partway.
+        let provider = Arc::new(VecMemoryProvider::new(false).refusing_atomic_shrink());
+        let fs = Resolver::<TestPlatform, _>::with_credentials(
+            InMem::<TestPlatform>::new_initialized(
+                [("/", dir(ALL, posix(CAROL)))],
+                InodeAllocators::new().next(),
+            )
+            .with_shared_memory(
+                provider.clone(),
+                Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+            ),
+            profile(),
+        );
+        let elevated = ALL | Mode::SUID;
+        create(&fs, &alice, "/program", elevated);
+        let mut entry = fs
+            .open(bob.caller(), "/program", OFlags::RDWR, Mode::empty())
+            .unwrap();
+        fs.write_as(manager.caller(), &mut entry, b"data", None)
+            .unwrap();
+        fs.map_shared(&entry).unwrap();
+        let memory = provider.last();
+        let mode = || status(&fs, "/program").0;
+
+        // Refused shrinking changes neither the contents nor the grants.
+        assert!(matches!(
+            fs.truncate_as(bob.caller(), &mut entry, 1, false),
+            Err(TruncateError::Busy)
+        ));
+        assert!(matches!(
+            fs.truncate_without_position_update_as(bob.caller(), &entry, 0),
+            Err(TruncateError::Busy)
+        ));
+        assert!(matches!(
+            fs.open(
+                bob.caller(),
+                "/program",
+                OFlags::RDWR | OFlags::TRUNC,
+                Mode::empty()
+            ),
+            Err(OpenError::TruncateError(TruncateError::Busy))
+        ));
+        assert_eq!(memory.contents(), b"data");
+        assert_eq!(fs.handle_status(&entry).unwrap().size, 4);
+        assert_eq!(mode(), elevated);
+
+        // Growing completes, so it removes the grants.
+        fs.truncate_as(bob.caller(), &mut entry, 6, false).unwrap();
+        assert_eq!(memory.contents(), b"data\0\0");
+        assert_eq!(mode(), ALL);
     }
 
     #[test]

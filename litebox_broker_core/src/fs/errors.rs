@@ -14,6 +14,8 @@ use crate::BrokerError;
 /// Possible errors from [`super::resolver::Resolver::open`]
 #[derive(Error, Debug)]
 pub enum OpenError {
+    #[error("unsupported open flags or access mode")]
+    InvalidFlags,
     #[error("requested access to the file is not allowed")]
     AccessNotAllowed,
     #[error("the parent directory does not allow write permission")]

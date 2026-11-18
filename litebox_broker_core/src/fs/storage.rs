@@ -73,6 +73,14 @@ pub trait FileStorageMut: FileStorage {
 
     /// Truncates or zero-extends the contents to `len` bytes.
     fn set_len(&mut self, len: usize) -> Result<(), StorageError>;
+
+    /// Truncates or zero-extends the contents to `len` bytes as [`Self::set_len`] does, or fails
+    /// without changing them.
+    ///
+    /// Storage whose [`Self::set_len`] could change some bytes and then fail, such as by zeroing
+    /// a tail that the host cannot cut off, must refuse instead, with [`StorageError::Busy`] when
+    /// the host is what stops it.
+    fn set_len_atomically(&mut self, len: usize) -> Result<(), StorageError>;
 }
 
 /// Heap-backed storage that keeps borrowed static data borrowed until the first write.
@@ -134,6 +142,11 @@ impl FileStorageMut for MemoryStorage {
             data => data.to_mut().resize(len, 0),
         }
         Ok(())
+    }
+
+    /// Resizing never fails partway.
+    fn set_len_atomically(&mut self, len: usize) -> Result<(), StorageError> {
+        self.set_len(len)
     }
 }
 

@@ -595,6 +595,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     }
 
     /// [`Self::truncate_file`], for a file whose lock the caller holds.
+    ///
+    /// A truncation with a `content_change` either completes or changes nothing, so that
+    /// contents never change without it (see [`FileStorageMut::set_len_atomically`]).
     fn truncate_locked(
         file: &mut FileData,
         length: usize,
@@ -604,9 +607,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             // XXX(jayb): consider a `TruncateError::NotAFile` variant.
             unreachable!("symlinks are only opened path-only, which the resolver never truncates")
         };
-        storage.set_len(length)?;
-        if let Some(content_change) = content_change {
-            content_change(&mut file.descriptor);
+        match content_change {
+            Some(content_change) => {
+                storage.set_len_atomically(length)?;
+                content_change(&mut file.descriptor);
+            }
+            None => storage.set_len(length)?,
         }
         Ok(())
     }

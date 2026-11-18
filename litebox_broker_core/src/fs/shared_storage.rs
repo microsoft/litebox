@@ -31,9 +31,21 @@ pub trait HostHandle: Send {
 }
 
 /// A host object whose pages are one file's contents.
+///
+/// The object itself may do anything to the file's memory, so it is handed out only as a
+/// [`SharedMapping`], which bounds what its exports allow.
 pub trait SharedFileObject: Send + Sync {
-    /// Returns a host handle for exporting the object, writable only if `writable` is set.
-    fn host_handle(&self, writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError>;
+    /// Returns a host handle for exporting the object, through which it can be mapped up to
+    /// `end`, a byte offset that may lie past the end of the file, and written only if
+    /// `writable` is set.
+    ///
+    /// The handle itself must carry no more rights than that, whoever holds it: never, for
+    /// example, a writable handle to the host file holding the contents for a read-only export.
+    fn host_handle(
+        &self,
+        writable: bool,
+        end: u64,
+    ) -> Result<Box<dyn HostHandle + '_>, MapSharedError>;
 }
 
 /// Host memory that holds one file's contents, as two views of the same host object.
@@ -110,11 +122,6 @@ impl SharedFile {
         }
     }
 
-    /// Returns the host object holding the file's contents.
-    pub fn object(&self) -> &Arc<dyn SharedFileObject> {
-        &self.object
-    }
-
     /// Returns the ID naming the object, issuing it with `issue` the first time.
     pub(crate) fn memory_id<E>(
         &self,
@@ -124,30 +131,92 @@ impl SharedFile {
     }
 }
 
-/// A file's host shared object as one descriptor may map it.
+/// The right to map a file's host shared object, read-only or also writable.
+///
+/// Holders reach the object only through [`Self::host_handle`], which exports it with no more
+/// rights than this allows, and can only narrow those rights, never widen them.
+#[derive(Clone)]
 pub struct SharedMapping {
-    /// The file's host shared object.
-    pub file: Arc<SharedFile>,
-    /// Whether the descriptor may map the object writable.
-    pub writable: bool,
+    file: Arc<SharedFile>,
+    writable: bool,
+}
+
+impl SharedMapping {
+    /// Allows mapping `file`, writable if `writable` is set.
+    pub fn new(file: Arc<SharedFile>, writable: bool) -> Self {
+        Self { file, writable }
+    }
+
+    /// Returns whether the object may be mapped writable.
+    pub fn writable(&self) -> bool {
+        self.writable
+    }
+
+    /// Allows mapping the object writable only if both this and `writable` allow it.
+    #[must_use]
+    pub fn restrict(self, writable: bool) -> Self {
+        Self {
+            writable: self.writable && writable,
+            ..self
+        }
+    }
+
+    /// Returns a host handle through which the object can be mapped up to `end`, a byte offset
+    /// that may lie past the end of the file, with only the rights this allows (see
+    /// [`SharedFileObject::host_handle`]).
+    pub fn host_handle(&self, end: u64) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
+        self.file.object.host_handle(self.writable, end)
+    }
+
+    /// Returns the ID naming the object, issuing it with `issue` the first time.
+    pub(crate) fn memory_id<E>(
+        &self,
+        issue: impl FnOnce() -> Result<SharedMemoryId, E>,
+    ) -> Result<SharedMemoryId, E> {
+        self.file.memory_id(issue)
+    }
+
+    /// Returns the file whose object this maps.
+    #[cfg(test)]
+    pub(crate) fn file(&self) -> &Arc<SharedFile> {
+        &self.file
+    }
 }
 
 /// A file's host shared object, as returned to a runner that maps the file.
 #[derive(Clone)]
 pub struct SharedFileMapping {
-    /// Names the object, the same for every process that maps the file.
-    pub memory_id: SharedMemoryId,
-    /// The host object holding the file's contents, for the deployment to deliver.
-    pub object: Arc<dyn SharedFileObject>,
-    /// Whether the runner may map the object writable.
-    pub writable: bool,
+    memory_id: SharedMemoryId,
+    mapping: SharedMapping,
+}
+
+impl SharedFileMapping {
+    /// Maps the object `mapping` allows, named by `memory_id`.
+    pub(crate) fn new(memory_id: SharedMemoryId, mapping: SharedMapping) -> Self {
+        Self { memory_id, mapping }
+    }
+
+    /// Returns the ID naming the object, the same for every process that maps the file.
+    pub fn memory_id(&self) -> SharedMemoryId {
+        self.memory_id
+    }
+
+    /// Returns the right to map the object, for the deployment to deliver.
+    pub fn mapping(&self) -> &SharedMapping {
+        &self.mapping
+    }
+
+    /// Returns whether the runner may map the object writable.
+    pub fn writable(&self) -> bool {
+        self.mapping.writable
+    }
 }
 
 impl core::fmt::Debug for SharedFileMapping {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SharedFileMapping")
             .field("memory_id", &self.memory_id)
-            .field("writable", &self.writable)
+            .field("writable", &self.mapping.writable)
             .finish_non_exhaustive()
     }
 }
@@ -225,6 +294,10 @@ impl FileStorageMut for SharedStorage {
     fn set_len(&mut self, len: usize) -> Result<(), StorageError> {
         self.storage.set_len(len)
     }
+
+    fn set_len_atomically(&mut self, len: usize) -> Result<(), StorageError> {
+        self.storage.set_len_atomically(len)
+    }
 }
 
 #[cfg(test)]
@@ -248,6 +321,7 @@ pub(crate) mod test_memory {
     pub(crate) struct VecMemory {
         data: Mutex<Vec<u8>>,
         refuse_shrink: bool,
+        refuse_atomic_shrink: bool,
         capacity: usize,
     }
 
@@ -300,8 +374,12 @@ pub(crate) mod test_memory {
 
         /// Resizes as [`FileStorageMut::set_len`] does.
         pub(crate) fn set_len(&self, len: usize) -> Result<(), StorageError> {
+            self.resize(len, false)
+        }
+
+        fn resize(&self, len: usize, atomically: bool) -> Result<(), StorageError> {
             let mut data = self.data.lock();
-            if self.refuse_shrink && len < data.len() {
+            if (self.refuse_shrink || atomically && self.refuse_atomic_shrink) && len < data.len() {
                 return Err(StorageError::Busy);
             }
             if len > self.capacity {
@@ -338,21 +416,47 @@ pub(crate) mod test_memory {
         }
 
         fn set_len(&mut self, len: usize) -> Result<(), StorageError> {
-            self.0.set_len(len)
+            self.0.resize(len, false)
+        }
+
+        fn set_len_atomically(&mut self, len: usize) -> Result<(), StorageError> {
+            self.0.resize(len, true)
         }
     }
 
     struct VecObject;
 
     impl SharedFileObject for VecObject {
-        fn host_handle(&self, _writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
-            Err(MapSharedError::Unsupported)
+        fn host_handle(
+            &self,
+            writable: bool,
+            _end: u64,
+        ) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
+            Ok(Box::new(VecHandle { writable }))
         }
+    }
+
+    /// A handle that names only the rights it was exported with, as [`exported_writable`]
+    /// tells.
+    struct VecHandle {
+        writable: bool,
+    }
+
+    impl HostHandle for VecHandle {
+        fn raw(&self) -> u64 {
+            u64::from(self.writable)
+        }
+    }
+
+    /// Returns whether `handle`, exported by [`VecMemoryProvider`] memory, allows writing.
+    pub(crate) fn exported_writable(handle: &dyn HostHandle) -> bool {
+        handle.raw() != 0
     }
 
     /// Creates vector memory, and remembers it for tests to access as a runner would.
     pub(crate) struct VecMemoryProvider {
         refuse_shrink: bool,
+        refuse_atomic_shrink: bool,
         capacity: usize,
         created: Mutex<Vec<Arc<VecMemory>>>,
     }
@@ -362,9 +466,17 @@ pub(crate) mod test_memory {
         pub(crate) fn new(refuse_shrink: bool) -> Self {
             Self {
                 refuse_shrink,
+                refuse_atomic_shrink: false,
                 capacity: usize::MAX,
                 created: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Makes memory refuse shrinking atomically, as memory that a host shrinks while it is
+        /// mapped only with a fallback that could fail partway does.
+        pub(crate) fn refusing_atomic_shrink(mut self) -> Self {
+            self.refuse_atomic_shrink = true;
+            self
         }
 
         /// Makes memory run out of space when growing past `capacity` bytes.
@@ -384,6 +496,7 @@ pub(crate) mod test_memory {
             let memory = Arc::new(VecMemory {
                 data: Mutex::new(Vec::new()),
                 refuse_shrink: self.refuse_shrink,
+                refuse_atomic_shrink: self.refuse_atomic_shrink,
                 capacity: self.capacity,
             });
             self.created.lock().push(Arc::clone(&memory));

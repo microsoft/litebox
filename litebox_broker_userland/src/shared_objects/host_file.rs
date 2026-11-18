@@ -31,14 +31,20 @@ pub(super) trait HostFile: Default + Send + Sync + 'static {
         read_to_host_end::<Self>(file, offset, buffer)
     }
 
-    /// Resizes the file to `length` bytes.
-    fn resize(&mut self, file: &File, length: u64) -> Result<(), StorageError>;
+    /// Resizes the file to `length` bytes, either completely or, if `atomically` is set,
+    /// without changing any bytes on failure (see [`FileStorageMut::set_len_atomically`]).
+    fn resize(&mut self, file: &File, length: u64, atomically: bool) -> Result<(), StorageError>;
 
     /// Records a write that ended at `end`.
     fn after_write(&mut self, _end: u64) {}
 
-    /// Returns a handle for exporting `file`, writable only if `writable` is set.
-    fn export(file: &File, writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError>;
+    /// Returns a handle for exporting `file`, to be mapped up to `end` and written only if
+    /// `writable` is set, as [`SharedFileObject::host_handle`] describes.
+    fn export(
+        file: &File,
+        writable: bool,
+        end: u64,
+    ) -> Result<Box<dyn HostHandle + '_>, MapSharedError>;
 
     /// Returns the most bytes the host lets the broker's files hold.
     fn size_limit() -> u64;
@@ -113,13 +119,19 @@ impl<H: HostFile> HostFileStorage<H> {
         Ok(written)
     }
 
-    /// Resizes like [`FileStorageMut::set_len`], but to at most `limit` bytes.
-    fn set_len_limited(&mut self, length: usize, limit: u64) -> Result<(), StorageError> {
+    /// Resizes like [`FileStorageMut::set_len`], or [`FileStorageMut::set_len_atomically`] if
+    /// `atomically` is set, but to at most `limit` bytes.
+    fn set_len_limited(
+        &mut self,
+        length: usize,
+        limit: u64,
+        atomically: bool,
+    ) -> Result<(), StorageError> {
         let length = u64::try_from(length)
             .ok()
             .filter(|length| *length <= limit)
             .ok_or(StorageError::NoSpace)?;
-        self.host.resize(&self.file, length)
+        self.host.resize(&self.file, length, atomically)
     }
 }
 
@@ -139,7 +151,11 @@ impl<H: HostFile> FileStorageMut for HostFileStorage<H> {
     }
 
     fn set_len(&mut self, length: usize) -> Result<(), StorageError> {
-        self.set_len_limited(length, H::size_limit())
+        self.set_len_limited(length, H::size_limit(), false)
+    }
+
+    fn set_len_atomically(&mut self, length: usize) -> Result<(), StorageError> {
+        self.set_len_limited(length, H::size_limit(), true)
     }
 }
 
@@ -147,8 +163,12 @@ impl<H: HostFile> FileStorageMut for HostFileStorage<H> {
 struct HostFileObject<H>(Arc<File>, PhantomData<fn() -> H>);
 
 impl<H: HostFile> SharedFileObject for HostFileObject<H> {
-    fn host_handle(&self, writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
-        H::export(&self.0, writable)
+    fn host_handle(
+        &self,
+        writable: bool,
+        end: u64,
+    ) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
+        H::export(&self.0, writable, end)
     }
 }
 
@@ -344,9 +364,14 @@ pub(super) mod tests {
             memory.write_limited(4, &b"!".as_slice(), 4),
             Err(StorageError::NoSpace)
         );
-        assert_eq!(memory.set_len_limited(5, 4), Err(StorageError::NoSpace));
+        for atomically in [false, true] {
+            assert_eq!(
+                memory.set_len_limited(5, 4, atomically),
+                Err(StorageError::NoSpace)
+            );
+        }
         assert_eq!(memory.len(), Ok(4));
-        memory.set_len_limited(4, 4).unwrap();
+        memory.set_len_limited(4, 4, false).unwrap();
         let mut bytes = [0; 4];
         assert_eq!(memory.read_at(0, &mut bytes.as_mut_slice()), Ok(4));
         assert_eq!(&bytes, b"heab");
@@ -357,6 +382,10 @@ pub(super) mod tests {
             Err(StorageError::NoSpace)
         );
         assert_eq!(memory.set_len(usize::MAX), Err(StorageError::NoSpace));
+        assert_eq!(
+            memory.set_len_atomically(usize::MAX),
+            Err(StorageError::NoSpace)
+        );
         assert_eq!(
             memory.read_at(usize::MAX - 1, &mut bytes.as_mut_slice()),
             Ok(0)
@@ -411,5 +440,12 @@ pub(super) mod tests {
         assert_eq!(memory.len().unwrap(), 2);
         assert_eq!(memory.read_at(1, &mut bytes.as_mut_slice()).unwrap(), 1);
         assert_eq!(memory.read_at(4, &mut bytes.as_mut_slice()).unwrap(), 0);
+
+        // Unmapped memory resizes atomically just the same.
+        memory.set_len_atomically(4).unwrap();
+        assert_eq!(memory.read_at(0, &mut bytes.as_mut_slice()).unwrap(), 4);
+        assert_eq!(&bytes[..4], b"h\0\0\0");
+        memory.set_len_atomically(1).unwrap();
+        assert_eq!(memory.len().unwrap(), 1);
     }
 }
