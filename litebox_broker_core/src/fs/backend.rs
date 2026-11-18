@@ -241,7 +241,8 @@ pub trait Backend: Send + Sync + Any {
         metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError>;
 
-    /// Remove `name` after the resolver authorizes search and write access to `parent`.
+    /// Remove a non-directory `name` after the resolver authorizes search and write access to
+    /// `parent`. An existing directory must be left intact.
     fn unlink_at(&self, parent: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError>;
 
     /// Remove the directory `name` at `parent`.
@@ -581,7 +582,8 @@ pub struct CreationMetadata {
 pub enum PermissionCheck {
     /// The backend is self-enforcing permissions for this item.
     ByBackend,
-    /// The backend enforces lookup permissions, but this view refuses mutations.
+    /// The backend checks permissions, but refuses file writes or directory entry changes.
+    /// Metadata operations remain backend-authorized.
     ByReadOnlyBackend,
     /// The resolver should check this permission metadata.
     ByResolver(PermissionInfo),

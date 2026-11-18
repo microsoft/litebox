@@ -962,12 +962,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             ResolvedTarget::Dir(dir) => &dir.permissions,
             ResolvedTarget::File(file) => &file.permissions,
         };
-        if permissions.on_read_only_fs() {
-            return Err(SetTimesError::ReadOnlyFileSystem);
-        }
         let PermissionCheck::ByResolver(permissions) = permissions else {
             return Ok(());
         };
+        if permissions.on_read_only_fs {
+            return Err(SetTimesError::ReadOnlyFileSystem);
+        }
         if Self::may_change_metadata(context, target) {
             return Ok(());
         }

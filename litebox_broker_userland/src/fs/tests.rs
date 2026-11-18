@@ -53,6 +53,29 @@ fn private_mount_pins_do_not_hide_a_read_only_host_mount() {
     assert!(temp.path().join("target").is_dir());
 }
 
+#[cfg(unix)]
+#[test]
+fn private_mount_pins_do_not_bypass_host_directory_search() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let temp = tempfile::tempdir().unwrap();
+    if fs::metadata(temp.path()).unwrap().uid() == 0 {
+        return; // Root may bypass DAC.
+    }
+    let dir = temp.path().join("closed");
+    fs::create_dir(&dir).unwrap();
+    fs::create_dir(dir.join("target")).unwrap();
+    fs::create_dir(temp.path().join("source")).unwrap();
+    let parent = host_service(temp.path());
+    let child = parent.copy_mount_view().unwrap();
+    child.mount_in_mem("/closed/target", ROOT).unwrap().unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o600)).unwrap();
+    let rmdir = parent.rmdir("/closed/target", ROOT).unwrap();
+    let rename = parent.rename("/source", "/closed/target", ROOT).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(rmdir, Err(FileError::NoSearchPermissions));
+    assert_eq!(rename, Err(FileError::NoSearchPermissions));
+}
+
 #[test]
 fn private_mount_guards_its_host_directories_under_other_spellings() {
     let temp = tempfile::tempdir().unwrap();

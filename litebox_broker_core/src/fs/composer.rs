@@ -572,11 +572,11 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         };
         let mount = self.mount_at(*mount_index).expect("initialized mount");
         let pins = mount.live_directory_pins();
-        if pins.is_empty() {
+        let path = self.checked_child_path(path.clone(), name, RmdirError::ReadOnlyFileSystem)?;
+        let path_pinned = mount.protects(&path);
+        if pins.is_empty() && !path_pinned {
             return Ok(Some(parent));
         }
-        let path = self.checked_child_path(path.clone(), name, RmdirError::ReadOnlyFileSystem)?;
-        self.check_backing_mount(*mount_index, &path, RmdirError::Busy)?;
         let ComposerWalkingDirHandleInner::Mounted {
             target: ResolvedTarget::Dir(handle),
             ..
@@ -585,8 +585,9 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
             unreachable!()
         };
         match mount.lookup_entry_pin(handle, name, &pins) {
-            Ok(Some(true)) => Err(RmdirError::Busy),
-            Ok(_) => Ok(None),
+            Ok(None) => Err(PathError::NoSuchFileOrDirectory.into()),
+            Ok(Some(pinned)) if path_pinned || pinned => Err(RmdirError::Busy),
+            Ok(Some(_)) => Ok(None),
             Err(WalkError::PathError(e)) => Err(RmdirError::PathError(e)),
             Err(WalkError::Io) => Err(RmdirError::Io),
         }
@@ -1256,8 +1257,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 let ResolvedTarget::Dir(handle) = target else {
                     unreachable!()
                 };
-                let path = self.checked_child_path(path, name, UnlinkError::ReadOnlyFileSystem)?;
-                self.check_backing_mount(mount_index, &path, UnlinkError::ReadOnlyFileSystem)?;
+                self.checked_child_path(path, name, UnlinkError::ReadOnlyFileSystem)?;
                 self.backend(mount_index).unlink_at(handle, name)
             }
         }
@@ -1319,6 +1319,16 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 },
             ) if old_mount == new_mount => {
                 let mount = self.mount_at(old_mount).expect("initialized mount");
+                if old_path == new_path {
+                    // This cannot move a pinned entry. Use one parent even if the host
+                    // concurrently replaced the directory between the two parent lookups.
+                    return mount.backend.rename_at(
+                        old_handle.clone(),
+                        old_name,
+                        old_handle,
+                        new_name,
+                    );
+                }
                 let pins = mount.live_directory_pins();
                 let old_pinned = mount.protects(&old_path);
                 let new_pinned = mount.protects(&new_path);
@@ -1339,11 +1349,9 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     // particular, it cannot turn EXDEV or a missing source into EBUSY.
                     let source_pinned =
                         lookup(&old_handle, old_name)?.ok_or(PathError::NoSuchFileOrDirectory)?;
-                    if old_pinned
-                        || source_pinned
-                        || new_pinned
-                        || (!pins.is_empty() && lookup(&new_handle, new_name)? == Some(true))
-                    {
+                    // Both lookups must pass the backend's search checks before reporting a pin.
+                    let destination_pinned = lookup(&new_handle, new_name)? == Some(true);
+                    if old_pinned || source_pinned || new_pinned || destination_pinned {
                         return Err(RenameError::Busy);
                     }
                 }

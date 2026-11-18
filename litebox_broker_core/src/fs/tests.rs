@@ -227,7 +227,7 @@ fn copied_mount_views_share_files_and_locks_but_not_new_mounts() {
 
 #[test]
 fn private_mount_pins_do_not_hide_earlier_rename_errors() {
-    use super::errors::{PathError, RenameError};
+    use super::errors::{PathError, RenameError, UnlinkError};
     let parent = Resolver::<TestPlatform, _>::new(
         super::composer::Composer::<TestPlatform>::builder()
             .mount("/", InMem::<TestPlatform>::new)
@@ -249,6 +249,11 @@ fn private_mount_pins_do_not_hide_earlier_rename_errors() {
     assert!(matches!(
         parent.rename(ROOT, "/missing", "/pinned"),
         Err(RenameError::PathError(PathError::NoSuchFileOrDirectory))
+    ));
+    parent.rename(ROOT, "/pinned", "/pinned").unwrap();
+    assert!(matches!(
+        parent.unlink(ROOT, "/pinned"),
+        Err(UnlinkError::IsADirectory)
     ));
 }
 
@@ -3451,6 +3456,19 @@ mod devices {
                 .build()
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn private_mount_keeps_device_directory_entries_read_only() {
+        let fs = devices_fs(Arc::new(TestStdioProvider::default()));
+        let child = fs.copy_mount_view().unwrap();
+        child.mount_in_mem(super::ROOT, "/dev/pts").unwrap();
+        assert!(matches!(
+            fs.rename(USER, "/dev/missing", "/dev/new"),
+            Err(crate::fs::errors::RenameError::ReadOnlyFileSystem)
+        ));
+        fs.open(USER, "/dev/null", OFlags::WRONLY, Mode::empty())
+            .unwrap();
     }
 
     /// Device I/O and terminal queries reach the providers the backend was built with.
