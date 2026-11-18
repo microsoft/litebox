@@ -551,9 +551,9 @@ jobs:
           $prefix = "windows-oci-rootfs-v1-${{ runner.os }}-${{ runner.arch }}-${env:ImageOS}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml') }}-"
           "prefix=$prefix" >> $env:GITHUB_OUTPUT
           "key=${prefix}${{ hashFiles('litebox_packager/**', 'litebox_syscall_rewriter/**', 'litebox_trampoline/**', 'litebox_common_windows/**', 'litebox_runner_linux_on_windows_userland/tests/**') }}" >> $env:GITHUB_OUTPUT
-      - name: Clear Windows OCI test fixtures before restore
+      - name: Clear Windows test fixtures and sysroot before restore
         run: |
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/tmp/windows_python_rewriter, target/tmp/windows_node_rewriter
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/tmp/windows_python_rewriter, target/tmp/windows_node_rewriter, target/linux-sysroot
       - name: Restore Windows OCI test fixtures
         id: fixture-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -563,6 +563,12 @@ jobs:
             target/tmp/windows_node_rewriter
           key: ${{ steps.fixture-key.outputs.key }}
           restore-keys: ${{ steps.fixture-key.outputs.prefix }}
+      - name: Restore Linux sysroot for the Windows loader tests
+        id: sysroot-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/linux-sysroot
+          key: linux-sysroot-${{ runner.os }}-${{ hashFiles('dev_tools/setup_windows_linux_sysroot.sh') }}
       - name: Install Linux sysroot for the Windows loader tests
         shell: bash
         run: |
@@ -588,11 +594,21 @@ jobs:
             target/tmp/windows_python_rewriter
             target/tmp/windows_node_rewriter
           key: ${{ steps.fixture-key.outputs.key }}
-      - name: Remove Windows OCI test fixtures
+      - name: Save Linux sysroot for the Windows loader tests
+        if: >-
+          success() && steps.sysroot-cache.outputs.cache-hit != 'true' &&
+          github.event_name == 'push' &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ulitebox')
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/linux-sysroot
+          key: ${{ steps.sysroot-cache.outputs.cache-primary-key }}
+      - name: Remove Windows test fixtures and sysroot
         if: always()
-        # Fixtures are cached separately above; keep them out of rust-cache.
+        # Fixtures and the sysroot are cached separately above; keep them out of rust-cache,
+        # whose cleanup would otherwise save the sysroot without its files.
         run: |
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/tmp/windows_python_rewriter, target/tmp/windows_node_rewriter
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target/tmp/windows_python_rewriter, target/tmp/windows_node_rewriter, target/linux-sysroot
 
   build_and_test_snp:
     name: Build and Test SNP

@@ -5,7 +5,8 @@
 //!
 //! To run locally, put LLVM's `bin` directory on PATH and run
 //! `bash dev_tools/setup_windows_linux_sysroot.sh` from the repository root.
-//! To use an existing Debian x86-64 sysroot with `libgcc-12-dev` instead, set `LITEBOX_LINUX_SYSROOT`.
+//! To use an existing Debian x86-64 sysroot with `libgcc-12-dev` instead,
+//! set `LITEBOX_LINUX_SYSROOT`.
 //! Each test cross-compiles its own guests; neither Docker nor WSL is required.
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -378,7 +379,7 @@ fn test_tcp_connection_states_with_windows_broker() {
 /// Runs `vsock_hybrid`, whose AF_VSOCK sockets reach host Unix sockets through the broker's
 /// hybrid vsock bridge (`--vsock-uds`), against [`vsock_hybrid_host`], its host end.
 ///
-/// Built at test time from `litebox_runner_vm_kernel/tests/linux/vsock_hybrid.rs`.
+/// Built from `litebox_runner_vm_kernel/tests/linux/vsock_hybrid.rs`.
 #[test]
 fn test_vsock_hybrid_with_windows_broker() {
     use std::io::BufRead as _;
@@ -823,6 +824,14 @@ fn linux_sysroot() -> std::path::PathBuf {
     root
 }
 
+/// The directory of the sysroot's shared libraries, such as those in [`DYNAMIC_LIBS`].
+fn linux_sysroot_libs() -> std::path::PathBuf {
+    linux_sysroot().join("lib/x86_64-linux-gnu")
+}
+
+/// Cross-compiles the guest `name` with `flags` into `CARGO_TARGET_TMPDIR/<suite>/<name>`.
+///
+/// Tests that may run concurrently must not build the same `name` in the same `suite`.
 fn build_c_guest(name: &str, suite: &str, flags: &[&str]) -> std::path::PathBuf {
     let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let source = match name {
@@ -832,7 +841,6 @@ fn build_c_guest(name: &str, suite: &str, flags: &[&str]) -> std::path::PathBuf 
             "../../litebox_runner_linux_userland/tests/{name}.c"
         )),
     };
-    // The broker and rewriter tests can build the same guest concurrently.
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(suite);
     std::fs::create_dir_all(&dir).unwrap();
     let guest = dir.join(name);
@@ -951,10 +959,11 @@ fn run_prog_with_windows_broker(
     } else {
         append_rewritten_file(&mut tar, guest, &exec_path);
     }
+    let sysroot_libs = linux_sysroot_libs();
     for (file, prefix) in libs {
         append_rewritten_file(
             &mut tar,
-            &linux_sysroot().join("lib/x86_64-linux-gnu").join(file),
+            &sysroot_libs.join(file),
             &format!("{}/{file}", prefix.trim_start_matches('/')),
         );
     }
@@ -994,8 +1003,8 @@ fn run_progs_with_process_duplication(
     )
 }
 
-/// Runs the first of `programs` with `arguments` under a broker started with
-/// `broker_arguments`, and returns its standard output. Each program is at
+/// Cross-compiles `programs` statically, then runs the first with `arguments` under a broker
+/// started with `broker_arguments`, and returns its standard output. Each program is at
 /// `/bin/<program>.hooked`.
 fn run_progs_with_broker_arguments(
     broker: &std::path::Path,
@@ -1132,8 +1141,9 @@ fn run_dynamic_linked_prog_with_rewriter(
     std::fs::create_dir_all(tar_src_path.join("out")).unwrap();
 
     // Rewrite all libraries that are required for initialization
+    let sysroot_libs = linux_sysroot_libs();
     for (file, prefix) in libs_to_rewrite {
-        let src = linux_sysroot().join("lib/x86_64-linux-gnu").join(file);
+        let src = sysroot_libs.join(file);
         let dst_dir = tar_src_path.join(prefix.trim_start_matches('/'));
         let dst = dst_dir.join(file);
         std::fs::create_dir_all(&dst_dir).unwrap();

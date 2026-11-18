@@ -3,9 +3,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# Requires curl, llvm-ar, tar, awk, and GNU coreutils.
+# Requires bash, curl, llvm-ar, tar with xz support, awk, and GNU coreutils.
 set -euo pipefail
-recipe=$(sha256sum < "$0")
+# Store only the hash, as sha256sum's output format varies between builds.
+recipe=$(sha256sum < "$0" | cut -d' ' -f1)
 cd "$(dirname "$0")/.."
 mkdir -p target
 if [[ -d target/linux-sysroot ]]; then
@@ -25,7 +26,7 @@ while read -r sha package; do
         curl --fail --location --retry 3 "https://snapshot.debian.org/archive/debian/20261111T000000Z/pool/main/$package" -o package.deb
     echo "$sha  package.deb" | sha256sum --check
     llvm-ar x package.deb data.tar.xz
-    # Windows checkouts need not support Unix symlinks.
+    # Extract only regular files, as creating symlinks on Windows may be unsupported.
     tar -tvf data.tar.xz | awk '/^-/ {print $NF}' > files
     tar -xf data.tar.xz -C root -T files
 done <<'PACKAGES'
