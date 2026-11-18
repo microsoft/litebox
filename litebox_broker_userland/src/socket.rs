@@ -873,7 +873,7 @@ impl UserlandSocket {
         };
         socket.drain_inbox()?;
         if socket.kind() == SocketKind::Echo {
-            socket.publish_echo_readiness()?;
+            socket.refresh_echo();
             return Ok(Dispatch::Applied);
         }
         let mut flags = flags;
@@ -1297,7 +1297,7 @@ impl<'a> SocketEntry<'a> {
             return self.shutdown_tcp_socket(mode);
         }
         if self.kind() == SocketKind::Echo {
-            return self.shutdown_echo(mode);
+            return Ok(self.shutdown_echo(mode));
         }
         let (shut_read, shut_write) = match mode {
             ShutdownMode::Read => (true, false),
@@ -1592,6 +1592,7 @@ const fn socket_error_from_errno(error: Errno) -> SocketError {
         Errno::CONNABORTED => SocketError::ConnectionAborted,
         Errno::NETUNREACH => SocketError::NetworkUnreachable,
         Errno::HOSTUNREACH => SocketError::HostUnreachable,
+        Errno::MSGSIZE => SocketError::MessageTooLong,
         Errno::TIMEDOUT => SocketError::TimedOut,
         Errno::ADDRINUSE => SocketError::AddressInUse,
         Errno::ADDRNOTAVAIL => SocketError::AddressNotAvailable,

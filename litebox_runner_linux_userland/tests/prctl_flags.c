@@ -9,6 +9,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <linux/capability.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -121,6 +122,12 @@ static void threads_share_dumpable(void) {
 }
 
 static int vfork_child_sets_flags(void *arg) {
+    // A launcher may drop credentials before exec. Whether or not it succeeds,
+    // that request must not terminate the waiting parent.
+    struct __user_cap_header_struct caps = {.version = _LINUX_CAPABILITY_VERSION_3};
+    struct __user_cap_data_struct empty[2] = {0};
+    syscall(SYS_setuid, *(uid_t *)arg);
+    syscall(SYS_capset, &caps, empty);
     if (dumpable() != 0 || no_new_privs() != 0) {
         _exit(1);
     }
@@ -134,8 +141,9 @@ static int vfork_child_sets_flags(void *arg) {
 // no_new_privs.
 static void vfork_child_shares_only_dumpable(void) {
     CHECK(set_dumpable(0));
+    uid_t uid = getuid();
     pid_t child = clone(vfork_child_sets_flags, vfork_stack + sizeof vfork_stack,
-                        CLONE_VM | CLONE_VFORK | SIGCHLD, NULL);
+                        CLONE_VM | CLONE_VFORK | SIGCHLD, &uid);
     CHECK(child > 0 && exited_with(child, 0));
     CHECK(dumpable() == 1);
     CHECK(no_new_privs() == 0);
@@ -220,10 +228,12 @@ static void no_new_privs_sticks_to_its_thread(void) {
 // keeps no_new_privs and is dumpable.
 static void fork_and_execve_carry_the_flags(void) {
     CHECK(set_dumpable(0));
+    CHECK(pr(PR_SET_KEEPCAPS, 1, 0, 0, 0) == 0);
     fflush(stdout);
     pid_t child = fork();
     if (child == 0) {
-        _exit(dumpable() == 0 && no_new_privs() == 1 ? 0 : 1);
+        _exit(dumpable() == 0 && no_new_privs() == 1 && pr(PR_GET_KEEPCAPS, 0, 0, 0, 0) == 1
+                  ? 0 : 1);
     }
     CHECK(child > 0 && exited_with(child, 0));
 
@@ -241,7 +251,8 @@ static void fork_and_execve_carry_the_flags(void) {
 
 int main(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[1], "exec-child") == 0) {
-        return dumpable() == 1 && no_new_privs() == atoi(argv[2]) ? 0 : 1;
+        return dumpable() == 1 && no_new_privs() == atoi(argv[2]) &&
+                       pr(PR_GET_KEEPCAPS, 0, 0, 0, 0) == 0 ? 0 : 1;
     }
     self_path = argv[0];
     setvbuf(stdout, NULL, _IONBF, 0);

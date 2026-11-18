@@ -17,7 +17,7 @@ use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
 
 use litebox_broker_core::BrokerError;
-use litebox_broker_protocol::socket::MAX_UDP_DATAGRAM_SIZE;
+use litebox_broker_protocol::socket::MAX_DATAGRAM_TRANSFER_SIZE;
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Poll, Registry, Token, Waker};
 use socket2::{Domain, Protocol, SockAddr, SockRef, Type};
@@ -64,7 +64,7 @@ impl Host for Windows {
 static INHERITABLE: RwLock<()> = RwLock::new(());
 
 /// The length of the longest datagram a UDP socket receives.
-const MAX_DATAGRAM_LENGTH: usize = MAX_UDP_DATAGRAM_SIZE as usize;
+const MAX_DATAGRAM_LENGTH: usize = MAX_DATAGRAM_TRANSFER_SIZE as usize;
 
 /// The most errors of sends past a connected socket's peer that a receive
 /// drops before it fails with `AGAIN`. Tests use a bound they can exceed
@@ -91,6 +91,7 @@ impl HostErrno for Errno {
     const CONNABORTED: Self = Self(WSAECONNABORTED);
     const NETUNREACH: Self = Self(WSAENETUNREACH);
     const HOSTUNREACH: Self = Self(WSAEHOSTUNREACH);
+    const MSGSIZE: Self = Self(WSAEMSGSIZE);
     const TIMEDOUT: Self = Self(WSAETIMEDOUT);
     const INVAL: Self = Self(WSAEINVAL);
 
@@ -108,8 +109,6 @@ impl Errno {
     const NOBUFS: Self = Self(WSAENOBUFS);
     const AFNOSUPPORT: Self = Self(WSAEAFNOSUPPORT);
     const NETRESET: Self = Self(WSAENETRESET);
-    /// A datagram is longer than a receive's output.
-    const MSGSIZE: Self = Self(WSAEMSGSIZE);
     const MFILE: Self = Self(WSAEMFILE);
     /// `ERROR_OUTOFMEMORY`, which some calls report instead of
     /// [`Self::NOMEM`].

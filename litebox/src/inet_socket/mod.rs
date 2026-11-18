@@ -113,8 +113,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         ))
     }
 
-    /// Returns the IPv4 socket of type `socket_type` this process inherited
-    /// from its parent as `handle`.
+    /// Adopts an inherited TCP stream or UDP datagram socket. For ICMP echo,
+    /// use [`Self::adopt_inherited_inet_socket_with_protocol`].
     ///
     /// The socket owns `handle`, so callers adopt each handle once and share
     /// the socket for every other use.
@@ -133,7 +133,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         )
     }
 
-    /// Adopts a broker handle with the IPv4 protocol recorded by its parent.
+    /// Takes ownership of an inherited handle with the IPv4 protocol recorded
+    /// by its parent. Adopt each handle only once.
     pub fn adopt_inherited_inet_socket_with_protocol(
         &self,
         handle: ObjectHandle,
@@ -407,8 +408,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
             ));
         }
         if let Some(addr) = destination
-            && ((self.protocol != IpProtocol::IcmpEcho && addr.port() == 0)
-                || addr.ip().is_unspecified())
+            && self.protocol != IpProtocol::IcmpEcho
+            && (addr.port() == 0 || addr.ip().is_unspecified())
         {
             return Err(SocketWriteError::Unaddressable);
         }
@@ -601,6 +602,7 @@ impl From<BrokerSocketError> for SocketAsyncError {
             BrokerSocketError::AddressNotAvailable => Self::AddressNotAvailable,
             BrokerSocketError::NotConnected => Self::NotConnected,
             BrokerSocketError::InvalidArgument => Self::InvalidArgument,
+            BrokerSocketError::MessageTooLong => Self::MessageTooLong,
             BrokerSocketError::PolicyDenied => Self::PolicyDenied,
             BrokerSocketError::ResourceExhausted => Self::ResourceExhausted,
             BrokerSocketError::UnsupportedOperation => Self::UnsupportedOperation,
@@ -629,6 +631,7 @@ impl From<SocketAsyncError> for BrokerSocketError {
             SocketAsyncError::UnsupportedOperation => Self::UnsupportedOperation,
             SocketAsyncError::BackendFailure => Self::Other,
             SocketAsyncError::InvalidArgument => Self::InvalidArgument,
+            SocketAsyncError::MessageTooLong => Self::MessageTooLong,
         }
     }
 }

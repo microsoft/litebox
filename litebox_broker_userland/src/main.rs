@@ -882,11 +882,14 @@ mod cli_tests {
         let echo = parse_ipv4_cidr("192.0.2.0/24").unwrap();
         let policy = configured_socket_policy(&[tcp, proxy], &[udp], &[echo]).unwrap();
         assert_eq!(
-            policy.icmp_echo_destination_rules().unwrap(),
-            &[IcmpEchoDestinationRule {
-                caller_credential: CallerCredential::HostGuaranteed,
-                destination: echo,
-            }]
+            policy,
+            configured_socket_policy(&[tcp, proxy], &[udp], &[])
+                .unwrap()
+                .with_icmp_echo_destination_rules(&[IcmpEchoDestinationRule {
+                    caller_credential: CallerCredential::HostGuaranteed,
+                    destination: echo,
+                }])
+                .unwrap()
         );
         let tcp_rules = policy.tcp_destination_rules().unwrap();
         assert_eq!(tcp_rules.len(), 2);

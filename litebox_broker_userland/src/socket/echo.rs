@@ -13,19 +13,38 @@ use litebox_platform::buffer::RawBytes;
 use std::collections::VecDeque;
 
 const HEADER: usize = 8;
-const MAX_PACKET: usize = MAX_UDP_DATAGRAM_SIZE as usize;
+const MAX_PACKET: usize = litebox_broker_protocol::socket::MAX_ICMP_ECHO_MESSAGE_SIZE as usize;
 const MAX_REPLIES: usize = 4;
 const MAX_OUTSTANDING: usize = 64;
+pub(super) const HOST_SCAN_BUDGET: usize = 16;
+
+enum Reply {
+    Virtual(Vec<u8>),
+    /// Bytes in `scratch`. Only stage host input when the queue is empty.
+    Host(usize),
+}
 
 #[derive(Default)]
 pub(super) struct EchoSocket {
     binding: Option<GuestSocketBinding>,
     peer: Option<SocketAddrV4>,
     host: Option<Socket>,
-    replies: VecDeque<(SocketAddrV4, Vec<u8>)>,
+    replies: VecDeque<(SocketAddrV4, Reply)>,
+    scratch: Vec<u8>,
+    write_blocked: bool,
+    pending_error: Option<BrokerResult<SocketError>>,
     /// Only deliver host replies to recent sends on this socket. Bounded even
     /// when a destination never replies.
     outstanding: VecDeque<(SocketAddrV4, [u8; 2])>,
+}
+
+fn retry_intr<T>(mut call: impl FnMut() -> Result<T, Errno>) -> Result<T, Errno> {
+    loop {
+        match call() {
+            Err(Errno::INTR) => {}
+            result => return result,
+        }
+    }
 }
 
 fn destination(address: SocketAddrV4) -> Result<SocketAddrV4, SocketError> {
@@ -83,7 +102,7 @@ impl SocketEntry<'_> {
     /// reconnect leaves the previous peer and its pending replies intact.
     #[cfg(target_os = "linux")]
     fn open_ping(&self, peer: Option<SocketAddrV4>) -> BrokerResult<SocketOutcome<Socket>> {
-        let mut host = match Socket::ping() {
+        let mut host = match retry_intr(Socket::ping) {
             Ok(host) => host,
             Err(error) if error.ping_unavailable() => {
                 return Ok(SocketOutcome::Failed(SocketError::UnsupportedOperation));
@@ -95,7 +114,7 @@ impl SocketEntry<'_> {
             }
         };
         if let Some(peer) = peer
-            && let Err(error) = host.connect(host_socket_destination(peer))
+            && let Err(error) = retry_intr(|| host.connect(host_socket_destination(peer)))
         {
             return Ok(SocketOutcome::Failed(socket_operation_error_from_errno(
                 error,
@@ -126,6 +145,9 @@ impl SocketEntry<'_> {
             Ok(peer) => peer,
             Err(error) => return Ok(SocketConnectionStatus::Failed(error)),
         };
+        if self.echo().peer == Some(peer) {
+            return Ok(SocketConnectionStatus::Connected);
+        }
         let Some(local) = self.echo_source(peer) else {
             return Ok(SocketConnectionStatus::Failed(
                 SocketError::AddressNotAvailable,
@@ -146,11 +168,14 @@ impl SocketEntry<'_> {
         let echo = self.echo_mut();
         echo.host = host;
         echo.peer = Some(peer);
+        echo.pending_error = None;
+        echo.write_blocked = false;
         echo.replies.retain(|(source, _)| *source == peer);
         self.guest_local_address = Some(local);
         self.connection_status = SocketConnectionStatus::Connected;
-        self.publish_echo_readiness()
-            .map_err(PlatformConnectError::PeerIndeterminate)?;
+        // Peer installation is complete. A subsequent refresh fault belongs
+        // to status, not to the result of the connect.
+        self.refresh_echo();
         Ok(SocketConnectionStatus::Connected)
     }
 
@@ -195,9 +220,9 @@ impl SocketEntry<'_> {
                     .try_reserve(1)
                     .map_err(|_| BrokerError::OutOfMemory)?;
                 rewrite_reply(&mut packet, local.port());
-                echo.replies.push_back((peer, packet));
+                echo.replies.push_back((peer, Reply::Virtual(packet)));
             }
-            self.publish_echo_readiness()?;
+            self.publish_echo_readiness();
             return Ok(SocketOutcome::Completed(length));
         }
         if self.echo().host.is_none() {
@@ -215,11 +240,13 @@ impl SocketEntry<'_> {
         }
         let host = echo.host.as_ref().unwrap();
         let parts = [RawBytes::from(packet.as_mut_slice())];
-        let result = if echo.peer == Some(peer) {
-            host.send(RawParts::from(&parts), None)
-        } else {
-            host.send_as_unconnected(RawParts::from(&parts), host_socket_destination(peer))
-        };
+        let result = retry_intr(|| {
+            if echo.peer == Some(peer) {
+                host.send(RawParts::from(&parts), None)
+            } else {
+                host.send_as_unconnected(RawParts::from(&parts), host_socket_destination(peer))
+            }
+        });
         let outcome = match result {
             Ok(n) => {
                 if echo.outstanding.len() == MAX_OUTSTANDING {
@@ -233,7 +260,7 @@ impl SocketEntry<'_> {
                 error,
             )?)),
         };
-        self.publish_echo_readiness()?;
+        self.refresh_echo();
         outcome
     }
 
@@ -250,26 +277,24 @@ impl SocketEntry<'_> {
             .ok_or(BrokerError::Internal)?
             .local_address()
             .port();
-        if !host.stream_readable().map_err(broker_error_from_errno)? {
-            return Ok(host
-                .take_error()
-                .map_err(broker_error_from_errno)?
-                .map(socket_error_from_errno));
-        }
         echo.replies
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
         // Unlike UDP, a Linux ping socket need not return the full length
         // from MSG_TRUNC. Let the kernel copy the whole ping message.
-        let mut packet = zeroed_vec(MAX_PACKET + 1)?;
-        for _ in 0..MAX_OUTSTANDING {
+        if echo.scratch.is_empty() {
+            echo.scratch = zeroed_vec(MAX_PACKET + 1)?;
+        }
+        let packet = &mut echo.scratch;
+        for _ in 0..HOST_SCAN_BUDGET {
             let parts = [RawBytes::from(packet.as_mut_slice())];
-            let (length, source) = match host.receive_datagram(RawParts::from(&parts), false) {
-                Ok((n, Some(source))) if (HEADER..=MAX_PACKET).contains(&n) => (n, source),
-                Ok(_) => continue,
-                Err(Errno::AGAIN) => break,
-                Err(error) => return Ok(Some(socket_operation_error_from_errno(error)?)),
-            };
+            let (length, source) =
+                match retry_intr(|| host.receive_datagram(RawParts::from(&parts), false)) {
+                    Ok((n, Some(source))) if (HEADER..=MAX_PACKET).contains(&n) => (n, source),
+                    Ok(_) => continue,
+                    Err(Errno::AGAIN) => return Ok(None),
+                    Err(error) => return Ok(Some(socket_operation_error_from_errno(error)?)),
+                };
             if packet[..2] != [0, 0] {
                 continue;
             }
@@ -283,11 +308,13 @@ impl SocketEntry<'_> {
             if echo.peer.is_some_and(|p| p != peer) {
                 continue;
             }
-            packet.truncate(length);
-            rewrite_reply(&mut packet, id);
-            echo.replies.push_back((peer, packet));
-            break;
+            rewrite_reply(&mut packet[..length], id);
+            echo.replies.push_back((peer, Reply::Host(length)));
+            return Ok(None);
         }
+        // Edge-triggered input may still be queued. Yield to other sockets
+        // before scanning another batch, even if the guest never calls recv.
+        self.core().posted.post(self.id());
         Ok(None)
     }
 
@@ -299,82 +326,140 @@ impl SocketEntry<'_> {
         if self.read_shutdown {
             return Ok(ReceiveFromOutcome::Failed(SocketError::NotConnected));
         }
-        if self.echo().replies.is_empty()
-            && let Some(error) = self.stage_echo_reply()?
-        {
-            self.publish_echo_readiness()?;
-            return Ok(ReceiveFromOutcome::Failed(error));
+        if self.echo().replies.is_empty() && self.echo().pending_error.is_none() {
+            self.refresh_echo();
         }
-        let echo = self.echo_mut();
-        let outcome = if let Some((source, packet)) = echo.replies.front() {
-            let received = output.len().min(packet.len());
-            output.copy_from_slice(&packet[..received]);
-            let result = ReceiveFromOutcome::Received {
-                received,
-                datagram_length: packet.len(),
-                source_address: *source,
+        let echo = self.echo();
+        let Some((source, reply)) = echo.replies.front() else {
+            return match self.take_echo_error()? {
+                Some(error) => Ok(ReceiveFromOutcome::Failed(error)),
+                None => Err(BrokerError::WouldBlock),
             };
-            if !flags.contains(ReceiveFromFlags::PEEK) {
-                echo.replies.pop_front();
-            }
-            Ok(result)
-        } else {
-            Err(BrokerError::WouldBlock)
         };
-        self.publish_echo_readiness()?;
-        outcome
+        let packet = match reply {
+            Reply::Virtual(packet) => packet.as_slice(),
+            Reply::Host(length) => &echo.scratch[..*length],
+        };
+        let received = output.len().min(packet.len());
+        output.copy_from_slice(&packet[..received]);
+        let result = ReceiveFromOutcome::Received {
+            received,
+            datagram_length: packet.len(),
+            source_address: *source,
+        };
+        if !flags.contains(ReceiveFromFlags::PEEK) {
+            self.echo_mut().replies.pop_front();
+            if self.echo().replies.is_empty() {
+                self.refresh_echo();
+            }
+        }
+        Ok(result)
     }
 
-    pub(super) fn publish_echo_readiness(&self) -> BrokerResult<()> {
-        let mut flags = ReadinessFlags::WRITE;
+    fn sample_echo(&mut self) -> BrokerResult<Option<SocketError>> {
         #[cfg(target_os = "linux")]
-        if let Some(host) = &self.echo().host {
-            flags = host.ping_readiness().map_err(broker_error_from_errno)?;
+        let events = match &self.echo().host {
+            Some(host) => host.ping_readiness().map_err(broker_error_from_errno)?,
+            None => ReadinessFlags::WRITE,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let events = ReadinessFlags::WRITE;
+        self.echo_mut().write_blocked = !events.contains(ReadinessFlags::WRITE);
+        if self.echo().pending_error.is_some() {
+            return Ok(None);
         }
-        if self.write_shutdown {
-            flags = flags & (ReadinessFlags::READ | ReadinessFlags::ERROR);
+        #[cfg(target_os = "linux")]
+        if events.contains(ReadinessFlags::ERROR) {
+            let host = self.echo().host.as_ref().unwrap();
+            if let Some(error) =
+                retry_intr(|| host.take_polled_error()).map_err(broker_error_from_errno)?
+            {
+                return Ok(Some(socket_error_from_errno(error)));
+            }
         }
-        if self.read_shutdown || !self.echo().replies.is_empty() {
+        if !self.read_shutdown
+            && self.echo().replies.is_empty()
+            && events.contains(ReadinessFlags::READ)
+        {
+            return self.stage_echo_reply();
+        }
+        Ok(None)
+    }
+
+    /// Refresh faults are observable via ERROR and status/recv; they must
+    /// not retroactively fail a send or receive that already transferred data.
+    pub(super) fn refresh_echo(&mut self) {
+        if let Some(error) = self.sample_echo().transpose() {
+            self.echo_mut().pending_error.get_or_insert(error);
+        }
+        self.publish_echo_readiness();
+    }
+
+    fn take_echo_error(&mut self) -> BrokerResult<Option<SocketError>> {
+        let error = self.echo_mut().pending_error.take();
+        if error.is_some() {
+            self.publish_echo_readiness();
+            // Resume sampling input that was deferred behind this fault.
+            self.core().posted.post(self.id());
+        }
+        error.transpose()
+    }
+
+    fn publish_echo_readiness(&self) {
+        let mut flags = ReadinessFlags::default();
+        if !self.write_shutdown && !self.echo().write_blocked {
+            flags = flags | ReadinessFlags::WRITE;
+        }
+        if self.echo().pending_error.is_some() {
+            flags = flags | ReadinessFlags::ERROR;
+        }
+        if !self.echo().replies.is_empty() {
             flags = flags | ReadinessFlags::READ;
         }
         set_own_readiness(self, flags);
-        Ok(())
     }
 
-    pub(super) fn shutdown_echo(&mut self, mode: ShutdownMode) -> BrokerResult<SocketOutcome<()>> {
+    pub(super) fn shutdown_echo(&mut self, mode: ShutdownMode) -> SocketOutcome<()> {
         match mode {
             ShutdownMode::Read | ShutdownMode::Write | ShutdownMode::Both => (),
-            _ => return Ok(SocketOutcome::Failed(SocketError::InvalidArgument)),
+            _ => return SocketOutcome::Failed(SocketError::InvalidArgument),
         }
         if matches!(mode, ShutdownMode::Read | ShutdownMode::Both) {
             self.read_shutdown = true;
             self.echo_mut().replies.clear();
         }
         self.write_shutdown |= matches!(mode, ShutdownMode::Write | ShutdownMode::Both);
-        self.publish_echo_readiness()?;
-        Ok(SocketOutcome::Completed(()))
+        self.publish_echo_readiness();
+        SocketOutcome::Completed(())
     }
 
-    pub(super) fn status_echo(&self) -> BrokerResult<PlatformSocketStatus> {
-        let pending_error = match &self.echo().host {
-            Some(host) => host
-                .take_error()
-                .map_err(broker_error_from_errno)?
-                .map(socket_error_from_errno),
-            None => None,
-        };
-        self.publish_echo_readiness()?;
+    pub(super) fn status_echo(&mut self) -> BrokerResult<PlatformSocketStatus> {
+        if self.echo().pending_error.is_none() {
+            self.refresh_echo();
+        }
         Ok(PlatformSocketStatus {
             status: self.connection_status,
             local_address: self.guest_local_address,
-            pending_error,
+            pending_error: self.take_echo_error()?,
         })
     }
 
     pub(super) fn retire_echo(&mut self) {
         self.close_ping();
-        self.echo_mut().replies.clear();
+        *self.echo_mut() = EchoSocket::default();
         self.core().unregister(self.id());
         self.core().release_socket_charge(self.process_key());
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn install_echo_test_host(
+        &mut self,
+        host: Socket,
+        peer: SocketAddrV4,
+        seq: [u8; 2],
+    ) {
+        let echo = self.echo_mut();
+        echo.host = Some(host);
+        echo.outstanding.push_back((peer, seq));
     }
 }

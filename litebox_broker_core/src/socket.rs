@@ -15,8 +15,8 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
-    CreateSocketRequest, IpProtocol, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
-    MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromFlags, SendFlags, ShutdownMode,
+    CreateSocketRequest, IpProtocol, MAX_DATAGRAM_TRANSFER_SIZE, MAX_SOCKET_TRANSFER_SIZE,
+    MAX_TCP_LISTEN_BACKLOG, ReceiveFlags, ReceiveFromFlags, SendFlags, ShutdownMode,
     SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
     SocketType,
 };
@@ -482,7 +482,7 @@ pub struct PlatformDatagramReceive {
     /// Number of bytes of the datagram's prefix received into the start of the
     /// caller's buffer: the lesser of the datagram's and the buffer's lengths.
     pub received: usize,
-    /// Original datagram length, no greater than [`MAX_UDP_DATAGRAM_SIZE`].
+    /// Original message length, bounded by the socket protocol's maximum.
     pub datagram_length: usize,
     /// Normalized guest-visible source address of the datagram.
     ///
@@ -804,8 +804,9 @@ pub fn create(
 /// Connect never reports [`SocketConnectionStatus::Failed`]: a failed attempt
 /// is a [`SocketOutcome::Failed`], after which a stream is unconnected but
 /// fails every later attempt the same way. Datagram connects complete
-/// synchronously, and a failed attempt preserves the previous peer. Policy
-/// denial is also a [`SocketOutcome::Failed`] that preserves existing state.
+/// synchronously. An ordinary failure (including policy denial) preserves
+/// the previous peer; a provider error that leaves the peer indeterminate
+/// retires the socket.
 pub fn connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -997,7 +998,7 @@ fn transport_connect(
 
     // Destination denial is an operation-level socket failure. Failures while
     // evaluating policy remain broker errors.
-    match process.core.policy.authorize_socket_connect(
+    match process.core.policy.authorize_socket_destination(
         process.caller_credential,
         create_request.protocol,
         destination,
@@ -1465,7 +1466,7 @@ pub fn send_to(
     flags: SendFlags,
     destination: Option<SocketAddrV4>,
 ) -> Result<SocketOutcome<usize>> {
-    if flags.has_unsupported_bits() || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+    if flags.has_unsupported_bits() || data.len() > MAX_DATAGRAM_TRANSFER_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
@@ -1481,8 +1482,17 @@ fn send_datagram(
     flags: SendFlags,
     destination: Option<SocketAddrV4>,
 ) -> Result<SocketOutcome<usize>> {
-    if !read_socket(object, |socket| is_datagram(socket.create_request))? {
+    let request = read_socket(object, |socket| socket.create_request)?;
+    if !is_datagram(request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+    }
+    if data.len()
+        > request
+            .protocol
+            .max_datagram_size()
+            .expect("datagram protocol") as usize
+    {
+        return Err(BrokerError::UnsupportedOperation);
     }
     if let Some(error) = take_pending_error(object, false) {
         return Ok(SocketOutcome::Failed(error));
@@ -1563,7 +1573,7 @@ fn transport_send_to(
     // A destination that policy denies may still take a reply, which the platform checks.
     let mut reply = false;
     if let Some(destination) = destination {
-        match process.core.policy.authorize_socket_connect(
+        match process.core.policy.authorize_socket_destination(
             process.caller_credential,
             create_request.protocol,
             destination,
@@ -1798,7 +1808,7 @@ pub fn receive_from(
     output: &mut dyn ReadBuffer,
     flags: ReceiveFromFlags,
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
-    if flags.has_unsupported_bits() || output.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+    if flags.has_unsupported_bits() || output.len() > MAX_DATAGRAM_TRANSFER_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
@@ -1812,13 +1822,21 @@ fn receive_datagram(
     output: &mut dyn ReadBuffer,
     flags: ReceiveFromFlags,
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
-    if !read_socket(object, |socket| is_datagram(socket.create_request))? {
+    let request = read_socket(object, |socket| socket.create_request)?;
+    if !is_datagram(request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+    }
+    let maximum = request
+        .protocol
+        .max_datagram_size()
+        .expect("datagram protocol") as usize;
+    if output.len() > maximum {
+        return Err(BrokerError::UnsupportedOperation);
     }
     if let Some(error) = take_pending_error(object, false) {
         return Ok(SocketOutcome::Failed(error));
     }
-    match transport_receive_from(object, output, flags) {
+    match transport_receive_from(object, output, flags, maximum) {
         // Whether the broker or the transport observed shutdown first, an
         // error that poll has not yet queued takes precedence.
         Ok(SocketOutcome::Failed(SocketError::Shutdown)) => Ok(SocketOutcome::Failed(
@@ -1832,6 +1850,7 @@ fn transport_receive_from(
     object: &RwLock<ObjectEntry>,
     output: &mut dyn ReadBuffer,
     flags: ReceiveFromFlags,
+    maximum: usize,
 ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
     let length = output.len();
     let state = socket_state(object)?;
@@ -1849,7 +1868,7 @@ fn transport_receive_from(
         .map_err(|error| would_block_error(error, state.nonblocking))?;
     if let SocketOutcome::Completed(received) = &outcome
         && (received.received != received.datagram_length.min(length)
-            || received.datagram_length > MAX_UDP_DATAGRAM_SIZE as usize
+            || received.datagram_length > maximum
             || normalize_socket_destination(received.source_address) != Ok(received.source_address))
     {
         return Err(BrokerError::Internal);
@@ -1872,6 +1891,12 @@ pub fn set_option(
     let ObjectEntry::Socket(socket) = &mut *object else {
         return Err(BrokerError::InvalidRights);
     };
+    if let SocketOptionValue::ReceiveExtendedErrors(enabled) = value
+        && is_datagram(socket.create_request)
+    {
+        socket.receive_extended_errors = enabled;
+        return Ok(());
+    }
     if !is_tcp_option(socket.create_request, value.name()) {
         return socket.options.set(value);
     }
@@ -1895,6 +1920,11 @@ pub fn get_option(
     let ObjectEntry::Socket(socket) = &*object else {
         return Err(BrokerError::InvalidRights);
     };
+    if name == SocketOptionName::ReceiveExtendedErrors && is_datagram(socket.create_request) {
+        return Ok(SocketOptionValue::ReceiveExtendedErrors(
+            socket.receive_extended_errors,
+        ));
+    }
     if !is_tcp_option(socket.create_request, name) {
         return socket.options.get(name);
     }
@@ -2911,8 +2941,7 @@ pub(crate) struct SocketOptions {
 }
 
 impl SocketOptions {
-    /// Stores `value`, failing with `UnsupportedOperation` for
-    /// [`SocketOptionValue::NoDelay`], which only a TCP transport implements.
+    /// Stores a protocol-independent option.
     pub(crate) fn set(&mut self, value: SocketOptionValue) -> Result<()> {
         match value {
             SocketOptionValue::ReceiveTimeout(timeout) => self.receive_timeout = timeout,
@@ -2921,13 +2950,14 @@ impl SocketOptions {
             SocketOptionValue::ReuseAddress(value) => self.reuse_address = value,
             SocketOptionValue::KeepAlive(value) => self.keep_alive = value,
             SocketOptionValue::Broadcast(value) => self.broadcast = value,
-            SocketOptionValue::NoDelay(_) => return Err(BrokerError::UnsupportedOperation),
+            SocketOptionValue::NoDelay(_) | SocketOptionValue::ReceiveExtendedErrors(_) => {
+                return Err(BrokerError::UnsupportedOperation);
+            }
         }
         Ok(())
     }
 
-    /// Returns the stored value of the option `name`, failing with
-    /// `UnsupportedOperation` for [`SocketOptionName::NoDelay`].
+    /// Returns the stored value of a protocol-independent option.
     pub(crate) fn get(&self, name: SocketOptionName) -> Result<SocketOptionValue> {
         Ok(match name {
             SocketOptionName::ReceiveTimeout => {
@@ -2938,7 +2968,9 @@ impl SocketOptions {
             SocketOptionName::ReuseAddress => SocketOptionValue::ReuseAddress(self.reuse_address),
             SocketOptionName::KeepAlive => SocketOptionValue::KeepAlive(self.keep_alive),
             SocketOptionName::Broadcast => SocketOptionValue::Broadcast(self.broadcast),
-            SocketOptionName::NoDelay => return Err(BrokerError::UnsupportedOperation),
+            SocketOptionName::NoDelay | SocketOptionName::ReceiveExtendedErrors => {
+                return Err(BrokerError::UnsupportedOperation);
+            }
         })
     }
 }
@@ -2953,6 +2985,7 @@ pub(crate) struct SocketObject {
     status: StatusFlags,
     /// Options other than those [`is_tcp_option`] selects.
     options: SocketOptions,
+    receive_extended_errors: bool,
     /// The transport's connection state, which [`Self::view`] refines.
     connection_status: SocketConnectionStatus,
     local_address: Option<SocketAddrV4>,
@@ -2985,6 +3018,7 @@ impl SocketObject {
             create_request,
             status,
             options: SocketOptions::default(),
+            receive_extended_errors: false,
             connection_status: SocketConnectionStatus::Unconnected,
             local_address: None,
             peer_address: None,

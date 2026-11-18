@@ -73,6 +73,7 @@ impl HostErrno for Errno {
     const CONNABORTED: Self = Self(RustixErrno::CONNABORTED);
     const NETUNREACH: Self = Self(RustixErrno::NETUNREACH);
     const HOSTUNREACH: Self = Self(RustixErrno::HOSTUNREACH);
+    const MSGSIZE: Self = Self(RustixErrno::MSGSIZE);
     const TIMEDOUT: Self = Self(RustixErrno::TIMEDOUT);
     const INVAL: Self = Self(RustixErrno::INVAL);
 
@@ -125,6 +126,18 @@ impl Socket {
             flags = flags | ReadinessFlags::ERROR;
         }
         Ok(flags)
+    }
+
+    /// Consume SO_ERROR after the caller has already observed POLLERR.
+    pub(crate) fn take_polled_error(&self) -> Result<Option<Errno>, Errno> {
+        let error = sockopt::socket_error(&self.0).map_err(Errno)?.err();
+        Ok(error.map(|error| {
+            if error == RustixErrno::PIPE {
+                Errno::CONNRESET
+            } else {
+                Errno(error)
+            }
+        }))
     }
 
     fn open(socket_type: SocketType, protocol: Protocol) -> Result<Self, Errno> {
@@ -325,14 +338,7 @@ impl HostSocket for Socket {
         }
         // Linux records a reset of a connection whose peer ended its stream
         // as `EPIPE`, which the contract reserves for sends.
-        let error = sockopt::socket_error(&self.0).map_err(Errno)?.err();
-        Ok(error.map(|error| {
-            if error == RustixErrno::PIPE {
-                Errno::CONNRESET
-            } else {
-                Errno(error)
-            }
-        }))
+        self.take_polled_error()
     }
 
     fn error_pending(&self) -> Result<bool, Errno> {

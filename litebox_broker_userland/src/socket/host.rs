@@ -93,6 +93,7 @@ pub(crate) trait HostErrno:
     const CONNABORTED: Self;
     const NETUNREACH: Self;
     const HOSTUNREACH: Self;
+    const MSGSIZE: Self;
     const TIMEDOUT: Self;
     const INVAL: Self;
 

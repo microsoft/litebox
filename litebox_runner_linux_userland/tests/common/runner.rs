@@ -415,6 +415,68 @@ impl Runner {
         output.stdout
     }
 
+    /// Bounds the entire broker/runner process group, including forked guests.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn output_with_watchdog(&mut self) -> Vec<u8> {
+        use std::io::{Read as _, Seek as _};
+        use std::os::unix::process::CommandExt as _;
+        use std::time::{Duration, Instant};
+
+        self.prepare_command();
+        // A pipe can fill while polling or stay open in a descendant after the broker exits.
+        let mut stdout = tempfile::tempfile_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        self.command
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout.try_clone().unwrap());
+        self.use_broker_standard_streams();
+        let mut child = self.command.spawn().unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let result = loop {
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            // SAFETY: waitid writes to a valid siginfo_t. WNOWAIT keeps the group
+            // leader's PID reserved until the group has been cleaned up below.
+            if unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            } < 0
+            {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    break Err(error);
+                }
+            // SAFETY: waitid succeeded; si_pid is zero if there was no exit.
+            } else if unsafe { info.assume_init().si_pid() } != 0 {
+                break Ok(());
+            }
+            if Instant::now() >= deadline {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "runner exceeded 60s watchdog",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // SAFETY: the unreaped child leads our private process group.
+        unsafe { libc::kill(-libc::pid_t::try_from(pid).unwrap(), libc::SIGKILL) };
+        let status = child.wait().unwrap();
+        result.unwrap();
+        stdout.rewind().unwrap();
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        assert!(
+            status.success(),
+            "{status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        bytes
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn spawn_with_stdio(
         &mut self,

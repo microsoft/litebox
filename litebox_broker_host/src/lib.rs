@@ -73,9 +73,9 @@ use litebox_broker_protocol::shared_buffer::{
 use litebox_broker_protocol::signal::OpenSignalsResponse;
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, BindSocketResponse, ConnectSocketResponse, CreateSocketResponse,
-    ListenSocketResponse, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
-    MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromSocketResponse, ReceiveSocketResponse,
-    SendSocketResponse, SendToSocketResponse, SocketOutcome,
+    ListenSocketResponse, MAX_DATAGRAM_TRANSFER_SIZE, MAX_SOCKET_PEEK_SIZE,
+    MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG, ReceiveFlags, ReceiveFromSocketResponse,
+    ReceiveSocketResponse, SendSocketResponse, SendToSocketResponse, SocketOutcome,
 };
 use litebox_broker_protocol::timer::{
     CreateTimerResponse, GetTimerResponse, ReadTimerResponse, SetTimerResponse,
@@ -1556,11 +1556,11 @@ fn handle_socket_request<Memory: SharedMemory>(
         }
         SocketRequest::SendTo(request) => {
             if request.flags.has_unsupported_bits()
-                || request.buffer.length() > MAX_UDP_DATAGRAM_SIZE
+                || request.buffer.length() > MAX_DATAGRAM_TRANSFER_SIZE
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
-            let data = shared_buffer(shared_buffers, request.buffer, MAX_UDP_DATAGRAM_SIZE)?;
+            let data = shared_buffer(shared_buffers, request.buffer, MAX_DATAGRAM_TRANSFER_SIZE)?;
             match litebox_broker_core::socket::send_to(
                 process,
                 request.handle,
@@ -1630,11 +1630,12 @@ fn handle_socket_request<Memory: SharedMemory>(
         }
         SocketRequest::ReceiveFrom(request) => {
             if request.flags.has_unsupported_bits()
-                || request.buffer.length() > MAX_UDP_DATAGRAM_SIZE
+                || request.buffer.length() > MAX_DATAGRAM_TRANSFER_SIZE
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
-            let mut output = shared_buffer(shared_buffers, request.buffer, MAX_UDP_DATAGRAM_SIZE)?;
+            let mut output =
+                shared_buffer(shared_buffers, request.buffer, MAX_DATAGRAM_TRANSFER_SIZE)?;
             match litebox_broker_core::socket::receive_from(
                 process,
                 request.handle,

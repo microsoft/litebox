@@ -12,12 +12,12 @@ use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::socket::{
     AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
     CheckConnectSocketRequest, ConnectSocketRequest, CreateSocketRequest, GetSocketNameRequest,
-    GetSocketOptionRequest, IpProtocol, ListenSocketRequest, MAX_SOCKET_TRANSFER_SIZE,
-    MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
-    ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest, SendToSocketRequest,
-    SetSocketErrorRequest, SetSocketOptionRequest, ShutdownMode, ShutdownSocketRequest,
-    SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketType,
-    TakeSocketErrorRequest,
+    GetSocketOptionRequest, IpProtocol, ListenSocketRequest, MAX_DATAGRAM_TRANSFER_SIZE,
+    MAX_SOCKET_TRANSFER_SIZE, ReceiveFromFlags, ReceiveFromSocketRequest,
+    ReceiveFromSocketResponse, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags,
+    SendSocketRequest, SendToSocketRequest, SetSocketErrorRequest, SetSocketOptionRequest,
+    ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketOptionName,
+    SocketOptionValue, SocketType, TakeSocketErrorRequest,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -579,7 +579,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
 
     /// Sends one datagram from an operation-scoped shared-buffer lease.
     ///
-    /// The destination is omitted only for a connected UDP socket.
+    /// Omit the destination to send to the connected datagram peer.
     ///
     /// # Panics
     ///
@@ -594,8 +594,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         destination: Option<SocketAddrV4>,
     ) -> Result<core::result::Result<usize, SocketError>, Channel::Error> {
         assert!(
-            buffer.length() <= MAX_UDP_DATAGRAM_SIZE,
-            "shared UDP sequence exceeds the datagram limit"
+            buffer.length() <= MAX_DATAGRAM_TRANSFER_SIZE,
+            "shared sequence exceeds the datagram transport limit"
         );
         self.copy_to_shared_buffer(buffer, 0, data)?;
         match self.request_socket(SocketRequest::SendTo(SendToSocketRequest {
@@ -662,7 +662,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         destination: &mut dyn ReadBuffer,
         flags: ReceiveFromFlags,
     ) -> Result<core::result::Result<ReceiveFromSocketResponse, SocketError>, Channel::Error> {
-        self.validate_udp_buffer(buffer, destination.len());
+        self.validate_datagram_buffer(buffer, destination.len());
         match self.request_socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
             handle,
             buffer,
@@ -678,8 +678,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     "broker returned inconsistent UDP receive lengths"
                 );
                 assert!(
-                    response.datagram_length <= MAX_UDP_DATAGRAM_SIZE,
-                    "broker returned oversized UDP datagram length"
+                    response.datagram_length <= MAX_DATAGRAM_TRANSFER_SIZE,
+                    "broker returned oversized datagram length"
                 );
                 let received = response.received as usize;
                 self.copy_from_shared_buffer(buffer, received, destination)?;
@@ -725,10 +725,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             .expect("shared buffer sequence must identify valid slot ranges");
     }
 
-    fn validate_udp_buffer(&self, buffer: SharedBufferSequence, data_len: usize) {
+    fn validate_datagram_buffer(&self, buffer: SharedBufferSequence, data_len: usize) {
         assert!(
-            buffer.length() <= MAX_UDP_DATAGRAM_SIZE,
-            "shared UDP sequence exceeds the datagram limit"
+            buffer.length() <= MAX_DATAGRAM_TRANSFER_SIZE,
+            "shared sequence exceeds the datagram transport limit"
         );
         assert_eq!(
             data_len,

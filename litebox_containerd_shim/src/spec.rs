@@ -80,12 +80,13 @@ pub struct Bind {
     pub read_only: bool,
 }
 
-/// What the guests may reach outside the broker, as the broker's `CIDR:PORT[-PORT]` lists:
-/// `--allow-tcp-destination` and `--allow-udp-destination` (or the VM payload's `policy`). An
-/// allowed range reaches what the broker's network namespace ([`Network`]) reaches: the guests'
-/// gateway, 10.0.2.1, is that namespace's loopback: a pod's, shared by its containers, or in the
-/// daemon's namespace ([`Network::Daemon`]), the host's. The VM's network, QEMU's, takes
-/// 10.0.2.0/24: of it, only the gateway and QEMU's DNS forwarder, 10.0.2.3, are reachable.
+/// What the guests may reach outside the broker: the broker's `--allow-tcp-destination` and
+/// `--allow-udp-destination` rules take `CIDR:PORT[-PORT]` (or the VM payload's `policy`), while its
+/// `--allow-icmp-echo-destination` rules take a bare IPv4 CIDR. An allowed range reaches what the
+/// broker's network namespace ([`Network`]) reaches: the guests' gateway, 10.0.2.1, is that
+/// namespace's loopback: a pod's, shared by its containers, or in the daemon's namespace
+/// ([`Network::Daemon`]), the host's. The VM's network, QEMU's, takes 10.0.2.0/24: of it, only the
+/// gateway and QEMU's DNS forwarder, 10.0.2.3, are reachable.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Egress {
     pub tcp: Vec<Destination>,

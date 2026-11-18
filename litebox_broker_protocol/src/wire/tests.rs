@@ -812,6 +812,7 @@ fn socket_error_codec_round_trips_all_variants() {
         SocketError::Listening,
         SocketError::ResourceExhausted,
         SocketError::UnsupportedOperation,
+        SocketError::MessageTooLong,
     ] {
         for socket_response in [
             SocketResponse::Failed(error),
@@ -2278,7 +2279,7 @@ fn decode_rejects_malformed_socket_response_frames() {
         request_id: TEST_REQUEST_ID,
         result: BrokerResult::Socket(SocketResponse::Failed(SocketError::TimedOut)),
     });
-    for raw in [19, 20, u8::MAX] {
+    for raw in [20, 21, u8::MAX] {
         let mut unknown_socket_error = socket_error.clone();
         *unknown_socket_error.last_mut().unwrap() = raw;
         assert_eq!(

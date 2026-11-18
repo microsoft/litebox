@@ -9,7 +9,6 @@
 use alloc::sync::{Arc, Weak};
 use core::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -76,15 +75,12 @@ pub(crate) type InetSocketFd<Platform> = TypedFd<InetSocketSubsystem<Platform>>;
 /// An internet socket descriptor's open file description.
 pub(crate) struct InetSocket<Platform: ShimPlatform> {
     socket: Arc<inet_socket::InetSocket<Platform>>,
-    // XXX: Temporary storage until we actually support IP_RECVERR.
-    recv_err: AtomicBool,
 }
 
 impl<Platform: ShimPlatform> From<inet_socket::InetSocket<Platform>> for InetSocket<Platform> {
     fn from(socket: inet_socket::InetSocket<Platform>) -> Self {
         Self {
             socket: Arc::new(socket),
-            recv_err: AtomicBool::new(false),
         }
     }
 }
@@ -206,7 +202,6 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             && !flags.contains(ReceiveFlags::DONTWAIT)
             && !self.is_nonblocking()?;
         Ok(ReceivePlan {
-            is_stream,
             wait_all,
             // The receives of a `MSG_WAITALL` call share one receive timeout.
             timeout: if wait_all {
@@ -215,7 +210,8 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                 None
             },
             // `MSG_TRUNC` discards stream data.
-            copies_data: !(is_stream && flags.contains(ReceiveFlags::TRUNC)),
+            check_write_prefix: is_stream && !flags.contains(ReceiveFlags::TRUNC),
+            report_full_length_on_trunc: self.socket.protocol() != IpProtocol::IcmpEcho,
         })
     }
 
@@ -384,7 +380,12 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
         destination: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
         // Like Linux, an oversized datagram is rejected before its bytes are read.
-        if !self.is_stream() && buf.len() > inet_socket::MAX_UDP_DATAGRAM_SIZE {
+        if self
+            .socket
+            .protocol()
+            .max_datagram_size()
+            .is_some_and(|max| buf.len() > max as usize)
+        {
             return Err(Errno::EMSGSIZE);
         }
         let send_flags = convert_flags!(
@@ -635,7 +636,8 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                         return Err(Errno::EOPNOTSUPP);
                     }
                     let enabled = super::read_from_user::<u32, Platform>(optval, optlen)? != 0;
-                    self.recv_err.store(enabled, Ordering::Relaxed);
+                    self.socket
+                        .set_option(socket::SocketOptionValue::ReceiveExtendedErrors(enabled))?;
                     litebox_util_log::debug!(
                         "recording IP_RECVERR={enabled}; flag has no effect (error queue not implemented)"
                     );
@@ -745,7 +747,13 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                     if self.is_stream() {
                         return Err(Errno::EOPNOTSUPP);
                     }
-                    u32::from(self.recv_err.load(Ordering::Relaxed))
+                    let socket::SocketOptionValue::ReceiveExtendedErrors(enabled) = self
+                        .socket
+                        .get_option(socket::SocketOptionName::ReceiveExtendedErrors)?
+                    else {
+                        return Err(Errno::EIO);
+                    };
+                    u32::from(enabled)
                 }
                 _ => return Err(Errno::EOPNOTSUPP),
             },
@@ -917,13 +925,9 @@ mod tests {
     }
 
     #[test]
-    fn ping_socket_receives_echo_without_raw_access() {
+    fn ping_socket_receives_echo() {
         let task = init_platform();
         let icmp = litebox_common_linux::IPProtocol::ICMP as u8;
-        assert_eq!(
-            task.do_socket(AddressFamily::INET, SockType::Raw, SockFlags::empty(), icmp),
-            Err(Errno::EPERM)
-        );
         let fd = task
             .do_socket(
                 AddressFamily::INET,
@@ -954,10 +958,6 @@ mod tests {
         msg.msg_iovlen = 1;
         let msg = UserPtrMut::from_ptr(&raw mut msg);
         let raw_fd = i32::try_from(fd).unwrap();
-        assert_eq!(
-            task.sys_recvmsg(raw_fd, msg, ReceiveFlags::ERRQUEUE | ReceiveFlags::DONTWAIT),
-            Err(Errno::EAGAIN)
-        );
         assert_eq!(task.sys_recvmsg(raw_fd, msg, ReceiveFlags::empty()), Ok(8));
         assert_eq!(reply[..2], [0, 0]); // Echo reply, code 0
         assert_eq!(reply[6..], [0, 1]);

@@ -211,11 +211,11 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     /// `MSG_WAITALL`.
     pub(super) fn receive_plan(&self) -> ReceivePlan {
         ReceivePlan {
-            is_stream: self.is_stream(),
             wait_all: false,
             // LiteBox bounds each receive by the socket's receive timeout.
             timeout: None,
-            copies_data: true,
+            check_write_prefix: self.is_stream(),
+            report_full_length_on_trunc: true,
         }
     }
 

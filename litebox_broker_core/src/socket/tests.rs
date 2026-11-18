@@ -9,7 +9,9 @@ use crate::test_support::{
 use crate::{BrokerCore, CallerCredential};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use litebox_broker_protocol::fs::SetStatusFlagsRequest;
-use litebox_broker_protocol::socket::{AddressFamily, IpProtocol, SocketType};
+use litebox_broker_protocol::socket::{
+    AddressFamily, IpProtocol, MAX_ICMP_ECHO_MESSAGE_SIZE, MAX_UDP_DATAGRAM_SIZE, SocketType,
+};
 use litebox_platform::buffer::Fault;
 use std::net::Ipv4Addr;
 use std::sync::{Mutex as StdMutex, mpsc};
@@ -147,18 +149,80 @@ fn echo_authorizes_the_concrete_peer_and_has_its_own_identifier_namespace() {
         connect(&process, echo, gateway),
         Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
     );
+    let request = [8, 0, 0xf7, 0xfe, 0, 0, 0, 1];
     assert_eq!(
-        send_to(&process, echo, b"x", SendFlags::NONE, Some(gateway)),
+        send_to(&process, echo, &request, SendFlags::NONE, Some(gateway)),
         Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
     );
     assert_eq!(get_name(&process, echo, true), Ok(Some(peer)));
     assert_eq!(
-        send_to(&process, echo, b"x", SendFlags::NONE, None),
-        Ok(SocketOutcome::Completed(1))
+        send_to(&process, echo, &request, SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(request.len()))
     );
     assert_eq!(
         provider.state.send_destinations.lock().unwrap().as_slice(),
         [Some(peer)]
+    );
+}
+
+#[test]
+fn echo_transfers_the_full_ipv4_message_but_no_more() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let handle = create(
+        &process,
+        CreateSocketRequest {
+            protocol: IpProtocol::IcmpEcho,
+            ..create_udp_request()
+        },
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+    let maximum = MAX_ICMP_ECHO_MESSAGE_SIZE as usize;
+    let mut packet = vec![0x5a; maximum];
+    packet[0..2].copy_from_slice(&[8, 0]);
+    assert_eq!(
+        send_to(
+            &process,
+            handle,
+            &packet,
+            SendFlags::NONE,
+            Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        ),
+        Ok(SocketOutcome::Completed(maximum)),
+    );
+    assert_eq!(
+        provider.state.send_destinations.lock().unwrap().as_slice(),
+        [Some(peer)]
+    );
+    provider.return_next_datagram_receive(
+        &packet,
+        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+            received: maximum,
+            datagram_length: maximum,
+            source_address: peer,
+        })),
+    );
+    assert_eq!(
+        receive_data_from(&process, handle, maximum, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Completed(DatagramData {
+            data: packet.clone(),
+            datagram_length: maximum,
+            source_address: peer
+        })),
+    );
+    packet.push(0);
+    assert_eq!(
+        send_to(&process, handle, &packet, SendFlags::NONE, Some(peer)),
+        Err(BrokerError::UnsupportedOperation)
+    );
+    assert_eq!(
+        receive_data_from(&process, handle, maximum + 1, ReceiveFromFlags::NONE),
+        Err(BrokerError::UnsupportedOperation)
     );
 }
 
@@ -3818,7 +3882,8 @@ fn in_flight_datagram_receive_observes_shutdown_after_retirement() {
         transport_receive_from(
             &object,
             &mut [0u8; 1].as_mut_slice(),
-            ReceiveFromFlags::NONE
+            ReceiveFromFlags::NONE,
+            IpProtocol::Udp.max_datagram_size().unwrap() as usize,
         ),
         Ok(SocketOutcome::Failed(SocketError::Shutdown))
     );

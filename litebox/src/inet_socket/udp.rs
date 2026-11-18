@@ -6,8 +6,8 @@
 use core::net::SocketAddr;
 
 use litebox_broker_protocol::socket::{
-    MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags as BrokerReceiveFromFlags,
-    SendFlags as BrokerSendFlags, SocketError as BrokerSocketError, SocketOutcome,
+    ReceiveFromFlags as BrokerReceiveFromFlags, SendFlags as BrokerSendFlags,
+    SocketError as BrokerSocketError, SocketOutcome,
 };
 use litebox_platform::time::TimeProvider;
 
@@ -32,10 +32,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         if flags.contains(ReceiveFlags::PEEK) {
             broker_flags.0 |= BrokerReceiveFromFlags::PEEK.0;
         }
+        let maximum = self
+            .protocol
+            .max_datagram_size()
+            .expect("datagram protocol");
         let length = if flags.contains(ReceiveFlags::DISCARD) {
             0
         } else {
-            buffer.len().min(MAX_UDP_DATAGRAM_SIZE as usize)
+            buffer.len().min(maximum as usize)
         };
         match self.broker.receive_from_socket(
             self.handle,
@@ -43,6 +47,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
             broker_flags,
         ) {
             Ok(SocketOutcome::Completed(received)) => {
+                if received.datagram_length > maximum {
+                    return Err(SocketReadError::Socket(SocketAsyncError::BackendFailure));
+                }
                 if let Some(source_address) = source_address {
                     *source_address = Some(SocketAddr::V4(received.source_address));
                 }
@@ -65,7 +72,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         buffer: impl WriteBuffer,
         destination: Option<SocketAddr>,
     ) -> Result<usize, SocketWriteError> {
-        if buffer.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+        if buffer.len()
+            > self
+                .protocol
+                .max_datagram_size()
+                .expect("datagram protocol") as usize
+        {
             return Err(SocketWriteError::MessageTooLong);
         }
         let destination = match destination {
@@ -80,6 +92,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
             Ok(SocketOutcome::Completed(sent)) => Ok(sent),
             Ok(SocketOutcome::Failed(BrokerSocketError::Shutdown)) => {
                 Err(SocketWriteError::WriteShutdown)
+            }
+            Ok(SocketOutcome::Failed(BrokerSocketError::MessageTooLong)) => {
+                Err(SocketWriteError::MessageTooLong)
             }
             Ok(SocketOutcome::Failed(BrokerSocketError::DestinationAddressRequired)) => {
                 Err(SocketWriteError::DestinationAddressRequired)

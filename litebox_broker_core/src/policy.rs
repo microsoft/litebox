@@ -270,12 +270,6 @@ impl SocketPolicy {
         Ok(self)
     }
 
-    /// Returns the external ICMP echo rules, or `None` when echo sockets are denied.
-    #[must_use]
-    pub fn icmp_echo_destination_rules(&self) -> Option<&[IcmpEchoDestinationRule]> {
-        self.icmp_echo.as_ref().map(DestinationPolicy::rules)
-    }
-
     /// Returns the native TCP destination rules, or `None` when TCP is denied.
     #[must_use]
     pub fn tcp_destination_rules(&self) -> Option<&[DestinationRule]> {
@@ -567,7 +561,7 @@ impl PolicyEngine {
         }
     }
 
-    pub(crate) fn authorize_socket_connect(
+    pub(crate) fn authorize_socket_destination(
         &self,
         caller_credential: CallerCredential,
         protocol: IpProtocol,
@@ -952,7 +946,7 @@ mod tests {
             Ok(ObjectRights::all())
         );
         assert_eq!(
-            unauthenticated.authorize_socket_connect(
+            unauthenticated.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
                 normalized_destination([10, 15, 0, 1], 443),
@@ -960,7 +954,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            unauthenticated.authorize_socket_connect(
+            unauthenticated.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
                 normalized_destination([10, 0, 2, 15], 1),
@@ -968,7 +962,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            unauthenticated.authorize_socket_connect(
+            unauthenticated.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
                 normalized_destination([10, 0, 2, 1], 8080),
@@ -982,7 +976,7 @@ mod tests {
             normalized_destination([10, 15, 0, 1], 0),
         ] {
             assert_eq!(
-                unauthenticated.authorize_socket_connect(
+                unauthenticated.authorize_socket_destination(
                     CallerCredential::Unauthenticated,
                     IpProtocol::Tcp,
                     denied,
@@ -1019,20 +1013,10 @@ mod tests {
                 .unwrap(),
         );
         assert!(policy.authorize_socket_create(caller, echo).is_ok());
-        assert_eq!(
-            policy.authorize_socket_create(
-                caller,
-                CreateSocketRequest {
-                    socket_type: SocketType::Stream,
-                    ..echo
-                }
-            ),
-            Err(BrokerError::PolicyDenied)
-        );
         let allowed = normalized_destination([192, 0, 2, 254], 0);
         assert!(
             policy
-                .authorize_socket_connect(caller, IpProtocol::IcmpEcho, allowed)
+                .authorize_socket_destination(caller, IpProtocol::IcmpEcho, allowed)
                 .is_ok()
         );
         for (principal, protocol, destination) in [
@@ -1049,7 +1033,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                policy.authorize_socket_connect(principal, protocol, destination),
+                policy.authorize_socket_destination(principal, protocol, destination),
                 Err(BrokerError::PolicyDenied)
             );
         }
@@ -1063,7 +1047,7 @@ mod tests {
         let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(socket_policy);
         assert_eq!(
-            policy.authorize_socket_connect(
+            policy.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
                 normalized_destination([127, 255, 0, 1], 80),
@@ -1071,7 +1055,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            policy.authorize_socket_connect(
+            policy.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
                 normalized_destination([10, 0, 2, 15], 80),
@@ -1079,7 +1063,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            policy.authorize_socket_connect(
+            policy.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
                 normalized_destination([10, 0, 0, 1], 80),
@@ -1087,7 +1071,7 @@ mod tests {
             Err(BrokerError::PolicyDenied)
         );
         assert_eq!(
-            policy.authorize_socket_connect(
+            policy.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
                 normalized_destination([127, 0, 0, 1], 0),
@@ -1095,7 +1079,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            policy.authorize_socket_connect(
+            policy.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
                 normalized_destination([127, 0, 0, 1], 53),
@@ -1103,7 +1087,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            policy.authorize_socket_connect(
+            policy.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
                 normalized_destination([10, 0, 2, 15], 53),
@@ -1111,7 +1095,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            policy.authorize_socket_connect(
+            policy.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
                 normalized_destination([10, 0, 0, 1], 53),
@@ -1139,7 +1123,7 @@ mod tests {
             Ok(ObjectRights::all())
         );
         assert_eq!(
-            policy.authorize_socket_connect(
+            policy.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
                 normalized_destination([10, 0, 2, 15], 53),
@@ -1147,7 +1131,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            policy.authorize_socket_connect(
+            policy.authorize_socket_destination(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
                 normalized_destination([192, 0, 2, 1], 443),

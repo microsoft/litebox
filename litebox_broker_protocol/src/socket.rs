@@ -31,7 +31,14 @@ const _: () = assert!(MAX_SOCKET_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
 /// datagram atomicity across the broker boundary.
 pub const MAX_UDP_DATAGRAM_SIZE: u32 = 65_507;
 
-const _: () = assert!(MAX_UDP_DATAGRAM_SIZE <= SHARED_BUFFER_SLOT_SIZE);
+/// Largest IPv4 echo message, including the ICMP header but not the IPv4 header.
+pub const MAX_ICMP_ECHO_MESSAGE_SIZE: u32 = 65_515;
+
+/// Largest atomic message the shared datagram transport must accommodate.
+pub const MAX_DATAGRAM_TRANSFER_SIZE: u32 = MAX_ICMP_ECHO_MESSAGE_SIZE;
+
+const _: () = assert!(MAX_UDP_DATAGRAM_SIZE <= MAX_DATAGRAM_TRANSFER_SIZE);
+const _: () = assert!(MAX_DATAGRAM_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
 
 /// Maximum stream prefix addressable by offset-based peek requests.
 pub const MAX_SOCKET_PEEK_SIZE: u32 = 0x80_000;
@@ -77,6 +84,17 @@ wire_enum! {
     }
 }
 
+impl IpProtocol {
+    /// Maximum IPv4 datagram message size, or `None` for a stream.
+    pub const fn max_datagram_size(self) -> Option<u32> {
+        match self {
+            Self::Udp => Some(MAX_UDP_DATAGRAM_SIZE),
+            Self::IcmpEcho => Some(MAX_ICMP_ECHO_MESSAGE_SIZE),
+            Self::Tcp => None,
+        }
+    }
+}
+
 wire_enum! {
     /// How to stop I/O on a socket.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +134,8 @@ wire_enum! {
         Broadcast,
         /// Whether Nagle's algorithm is disabled, which only TCP sockets support.
         NoDelay,
+        /// Whether a datagram socket requested extended error reporting.
+        ReceiveExtendedErrors,
     }
 }
 
@@ -137,6 +157,9 @@ wire_enum! {
         Broadcast(bool),
         /// [`SocketOptionName::NoDelay`].
         NoDelay(bool),
+        /// [`SocketOptionName::ReceiveExtendedErrors`]. Records the request;
+        /// it does not imply the transport supplies an extended error queue.
+        ReceiveExtendedErrors(bool),
     }
 }
 
@@ -151,6 +174,7 @@ impl SocketOptionValue {
             Self::KeepAlive(_) => SocketOptionName::KeepAlive,
             Self::Broadcast(_) => SocketOptionName::Broadcast,
             Self::NoDelay(_) => SocketOptionName::NoDelay,
+            Self::ReceiveExtendedErrors(_) => SocketOptionName::ReceiveExtendedErrors,
         }
     }
 }
@@ -332,6 +356,9 @@ wire_enum! {
         /// The socket does not support the operation.
         #[error("socket operation unsupported")]
         UnsupportedOperation,
+        /// The message exceeds the protocol or path MTU limit.
+        #[error("message too long")]
+        MessageTooLong,
     }
 }
 

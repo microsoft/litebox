@@ -183,19 +183,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         header: UserPtrMut<litebox_common_linux::CapHeader>,
         data: UserPtr<litebox_common_linux::CapData>,
     ) -> Result<(), Errno> {
-        let mut hdr = header.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        let words = match hdr.version {
+        let fields = header.cast::<u32>();
+        let words = match fields.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)? {
             LINUX_CAPABILITY_VERSION_1 => 1,
             LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => 2,
             _ => {
-                hdr.version = LINUX_CAPABILITY_VERSION_3;
-                header
-                    .write_at_offset::<Platform>(0, hdr)
+                fields
+                    .write_at_offset::<Platform>(0, LINUX_CAPABILITY_VERSION_3)
                     .ok_or(Errno::EFAULT)?;
                 return Err(Errno::EINVAL);
             }
         };
-        if hdr.pid != 0 && i32::try_from(hdr.pid) != Ok(self.sys_gettid()) {
+        let pid = fields.read_at_offset::<Platform>(1).ok_or(Errno::EFAULT)?;
+        if pid != 0 && i32::try_from(pid) != Ok(self.sys_gettid()) {
             return Err(Errno::EPERM);
         }
         for i in 0..words {
@@ -272,30 +272,27 @@ mod tests {
     use litebox::user_pointers::UserPtrMut;
 
     #[test]
-    fn capset_only_accepts_empty_sets() {
+    fn capset_negotiates_version_then_drops_capabilities() {
         use litebox::user_pointers::UserPtr;
         use litebox_common_linux::{CapData, CapHeader, errno::Errno};
         let task = init_platform();
-        let mut header = CapHeader {
-            version: super::LINUX_CAPABILITY_VERSION_3,
-            pid: 0,
-        };
-        let mut data = [const {
+        let mut header = CapHeader { version: 0, pid: 0 };
+        let data = [const {
             CapData {
                 effective: 0,
                 permitted: 0,
                 inheritable: 0,
             }
         }; 2];
-        let header = UserPtrMut::from_ptr(&raw mut header);
+        let ptr = UserPtrMut::from_ptr(&raw mut header);
         assert_eq!(
-            task.sys_capset(header, UserPtr::from_ptr(data.as_ptr())),
-            Ok(())
+            task.sys_capset(ptr, UserPtr::from_ptr(data.as_ptr())),
+            Err(Errno::EINVAL)
         );
-        data[1].permitted = 1;
+        assert_eq!(header.version, super::LINUX_CAPABILITY_VERSION_3);
         assert_eq!(
-            task.sys_capset(header, UserPtr::from_ptr(data.as_ptr())),
-            Err(Errno::EPERM)
+            task.sys_capset(ptr, UserPtr::from_ptr(data.as_ptr())),
+            Ok(())
         );
     }
 

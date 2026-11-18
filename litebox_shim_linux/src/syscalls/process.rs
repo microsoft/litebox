@@ -4122,6 +4122,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         self.thread.clear_child_tid.set(None);
         self.rebind_exec_identity();
+        self.thread.keep_caps.set(false);
         // The new program is dumpable. Linux makes it non-dumpable instead if the caller can't
         // read its file, or if the caller's real and effective IDs differ, which they don't in
         // LiteBox.

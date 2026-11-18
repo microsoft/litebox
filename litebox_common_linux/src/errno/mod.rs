@@ -625,6 +625,7 @@ impl From<litebox::inet_socket::errors::SocketAsyncError> for Errno {
                 Errno::EOPNOTSUPP
             }
             litebox::inet_socket::errors::SocketAsyncError::BackendFailure => Errno::EIO,
+            litebox::inet_socket::errors::SocketAsyncError::MessageTooLong => Errno::EMSGSIZE,
             _ => unimplemented!(),
         }
     }
@@ -674,6 +675,7 @@ impl TryFrom<Errno> for litebox::inet_socket::errors::SocketAsyncError {
                 Ok(litebox::inet_socket::errors::SocketAsyncError::UnsupportedOperation)
             }
             Errno::EIO => Ok(litebox::inet_socket::errors::SocketAsyncError::BackendFailure),
+            Errno::EMSGSIZE => Ok(litebox::inet_socket::errors::SocketAsyncError::MessageTooLong),
             _ => Err(value),
         }
     }

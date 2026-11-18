@@ -56,15 +56,16 @@ enum ReceiveSocket<Platform: ShimPlatform> {
 
 /// How a receive call receives from its socket, which the socket's family decides.
 pub(super) struct ReceivePlan {
-    /// Whether the socket is a stream socket.
-    pub(super) is_stream: bool,
     /// Whether the call receives until it fills its buffer (`MSG_WAITALL`).
     pub(super) wait_all: bool,
     /// The receive timeout that every receive of the call shares, or `None` for each receive to
     /// wait as long as the socket allows.
     pub(super) timeout: Option<Duration>,
-    /// Whether the call copies the received data to the caller.
-    pub(super) copies_data: bool,
+    /// Whether to check for a writable prefix before a stream receive.
+    pub(super) check_write_prefix: bool,
+    /// Whether input `MSG_TRUNC` returns the full message length. Linux
+    /// ping sockets set the output flag but still return only bytes copied.
+    pub(super) report_full_length_on_trunc: bool,
 }
 
 impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
@@ -75,10 +76,10 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
             ReceiveSocket::Unix(handle) => Ok(handle.with_entry(UnixSocket::receive_plan)),
             // Vsock sockets don't support `MSG_WAITALL`.
             ReceiveSocket::Vsock(_) => Ok(ReceivePlan {
-                is_stream: true,
                 wait_all: false,
                 timeout: None,
-                copies_data: true,
+                check_write_prefix: true,
+                report_full_length_on_trunc: true,
             }),
         }
     }
@@ -356,7 +357,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             | socket::SocketOptionValue::Broadcast(enabled) => {
                 super::write_to_user::<_, Platform>(u32::from(enabled), optval, len)
             }
-            value @ socket::SocketOptionValue::NoDelay(_) => {
+            value @ (socket::SocketOptionValue::NoDelay(_)
+            | socket::SocketOptionValue::ReceiveExtendedErrors(_)) => {
                 unreachable!("{value:?} is not a socket-level option")
             }
         }
@@ -955,7 +957,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut received = 0;
         let reported = loop {
             let requested_chunk_len = (len - received).min(SOCKET_RECEIVE_OPERATION_SIZE);
-            let write_prefix = (plan.is_stream && plan.copies_data && requested_chunk_len != 0)
+            let write_prefix = (plan.check_write_prefix && requested_chunk_len != 0)
                 .then(|| user_write_prefix(&self.global.mm, buf, received, requested_chunk_len));
             let needs_probe = write_prefix.as_ref().is_some_and(
                 |prefix| !matches!(prefix, Ok(prefix) if *prefix == requested_chunk_len),
@@ -1011,7 +1013,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             write_sockaddr_to_user::<Platform>(src_addr, sock_ptr, addrlen)?;
         }
 
-        if flags.contains(ReceiveFlags::TRUNC) {
+        if plan.report_full_length_on_trunc && flags.contains(ReceiveFlags::TRUNC) {
             // the actual message size
             Ok(reported)
         } else {
@@ -1107,10 +1109,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let reported = 'receive: loop {
             let requested_chunk_len =
                 (total_iov_capacity - total_received).min(SOCKET_RECEIVE_OPERATION_SIZE);
-            let write_prefix = (plan.is_stream && plan.copies_data && requested_chunk_len != 0)
-                .then(|| {
-                    iov_write_prefix(&self.global.mm, &iovs, total_received, requested_chunk_len)
-                });
+            let write_prefix = (plan.check_write_prefix && requested_chunk_len != 0).then(|| {
+                iov_write_prefix(&self.global.mm, &iovs, total_received, requested_chunk_len)
+            });
             let needs_probe = write_prefix.as_ref().is_some_and(
                 |prefix| !matches!(prefix, Ok(prefix) if *prefix == requested_chunk_len),
             );
@@ -1161,7 +1162,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 break reported;
             }
         };
-        if flags.contains(ReceiveFlags::TRUNC) {
+        if plan.report_full_length_on_trunc && flags.contains(ReceiveFlags::TRUNC) {
             total_received = reported;
         }
 

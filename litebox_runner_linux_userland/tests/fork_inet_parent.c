@@ -274,6 +274,34 @@ static int exec_child(const char *child_path) {
     return failures;
 }
 
+// The exec'd child sends on the parent's bound ping socket. The parent sees both
+// the resulting reply (with its original identifier) and the child's option change.
+static int exec_echo(const char *child_path) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_ICMP);
+    struct sockaddr_in local = {.sin_family = AF_INET, .sin_port = htons(12345)};
+    int recverr = 1;
+    if (fd < 0 || bind(fd, (struct sockaddr *)&local, sizeof local) != 0 ||
+        setsockopt(fd, IPPROTO_IP, IP_RECVERR, &recverr, sizeof recverr) != 0) {
+        close(fd);
+        return 1;
+    }
+    char fd_arg[16];
+    snprintf(fd_arg, sizeof fd_arg, "%d", fd);
+    pid_t child = fork();
+    if (child == 0) {
+        execl(child_path, child_path, "echo-fd", fd_arg, NULL);
+        _exit(99);
+    }
+    unsigned char reply[16];
+    socklen_t len = sizeof recverr;
+    int failed = child < 0 || wait_code(child) != 0 || !wait_readable(fd) ||
+                 recv(fd, reply, sizeof reply, 0) != 9 || reply[0] != 0 ||
+                 memcmp(reply + 4, &local.sin_port, 2) != 0 || reply[7] != 42 || reply[8] != 'e' ||
+                 getsockopt(fd, IPPROTO_IP, IP_RECVERR, &recverr, &len) != 0 || recverr != 0;
+    close(fd);
+    return failed;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         return 2;
@@ -283,6 +311,7 @@ int main(int argc, char **argv) {
     int udp = udp_shared();
     int orphan = orphaned_socket();
     int exec = exec_child(argv[1]);
-    printf("inet-fork tcp=%d udp=%d orphan=%d exec=%d\n", tcp, udp, orphan, exec);
-    return tcp + udp + orphan + exec;
+    int echo = exec_echo(argv[1]);
+    printf("inet-fork tcp=%d udp=%d orphan=%d exec=%d echo=%d\n", tcp, udp, orphan, exec, echo);
+    return tcp + udp + orphan + exec + echo;
 }

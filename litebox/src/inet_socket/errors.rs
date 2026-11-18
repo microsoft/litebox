@@ -191,5 +191,7 @@ crate::utilities::macros::repr_enum! {
         BackendFailure = 13,
         /// An argument or socket state is invalid for the operation.
         InvalidArgument = 14,
+        /// The datagram exceeds the protocol limit or the path MTU.
+        MessageTooLong = 15,
     }
 }

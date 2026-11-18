@@ -3865,12 +3865,14 @@ impl SyscallRequest {
             Sysno::socket => sys_req!(Socket {
                 domain,
                 type_and_flags,
-                protocol,
+                protocol: {
+                    u8::try_from(ctx.sys_req_arg::<i32>(2)).map_err(|_| errno::Errno::EINVAL)?
+                },
             }),
             Sysno::socketpair => sys_req!(Socketpair {
                 domain,
                 type_and_flags,
-                protocol,
+                protocol: { u8::try_from(ctx.sys_req_arg::<i32>(2)).map_err(|_| errno::Errno::EINVAL)? },
                 sockvec: *,
             }),
             Sysno::connect => sys_req!(Connect { sockfd, sockaddr:*, addrlen }),

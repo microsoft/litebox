@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -71,6 +72,20 @@ static int child_is_reaped(int code) {
 
 int main(int argc, char **argv) {
     const char *marker = argc > 1 ? argv[1] : "";
+    if (strcmp(marker, "echo-fd") == 0 && argc == 3) {
+        int fd = atoi(argv[2]);
+        int recverr = 0;
+        socklen_t len = sizeof recverr;
+        if (getsockopt(fd, IPPROTO_IP, IP_RECVERR, &recverr, &len) != 0 || recverr != 1) {
+            return 1;
+        }
+        recverr = 0;
+        struct sockaddr_in dst = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+        unsigned char request[] = {8, 0, 0, 0, 0, 0, 0, 42, 'e'};
+        return setsockopt(fd, IPPROTO_IP, IP_RECVERR, &recverr, sizeof recverr) != 0 ||
+               sendto(fd, request, sizeof request, 0, (struct sockaddr *)&dst, sizeof dst) !=
+                   sizeof request;
+    }
     if (strcmp(marker, "abort") == 0) {
         abort();
     }

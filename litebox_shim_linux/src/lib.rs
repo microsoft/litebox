@@ -1018,6 +1018,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // that fails to decode has already returned its error above, since nothing ran.
         let is_vfork_child = self.vfork.borrow().is_some();
         if is_vfork_child
+            && matches!(
+                &request,
+                SyscallRequest::Setuid { .. } | SyscallRequest::CapSet { .. }
+            )
+        {
+            // These handlers use the current task's credentials, not the vfork child's.
+            return Err(Errno::ENOSYS);
+        }
+        if is_vfork_child
             && !matches!(
                 &request,
                 SyscallRequest::Exit { .. }

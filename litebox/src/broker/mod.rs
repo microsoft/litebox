@@ -37,7 +37,7 @@ use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::socket::{
-    AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
+    AcceptSocketResponse, MAX_DATAGRAM_TRANSFER_SIZE, MAX_SOCKET_TRANSFER_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
     ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
     SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
@@ -1448,7 +1448,7 @@ where
         flags: BrokerSendFlags,
         destination: Option<SocketAddrV4>,
     ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError> {
-        if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+        if data.len() > MAX_DATAGRAM_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(data.len())?;
@@ -1467,7 +1467,7 @@ where
         data: &mut dyn ReadBuffer,
         flags: BrokerReceiveFromFlags,
     ) -> core::result::Result<SocketOutcome<ReceiveFromSocketResponse>, BrokerControlError> {
-        if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+        if data.len() > MAX_DATAGRAM_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(data.len())?;
