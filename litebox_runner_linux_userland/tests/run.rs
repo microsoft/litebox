@@ -1646,14 +1646,9 @@ fn the_root_is_the_guest_s_init_only_when_the_broker_says_so() {
     let mut runner = Runner::new(&program, "root_init");
     runner
         .allow_process_duplication()
-        .broker_arg("--root-process-as-init")
-        .arg("init");
+        .broker_arg("--root-process-as-init");
     let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "root-init failures=0"),
-        "{output}"
-    );
-    assert!(!output.contains("outlived"), "{output}");
+    assert_eq!(output, "root-init started\nroot-init survived\n");
 
     let mut runner = Runner::new(&program, "root_init_ordinary");
     runner.allow_process_duplication();
