@@ -19,6 +19,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::OnceCell;
 
 use hashbrown::HashMap;
 
@@ -160,10 +161,29 @@ enum OverlayFileLayer {
 ///
 /// Its entries are looked up by name on demand (see [`Overlay::entry`]), so resolving a path never
 /// reads whole lower directories.
+///
+/// Whether an upper directory is opaque, hiding every lower directory, is known only by reading
+/// it, which needs a permission that metadata-only access (status, `O_PATH`) does not; and an
+/// opaque upper must never reach the lowers it hides. So the lower directories under an upper
+/// directory are opened only once its entries or contributors are needed, which reads it anyway
+/// (see [`Overlay::lower_dirs`]).
 struct ResolvedDir {
     upper: Option<DirHandle>,
     /// Per lower backend in precedence order, its directory if it contributes to this one.
-    lowers: Vec<Option<DirHandle>>,
+    lowers: OnceCell<Vec<Option<DirHandle>>>,
+    /// The lower directories that contribute unless the upper directory is opaque.
+    candidates: LowerCandidates,
+}
+
+/// The lower directories that may contribute to a [`ResolvedDir`], not yet opened.
+enum LowerCandidates {
+    /// The root directory of every lower backend.
+    Roots,
+    /// Per lower backend, its directory holding a directory `name` that merges into this one.
+    Children {
+        name: String,
+        parents: Vec<Option<DirHandle>>,
+    },
 }
 
 /// An overlay-visible directory entry, plus which layers contribute to it.
@@ -213,29 +233,23 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         }
     }
 
-    /// An opaque upper is the whole directory: even opening a hidden lower could fail or
-    /// invoke a backend hook. Keep handles only for layers that can contribute entries.
+    /// A directory made of `upper` and the lower directories `candidates` describe. Lowers are
+    /// opened now only when no upper directory could hide them, or there are none to hide.
     fn resolve_layers(
         &self,
         upper: Option<DirHandle>,
-        candidates: impl Iterator<Item = usize>,
-        open_lower: impl Fn(usize) -> Result<DirHandle, OpenError>,
+        candidates: LowerCandidates,
     ) -> Result<ResolvedDir, OpenError> {
-        let mut dir = ResolvedDir {
+        let settled = upper.is_none()
+            || matches!(&candidates, LowerCandidates::Children { parents, .. }
+                if parents.iter().all(Option::is_none));
+        let dir = ResolvedDir {
             upper,
-            lowers: vec![None; self.lowers.len()],
+            lowers: OnceCell::new(),
+            candidates,
         };
-        let mut candidates = candidates.peekable();
-        if candidates.peek().is_some()
-            && let Some(upper) = &dir.upper
-            && self
-                .marker_present(upper, OPAQUE_MARKER)
-                .map_err(|_| OpenError::Io)?
-        {
-            return Ok(dir);
-        }
-        for layer in candidates {
-            dir.lowers[layer] = Some(open_lower(layer)?);
+        if settled {
+            self.open_lower_dirs(&dir, false)?;
         }
         Ok(dir)
     }
@@ -244,10 +258,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         let upper = self
             .upper
             .open_dir(self.upper.root().map_err(walk_to_open_error)?, OFlags::PATH)?;
-        self.resolve_layers(Some(upper), 0..self.lowers.len(), |layer| {
-            let lower = &self.lowers[layer];
-            lower.open_dir(lower.root().map_err(walk_to_open_error)?, OFlags::PATH)
-        })
+        self.resolve_layers(Some(upper), LowerCandidates::Roots)
     }
 
     /// Resolve a child without inspecting the child's entries.
@@ -257,24 +268,6 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         dir_name: &str,
         entry: &ResolvedEntry,
     ) -> Result<ResolvedDir, OpenError> {
-        fn walk_into_dir(
-            backend: &dyn Backend,
-            parent: &DirHandle,
-            dir_name: &str,
-        ) -> Result<DirHandle, OpenError> {
-            let walking = backend.walking_dir_at(parent).ok_or(OpenError::Io)?;
-            match backend
-                .resolve(walking, &[dir_name], &|_| Ok(()))
-                .map_err(|error| walk_to_open_error(error.error))?
-            {
-                Resolution::Found(ResolvedTarget::Dir(dir)) => backend.open_dir(dir, OFlags::PATH),
-                Resolution::Found(ResolvedTarget::File(_)) => {
-                    Err(PathError::ComponentNotADirectory.into())
-                }
-                Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
-            }
-        }
-
         if entry.entry.file_type != FileType::Directory {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
@@ -284,11 +277,77 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             _ => None,
         };
 
-        let layers = (0..self.lowers.len()).filter(|&layer| entry.lower_directories[layer]);
-        self.resolve_layers(upper, layers, |layer| {
-            let parent = parent.lowers[layer].as_ref().ok_or(OpenError::Io)?;
-            walk_into_dir(self.lowers[layer].as_ref(), parent, dir_name)
-        })
+        let parents = if entry.lower_directories.contains(&true) {
+            self.lower_dirs(parent)?
+                .iter()
+                .zip(&entry.lower_directories)
+                .map(|(handle, &merges)| match (handle, merges) {
+                    (Some(handle), true) => Ok(Some(handle.clone())),
+                    (None, true) => Err(OpenError::Io),
+                    (_, false) => Ok(None),
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            vec![None; self.lowers.len()]
+        };
+        self.resolve_layers(
+            upper,
+            LowerCandidates::Children {
+                name: String::from(dir_name),
+                parents,
+            },
+        )
+    }
+
+    /// The lower directories contributing to `dir`, opened on first use: none, without opening
+    /// any, if its upper directory is opaque, which this checks by reading it.
+    fn lower_dirs<'d>(&self, dir: &'d ResolvedDir) -> Result<&'d [Option<DirHandle>], OpenError> {
+        if let Some(lowers) = dir.lowers.get() {
+            return Ok(lowers);
+        }
+        let opaque = match &dir.upper {
+            Some(upper) => self
+                .marker_present(upper, OPAQUE_MARKER)
+                .map_err(|_| OpenError::Io)?,
+            None => false,
+        };
+        self.open_lower_dirs(dir, opaque)
+    }
+
+    /// As [`Self::lower_dirs`], for a caller that has read whether the upper directory of `dir`
+    /// is `opaque`.
+    fn open_lower_dirs<'d>(
+        &self,
+        dir: &'d ResolvedDir,
+        opaque: bool,
+    ) -> Result<&'d [Option<DirHandle>], OpenError> {
+        if let Some(lowers) = dir.lowers.get() {
+            return Ok(lowers);
+        }
+        let mut lowers = vec![None; self.lowers.len()];
+        if !opaque {
+            match &dir.candidates {
+                LowerCandidates::Roots => {
+                    for (lower, opened) in self.lowers.iter().zip(&mut lowers) {
+                        *opened =
+                            Some(lower.open_dir(
+                                lower.root().map_err(walk_to_open_error)?,
+                                OFlags::PATH,
+                            )?);
+                    }
+                }
+                LowerCandidates::Children { name, parents } => {
+                    for ((lower, parent), opened) in
+                        self.lowers.iter().zip(parents).zip(&mut lowers)
+                    {
+                        if let Some(parent) = parent {
+                            *opened = Some(walk_into_dir(lower.as_ref(), parent, name)?);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(dir.lowers.get_or_init(|| lowers))
     }
 
     /// Resolve a logical `path` (relative to the overlay root) to its per-layer directories.
@@ -440,7 +499,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         metadata: CreationMetadata,
     ) -> Result<DirHandle, OpenError> {
         let lower_dir = self.resolve_dir(parent)?;
-        let lower_dir = lower_dir.lowers[layer]
+        let lower_dir = self.lower_dirs(&lower_dir)?[layer]
             .as_ref()
             .and_then(|dir| self.lowers[layer].walking_dir_at(dir))
             .ok_or(OpenError::Io)?;
@@ -721,20 +780,25 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     }
 
     /// The layer that owns a resolved directory, and its handle within that layer: the upper
-    /// directory when there is one, the highest-precedence lower directory otherwise.
+    /// directory when there is one, the highest-precedence lower directory otherwise (which
+    /// [`Self::resolve_layers`] opens at once).
     fn owning_dir<'a, 'd>(
         &'a self,
         dir: &'d ResolvedDir,
     ) -> Option<(Option<usize>, &'a dyn Backend, &'d DirHandle)> {
         match &dir.upper {
             Some(handle) => Some((None, self.upper.as_ref(), handle)),
-            None => dir.lowers.iter().zip(&self.lowers).enumerate().find_map(
-                |(layer, (handle, lower))| {
+            None => dir
+                .lowers
+                .get()?
+                .iter()
+                .zip(&self.lowers)
+                .enumerate()
+                .find_map(|(layer, (handle, lower))| {
                     handle
                         .as_ref()
                         .map(|handle| (Some(layer), lower.as_ref(), handle))
-                },
-            ),
+                }),
         }
     }
 
@@ -743,7 +807,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     /// self-enforcing lower contributes would reach subjects without any check of that lower's
     /// own permissions.
     fn lowers_broker_owned(&self, dir: &ResolvedDir) -> Result<bool, OpenError> {
-        for (lower, handle) in self.lowers.iter().zip(&dir.lowers) {
+        for (lower, handle) in self.lowers.iter().zip(self.lower_dirs(dir)?) {
             let Some(handle) = handle else {
                 continue;
             };
@@ -827,7 +891,10 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             (self.upper.as_ref(), dir.upper.as_ref())
         } else {
             let layer = entry.lower.ok_or(OpenError::Io)?;
-            (self.lowers[layer].as_ref(), dir.lowers[layer].as_ref())
+            (
+                self.lowers[layer].as_ref(),
+                self.lower_dirs(dir)?[layer].as_ref(),
+            )
         };
         let parent = parent
             .and_then(|dir| backend.walking_dir_at(dir))
@@ -1480,7 +1547,8 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             }
         }
         // Lower backends are immutable, so they can be looked up by name.
-        for (layer, (backend, handle)) in self.lowers.iter().zip(&dir.lowers).enumerate() {
+        let lower_dirs = self.open_lower_dirs(dir, false)?;
+        for (layer, (backend, handle)) in self.lowers.iter().zip(lower_dirs).enumerate() {
             if let Some(handle) = handle
                 && let Some(entry) =
                     lookup_layer_entry(backend.as_ref(), handle, name).map_err(|_| OpenError::Io)?
@@ -1511,7 +1579,8 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             }
         }
         if !markers.contains(OPAQUE_MARKER) {
-            for (layer, (backend, handle)) in self.lowers.iter().zip(&dir.lowers).enumerate() {
+            let lower_dirs = self.open_lower_dirs(dir, false)?;
+            for (layer, (backend, handle)) in self.lowers.iter().zip(lower_dirs).enumerate() {
                 let Some(handle) = handle else {
                     continue;
                 };
@@ -1614,6 +1683,24 @@ fn whiteout(name: &str) -> String {
     let mut out = String::from(WHITEOUT_PREFIX);
     out.push_str(name);
     out
+}
+
+/// The directory `dir_name` in the layer directory `parent`, opened `O_PATH`, without reading
+/// either.
+fn walk_into_dir(
+    backend: &dyn Backend,
+    parent: &DirHandle,
+    dir_name: &str,
+) -> Result<DirHandle, OpenError> {
+    let walking = backend.walking_dir_at(parent).ok_or(OpenError::Io)?;
+    match backend
+        .resolve(walking, &[dir_name], &|_| Ok(()))
+        .map_err(|error| walk_to_open_error(error.error))?
+    {
+        Resolution::Found(ResolvedTarget::Dir(dir)) => backend.open_dir(dir, OFlags::PATH),
+        Resolution::Found(ResolvedTarget::File(_)) => Err(PathError::ComponentNotADirectory.into()),
+        Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
+    }
 }
 
 fn lookup_layer_entry(
@@ -1792,10 +1879,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 (None, self.upper.as_ref(), resolved.upper.as_ref())
             } else {
                 let layer = entry.lower.ok_or_else(|| fail(WalkError::Io))?;
+                let lower_dirs = self
+                    .lower_dirs(&resolved)
+                    .map_err(open_to_walk_error)
+                    .map_err(fail)?;
                 (
                     Some(layer),
                     self.lowers[layer].as_ref(),
-                    resolved.lowers[layer].as_ref(),
+                    lower_dirs[layer].as_ref(),
                 )
             };
             let parent = parent
@@ -1857,7 +1948,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         let backend = layer.map_or(self.upper.as_ref(), |layer| self.lowers[layer].as_ref());
         let parent = match layer {
             None => resolved.upper.as_ref(),
-            Some(layer) => resolved.lowers[layer].as_ref(),
+            Some(layer) => self.lower_dirs(resolved).map_err(open_to_walk_error)?[layer].as_ref(),
         };
         let parent = parent
             .and_then(|dir| backend.walking_dir_at(dir))

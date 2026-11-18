@@ -4572,6 +4572,51 @@ mod credentials {
     }
 
     #[test]
+    fn only_the_issuing_resolver_accepts_an_open_entry() {
+        use crate::fs::errors::MapSharedError;
+
+        let backend = || {
+            InMem::<TestPlatform>::new_initialized(
+                [("/file", file(ALL, posix(CAROL)))],
+                InodeAllocators::new().next(),
+            )
+        };
+        let carol = Credentials::new(CAROL);
+        let fs = Resolver::<TestPlatform, _>::with_credentials(backend(), profile());
+        let mut entry = fs
+            .open(carol.caller(), "/file", OFlags::RDWR, Mode::empty())
+            .unwrap();
+
+        let legacy = Resolver::<TestPlatform, _>::new(backend());
+        assert!(matches!(
+            legacy.write(&mut entry, b"x", None),
+            Err(WriteError::Io)
+        ));
+        assert!(matches!(
+            legacy.truncate(&mut entry, 0, true),
+            Err(TruncateError::Io)
+        ));
+        assert!(matches!(legacy.map_shared(&entry), Err(MapSharedError::Io)));
+        assert!(legacy.get_static_backing_data(&entry).is_none());
+
+        // An identical policy on a separate resolver does not make the entry its own.
+        let other = Resolver::<TestPlatform, _>::with_credentials(backend(), profile());
+        assert!(matches!(
+            other.handle_status(&entry),
+            Err(FileStatusError::Io)
+        ));
+        assert!(matches!(
+            other.write_as(carol.caller(), &mut entry, b"x", None),
+            Err(WriteError::Io)
+        ));
+        assert_eq!(fs.get_static_backing_data(&entry), Some(&b"data"[..]));
+        assert_eq!(
+            fs.write_as(carol.caller(), &mut entry, b"x", None).unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn self_enforcing_mounts_fail_closed() {
         let alice = Credentials::new(ALICE);
         let fs = Resolver::<TestPlatform, _>::with_credentials(

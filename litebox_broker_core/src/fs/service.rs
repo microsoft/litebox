@@ -488,7 +488,7 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::<Platform, Backend>::seek_without_position_update(&entry)
+            self.resolver.seek_without_position_update(&entry)
         };
         let offset = match seek {
             Ok(offset) => offset,

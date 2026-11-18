@@ -49,6 +49,8 @@ const MAX_SYMLINKS: usize = 40;
 pub struct Resolver<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
 {
     backend: Backend,
+    /// Entries belong to this particular resolver and its policy, not just its backend type.
+    instance: Arc<()>,
     flocks: super::flock::FlockTable<Platform>,
     /// The profile that bounds guest-stored descriptors, for a resolver that authorizes subjects.
     profile: Option<FileSystemProfile>,
@@ -64,6 +66,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     pub fn new(backend: Backend) -> Self {
         Self {
             backend,
+            instance: Arc::new(()),
             flocks: super::flock::FlockTable::new(),
             profile: None,
             _sync: PhantomData,
@@ -83,6 +86,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             profile: Some(profile),
             ..Self::new(backend)
         }
+    }
+
+    fn entry_handle<'e>(&self, entry: &'e ResolverEntry<Backend>) -> Option<&'e Handle> {
+        Arc::ptr_eq(&self.instance, &entry.instance).then_some(&entry.handle)
     }
 
     /// The context for an operation by `caller`, which must be of the kind this resolver checks.
@@ -822,6 +829,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         let nonblocking = flags.contains(OFlags::NONBLOCK);
         let entry = |handle, seek_behavior| ResolverEntry {
             handle,
+            instance: Arc::clone(&self.instance),
             _backend: core::marker::PhantomData,
             read_allowed,
             write_allowed,
@@ -978,7 +986,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         if entry.path_only {
             return Err(ReadError::NotForReading);
         }
-        let file = match &entry.handle {
+        let file = match self.entry_handle(entry).ok_or(ReadError::Io)? {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(ReadError::NotAFile),
         };
@@ -1043,7 +1051,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         if entry.path_only {
             return Err(WriteError::NotForWriting);
         }
-        let file = match &entry.handle {
+        let file = match self.entry_handle(entry).ok_or(WriteError::Io)? {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(WriteError::NotAFile),
         };
@@ -1144,7 +1152,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let file = match &entry.handle {
+        let file = match self.entry_handle(entry).ok_or(SeekError::Io)? {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(SeekError::NotAFile),
         };
@@ -1182,9 +1190,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 
     pub(crate) fn seek_without_position_update(
+        &self,
         entry: &ResolverEntry<Backend>,
     ) -> Result<usize, SeekError> {
-        match &entry.handle {
+        match self.entry_handle(entry).ok_or(SeekError::Io)? {
             Handle::File(_) => {}
             Handle::Dir(_) => return Err(SeekError::NotAFile),
         }
@@ -1267,7 +1276,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         length: usize,
     ) -> Result<(), TruncateError> {
         let writer = self.content_context(caller, TruncateError::Io)?;
-        let file = match &entry.handle {
+        let file = match self.entry_handle(entry).ok_or(TruncateError::Io)? {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(TruncateError::IsDirectory),
         };
@@ -1377,10 +1386,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         };
         // Before resolving: the resolved target can hold a backend lock (e.g. the overlay's
         // namespace) that querying the open handle would take again.
-        let opened = self
-            .backend
-            .status(entry.handle.as_ref())
-            .map_err(|_| SetTimesError::Io)?;
+        let opened = self.handle_status(entry).map_err(|_| SetTimesError::Io)?;
         let path = self
             .resolve_path(&context, entry.path(), false, false)
             .map_err(map_walk)?;
@@ -2007,7 +2013,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         if entry.path_only || !entry.read_allowed {
             return Err(ReadDirError::NotOpenForReading);
         }
-        let dir = match &entry.handle {
+        let dir = match self.entry_handle(entry).ok_or(ReadDirError::Io)? {
             Handle::File(_) => return Err(ReadDirError::NotADirectory),
             Handle::Dir(dir) => dir,
         };
@@ -2059,7 +2065,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         &self,
         entry: &ResolverEntry<Backend>,
     ) -> Result<super::FileStatus, FileStatusError> {
-        self.backend.status(entry.handle.as_ref())
+        self.backend.status(
+            self.entry_handle(entry)
+                .ok_or(FileStatusError::Io)?
+                .as_ref(),
+        )
     }
 
     /// Applies, or fails without blocking, an advisory whole-file lock held by the open
@@ -2073,11 +2083,14 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         owner: Weak<dyn Send + Sync>,
         operation: FileLockOperation,
     ) -> crate::Result<Result<(), FileStatusError>> {
+        let Some(handle) = self.entry_handle(entry) else {
+            return Ok(Err(FileStatusError::Io));
+        };
         let request = match operation {
             FileLockOperation::Shared | FileLockOperation::Exclusive => {
                 // TODO(jayb): overlay dir flock identity follows the stored path; after a
                 // rename-while-open it may lock the wrong dir or fail.
-                let status = match self.handle_status(entry) {
+                let status = match self.backend.status(handle.as_ref()) {
                     Ok(status) => status,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -2093,7 +2106,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
     /// Shared terminal backing a non-path-only entry.
     pub fn terminal(&self, entry: &ResolverEntry<Backend>) -> Option<Arc<dyn TerminalEndpoint>> {
-        match &entry.handle {
+        match self.entry_handle(entry)? {
             Handle::File(file) if !entry.path_only => match self.backend.terminal(file)? {
                 FileTerminal::Fixed(terminal) => Some(terminal),
                 FileTerminal::OpenersControlling => entry
@@ -2111,10 +2124,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         &self,
         entry: &ResolverEntry<Backend>,
     ) -> Option<Arc<dyn ReadinessSource>> {
+        let handle = self.entry_handle(entry)?;
         if let Some(controlling) = &entry.controlling_terminal {
             return Some(Arc::clone(&controlling.terminal) as Arc<dyn ReadinessSource>);
         }
-        match &entry.handle {
+        match handle {
             Handle::File(file) if !entry.path_only => self.backend.readiness_source(file),
             Handle::File(_) | Handle::Dir(_) => None,
         }
@@ -2127,7 +2141,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     ///
     /// Returns `None` if the entry is not open for reading or has no static backing data.
     pub fn get_static_backing_data(&self, entry: &ResolverEntry<Backend>) -> Option<&'static [u8]> {
-        match &entry.handle {
+        match self.entry_handle(entry)? {
             Handle::File(file) if !entry.path_only && entry.read_allowed => {
                 self.backend.get_static_backing_data(file)
             }
@@ -2154,7 +2168,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         if entry.path_only {
             return Err(MapSharedError::PathOnly);
         }
-        let file = match &entry.handle {
+        let file = match self.entry_handle(entry).ok_or(MapSharedError::Io)? {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(MapSharedError::IsDirectory),
         };
@@ -2173,9 +2187,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     clippy::struct_excessive_bools,
     reason = "resolver fd entries carry independent descriptor flags"
 )]
-/// Authoritative resolver-owned state for one open filesystem entry.
+/// Authoritative state for one open filesystem entry. Only the resolver that issued the
+/// entry may operate on it, even if another resolver uses the same backend type or policy.
 pub struct ResolverEntry<Backend: super::backend::Backend> {
     handle: Handle,
+    instance: Arc<()>,
     _backend: core::marker::PhantomData<Backend>,
     read_allowed: bool,
     write_allowed: bool,
