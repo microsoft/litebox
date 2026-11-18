@@ -145,8 +145,9 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
     /// are made. Existing mounts share their backends and keep their device and inode numbers.
     /// All related views share the runtime mount budget; copying does not consume mount slots.
     /// As with any two backends, handles must be used with the instance that produced them.
+    /// Only the resolver exposes this operation publicly, so copies also share advisory locks.
     #[must_use]
-    pub fn copy_mount_view(&self) -> Self {
+    pub(super) fn copy_mount_view(&self) -> Self {
         Self {
             state: RwLock::new(self.state.read().clone()),
             resources: Arc::clone(&self.resources),

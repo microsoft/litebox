@@ -60,6 +60,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform, super::composer::Composer<Platform>> {
     /// Resolve paths against a private copy of the mount layout. Locks on shared files
     /// still conflict across views. Existing open descriptions keep their original resolver.
+    /// Copies share the runtime mount budget; copying the layout consumes no mount slots.
     #[must_use]
     pub fn copy_mount_view(&self) -> Self {
         Self {
