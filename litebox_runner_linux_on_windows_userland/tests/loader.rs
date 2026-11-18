@@ -3,8 +3,9 @@
 
 //! Tests for the Windows userland runner.
 //!
-//! To run locally, put LLVM's `bin` directory on PATH and set `LITEBOX_LINUX_SYSROOT` to
-//! the Debian x86-64 sysroot prepared by the Windows job in `.github/workflows/ci.yml`.
+//! To run locally, put LLVM's `bin` directory on PATH and run
+//! `bash dev_tools/setup_windows_linux_sysroot.sh` from the repository root.
+//! To use an existing Debian x86-64 sysroot instead, set `LITEBOX_LINUX_SYSROOT`.
 //! Each test cross-compiles its own guests; neither Docker nor WSL is required.
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -810,9 +811,16 @@ const DYNAMIC_LIBS: [(&str, &str); 2] = [
 ];
 
 fn linux_sysroot() -> std::path::PathBuf {
-    std::env::var_os("LITEBOX_LINUX_SYSROOT")
-        .expect("set LITEBOX_LINUX_SYSROOT to the x86-64 Debian sysroot (see Windows CI)")
-        .into()
+    let root = std::env::var_os("LITEBOX_LINUX_SYSROOT").map_or_else(
+        || std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/linux-sysroot"),
+        std::path::PathBuf::from,
+    );
+    assert!(
+        root.is_dir(),
+        "Linux sysroot not found at {}; run bash dev_tools/setup_windows_linux_sysroot.sh or set LITEBOX_LINUX_SYSROOT",
+        root.display()
+    );
+    root
 }
 
 fn build_c_guest(name: &str, suite: &str, flags: &[&str]) -> std::path::PathBuf {
@@ -931,7 +939,7 @@ fn run_prog_with_windows_broker(
     } else {
         ""
     };
-    let tar_path = std::path::Path::new(env!("OUT_DIR"))
+    let tar_path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("broker_{exec_name}{variant}_rootfs.tar"));
     let mut tar = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
     let exec_path = format!("bin/{exec_name}.hooked");
@@ -1023,8 +1031,8 @@ fn broker_command(
         .iter()
         .map(|program| program.file_name().unwrap().to_str().unwrap())
         .collect();
-    let tar_path =
-        std::path::Path::new(env!("OUT_DIR")).join(format!("broker_{}_rootfs.tar", names[0]));
+    let tar_path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("broker_{}_rootfs.tar", names[0]));
     let mut tar = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
     for (program, name) in programs.iter().zip(&names) {
         append_rewritten_file(&mut tar, program, &format!("bin/{name}.hooked"));
