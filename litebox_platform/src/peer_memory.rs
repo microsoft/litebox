@@ -45,6 +45,17 @@ pub unsafe fn load_u32_acquire(address: *const u32) -> u32 {
             options(nostack, preserves_flags),
         );
     }
+    // SAFETY: The caller guarantees alignment. Order the load before later reads and writes.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        asm!(
+            "lwu {value}, 0({address})",
+            "fence r, rw",
+            value = out(reg) value,
+            address = in(reg) address,
+            options(nostack),
+        );
+    }
     value
 }
 
@@ -82,6 +93,16 @@ pub unsafe fn increment_u32_release(address: *mut u32) {
             options(nostack, preserves_flags),
         );
     }
+    // SAFETY: The caller guarantees alignment. The release AMO adds modulo 2^32.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        asm!(
+            "amoadd.w.rl zero, {one}, ({address})",
+            address = in(reg) address,
+            one = in(reg) 1u32,
+            options(nostack),
+        );
+    }
 }
 
 /// Writes a `u32` with release semantics.
@@ -109,6 +130,17 @@ pub unsafe fn store_u32_release(address: *mut u32, value: u32) {
             address = in(reg) address,
             value = in(reg) value,
             options(nostack, preserves_flags),
+        );
+    }
+    // SAFETY: The caller guarantees alignment. Order earlier reads and writes before the store.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        asm!(
+            "fence rw, w",
+            "sw {value}, 0({address})",
+            address = in(reg) address,
+            value = in(reg) value,
+            options(nostack),
         );
     }
 }
@@ -141,6 +173,17 @@ pub unsafe fn load_u64_acquire(address: *const u64) -> u64 {
             options(nostack, preserves_flags),
         );
     }
+    // SAFETY: As for load_u32_acquire, with a naturally aligned doubleword.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        asm!(
+            "ld {value}, 0({address})",
+            "fence r, rw",
+            value = out(reg) value,
+            address = in(reg) address,
+            options(nostack),
+        );
+    }
     value
 }
 
@@ -169,6 +212,17 @@ pub unsafe fn store_u64_release(address: *mut u64, value: u64) {
             address = in(reg) address,
             value = in(reg) value,
             options(nostack, preserves_flags),
+        );
+    }
+    // SAFETY: As for store_u32_release, with a naturally aligned doubleword.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        asm!(
+            "fence rw, w",
+            "sd {value}, 0({address})",
+            address = in(reg) address,
+            value = in(reg) value,
+            options(nostack),
         );
     }
 }
@@ -216,6 +270,28 @@ pub unsafe fn copy_to_peer(source: &[u8], destination: *mut u8) {
 /// and the ranges must not overlap.
 unsafe fn copy(source: *const u8, destination: *mut u8, length: usize) {
     let mut offset = 0;
+    // RV64 does not guarantee misaligned doubleword accesses. Peel bytes until
+    // both pointers are aligned, or copy only bytes if their alignments differ.
+    #[cfg(target_arch = "riscv64")]
+    {
+        let src_prefix = source.align_offset(align_of::<u64>());
+        let dst_prefix = destination.align_offset(align_of::<u64>());
+        let prefix = if src_prefix == dst_prefix {
+            src_prefix.min(length)
+        } else {
+            length
+        };
+        while offset < prefix {
+            // SAFETY: offset is within both ranges.
+            unsafe {
+                copy_byte(
+                    source.wrapping_add(offset),
+                    destination.wrapping_add(offset),
+                );
+            }
+            offset += 1;
+        }
+    }
     while length - offset >= CHUNK_SIZE {
         let (from, to) = (
             source.wrapping_add(offset),
@@ -251,7 +327,8 @@ const CHUNK_SIZE: usize = 64;
 ///
 /// # Safety
 ///
-/// As for [`copy`] with `length` equal to [`CHUNK_SIZE`].
+/// As for [`copy`] with `length` equal to [`CHUNK_SIZE`]. On RV64 both pointers must be
+/// aligned for `u64`.
 unsafe fn copy_chunk(source: *const u8, destination: *mut u8) {
     // SAFETY: Guaranteed by the caller.
     #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
@@ -310,6 +387,39 @@ unsafe fn copy_chunk(source: *const u8, destination: *mut u8) {
             options(nostack, preserves_flags),
         );
     }
+    // SAFETY: Both ranges contain eight aligned doublewords.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        asm!(
+            "ld {a},  0({source})",
+            "ld {b},  8({source})",
+            "ld {c}, 16({source})",
+            "ld {d}, 24({source})",
+            "ld {e}, 32({source})",
+            "ld {f}, 40({source})",
+            "ld {g}, 48({source})",
+            "ld {h}, 56({source})",
+            "sd {a},  0({destination})",
+            "sd {b},  8({destination})",
+            "sd {c}, 16({destination})",
+            "sd {d}, 24({destination})",
+            "sd {e}, 32({destination})",
+            "sd {f}, 40({destination})",
+            "sd {g}, 48({destination})",
+            "sd {h}, 56({destination})",
+            source = in(reg) source,
+            destination = in(reg) destination,
+            a = out(reg) _,
+            b = out(reg) _,
+            c = out(reg) _,
+            d = out(reg) _,
+            e = out(reg) _,
+            f = out(reg) _,
+            g = out(reg) _,
+            h = out(reg) _,
+            options(nostack),
+        );
+    }
     // SAFETY: Guaranteed by the caller. General-purpose registers keep this
     // usable on targets without floating-point registers.
     #[cfg(target_arch = "aarch64")]
@@ -342,7 +452,7 @@ unsafe fn copy_chunk(source: *const u8, destination: *mut u8) {
 ///
 /// # Safety
 ///
-/// As for [`copy`] with `length` equal to eight.
+/// As for [`copy`] with `length` equal to eight. On RV64 both pointers must be aligned for `u64`.
 unsafe fn copy_word(source: *const u8, destination: *mut u8) {
     // SAFETY: Guaranteed by the caller.
     #[cfg(target_arch = "x86_64")]
@@ -366,6 +476,18 @@ unsafe fn copy_word(source: *const u8, destination: *mut u8) {
             destination = in(reg) destination,
             word = out(reg) _,
             options(nostack, preserves_flags),
+        );
+    }
+    // SAFETY: Both ranges contain an aligned doubleword.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        asm!(
+            "ld {word}, 0({source})",
+            "sd {word}, 0({destination})",
+            source = in(reg) source,
+            destination = in(reg) destination,
+            word = out(reg) _,
+            options(nostack),
         );
     }
 }
@@ -400,11 +522,43 @@ unsafe fn copy_byte(source: *const u8, destination: *mut u8) {
             options(nostack, preserves_flags),
         );
     }
+    // SAFETY: Guaranteed by the caller. Byte accesses impose no alignment requirement.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        asm!(
+            "lbu {byte}, 0({source})",
+            "sb {byte}, 0({destination})",
+            source = in(reg) source,
+            destination = in(reg) destination,
+            byte = out(reg) _,
+            options(nostack),
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_operations_preserve_width() {
+        let mut words = [42u32; 3];
+        let word = &raw mut words[1];
+        // SAFETY: word points to a live, aligned element, accessed only here.
+        unsafe {
+            store_u32_release(word, u32::MAX);
+            assert_eq!(load_u32_acquire(word), u32::MAX);
+            increment_u32_release(word);
+        }
+        assert_eq!(words, [42, 0, 42]);
+
+        let mut wide = 0u64;
+        // SAFETY: wide is live, aligned and exclusively accessed here.
+        unsafe {
+            store_u64_release(&raw mut wide, 0xfedc_ba98_7654_3210);
+            assert_eq!(load_u64_acquire(&raw const wide), 0xfedc_ba98_7654_3210);
+        }
+    }
 
     #[test]
     fn concurrent_increments_are_indivisible() {
@@ -430,26 +584,23 @@ mod tests {
     #[test]
     fn copies_cover_every_length_and_alignment() {
         let source: alloc::vec::Vec<u8> = (0..=255u8).collect();
-        for start in 0..8 {
-            for length in 0..(source.len() - start) {
-                let mut shared = [0xffu8; 256];
-                // SAFETY: Both ranges are live, in bounds, and disjoint.
-                unsafe {
-                    copy_to_peer(
-                        &source[start..start + length],
-                        shared.as_mut_ptr().add(start),
-                    );
-                };
-                assert_eq!(
-                    &shared[start..start + length],
-                    &source[start..start + length]
-                );
-                assert!(shared[..start].iter().all(|&byte| byte == 0xff));
-                assert!(shared[start + length..].iter().all(|&byte| byte == 0xff));
-                let mut private = alloc::vec![0u8; length];
-                // SAFETY: Both ranges are live, in bounds, and disjoint.
-                unsafe { copy_from_peer(shared.as_ptr().add(start), &mut private) };
-                assert_eq!(private, &source[start..start + length]);
+        for src in 0..8 {
+            for dst in 0..8 {
+                for length in 0..=source.len() - src.max(dst) {
+                    let input = &source[src..src + length];
+                    let mut shared = [0xffu8; 256];
+                    let mut private = [0xffu8; 256];
+                    // SAFETY: Both copies are between live, in-bounds, disjoint ranges.
+                    unsafe {
+                        copy_to_peer(input, shared.as_mut_ptr().add(dst));
+                        copy_from_peer(shared.as_ptr().add(dst), &mut private[src..src + length]);
+                    }
+                    for (buffer, start) in [(&shared, dst), (&private, src)] {
+                        assert_eq!(&buffer[start..start + length], input);
+                        assert!(buffer[..start].iter().all(|&byte| byte == 0xff));
+                        assert!(buffer[start + length..].iter().all(|&byte| byte == 0xff));
+                    }
+                }
             }
         }
     }

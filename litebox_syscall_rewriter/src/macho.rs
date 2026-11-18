@@ -17,7 +17,7 @@ use object::{LittleEndian as LE, macho};
 use zerocopy::IntoBytes as _;
 
 use crate::{
-    Arch, Error, LoadSegment, MACOS_TRAMPOLINE_PAGE_SIZE, Result, RewriteOptions, TextSectionInfo,
+    Error, LoadSegment, MACOS_TRAMPOLINE_PAGE_SIZE, Result, RewriteOptions, TextSectionInfo,
     TrampolinePlacement, aarch64, append_trampoline_footer, checked_add_u64, is_already_hooked,
     trampoline_placement_for,
 };
@@ -214,7 +214,7 @@ pub fn hook_syscalls_in_macho_with_options(
         return Ok(input.to_vec());
     };
     Rewriter::new(options.target_host())?;
-    if is_already_hooked(input, Arch::Aarch64) {
+    if is_already_hooked(input) {
         return Ok(input.to_vec());
     }
     let placement = trampoline_placement_for(

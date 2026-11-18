@@ -21,6 +21,11 @@
 //!
 //! AArch64 Mach-O syscall and thread-pointer rewriting is supported; see
 //! [`mod@macho`] for loader requirements.
+//!
+//! The ahead-of-time RV64 Linux backend supports a subset of integer and
+//! compressed instructions in static ET_EXEC files with ELF mapping symbols.
+//! It redirects ECALL and virtualizes gp using [`litebox_trampoline::riscv64::GateTls`].
+//! There is not yet a corresponding RV64 Linux userland runner.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
@@ -34,6 +39,7 @@ compile_error!(
 
 pub mod aarch64;
 pub mod macho;
+mod riscv64;
 pub use macho::{hook_syscalls_in_macho, hook_syscalls_in_macho_with_options};
 
 /// `LEA RCX, [RIP + X86_64_SYSCALL_ENTRY_JMP_LEN]`, which precedes an x86-64 ELF trampoline's
@@ -427,6 +433,9 @@ fn hook_syscalls_in_elf_inner(
             "big-endian AArch64 ELF".into(),
         ));
     }
+    if data == Some(&object::elf::ELFDATA2MSB) && machine == Some(object::elf::EM_RISCV) {
+        return Err(Error::UnsupportedExecutable("big-endian RISC-V ELF".into()));
+    }
 
     // Relocatable object files (.o) must not be patched: they are linker
     // input, not executable code. Rewriting instructions or appending
@@ -463,6 +472,22 @@ fn hook_syscalls_in_elf_inner(
     let (arch, text_sections, aarch64_code_sections, placement) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
+        if matches!(file, object::File::Elf64(_))
+            && file.architecture() == object::Architecture::Riscv64
+        {
+            if options != RewriteOptions::default() || trampoline.unwrap_or(0) != 0 {
+                return Err(Error::UnsupportedExecutable(
+                    "RV64 gates require Linux defaults and a per-thread callback".into(),
+                ));
+            }
+            if is_already_hooked(buf) {
+                return Ok(input_binary.to_vec());
+            }
+            let ranges = riscv64::code_ranges(&file)?;
+            let base = find_addr_for_trampoline_code(&file, options.target_host())?.addr();
+            return riscv64::rewrite_elf(buf, &ranges, base);
+        }
+
         let arch = match file {
             object::File::Elf64(_) => match file.architecture() {
                 object::Architecture::X86_64 => Arch::X86_64,
@@ -490,7 +515,7 @@ fn hook_syscalls_in_elf_inner(
             (sections, Vec::new())
         };
 
-        if is_already_hooked(&*buf, arch) {
+        if is_already_hooked(buf) {
             return Ok(input_binary.to_vec());
         }
 
@@ -566,7 +591,7 @@ fn hook_syscalls_in_elf_inner(
 /// through a LiteBox trampoline appended as a file overlay. The Windows shim
 /// loader maps that overlay by reading the footer this function appends.
 pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
-    if is_already_hooked(input_binary, Arch::X86_64) {
+    if is_already_hooked(input_binary) {
         return Ok(input_binary.to_vec());
     }
 
@@ -1258,10 +1283,8 @@ fn text_sections(
 }
 
 /// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
-fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
-    let header_size = match arch {
-        Arch::X86_64 | Arch::Aarch64 => size_of::<TrampolineHeader64>(),
-    };
+fn is_already_hooked(input_binary: &[u8]) -> bool {
+    let header_size = size_of::<TrampolineHeader64>();
 
     if input_binary.len() < header_size {
         return false;
