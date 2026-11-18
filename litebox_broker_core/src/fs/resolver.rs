@@ -157,7 +157,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         use litebox_broker_protocol::fs::FileError;
 
         let composer = self.composer();
-        let _paths = composer.map(|c| c.mount_paths.write());
+        let _paths = composer.map(|c| c.mount_paths.lock());
         let context = Context::new(user);
         let path = self
             .resolve_path(&context, path, true, false)
@@ -1082,7 +1082,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
     /// Unlink a file
     pub fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
-        let _paths = self.composer().map(|c| c.mount_paths.read());
+        let _paths = self.composer().map(|c| c.mount_paths.lock());
         let context = Context::new(user);
         let trailing_slash = path.ends_with('/');
         let Some((parent, name)) =
@@ -1205,7 +1205,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         old_path: &str,
         new_path: &str,
     ) -> Result<(), RenameError> {
-        let _paths = self.composer().map(|c| c.mount_paths.read());
+        let _paths = self.composer().map(|c| c.mount_paths.lock());
         let context = Context::new(user);
         let map_walk_error = |error| match error {
             WalkError::Io => RenameError::Io,
@@ -1350,41 +1350,54 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
     /// Remove a directory
     pub fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
-        let _paths = self.composer().map(|c| c.mount_paths.read());
+        let composer = self.composer();
+        let _paths = composer.map(|c| c.mount_paths.lock());
         let context = Context::new(user);
-        let Some((parent, name)) =
-            self.parent_dir_and_name(&context, path)
-                .map_err(|error| match error {
-                    WalkError::Io => RmdirError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
-        else {
-            return Err(RmdirError::Busy);
-        };
-        match name.as_str() {
-            "." => return Err(PathError::InvalidPathname.into()),
-            ".." => return Err(RmdirError::NotEmpty),
-            _ => {}
-        }
-        let writable = Self::check_dir_entries_change(
-            &context,
-            &parent,
-            RmdirError::ReadOnlyFileSystem,
-            RmdirError::NoWritePerms,
-        );
-        // Linux checks for a read-only mount before looking up the name.
-        if matches!(writable, Err(RmdirError::ReadOnlyFileSystem)) {
-            return writable;
-        }
-        if let Err(error) = writable {
-            return Err(
-                if matches!(self.name_exists(&context, parent, &name), Ok(false)) {
-                    PathError::NoSuchFileOrDirectory.into()
-                } else {
-                    error
-                },
+        let authorized_parent = || {
+            let Some((parent, name)) =
+                self.parent_dir_and_name(&context, path)
+                    .map_err(|error| match error {
+                        WalkError::Io => RmdirError::Io,
+                        WalkError::PathError(error) => error.into(),
+                    })?
+            else {
+                return Err(RmdirError::Busy);
+            };
+            match name.as_str() {
+                "." => return Err(PathError::InvalidPathname.into()),
+                ".." => return Err(RmdirError::NotEmpty),
+                _ => {}
+            }
+            let writable = Self::check_dir_entries_change(
+                &context,
+                &parent,
+                RmdirError::ReadOnlyFileSystem,
+                RmdirError::NoWritePerms,
             );
-        }
+            // Linux checks for a read-only mount before looking up the name.
+            if matches!(writable, Err(RmdirError::ReadOnlyFileSystem)) {
+                return Err(RmdirError::ReadOnlyFileSystem);
+            }
+            if let Err(error) = writable {
+                return Err(
+                    if matches!(self.name_exists(&context, parent, &name), Ok(false)) {
+                        PathError::NoSuchFileOrDirectory.into()
+                    } else {
+                        error
+                    },
+                );
+            }
+            Ok((parent, name))
+        };
+        let (parent, name) = authorized_parent()?;
+        let parent = if let Some(composer) = composer {
+            match composer.check_rmdir_pins(parent, &name)? {
+                Some(parent) => parent,
+                None => authorized_parent()?.0,
+            }
+        } else {
+            parent
+        };
         self.backend.rmdir_at(parent, &name)
     }
 

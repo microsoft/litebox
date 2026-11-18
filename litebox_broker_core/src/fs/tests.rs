@@ -117,6 +117,35 @@ fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform, TarRo> {
 }
 
 #[test]
+fn private_mount_can_cross_a_name_reserved_by_the_covered_backend() {
+    let parent = Resolver::<TestPlatform, _>::new(
+        super::composer::Composer::<TestPlatform>::builder()
+            .mount_nestable("/", |ids| {
+                Overlay::<TestPlatform>::new(
+                    InMem::<TestPlatform>::new(ids.next()),
+                    TarRo::new(TEST_TAR_FILE.into(), ids.next()),
+                    ids.next(),
+                )
+            })
+            .mount("/.litebox-overlay-data", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap(),
+    );
+    let target = "/.litebox-overlay-data/target";
+    parent.mkdir(ROOT, target, Mode::RWXU).unwrap();
+    let child = parent.copy_mount_view().unwrap();
+    child.mount_in_mem(ROOT, target).unwrap();
+    assert_ne!(
+        parent
+            .file_status(ROOT, target, true)
+            .unwrap()
+            .node_info
+            .dev,
+        child.file_status(ROOT, target, true).unwrap().node_info.dev,
+    );
+}
+
+#[test]
 fn copied_mount_views_share_files_and_locks_but_not_new_mounts() {
     use alloc::sync::Arc;
     use litebox_broker_protocol::fs::FileLockOperation::Exclusive;

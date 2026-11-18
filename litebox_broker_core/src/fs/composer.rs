@@ -14,7 +14,7 @@ use core::marker::PhantomData;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
-use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
+use litebox_platform::sync::{Mutex, RawSyncPrimitivesProvider, RwLock};
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
@@ -35,9 +35,9 @@ use thiserror::Error;
 pub struct Composer<Platform: RawSyncPrimitivesProvider> {
     state: RwLock<Platform, MountState>,
     resources: Arc<MountResources>,
-    /// Resolver mounts and destructive path operations exclude each other across views, from
-    /// their first lookup through publication or mutation. Ordinary lookups need no guard.
-    pub(super) mount_paths: Arc<RwLock<Platform, ()>>,
+    /// Path-based backends need stable names from lookup through mutation, including while
+    /// checking directory IDs. Mounts and destructive operations take this lock before lookup.
+    pub(super) mount_paths: Arc<Mutex<Platform, ()>>,
 }
 
 #[derive(Clone)]
@@ -400,7 +400,7 @@ impl<Platform: RawSyncPrimitivesProvider> ComposerBuilder<Platform> {
 
         // TODO(jayb): Validate mounted backend device IDs once backends expose that cheaply.
         Ok(Composer {
-            mount_paths: Arc::new(RwLock::new(())),
+            mount_paths: Arc::new(Mutex::new(())),
             state: RwLock::new(MountState {
                 mounts,
                 virtual_dirs,
@@ -519,13 +519,19 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
             let end = mounts.get(i + 1).map_or(path.len(), |(_, m)| m.path.len());
             let mut ids = Vec::new();
             let mut dir = mount.backend.root()?;
-            for name in &path[mount.path.len()..end] {
-                let Resolution::Found(target @ ResolvedTarget::Dir(_)) = mount
-                    .backend
-                    .resolve(dir, &[name], authorize)
-                    .map_err(|e| e.error)?
-                else {
-                    break;
+            for (j, name) in path[mount.path.len()..end].iter().enumerate() {
+                let target = match mount.backend.resolve(dir, &[name], authorize) {
+                    Ok(Resolution::Found(target @ ResolvedTarget::Dir(_))) => target,
+                    Ok(_) => break,
+                    // A configured mount can supply a name the covered backend doesn't admit.
+                    Err(ResolutionError {
+                        error:
+                            WalkError::PathError(
+                                PathError::InvalidPathname | PathError::NoSuchFileOrDirectory,
+                            ),
+                        ..
+                    }) if end < path.len() && mount.path.len() + j + 1 == end => break,
+                    Err(error) => return Err(error.error),
                 };
                 ids.push(
                     mount
@@ -543,6 +549,41 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
             }
         }
         Ok(pins)
+    }
+
+    /// Keep the authorized parent on the fast path. An identity lookup consumes it; in that
+    /// case the resolver must walk and authorize a fresh parent for the actual removal.
+    pub(super) fn check_rmdir_pins<'a>(
+        &'a self,
+        parent: ResolvedDir<'a>,
+        name: &str,
+    ) -> Result<Option<ResolvedDir<'a>>, RmdirError> {
+        let ComposerWalkingDirHandleInner::Mounted {
+            path, mount_index, ..
+        } = &parent.get_typed::<Self>().inner
+        else {
+            return Ok(Some(parent));
+        };
+        let mount = self.mount_at(*mount_index).expect("initialized mount");
+        let pins = mount.live_directory_pins();
+        if pins.is_empty() {
+            return Ok(Some(parent));
+        }
+        let path = self.checked_child_path(path.clone(), name, RmdirError::ReadOnlyFileSystem)?;
+        self.check_backing_mount(*mount_index, &path, RmdirError::Busy)?;
+        let ComposerWalkingDirHandleInner::Mounted {
+            target: ResolvedTarget::Dir(handle),
+            ..
+        } = parent.into_typed::<Self>().inner
+        else {
+            unreachable!()
+        };
+        match mount.protects_entry(handle, name, &pins) {
+            Ok(true) => Err(RmdirError::Busy),
+            Ok(false) => Ok(None),
+            Err(WalkError::PathError(e)) => Err(RmdirError::PathError(e)),
+            Err(WalkError::Io) => Err(RmdirError::Io),
+        }
     }
 
     /// Returns child names from mount paths only; mounted backend contents are not inspected.
@@ -1230,26 +1271,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 };
                 let path = self.checked_child_path(path, name, RmdirError::ReadOnlyFileSystem)?;
                 self.check_backing_mount(mount_index, &path, RmdirError::Busy)?;
-                let mount = self.mount_at(mount_index).expect("initialized mount");
-                let pins = mount.live_directory_pins();
-                if pins.is_empty() {
-                    return mount.backend.rmdir_at(handle, name);
-                }
-                let dir = mount
-                    .backend
-                    .open_dir(handle, OFlags::PATH)
-                    .map_err(|_| RmdirError::Io)?;
-                let parent = || mount.backend.walking_dir_at(&dir).ok_or(RmdirError::Io);
-                if mount
-                    .protects_entry(parent()?, name, &pins)
-                    .map_err(|e| match e {
-                        WalkError::PathError(e) => RmdirError::PathError(e),
-                        WalkError::Io => RmdirError::Io,
-                    })?
-                {
-                    return Err(RmdirError::Busy);
-                }
-                mount.backend.rmdir_at(parent()?, name)
+                self.backend(mount_index).rmdir_at(handle, name)
             }
         }
     }
