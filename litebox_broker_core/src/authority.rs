@@ -16,6 +16,9 @@ use thiserror::Error;
 mod process;
 pub(crate) use process::SubjectObject;
 
+/// Maximum number of distinct canonical terms in an authority.
+pub const MAX_TERMS: usize = litebox_broker_protocol::authority::MAX_AUTHORITY_TERMS;
+
 /// Reason a proposed authority was rejected.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum AuthorityError {
