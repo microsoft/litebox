@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use crate::authority::RestrictChildAuthorityRequest;
 use crate::error::ErrorCode;
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
@@ -173,7 +174,14 @@ impl BrokerOperation {
                     ..
                 })
                 | ProcessRequest::GetHostNames(GetHostNamesRequest { buffer, .. })
-                | ProcessRequest::SetHostName(SetHostNameRequest { name: buffer, .. }),
+                | ProcessRequest::SetHostName(SetHostNameRequest { name: buffer, .. })
+                | ProcessRequest::GetAuthority(buffer)
+                | ProcessRequest::RestrictAuthority(buffer)
+                | ProcessRequest::RestrictChildAuthority(RestrictChildAuthorityRequest {
+                    terms: buffer,
+                    ..
+                })
+                | ProcessRequest::CreateSubject(buffer),
             )
             | Self::UnixSocket(
                 UnixSocketRequest::Bind(BindUnixSocketRequest {
@@ -516,6 +524,36 @@ wire_enum! {
         /// The broker returns `UnknownObject` if the process is neither, and
         /// `UnsupportedOperation` for a signal number above [`crate::signal::MAX_SIGNAL`].
         SetParentExitSignal(SetParentExitSignalRequest),
+        /// Read a snapshot of the caller's authority, as
+        /// [`crate::authority::EncodedTerms`], into the start of the buffer.
+        ///
+        /// The broker writes the terms only if they fit in the buffer, and
+        /// returns their encoded length either way. The buffer may be at most
+        /// [`crate::authority::MAX_ENCODED_TERMS_SIZE`] long.
+        GetAuthority(SharedBufferSequence),
+        /// Replace the caller's authority with the terms in the buffer, as
+        /// [`crate::authority::EncodedTerms`], if together they restrict it.
+        ///
+        /// The broker returns `PolicyDenied` if the terms are invalid or not a
+        /// restriction, and `ResourceExhausted` if they are too many. Either
+        /// leaves the authority unchanged.
+        RestrictAuthority(SharedBufferSequence),
+        /// Replace the authority of the caller's pending child with a
+        /// restriction of it, as [`Self::RestrictAuthority`] does for the
+        /// caller.
+        ///
+        /// The broker also returns `UnknownObject` if the process is not the
+        /// caller's pending child, and `PeerClosed` once it is no longer
+        /// pending.
+        RestrictChildAuthority(RestrictChildAuthorityRequest),
+        /// Register the subject in the buffer, as
+        /// [`crate::authority::EncodedSubject`], for the caller's later
+        /// requests.
+        ///
+        /// The handle has no I/O rights and cannot be duplicated to another
+        /// process. The broker returns `PolicyDenied` if the caller's current
+        /// authority does not admit the subject.
+        CreateSubject(SharedBufferSequence),
     }
 }
 
@@ -847,6 +885,15 @@ wire_enum! {
         GetParentExitSignal(u32),
         /// The parent-exit signal was set.
         SetParentExitSignal,
+        /// The encoded length of the caller's authority, written to the
+        /// request's buffer if it is no longer than the buffer.
+        GetAuthority(u32),
+        /// The caller's authority was restricted.
+        RestrictAuthority,
+        /// The pending child's authority was restricted.
+        RestrictChildAuthority,
+        /// The subject was registered under this handle.
+        CreateSubject(ObjectHandle),
     }
 }
 

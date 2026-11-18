@@ -12,6 +12,9 @@ use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::ThreadId;
+use litebox_broker_protocol::authority::{
+    EncodedSubject, EncodedTerms, MAX_ENCODED_TERMS_SIZE, Term,
+};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::fs::{
@@ -201,6 +204,25 @@ pub(crate) trait BrokerControl: Send + Sync {
         process_id: litebox_broker_protocol::ProcessId,
         signal: u32,
     ) -> core::result::Result<(), BrokerControlError>;
+
+    /// Returns a snapshot of this process's authority terms.
+    fn get_authority(&self) -> core::result::Result<Vec<Term>, BrokerControlError>;
+
+    fn restrict_authority(
+        &self,
+        terms: &EncodedTerms,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn restrict_child_authority(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        terms: &EncodedTerms,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn create_subject(
+        &self,
+        subject: &EncodedSubject,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -1194,6 +1216,44 @@ where
         signal: u32,
     ) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.set_parent_exit_signal(process_id, signal))
+    }
+
+    fn get_authority(&self) -> core::result::Result<Vec<Term>, BrokerControlError> {
+        // One slot holds a typical authority; the retry's maximum always fits.
+        for length in [SHARED_BUFFER_SLOT_SIZE, MAX_ENCODED_TERMS_SIZE] {
+            let lease = self.acquire_shared_buffer(length as usize)?;
+            if let Some(terms) = self.request(|local| local.get_authority(lease.sequence()))? {
+                return Ok(terms);
+            }
+        }
+        panic!("broker authority exceeds its protocol ceiling");
+    }
+
+    fn restrict_authority(
+        &self,
+        terms: &EncodedTerms,
+    ) -> core::result::Result<(), BrokerControlError> {
+        let lease = self.acquire_shared_buffer(terms.as_bytes().len())?;
+        self.request(|local| local.restrict_authority(lease.sequence(), terms))
+    }
+
+    fn restrict_child_authority(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        terms: &EncodedTerms,
+    ) -> core::result::Result<(), BrokerControlError> {
+        let lease = self.acquire_shared_buffer(terms.as_bytes().len())?;
+        self.request(|local| {
+            local.restrict_child_authority(child_process_id, lease.sequence(), terms)
+        })
+    }
+
+    fn create_subject(
+        &self,
+        subject: &EncodedSubject,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        let lease = self.acquire_shared_buffer(subject.as_bytes().len())?;
+        self.request(|local| local.create_subject(lease.sequence(), subject))
     }
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {

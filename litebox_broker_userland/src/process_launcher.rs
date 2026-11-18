@@ -181,6 +181,7 @@ impl UserlandProcessLauncher {
         let process = core
             .create_process(
                 CallerCredential::HostGuaranteed,
+                Arc::default(),
                 &pid_namespace,
                 &fs,
                 &launcher.job,

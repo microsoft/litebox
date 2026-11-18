@@ -13,9 +13,12 @@ use litebox_broker_protocol::authority::{
 };
 use thiserror::Error;
 
+mod process;
+pub(crate) use process::SubjectObject;
+
 /// Maximum number of distinct terms, including subsumed but nonidentical
 /// terms. Allows old and new pairs to coexist during a multithreaded change.
-pub const MAX_TERMS: usize = 16;
+pub use litebox_broker_protocol::authority::MAX_AUTHORITY_TERMS as MAX_TERMS;
 
 /// Reason a proposed authority was rejected.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -28,6 +31,8 @@ pub enum AuthorityError {
     InvalidPrivileges,
     #[error("too many distinct authority terms")]
     TooManyTerms,
+    #[error("authority principal set exceeds the size limit")]
+    SetTooLarge,
     #[error("proposed authority is not a restriction")]
     NotRestriction,
 }
@@ -44,6 +49,9 @@ impl Authority {
     pub fn new(terms: impl IntoIterator<Item = Term>) -> Result<Self, AuthorityError> {
         let mut distinct = BTreeSet::new();
         for mut term in terms {
+            if !term.within_size_limits() {
+                return Err(AuthorityError::SetTooLarge);
+            }
             validate_and_normalize(&mut term)?;
             distinct.insert(term);
             if distinct.len() > MAX_TERMS {

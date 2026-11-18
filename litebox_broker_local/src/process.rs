@@ -3,6 +3,10 @@
 
 use alloc::vec::Vec;
 
+use litebox_broker_protocol::authority::{
+    AuthorityCodecError, EncodedSubject, EncodedTerms, MAX_ENCODED_TERMS_SIZE,
+    RestrictChildAuthorityRequest, Term, decode_terms,
+};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::message::{
@@ -553,6 +557,120 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             SetParentExitSignalRequest { process_id, signal },
         ))? {
             ProcessResponse::SetParentExitSignal => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Returns a snapshot of this process's authority, read through `buffer`.
+    ///
+    /// Returns `None` if the encoded terms are longer than `buffer`; a buffer
+    /// of [`MAX_ENCODED_TERMS_SIZE`] bytes always suffices.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buffer` is longer than [`MAX_ENCODED_TERMS_SIZE`], or the
+    /// broker returns malformed terms or a response for another operation.
+    pub fn get_authority(
+        &self,
+        buffer: SharedBufferSequence,
+    ) -> Result<Option<Vec<Term>>, Channel::Error> {
+        assert!(
+            buffer.length() <= MAX_ENCODED_TERMS_SIZE,
+            "authority buffers are at most the maximum encoded size"
+        );
+        let length = match self.request_process(ProcessRequest::GetAuthority(buffer))? {
+            ProcessResponse::GetAuthority(length) => length,
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        };
+        if length > buffer.length() {
+            return Ok(None);
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(length as usize)
+            .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
+        data.resize(length as usize, 0);
+        self.read_shared_buffer(buffer, &mut data);
+        match decode_terms(&data) {
+            Ok(terms) => Ok(Some(terms)),
+            Err(AuthorityCodecError::OutOfMemory) => {
+                Err(BrokerLocalError::Broker(ErrorCode::OutOfMemory))
+            }
+            Err(error) => panic!("broker returned malformed authority: {error}"),
+        }
+    }
+
+    /// Replaces this process's authority with `terms` if they restrict it.
+    ///
+    /// `buffer` carries the terms, so its length must be theirs. Returns
+    /// `PolicyDenied` if the terms are invalid or not a restriction, and
+    /// `ResourceExhausted` if the broker cannot hold them; the authority is
+    /// then unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buffer` has another length or the broker returns a response
+    /// for another operation.
+    pub fn restrict_authority(
+        &self,
+        buffer: SharedBufferSequence,
+        terms: &EncodedTerms,
+    ) -> Result<(), Channel::Error> {
+        self.write_shared_buffer(buffer, terms.as_bytes());
+        match self.request_process(ProcessRequest::RestrictAuthority(buffer))? {
+            ProcessResponse::RestrictAuthority => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Replaces the authority of this process's pending child
+    /// `child_process_id` with `terms` if they restrict it, as
+    /// [`Self::restrict_authority`] does for this process.
+    ///
+    /// Also returns `UnknownObject` if `child_process_id` is not the pending
+    /// child, and `PeerClosed` if it is no longer pending.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buffer` has another length or the broker returns a response
+    /// for another operation.
+    pub fn restrict_child_authority(
+        &self,
+        child_process_id: ProcessId,
+        buffer: SharedBufferSequence,
+        terms: &EncodedTerms,
+    ) -> Result<(), Channel::Error> {
+        self.write_shared_buffer(buffer, terms.as_bytes());
+        match self.request_process(ProcessRequest::RestrictChildAuthority(
+            RestrictChildAuthorityRequest {
+                child_process_id,
+                terms: buffer,
+            },
+        ))? {
+            ProcessResponse::RestrictChildAuthority => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Registers `subject` for this process's later requests, returning a
+    /// handle that cannot be duplicated to another process. Close it with
+    /// [`Self::close_object`].
+    ///
+    /// `buffer` carries the subject, so its length must be the subject's.
+    /// Returns `PolicyDenied` if this process's authority does not admit the
+    /// subject.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `buffer` has another length or the broker returns a response
+    /// for another operation.
+    pub fn create_subject(
+        &self,
+        buffer: SharedBufferSequence,
+        subject: &EncodedSubject,
+    ) -> Result<ObjectHandle, Channel::Error> {
+        self.write_shared_buffer(buffer, subject.as_bytes());
+        match self.request_process(ProcessRequest::CreateSubject(buffer))? {
+            ProcessResponse::CreateSubject(handle) => Ok(handle),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

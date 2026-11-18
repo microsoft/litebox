@@ -30,6 +30,10 @@ use litebox_broker_core::unix_socket::UnixSocketResult;
 use litebox_broker_core::{
     BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage, ProcessKey,
 };
+use litebox_broker_protocol::authority::{
+    AuthorityCodecError, EncodedTerms, MAX_ENCODED_SUBJECT_SIZE, MAX_ENCODED_TERMS_SIZE,
+    RestrictChildAuthorityRequest, Term, decode_subject, decode_terms,
+};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
@@ -675,8 +679,72 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::SetParentExitSignal(request) => process
             .set_parent_exit_signal(request.process_id, request.signal)
             .map(|()| ProcessResponse::SetParentExitSignal),
+        ProcessRequest::GetAuthority(buffer) => {
+            return get_authority(process, buffer, shared_buffers)
+                .map(ProcessResponse::GetAuthority);
+        }
+        ProcessRequest::RestrictAuthority(buffer) => {
+            let terms = read_authority_terms(shared_buffers, buffer)?;
+            process
+                .restrict_authority(terms)
+                .map(|()| ProcessResponse::RestrictAuthority)
+        }
+        ProcessRequest::RestrictChildAuthority(RestrictChildAuthorityRequest {
+            child_process_id,
+            terms,
+        }) => {
+            let terms = read_authority_terms(shared_buffers, terms)?;
+            process
+                .restrict_child_authority(child_process_id, terms)
+                .map(|()| ProcessResponse::RestrictChildAuthority)
+        }
+        ProcessRequest::CreateSubject(buffer) => {
+            let subject = read_shared_buffer(shared_buffers, buffer, MAX_ENCODED_SUBJECT_SIZE)?;
+            let subject = decode_subject(&subject).map_err(authority_payload_failure)?;
+            process
+                .create_subject(subject)
+                .map(ProcessResponse::CreateSubject)
+        }
     };
     response.map_err(RequestFailure::from)
+}
+
+/// Writes a snapshot of the caller's authority to the start of the buffer if
+/// it fits, and returns its encoded length either way.
+fn get_authority<Memory: SharedMemory>(
+    process: &BrokerProcess,
+    buffer: SharedBufferSequence,
+    shared_buffers: &SharedBufferPool<Memory>,
+) -> RequestResult<u32> {
+    validate_shared_buffer(buffer, MAX_ENCODED_TERMS_SIZE)?;
+    let authority = process.authority();
+    let encoded = EncodedTerms::new(authority.terms()).map_err(|error| match error {
+        AuthorityCodecError::OutOfMemory => RequestFailure::Respond(ErrorCode::OutOfMemory),
+        // The core accepts only authorities within the protocol ceilings.
+        _ => RequestFailure::Abort(ErrorCode::Internal),
+    })?;
+    let encoded = encoded.as_bytes();
+    if encoded.len() <= buffer.length() as usize {
+        write_shared_buffer(shared_buffers, buffer, encoded, MAX_ENCODED_TERMS_SIZE)?;
+    }
+    Ok(u32::try_from(encoded.len()).expect("encoded terms are bounded"))
+}
+
+fn read_authority_terms<Memory: SharedMemory>(
+    shared_buffers: &SharedBufferPool<Memory>,
+    buffer: SharedBufferSequence,
+) -> RequestResult<Vec<Term>> {
+    let terms = read_shared_buffer(shared_buffers, buffer, MAX_ENCODED_TERMS_SIZE)?;
+    decode_terms(&terms).map_err(authority_payload_failure)
+}
+
+/// A payload over a protocol ceiling is malformed: the client encoder rejects
+/// it before sending.
+fn authority_payload_failure(error: AuthorityCodecError) -> RequestFailure {
+    match error {
+        AuthorityCodecError::OutOfMemory => RequestFailure::Respond(ErrorCode::OutOfMemory),
+        _ => RequestFailure::Abort(ErrorCode::MalformedRequest),
+    }
 }
 
 /// Writes the host names the request selects into its shared buffer, the
@@ -2310,9 +2378,11 @@ pub enum ConnectionTermination {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::BTreeSet;
     use alloc::vec;
     use core::cell::Cell;
     use core::net::{Ipv4Addr, SocketAddrV4};
+    use litebox_broker_core::authority::Authority;
     use litebox_broker_core::random::{RandomProvider, RandomProviderError};
     use litebox_broker_core::readiness::ReadinessRegistration;
     use litebox_broker_core::socket::{
@@ -2328,6 +2398,10 @@ mod tests {
         AcceptedPlatformVsockSocket, PlatformVsockSocket, VsockProvider,
     };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy};
+    use litebox_broker_protocol::authority::{
+        DomainId, EncodedSubject, MAX_AUTHORITY_TERMS, Principal, PrincipalSet, Privileges, Scope,
+        Slots, Subject,
+    };
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
     };
@@ -2341,8 +2415,8 @@ mod tests {
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
     use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
     use litebox_broker_protocol::shared_buffer::{
-        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
-        SharedBufferSlotIndex,
+        MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE,
+        SHARED_BUFFER_SLOT_SIZE, SharedBufferSlotIndex,
     };
     use litebox_broker_protocol::socket::{
         AddressFamily, CheckConnectSocketRequest, ConnectSocketRequest, CreateSocketRequest,
@@ -2753,6 +2827,9 @@ mod tests {
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
+        active_requests_manage_authority(&broker);
+        active_requests_restrict_pending_child_authority(&broker);
+        active_requests_reject_malformed_authority_payloads(&broker);
         active_requests_operate_timers(&broker, &timer_provider);
         active_requests_operate_shared_futexes(&broker);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
@@ -3843,6 +3920,300 @@ mod tests {
             ),
             BrokerResult::Error(ErrorCode::UnknownObject)
         );
+    }
+
+    fn principal(domain: DomainId, id: u32) -> Principal {
+        Principal { domain, id }
+    }
+
+    /// A term that selects user 1000 and group 100, may enable group 5, and
+    /// may signal any process.
+    fn broad_term() -> Term {
+        let slots = Slots {
+            owners: PrincipalSet {
+                exact: BTreeSet::from([principal(DomainId::POSIX_USER, 1000)]),
+                domains: BTreeSet::new(),
+            },
+            groups: PrincipalSet {
+                exact: BTreeSet::from([principal(DomainId::POSIX_GROUP, 100)]),
+                domains: BTreeSet::new(),
+            },
+        };
+        Term {
+            access: slots.clone(),
+            identity: slots,
+            optional: PrincipalSet {
+                exact: BTreeSet::from([principal(DomainId::POSIX_GROUP, 5)]),
+                domains: BTreeSet::new(),
+            },
+            privileges: Privileges::SIGNAL_ANY,
+            ..Term::default()
+        }
+    }
+
+    /// The broad term without group 5 or any privileges.
+    fn narrow_term() -> Term {
+        Term {
+            optional: PrincipalSet::default(),
+            privileges: Privileges::empty(),
+            ..broad_term()
+        }
+    }
+
+    fn create_process_with_authority(broker: &TestBroker, terms: &[Term]) -> Arc<BrokerProcess> {
+        let process = broker
+            .core
+            .create_process(
+                CallerCredential::Unauthenticated,
+                Arc::new(Authority::new(terms.iter().cloned()).unwrap()),
+                &broker.pid_namespace,
+                &broker.fs,
+                &broker.job,
+                broker.host_names.clone(),
+                None,
+            )
+            .unwrap();
+        process.complete_start().unwrap();
+        process
+    }
+
+    /// Stages `payload` in slot 3 and returns a sequence covering it.
+    fn stage_payload(
+        shared_buffers: &SharedBufferPool<TestSharedMemory>,
+        payload: &[u8],
+    ) -> SharedBufferSequence {
+        shared_buffers
+            .write(SharedBufferSlotIndex(3), payload)
+            .unwrap();
+        single_slot_sequence(3, u32::try_from(payload.len()).unwrap())
+    }
+
+    fn active_requests_manage_authority(broker: &TestBroker) {
+        let process = create_process_with_authority(broker, &[broad_term()]);
+        let shared_buffers = test_shared_buffers();
+        let request = |request| {
+            complete_request(handle_request(
+                &process,
+                BrokerOperation::Process(request),
+                &shared_buffers,
+                &test_readiness_sink(),
+            ))
+        };
+
+        let encoded = EncodedTerms::new([&broad_term()]).unwrap();
+        let length = u32::try_from(encoded.as_bytes().len()).unwrap();
+        let too_small = [0xa5; 8];
+        shared_buffers
+            .write(SharedBufferSlotIndex(3), &too_small)
+            .unwrap();
+        assert_eq!(
+            request(ProcessRequest::GetAuthority(single_slot_sequence(
+                3,
+                length - 1
+            ))),
+            Ok(BrokerResult::Process(ProcessResponse::GetAuthority(length)))
+        );
+        let mut untouched = [0; 8];
+        shared_buffers
+            .read(SharedBufferSlotIndex(3), &mut untouched)
+            .unwrap();
+        assert_eq!(untouched, too_small);
+        assert_eq!(
+            request(ProcessRequest::GetAuthority(single_slot_sequence(
+                3,
+                SHARED_BUFFER_SLOT_SIZE
+            ))),
+            Ok(BrokerResult::Process(ProcessResponse::GetAuthority(length)))
+        );
+        let mut snapshot = vec![0; length as usize];
+        shared_buffers
+            .read(SharedBufferSlotIndex(3), &mut snapshot)
+            .unwrap();
+        assert_eq!(decode_terms(&snapshot), Ok(vec![broad_term()]));
+
+        let subject = Subject {
+            scope: Scope::Identity,
+            owner: principal(DomainId::POSIX_USER, 1000),
+            group: principal(DomainId::POSIX_GROUP, 100),
+            identities: BTreeSet::from([principal(DomainId::POSIX_GROUP, 5)]),
+            deny_only: BTreeSet::new(),
+            privileges: Privileges::SIGNAL_ANY,
+        };
+        let create_subject = |subject: &Subject| {
+            let buffer = stage_payload(
+                &shared_buffers,
+                EncodedSubject::new(subject).unwrap().as_bytes(),
+            );
+            request(ProcessRequest::CreateSubject(buffer))
+        };
+        let Ok(BrokerResult::Process(ProcessResponse::CreateSubject(handle))) =
+            create_subject(&subject)
+        else {
+            panic!("the authority admits the subject");
+        };
+        assert_eq!(
+            process.with_subject(handle, Some(Scope::Identity), Clone::clone),
+            Ok(subject.clone())
+        );
+        let unadmitted = Subject {
+            owner: principal(DomainId::POSIX_USER, 0),
+            ..subject.clone()
+        };
+        assert_eq!(
+            create_subject(&unadmitted),
+            Ok(BrokerResult::Error(ErrorCode::PolicyDenied))
+        );
+
+        let restrict = |terms: &[Term]| {
+            let buffer = stage_payload(
+                &shared_buffers,
+                EncodedTerms::new(terms).unwrap().as_bytes(),
+            );
+            request(ProcessRequest::RestrictAuthority(buffer))
+        };
+        let broader = Term {
+            privileges: Privileges::SIGNAL_ANY | Privileges::SET_HOST_NAME,
+            ..broad_term()
+        };
+        assert_eq!(
+            restrict(&[narrow_term(), broader]),
+            Ok(BrokerResult::Error(ErrorCode::PolicyDenied))
+        );
+        assert!(process.authority().terms().eq([&broad_term()]));
+        assert_eq!(
+            restrict(&[narrow_term()]),
+            Ok(BrokerResult::Process(ProcessResponse::RestrictAuthority))
+        );
+        assert!(process.authority().terms().eq([&narrow_term()]));
+        assert_eq!(
+            restrict(&[broad_term()]),
+            Ok(BrokerResult::Error(ErrorCode::PolicyDenied))
+        );
+
+        // The restriction revoked the registered subject, which can still be closed.
+        assert_eq!(
+            process.with_subject(handle, None, |_| ()),
+            Err(BrokerError::StaleSubject)
+        );
+        assert_eq!(
+            handle_test_request(&process, BrokerOperation::CloseObject(handle)),
+            BrokerResult::ObjectClosed
+        );
+    }
+
+    fn active_requests_restrict_pending_child_authority(broker: &TestBroker) {
+        let parent = create_process_with_authority(broker, &[broad_term()]);
+        let shared_buffers = test_shared_buffers();
+        let restrict_child = |child_process_id, terms: &[Term]| {
+            let buffer = stage_payload(
+                &shared_buffers,
+                EncodedTerms::new(terms).unwrap().as_bytes(),
+            );
+            complete_request(handle_request(
+                &parent,
+                BrokerOperation::Process(ProcessRequest::RestrictChildAuthority(
+                    RestrictChildAuthorityRequest {
+                        child_process_id,
+                        terms: buffer,
+                    },
+                )),
+                &shared_buffers,
+                &test_readiness_sink(),
+            ))
+        };
+
+        assert_eq!(
+            restrict_child(parent.id(), &[narrow_term()]),
+            Ok(BrokerResult::Error(ErrorCode::UnknownObject))
+        );
+        let child = parent.allocate_child_process(None, false).unwrap();
+        assert_eq!(
+            restrict_child(child.process_id, &[narrow_term()]),
+            Ok(BrokerResult::Process(
+                ProcessResponse::RestrictChildAuthority
+            ))
+        );
+        // The child's authority is now narrower than the parent's, which is unchanged.
+        assert_eq!(
+            restrict_child(child.process_id, &[broad_term()]),
+            Ok(BrokerResult::Error(ErrorCode::PolicyDenied))
+        );
+        assert!(parent.authority().terms().eq([&broad_term()]));
+        assert_eq!(
+            restrict_child(child.process_id, &[]),
+            Ok(BrokerResult::Process(
+                ProcessResponse::RestrictChildAuthority
+            ))
+        );
+        parent.cancel_child_process(child.process_id).unwrap();
+        assert_eq!(
+            restrict_child(child.process_id, &[]),
+            Ok(BrokerResult::Error(ErrorCode::UnknownObject))
+        );
+    }
+
+    fn active_requests_reject_malformed_authority_payloads(broker: &TestBroker) {
+        let process = create_process_with_authority(broker, &[broad_term()]);
+        let shared_buffers = test_shared_buffers();
+        let request = |request| {
+            complete_request(handle_request(
+                &process,
+                BrokerOperation::Process(request),
+                &shared_buffers,
+                &test_readiness_sink(),
+            ))
+        };
+        let malformed = Err(ErrorCode::MalformedRequest);
+
+        let terms = EncodedTerms::new([&narrow_term()]).unwrap();
+        let terms = terms.as_bytes();
+        let truncated = stage_payload(&shared_buffers, &terms[..terms.len() - 1]);
+        assert_eq!(
+            request(ProcessRequest::RestrictAuthority(truncated)),
+            malformed
+        );
+        let too_many = u16::try_from(MAX_AUTHORITY_TERMS + 1).unwrap();
+        let too_many = stage_payload(&shared_buffers, &too_many.to_le_bytes());
+        assert_eq!(
+            request(ProcessRequest::RestrictAuthority(too_many)),
+            malformed
+        );
+        let trailing = stage_payload(&shared_buffers, &[terms, &[0]].concat());
+        assert_eq!(
+            request(ProcessRequest::RestrictChildAuthority(
+                RestrictChildAuthorityRequest {
+                    child_process_id: process.id(),
+                    terms: trailing,
+                }
+            )),
+            malformed
+        );
+        let unknown_scope = stage_payload(&shared_buffers, &[2; 1]);
+        assert_eq!(
+            request(ProcessRequest::CreateSubject(unknown_scope)),
+            malformed
+        );
+        let oversized =
+            SHARED_BUFFER_SLOT_SIZE * u32::try_from(MAX_SHARED_BUFFER_SEQUENCE_SLOTS).unwrap();
+        let oversized = sequence(
+            core::array::from_fn::<u32, MAX_SHARED_BUFFER_SEQUENCE_SLOTS, _>(|slot| {
+                u32::try_from(slot).unwrap()
+            }),
+            oversized,
+        );
+        assert_eq!(request(ProcessRequest::GetAuthority(oversized)), malformed);
+        assert_eq!(
+            request(ProcessRequest::RestrictAuthority(oversized)),
+            malformed
+        );
+        assert_eq!(
+            request(ProcessRequest::CreateSubject(single_slot_sequence(
+                3,
+                MAX_ENCODED_SUBJECT_SIZE + 1
+            ))),
+            malformed
+        );
+        assert!(process.authority().terms().eq([&broad_term()]));
     }
 
     fn active_requests_operate_shared_futexes(broker: &TestBroker) {

@@ -19,6 +19,7 @@ use crate::message::{
 
 pub(crate) use primitive::{Decoder, Encoder};
 
+mod authority;
 mod fs;
 mod primitive;
 mod process;

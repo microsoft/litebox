@@ -10,6 +10,7 @@ use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crate::authority::Authority;
 use crate::fs::FileService;
 use crate::job::Job;
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights, StatusFlags};
@@ -281,6 +282,8 @@ pub struct BrokerProcess {
     state: Mutex<BrokerProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
+    /// Guest authority, installed before publication and only narrowed thereafter.
+    pub(crate) authority: RwLock<Arc<Authority>>,
     /// Handles of the live object references owned by this process.
     references: Mutex<ProcessReferences>,
     /// Authoritative broker threads owned by this process, by their IDs in its
@@ -627,6 +630,7 @@ impl BrokerProcess {
         parent: Option<&Arc<BrokerProcess>>,
         creator: Option<&Arc<BrokerProcess>>,
         caller_credential: CallerCredential,
+        authority: Arc<Authority>,
     ) -> Self {
         let process_group = creator.map_or_else(
             || ProcessGroup::new(&ids),
@@ -669,6 +673,7 @@ impl BrokerProcess {
                 shutdown: None,
             }),
             caller_credential,
+            authority: RwLock::new(authority),
             references: Mutex::new(ProcessReferences {
                 handles: Vec::new(),
                 pending_handles: 0,
@@ -832,6 +837,7 @@ impl BrokerProcess {
             let child = parent.with_live_owner(|| {
                 self.core.register_process(
                     self.caller_credential,
+                    self.authority(),
                     pid_namespace,
                     &self.fs,
                     &self.job,

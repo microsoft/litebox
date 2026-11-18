@@ -206,6 +206,7 @@ impl Broker {
             let init = core
                 .create_process(
                     CallerCredential::HostGuaranteed,
+                    Arc::default(),
                     &pid_namespace,
                     &fs,
                     &job,
@@ -277,6 +278,7 @@ impl Broker {
         let Some(init) = &self.init else {
             return self.core.create_process(
                 CallerCredential::HostGuaranteed,
+                Arc::default(),
                 &self.pid_namespace,
                 &self.fs,
                 &self.job,

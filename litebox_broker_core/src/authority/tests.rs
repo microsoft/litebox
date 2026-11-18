@@ -256,3 +256,199 @@ fn bound_counts_distinct_terms_not_threads_and_never_partially_commits() {
         Err(AuthorityError::NotRestriction)
     );
 }
+
+mod lifecycle {
+    use super::*;
+    use crate::test_support::{TestBroker, TestBrokerBuilder};
+    use crate::{
+        BrokerCoreLimits, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
+    };
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn broker(limits: BrokerCoreLimits) -> TestBroker {
+        TestBrokerBuilder::new(PolicyEngine::default_deny().with_process_duplication_enabled(true))
+            .with_limits(limits)
+            .build()
+            .unwrap()
+    }
+
+    fn root(broker: &TestBroker, terms: impl IntoIterator<Item = Term>) -> Arc<BrokerProcess> {
+        let process = broker
+            .core
+            .create_process(
+                CallerCredential::HostGuaranteed,
+                Arc::new(Authority::new(terms).unwrap()),
+                &broker.pid_namespace,
+                &broker.fs,
+                &broker.job,
+                broker.host_names.clone(),
+                None,
+            )
+            .unwrap();
+        process.complete_start().unwrap();
+        process
+    }
+
+    #[test]
+    fn subjects_are_private_scoped_and_rechecked_after_restriction() {
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let a = term(user(7));
+        let b = term(user(8));
+        let process = root(&broker, [a.clone(), b.clone()]);
+        let other = root(&broker, [b.clone()]);
+        let kept = process.create_subject(subject(user(7))).unwrap();
+        let lost = process.create_subject(subject(user(8))).unwrap();
+        assert_eq!(
+            other.with_subject(lost, Some(Scope::Access), |_| ()),
+            Err(BrokerError::UnknownObject)
+        );
+        assert!(
+            process
+                .duplicate_object_references_to(&[kept], &other)
+                .is_err()
+        );
+        assert_eq!(
+            process.with_subject(kept, Some(Scope::Identity), |_| ()),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(
+            process.restrict_authority(vec![a.clone(), term(user(9))]),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert!(process.with_subject(lost, None, |_| ()).is_ok());
+        process.restrict_authority(vec![a]).unwrap();
+        assert_eq!(
+            process.with_subject(kept, Some(Scope::Access), |s| s.owner),
+            Ok(user(7))
+        );
+        assert_eq!(
+            process.with_subject(lost, None, |_| ()),
+            Err(BrokerError::StaleSubject)
+        );
+        assert_eq!(
+            process.create_subject(subject(user(8))),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert!(other.create_subject(subject(user(8))).is_ok());
+        process.close_object_reference(lost).unwrap();
+        assert_eq!(
+            process.with_subject(lost, None, |_| ()),
+            Err(BrokerError::UnknownObject)
+        );
+    }
+
+    #[test]
+    fn pending_sibling_inherits_creator_not_tree_parent() {
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let a = term(user(1));
+        let ancestor = root(&broker, [a.clone(), term(user(2))]);
+        let id = ancestor.allocate_child_process(None, false).unwrap();
+        let creator = ancestor.take_child_process(id.process_id).unwrap();
+        creator.complete_start().unwrap();
+        creator.restrict_authority(vec![a.clone()]).unwrap();
+        let sibling_id = creator
+            .allocate_child_process(None, true)
+            .unwrap()
+            .process_id;
+        assert_eq!(
+            ancestor.restrict_child_authority(sibling_id, Vec::new()),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            creator.restrict_child_authority(sibling_id, vec![term(user(2))]),
+            Err(BrokerError::PolicyDenied)
+        );
+        creator
+            .restrict_child_authority(sibling_id, Vec::new())
+            .unwrap();
+        let sibling = creator.take_child_process(sibling_id).unwrap();
+        assert_eq!(sibling.authority().terms().len(), 0);
+        assert!(creator.authority().terms().eq([&a]));
+        assert_eq!(
+            creator.restrict_child_authority(sibling_id, Vec::new()),
+            Err(BrokerError::UnknownObject)
+        );
+        assert!(ancestor.authority().admits(&subject(user(2))));
+    }
+
+    #[test]
+    fn subject_quota_is_released_on_close_and_cleanup() {
+        let broker = broker(BrokerCoreLimits {
+            max_references: 1,
+            max_references_per_process: 1,
+            ..BrokerCoreLimits::DEFAULT
+        });
+        let first = root(&broker, [term(user(1))]);
+        let second = root(&broker, [term(user(2))]);
+        let handle = first.create_subject(subject(user(1))).unwrap();
+        assert_eq!(
+            second.create_subject(subject(user(2))),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(
+            first.check_readiness(handle),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(
+            first.duplicate_object_reference_to(handle, &second, ObjectRights::WAIT),
+            Err(BrokerError::InvalidRights)
+        );
+        first.close_object_reference(handle).unwrap();
+        first.create_subject(subject(user(1))).unwrap();
+        first.cleanup(true);
+        assert_eq!(
+            first.create_subject(subject(user(1))),
+            Err(BrokerError::PeerClosed)
+        );
+        assert!(second.create_subject(subject(user(2))).is_ok());
+    }
+
+    #[test]
+    fn concurrent_restrictions_cannot_restore_an_alternative() {
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let a = term(user(1));
+        let b = term(user(2));
+        let process = root(&broker, [a.clone(), b.clone()]);
+        let results = std::thread::scope(|scope| {
+            let first = scope.spawn(|| process.restrict_authority(vec![a]));
+            let second = scope.spawn(|| process.restrict_authority(vec![b]));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert!(results.contains(&Ok(())));
+        assert!(results.contains(&Err(BrokerError::PolicyDenied)));
+        assert_eq!(process.authority().terms().len(), 1);
+    }
+
+    #[test]
+    fn oversized_principal_sets_are_rejected_without_changing_authority() {
+        use litebox_broker_protocol::authority::MAX_SET_PRINCIPALS;
+
+        let broker = broker(BrokerCoreLimits::DEFAULT);
+        let mut broad = term(user(7));
+        broad.optional.domains.insert(DomainId::POSIX_GROUP);
+        let process = root(&broker, [broad.clone()]);
+        let oversized: BTreeSet<_> = (0..=u32::try_from(MAX_SET_PRINCIPALS).unwrap())
+            .map(group)
+            .collect();
+        let mut proposal = broad.clone();
+        proposal.required.clone_from(&oversized);
+        assert_eq!(
+            Authority::new([proposal.clone()]),
+            Err(AuthorityError::SetTooLarge)
+        );
+        assert_eq!(
+            process.restrict_authority(vec![proposal]),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert!(process.authority().terms().eq([&broad]));
+        assert_eq!(
+            process.create_subject(Subject {
+                identities: oversized,
+                ..subject(user(7))
+            }),
+            Err(BrokerError::ResourceExhausted)
+        );
+    }
+}

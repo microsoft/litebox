@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use litebox_broker_protocol::authority::Term;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::process::{
@@ -26,6 +27,7 @@ use crate::LiteBox;
 use crate::broker::{
     BrokerControl, BrokerPollableRegistry, error::BrokerControlError, readiness_events,
 };
+use crate::credential::{CredentialError, encode_terms};
 use crate::event::{
     Events, IOPollable, counter::EventCounter, observer::Observer, polling::Pollee,
     readiness_queue::ReadinessQueue, timer::Timer,
@@ -459,6 +461,29 @@ impl PendingChild {
     /// child's ID in its own PID namespace.
     pub fn identity(&self) -> ProcessIdentity {
         self.identity
+    }
+
+    /// Replaces this child's authority, inherited from its creator, as
+    /// [`LiteBox::restrict_authority`] replaces the creator's. The creator's
+    /// authority does not change.
+    ///
+    /// Fails with [`CredentialError::InvalidChild`] once the child has started
+    /// or exited.
+    pub fn restrict_authority(&mut self, terms: &[Term]) -> Result<(), CredentialError> {
+        // A finished child's numeric ID may have been reused. The exclusive
+        // borrow prevents a concurrent start or exit through this PendingChild.
+        if !*self.pending.get_mut() {
+            return Err(CredentialError::InvalidChild);
+        }
+        let terms = encode_terms(terms)?;
+        self.broker
+            .restrict_child_authority(self.identity.process_id, &terms)
+            .map_err(|error| match error {
+                BrokerControlError::Broker(ErrorCode::UnknownObject | ErrorCode::PeerClosed) => {
+                    CredentialError::InvalidChild
+                }
+                error => error.into(),
+            })
     }
 
     /// Starts this pending child process in a fresh runner.

@@ -37,5 +37,8 @@ wire_enum! {
         PeerClosed,
         #[error("broker memory allocation failed")]
         OutOfMemory,
+        /// A previously registered subject is outside the process's current authority.
+        #[error("stale broker subject")]
+        StaleSubject,
     }
 }
