@@ -2294,8 +2294,12 @@ impl BrokerProcess {
                 }
             }
         }
-        // Like a failed start, a failed child's threads end.
+        // As in fail_start, release resources outside the tree lock, even if a supervisor
+        // still holds the failed process.
         for child in &failed_children {
+            if child.release_references() {
+                child.state.lock().retirement.mark_abnormal();
+            }
             child.end_threads(false);
         }
         if !failed_children.is_empty() {
@@ -4709,10 +4713,16 @@ mod tests {
 
     #[test]
     fn owner_death_fails_and_retires_pending_child_process() {
+        use crate::fs::{composer::Composer, in_mem::InMem, resolver::Resolver};
+        let fs = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
         let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
         .unwrap();
         let parent = broker
@@ -4720,7 +4730,7 @@ mod tests {
             .unwrap();
         parent.complete_start().unwrap();
         let process_id = parent
-            .allocate_child_process(None, ChildProcessFlags::empty())
+            .allocate_child_process(None, ChildProcessFlags::PRIVATE_MOUNT_VIEW)
             .unwrap()
             .process_id;
         let child = broker
@@ -4731,8 +4741,10 @@ mod tests {
             .and_then(alloc::sync::Weak::upgrade)
             .unwrap();
 
+        let view = Arc::downgrade(&child.file_service().unwrap());
         parent.handle_owner_death();
 
+        assert!(view.upgrade().is_none());
         assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
         assert!(child.is_released());
         assert!(parent.tree_node.lock().children.is_empty());

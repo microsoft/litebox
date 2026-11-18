@@ -445,15 +445,15 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         read_only: E,
         no_write_perms: E,
     ) -> Result<(), E> {
-        match &dir.permissions {
-            PermissionCheck::ByResolver(permissions) if permissions.on_read_only_fs => {
-                Err(read_only)
-            }
-            PermissionCheck::ByResolver(permissions) if !context.can_write(permissions) => {
-                Err(no_write_perms)
-            }
-            PermissionCheck::ByBackend | PermissionCheck::ByResolver(_) => Ok(()),
+        if dir.permissions.on_read_only_fs() {
+            return Err(read_only);
         }
+        if let PermissionCheck::ByResolver(permissions) = &dir.permissions
+            && !context.can_write(permissions)
+        {
+            return Err(no_write_perms);
+        }
+        Ok(())
     }
 
     fn resolve_target(
@@ -679,15 +679,15 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     return Err(PathError::ComponentNotADirectory.into());
                 }
                 let wants_write = write_allowed || flags.contains(OFlags::TRUNC);
-                if !path_only && let PermissionCheck::ByResolver(permissions) = &file.permissions {
-                    if wants_write && permissions.on_read_only_fs {
-                        return Err(OpenError::ReadOnlyFileSystem);
-                    }
-                    if (read_allowed && !context.can_read(permissions))
-                        || (wants_write && !context.can_write(permissions))
-                    {
-                        return Err(OpenError::AccessNotAllowed);
-                    }
+                if !path_only && wants_write && file.permissions.on_read_only_fs() {
+                    return Err(OpenError::ReadOnlyFileSystem);
+                }
+                if !path_only
+                    && let PermissionCheck::ByResolver(permissions) = &file.permissions
+                    && ((read_allowed && !context.can_read(permissions))
+                        || (wants_write && !context.can_write(permissions)))
+                {
+                    return Err(OpenError::AccessNotAllowed);
                 }
                 let file = self.backend.open_file(file, flags)?;
                 let seek_behavior = self.backend.seek_behavior(&file);
@@ -962,12 +962,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             ResolvedTarget::Dir(dir) => &dir.permissions,
             ResolvedTarget::File(file) => &file.permissions,
         };
+        if permissions.on_read_only_fs() {
+            return Err(SetTimesError::ReadOnlyFileSystem);
+        }
         let PermissionCheck::ByResolver(permissions) = permissions else {
             return Ok(());
         };
-        if permissions.on_read_only_fs {
-            return Err(SetTimesError::ReadOnlyFileSystem);
-        }
         if Self::may_change_metadata(context, target) {
             return Ok(());
         }

@@ -581,8 +581,20 @@ pub struct CreationMetadata {
 pub enum PermissionCheck {
     /// The backend is self-enforcing permissions for this item.
     ByBackend,
+    /// The backend enforces lookup permissions, but this view refuses mutations.
+    ByReadOnlyBackend,
     /// The resolver should check this permission metadata.
     ByResolver(PermissionInfo),
+}
+
+impl PermissionCheck {
+    pub(super) fn on_read_only_fs(&self) -> bool {
+        match self {
+            Self::ByBackend => false,
+            Self::ByReadOnlyBackend => true,
+            Self::ByResolver(info) => info.on_read_only_fs,
+        }
+    }
 }
 
 /// Permission information for a particular component of the walk.

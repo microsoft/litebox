@@ -414,6 +414,32 @@ fn test_nine_p_unlink_and_rmdir() {
 }
 
 #[test]
+fn tremove_fallback_preserves_entries_of_the_wrong_kind() {
+    let server = DiodServer::start();
+    std::fs::write(server.export_path().join("file"), b"keep").unwrap();
+    std::fs::create_dir(server.export_path().join("dir")).unwrap();
+    let backend = attach(server.connect(), &server, InodeAllocators::new().next());
+    backend.unlinkat_supported.store(false, Ordering::SeqCst);
+    let fs = Resolver::<TestPlatform, _>::new(backend);
+
+    assert!(matches!(
+        fs.unlink(USER, "/dir"),
+        Err(UnlinkError::IsADirectory)
+    ));
+    assert!(matches!(
+        fs.rmdir(USER, "/file"),
+        Err(RmdirError::NotADirectory)
+    ));
+    assert!(server.export_path().join("dir").is_dir());
+    assert_eq!(
+        std::fs::read(server.export_path().join("file")).unwrap(),
+        b"keep"
+    );
+    fs.unlink(USER, "/file").unwrap();
+    fs.rmdir(USER, "/dir").unwrap();
+}
+
+#[test]
 fn test_nine_p_seek_and_partial_read() {
     let server = DiodServer::start();
     let fs = connect_9p(&server);

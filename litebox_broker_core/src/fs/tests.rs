@@ -226,6 +226,33 @@ fn copied_mount_views_share_files_and_locks_but_not_new_mounts() {
 }
 
 #[test]
+fn private_mount_pins_do_not_hide_earlier_rename_errors() {
+    use super::errors::{PathError, RenameError};
+    let parent = Resolver::<TestPlatform, _>::new(
+        super::composer::Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .mount("/other", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap(),
+    );
+    parent.mkdir(ROOT, "/pinned", Mode::RWXU).unwrap();
+    parent.mkdir(ROOT, "/other/source", Mode::RWXU).unwrap();
+    let child = parent.copy_mount_view().unwrap();
+    child.mount_in_mem(ROOT, "/pinned").unwrap();
+
+    for (old, new) in [("/pinned", "/other/new"), ("/other/source", "/pinned")] {
+        assert!(matches!(
+            parent.rename(ROOT, old, new),
+            Err(RenameError::CrossDevice)
+        ));
+    }
+    assert!(matches!(
+        parent.rename(ROOT, "/missing", "/pinned"),
+        Err(RenameError::PathError(PathError::NoSuchFileOrDirectory))
+    ));
+}
+
+#[test]
 fn a_private_mount_does_not_pin_names_in_an_unrelated_backend() {
     let fs = Resolver::<TestPlatform, _>::new(
         super::composer::Composer::<TestPlatform>::builder()

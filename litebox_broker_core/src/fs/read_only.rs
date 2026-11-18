@@ -47,8 +47,8 @@ impl<B: Backend> ReadOnly<B> {
 fn mark_read_only(permissions: &mut PermissionCheck) {
     match permissions {
         PermissionCheck::ByResolver(permissions) => permissions.on_read_only_fs = true,
-        PermissionCheck::ByBackend => {
-            // ByBackend backends are covered by the open-flag and mutation checks below.
+        PermissionCheck::ByBackend | PermissionCheck::ByReadOnlyBackend => {
+            *permissions = PermissionCheck::ByReadOnlyBackend;
         }
     }
 }

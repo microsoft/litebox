@@ -131,10 +131,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
 
         // `Tremove` removes whatever a fid names (and clunks it), so it needs a fid of its own.
-        let fid = self
-            .client
-            .walk(&dir.fid.fid, &[name])?
-            .into_complete_fid()?;
+        let walk = self.client.walk(&dir.fid.fid, &[name])?;
+        let fid = walk.fid.ok_or(Error::Remote(ENOENT))?;
+        // A complete single-component walk has exactly one qid. Unlike Tunlinkat,
+        // Tremove has no flag to enforce the kind of entry being removed.
+        if walk.wqids[0].typ.contains(fcall::QidType::DIR) == is_file {
+            self.client.clunk(fid);
+            return Err(Error::Remote(if is_file { EISDIR } else { ENOTDIR }));
+        }
         self.client.remove(fid)
     }
 }

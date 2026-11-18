@@ -29,6 +29,31 @@ fn host_service(host: &Path) -> Arc<dyn FileService> {
 }
 
 #[test]
+fn private_mount_pins_do_not_hide_a_read_only_host_mount() {
+    use litebox_broker_core::fs::read_only::ReadOnly;
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("target")).unwrap();
+    let parent: Arc<dyn FileService> = Arc::new(Resolver::<TestPlatform, _>::new(
+        Composer::<TestPlatform>::builder()
+            .try_mount("/", |ids| LocalFs::new(temp.path(), ids).map(ReadOnly::new))
+            .unwrap()
+            .build()
+            .unwrap(),
+    ));
+    let child = parent.copy_mount_view().unwrap();
+    child.mount_in_mem("/target", ROOT).unwrap().unwrap();
+    assert_eq!(
+        parent.rmdir("/target", ROOT).unwrap(),
+        Err(FileError::ReadOnlyFs)
+    );
+    assert_eq!(
+        parent.rename("/target", "/moved", ROOT).unwrap(),
+        Err(FileError::ReadOnlyFs)
+    );
+    assert!(temp.path().join("target").is_dir());
+}
+
+#[test]
 fn private_mount_guards_its_host_directories_under_other_spellings() {
     let temp = tempfile::tempdir().unwrap();
     for dir in ["Work", "Work/Target", "Work/Other"] {
