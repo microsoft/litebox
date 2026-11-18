@@ -662,9 +662,14 @@ fn execute_any(descriptor: &SecurityDescriptor) -> bool {
 #[test]
 fn execute_any_needs_execute_reachable_through_the_walk() {
     assert!(!execute_any(&file(0o644)));
-    for bits in [0o100, 0o010, 0o001] {
+    for bits in [0o100, 0o010] {
         assert!(execute_any(&file(bits)), "{bits:o}");
     }
+    let other_execute = file(0o001);
+    let owner = subject(other_execute.owner(), group(8));
+    assert!(!other_execute.allows_file(&owner, Rights::EXECUTE));
+    let privileged_owner = with_privileges(owner, Privileges::READ_ANY | Privileges::EXECUTE_ANY);
+    assert!(other_execute.allows_file(&privileged_owner, Rights::EXECUTE));
     // Owner and group are one principal, so the owner class shadows group x.
     assert!(!execute_any(&mode_of(
         FileKind::File,
@@ -732,7 +737,7 @@ fn execute_any_needs_execute_reachable_through_the_walk() {
 }
 
 #[test]
-fn execute_any_matches_exhaustive_search() {
+fn cached_execute_reachability_matches_exhaustive_search() {
     for (owner, group) in [
         (user(1), group(1)),
         (user(1), user(1)),
@@ -743,7 +748,7 @@ fn execute_any_matches_exhaustive_search() {
             let bits = 0o644 | ((x & 4) << 4) | ((x & 2) << 2) | (x & 1);
             let descriptor = mode_of(FileKind::File, owner, group, bits);
             assert_eq!(
-                execute_any(&descriptor),
+                descriptor.executable,
                 some_subject_executes(&descriptor),
                 "{owner:?} {group:?} {bits:o}"
             );
@@ -769,7 +774,7 @@ fn execute_any_matches_exhaustive_search() {
         )
         .unwrap();
         assert_eq!(
-            execute_any(&descriptor),
+            descriptor.executable,
             some_subject_executes(&descriptor),
             "{descriptor:?}"
         );
