@@ -2483,19 +2483,30 @@ fn a_udp_read_shutdown_drops_datagrams_from_outside() {
         core_socket::bind(&process, socket, bound),
         Ok(SocketOutcome::Completed(bound))
     );
-    // An unconnected socket records the shutdown even though the call fails.
-    assert_eq!(
-        core_socket::shutdown(&process, socket, ShutdownMode::Read),
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
-    );
-    // As from guest sockets, and on the userland broker.
-    wire.to_guest.lock().push_back(udp_frame(
-        wire,
-        SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 6000),
-        SocketAddrV4::new(GUEST_IPV4_ADDRESS, 5000),
-        b"late",
-    ));
-    test.provider.poll();
+    let deliver = |payload: &[u8]| {
+        wire.to_guest.lock().push_back(udp_frame(
+            wire,
+            SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 6000),
+            SocketAddrV4::new(GUEST_IPV4_ADDRESS, 5000),
+            payload,
+        ));
+        test.provider.poll();
+    };
+    deliver(b"queued");
+    // An unconnected socket records shutdown even though the call fails.
+    // Only read shutdown discards what is queued and releases its charge.
+    for (mode, queued) in [
+        (ShutdownMode::Write, b"queued".len()),
+        (ShutdownMode::Read, 0),
+        (ShutdownMode::Both, 0),
+    ] {
+        assert_eq!(
+            core_socket::shutdown(&process, socket, mode),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
+        assert_eq!(test.provider.0.stack.lock().sockets.queued, queued);
+    }
+    deliver(b"late");
     assert!(wire.to_guest.lock().is_empty());
     assert_eq!(test.provider.0.stack.lock().sockets.queued, 0);
 }

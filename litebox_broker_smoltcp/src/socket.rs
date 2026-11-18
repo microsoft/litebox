@@ -202,8 +202,8 @@ impl PlatformSocket for SmoltcpSocket {
 
     fn shutdown(&self, mode: ShutdownMode) -> BrokerResult<SocketOutcome<()>> {
         self.run(|stack| {
-            if let Kind::Udp(udp) = stack.parts(self.id)?.0 {
-                return Ok(udp.shutdown(mode));
+            if let (Kind::Udp(udp), sockets) = stack.parts(self.id)? {
+                return Ok(udp.shutdown(sockets, mode));
             }
             stack.shutdown_tcp(self.id, mode)
         })
