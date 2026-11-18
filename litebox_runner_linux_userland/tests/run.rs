@@ -3208,7 +3208,8 @@ fn run_python(args: &[&str]) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn python_runner(unique_name: &str) -> Runner {
+fn python_runner() -> Runner {
+    const ROOTFS_NAME: &str = "python_rewriter";
     let python_path = run_which("python3");
     let python_guest_dir = python_path.parent().unwrap().to_str().unwrap().to_string();
 
@@ -3250,21 +3251,73 @@ fn python_runner(unique_name: &str) -> Runner {
     let mut paths_to_stage = std::collections::BTreeSet::new();
     paths_to_stage.extend(python_lib_paths.iter().cloned());
 
-    let mut runner = Runner::new(&python_path, unique_name);
-    runner
-        .envs([
-            &format!("PYTHONHOME={python_home}"),
-            &format!("PYTHONPATH={python_lib_paths_str}"),
-            // LiteBox does not provide /proc/self/exe yet; give glibc a fallback
-            // origin for DT_NEEDED entries like $ORIGIN/../lib/libpython*.so.
-            &format!("LD_ORIGIN_PATH={python_guest_dir}"),
-            // LiteBox does not support timestamp yet, so pre-compiled .pyc files are not usable.
-            // Avoid creating .pyc files as tar filesystem is read-only.
-            "PYTHONDONTWRITEBYTECODE=1",
-            // These tests run without a broker and do not exercise Python hash randomization.
-            "PYTHONHASHSEED=0",
-        ])
-        .with_fs_path(|out_dir| {
+    let mut input_files = vec![python_path.clone(), PathBuf::from("/usr/bin/dash")];
+    for program in [&python_path, Path::new("/usr/bin/dash")] {
+        input_files.extend(
+            common::find_dependencies(program.to_str().unwrap())
+                .into_iter()
+                .map(PathBuf::from),
+        );
+    }
+    for source in &paths_to_stage {
+        input_files.extend(
+            walkdir::WalkDir::new(source)
+                .follow_links(true)
+                .into_iter()
+                .filter_entry(|entry| !is_optional_package_path(entry.path()))
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_file())
+                .map(walkdir::DirEntry::into_path),
+        );
+    }
+    input_files.extend(common::find_rewriter_source_files());
+    for source in ["run.rs", "cache.rs", "common/mod.rs", "common/runner.rs"] {
+        input_files.push(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join(source),
+        );
+    }
+    input_files.sort();
+    input_files.dedup();
+    let input_paths = input_files.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    let cache_command = format!(
+        "python rootfs {} {python_config:?} {:?}",
+        python_path.canonicalize().unwrap().display(),
+        common::rewriter_flags(),
+    );
+    let tmp_dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let tar_file = tmp_dir.join(format!("rootfs_{ROOTFS_NAME}.tar"));
+    // Never unlink the lock: waiting builders must continue to lock the same inode.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(tmp_dir.join(format!("rootfs_{ROOTFS_NAME}.lock")))
+        .unwrap();
+    lock.lock().unwrap();
+    let rootfs_cached =
+        crate::cache::is_cached_and_valid(&input_paths, &tar_file, &cache_command).unwrap_or(false);
+    let mut runner = if rootfs_cached {
+        println!("Using cached Python rootfs");
+        Runner::new_with_rootfs(&python_path, ROOTFS_NAME)
+    } else {
+        Runner::new(&python_path, ROOTFS_NAME)
+    };
+    runner.envs([
+        &format!("PYTHONHOME={python_home}"),
+        &format!("PYTHONPATH={python_lib_paths_str}"),
+        // LiteBox does not provide /proc/self/exe yet; give glibc a fallback
+        // origin for DT_NEEDED entries like $ORIGIN/../lib/libpython*.so.
+        &format!("LD_ORIGIN_PATH={python_guest_dir}"),
+        // LiteBox does not support timestamp yet, so pre-compiled .pyc files are not usable.
+        // Avoid creating .pyc files as tar filesystem is read-only.
+        "PYTHONDONTWRITEBYTECODE=1",
+        // These tests run without a broker and do not exercise Python hash randomization.
+        "PYTHONHASHSEED=0",
+    ]);
+    if !rootfs_cached {
+        runner.with_fs_path(|out_dir| {
             for source_path in &paths_to_stage {
                 if !source_path.exists() {
                     continue;
@@ -3272,49 +3325,41 @@ fn python_runner(unique_name: &str) -> Runner {
 
                 if source_path.is_file() {
                     let dest_path = out_dir.join(source_path.strip_prefix("/").unwrap());
-                    if !dest_path.exists() {
-                        if let Some(parent) = dest_path.parent() {
-                            std::fs::create_dir_all(parent).unwrap();
-                        }
-                        std::fs::copy(source_path, dest_path).unwrap();
+                    if let Some(parent) = dest_path.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
                     }
+                    std::fs::copy(source_path, dest_path).unwrap();
                     continue;
                 }
 
                 if source_path.is_dir() {
                     let python_lib_dst = out_dir.join(source_path.strip_prefix("/").unwrap());
-                    let stage_marker = python_lib_dst.join(".stage-complete.cache-checksum");
-                    if !stage_marker.exists() {
-                        std::fs::create_dir_all(&python_lib_dst).unwrap();
-                        println!(
-                            "Copying python3 lib from {} to {}",
-                            source_path.display(),
-                            python_lib_dst.display()
-                        );
-                        let mut sources = std::fs::read_dir(source_path)
-                            .unwrap()
-                            .map(|entry| entry.unwrap().path())
-                            .filter(|path| !is_optional_package_path(path))
-                            .collect::<Vec<_>>();
-                        sources.sort();
-                        if !sources.is_empty() {
-                            let output = std::process::Command::new("cp")
-                                // Preserve attributes for the tar cache and dereference symlinks.
-                                .arg("-rpL")
-                                .args(&sources)
-                                .arg(&python_lib_dst)
-                                .output()
-                                .expect("Failed to copy python3 lib");
-                            // Broken symlinks can fail without preventing the remaining copies.
-                            if !output.status.success() {
-                                let stderr =
-                                    std::str::from_utf8(output.stderr.as_slice()).unwrap_or("");
-                                eprintln!(
-                                    "Warning: cp finished with errors (non-critical):\n{stderr}"
-                                );
-                            }
+                    std::fs::create_dir_all(&python_lib_dst).unwrap();
+                    println!(
+                        "Copying python3 lib from {} to {}",
+                        source_path.display(),
+                        python_lib_dst.display()
+                    );
+                    let mut sources = std::fs::read_dir(source_path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .filter(|path| !is_optional_package_path(path))
+                        .collect::<Vec<_>>();
+                    sources.sort();
+                    if !sources.is_empty() {
+                        let output = std::process::Command::new("cp")
+                            // Preserve attributes for the tar cache and dereference symlinks.
+                            .arg("-rpL")
+                            .args(&sources)
+                            .arg(&python_lib_dst)
+                            .output()
+                            .expect("Failed to copy python3 lib");
+                        // Broken symlinks can fail without preventing the remaining copies.
+                        if !output.status.success() {
+                            let stderr =
+                                std::str::from_utf8(output.stderr.as_slice()).unwrap_or("");
+                            eprintln!("Warning: cp finished with errors (non-critical):\n{stderr}");
                         }
-                        std::fs::write(&stage_marker, b"").unwrap();
                     }
 
                     // Rewrite shared objects (.so, .so.1, .so.1.2.3, etc.) under the python lib directory.
@@ -3354,6 +3399,10 @@ fn python_runner(unique_name: &str) -> Runner {
                 }
             }
         });
+        runner.with_fs_path(stage_shell);
+        assert_eq!(runner.prepare_rootfs(), tar_file);
+        crate::cache::create_cache_entry(&input_paths, &tar_file, &cache_command).unwrap();
+    }
     runner
 }
 
@@ -3380,11 +3429,8 @@ finally:
     release.set()
     thread.join()
 "#;
-    let mut runner = python_runner("python_child_programs");
-    runner
-        .allow_process_duplication()
-        .args(["-c", SCRIPT])
-        .with_fs_path(stage_shell);
+    let mut runner = python_runner();
+    runner.allow_process_duplication().args(["-c", SCRIPT]);
 
     let output = String::from_utf8(runner.output()).unwrap();
     let lines: Vec<&str> = output.lines().collect();
@@ -3424,7 +3470,7 @@ print("pipe", message == f"child {pid} {os.getpid()} 2")
 print("wait", waited == pid, os.waitstatus_to_exitcode(status))
 print("parent", data["value"])
 "#;
-    let mut runner = python_runner("python_os_fork");
+    let mut runner = python_runner();
     runner.allow_process_duplication().args(["-c", SCRIPT]);
 
     let output = String::from_utf8(runner.output()).unwrap();
@@ -3440,7 +3486,7 @@ print("parent", data["value"])
 #[cfg(target_os = "linux")]
 #[test]
 fn test_runner_with_python_repl_pty() {
-    let mut runner = python_runner("python_repl_pty_rewriter");
+    let mut runner = python_runner();
     let mut pty = common::pty::Pty::open();
     let (stdin, stdout, stderr) = pty.slave_stdio();
     let mut child =
