@@ -40,7 +40,7 @@ use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::{ProcessGroupId, ProcessId, ThreadId};
 #[cfg(target_arch = "aarch64")]
 use litebox_common_linux::SveSetVlFlags;
-use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
+use litebox_common_linux::program_startup::{ForkMemoryRegion, InheritedCwd, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Siginfo, SiginfoChild, Signal};
 use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
@@ -1904,10 +1904,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .name_shared_memory(|| self.issue_shared_memory_id())
                 .map_err(|_| Errno::EAGAIN)?;
         }
-        let (fds, objects): (Vec<_>, Vec<_>) =
+        let (fds, mut objects): (Vec<_>, Vec<_>) =
             self.fds_inherited_across_fork()?.into_iter().unzip();
         let fs = self.fs.borrow();
-        let cwd = alloc::string::ToString::to_string(fs.context.read().cwd());
+        let cwd = fs.cwd_for_child(&mut objects);
         let umask = u32::from(fs.umask().bits());
         drop(fs);
         let (blocked_signals, signal_actions, alternate_signal_stack) = self.signals.fork_state();
@@ -1954,7 +1954,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child = self.allocate_child_process(relation)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
-        let handles = child.inherit(&objects).map_err(Errno::from)?;
+        let mut handles = child.inherit(&objects).map_err(Errno::from)?;
+        finish_cwd_transfer(&mut startup.cwd, &mut handles);
         for (forked, handle) in startup.fds.iter_mut().zip(handles) {
             forked.inherited.handle = handle;
         }
@@ -3881,6 +3882,31 @@ const SHEBANG_MAX_RECURSION: u32 = 6;
 /// Maximum length of a shebang line that we inspect. Matches Linux `BINPRM_BUF_SIZE`.
 const SHEBANG_MAX_LINE: usize = 256;
 
+impl<P: ShimPlatform> crate::syscalls::file::FsState<P> {
+    fn cwd_for_child(&self, objects: &mut Vec<litebox::process::InheritableFd<P>>) -> InheritedCwd {
+        if let Some(dir) = self.cwd_handle() {
+            objects.push(litebox::process::InheritableFd::File(dir));
+            // Same encoded size as the child's eventual handle, for the payload size check.
+            InheritedCwd::File(litebox_broker_protocol::ObjectHandle(0))
+        } else {
+            InheritedCwd::Path(alloc::string::ToString::to_string(
+                self.context.read().cwd(),
+            ))
+        }
+    }
+}
+
+fn finish_cwd_transfer(
+    cwd: &mut InheritedCwd,
+    handles: &mut Vec<litebox_broker_protocol::ObjectHandle>,
+) {
+    if let InheritedCwd::File(handle) = cwd {
+        *handle = handles
+            .pop()
+            .expect("cwd follows the inherited descriptors");
+    }
+}
+
 /// Parse a `#!interpreter [optional-arg]` line from a file header buffer.
 ///
 /// Returns `Some((interpreter, optional_arg))` when `buf` starts with `#!` and
@@ -3918,9 +3944,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mut argv: alloc::vec::Vec<alloc::ffi::CString>,
     ) -> Result<(alloc::string::String, alloc::vec::Vec<alloc::ffi::CString>), Errno> {
         for _ in 0..SHEBANG_MAX_RECURSION {
-            let full_path = self.resolve_path(&path)?;
             let file = self.do_open(
-                &full_path,
+                &path,
                 litebox_common_linux::OFlags::RDONLY | litebox_common_linux::OFlags::NOCTTY,
                 litebox_broker_protocol::fs::FileMode::empty(),
             )?;
@@ -3961,12 +3986,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         envp: alloc::vec::Vec<alloc::ffi::CString>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
-        // The fresh runner needs an absolute path; resolve it against this task's cwd.
-        let path = self.resolve_path(path.as_str())?;
-        let (inherited_fds, fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
+        let (inherited_fds, mut fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
             self.fds_inherited_across_exec()?.into_iter().unzip();
         let fs = self.fs.borrow();
-        let cwd = alloc::string::ToString::to_string(fs.context.read().cwd());
+        let cwd = fs.cwd_for_child(&mut fds);
         let umask = u32::from(fs.umask().bits());
         drop(fs);
         let resource_limits = self
@@ -3999,7 +4022,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         startup.encode().map_err(|_| Errno::E2BIG)?;
         let vfork = self.vfork.borrow();
         let child = &vfork.as_ref().expect("vfork transfer lost its child").child;
-        let handles = child.inherit(&fds).map_err(Errno::from)?;
+        let mut handles = child.inherit(&fds).map_err(Errno::from)?;
+        finish_cwd_transfer(&mut startup.cwd, &mut handles);
         for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
             inherited.handle = handle;
         }
@@ -6473,6 +6497,39 @@ mod fork_tests {
     use litebox_broker_transport::channel::LocalCallChannel;
 
     #[test]
+    fn startup_pins_path_only_working_directory() {
+        use crate::syscalls::tests::{TestPlatform, test_platform};
+        use litebox::platform::ThreadProvider;
+        use litebox_broker_protocol::fs::FileMode;
+
+        let platform = test_platform();
+        TestPlatform::run_test_thread(|| {
+            let (litebox, pid) = crate::syscalls::test_broker::litebox(platform);
+            let shim = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, pid).build();
+            let task = shim.0.clone().new_test_task();
+            let fs = task.fs.borrow();
+            let path = "/startup-cwd";
+            let renamed = "/renamed-startup-cwd";
+            shim.0
+                .litebox
+                .mkdir_file(&fs.context.read(), path, FileMode::RWXU)
+                .unwrap();
+            shim.restore_cwd(
+                &fs,
+                &task.files.borrow(),
+                &InheritedCwd::Path(path.into()),
+                core::iter::empty(),
+            )
+            .unwrap();
+            shim.0
+                .litebox
+                .rename_file(&fs.context.read(), path, renamed)
+                .unwrap();
+            assert_eq!(fs.cwd_handle().unwrap().path().unwrap(), renamed);
+        });
+    }
+
+    #[test]
     fn native_fork_retains_memory_manager() {
         use crate::syscalls::tests::{TestPlatform, test_platform};
         use litebox::platform::ThreadProvider;
@@ -6560,7 +6617,7 @@ mod fork_tests {
                 resource_limits: task.process().limits.get(),
                 dumpable: true,
                 no_new_privs: false,
-                cwd: "/".into(),
+                cwd: InheritedCwd::Path("/".into()),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN],
                 blocked_signals,
                 signal_actions,

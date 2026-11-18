@@ -322,6 +322,8 @@ pub enum RmdirError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
+    #[error("directory has been removed")]
+    Removed,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("fd does not point to a directory")]
@@ -361,6 +363,8 @@ pub enum WalkError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum FilePathError {
+    #[error("directory has no name in this namespace")]
+    NoSuchFileOrDirectory,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("I/O error")]

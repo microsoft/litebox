@@ -493,6 +493,45 @@ impl<Platform: ShimPlatform> Clone for LinuxShim<Platform> {
 }
 
 impl<Platform: ShimPlatform> LinuxShim<Platform> {
+    fn restore_cwd(
+        &self,
+        fs: &syscalls::file::FsState<Platform>,
+        files: &syscalls::file::FilesState<Platform>,
+        cwd: &litebox_common_linux::program_startup::InheritedCwd,
+        mut inherited: impl Iterator<Item = litebox_common_linux::program_startup::InheritedFd>,
+    ) -> Result<(), Errno> {
+        use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags};
+        use litebox_common_linux::program_startup::InheritedCwd;
+        let file = match cwd {
+            InheritedCwd::Path(path) => {
+                fs.inherit_cwd(path)?;
+                if path == "/" {
+                    return Ok(());
+                }
+                Arc::new(self.0.litebox.open_file(
+                    &fs.context.read(),
+                    path,
+                    FileAccessMode::ReadOnly,
+                    FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+                    FileMode::empty(),
+                )?)
+            }
+            InheritedCwd::File(handle) => {
+                // Broker inheritance deduplicates references. If fchdir used an fd that was
+                // also inherited, share its already adopted file; never own its handle twice.
+                if let Some(fd) = inherited.find(|fd| fd.handle == *handle) {
+                    let fd = files.typed_fd_from_raw(fd.fd as usize)?;
+                    self.0
+                        .with_file(fd.file_only(Errno::ENOTDIR)?, |f| Ok(Arc::clone(f.file())))?
+                } else {
+                    Arc::new(self.0.litebox.adopt_inherited_file(*handle)?)
+                }
+            }
+        };
+        fs.set_cwd_handle(file);
+        Ok(())
+    }
+
     /// Loads a program using the initial thread allocated during broker negotiation.
     pub fn load_program(
         &self,
@@ -538,21 +577,20 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
         });
         let fs_state = syscalls::file::FsState::new(&credentials);
-        if let Some(cwd) = cwd {
-            fs_state
-                .inherit_cwd(&cwd)
-                .map_err(loader::elf::ElfLoaderError::OpenError)?;
-        }
         if let Some(umask) = umask {
             fs_state.set_umask(umask);
         }
         let fs_state = Arc::new(fs_state);
-        match inherited_fds {
+        match &inherited_fds {
             None => {
                 let context = fs_state.context.read().clone();
                 files.initialize_stdio_in_shared_descriptors_table(&self.0, &context);
             }
-            Some(inherited_fds) => files.install_inherited_fds(&self.0, &inherited_fds)?,
+            Some(inherited_fds) => files.install_inherited_fds(&self.0, inherited_fds)?,
+        }
+        if let Some(cwd) = cwd {
+            self.restore_cwd(&fs_state, &files, &cwd, inherited_fds.into_iter().flatten())
+                .map_err(loader::elf::ElfLoaderError::OpenError)?;
         }
 
         let signals = syscalls::signal::SignalState::inherited(
@@ -722,8 +760,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
         });
         let fs_state = syscalls::file::FsState::new(&credentials);
-        fs_state
-            .inherit_cwd(&cwd)
+        self.restore_cwd(&fs_state, &files, &cwd, fds.iter().map(|fd| fd.inherited))
             .map_err(ForkRestoreError::WorkingDirectory)?;
         fs_state.set_umask(umask);
 

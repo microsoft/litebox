@@ -16,7 +16,7 @@
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -54,13 +54,47 @@ pub struct Overlay<Platform: RawSyncPrimitivesProvider> {
     lowers: Vec<Box<dyn Backend>>,
     alloc: InodeAllocator,
     /// Keeps resolution, authorization, and any subsequent copy-up or mutation atomic.
-    namespace: Mutex<Platform, Namespace>,
+    namespace: Mutex<Platform, Namespace<Platform>>,
     state: Mutex<Platform, State>,
 }
 
 /// A held namespace lock, marking mutability of the upper backend.
-type NamespaceGuard<'a, Platform> = MutexGuard<'a, Platform, Namespace>;
-struct Namespace;
+type NamespaceGuard<'a, Platform> = MutexGuard<'a, Platform, Namespace<Platform>>;
+// While linked, the name moves under the namespace lock. After unlink, only the
+// former parent remains reachable (via `..`); the old name is never reused.
+type DirectoryLocation<P> = Mutex<P, Result<Vec<String>, OverlayDir<P>>>;
+struct Namespace<P: RawSyncPrimitivesProvider> {
+    directories: Vec<Weak<DirectoryLocation<P>>>,
+}
+
+impl<P: RawSyncPrimitivesProvider> Namespace<P> {
+    fn track(&mut self, path: Vec<String>) -> Arc<DirectoryLocation<P>> {
+        if self.directories.len() == self.directories.capacity() {
+            self.directories.retain(|dir| dir.strong_count() != 0);
+        }
+        let location = Arc::new(Mutex::new(Ok(path)));
+        self.directories.push(Arc::downgrade(&location));
+        location
+    }
+
+    fn relocate(&mut self, old: &[String], new: Option<&[String]>, parent: &OverlayDir<P>) {
+        self.directories.retain(|dir| {
+            let Some(dir) = dir.upgrade() else {
+                return false;
+            };
+            let mut location = dir.lock();
+            if let Ok(path) = location.as_ref() {
+                if let Some(suffix) = path.strip_prefix(old) {
+                    *location =
+                        new.map_or_else(|| Err(parent.clone()), |new| Ok([new, suffix].concat()));
+                } else if new.is_some_and(|new| path.starts_with(new)) {
+                    *location = Err(parent.clone());
+                }
+            }
+            true
+        });
+    }
+}
 
 struct State {
     /// Overlay-visible identity assigned to each per-layer node.
@@ -79,9 +113,29 @@ enum LayerNode {
 
 // Holds no nested-layer scopes: re-entering a layer during lazy lookup would deadlock.
 pub struct OverlayWalkingDir<'a, Platform: RawSyncPrimitivesProvider> {
-    path: Vec<String>,
+    path: WalkLocation<Platform>,
     resolved: ResolvedDir,
     locked: NamespaceGuard<'a, Platform>,
+}
+
+enum WalkLocation<P: RawSyncPrimitivesProvider> {
+    Linked(Vec<String>),
+    Detached(OverlayDir<P>),
+}
+
+impl<P: RawSyncPrimitivesProvider> WalkLocation<P> {
+    fn linked(self) -> Result<Vec<String>, PathError> {
+        match self {
+            Self::Linked(path) => Ok(path),
+            Self::Detached(_) => Err(PathError::NoSuchFileOrDirectory),
+        }
+    }
+}
+
+impl<P: RawSyncPrimitivesProvider> From<Vec<String>> for WalkLocation<P> {
+    fn from(path: Vec<String>) -> Self {
+        Self::Linked(path)
+    }
 }
 
 pub struct OverlayResolvedFile<'a, Platform: RawSyncPrimitivesProvider> {
@@ -92,10 +146,19 @@ pub struct OverlayResolvedFile<'a, Platform: RawSyncPrimitivesProvider> {
     locked: NamespaceGuard<'a, Platform>,
 }
 
-#[derive(Clone)]
-pub struct OverlayDir {
-    // XXX(jayb): directory handles are path-based and go stale on directory rename.
-    path: Vec<String>,
+pub struct OverlayDir<P: RawSyncPrimitivesProvider> {
+    location: Arc<DirectoryLocation<P>>,
+    // Keep fstat on the underlying directory possible after it has been removed.
+    backing: (Option<usize>, DirHandle),
+}
+
+impl<P: RawSyncPrimitivesProvider> Clone for OverlayDir<P> {
+    fn clone(&self) -> Self {
+        Self {
+            location: self.location.clone(),
+            backing: self.backing.clone(),
+        }
+    }
 }
 
 /// An owned handle to a file opened through the overlay.
@@ -167,7 +230,9 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             upper: Box::new(upper),
             lowers,
             alloc: allocator,
-            namespace: Mutex::new(Namespace),
+            namespace: Mutex::new(Namespace {
+                directories: Vec::new(),
+            }),
             state: Mutex::new(State {
                 ids: HashMap::new(),
                 copied_up: HashMap::new(),
@@ -255,7 +320,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
 
     fn scoped_dir<'a>(
         &'a self,
-        path: Vec<String>,
+        path: impl Into<WalkLocation<Platform>>,
         resolved: ResolvedDir,
         locked: NamespaceGuard<'a, Platform>,
     ) -> Result<ScopedDir<'a>, OpenError> {
@@ -267,7 +332,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             .map_err(file_status_to_open_error)?;
         Ok(ScopedDir::from_typed::<Self>(
             OverlayWalkingDir {
-                path,
+                path: path.into(),
                 resolved,
                 locked,
             },
@@ -488,7 +553,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 } = dir.into_typed::<Self>();
                 let upper = match resolved.upper {
                     Some(upper) => upper,
-                    None => self.ensure_upper_dir(&locked, &path)?,
+                    None => self.ensure_upper_dir(&locked, &path.linked()?)?,
                 };
                 let target = self.upper.walking_dir_at(&upper).ok_or(OpenError::Io)?;
                 Ok(f(ResolvedTarget::Dir(target)))
@@ -972,7 +1037,7 @@ impl<Platform: RawSyncPrimitivesProvider> BackendHandles for Overlay<Platform> {
     type ResolvedDir<'a> = OverlayWalkingDir<'a, Platform>;
     type ResolvedFile<'a> = OverlayResolvedFile<'a, Platform>;
     type FileHandle = OverlayFile;
-    type DirHandle = OverlayDir;
+    type DirHandle = OverlayDir<Platform>;
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
@@ -1003,10 +1068,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 return Err(fail(PathError::InvalidPathname.into()));
             }
             let OverlayWalkingDir {
-                mut path,
+                path,
                 resolved,
                 locked,
             } = current.into_typed::<Self>();
+            let mut path = path.linked().map_err(|error| fail(error.into()))?;
             let Some(entry) = self
                 .entry(&resolved, name)
                 .map_err(open_to_walk_error)
@@ -1115,18 +1181,67 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         let OverlayWalkingDir {
             path,
             resolved,
-            locked: _locked,
+            mut locked,
         } = dir.into_typed::<Self>();
-        let (_, backend, handle) = self.owning_dir(&resolved).ok_or(OpenError::Io)?;
-        backend.open_dir(backend.walking_dir_at(handle).ok_or(OpenError::Io)?, flags)?;
-        Ok(DirHandle::from_typed::<Self>(OverlayDir { path }))
+        let (layer, backend, handle) = self.owning_dir(&resolved).ok_or(OpenError::Io)?;
+        let handle =
+            backend.open_dir(backend.walking_dir_at(handle).ok_or(OpenError::Io)?, flags)?;
+        Ok(DirHandle::from_typed::<Self>(OverlayDir {
+            location: match path {
+                WalkLocation::Linked(path) => locked.track(path),
+                WalkLocation::Detached(dir) => dir.location,
+            },
+            backing: (layer, handle),
+        }))
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ScopedDir<'a>> {
         let locked = self.namespace.lock();
-        let path = dir.get_typed::<Self>().path.clone();
-        let resolved = self.resolve_dir(&path).ok()?;
-        self.scoped_dir(path, resolved, locked).ok()
+        let dir = dir.get_typed::<Self>();
+        if let Ok(path) = dir.location.lock().as_ref() {
+            self.scoped_dir(path.clone(), self.resolve_dir(path).ok()?, locked)
+                .ok()
+        } else {
+            let mut resolved = ResolvedDir {
+                upper: None,
+                lowers: vec![None; self.lowers.len()],
+            };
+            let (layer, backing) = &dir.backing;
+            *match layer {
+                Some(i) => &mut resolved.lowers[*i],
+                None => &mut resolved.upper,
+            } = Some(backing.clone());
+            self.scoped_dir(WalkLocation::Detached(dir.clone()), resolved, locked)
+                .ok()
+        }
+    }
+
+    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+        let _namespace = self.namespace.lock();
+        dir.get_typed::<Self>()
+            .location
+            .lock()
+            .as_ref()
+            .cloned()
+            .map_err(|_| PathError::NoSuchFileOrDirectory.into())
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        let locked = self.namespace.lock();
+        let mut path = match dir.get_typed::<Self>().location.lock().clone() {
+            Ok(path) => path,
+            Err(parent) => return Ok(Some(DirHandle::from_typed::<Self>(parent))),
+        };
+        if path.pop().is_none() {
+            return Ok(None);
+        }
+        let resolved = self.resolve_dir(&path).map_err(open_to_walk_error)?;
+        let parent = self
+            .scoped_dir(path, resolved, locked)
+            .map_err(open_to_walk_error)?;
+        self.open_dir(parent, OFlags::PATH)
+            .map(Some)
+            .map_err(open_to_walk_error)
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
@@ -1187,8 +1302,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        let path = handle.into_typed::<Self>().path;
         let _locked = self.namespace.lock();
+        let Ok(path) = handle.get_typed::<Self>().location.lock().clone() else {
+            return Err(ReadDirError::Removed);
+        };
         let resolved = self.resolve_dir(&path).map_err(|_| ReadDirError::Io)?;
         self.entries(&resolved).map_err(|_| ReadDirError::Io)
     }
@@ -1271,9 +1388,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 })
             }
             HandleRef::Dir(handle) => {
-                let path = &handle.get_typed::<Self>().path;
                 let _locked = self.namespace.lock();
-                let resolved = self.resolve_dir(path).map_err(|_| FileStatusError::Io)?;
+                let dir = handle.get_typed::<Self>();
+                let Ok(path) = dir.location.lock().clone() else {
+                    let (layer, handle) = &dir.backing;
+                    let backend = layer.map_or(self.upper.as_ref(), |i| self.lowers[i].as_ref());
+                    return Ok(self.map_status(backend.status(HandleRef::Dir(handle))?, *layer));
+                };
+                let resolved = self.resolve_dir(&path).map_err(|_| FileStatusError::Io)?;
                 let (layer, backend, handle) =
                     self.owning_dir(&resolved).ok_or(FileStatusError::Io)?;
                 let status = backend.status(HandleRef::Dir(handle))?;
@@ -1317,6 +1439,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             resolved,
             locked,
         } = dir.into_typed::<Self>();
+        let path = path.linked()?;
         if self.entry(&resolved, name)?.is_some() {
             return Err(OpenError::AlreadyExists);
         }
@@ -1363,6 +1486,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             resolved,
             locked,
         } = dir.into_typed::<Self>();
+        let path = path.linked()?;
         if self
             .entry(&resolved, name)
             .map_err(open_to_symlink_error)?
@@ -1411,10 +1535,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             return Err(PathError::InvalidPathname.into());
         }
         let OverlayWalkingDir {
-            mut path,
+            path,
             resolved,
-            locked,
+            mut locked,
         } = dir.into_typed::<Self>();
+        let mut path = path.linked()?;
         if self
             .entry(&resolved, name)
             .map_err(open_to_mkdir_error)?
@@ -1458,7 +1583,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         }
 
         path.push(String::from(name));
-        Ok(DirHandle::from_typed::<Self>(OverlayDir { path }))
+        Ok(DirHandle::from_typed::<Self>(OverlayDir {
+            location: locked.track(path),
+            backing: (None, child),
+        }))
     }
 
     fn unlink_at(&self, dir: ScopedDir<'_>, name: &str) -> Result<(), UnlinkError> {
@@ -1478,6 +1606,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             resolved,
             locked,
         } = dir.into_typed::<Self>();
+        let path = path.linked()?;
         let entry = self
             .entry(&resolved, name)
             .map_err(open_to_unlink_error)?
@@ -1522,8 +1651,9 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         let OverlayWalkingDir {
             path,
             resolved,
-            locked,
+            mut locked,
         } = dir.into_typed::<Self>();
+        let mut path = path.linked()?;
         let entry = self
             .entry(&resolved, name)
             .map_err(open_to_rmdir_error)?
@@ -1569,6 +1699,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 return Err(error);
             }
         }
+        let parent = OverlayDir {
+            location: locked.track(path.clone()),
+            backing: (None, upper),
+        };
+        path.push(String::from(name));
+        locked.relocate(&path, None, &parent);
         Ok(())
     }
 
@@ -1595,9 +1731,19 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         }) {
             return Err(PathError::InvalidPathname.into());
         }
-        let old_path = old_dir.into_typed::<Self>().path;
-        let new_path = new_dir.into_typed::<Self>().path;
-        let locked = self.namespace.lock();
+        let mut locked = self.namespace.lock();
+        let old_path = old_dir
+            .get_typed::<Self>()
+            .location
+            .lock()
+            .clone()
+            .map_err(|_| PathError::NoSuchFileOrDirectory)?;
+        let new_parent = new_dir.get_typed::<Self>();
+        let new_path = new_parent
+            .location
+            .lock()
+            .clone()
+            .map_err(|_| PathError::NoSuchFileOrDirectory)?;
         let old_dir = self.resolve_dir(&old_path).map_err(open_to_rename_error)?;
         let source = self
             .entry(&old_dir, old_name)
@@ -1679,7 +1825,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 .map_err(open_to_rename_error)?;
         }
         self.upper
-            .rename_at(old_upper, old_name, new_upper, new_name)
+            .rename_at(old_upper, old_name, new_upper, new_name)?;
+        if directory {
+            locked.relocate(&source_path, Some(&destination_path), new_parent);
+        }
+        Ok(())
     }
 
     fn set_times(

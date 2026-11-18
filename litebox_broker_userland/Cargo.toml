@@ -22,6 +22,9 @@ litebox_runner_linux_userland = { path = "../litebox_runner_linux_userland", ver
 rustix = { version = "1.1.2", default-features = false, features = ["event", "fs", "net", "process", "std"] }
 tempfile = { version = "3", default-features = false }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1.1.2", default-features = false, features = ["alloc", "fs"] }
+
 [target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
 litebox_broker_platform_windows_userland = { path = "../litebox_broker_platform_windows_userland", version = "0.1.0" }
 litebox_broker_transport_windows_userland = { path = "../litebox_broker_transport_windows_userland", version = "0.1.0" }

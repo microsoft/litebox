@@ -103,4 +103,6 @@ pub struct SharedObjectToken(pub u64);
 pub struct ProtocolVersion(pub u16);
 
 /// Current broker protocol version.
-pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
+///
+/// Version 2 adds optional directory handles to filesystem path requests.
+pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(2);

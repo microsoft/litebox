@@ -98,12 +98,27 @@ pub trait Backend: Send + Sync + Any {
 
     /// Obtain a resolved directory from an existing owned directory handle, without opening it.
     ///
-    /// This operation always succeeds and returns a `Some` _unless_ on a networked backend where
-    /// owned handles can go stale.
+    /// Returns `None` if the backend can no longer walk the directory, for example if a
+    /// network handle is stale. Never return the directory replacing it at its original path.
     ///
     /// XXX(jayb): We will likely migrate away from `Option` here when we do a bit of an overhaul of
     /// the `errors` module in order to more consistently support stale errors everywhere.
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>>;
+
+    /// Current physical name, as components relative to this backend's root (empty at root).
+    /// Use the directory identity without requiring permission to search or list ancestors.
+    /// A directory no longer linked into this namespace has no name.
+    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError>;
+
+    /// Walk up from an owned directory, returning `None` at this backend's root.
+    /// Implementations must not follow `..` beyond their exported subtree.
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError>;
+
+    /// Authorize consuming a dot component when the backend, rather than the resolver,
+    /// enforces search permissions. Unrestricted backends need no additional check.
+    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        Ok(())
+    }
 
     /// Open the already-resolved file after resolver authorization, validating `flags`.
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError>;

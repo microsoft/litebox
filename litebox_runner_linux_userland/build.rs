@@ -18,6 +18,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "inherited_ignored_signals.c",
     "mount.c",
     "pid_namespace.c",
+    "process_cwd.c",
     "root_init.c",
     "sigreturn.c",
     "sigreturn_simd.c",

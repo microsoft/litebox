@@ -107,6 +107,30 @@ impl super::backend::BackendHandles for TarRo {
 }
 
 impl super::backend::Backend for TarRo {
+    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+        let mut child = dir.get_typed::<Self>().idx;
+        let mut path = Vec::new();
+        while let Some(parent) = self.tar_index.dirs[child].parent {
+            let name = self.tar_index.dirs[parent]
+                .children
+                .iter()
+                .find_map(|(name, node)| {
+                    matches!(node, IndexedChild::Dir(idx) if *idx == child).then(|| name.clone())
+                })
+                .ok_or(WalkError::Io)?;
+            path.push(name);
+            child = parent;
+        }
+        path.reverse();
+        Ok(path)
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        Ok(self.tar_index.dirs[dir.get_typed::<Self>().idx]
+            .parent
+            .map(|idx| DirHandle::from_typed::<Self>(TarRoDirHandle { idx })))
+    }
+
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(self.resolved_dir(TarRoDirHandle { idx: 0 }))
     }
@@ -394,6 +418,7 @@ impl IndexedFile {
 }
 
 struct IndexedDir {
+    parent: Option<usize>,
     times: Option<super::FileTimestamps>,
     mode: Mode,
     /// Set by the directory's own archive entry, or else by the first entry beneath it.
@@ -403,8 +428,13 @@ struct IndexedDir {
 }
 
 impl IndexedDir {
-    fn new(owner: Option<UserInfo>, inode_allocator: &InodeAllocator) -> Self {
+    fn new(
+        parent: Option<usize>,
+        owner: Option<UserInfo>,
+        inode_allocator: &InodeAllocator,
+    ) -> Self {
         Self {
+            parent,
             times: None,
             mode: DEFAULT_DIR_MODE,
             owner,
@@ -433,7 +463,7 @@ impl TarIndex {
         let mut index = Self {
             tar_data: alloc::borrow::Cow::Borrowed(&[]),
             files: Vec::new(),
-            dirs: alloc::vec![IndexedDir::new(None, &inode_allocator)],
+            dirs: alloc::vec![IndexedDir::new(None, None, &inode_allocator)],
         };
         for entry in archive_entries(&tar_data) {
             let (entry, data_range) = entry.unwrap_or_else(|error| panic!("{error}"));
@@ -575,7 +605,7 @@ impl TarIndex {
                 None => {
                     let child = self.dirs.len();
                     self.dirs
-                        .push(IndexedDir::new(Some(owner), inode_allocator));
+                        .push(IndexedDir::new(Some(dir), Some(owner), inode_allocator));
                     self.dirs[dir]
                         .children
                         .insert((*component).into(), IndexedChild::Dir(child));

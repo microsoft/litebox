@@ -39,10 +39,11 @@ pub use litebox_broker_protocol::fs::{
 };
 pub(crate) use service::{File, handle_terminal, handle_terminal_access, open_without_reference};
 pub use service::{
-    FileResult, FileService, UnsupportedFileService, chmod, chown, handle_path, handle_status,
-    is_terminal, lock, map_shared, mkdir, mount_in_mem, open, path_status, read, read_directory,
-    read_link, rename, resolve_path, rmdir, seek, set_times, symlink, terminal_control, truncate,
-    unlink, write,
+    FileResult, FileService, UnsupportedFileService, chmod, chmod_at, chown, chown_at, handle_path,
+    handle_status, is_terminal, lock, map_shared, mkdir, mkdir_at, mount_in_mem, open, open_at,
+    path_status, path_status_at, read, read_directory, read_link, read_link_at, rename, rename_at,
+    resolve_path, rmdir, rmdir_at, seek, set_times, symlink, symlink_at, terminal_control,
+    truncate, unlink, unlink_at, write,
 };
 
 bitflags! {

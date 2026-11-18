@@ -191,6 +191,18 @@ impl Backend for ShareFs {
         self.0.walking_dir_at(dir)
     }
 
+    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+        self.0.dir_path(dir)
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        self.0.parent_dir(dir)
+    }
+
+    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        self.0.check_search(dir)
+    }
+
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
         self.0.open_file(file, flags)
     }

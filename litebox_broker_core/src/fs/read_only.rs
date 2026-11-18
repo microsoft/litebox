@@ -62,6 +62,18 @@ fn read_only_flags(flags: OFlags) -> Result<OFlags, OpenError> {
 }
 
 impl<B: Backend> Backend for ReadOnly<B> {
+    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        self.inner.check_search(dir)
+    }
+
+    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+        self.inner.dir_path(dir)
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        self.inner.parent_dir(dir)
+    }
+
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         let mut dir = self.inner.root()?;
         mark_read_only(&mut dir.permissions);

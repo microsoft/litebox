@@ -5,7 +5,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
@@ -58,6 +58,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     pub fn new(inode_allocator: InodeAllocator) -> Self {
         let root = Arc::new(sync::RwLock::new(DirData {
             instance: Arc::new(()),
+            parent: None,
+            detached_from: None,
             perms: Permissions {
                 mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                 userinfo: UserInfo::ROOT,
@@ -158,6 +160,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             name = next;
         }
 
+        let parent = Arc::downgrade(&dir);
         let mut dir = dir.write();
         match (dir.children.get(name), node) {
             (Some(Node::Dir(existing)), InitialNode::Directory { mode, owner }) => {
@@ -203,6 +206,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             (None, InitialNode::Directory { mode, owner }) => {
                 let child = Arc::new(sync::RwLock::new(DirData {
                     instance: dir.instance.clone(),
+                    parent: Some(parent),
+                    detached_from: None,
                     perms: Permissions {
                         mode,
                         userinfo: owner,
@@ -460,6 +465,51 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }))
     }
 
+    fn dir_path(&self, dir: &super::backend::DirHandle) -> Result<Vec<String>, WalkError> {
+        let _rename = self.rename_lock.lock();
+        let mut child = dir.get_typed::<Self>().dir.clone();
+        let mut path = Vec::new();
+        while !Arc::ptr_eq(&child, &self.root) {
+            let parent = child
+                .read()
+                .parent
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .ok_or(PathError::NoSuchFileOrDirectory)?;
+            let name = parent
+                .read()
+                .children
+                .iter()
+                .find_map(|(name, node)| {
+                    matches!(node, Node::Dir(dir) if Arc::ptr_eq(dir, &child)).then(|| name.clone())
+                })
+                .ok_or(PathError::NoSuchFileOrDirectory)?;
+            path.push(name);
+            child = parent;
+        }
+        path.reverse();
+        Ok(path)
+    }
+
+    fn parent_dir(
+        &self,
+        dir: &super::backend::DirHandle,
+    ) -> Result<Option<super::backend::DirHandle>, WalkError> {
+        let dir = dir.get_typed::<Self>().dir.read();
+        dir.parent
+            .as_ref()
+            .map(|parent| {
+                let dir = parent.upgrade().ok_or(PathError::NoSuchFileOrDirectory)?;
+                Ok(super::backend::DirHandle::from_typed::<Self>(
+                    InMemDirHandle {
+                        dir,
+                        flags: super::OFlags::PATH,
+                    },
+                ))
+            })
+            .transpose()
+    }
+
     fn open_file(
         &self,
         file: ResolvedFile<'_>,
@@ -483,10 +533,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         &self,
         handle: super::backend::DirHandle,
     ) -> Result<Vec<DirEntry>, ReadDirError> {
-        Ok(handle
-            .into_typed::<Self>()
-            .dir
-            .read()
+        let handle = handle.into_typed::<Self>();
+        let dir = handle.dir.read();
+        if dir.detached_from.is_some() {
+            return Err(ReadDirError::Removed);
+        }
+        Ok(dir
             .children
             .iter()
             .map(|(name, child)| child.dir_entry(name))
@@ -597,6 +649,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         // the resolver should do so before calling this.
         let parent = dir.into_typed::<Self>();
         let mut parent = parent.dir.write();
+        if parent.detached_from.is_some() {
+            return Err(PathError::NoSuchFileOrDirectory.into());
+        }
         if parent.children.contains_key(name) {
             return Err(OpenError::AlreadyExists);
         }
@@ -627,6 +682,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     ) -> Result<(), SymlinkError> {
         let parent = dir.into_typed::<Self>();
         let mut parent = parent.dir.write();
+        if parent.detached_from.is_some() {
+            return Err(PathError::NoSuchFileOrDirectory.into());
+        }
         if parent.children.contains_key(name) {
             return Err(SymlinkError::AlreadyExists);
         }
@@ -652,12 +710,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         // TODO(jayb): Nothing checks write permission on the parent directory before creating;
         // the resolver should do so before calling this.
         let parent = dir.into_typed::<Self>();
+        let parent_node = Arc::downgrade(&parent.dir);
         let mut parent = parent.dir.write();
+        if parent.detached_from.is_some() {
+            return Err(PathError::NoSuchFileOrDirectory.into());
+        }
         if parent.children.contains_key(name) {
             return Err(MkdirError::AlreadyExists);
         }
         let child = Arc::new(sync::RwLock::new(DirData {
             instance: parent.instance.clone(),
+            parent: Some(parent_node),
+            detached_from: None,
             perms: Permissions {
                 mode: metadata.mode,
                 userinfo: metadata.owner,
@@ -697,14 +761,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         // TODO(jayb): Nothing checks write permission on the parent directory before removing;
         // the resolver should do so before calling this.
         let parent = dir.into_typed::<Self>();
+        let parent_node = parent.dir.clone();
         let mut parent = parent.dir.write();
         match parent.children.get(name) {
             None => Err(PathError::NoSuchFileOrDirectory.into()),
             Some(Node::File(_)) => Err(RmdirError::NotADirectory),
-            Some(Node::Dir(child)) if !child.read().children.is_empty() => {
-                Err(RmdirError::NotEmpty)
-            }
-            Some(Node::Dir(_)) => {
+            Some(Node::Dir(child)) => {
+                let mut child = child.write();
+                if !child.children.is_empty() {
+                    return Err(RmdirError::NotEmpty);
+                }
+                child.detached_from = Some(parent_node);
+                drop(child);
                 parent.children.remove(name);
                 Ok(())
             }
@@ -723,8 +791,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 return Err(PathError::InvalidPathname.into());
             }
         }
-        // XXX(jayb): racing rmdir can detach a resolved parent, as for create and mkdir; fix all
-        // three together as part of broader atomicity fixups.
         let old_dir = old_dir.into_typed::<Self>().dir;
         let new_dir = new_dir.into_typed::<Self>().dir;
         let _rename = self.rename_lock.lock();
@@ -752,6 +818,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             _ => false,
         };
         let replace = |old: &mut DirData<Platform>, new: Option<&mut DirData<Platform>>| {
+            if old.detached_from.is_some()
+                || new.as_ref().is_some_and(|new| new.detached_from.is_some())
+            {
+                return Err(PathError::NoSuchFileOrDirectory.into());
+            }
             let current = old
                 .children
                 .get(old_name)
@@ -780,8 +851,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             match (current, target) {
                 (Node::Dir(_), Some(Node::File(_))) => return Err(RenameError::NotADirectory),
                 (Node::File(_), Some(Node::Dir(_))) => return Err(RenameError::IsADirectory),
-                (Node::Dir(_), Some(Node::Dir(dir))) if !dir.read().children.is_empty() => {
-                    return Err(RenameError::NotEmpty);
+                (Node::Dir(_), Some(Node::Dir(dir))) => {
+                    let mut replaced = dir.write();
+                    if !replaced.children.is_empty() {
+                        return Err(RenameError::NotEmpty);
+                    }
+                    replaced.detached_from = Some(new_dir.clone());
                 }
                 _ => {}
             }
@@ -789,6 +864,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 .children
                 .remove(old_name)
                 .expect("source was checked under lock");
+            if !same_parent && let Node::Dir(dir) = &moved {
+                dir.write().parent = Some(Arc::downgrade(&new_dir));
+            }
             match new {
                 Some(new) => new.children.insert(new_name.into(), moved),
                 None => old.children.insert(new_name.into(), moved),
@@ -987,6 +1065,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Node<Platform> {
 type DirNode<Platform> = Arc<sync::RwLock<Platform, DirData<Platform>>>;
 struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
     instance: Arc<()>,
+    parent: Option<Weak<sync::RwLock<Platform, DirData<Platform>>>>,
+    // Once the parent no longer owns this child, the child can pin it for `..`.
+    detached_from: Option<DirNode<Platform>>,
     perms: Permissions,
     children: HashMap<String, Node<Platform>>,
     node_info: NodeInfo,

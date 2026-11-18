@@ -3,7 +3,7 @@
 
 //! Windows-shim file access with registry namespace isolation.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -29,7 +29,7 @@ enum Namespace {
 
 impl Namespace {
     fn resolve_path(self, context: &Context, path: &str) -> Result<String, PathError> {
-        let path = namespace_path(context, path);
+        let path = context.resolve(path).to_string();
         match (self, is_registry_path(&path)) {
             (Self::Regular, false) | (Self::Registry, true) => Ok(path),
             (Self::Regular, true) => Err(PathError::MissingComponent),
@@ -38,7 +38,7 @@ impl Namespace {
     }
 
     fn hides_registry_entry(self, context: &Context, directory_path: &str) -> bool {
-        self == Self::Regular && namespace_path(context, directory_path) == "/"
+        self == Self::Regular && context.resolve(directory_path).to_string() == "/"
     }
 }
 
@@ -132,22 +132,6 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         let path = self.resolve_path(context, path)?;
         self.litebox.rmdir_file(context, path.as_str())
     }
-}
-
-// Classify and send the same Windows namespace path, even when the caller uses dot components.
-fn namespace_path(context: &Context, path: &str) -> String {
-    let path = context.joined(path);
-    let mut components = Vec::new();
-    for component in path.as_str().split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                components.pop();
-            }
-            _ => components.push(component),
-        }
-    }
-    String::from("/") + &components.join("/")
 }
 
 fn is_registry_path(path: &str) -> bool {

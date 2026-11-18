@@ -8,7 +8,7 @@
 //! guest-neutral Unix socket operations.
 
 use alloc::{
-    string::String,
+    string::{String, ToString as _},
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -136,10 +136,14 @@ impl UnixSocketAddr {
         match self {
             UnixSocketAddr::Unnamed => Err(Errno::EINVAL),
             UnixSocketAddr::Abstract(name) => Ok(UnixSocketAddress::Abstract(name.clone())),
-            UnixSocketAddr::Path(path) => Ok(UnixSocketAddress::Path {
-                path: task.resolve_path(path)?.into(),
-                name: path.as_bytes().to_vec(),
-            }),
+            UnixSocketAddr::Path(path) => {
+                let absolute = task.resolve_path(path.as_str())?;
+                let resolved = task.fs.borrow().context.read().resolve(&absolute);
+                Ok(UnixSocketAddress::Path {
+                    path: resolved.to_string(),
+                    name: path.as_bytes().to_vec(),
+                })
+            }
         }
     }
 }

@@ -16,10 +16,10 @@ use crate::fs::{
     HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MapFileRequest,
     MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest, OpenFileResponse,
     PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest, SetTimesFileRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse,
+    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest,
+    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::message::{
     BrokerOperation, BrokerResult, EventRequest, EventResponse, FileRequest, FileResponse,
@@ -281,6 +281,7 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::FillRandom(sequence(7, 256)),
         BrokerOperation::File(FileRequest::Open(OpenFileRequest {
+            dir: Some(handle),
             path: sequence(1, 7),
             user: FileUser { user: 2, group: 3 },
             access: FileAccessMode::ReadWrite,
@@ -318,11 +319,13 @@ fn request_codec_round_trips_all_variants() {
             start_index: 19,
         })),
         BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
+            dir: Some(handle),
             path: sequence(5, 9),
             user: FileUser { user: 2, group: 3 },
             follow_symlinks: true,
         })),
         BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
+            dir: Some(handle),
             path: sequence(5, 9),
             user: FileUser { user: 2, group: 3 },
             follow_symlinks: false,
@@ -351,30 +354,49 @@ fn request_codec_round_trips_all_variants() {
             },
         })),
         BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
+            dir: Some(handle),
             path: sequence(6, 9),
             user: FileUser { user: 2, group: 3 },
             mode: FileMode::from_bits(0o755).unwrap(),
         })),
         BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
+            dir: Some(handle),
             path: sequence(7, 9),
             acting_user: FileUser { user: 0, group: 0 },
             user: Some(2),
             group: None,
         })),
         BrokerOperation::File(FileRequest::Unlink(UnlinkFileRequest {
+            dir: Some(handle),
             path: sequence(8, 9),
             user: FileUser { user: 2, group: 3 },
         })),
         BrokerOperation::File(FileRequest::Mkdir(MkdirFileRequest {
+            dir: Some(handle),
             path: sequence(9, 9),
             user: FileUser { user: 2, group: 3 },
             mode: FileMode::from_bits(0o750).unwrap(),
         })),
         BrokerOperation::File(FileRequest::Rmdir(RmdirFileRequest {
+            dir: Some(handle),
             path: sequence(10, 9),
             user: FileUser { user: 2, group: 3 },
         })),
+        BrokerOperation::File(FileRequest::Rename(RenameFileRequest {
+            old_dir: Some(ObjectHandle(0)),
+            new_dir: Some(handle),
+            paths: largest_sequence,
+            old_path_length: 3,
+            user: FileUser { user: 2, group: 3 },
+        })),
+        BrokerOperation::File(FileRequest::Symlink(SymlinkFileRequest {
+            dir: Some(handle),
+            buffer: sequence(6, 9),
+            path_length: 3,
+            user: FileUser { user: 2, group: 3 },
+        })),
         BrokerOperation::File(FileRequest::ReadLink(ReadLinkFileRequest {
+            dir: Some(handle),
             buffer: sequence(11, 256),
             path_length: 9,
             user: FileUser { user: 2, group: 3 },
@@ -1970,6 +1992,7 @@ fn decode_rejects_malformed_fs_request_frames() {
     let open = BrokerRequest {
         request_id: TEST_REQUEST_ID,
         operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
+            dir: None,
             path: sequence(1, 9),
             user: FileUser { user: 2, group: 3 },
             access: FileAccessMode::ReadOnly,
@@ -1987,17 +2010,20 @@ fn decode_rejects_malformed_fs_request_frames() {
     );
 
     let open = encode_request(&open);
+    let mut invalid_dir = open.clone();
+    invalid_dir[11] = 2;
+    assert_eq!(decode_request(&invalid_dir), Err(WireError::InvalidTag));
     let mut unknown_access = open.clone();
-    unknown_access[24] = 0xff;
+    unknown_access[25] = 0xff;
     assert_eq!(decode_request(&unknown_access), Err(WireError::InvalidTag));
     let mut unsupported_flags = open.clone();
-    unsupported_flags[25..27].copy_from_slice(&(1u16 << 15).to_le_bytes());
+    unsupported_flags[26..28].copy_from_slice(&(1u16 << 15).to_le_bytes());
     assert_eq!(
         decode_request(&unsupported_flags),
         Err(WireError::InvalidTag)
     );
     let mut unsupported_mode = open.clone();
-    unsupported_mode[27..29].copy_from_slice(&0o10000u16.to_le_bytes());
+    unsupported_mode[28..30].copy_from_slice(&0o10000u16.to_le_bytes());
     assert_eq!(
         decode_request(&unsupported_mode),
         Err(WireError::InvalidTag)
@@ -2029,6 +2055,7 @@ fn decode_rejects_malformed_fs_request_frames() {
     let chown = BrokerRequest {
         request_id: TEST_REQUEST_ID,
         operation: BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
+            dir: None,
             path: sequence(1, 9),
             acting_user: FileUser { user: 0, group: 0 },
             user: Some(2),
@@ -2697,6 +2724,7 @@ fn fs_open_request_wire_shape_is_pinned() {
         encode_request(&BrokerRequest {
             request_id: RequestId(13),
             operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
+                dir: None,
                 path: sequence(2, 3),
                 user: FileUser { user: 5, group: 7 },
                 access: FileAccessMode::ReadWrite,
@@ -2705,7 +2733,7 @@ fn fs_open_request_wire_shape_is_pinned() {
             })),
         }),
         [
-            1, 13, 0, 0, 0, 0, 0, 0, 0, 9, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0,
+            1, 13, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0,
             160, 1
         ]
     );

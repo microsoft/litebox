@@ -340,6 +340,20 @@ impl BackendHandles for Devices {
 }
 
 impl Backend for Devices {
+    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+        Ok(match dir.get_typed::<Self>() {
+            DeviceDirHandle::Root => Vec::new(),
+            DeviceDirHandle::Pts => alloc::vec!["pts".into()],
+        })
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        Ok(match dir.get_typed::<Self>() {
+            DeviceDirHandle::Root => None,
+            DeviceDirHandle::Pts => Some(DirHandle::from_typed::<Self>(DeviceDirHandle::Root)),
+        })
+    }
+
     fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {
         match &h.get_typed::<Self>().0 {
             DeviceFile::Device(Device::Tty) => Some(FileTerminal::OpenersControlling),

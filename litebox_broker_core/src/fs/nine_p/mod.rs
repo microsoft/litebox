@@ -55,7 +55,7 @@ pub struct NineP<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read +
     /// The fid attached to the root of the remote filesystem.
     ///
     /// Handed out (shared) by [`Backend::root`](super::backend::Backend::root), so it must never
-    /// be `Tlopen`ed or `Tlcreate`d; see the `is_backend_root` flag on the walking dir handle.
+    /// be `Tlopen`ed or `Tlcreate`d.
     root: Arc<OwnedFid<Platform, T>>,
     /// Device id reported in every [`NodeInfo`](super::NodeInfo) from this backend; inode numbers
     /// come from the server's qids instead.
@@ -164,8 +164,6 @@ pub struct NinePWalkingDirHandle<
     T: transport::Read + transport::Write,
 > {
     fid: Arc<OwnedFid<Platform, T>>,
-    /// The shared attach fid must be cloned before a server-side open or create.
-    is_backend_root: bool,
 }
 
 /// Directory handle
@@ -173,7 +171,9 @@ pub struct NinePDirHandle<
     Platform: sync::RawSyncPrimitivesProvider,
     T: transport::Read + transport::Write,
 > {
+    // Twalk requires an unopened fid, even for directories opened for reading.
     fid: Arc<OwnedFid<Platform, T>>,
+    reader: Option<Arc<OwnedFid<Platform, T>>>,
 }
 impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write> Clone
     for NinePDirHandle<Platform, T>
@@ -181,6 +181,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     fn clone(&self) -> Self {
         Self {
             fid: Arc::clone(&self.fid),
+            reader: self.reader.clone(),
         }
     }
 }
@@ -222,7 +223,6 @@ where
         Ok(ResolvedDir::from_typed::<Self>(
             NinePWalkingDirHandle {
                 fid: Arc::clone(&self.root),
-                is_backend_root: true,
             },
             PermissionCheck::ByBackend,
         ))
@@ -279,10 +279,7 @@ where
                 )));
             }
             if let Some(fid) = fid {
-                current = NinePWalkingDirHandle {
-                    fid,
-                    is_backend_root: false,
-                };
+                current = NinePWalkingDirHandle { fid };
                 index += chunk.len();
                 continue;
             }
@@ -303,10 +300,7 @@ where
                         component: None,
                         error: error.into(),
                     })?;
-                current = NinePWalkingDirHandle {
-                    fid: self.own(fid),
-                    is_backend_root: false,
-                };
+                current = NinePWalkingDirHandle { fid: self.own(fid) };
             }
             return Ok(Resolution::MissingFinal {
                 parent: ResolvedDir::from_typed::<Self>(current, PermissionCheck::ByBackend),
@@ -332,39 +326,77 @@ where
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
         assert_supported_oflags(flags);
-        let NinePWalkingDirHandle {
-            fid,
-            is_backend_root,
-        } = dir.into_typed::<Self>();
-        if flags.contains(OFlags::PATH) {
-            // An `O_PATH` handle is never opened server-side, so the walked fid can be handed over
-            // as-is, even when it is the shared root fid.
-            return Ok(DirHandle::from_typed::<Self>(NinePDirHandle { fid }));
-        }
-        // `Tlopen` mutates the fid server-side, so it must never be issued on the shared root fid.
-        let fid = if is_backend_root {
-            self.own(self.client.clone_fid(&fid.fid)?)
+        let fid = dir.into_typed::<Self>().fid;
+        let reader = if flags.contains(OFlags::PATH) {
+            None
         } else {
-            fid
+            let reader = self.own(self.client.clone_fid(&fid.fid)?);
+            self.client
+                .open(&reader.fid, fcall::LOpenFlags::O_DIRECTORY)?;
+            Some(reader)
         };
-        self.client.open(&fid.fid, fcall::LOpenFlags::O_DIRECTORY)?;
-        Ok(DirHandle::from_typed::<Self>(NinePDirHandle { fid }))
+        Ok(DirHandle::from_typed::<Self>(NinePDirHandle {
+            fid,
+            reader,
+        }))
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
-        // The walking handle can end up being opened (via `open_dir`), which must not affect
-        // the directory handle it came from, so this hands out a private clone of the fid.
-        let fid = self
-            .client
-            .clone_fid(&dir.get_typed::<Self>().fid.fid)
-            .ok()?;
         Some(ResolvedDir::from_typed::<Self>(
             NinePWalkingDirHandle {
-                fid: self.own(fid),
-                is_backend_root: false,
+                fid: Arc::clone(&dir.get_typed::<Self>().fid),
             },
             PermissionCheck::ByBackend,
         ))
+    }
+
+    fn dir_path(&self, dir: &DirHandle) -> Result<Vec<String>, WalkError> {
+        let attr = self
+            .client
+            .getattr(&dir.get_typed::<Self>().fid.fid, fcall::GetattrMask::NLINK)?;
+        if attr.valid.contains(fcall::GetattrMask::NLINK) && attr.stat.nlink == 0 {
+            return Err(PathError::NoSuchFileOrDirectory.into());
+        }
+        if attr.qid.path
+            == self
+                .client
+                .getattr(&self.root.fid, fcall::GetattrMask::NLINK)?
+                .qid
+                .path
+        {
+            return Ok(Vec::new());
+        }
+        // 9P2000.L cannot request the current name of a fid. Do not return an obsolete
+        // walk string or open and enumerate ancestors (which requires extra permissions).
+        Err(WalkError::Io)
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        let dir = &dir.get_typed::<Self>().fid.fid;
+        if self.client.getattr(dir, fcall::GetattrMask::ALL)?.qid.path
+            == self
+                .client
+                .getattr(&self.root.fid, fcall::GetattrMask::ALL)?
+                .qid
+                .path
+        {
+            return Ok(None);
+        }
+
+        let fid = self.client.walk(dir, &[".."])?.into_complete_fid()?;
+        Ok(Some(DirHandle::from_typed::<Self>(NinePDirHandle {
+            fid: self.own(fid),
+            reader: None,
+        })))
+    }
+
+    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        let fid = self
+            .client
+            .walk(&dir.get_typed::<Self>().fid.fid, &["."])?
+            .into_complete_fid()?;
+        drop(self.own(fid));
+        Ok(())
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
@@ -392,7 +424,9 @@ where
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<super::DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
-        let entries = self.client.readdir_all(&handle.fid.fid)?;
+        let entries = self
+            .client
+            .readdir_all(&handle.reader.as_ref().unwrap_or(&handle.fid).fid)?;
         Ok(entries
             .into_iter()
             .filter(|entry| {
@@ -543,6 +577,7 @@ where
             .into_complete_fid()?;
         Ok(DirHandle::from_typed::<Self>(NinePDirHandle {
             fid: self.own(fid),
+            reader: None,
         }))
     }
 

@@ -293,6 +293,8 @@ pub enum RmdirError {
 /// Possible errors from [`super::resolver::Resolver::read_dir`]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
+    #[error("directory has been removed")]
+    Removed,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("fd does not point to a directory")]
