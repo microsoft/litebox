@@ -6,7 +6,7 @@
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
@@ -1438,7 +1438,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     pub(super) fn lock(
         &self,
         entry: &ResolverEntry<Backend>,
-        owner: &Arc<dyn core::any::Any + Send + Sync>,
+        owner: Weak<dyn Send + Sync>,
         operation: FileLockOperation,
     ) -> crate::Result<Result<(), FileStatusError>> {
         let request = match operation {

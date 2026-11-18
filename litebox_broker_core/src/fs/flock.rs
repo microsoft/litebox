@@ -1,9 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Weak;
 use alloc::vec::Vec;
-use core::{any::Any, ptr};
 
 use litebox_broker_protocol::fs::FileLockOperation;
 use litebox_platform::sync::{Mutex, RawSyncPrimitivesProvider};
@@ -17,7 +16,7 @@ struct Holder {
     // or cross-allocator uniqueness.
     node: (u64, u64),
     // Weak: lock lives as long as the open description; dead holders are pruned lazily.
-    owner: Weak<dyn Any + Send + Sync>,
+    owner: Weak<dyn Send + Sync>,
     kind: FileLockOperation,
 }
 
@@ -28,12 +27,12 @@ impl<Platform: RawSyncPrimitivesProvider> FlockTable<Platform> {
 
     pub(super) fn set(
         &self,
-        owner: &Arc<dyn Any + Send + Sync>,
+        owner: Weak<dyn Send + Sync>,
         request: Option<((u64, u64), FileLockOperation)>,
     ) -> Result<bool> {
         let mut holders = self.0.lock();
         holders.retain(|holder| holder.owner.strong_count() != 0);
-        let same_owner = |holder: &Holder| ptr::addr_eq(holder.owner.as_ptr(), Arc::as_ptr(owner));
+        let same_owner = |holder: &Holder| holder.owner.ptr_eq(&owner);
         if let Some((node, kind)) = request
             && holders
                 .iter()
@@ -54,11 +53,7 @@ impl<Platform: RawSyncPrimitivesProvider> FlockTable<Platform> {
         holders
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
-        holders.push(Holder {
-            node,
-            owner: Arc::downgrade(owner),
-            kind,
-        });
+        holders.push(Holder { node, owner, kind });
         Ok(true)
     }
 }
