@@ -29,7 +29,7 @@ use super::errors::{
     SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::shared_storage::SharedFile;
-use super::{DirEntry, FileStatus, FileType, Mode, OFlags};
+use super::{DirEntry, FileStatus, Mode, OFlags};
 use crate::descriptor::SecurityDescriptor;
 use crate::readiness::ReadinessSource;
 
@@ -46,16 +46,6 @@ impl<B: Backend> ReadOnly<B> {
     }
 }
 
-impl<B: Backend> ReadOnly<B> {
-    fn check_device_open(file: &ResolvedFile<'_>, flags: OFlags) {
-        if matches!(file.file_type, FileType::CharacterDevice)
-            && flags.intersects(OFlags::WRONLY | OFlags::RDWR)
-        {
-            unimplemented!("writable device open on a read-only filesystem");
-        }
-    }
-}
-
 fn mark_read_only(permissions: &mut PermissionCheck) {
     match permissions {
         PermissionCheck::ByResolver(permissions) => permissions.set_read_only_fs(),
@@ -65,11 +55,11 @@ fn mark_read_only(permissions: &mut PermissionCheck) {
     }
 }
 
-// Strip APPEND so an Overlay inner backend doesn't copy up on a read-only open.
 fn read_only_flags(flags: OFlags) -> Result<OFlags, OpenError> {
     if flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::TRUNC) {
         return Err(OpenError::ReadOnlyFileSystem);
     }
+    // A read-only open must not trigger copy-up in an inner overlay.
     Ok(flags - OFlags::APPEND)
 }
 
@@ -116,7 +106,6 @@ impl<B: Backend> Backend for ReadOnly<B> {
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
-        Self::check_device_open(&file, flags);
         self.inner.open_file(file, read_only_flags(flags)?)
     }
 
@@ -326,7 +315,6 @@ impl<B: Backend> Backend for ReadOnly<B> {
         flags: OFlags,
         checks: &OpenChecks<'_>,
     ) -> Result<FileHandle, OpenError> {
-        Self::check_device_open(&file, flags);
         self.inner
             .open_file_checked(file, read_only_flags(flags)?, checks)
     }

@@ -4609,6 +4609,60 @@ mod credentials {
         DeviceSecurity::posix(carol, carols, alice, alices)
     }
 
+    #[test]
+    fn read_only_devices_refuse_write_opens() {
+        use crate::fs::read_only::ReadOnly;
+
+        let devices = || {
+            ReadOnly::new(
+                Devices::new(
+                    InodeAllocators::new().next(),
+                    Arc::new(TestStdioProvider::default()),
+                    Arc::new(TestRandomProvider),
+                )
+                .with_security(device_security()),
+            )
+        };
+        let legacy = Resolver::<TestPlatform, _>::new(devices());
+        let fs = Resolver::<TestPlatform, _>::with_credentials(devices(), profile());
+        let carol = Credentials::new(CAROL);
+        for flags in [OFlags::WRONLY, OFlags::RDWR] {
+            assert!(matches!(
+                legacy.open(posix(CAROL), "/null", flags, Mode::empty()),
+                Err(OpenError::ReadOnlyFileSystem)
+            ));
+            assert!(matches!(
+                fs.open(carol.caller(), "/null", flags, Mode::empty()),
+                Err(OpenError::ReadOnlyFileSystem)
+            ));
+        }
+        fs.open(carol.caller(), "/null", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+    }
+
+    #[test]
+    fn archive_security_updates_report_a_read_only_filesystem() {
+        let carol = Credentials::new(CAROL);
+        let fs = Resolver::<TestPlatform, _>::with_credentials(
+            TarRo::new(
+                build_tar(
+                    ExtensionMode::Gnu,
+                    &[ArchiveEntry::dir("dir", 0o755, CAROL.into())],
+                ),
+                InodeAllocators::new().next(),
+            ),
+            profile(),
+        );
+        assert!(matches!(
+            fs.chmod(carol.caller(), "/dir", Mode::RWXU),
+            Err(ChmodError::ReadOnlyFileSystem)
+        ));
+        assert!(matches!(
+            fs.chown(carol.caller(), "/dir", Some(BOB), None),
+            Err(ChownError::ReadOnlyFileSystem)
+        ));
+    }
+
     const TERMINAL: Mode = Mode::RUSR.union(Mode::WUSR).union(Mode::WGRP);
 
     /// Opens `/dev/ptmx` as `who`, unlocking the new subsidiary, and returns the manager with the
@@ -5402,13 +5456,13 @@ mod credentials {
 
     #[test]
     fn overlays_refuse_subjects_directories_that_a_self_enforcing_lower_merges_into() {
-        let overlay = || {
+        let overlay = |upper_dev| {
             let allocators = InodeAllocators::new();
             Overlay::<TestPlatform>::new(
                 InMem::<TestPlatform>::new_initialized(
                     [
                         ("/", dir(ALL, posix(CAROL))),
-                        ("/dev", dir(ALL, posix(CAROL))),
+                        upper_dev,
                         ("/home", dir(ALL, posix(CAROL))),
                     ],
                     allocators.next(),
@@ -5429,7 +5483,8 @@ mod credentials {
         let read_dir = OFlags::RDONLY | OFlags::DIRECTORY;
 
         let carol = Credentials::new(CAROL);
-        let fs = Resolver::<TestPlatform, _>::with_credentials(overlay(), profile());
+        let visible = || ("/dev", dir(ALL, posix(CAROL)));
+        let fs = Resolver::<TestPlatform, _>::with_credentials(overlay(visible()), profile());
         let root = fs
             .open(carol.caller(), "/", read_dir, Mode::empty())
             .unwrap();
@@ -5454,7 +5509,7 @@ mod credentials {
             Err(RmdirError::PathError(PathError::NoSearchPerms))
         ));
 
-        let legacy = Resolver::<TestPlatform, _>::new(overlay());
+        let legacy = Resolver::<TestPlatform, _>::new(overlay(visible()));
         let user = posix(CAROL);
         let dev = legacy.open(user, "/dev", read_dir, Mode::empty()).unwrap();
         assert!(
@@ -5468,6 +5523,27 @@ mod credentials {
             .open(user, "/dev/null", OFlags::RDONLY, Mode::empty())
             .unwrap();
         legacy.mkdir(user, "/dev/new", ALL).unwrap();
+
+        // A directory recreated over a whiteout is opaque: only its upper contributes.
+        let fs = Resolver::<TestPlatform, _>::with_credentials(
+            overlay(("/.litebox-overlay-whiteout-dev", file(ALL, posix(CAROL)))),
+            profile(),
+        );
+        fs.mkdir(carol.caller(), "/dev", ALL).unwrap();
+        let dev = fs
+            .open(carol.caller(), "/dev", read_dir, Mode::empty())
+            .unwrap();
+        assert!(
+            fs.read_dir(&dev)
+                .unwrap()
+                .iter()
+                .all(|entry| matches!(entry.name.as_str(), "." | ".."))
+        );
+        create(&fs, &carol, "/dev/new", ALL);
+        assert!(matches!(
+            fs.open(carol.caller(), "/dev/null", OFlags::PATH, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
     }
 
     #[test]

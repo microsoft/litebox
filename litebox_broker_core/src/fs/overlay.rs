@@ -304,13 +304,14 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             .map_err(file_status_to_open_error)?;
         let permissions = layered_permissions(dir.permissions(), &status);
         drop(dir);
-        let permissions = if self.lowers_broker_owned(&resolved)? {
-            permissions
-        } else {
-            // Legacy resolvers check the owning layer's metadata as before; resolvers that
-            // authorize subjects refuse to search, list, or change the merged directory.
-            PermissionCheck::ByResolver(PermissionInfo::reported_posix(&status, false))
-        };
+        let permissions =
+            if broker_descriptor(&permissions).is_none() || self.lowers_broker_owned(&resolved)? {
+                permissions
+            } else {
+                // Legacy resolvers check the owning layer's metadata as before; resolvers that
+                // authorize subjects refuse to search, list, or change the merged directory.
+                PermissionCheck::ByResolver(PermissionInfo::reported_posix(&status, false))
+            };
         Ok(ScopedDir::from_typed::<Self>(
             OverlayWalkingDir {
                 path,
@@ -730,6 +731,15 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     /// self-enforcing lower contributes would reach subjects without any check of that lower's
     /// own permissions.
     fn lowers_broker_owned(&self, dir: &ResolvedDir) -> Result<bool, OpenError> {
+        // As in `entry` and `entries`, an opaque upper supplies the whole directory.
+        if let Some(upper) = &dir.upper
+            && dir.lowers.iter().any(Option::is_some)
+            && self
+                .marker_present(upper, OPAQUE_MARKER)
+                .map_err(|_| OpenError::Io)?
+        {
+            return Ok(true);
+        }
         for (lower, handle) in self.lowers.iter().zip(&dir.lowers) {
             let Some(handle) = handle else {
                 continue;
@@ -977,24 +987,23 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             metadata,
         )?;
 
-        // A directory recreated over a whiteout must not re-merge with the lower directory it
-        // replaces, so it starts out opaque.
-        let cleared = if recreated {
-            self.create_marker(&locked, &child, OPAQUE_MARKER)
-                .and_then(|()| {
-                    self.remove_marker(&locked, &upper, &whiteout)
-                        .map_err(unlink_to_open_error)
-                })
-                .map_err(open_to_mkdir_error)
-        } else {
-            Ok(())
-        };
-        let status = cleared.and_then(|()| {
-            self.upper
+        let finish = || {
+            let status = self
+                .upper
                 .status(HandleRef::Dir(&child))
-                .map_err(|_| MkdirError::Io)
-        });
-        let status = match status {
+                .map_err(|_| MkdirError::Io)?;
+            // Removing the parent whiteout commits the recreation. Keep it until no
+            // other fallible operation can roll the new upper directory back.
+            if recreated {
+                self.create_marker(&locked, &child, OPAQUE_MARKER)
+                    .map_err(open_to_mkdir_error)?;
+                self.remove_marker(&locked, &upper, &whiteout)
+                    .map_err(unlink_to_open_error)
+                    .map_err(open_to_mkdir_error)?;
+            }
+            Ok(status)
+        };
+        let status = match finish() {
             Ok(status) => status,
             Err(error) => {
                 let _rollback_marker = self.clear_markers(&locked, &child);

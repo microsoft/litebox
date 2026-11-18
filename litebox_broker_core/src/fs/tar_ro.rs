@@ -34,6 +34,7 @@ use tar_core::{EntryType, PAX_GID, PAX_MTIME, PAX_SIZE, PAX_UID, PaxExtensions};
 
 use super::{DirEntry, FileType};
 
+use crate::descriptor::SecurityDescriptor;
 use litebox_broker_protocol::authority::Principal;
 
 use super::{
@@ -44,8 +45,8 @@ use super::{
     },
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
-        RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
-        WalkError, WriteError,
+        RenameError, ResolutionError, RmdirError, SetSecurityError, SymlinkError, TruncateError,
+        UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
 };
@@ -384,6 +385,14 @@ impl super::backend::Backend for TarRo {
 
     fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn update_security(
+        &self,
+        _target: ResolvedTarget<'_>,
+        _update: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, SetSecurityError>,
+    ) -> Result<(), SetSecurityError> {
+        Err(SetSecurityError::ReadOnlyFileSystem)
     }
 
     fn chown(
