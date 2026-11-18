@@ -1,0 +1,30 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+    - main
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- bash: |
+    echo "Build reason: $BUILD_REASON"
+    echo "Repository: $BUILD_REPOSITORY_NAME"
+    echo "Repository URI: $BUILD_REPOSITORY_URI"
+    echo "Source branch: $BUILD_SOURCEBRANCH"
+    echo "Source version: $BUILD_SOURCEVERSION"
+
+    echo
+    echo "PR ID: ${SYSTEM_PULLREQUEST_PULLREQUESTID:-<unset>}"
+    echo "PR source branch: ${SYSTEM_PULLREQUEST_SOURCEBRANCH:-<unset>}"
+    echo "PR source repository: ${SYSTEM_PULLREQUEST_SOURCEREPOSITORYURI:-<unset>}"
+    echo "PR source commit: ${SYSTEM_PULLREQUEST_SOURCECOMMITID:-<unset>}"
+    echo "PR target branch: ${SYSTEM_PULLREQUEST_TARGETBRANCH:-<unset>}"
+
+    echo
+    echo "Checkout:"
+    git rev-parse HEAD
+    git remote -v
+  displayName: Dump LiteBox PR context
