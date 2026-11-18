@@ -4,11 +4,9 @@
 //! RingBuffer implementation and functions
 
 use super::{PrivilegedVmap, PrivilegedVtl0PhysMutPtr};
-use core::fmt;
 use litebox::mm::vmap::PhysPageAddr;
 use litebox::utils::TruncateExt;
 use litebox_common_lvbs::PAGE_SIZE;
-use spin::{Mutex, Once};
 use x86_64::PhysAddr;
 
 pub struct RingBuffer {
@@ -42,6 +40,10 @@ impl RingBuffer {
         }
     }
 
+    // Writing maps the ring through the current page table and takes its lock.
+    // Calling this (directly or via `log::`) from the panic handler, the ring
+    // write path, or while holding a page-table lock can deadlock the core.
+    // The ultimate fix (TODO) is to map ringbuffer once, and make writes lockless
     pub fn write(&mut self, buf: &[u8]) {
         if self.size == 0 || buf.is_empty() {
             return;
@@ -152,27 +154,4 @@ fn write_slow(
         let _ = write_slice(rb_pa + write_offset as u64, buf);
     }
     advance_offset(size, write_offset, buf.len())
-}
-
-static RINGBUFFER_ONCE: Once<Mutex<RingBuffer>> = Once::new();
-pub(crate) fn set_ringbuffer(
-    platform: &'static crate::host::LvbsLinuxKernel,
-    pa: PhysAddr,
-    size: usize,
-) -> &'static Mutex<RingBuffer> {
-    RINGBUFFER_ONCE.call_once(|| {
-        let ring_buffer = RingBuffer::new(platform, pa, size);
-        Mutex::new(ring_buffer)
-    })
-}
-
-pub(crate) fn ringbuffer() -> Option<&'static Mutex<RingBuffer>> {
-    RINGBUFFER_ONCE.get()
-}
-
-impl fmt::Write for RingBuffer {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.write(s.as_bytes());
-        Ok(())
-    }
 }

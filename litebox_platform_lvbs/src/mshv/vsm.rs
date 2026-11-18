@@ -711,8 +711,11 @@ impl Vtl0Gate for LvbsVtl0Gate {
     }
 
     fn install_ringbuffer(&self, pa: u64, size: u64) {
-        let _ =
-            crate::mshv::ringbuffer::set_ringbuffer(self.platform, PhysAddr::new(pa), size.trunc());
+        crate::crash_log::crash_logger().install_ringbuffer(
+            self.platform,
+            PhysAddr::new(pa),
+            size.trunc(),
+        );
     }
 
     fn end_of_boot_reached(&self) -> bool {

@@ -1643,6 +1643,7 @@ dependencies = [
  "litebox_common_linux",
  "litebox_common_lvbs",
  "litebox_util_log",
+ "log",
  "modular-bitfield",
  "num_enum",
  "once_cell",
@@ -1707,7 +1708,6 @@ dependencies = [
 name = "litebox_runner_lvbs"
 version = "0.1.0"
 dependencies = [
- "arrayvec",
  "litebox",
  "litebox_common_linux",
  "litebox_common_lvbs",
@@ -1715,7 +1715,6 @@ dependencies = [
  "litebox_platform_lvbs",
  "litebox_service_heki",
  "litebox_shim_optee",
- "litebox_util_log",
  "log",
  "once_cell",
  "spin 0.10.0",
