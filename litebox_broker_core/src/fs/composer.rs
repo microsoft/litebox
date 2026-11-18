@@ -11,6 +11,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
@@ -33,22 +34,42 @@ use thiserror::Error;
 /// A [`Backend`] composed from mounted [`Backend`]s at various paths.
 pub struct Composer<Platform: RawSyncPrimitivesProvider> {
     state: RwLock<Platform, MountState>,
+    resources: Arc<MountResources>,
 }
 
+#[derive(Clone)]
 struct MountState {
-    // Append-only: borrowed backend handles point into these boxes.
-    #[expect(
-        clippy::vec_box,
-        reason = "published mounts need stable addresses for borrowed handles"
-    )]
-    mounts: Vec<Box<Mount>>,
-    limit: usize,
-    allocators: InodeAllocators,
-    virtual_dir_allocator: InodeAllocator,
+    // Append-only in each view: borrowed backend handles point into the published mounts.
+    mounts: Vec<Arc<Mount>>,
     // TODO(jayb): We have these to account for `/mnt` in something like mounting `/mnt/foo`; I am
     // not certain this is the best design (maybe we should have something _explicitly_ make
     // `/mnt`), but for now, this is the design I've chosen.
     virtual_dirs: Vec<VirtualDir>,
+}
+
+/// Identity allocation and the runtime mount budget span all copies of a view.
+struct MountResources {
+    allocators: InodeAllocators,
+    virtual_dir_allocator: InodeAllocator,
+    runtime_mounts: AtomicUsize,
+}
+
+struct RuntimeMountSlot(Arc<MountResources>);
+
+impl RuntimeMountSlot {
+    fn reserve(resources: &Arc<MountResources>) -> Result<Self, MountError> {
+        if crate::quota::try_increment(&resources.runtime_mounts, RUNTIME_MOUNT_CAPACITY) {
+            Ok(Self(Arc::clone(resources)))
+        } else {
+            Err(MountError::NoSpace)
+        }
+    }
+}
+
+impl Drop for RuntimeMountSlot {
+    fn drop(&mut self) {
+        self.0.runtime_mounts.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A [`Composer`] builder.
@@ -64,6 +85,7 @@ pub struct ComposerBuilder<Platform: RawSyncPrimitivesProvider> {
 struct Mount {
     path: Vec<String>,
     backend: Box<dyn Backend>,
+    _slot: Option<RuntimeMountSlot>,
 }
 
 /// Synthetic directory needed to connect mount points.
@@ -119,6 +141,18 @@ fn parse_mount_path(raw: &str) -> Result<Vec<String>, MountError> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
+    /// Copy the current mount layout. Later mounts are visible only in the view where they
+    /// are made. Existing mounts share their backends and keep their device and inode numbers.
+    /// All related views share the runtime mount budget; copying does not consume mount slots.
+    /// As with any two backends, handles must be used with the instance that produced them.
+    #[must_use]
+    pub fn copy_mount_view(&self) -> Self {
+        Self {
+            state: RwLock::new(self.state.read().clone()),
+            resources: Arc::clone(&self.resources),
+        }
+    }
+
     /// Append a mounted backend without invalidating existing handles.
     ///
     /// Missing ancestor directories are synthesized; callers that require an existing target
@@ -136,18 +170,14 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         let path = parse_mount_path(path)?;
         let mut state = self.state.write();
         // XXX(jayb): No mount stacking or unmount; Linux would stack here instead of EBUSY.
-        if MountRelation::of(state.mounts.iter().map(Box::as_ref), &path) == MountRelation::Exact {
+        if MountRelation::of(state.mounts.iter().map(Arc::as_ref), &path) == MountRelation::Exact {
             return Err(MountError::Busy);
         }
-        if state.mounts.len() >= state.limit {
-            return Err(MountError::NoSpace);
-        }
-        let backend = Box::new(make(state.allocators.next()));
+        let slot = RuntimeMountSlot::reserve(&self.resources)?;
+        let backend = Box::new(make(self.resources.allocators.next()));
         let MountState {
             mounts,
             virtual_dirs,
-            virtual_dir_allocator,
-            ..
         } = &mut *state;
         for len in 0..path.len() {
             let ancestor = &path[..len];
@@ -156,13 +186,17 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
             }
             virtual_dirs.push(VirtualDir {
                 path: ancestor.to_vec(),
-                node_info: virtual_dir_allocator.next(),
+                node_info: self.resources.virtual_dir_allocator.next(),
             });
         }
         // Publish fallback metadata first: a host ancestor can disappear after validation.
         // XXX(jayb): Mounts are keyed by path, not dentry; renaming an ancestor doesn't move the
         // mount as on Linux.
-        mounts.push(Box::new(Mount { path, backend }));
+        mounts.push(Arc::new(Mount {
+            path,
+            backend,
+            _slot: Some(slot),
+        }));
         Ok(())
     }
 
@@ -234,7 +268,11 @@ impl<Platform: RawSyncPrimitivesProvider> ComposerBuilder<Platform> {
         for (raw, backend) in self.mounts {
             let path = parse_mount_path(&raw).map_err(|_| BuildError::InvalidMountPath)?;
             paths.push(path.clone());
-            mounts.push(Mount { path, backend });
+            mounts.push(Arc::new(Mount {
+                path,
+                backend,
+                _slot: None,
+            }));
         }
 
         let sorted_paths = {
@@ -253,7 +291,7 @@ impl<Platform: RawSyncPrimitivesProvider> ComposerBuilder<Platform> {
         for mount_path in paths {
             for len in 0..mount_path.len() {
                 let path = mount_path[..len].to_vec();
-                if MountRelation::of(&mounts, &path) == MountRelation::Exact
+                if MountRelation::of(mounts.iter().map(Arc::as_ref), &path) == MountRelation::Exact
                     || virtual_dirs.iter().any(|dir: &VirtualDir| dir.path == path)
                 {
                     continue;
@@ -265,18 +303,16 @@ impl<Platform: RawSyncPrimitivesProvider> ComposerBuilder<Platform> {
             }
         }
 
-        let mount_limit = mounts.len() + RUNTIME_MOUNT_CAPACITY;
-        let mut published = Vec::with_capacity(mount_limit);
-        published.extend(mounts.into_iter().map(Box::new));
-
         // TODO(jayb): Validate mounted backend device IDs once backends expose that cheaply.
         Ok(Composer {
             state: RwLock::new(MountState {
-                mounts: published,
-                limit: mount_limit,
+                mounts,
+                virtual_dirs,
+            }),
+            resources: Arc::new(MountResources {
                 allocators: self.allocators,
                 virtual_dir_allocator,
-                virtual_dirs,
+                runtime_mounts: AtomicUsize::new(0),
             }),
         })
     }
@@ -312,10 +348,9 @@ fn append_components(mut path: Vec<String>, components: &[&str]) -> Vec<String> 
 impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
     fn mount_at(&self, index: usize) -> Option<&Mount> {
         let mount = core::ptr::from_ref(self.state.read().mounts.get(index)?.as_ref());
-        // SAFETY: Writers only push new boxed mounts; published mounts remain immutable.
-        // Their boxes keep their addresses stable, and the pointees cannot be freed while
-        // `self` is borrowed. The read lock synchronizes publication and is released before
-        // calling into a backend.
+        // SAFETY: This view only appends Arcs; its own strong reference keeps each published
+        // mount at a stable address as long as `self` is borrowed, independently of other views.
+        // The read lock synchronizes publication and is released before calling into a backend.
         Some(unsafe { &*mount })
     }
 
@@ -1282,6 +1317,29 @@ mod tests {
             composer.initialized_mounts().count(),
             1 + RUNTIME_MOUNT_CAPACITY
         );
+    }
+
+    #[test]
+    fn copied_views_share_slots_until_the_last_view_releases_the_mount() {
+        let parent = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        parent.mount("/shared", InMem::<TestPlatform>::new).unwrap();
+        let child = parent.copy_mount_view();
+        for index in 1..RUNTIME_MOUNT_CAPACITY {
+            child
+                .mount(&format!("/private/{index}"), InMem::<TestPlatform>::new)
+                .unwrap();
+        }
+        let grandchild = child.copy_mount_view();
+        drop(child);
+        assert_eq!(
+            parent.mount::<InMem<TestPlatform>>("/other", |_| panic!("exhausted constructor")),
+            Err(MountError::NoSpace),
+        );
+        drop(grandchild);
+        parent.mount("/other", InMem::<TestPlatform>::new).unwrap();
     }
 
     #[test]

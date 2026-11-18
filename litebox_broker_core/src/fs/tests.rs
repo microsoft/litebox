@@ -116,6 +116,86 @@ fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform, TarRo> {
     Resolver::new(TarRo::new(tar_data, InodeAllocators::new().next()))
 }
 
+#[test]
+fn copied_mount_views_share_files_and_locks_but_not_new_mounts() {
+    use alloc::sync::Arc;
+    use litebox_broker_protocol::fs::FileLockOperation::Exclusive;
+
+    let parent = Resolver::<TestPlatform, _>::new(
+        super::composer::Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap(),
+    );
+    parent.mkdir(ROOT, "/work", Mode::RWXU).unwrap();
+    parent.mount_in_mem(ROOT, "/work").unwrap();
+    parent.mkdir(ROOT, "/work/dir", Mode::RWXU).unwrap();
+    let file = "/work/dir/file";
+    let mut original = parent
+        .open(ROOT, file, OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+        .unwrap();
+    let child = parent.copy_mount_view();
+    let mut opened = child.open(ROOT, file, OFlags::RDWR, Mode::empty()).unwrap();
+
+    let owner: Arc<dyn Send + Sync> = Arc::new(());
+    let other: Arc<dyn Send + Sync> = Arc::new(());
+    parent
+        .lock(&original, Arc::downgrade(&owner), Exclusive)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        child
+            .lock(&opened, Arc::downgrade(&other), Exclusive)
+            .unwrap_err(),
+        crate::BrokerError::NonBlockingWouldBlock
+    );
+
+    let underlying = parent
+        .file_status(ROOT, "/work/dir", true)
+        .unwrap()
+        .node_info;
+    child.mount_in_mem(ROOT, "/work/dir").unwrap();
+    assert_eq!(
+        parent
+            .file_status(ROOT, "/work/dir", true)
+            .unwrap()
+            .node_info,
+        underlying
+    );
+    assert_ne!(
+        child
+            .file_status(ROOT, "/work/dir", true)
+            .unwrap()
+            .node_info
+            .dev,
+        underlying.dev,
+    );
+    assert!(matches!(
+        child.open(ROOT, file, OFlags::RDONLY, Mode::empty()),
+        Err(super::errors::OpenError::PathError(
+            super::errors::PathError::NoSuchFileOrDirectory
+        ))
+    ));
+    assert_eq!(child.write(&mut opened, b"x", None).unwrap(), 1);
+    let mut data = [0; 1];
+    assert_eq!(parent.read(&mut original, &mut data, None).unwrap(), 1);
+    assert_eq!(&data, b"x");
+    // Both views can now mount at the same path without colliding device identities.
+    parent.mount_in_mem(ROOT, "/work/dir").unwrap();
+    assert_ne!(
+        parent
+            .file_status(ROOT, "/work/dir", true)
+            .unwrap()
+            .node_info
+            .dev,
+        child
+            .file_status(ROOT, "/work/dir", true)
+            .unwrap()
+            .node_info
+            .dev,
+    );
+}
+
 /// The path that `path` opens as, and up to 1 KiB of its content.
 fn read_path<Backend: super::backend::Backend + 'static>(
     fs: &Resolver<TestPlatform, Backend>,

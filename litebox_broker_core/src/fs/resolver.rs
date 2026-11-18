@@ -39,7 +39,7 @@ const MAX_SYMLINKS: usize = 40;
 pub struct Resolver<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
 {
     backend: Backend,
-    flocks: super::flock::FlockTable<Platform>,
+    flocks: Arc<super::flock::FlockTable<Platform>>,
     _sync: PhantomData<fn() -> Platform>,
 }
 
@@ -51,7 +51,20 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     pub fn new(backend: Backend) -> Self {
         Self {
             backend,
-            flocks: super::flock::FlockTable::new(),
+            flocks: Arc::new(super::flock::FlockTable::new()),
+            _sync: PhantomData,
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> Resolver<Platform, super::composer::Composer<Platform>> {
+    /// Resolve paths against a private copy of the mount layout. Locks on shared files
+    /// still conflict across views. Existing open descriptions keep their original resolver.
+    #[must_use]
+    pub fn copy_mount_view(&self) -> Self {
+        Self {
+            backend: self.backend.copy_mount_view(),
+            flocks: Arc::clone(&self.flocks),
             _sync: PhantomData,
         }
     }
