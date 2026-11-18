@@ -637,11 +637,13 @@ pub trait PlatformSocket: Send + Sync {
     /// [`crate::transfer`]) without waiting for platform readiness.
     ///
     /// The original datagram length is returned even when the caller's buffer
-    /// is smaller, and zero-length datagrams are successful receives. When no
-    /// datagram is available, returns [`BrokerError::WouldBlock`]. Once the
-    /// transport has shut down reading, it returns a pending error or
-    /// `Failed(Shutdown)`, even if the broker has not yet recorded the shutdown.
-    /// The source address follows [`PlatformDatagramReceive::source_address`].
+    /// is smaller, and zero-length datagrams are successful receives. The
+    /// source address follows [`PlatformDatagramReceive::source_address`].
+    ///
+    /// Once the transport applies read shutdown, return a pending error or
+    /// `Failed(Shutdown)`, leaving any unconsumed error available through [`Self::status`].
+    /// Otherwise, if neither a datagram nor an error is available, return
+    /// [`BrokerError::WouldBlock`].
     fn receive_from(
         &self,
         output: &mut dyn ReadBuffer,
@@ -2478,7 +2480,7 @@ fn refresh(object: &RwLock<ObjectEntry>, include_connected: bool) {
     refresh_error_queue(object, udp, include_connected);
 }
 
-/// Refreshes the queue while holding the socket's error-query lock.
+/// Refreshes the queue. The caller must hold the socket's error-query lock.
 fn refresh_error_queue(object: &RwLock<ObjectEntry>, udp: bool, include_connected: bool) {
     let needed = read_socket(object, |socket| {
         socket.errors.is_empty()
@@ -2521,9 +2523,10 @@ fn refresh_after_failure(object: &RwLock<ObjectEntry>) {
     let _ = write_socket(object, |socket| socket.errors.take_connection_failure());
 }
 
-/// Takes the oldest queued error and refills an emptied queue. When checking
-/// the transport, keep the query lock from the check through the take so two
-/// readers cannot both rely on the same queued error.
+/// Takes the oldest queued error. With `check_transport`, first check the
+/// transport if the broker queue is empty; without it, `None` means only
+/// that the broker queue was empty. In either mode, taking the last queued
+/// error triggers a check for the next transport error.
 fn take_pending_error(object: &RwLock<ObjectEntry>, check_transport: bool) -> Option<SocketError> {
     let (resource, udp) = read_socket(object, |socket| {
         (check_transport || !socket.errors.is_empty())
@@ -3090,7 +3093,8 @@ pub(crate) struct SocketResource {
     readiness_sink: Arc<SocketReadinessSink>,
     port_binding: Mutex<Option<Arc<GuestPortBinding>>>,
     guest_source_lease: Mutex<Option<GuestSourceLease>>,
-    /// Serializes querying, claiming, and refilling the pending-error queue.
+    /// Orders transport error queries with operations that claim an error and
+    /// refill the queue. The object lock protects the queue itself.
     error_queries: Mutex<()>,
     /// The account the provider charges this socket to, which drops after the
     /// socket retires.
