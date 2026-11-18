@@ -29,7 +29,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // A vfork child has the parent's address space and service association until exec.
         // Don't let it operate in its parent's name or modify its attachment records.
         if self.vfork.borrow().is_some() {
-            Err(Errno::ENOSYS)
+            log_unsupported!("SysV shared memory in a vfork child");
+            Err(Errno::EINVAL)
         } else {
             Ok(())
         }
@@ -73,11 +74,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             _ => return Err(Errno::EINVAL),
         };
         let readonly = flags & SHM_RDONLY != 0;
-        let (file, size) = self.global.litebox.attach_segment::<_, PAGE_SIZE>(
-            self.global.platform,
-            id,
-            !readonly,
-        )?;
+        let (file, size) = self
+            .global
+            .litebox
+            .attach_segment::<_, PAGE_SIZE>(self.global.platform, id, !readonly)
+            .map_err(|error| match error {
+                // `shmat` reports any lack of resources as ENOMEM; ENOSPC is `shmget`'s.
+                SegmentError::NoSpace => Errno::ENOMEM,
+                error => error.into(),
+            })?;
         let mapped = usize::try_from(size)
             .map_err(|_| Errno::ENOMEM)
             .and_then(|len| {
@@ -89,8 +94,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     id,
                 )
             });
-        if mapped.is_err() {
-            self.global.litebox.detach_segment(id)?;
+        // Report the mapping failure; a failed rollback only overcounts until exit.
+        if mapped.is_err()
+            && let Err(rollback) = self.global.litebox.detach_segment(id)
+        {
+            litebox_util_log::warn!(id, rollback:?; "failed to roll back a SysV attach");
         }
         mapped
     }

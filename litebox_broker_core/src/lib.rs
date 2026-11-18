@@ -120,10 +120,12 @@ pub struct BrokerCoreLimits {
     pub max_child_image_size: u64,
     /// Maximum total size in bytes of child memory images held by the broker.
     pub max_total_child_image_size: u64,
-    /// Maximum files whose contents are in host shared memory at once.
+    /// Maximum files whose contents are in host shared memory at once, and
+    /// separately, maximum keyed shared-memory segments.
     ///
-    /// Each such file holds a broker descriptor or handle until it is deleted,
-    /// so the limit is broker-wide only. Zero keeps every file in broker memory.
+    /// Each such file or segment holds a broker descriptor or handle until it
+    /// is deleted, so the limit is broker-wide only. Zero keeps every file in
+    /// broker memory and disables segments.
     pub max_shared_files: usize,
     /// Maximum PID namespaces that processes have created, across all jobs.
     pub max_pid_namespaces: usize,
@@ -346,8 +348,7 @@ pub struct BrokerCore {
     pub(crate) limits: BrokerCoreLimits,
     /// The next [`ProcessKey`] to allocate.
     pub(crate) next_process_key: AtomicU64,
-    segment_limit: Arc<fs::shared_storage::SharedFileLimit>,
-    next_segment_id: core::sync::atomic::AtomicU32,
+    pub(crate) segment_ids: Arc<segment::SegmentIds>,
     /// The next [`PidNamespaceId`](pid_namespace::PidNamespaceId) to allocate.
     pub(crate) next_pid_namespace_id: AtomicU64,
     /// PID namespaces that processes have created and that still exist.
@@ -406,8 +407,7 @@ impl BrokerCore {
             policy,
             limits,
             next_process_key: AtomicU64::new(1),
-            segment_limit: Arc::new(fs::shared_storage::SharedFileLimit::new(256)),
-            next_segment_id: core::sync::atomic::AtomicU32::new(1),
+            segment_ids: Arc::new(segment::SegmentIds::new(limits.max_shared_files)),
             next_pid_namespace_id: AtomicU64::new(1),
             pid_namespaces: Arc::new(AtomicUsize::new(0)),
             live_processes: AtomicUsize::new(0),

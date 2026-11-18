@@ -18,7 +18,7 @@ use litebox::{
             RemapError,
         },
     },
-    sync::{RawSyncPrimitivesProvider, RwLock},
+    sync::{RawSyncPrimitivesProvider, RwLock, RwLockWriteGuard},
 };
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 
@@ -59,6 +59,79 @@ where
     vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
 }
 
+/// Exclusive access to an address space. SysV attachments that a change ends are released
+/// only after the lock is dropped, so the release hook's service requests never hold up other
+/// mapping changes or page faults, and the hook may use this manager.
+struct VmemWriteGuard<'a, Platform, const ALIGN: usize>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    // Fields drop in order: the lock is released before `released` runs the hook.
+    vmem: RwLockWriteGuard<'a, Platform, Vmem<Platform, ALIGN>>,
+    released: PendingSysvReleases,
+}
+
+#[derive(Default)]
+struct PendingSysvReleases {
+    hook: Option<alloc::sync::Arc<dyn Fn(u32) + Send + Sync>>,
+    segments: Vec<u32>,
+}
+
+impl Drop for PendingSysvReleases {
+    fn drop(&mut self) {
+        if let Some(hook) = &self.hook {
+            self.segments.iter().for_each(|&segment| hook(segment));
+        }
+    }
+}
+
+impl<Platform, const ALIGN: usize> Drop for VmemWriteGuard<'_, Platform, ALIGN>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    fn drop(&mut self) {
+        if !self.vmem.sysv_released.is_empty() {
+            self.released = PendingSysvReleases {
+                hook: self.vmem.sysv_release.clone(),
+                segments: core::mem::take(&mut self.vmem.sysv_released),
+            };
+        }
+    }
+}
+
+impl<Platform, const ALIGN: usize> core::ops::Deref for VmemWriteGuard<'_, Platform, ALIGN>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    type Target = Vmem<Platform, ALIGN>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.vmem
+    }
+}
+
+impl<Platform, const ALIGN: usize> core::ops::DerefMut for VmemWriteGuard<'_, Platform, ALIGN>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.vmem
+    }
+}
+
+impl<Platform, const ALIGN: usize> VmemManager<Platform, ALIGN>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    /// Locks the address space for a change. Use this rather than `self.vmem.write()`.
+    fn write(&self) -> VmemWriteGuard<'_, Platform, ALIGN> {
+        VmemWriteGuard {
+            vmem: self.vmem.write(),
+            released: PendingSysvReleases::default(),
+        }
+    }
+}
+
 impl<Platform, const ALIGN: usize> VmemManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
@@ -78,17 +151,17 @@ where
     /// `platform` must be able to manage every inherited mapping and reservation. The copied
     /// parent runtime must never use this manager again.
     pub unsafe fn rebind_platform_after_clone(&self, platform: &'static Platform) {
-        self.vmem.write().platform = platform;
+        self.write().platform = platform;
     }
 
     /// Sets the release hook for SysV attachments in this address space. A native clone
     /// must bind its own process's hook before changing inherited mappings.
-    /// The hook runs under the mapping lock and must not re-enter this memory manager.
+    /// The hook runs after the change that ended the attachment releases the mapping lock.
     pub fn set_sysv_release(&self, release: impl Fn(u32) + Send + Sync + 'static) {
-        self.vmem.write().sysv_release = Some(alloc::boxed::Box::new(release));
+        self.write().sysv_release = Some(alloc::sync::Arc::new(release));
     }
 
-    /// Whether a native fork child will inherit any SysV attachments.
+    /// Whether this address space has any live SysV attachments.
     pub fn has_sysv_attachments(&self) -> bool {
         self.vmem.read().has_sysv_attachments()
     }
@@ -130,7 +203,7 @@ where
         let (before_perms, after_perms) = permissions;
         // SAFETY: The caller authorizes any replacements.
         let addr = unsafe {
-            self.vmem.write().create_pages(
+            self.write().create_pages(
                 suggested_address,
                 length,
                 flags,
@@ -144,12 +217,12 @@ where
         // Note `op` may trigger page fault handler which requires write lock to `vmem`.
         if let Err(e) = op(addr) {
             // remove the mapping if the user function fails
-            let mut vmem = self.vmem.write();
+            let mut vmem = self.write();
             unsafe { vmem.remove_mapping(range) }.unwrap();
             return Err(e);
         }
         if before_perms != after_perms {
-            let mut vmem = self.vmem.write();
+            let mut vmem = self.write();
             if let Err(error) = unsafe { vmem.protect_mapping(range, after_perms) } {
                 unsafe { vmem.remove_mapping(range) }
                     .expect("failed to remove mapping after permission update failure");
@@ -389,7 +462,7 @@ where
     ///
     /// The caller must ensure that the released memory regions are no longer used.
     pub unsafe fn release_memory(&self) -> Result<(), VmemUnmapError> {
-        unsafe { self.vmem.write().release_all() }.map_err(VmemUnmapError::UnmapError)
+        unsafe { self.write().release_all() }.map_err(VmemUnmapError::UnmapError)
     }
 
     /// Expands (or shrinks) an existing memory mapping
@@ -419,7 +492,7 @@ where
         new_size: usize,
         may_move: bool,
     ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
-        let mut vmem = self.vmem.write();
+        let mut vmem = self.write();
         let old_end = old_addr
             .as_usize()
             .checked_add(old_size)
@@ -470,7 +543,7 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemUnmapError> {
-        let mut vmem = self.vmem.write();
+        let mut vmem = self.write();
         let start = ptr.as_usize();
         let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::UnAligned)?;
         unsafe { vmem.remove_mapping(range) }
@@ -496,7 +569,7 @@ where
         len: usize,
         anonymous_only: bool,
     ) -> Result<(), VmemResetError> {
-        let mut vmem = self.vmem.write();
+        let mut vmem = self.write();
         let start = ptr.as_usize();
         let range = PageRange::new(start, start + len).ok_or(VmemResetError::UnAligned)?;
         unsafe { vmem.reset_pages(range, anonymous_only) }
@@ -514,7 +587,7 @@ where
         len: usize,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), VmemProtectError> {
-        let mut vmem = self.vmem.write();
+        let mut vmem = self.write();
         let start = ptr.as_usize();
         let end = start.saturating_add(len);
         let range = PageRange::new(start, end).ok_or(VmemProtectError::InvalidRange(start..end))?;
@@ -674,7 +747,7 @@ where
         let Some(memory) = issue()? else {
             return Ok(None);
         };
-        let mut vmem = self.vmem.write();
+        let mut vmem = self.write();
         if let Some(mapping) = area(&vmem).and_then(|vma| vma.unnamed_shared_mapping()) {
             vmem.name_shared_mapping(mapping, memory);
         }
@@ -702,7 +775,7 @@ where
             let Some(memory) = issue()? else {
                 return Ok(());
             };
-            self.vmem.write().name_shared_mapping(mapping, memory);
+            self.write().name_shared_mapping(mapping, memory);
         }
         Ok(())
     }
@@ -837,7 +910,7 @@ where
             return Err(PageFaultError::AccessError("Invalid address"));
         }
 
-        let mut vmem = self.vmem.write();
+        let mut vmem = self.write();
         // Find the range closest to the fault address
         let (start, vma) = {
             let (r, vma) = vmem
@@ -1053,7 +1126,7 @@ where
     {
         let (flags, suggested_addr, length, permissions) =
             Self::mmap_arguments(suggested_addr, len, prot, flags, &placement)?;
-        let mut vmem = self.vmem.write();
+        let mut vmem = self.write();
         // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the
         // mapping.
         unsafe {
@@ -1105,7 +1178,7 @@ where
         flags.set(MapFlags::MAP_FIXED_NOREPLACE, addr.is_some());
         let (flags, addr, length, permissions) =
             Self::mmap_arguments(addr, len, prot, flags, &MmapPlacement::GUEST)?;
-        let mut vmem = self.vmem.write();
+        let mut vmem = self.write();
         if vmem.sysv_release.is_none() {
             return Err(Errno::ENOSYS);
         }
@@ -1130,7 +1203,7 @@ where
 
     /// Detaches the remaining pages of a SysV attachment originally placed at `base`.
     pub fn detach_sysv(&self, base: usize) -> Result<(), Errno> {
-        self.vmem.write().detach_sysv(base)
+        self.write().detach_sysv(base)
     }
 
     /// Handle syscall `msync`.

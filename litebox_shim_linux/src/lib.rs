@@ -472,9 +472,13 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     pub fn build(self) -> LinuxShim<Platform> {
         let litebox = Arc::new(self.litebox);
         // The child's native clone inherits the VMAs but must debit its own broker connection.
-        let segment_client = Arc::clone(&litebox);
+        // The hook must not keep this LiteBox alive with the memory manager; once it is gone, the
+        // broker has released all of this process's attachments.
+        let segment_client = Arc::downgrade(&litebox);
         self.memory_manager.set_sysv_release(move |id| {
-            if segment_client.detach_segment(id).is_err() {
+            if let Some(litebox) = segment_client.upgrade()
+                && litebox.detach_segment(id).is_err()
+            {
                 litebox_util_log::warn!(id; "failed to release SysV attachment");
             }
         });

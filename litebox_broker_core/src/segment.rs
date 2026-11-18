@@ -5,35 +5,107 @@
 //! descendants share it until they explicitly move to a new one.
 
 use alloc::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Weak},
 };
-use core::sync::atomic::Ordering;
-use spin::Mutex;
+use spin::{Mutex, MutexGuard};
 
 use crate::{
     BrokerError, BrokerProcess,
-    fs::shared_storage::{SharedFileMemoryProvider, SharedFileObject, SharedFileSlot},
+    fs::shared_storage::{SharedFileMemoryProvider, SharedFileObject},
     object::ObjectRights,
     pid_namespace::PerNamespaceIds,
 };
 use litebox_broker_protocol::{
+    ProcessId,
     fs::{FileError as E, FileUser, MapFileResponse},
     segment::{SegmentRequest as Request, SegmentResponse as Response, SegmentStatus},
     shared_futex::SharedMemoryId,
 };
 
-// Bound both the host object count (in BrokerCore) and the storage one
-// object can consume. Backing storage is page-rounded, metadata is not.
+// Bounds the storage one segment can consume. Backing storage is page-rounded,
+// metadata is not.
 const MAX_SIZE: u64 = 64 * 1024 * 1024;
+const PAGE_SIZE: u64 = 4096;
+// Guests see IDs as non-negative `int`s.
+const MAX_ID: u32 = i32::MAX.cast_unsigned();
+
+/// Broker-wide segment IDs, which also bound how many segments hold host
+/// memory at once.
+///
+/// IDs are unique across namespaces, so an attachment that outlives a
+/// namespace switch still names one segment. Freed IDs are reused, but only
+/// after every other free ID, so churn neither exhausts them nor quickly
+/// recycles a stale one.
+pub(crate) struct SegmentIds {
+    max: usize,
+    state: Mutex<IdState>,
+}
+
+struct IdState {
+    next: u32,
+    live: BTreeSet<u32>,
+}
+
+const fn id_after(id: u32) -> u32 {
+    if id >= MAX_ID { 1 } else { id + 1 }
+}
+
+impl SegmentIds {
+    /// Allows up to `max` live segments; zero disables segments.
+    pub(crate) const fn new(max: usize) -> Self {
+        Self {
+            max,
+            state: Mutex::new(IdState {
+                next: 1,
+                live: BTreeSet::new(),
+            }),
+        }
+    }
+
+    fn reserve(self: &Arc<Self>) -> Result<SegmentId, E> {
+        if self.max == 0 {
+            return Err(E::NoSuchDevice);
+        }
+        let mut state = self.state.lock();
+        // Below `MAX_ID` live IDs, the search below always finds a free one.
+        if state.live.len() >= self.max || state.live.len() >= MAX_ID as usize {
+            return Err(E::NoSpace);
+        }
+        let mut id = state.next;
+        while state.live.contains(&id) {
+            id = id_after(id);
+        }
+        state.next = id_after(id);
+        state.live.insert(id);
+        Ok(SegmentId {
+            ids: Arc::clone(self),
+            id,
+        })
+    }
+}
+
+/// A reserved ID, freed when its segment is dropped.
+struct SegmentId {
+    ids: Arc<SegmentIds>,
+    id: u32,
+}
+
+impl Drop for SegmentId {
+    fn drop(&mut self) {
+        self.ids.state.lock().live.remove(&self.id);
+    }
+}
 
 struct Segment {
     status: SegmentStatus,
+    /// Page-rounded length of `backing`.
+    length: u64,
     creator: Arc<PerNamespaceIds>,
     last: Option<Arc<PerNamespaceIds>>,
     memory: SharedMemoryId,
     backing: Arc<dyn SharedFileObject>,
-    _slot: SharedFileSlot,
+    _id: SegmentId,
 }
 
 impl Segment {
@@ -94,7 +166,7 @@ impl Attachment {
 
 #[derive(Default)]
 pub(crate) struct ProcessSegments {
-    // Lock order: process, namespace, segment. The registry owns all live
+    // Lock order: process, namespace, segment, IDs. The registry owns all live
     // segments in it; mappings can outlive that namespace, but must not pin
     // unrelated segments in an otherwise dead namespace.
     namespace: Arc<Namespace>,
@@ -122,6 +194,27 @@ impl ProcessSegments {
     }
 }
 
+/// Why a request did not complete: an ordinary guest error, or a failure of
+/// the request itself.
+enum Failure {
+    Segment(E),
+    Broker(BrokerError),
+}
+
+impl From<E> for Failure {
+    fn from(error: E) -> Self {
+        Self::Segment(error)
+    }
+}
+
+impl From<BrokerError> for Failure {
+    fn from(error: BrokerError) -> Self {
+        Self::Broker(error)
+    }
+}
+
+type Outcome = Result<Response, Failure>;
+
 /// Handles a segment request. `provider` creates empty storage and `deliver`
 /// lends a handle to this association only, attenuated to the requested
 /// rights. An attachment is recorded only when delivery succeeds.
@@ -132,218 +225,278 @@ pub fn operate(
     deliver: impl FnOnce(&dyn SharedFileObject, bool, u64) -> Result<u64, E>,
 ) -> crate::Result<Response> {
     let rights = process.require_object_rights(ObjectRights::WAIT)?;
-    let can_write = rights.contains(ObjectRights::WRITE);
-    let user = process.core.policy.segment_user;
-    if let Request::NewNamespace { target } = request {
-        if !can_write || user.user != 0 {
-            return Ok(Response::Failed(E::NotOwner));
-        }
-        let reset = |p: &BrokerProcess| {
-            p.segments.lock().namespace = Arc::default();
-        };
-        if target == process.id() {
-            reset(process);
-        } else {
-            process.with_pending_child(target, |child| reset(child))?;
-        }
-        return Ok(Response::Done);
+    let caller = Caller {
+        process,
+        user: process.core.policy.segment_user,
+        can_write: rights.contains(ObjectRights::WRITE),
+    };
+    let outcome = match request {
+        Request::Get {
+            key,
+            size,
+            mode,
+            create,
+            exclusive,
+        } => caller.get(key, size, mode, create, exclusive, provider),
+        Request::Status { id } => caller.status(id),
+        Request::Set { id, owner, mode } => caller.set(id, owner, mode),
+        Request::Delete { id } => caller.delete(id),
+        Request::Attach { id, writable } => caller.attach(id, writable, deliver),
+        Request::Detach { id } => caller.detach(id),
+        Request::NewNamespace { target } => caller.new_namespace(target),
+        Request::Inherit { target } => caller.inherit(target),
+    };
+    match outcome {
+        Ok(response) => Ok(response),
+        Err(Failure::Segment(error)) => Ok(Response::Failed(error)),
+        Err(Failure::Broker(error)) => Err(error),
     }
-    if let Request::Inherit { target } = request {
-        return process.with_pending_child(target, |child| {
+}
+
+/// Locks `id`'s segment in `namespace`, releasing the namespace first.
+fn with_segment<R>(
+    namespace: &Namespace,
+    id: u32,
+    f: impl FnOnce(&Entry, &mut Segment) -> Result<R, Failure>,
+) -> Result<R, Failure> {
+    let registry = namespace.lock();
+    let entry = Arc::clone(registry.get(&id).ok_or(E::InvalidArgument)?);
+    let mut segment = entry.lock();
+    drop(registry);
+    f(&entry, &mut segment)
+}
+
+struct Caller<'a> {
+    process: &'a BrokerProcess,
+    user: FileUser,
+    can_write: bool,
+}
+
+impl Caller<'_> {
+    fn now(&self) -> u64 {
+        self.process.core.timer_provider.unix_seconds()
+    }
+
+    fn require_write(&self) -> Result<(), E> {
+        if self.can_write {
+            Ok(())
+        } else {
+            Err(E::AccessNotAllowed)
+        }
+    }
+
+    fn segments(&self) -> Result<MutexGuard<'_, ProcessSegments>, Failure> {
+        let local = self.process.segments.lock();
+        if local.closed {
+            Err(BrokerError::PeerClosed.into())
+        } else {
+            Ok(local)
+        }
+    }
+
+    fn get(
+        &self,
+        key: i32,
+        size: u64,
+        mode: u16,
+        create: bool,
+        exclusive: bool,
+        provider: Option<&dyn SharedFileMemoryProvider>,
+    ) -> Outcome {
+        let local = self.segments()?;
+        let mut registry = local.namespace.lock();
+        if key != 0 {
+            for (id, entry) in registry.iter() {
+                let s = entry.lock();
+                if !s.status.removed && s.status.key == key {
+                    if create && exclusive {
+                        return Err(E::AlreadyExists.into());
+                    }
+                    if size > s.status.size {
+                        return Err(E::InvalidArgument.into());
+                    }
+                    s.access(self.user, (mode | mode >> 3 | mode >> 6) & 7)?;
+                    return Ok(Response::Id(*id));
+                }
+            }
+            if !create {
+                return Err(E::NoSuchFileOrDirectory.into());
+            }
+        }
+        if size == 0 || size > MAX_SIZE {
+            return Err(E::InvalidArgument.into());
+        }
+        self.require_write()?;
+        let provider = provider.ok_or(E::NoSuchDevice)?;
+        let id = self.process.core.segment_ids.reserve()?;
+        let length = size.next_multiple_of(PAGE_SIZE);
+        let backing = provider
+            .create_segment(usize::try_from(length).map_err(|_| E::InvalidArgument)?)
+            .map_err(|_| E::NoSpace)?;
+        let memory = crate::shared_futex::issue_shared_memory_id(self.process)?;
+        let number = id.id;
+        registry.insert(
+            number,
+            Arc::new(Mutex::new(Segment {
+                status: SegmentStatus {
+                    key,
+                    size,
+                    creator: self.user,
+                    owner: self.user,
+                    mode: mode & 0o777,
+                    creator_pid: 0,
+                    last_pid: 0,
+                    attachments: 0,
+                    created: self.now(),
+                    attached: 0,
+                    detached: 0,
+                    removed: false,
+                },
+                length,
+                creator: Arc::clone(&self.process.ids),
+                last: None,
+                memory,
+                backing,
+                _id: id,
+            })),
+        );
+        Ok(Response::Id(number))
+    }
+
+    fn status(&self, id: u32) -> Outcome {
+        let local = self.segments()?;
+        with_segment(&local.namespace, id, |_, s| {
+            s.access(self.user, 4)?;
+            let namespace = self.process.pid_namespace();
+            let mut status = s.status;
+            status.creator_pid = s.creator.id_in_namespace(namespace).unwrap_or_default();
+            status.last_pid = s
+                .last
+                .as_ref()
+                .and_then(|ids| ids.id_in_namespace(namespace))
+                .unwrap_or_default();
+            Ok(Response::Status(status))
+        })
+    }
+
+    fn set(&self, id: u32, owner: FileUser, mode: u16) -> Outcome {
+        let local = self.segments()?;
+        with_segment(&local.namespace, id, |_, s| {
+            self.require_write()?;
+            // As on Linux, the owner or creator may hand the segment to anyone;
+            // the creator keeps control either way.
+            s.control(self.user)?;
+            s.status.owner = owner;
+            s.status.mode = mode & 0o777;
+            s.status.created = self.now();
+            Ok(Response::Done)
+        })
+    }
+
+    fn delete(&self, id: u32) -> Outcome {
+        let local = self.segments()?;
+        let mut registry = local.namespace.lock();
+        let entry = Arc::clone(registry.get(&id).ok_or(E::InvalidArgument)?);
+        let mut s = entry.lock();
+        self.require_write()?;
+        s.control(self.user)?;
+        s.status.removed = true;
+        s.status.key = 0;
+        if s.status.attachments == 0 {
+            registry.remove(&id);
+        }
+        Ok(Response::Done)
+    }
+
+    fn attach(
+        &self,
+        id: u32,
+        writable: bool,
+        deliver: impl FnOnce(&dyn SharedFileObject, bool, u64) -> Result<u64, E>,
+    ) -> Outcome {
+        let mut local = self.segments()?;
+        let namespace = Arc::clone(&local.namespace);
+        with_segment(&namespace, id, |entry, s| {
+            if writable {
+                self.require_write()?;
+            }
+            s.access(self.user, if writable { 6 } else { 4 })?;
+            let count = local
+                .attachments
+                .get(&id)
+                .map_or(0, |a| a.count)
+                .checked_add(1)
+                .ok_or(E::NoSpace)?;
+            let token = deliver(&*s.backing, writable, s.length)?;
+            s.status.attachments += 1;
+            s.status.attached = self.now();
+            s.last = Some(Arc::clone(&self.process.ids));
+            local
+                .attachments
+                .entry(id)
+                .or_insert_with(|| Attachment {
+                    namespace: Arc::downgrade(&namespace),
+                    entry: Arc::clone(entry),
+                    count: 0,
+                })
+                .count = count;
+            Ok(Response::Attached {
+                mapping: MapFileResponse {
+                    memory: s.memory,
+                    token,
+                    writable,
+                },
+                size: s.status.size,
+            })
+        })
+    }
+
+    fn detach(&self, id: u32) -> Outcome {
+        let mut local = self.segments()?;
+        let a = local.attachments.get_mut(&id).ok_or(E::InvalidArgument)?;
+        a.subtract(self.process, id, 1);
+        a.count -= 1;
+        if a.count == 0 {
+            local.attachments.remove(&id);
+        }
+        Ok(Response::Done)
+    }
+
+    fn new_namespace(&self, target: ProcessId) -> Outcome {
+        if !self.can_write || self.user.user != 0 {
+            return Err(E::NotOwner.into());
+        }
+        let reset = |p: &BrokerProcess| p.segments.lock().namespace = Arc::default();
+        if target == self.process.id() {
+            reset(self.process);
+        } else {
+            self.process
+                .with_pending_child(target, |child| reset(child))?;
+        }
+        Ok(Response::Done)
+    }
+
+    fn inherit(&self, target: ProcessId) -> Outcome {
+        let process = self.process;
+        process.with_pending_child(target, |child| {
             let parent = process.segments.lock();
             let mut dest = child.segments.lock();
             if parent.closed || dest.closed || dest.inherited {
-                return Response::Failed(E::InvalidArgument);
+                return Err(E::InvalidArgument.into());
             }
+            let now = self.now();
             for (id, a) in &parent.attachments {
                 let mut s = a.entry.lock();
                 s.status.attachments += u64::from(a.count);
-                s.status.attached = process.core.timer_provider.unix_seconds();
-                s.last = Some(Arc::clone(&child.ids));
+                s.status.attached = now;
+                // Linux credits fork's implicit attaches to the forking process.
+                s.last = Some(Arc::clone(&process.ids));
                 dest.attachments.insert(*id, a.clone());
             }
             dest.inherited = true;
-            Response::Done
-        });
+            Ok(Response::Done)
+        })?
     }
-    let mut local = process.segments.lock();
-    if local.closed {
-        return Err(BrokerError::PeerClosed);
-    }
-    let ns = Arc::clone(&local.namespace);
-    let now = || process.core.timer_provider.unix_seconds();
-    let result = (|| {
-        if let Request::Detach { id } = request {
-            let a = local.attachments.get_mut(&id).ok_or(E::InvalidArgument)?;
-            a.subtract(process, id, 1);
-            a.count -= 1;
-            if a.count == 0 {
-                local.attachments.remove(&id);
-            }
-            return Ok(Response::Done);
-        }
-        let mut registry = ns.lock();
-        let id = match request {
-            Request::Get {
-                key,
-                size,
-                mode,
-                create,
-                exclusive,
-            } => {
-                if key != 0 {
-                    for (id, entry) in registry.iter() {
-                        let s = entry.lock();
-                        if !s.status.removed && s.status.key == key {
-                            if create && exclusive {
-                                return Err(E::AlreadyExists);
-                            }
-                            if size > s.status.size {
-                                return Err(E::InvalidArgument);
-                            }
-                            s.access(user, (mode | mode >> 3 | mode >> 6) & 7)?;
-                            return Ok(Response::Id(*id));
-                        }
-                    }
-                    if !create {
-                        return Err(E::NoSuchFileOrDirectory);
-                    }
-                }
-                if size == 0 || size > MAX_SIZE {
-                    return Err(E::InvalidArgument);
-                }
-                if !can_write {
-                    return Err(E::AccessNotAllowed);
-                }
-                let provider = provider.ok_or(E::NoSuchDevice)?;
-                let slot = process.core.segment_limit.reserve().ok_or(E::NoSpace)?;
-                let length =
-                    usize::try_from(size.next_multiple_of(4096)).map_err(|_| E::InvalidArgument)?;
-                let backing = provider.create_segment(length).map_err(|_| E::NoSpace)?;
-                let memory =
-                    crate::shared_futex::issue_shared_memory_id(process).map_err(|_| E::Io)?;
-                let id = process
-                    .core
-                    .next_segment_id
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-                        (id <= i32::MAX.cast_unsigned()).then_some(id + 1)
-                    })
-                    .map_err(|_| E::NoSpace)?;
-                registry.insert(
-                    id,
-                    Arc::new(Mutex::new(Segment {
-                        status: SegmentStatus {
-                            key,
-                            size,
-                            creator: user,
-                            owner: user,
-                            mode: mode & 0o777,
-                            creator_pid: 0,
-                            last_pid: 0,
-                            attachments: 0,
-                            created: now(),
-                            attached: 0,
-                            detached: 0,
-                            removed: false,
-                        },
-                        creator: Arc::clone(&process.ids),
-                        last: None,
-                        memory,
-                        backing,
-                        _slot: slot,
-                    })),
-                );
-                return Ok(Response::Id(id));
-            }
-            Request::Attach { id, .. }
-            | Request::Set { id, .. }
-            | Request::Delete { id }
-            | Request::Status { id } => id,
-            _ => unreachable!(),
-        };
-        let entry = Arc::clone(registry.get(&id).ok_or(E::InvalidArgument)?);
-        let mut s = entry.lock();
-        if let Request::Delete { .. } = request {
-            if !can_write {
-                return Err(E::AccessNotAllowed);
-            }
-            s.control(user)?;
-            s.status.removed = true;
-            s.status.key = 0;
-            if s.status.attachments == 0 {
-                registry.remove(&id);
-            }
-            return Ok(Response::Done);
-        }
-        drop(registry);
-        match request {
-            Request::Status { .. } => {
-                s.access(user, 4)?;
-                let mut status = s.status;
-                status.creator_pid = s
-                    .creator
-                    .id_in_namespace(process.pid_namespace())
-                    .unwrap_or_default();
-                status.last_pid = s
-                    .last
-                    .as_ref()
-                    .and_then(|ids| ids.id_in_namespace(process.pid_namespace()))
-                    .unwrap_or_default();
-                Ok(Response::Status(status))
-            }
-            Request::Set { owner, mode, .. } => {
-                if !can_write {
-                    return Err(E::AccessNotAllowed);
-                }
-                s.control(user)?;
-                if user.user != 0
-                    && ((owner.user != s.status.owner.user && owner.user != user.user)
-                        || (owner.group != s.status.owner.group && owner.group != user.group))
-                {
-                    return Err(E::NotOwner);
-                }
-                s.status.owner = owner;
-                s.status.mode = mode & 0o777;
-                s.status.created = now();
-                Ok(Response::Done)
-            }
-            Request::Attach { writable, .. } => {
-                if writable && !can_write {
-                    return Err(E::AccessNotAllowed);
-                }
-                s.access(user, if writable { 6 } else { 4 })?;
-                let count = local
-                    .attachments
-                    .get(&id)
-                    .map_or(0, |a| a.count)
-                    .checked_add(1)
-                    .ok_or(E::NoSpace)?;
-                let token = deliver(&*s.backing, writable, s.status.size.next_multiple_of(4096))?;
-                s.status.attachments += 1;
-                s.status.attached = now();
-                s.last = Some(Arc::clone(&process.ids));
-                local
-                    .attachments
-                    .entry(id)
-                    .or_insert_with(|| Attachment {
-                        namespace: Arc::downgrade(&ns),
-                        entry: Arc::clone(&entry),
-                        count: 0,
-                    })
-                    .count = count;
-                Ok(Response::Attached {
-                    mapping: MapFileResponse {
-                        memory: s.memory,
-                        token,
-                        writable,
-                    },
-                    size: s.status.size,
-                })
-            }
-            _ => unreachable!(),
-        }
-    })();
-    Ok(result.unwrap_or_else(Response::Failed))
 }
 
 #[cfg(test)]
@@ -462,7 +615,10 @@ mod tests {
             Response::Failed(E::InvalidArgument)
         );
         let child = parent.take_child_process(child_id).unwrap();
-        assert_eq!(status(&parent, id).attachments, 2);
+        let inherited = status(&parent, id);
+        assert_eq!(inherited.attachments, 2);
+        // Linux: fork's implicit attach runs as the parent (ipc/shm.c `shm_open`).
+        assert_eq!(inherited.last_pid, parent.id().0);
         let Response::Attached { mapping: ro, .. } = call(
             &child,
             Request::Attach {
@@ -526,8 +682,10 @@ mod tests {
                     mode: 0o777
                 }
             ),
-            Response::Failed(E::NotOwner)
+            Response::Done
         );
+        // Linux: IPC_SET may give the segment away; its creator still controls it.
+        assert_eq!(status(&p, id).owner, FileUser::ROOT);
         assert_eq!(
             call(&p, Request::NewNamespace { target: p.id() }),
             Response::Failed(E::NotOwner)
@@ -575,5 +733,46 @@ mod tests {
         );
         assert_eq!(call(&p, Request::Delete { id }), Response::Done);
         assert_eq!(call(&p, Request::Detach { id }), Response::Done);
+    }
+    #[test]
+    fn cancelled_fork_child_returns_inherited_attachments() {
+        let (_broker, parent) = setup(FileUser::ROOT);
+        let id = create(&parent, 0);
+        assert!(matches!(
+            call(&parent, Request::Attach { id, writable: true }),
+            Response::Attached { .. }
+        ));
+        let child_id = parent
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        assert_eq!(
+            call(&parent, Request::Inherit { target: child_id }),
+            Response::Done
+        );
+        assert_eq!(status(&parent, id).attachments, 2);
+        parent.cancel_child_process(child_id).unwrap();
+        assert_eq!(status(&parent, id).attachments, 1);
+    }
+
+    #[test]
+    fn segment_ids_are_bounded_and_reused_after_wrapping() {
+        assert_eq!(
+            Arc::new(SegmentIds::new(0)).reserve().err(),
+            Some(E::NoSuchDevice)
+        );
+        let ids = Arc::new(SegmentIds::new(2));
+        let first = ids.reserve().unwrap();
+        let second = ids.reserve().unwrap();
+        assert_eq!((first.id, second.id), (1, 2));
+        assert_eq!(ids.reserve().err(), Some(E::NoSpace));
+        drop(first);
+        // A freed ID waits until the others have been used, then wraps around.
+        ids.state.lock().next = MAX_ID;
+        let last = ids.reserve().unwrap();
+        assert_eq!(last.id, MAX_ID);
+        drop(last);
+        assert_eq!(ids.reserve().unwrap().id, 1);
+        assert_eq!(second.id, 2);
     }
 }

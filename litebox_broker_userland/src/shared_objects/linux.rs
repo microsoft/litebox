@@ -6,6 +6,8 @@ use std::io::{Error as IoError, Result as IoResult};
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
+use rustix::fs::MemfdFlags;
+
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_storage::{
     HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
@@ -101,33 +103,24 @@ impl<T: std::os::fd::AsFd + Send> HostHandle for Exported<T> {
 /// Creates memory for files in memfds, accessed only through positional I/O by the broker.
 pub struct MemfdFileMemoryProvider;
 
-fn memfd() -> Result<File, StorageError> {
-    use rustix::fs::{MemfdFlags, memfd_create};
-
-    // Ask for execution support where the host otherwise seals memfds against execution.
-    // Older kernels and hosts that forbid it leave a plain memfd as the best available.
-    memfd_create(
-        c"litebox-shared-file",
-        MemfdFlags::CLOEXEC | MemfdFlags::EXEC,
-    )
-    .or_else(|_| memfd_create(c"litebox-shared-file", MemfdFlags::CLOEXEC))
-    .map(File::from)
-    .map_err(|error| storage_error::<Memfd>(&error.into()))
+fn memfd(name: &core::ffi::CStr, flags: MemfdFlags) -> Result<File, StorageError> {
+    rustix::fs::memfd_create(name, MemfdFlags::CLOEXEC | flags)
+        .map(File::from)
+        .map_err(|error| storage_error::<Memfd>(&error.into()))
 }
 
 impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
     fn create(&self) -> Result<SharedFileMemory, StorageError> {
-        Ok(create::<Memfd>(memfd()?))
+        // Ask for execution support where the host otherwise seals memfds against execution.
+        // Older kernels and hosts that forbid it leave a plain memfd as the best available.
+        let file = memfd(c"litebox-shared-file", MemfdFlags::EXEC)
+            .or_else(|_| memfd(c"litebox-shared-file", MemfdFlags::empty()))?;
+        Ok(create::<Memfd>(file))
     }
 
     fn create_segment(&self, len: usize) -> Result<Arc<dyn SharedFileObject>, StorageError> {
-        use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
-        let file = memfd_create(
-            c"litebox-segment",
-            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
-        )
-        .map(File::from)
-        .map_err(|error| storage_error::<Memfd>(&error.into()))?;
+        use rustix::fs::{SealFlags, fcntl_add_seals};
+        let file = memfd(c"litebox-segment", MemfdFlags::ALLOW_SEALING)?;
         let mut memory = create::<Memfd>(
             file.try_clone()
                 .map_err(|error| storage_error::<Memfd>(&error))?,
@@ -193,7 +186,9 @@ mod tests {
 
     #[test]
     fn memfd_memory_stays_within_size_limits() {
-        super::super::host_file::tests::check_size_limit::<Memfd>(memfd().unwrap());
+        super::super::host_file::tests::check_size_limit::<Memfd>(
+            memfd(c"litebox-shared-file", MemfdFlags::empty()).unwrap(),
+        );
     }
 
     #[test]

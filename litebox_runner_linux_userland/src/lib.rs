@@ -21,8 +21,10 @@ use litebox_common_linux::signal::{SigSet, Signal};
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
 // credentials aligned with packaged guest files and avoids truncating high host IDs.
-const DEFAULT_GUEST_UID: u16 = 1000;
-const DEFAULT_GUEST_GID: u16 = 1000;
+/// The guest user ID when `--guest-uid` is not given.
+pub const DEFAULT_GUEST_UID: u16 = 1000;
+/// The guest group ID when `--guest-gid` is not given.
+pub const DEFAULT_GUEST_GID: u16 = 1000;
 const MANAGED_PROXY_ENV_KEYS: [&str; 5] = [
     "HTTP_PROXY",
     "HTTPS_PROXY",

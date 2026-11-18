@@ -176,12 +176,14 @@ struct CliArgs {
     #[arg(short = 'Z', long = "unstable")]
     unstable: bool,
     /// Guest user ID for shared-memory permissions; also passed to the Linux runner.
+    // Not gated on `--unstable`: launches already pass this runner option through the broker,
+    // which supplies the runner's `--unstable` itself.
     #[cfg(target_os = "linux")]
-    #[arg(long, requires = "unstable", value_name = "UID")]
+    #[arg(long, value_name = "UID")]
     guest_uid: Option<u16>,
     /// Guest group ID for shared-memory permissions; also passed to the Linux runner.
     #[cfg(target_os = "linux")]
-    #[arg(long, requires = "unstable", value_name = "GID")]
+    #[arg(long, value_name = "GID")]
     guest_gid: Option<u16>,
     /// Run the runner library for this platform as a thread in this broker process.
     ///
@@ -454,10 +456,7 @@ impl CliArgs {
         // Existing launches may specify --guest-uid/gid among the Linux runner options. Use
         // the runner's parser on the broker's trusted launch arguments, never on a request.
         // In particular, a --guest-uid *after* the guest executable is just guest argv.
-        let linux_runner = self.in_process_runner
-            || self.runner.as_ref().and_then(|path| path.file_name())
-                == Some(OsStr::new("litebox_runner_linux_userland"));
-        let (user, group) = if linux_runner {
+        let (user, group) = if self.runs_linux_runner() {
             let args = litebox_runner_linux_userland::CliArgs::try_parse_from(
                 [OsString::from("runner")]
                     .into_iter()
@@ -466,23 +465,34 @@ impl CliArgs {
             (args.guest_uid, args.guest_gid)
         } else {
             (
-                self.guest_uid.unwrap_or(1000),
-                self.guest_gid.unwrap_or(1000),
+                self.guest_uid
+                    .unwrap_or(litebox_runner_linux_userland::DEFAULT_GUEST_UID),
+                self.guest_gid
+                    .unwrap_or(litebox_runner_linux_userland::DEFAULT_GUEST_GID),
             )
         };
         Ok(litebox_broker_protocol::fs::FileUser { user, group })
     }
 
+    #[cfg(target_os = "linux")]
+    fn runs_linux_runner(&self) -> bool {
+        self.in_process_runner
+            || self.runner.as_ref().and_then(|path| path.file_name())
+                == Some(OsStr::new("litebox_runner_linux_userland"))
+    }
+
     fn configured_runner_arguments(&self) -> Vec<OsString> {
         let mut arguments = Vec::new();
         #[cfg(target_os = "linux")]
-        for (flag, id) in [
-            ("--guest-uid", self.guest_uid),
-            ("--guest-gid", self.guest_gid),
-        ] {
-            if let Some(id) = id {
-                arguments.push(OsString::from(flag));
-                arguments.push(id.to_string().into());
+        if self.runs_linux_runner() {
+            for (flag, id) in [
+                ("--guest-uid", self.guest_uid),
+                ("--guest-gid", self.guest_gid),
+            ] {
+                if let Some(id) = id {
+                    arguments.push(OsString::from(flag));
+                    arguments.push(id.to_string().into());
+                }
             }
         }
         arguments.extend(self.runner_arguments.iter().cloned());
@@ -747,6 +757,42 @@ mod cli_tests {
                 group: 456
             }
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leading_guest_credentials_reach_the_runner_without_broker_unstable() {
+        let args = CliArgs::try_parse_from([
+            "broker",
+            "--runner",
+            "/bin/litebox_runner_linux_userland",
+            "--guest-uid",
+            "0",
+            "/guest",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.segment_user().unwrap(),
+            litebox_broker_protocol::fs::FileUser {
+                user: 0,
+                group: litebox_runner_linux_userland::DEFAULT_GUEST_GID
+            }
+        );
+        let other = CliArgs::try_parse_from([
+            "broker",
+            "--runner",
+            "/bin/other_runner",
+            "--guest-uid",
+            "5",
+            "/guest",
+        ])
+        .unwrap();
+        assert!(
+            !other
+                .configured_runner_arguments()
+                .contains(&OsString::from("--guest-uid"))
+        );
+        assert_eq!(other.segment_user().unwrap().user, 5);
     }
 
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]

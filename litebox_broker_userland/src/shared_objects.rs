@@ -66,13 +66,9 @@ pub fn handle_map_file<Delivery: SharedObjectDelivery>(
                 request,
                 provider,
                 |object, writable, end| {
-                    delivery.deliver(object, writable, end).map_err(|error| {
-                        if error.kind() == ErrorKind::Unsupported {
-                            FileError::NoSuchDevice
-                        } else {
-                            FileError::NoSpace
-                        }
-                    })
+                    delivery
+                        .deliver(object, writable, end)
+                        .map_err(delivery_failure)
                 },
             )
             .map(BrokerResult::Segment)
@@ -91,21 +87,24 @@ pub fn handle_map_file<Delivery: SharedObjectDelivery>(
                 token,
                 writable: mapping.writable,
             }),
-            Err(error) => {
-                litebox_util_log::warn!(error:% = error; "failed to deliver a shared file");
-                // A deployment that cannot deliver this kind of object, such as a broker
-                // without `/proc` to reopen a memfd read-only, cannot share the file, so a
-                // runner falls back as for any file it cannot share. Other failures, such as
-                // a runner leaving too many deliveries untaken, are a lack of resources.
-                FileResponse::Failed(if error.kind() == ErrorKind::Unsupported {
-                    FileError::NoSuchDevice
-                } else {
-                    FileError::NoSpace
-                })
-            }
+            Err(error) => FileResponse::Failed(delivery_failure(error)),
         },
     };
     Some(Ok(BrokerResult::File(response)))
+}
+
+/// Reports and classifies a failure to deliver a shared object to the runner.
+fn delivery_failure(error: IoError) -> FileError {
+    litebox_util_log::warn!(error:% = error; "failed to deliver a shared object");
+    // A deployment that cannot deliver this kind of object, such as a broker without `/proc`
+    // to reopen a memfd read-only, cannot share it, so a runner falls back as for any file it
+    // cannot share. Other failures, such as a runner leaving too many deliveries untaken, are a
+    // lack of resources.
+    if error.kind() == ErrorKind::Unsupported {
+        FileError::NoSuchDevice
+    } else {
+        FileError::NoSpace
+    }
 }
 
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]

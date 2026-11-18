@@ -57,7 +57,8 @@ int main(int argc, char **argv) {
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
-        CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 4);
+        // Linux credits fork's implicit attaches to the parent.
+        CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 4 && ds.shm_lpid == getppid());
         CHECK(ro[0] == 'a');
         execl(self, self, "lookup", key_string, (char *)NULL);
         _exit(2);
@@ -65,6 +66,10 @@ int main(int argc, char **argv) {
     int status;
     CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     CHECK(ro[1] == 'b');
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 2 && ds.shm_lpid == pid);
+    // SHM_RND rounds a free address down to the page.
+    CHECK(shmdt(rw) == 0);
+    CHECK((char *)shmat(id, rw + 1, SHM_RND) == rw && rw[0] == 'a');
     CHECK(shmctl(id, IPC_RMID, NULL) == 0);
     CHECK(shmget(key, 0, 0) == -1 && errno == ENOENT);
     int replacement = shmget(key, 123, IPC_CREAT | IPC_EXCL | 0600);
@@ -72,7 +77,7 @@ int main(int argc, char **argv) {
     CHECK(shmctl(replacement, IPC_RMID, NULL) == 0);
     CHECK(shmdt(ro + 1) == -1 && errno == EINVAL);
     CHECK(shmdt(ro) == 0);
-    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1 && ds.shm_lpid == getpid());
     CHECK(shmdt(rw) == 0);
     CHECK(shmctl(id, IPC_STAT, &ds) == -1 && errno == EINVAL);
 
