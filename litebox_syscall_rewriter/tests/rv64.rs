@@ -16,7 +16,7 @@ fn run(dir: &Path, tool: &str, args: &[&str]) {
 }
 
 #[test]
-fn big_endian_riscv_rejects_executables_but_preserves_linker_inputs() {
+fn big_endian_riscv_rejects_only_rv64_executables() {
     let mut elf = [0u8; 64];
     elf[..7].copy_from_slice(b"\x7fELF\x02\x02\x01");
     elf[18..20].copy_from_slice(&object::elf::EM_RISCV.to_be_bytes());
@@ -26,6 +26,9 @@ fn big_endian_riscv_rejects_executables_but_preserves_linker_inputs() {
         Err(Error::UnsupportedExecutable(reason)) if reason.contains("big-endian RISC-V")
     ));
     elf[16..18].copy_from_slice(&object::elf::ET_REL.to_be_bytes());
+    assert_eq!(hook_syscalls_in_elf(&elf, None).unwrap(), elf);
+    elf[16..18].copy_from_slice(&object::elf::ET_EXEC.to_be_bytes());
+    elf[4] = object::elf::ELFCLASS32;
     assert_eq!(hook_syscalls_in_elf(&elf, None).unwrap(), elf);
 }
 

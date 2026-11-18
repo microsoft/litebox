@@ -28,3 +28,7 @@ failed:
     # Data in executable memory is not code, even when it encodes ecall.
     .dword 0x0000007300000073
 __global_pointer$:
+
+    # Non-allocated executable sections are not guest instructions.
+.section .offline,"x",@progbits
+    lr.d t0, (t1)

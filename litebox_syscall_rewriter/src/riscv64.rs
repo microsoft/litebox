@@ -101,6 +101,8 @@ fn word_site(word: u32, pc: u64) -> Result<Site> {
         0x73 if word == 0x0010_0073 => Site::Native, // ebreak
         0x03 | 0x13 | 0x1b => operands(word, &[RD, RS1]),
         0x23 => operands(word, &[RS1, RS2]),
+        // ADD x0,x0,rs2 encodes hints such as NTL.PALL, not a read of gp.
+        0x33 if word & !(31 << RS2) == 0x33 => Site::Native,
         0x33 | 0x3b => operands(word, &[RD, RS1, RS2]),
         0x37 => operands(word, &[RD]),
         0x17 if reg(word, RD) == GP => Site::AuipcGp(word & 0xffff_f000),
@@ -139,6 +141,7 @@ fn compressed_site(half: u16, pc: u64) -> Result<Site> {
         (0, 0..=3 | 5..=7) | (1, 4..=7) | (2, 1 | 5) => return Ok(Site::Native),
         (1, 0..=3) | (2, 0 | 2 | 3) if rd != GP => return Ok(Site::Native),
         (2, 6 | 7) if rs != GP => return Ok(Site::Native),
+        (2, 4) if rd == 0 && rs != 0 => return Ok(Site::Native), // C.MV/C.ADD hints
         (2, 4) if rd != GP && rs != GP => return Ok(Site::Native),
         _ => (),
     }
@@ -278,7 +281,8 @@ pub(super) fn code_ranges(file: &object::File<'_>) -> Result<Vec<TextSectionInfo
         let object::SectionFlags::Elf { sh_flags } = section.flags() else {
             continue;
         };
-        if sh_flags & u64::from(object::elf::SHF_EXECINSTR) == 0 || section.size() == 0 {
+        let flags = u64::from(object::elf::SHF_ALLOC | object::elf::SHF_EXECINSTR);
+        if sh_flags & flags != flags || section.size() == 0 {
             continue;
         }
         let (offset, size) = section
@@ -338,6 +342,7 @@ pub(super) fn code_ranges(file: &object::File<'_>) -> Result<Vec<TextSectionInfo
 }
 
 pub(super) fn rewrite_elf(
+    input_binary: &[u8],
     buf: &mut [u8],
     ranges: &[TextSectionInfo],
     base: u64,
@@ -351,24 +356,27 @@ pub(super) fn rewrite_elf(
             &mut gates,
         )?;
     }
-    let mut out = buf.to_vec();
     if gates.is_empty() {
-        let header = super::TrampolineHeader64 {
-            magic: *super::TRAMPOLINE_MAGIC,
-            file_offset: 0.into(),
-            vaddr: 0.into(),
-            trampoline_size: 0.into(),
-        };
-        out.extend_from_slice(zerocopy::IntoBytes::as_bytes(&header));
-    } else {
-        append_trampoline_footer(&mut out, &mut gates, base, false);
+        return Ok(super::elf_with_empty_footer(input_binary));
     }
+    let mut out = buf.to_vec();
+    append_trampoline_footer(&mut out, &mut gates, base, false);
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_temporal_hints_preserve_the_encoded_register_selector() {
+        let hints = [0x33, 0x00, 0x30, 0x00, 0x0e, 0x90]; // ntl.pall; c.ntl.pall
+        let mut code = hints;
+        let mut gates = Vec::new();
+        rewrite_range(&mut code, 0, 0x10_0000, &mut gates).unwrap();
+        assert_eq!(code, hints);
+        assert_eq!(gates, [] as [u8; 0]);
+    }
 
     #[test]
     fn narrow_site_cannot_overwrite_the_next_instruction_to_reach_a_gate() {

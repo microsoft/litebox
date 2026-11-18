@@ -450,7 +450,11 @@ fn hook_syscalls_in_elf_inner(
             return Ok(input_binary.to_vec());
         }
     }
-    if data == Some(&object::elf::ELFDATA2MSB) && machine == Some(object::elf::EM_RISCV) {
+    if input_binary.get(core::mem::offset_of!(object::elf::Ident, class))
+        == Some(&object::elf::ELFCLASS64)
+        && data == Some(&object::elf::ELFDATA2MSB)
+        && machine == Some(object::elf::EM_RISCV)
+    {
         return Err(Error::UnsupportedExecutable("big-endian RISC-V ELF".into()));
     }
 
@@ -484,7 +488,7 @@ fn hook_syscalls_in_elf_inner(
             }
             let ranges = riscv64::code_ranges(&file)?;
             let base = find_addr_for_trampoline_code(&file, options.target_host())?.addr();
-            return riscv64::rewrite_elf(buf, &ranges, base);
+            return riscv64::rewrite_elf(input_binary, buf, &ranges, base);
         }
 
         let arch = match file {
@@ -557,15 +561,7 @@ fn hook_syscalls_in_elf_inner(
     )?;
 
     if !patch_result.found_syscall {
-        let mut out = input_binary.to_vec();
-        let header = TrampolineHeader64 {
-            magic: *TRAMPOLINE_MAGIC,
-            file_offset: 0.into(),
-            vaddr: 0.into(),
-            trampoline_size: 0.into(),
-        };
-        out.extend_from_slice(header.as_bytes());
-        return Ok(out);
+        return Ok(elf_with_empty_footer(input_binary));
     }
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
@@ -1094,6 +1090,19 @@ fn patch_dense_windows_syscall_stubs_in_sections(
     Ok(patched_any)
 }
 
+/// A processed ELF without patch sites retains its original bytes.
+fn elf_with_empty_footer(input_binary: &[u8]) -> Vec<u8> {
+    let mut out = input_binary.to_vec();
+    let header = TrampolineHeader64 {
+        magic: *TRAMPOLINE_MAGIC,
+        file_offset: 0.into(),
+        vaddr: 0.into(),
+        trampoline_size: 0.into(),
+    };
+    out.extend_from_slice(header.as_bytes());
+    out
+}
+
 fn append_trampoline_footer(
     out: &mut Vec<u8>,
     trampoline_data: &mut Vec<u8>,
@@ -1211,17 +1220,7 @@ fn hook_aarch64_elf_at(
         aarch64::RewriteConfig::for_options(options)?,
     )?
     else {
-        // No patch sites: emit the original binary with a size-0 sentinel
-        // header so the loader knows there is no trampoline to map.
-        let mut out = input_binary.to_vec();
-        let header = TrampolineHeader64 {
-            magic: *TRAMPOLINE_MAGIC,
-            file_offset: 0.into(),
-            vaddr: 0.into(),
-            trampoline_size: 0.into(),
-        };
-        out.extend_from_slice(header.as_bytes());
-        return Ok(out);
+        return Ok(elf_with_empty_footer(input_binary));
     };
 
     // Build output: [patched ELF][padding to page boundary][trampoline][header].
