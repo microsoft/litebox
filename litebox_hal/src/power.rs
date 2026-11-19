@@ -9,43 +9,36 @@ pub const DEBUG_EXIT_PORT: u16 = 0xf4;
 const DEBUG_EXIT_SUCCESS: u32 = 0x10;
 pub const DEBUG_EXIT_FAILURE: u32 = 0x20;
 
-/// The serial lines [`exit`] prints first, for hosts that cannot tell
-/// success from the VMM's exit status (e.g., Cloud Hypervisor's).
+/// Printed by [`exit`], for VMMs whose exit status does not tell (e.g.,
+/// Cloud Hypervisor).
 pub const EXIT_SUCCESS_LINE: &str = "[litebox] exit: success";
 pub const EXIT_FAILURE_LINE: &str = "[litebox] exit: failure";
 
-/// How long [`exit`] waits for the machine to power off after it entered
-/// S5, in TSC cycles (about 0.3-1 s), before it resets the machine instead:
-/// a VMM may power off asynchronously (e.g., QEMU).
+/// About 0.3-1 s: a VMM may power off asynchronously (e.g., QEMU).
 const SOFT_OFF_TIMEOUT_CYCLES: u64 = 1 << 30;
 
-/// PM1 control register bits ([`SoftOff::Pm1`]).
 const PM1_SLP_TYP_SHIFT: u16 = 10;
 const PM1_SLP_TYP: u16 = 0b111 << PM1_SLP_TYP_SHIFT;
 const PM1_SLP_EN: u16 = 1 << 13;
 
-/// How to enter ACPI's S5 sleep state (soft off), as the firmware's tables
-/// give it ([`crate::acpi::soft_off`]); the registers are I/O ports.
+/// How to enter ACPI's S5 sleep state (soft off): see
+/// [`crate::acpi::soft_off`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SoftOff {
-    /// Hardware-reduced ACPI (e.g., Cloud Hypervisor): `value` (the sleep
-    /// type and `SLP_EN`) written to the 8-bit sleep control register at
-    /// `port`.
+    /// Hardware-reduced ACPI (e.g., Cloud Hypervisor).
     SleepControl { port: u16, value: u8 },
-    /// The PM1 control registers (e.g., QEMU's), 16-bit: each `(port, sleep
-    /// type)`, the second for a PM1b block, if any.
+    /// `(port, sleep type)` of PM1a and PM1b, if any (e.g., QEMU).
     Pm1 { a: (u16, u8), b: Option<(u16, u8)> },
 }
 
 impl SoftOff {
-    /// Writes the registers, as ACPICA does.
+    /// As ACPICA: the sleep types first, then `SLP_EN`.
     fn enter(self) {
         use x86_64::instructions::port::Port;
         match self {
             // Safety: the firmware's sleep register, for this write.
             Self::SleepControl { port, value } => unsafe { Port::<u8>::new(port).write(value) },
             Self::Pm1 { a, b } => {
-                // The sleep types first, then with `SLP_EN`.
                 let mut typed = [None; 2];
                 for (block, typed) in [Some(a), b].into_iter().zip(&mut typed) {
                     let Some((port, sleep_type)) = block else {
@@ -71,21 +64,16 @@ impl SoftOff {
 
 static SOFT_OFF: spin::Once<SoftOff> = spin::Once::new();
 
-/// Has [`exit`] enter S5 this way, if the debug-exit device did not end the
-/// machine. Call at most once, e.g., at boot; later calls are ignored.
+/// Has [`exit`] enter S5 this way; later calls are ignored.
 pub fn set_soft_off(soft_off: SoftOff) {
     SOFT_OFF.call_once(|| soft_off);
 }
 
-/// Prints [`EXIT_SUCCESS_LINE`] or [`EXIT_FAILURE_LINE`] to the serial port,
-/// then ends the machine: through QEMU's `isa-debug-exit` device
-/// (`-device isa-debug-exit,iobase=0xf4,iosize=0x04`), where QEMU exits with
-/// status `(value << 1) | 1`; else, if [`set_soft_off`] was called, by
-/// entering S5 (e.g., Cloud Hypervisor, which exits with status 0); else, or
-/// if the machine still runs a while later, the machine resets (use QEMU's
-/// `-no-reboot` to make QEMU exit; Cloud Hypervisor reboots). Usable in
-/// panic handlers: it waits for no lock for long (see
-/// [`crate::serial::panic_print`]).
+/// Through QEMU's `isa-debug-exit` device
+/// (`-device isa-debug-exit,iobase=0xf4,iosize=0x04`): QEMU exits with status
+/// `(value << 1) | 1`. Without the device, enters S5 (see [`set_soft_off`]),
+/// else resets the machine (use `-no-reboot` to make QEMU exit). Usable in
+/// panic handlers.
 pub fn exit(success: bool) -> ! {
     let (value, line) = if success {
         (DEBUG_EXIT_SUCCESS, EXIT_SUCCESS_LINE)

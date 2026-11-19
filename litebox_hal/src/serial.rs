@@ -12,8 +12,6 @@ const COM1: u16 = 0x3F8;
 
 const MAX_WAIT_ITERATIONS: u32 = 1_000_000;
 
-/// How many times [`panic_print`] tries to lock the console before it
-/// writes without the lock.
 const MAX_LOCK_ATTEMPTS: u32 = 1_000_000;
 
 struct ComPort {
@@ -128,9 +126,8 @@ pub fn print_bytes(bytes: &[u8]) {
     com().lock().write_bytes(bytes);
 }
 
-/// Panic may interrupt a locked or initializing console. Never wait for it
-/// for long or alias its mutable handle: waits a while for output in progress
-/// (e.g., another CPU's) to end, then writes anyway, so emergency output may
+/// Panic may interrupt a locked or initializing console. Wait for it only
+/// briefly, and never alias its mutable handle; emergency output may
 /// interleave.
 pub fn panic_print(args: core::fmt::Arguments) {
     use core::fmt::Write;

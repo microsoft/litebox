@@ -3,7 +3,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# Run Linux programs under QEMU, or Cloud Hypervisor (VMM), with stacked
+# Run Linux programs under QEMU or Cloud Hypervisor (VMM) with stacked
 # runners: litebox_runner_vm_kernel as the guest kernel and
 # litebox_runner_linux_on_vm_userland as a ring-3 process per guest process.
 # Every litebox_runner_vm_kernel/tests/linux/<name>.c, and each of SHARED,
@@ -23,8 +23,7 @@
 # A test is litebox_runner_vm_kernel/tests/linux/<test>.json, a programs.json
 # of the host test client (dev_tools/guest_service_test_client), which runs
 # its programs through the guest service, booted as litebox.init, over hybrid
-# vsock (under QEMU, $VHOST_DEVICE_VSOCK's; Cloud Hypervisor has its own), in
-# a container whose init is /container_init.
+# vsock ($VHOST_DEVICE_VSOCK), in a container whose init is /container_init.
 # <test>.policy.txt, if any, is the payload's `policy`, an init test's too.
 # <test>.input.txt, if any, is the input of its `console_stdin` runs, sent
 # once a run prints a line `ready`. An entry with `min_reflected_syscalls` or
@@ -50,18 +49,15 @@
 # Runner processes' standard output and error go to a virtio console, backed
 # by a file.
 #
-# Under QEMU, their sockets reach a virtio network device on QEMU's user
-# network, isolated from the host (restrict=on) but for an echo server (cat)
-# at 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host)
-# 10.0.2.1.
+# Their sockets reach a virtio network device on QEMU's user network,
+# isolated from the host (restrict=on) but for an echo server (cat) at
+# 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
 #
-# Under QEMU, a fresh host directory per boot, with greeting.txt and the
-# symlinks link.txt (to greeting.txt), self (to .), and abs.txt (to
-# /mnt/host/greeting.txt), is mounted read-only at /mnt/host over virtio-9p
-# (its mount tag).
+# A fresh host directory per boot, with greeting.txt and the symlinks link.txt
+# (to greeting.txt), self (to .), and abs.txt (to /mnt/host/greeting.txt), is
+# mounted read-only at /mnt/host over virtio-9p (its mount tag).
 #
-# Cloud Hypervisor has neither a user network nor virtio-9p: there, the net
-# and share tests are skipped, and the VM has no network device.
+# Cloud Hypervisor has neither, so there the net and share tests are skipped.
 #
 # With QEMU_SMP above 4, the preempt test is skipped: it checks preemption
 # with 8 CPU-bound programs. With fewer than 2, the smp test is skipped: it
@@ -83,18 +79,18 @@
 #   RUSTC         Rust compiler with the x86_64-unknown-none target (default:
 #                 rustc)
 #   VMM           qemu or cloud-hypervisor (default: qemu)
-#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command, which needs KVM
-#                 (default: cloud-hypervisor)
+#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command (default:
+#                 cloud-hypervisor)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
-#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G); for Cloud Hypervisor
-#                 too, as an integer in MiB or suffixed M or G
-#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1); for Cloud
-#                 Hypervisor too
+#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G), also for Cloud
+#                 Hypervisor
+#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1), also for Cloud
+#                 Hypervisor
 #   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
-#   VHOST_DEVICE_VSOCK  QEMU's vhost-user vsock daemon (default:
+#   VHOST_DEVICE_VSOCK  the vhost-user vsock daemon (default:
 #                 vhost-device-vsock)
 #   CARGO_BUILD   command that builds the runners, the guest service and the
 #                 test client, run in their directories
@@ -131,7 +127,6 @@ smp=$(smp_cpus "$QEMU_SMP") || {
     echo "error: no CPU count in QEMU_SMP=$QEMU_SMP (see the header)" >&2
     exit 2
 }
-# 0 for a form the header does not list.
 mem=$(mem_mib "$QEMU_MEM")
 
 # The log level of the boots that check the processes' counts (see the header).
@@ -142,8 +137,8 @@ counted_log=debug
 declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writable_root [egress]=/egress
     [console_flood]=/console_flood [lifecycle]=/lifecycle)
 
-# Why test $1 is skipped with these CPUs, this RAM, or this VMM (see the
-# header), if it is.
+# Why test $1 is skipped with these CPUs or this RAM (see the header), if it
+# is.
 skip_reason() {
     case $1 in
         preempt) [[ $smp -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
@@ -257,14 +252,14 @@ console_args() {
     esac
 }
 
-# The network device, if any: see the header.
+# The network device: see the header.
 network_args() {
     [[ $VMM == qemu ]] || return 0
     echo -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.1,restrict=on,guestfwd=tcp:10.0.2.100:7-cmd:cat \
         -device virtio-net-pci,netdev=n0,disable-legacy=on
 }
 
-# The virtio-9p share for boot $1, if any: see the header.
+# The virtio-9p share for boot $1: see the header.
 share_args() {
     [[ $VMM == qemu ]] || return 0
     mkdir "$WORK/$1.share"

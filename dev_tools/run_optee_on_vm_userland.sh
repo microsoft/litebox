@@ -3,13 +3,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# Run OP-TEE TAs from litebox_runner_optee_on_linux_userland/tests under QEMU,
-# or Cloud Hypervisor (VMM), with stacked runners: litebox_runner_vm_kernel
-# as the guest kernel and
-# litebox_runner_optee_on_vm_userland as a ring-3 process per TA instance.
-# ldelf and each TA are syscall-rewritten ahead of time (unless -u), then
-# packed with the userland runner and the test's cmds.json into a tar passed
-# as the initrd.
+# Run OP-TEE TAs from litebox_runner_optee_on_linux_userland/tests under QEMU
+# or Cloud Hypervisor (VMM) with stacked runners: litebox_runner_vm_kernel as
+# the guest kernel and litebox_runner_optee_on_vm_userland as a ring-3 process
+# per TA instance. ldelf and each TA are syscall-rewritten ahead of time
+# (unless -u), then packed with the userland runner and the test's cmds.json
+# into a tar passed as the initrd.
 #
 # A test is a scenario litebox_runner_vm_kernel/tests/<test>-cmds.json, whose
 # open_session commands name the TAs it needs in their "ta" fields, or a TA
@@ -17,8 +16,8 @@
 #
 # Runner processes' standard streams are a virtio console, backed by files:
 # TA output must reach it, and in debug builds, whose runners echo standard
-# input, so must the line fed to it. Under Cloud Hypervisor, whose file
-# console takes no input, the input is not checked.
+# input, so must the line fed to it (but under Cloud Hypervisor, whose file
+# console takes no input).
 #
 # Usage: dev_tools/run_optee_on_vm_userland.sh [-t <test>]... [-u] [-r] [-v]
 #   -t   test to run, e.g. ta-death or hello-ta; append @default to a TA to
@@ -30,15 +29,15 @@
 #
 # Environment:
 #   VMM           qemu or cloud-hypervisor (default: qemu)
-#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command, which needs KVM
-#                 (default: cloud-hypervisor)
+#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command (default:
+#                 cloud-hypervisor)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
-#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G); for Cloud Hypervisor
-#                 too, as an integer in MiB or suffixed M or G
-#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1); for Cloud
-#                 Hypervisor too
+#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G), also for Cloud
+#                 Hypervisor
+#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1), also for Cloud
+#                 Hypervisor
 #   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runners (and the rewriter unless
@@ -109,8 +108,7 @@ prepare() {
 
 STDIN_LINE="hello from the host"
 
-# The virtio console for test $1, with its files: $WORK/$1.stdin, its input
-# (unused under Cloud Hypervisor), and $WORK/$1.stdout, its output.
+# The virtio console's files for test $1.
 console_args() {
     printf '%s\n' "$STDIN_LINE" >"$WORK/$1.stdin"
     : >"$WORK/$1.stdout"
@@ -124,7 +122,7 @@ console_args() {
     esac
 }
 
-# Run check: TA output, and (under QEMU) the echoed input, on the console.
+# Run check: TA output, and the echoed input, on the console.
 check_console() {
     local out="$WORK/$1.stdout"
     if [[ ${verbose:-0} -ne 0 ]]; then

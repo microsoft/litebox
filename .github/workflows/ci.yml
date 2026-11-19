@@ -193,7 +193,6 @@ jobs:
       - name: Put vhost-device-vsock on the PATH
         run: echo "$HOME/vhost-device-vsock/bin" >> "$GITHUB_PATH"
       - name: Install Cloud Hypervisor
-        # Its static release binary, checked against the pinned digest.
         run: |
           mkdir -p ~/cloud-hypervisor
           curl -fsSL --retry 3 -o ~/cloud-hypervisor/cloud-hypervisor \
@@ -247,8 +246,7 @@ jobs:
           QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
       - name: Smoke-test Linux programs and OP-TEE TAs in a Cloud Hypervisor VM with stacked runners on 2 CPUs
-        # What differs from QEMU: power-off, CPU startup, the memory map, and
-        # the console and vsock devices. The QEMU steps run the full suites.
+        # Only what differs from QEMU, which runs the full suites.
         run: |
           export VMM=cloud-hypervisor QEMU_SMP=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build"
           QEMU_MEM=6G ./dev_tools/run_linux_on_vm_userland.sh \

@@ -243,8 +243,8 @@ fn find_cpus(info: &BootInfo) -> Cpus {
     }
 }
 
-/// Has `litebox_hal::power::exit` power off through ACPI if it can, as it
-/// must where the VMM has no debug-exit device (e.g., Cloud Hypervisor).
+/// For `litebox_hal::power::exit` where the VMM has no debug-exit device
+/// (e.g., Cloud Hypervisor).
 fn find_soft_off(info: &BootInfo) {
     // Safety: as in `find_cpus`.
     let memory = unsafe { MappedMemory::new(KERNEL_OFFSET, info.mapped_limit.as_u64()) };

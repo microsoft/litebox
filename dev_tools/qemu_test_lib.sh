@@ -7,11 +7,6 @@
 # QEMU_ACCEL, QEMU_CPU, QEMU_MEM, QEMU_SMP, CLOUD_HYPERVISOR, TIMEOUT,
 # LITEBOX_LOG, VHOST_DEVICE_VSOCK and CARGO_BUILD (see the scripts), makes a
 # relative CARGO_TARGET_DIR absolute, and creates $WORK, removed on exit.
-#
-# VMM is the VMM that boots the kernels: qemu (the default) or
-# cloud-hypervisor (CLOUD_HYPERVISOR, which needs KVM). Cloud Hypervisor
-# takes QEMU_MEM's size and QEMU_SMP's CPU count (see mem_mib and smp_cpus),
-# and ignores QEMU, QEMU_ACCEL and QEMU_CPU.
 
 VMM=${VMM:-qemu}
 QEMU_MEM=${QEMU_MEM:-2G}
@@ -20,13 +15,11 @@ CARGO_BUILD=${CARGO_BUILD:-cargo build}
 VHOST_DEVICE_VSOCK=${VHOST_DEVICE_VSOCK:-vhost-device-vsock}
 # Local to each boot's vsock device.
 VSOCK_CID=3
-# The lines litebox_hal::power::exit prints as the kernel exits.
+# As litebox_hal::power::exit prints them.
 EXIT_SUCCESS='[litebox] exit: success'
 EXIT_FAILURE='[litebox] exit: failure'
 
-# The size in QEMU_MEM $1 (its first field, maybe after size=) in MiB, from
-# an integer in MiB or one suffixed M or G (e.g., 6144, 6g, or
-# size=6G,maxmem=8G); 0 for another form.
+# QEMU_MEM $1's size in MiB, or 0 for a form the scripts' headers do not list.
 mem_mib() {
     local mem=${1%%,*}
     mem=${mem#size=}
@@ -39,9 +32,7 @@ mem_mib() {
     fi
 }
 
-# The CPU count in QEMU_SMP $1, as QEMU counts it: cpus= (or a bare count),
-# else maxcpus=, else the product of the topology's counts (e.g.,
-# sockets=2,cores=2); fails for another form.
+# The CPU count in QEMU_SMP $1, as QEMU counts it; fails for another form.
 smp_cpus() {
     local field key value cpus='' maxcpus='' product=1
     local -a fields
@@ -93,7 +84,6 @@ case $VMM in
     *) echo "error: unknown VMM '$VMM' (qemu or cloud-hypervisor)" >&2; exit 2 ;;
 esac
 
-# Prints how the VMM runs the VMs.
 describe_vm() {
     case $VMM in
         qemu) echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU, -smp $QEMU_SMP" ;;
@@ -197,10 +187,9 @@ os.execvp(sys.argv[2], sys.argv[2:])
 '
 vsock_connect=()
 
-# Sets $vsock, the VMM's arguments for boot $1's vsock device, with its host
-# side (hybrid vsock) at $WORK/$1.vsock: Cloud Hypervisor's own device, or
-# for QEMU, a vhost-user device, whose daemon, $daemon, this starts, and
-# which QEMU reaches through $vsock_connect.
+# Sets $vsock for boot $1's vsock device, with its host side at
+# $WORK/$1.vsock; for QEMU, also starts its daemon, $daemon, and sets
+# $vsock_connect.
 start_vsock() {
     if [[ $VMM == cloud-hypervisor ]]; then
         vsock=(--vsock "cid=$VSOCK_CID,socket=$WORK/$1.vsock")
@@ -250,15 +239,13 @@ stop_vsock() {
 }
 
 # run_vm NAME KERNEL PAYLOAD [VMM_ARG]...: boots KERNEL with PAYLOAD as its
-# initrd under $VMM and records the outcome; with $verbose set, prints
-# passing logs too. $kernel_args, if set, goes on the kernel's command line,
-# and QEMU runs through $vsock_connect. The serial port is the log, and
-# Cloud Hypervisor's console is off unless a VMM_ARG sets it. If $client
-# names a function, `$client NAME` runs alongside as the host client, and a
-# pass needs it to exit 0; its end stops the VM, and the VM's end stops it
-# after 5s. If $check names a function, a guest pass also needs `$check NAME`
-# to succeed; it prints why not otherwise. Any pass also needs the kernel to
-# boot once, without a panic.
+# initrd and records the outcome; with $verbose set, prints passing logs too.
+# $kernel_args, if set, goes on the kernel's command line, and QEMU runs
+# through $vsock_connect. If $client names a function, `$client NAME` runs
+# alongside as the host client, and a pass needs it to exit 0; its end stops
+# the VM, and the VM's end stops it after 5s. If $check names a function, a
+# guest pass also needs `$check NAME` to succeed; it prints why not
+# otherwise.
 run_vm() {
     local name=$1 kernel=$2 payload=$3 log="$WORK/$1.log" status why vm_pid cpid
     local client_status=0 stopped=0 panicked=0 rebooted=0 cmdline exit_line
@@ -325,8 +312,7 @@ run_vm() {
     fi
     set -e
     # isa-debug-exit: QEMU exits with (value << 1) | 1; 33 = pass. Cloud
-    # Hypervisor exits with 0 either way (or 143, if the client stopped it):
-    # the kernel's last exit line tells.
+    # Hypervisor exits with 0 either way.
     if [[ $VMM == cloud-hypervisor && ($status -eq 0 || ($stopped -ne 0 && $status -eq 143)) ]]; then
         exit_line=$(grep -aoF -e "$EXIT_SUCCESS" -e "$EXIT_FAILURE" "$log" | tail -n 1) || true
         case $exit_line in
@@ -340,9 +326,8 @@ run_vm() {
     fi
     # A kernel panic fails, even after the client passed.
     grep -qF '[litebox] PANIC' "$log" && panicked=1
-    # Cloud Hypervisor has no -no-reboot: a reset (e.g., a triple fault) boots
-    # the kernel again, and a later boot may pass. Every boot prints the
-    # banner.
+    # Cloud Hypervisor has no -no-reboot: a crashed boot may be followed by a
+    # passing one.
     [[ $(grep -acF 'Hello from LiteBox!' "$log") -le 1 ]] || rebooted=1
     if [[ $status -eq 33 && $client_status -eq 0 && $panicked -eq 0 && $rebooted -eq 0 ]] &&
         { [[ -z ${check:-} ]] || why=$($check "$name"); }; then
