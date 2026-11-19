@@ -22,16 +22,17 @@
 //! AArch64 Mach-O syscall and thread-pointer rewriting is supported; see
 //! [`mod@macho`] for loader requirements.
 //!
-//! The ahead-of-time RV64 Linux backend supports a subset of integer and
-//! compressed instructions in static ET_EXEC files with ELF mapping symbols.
+//! The rewriter builds for x86-64 and AArch64. On either architecture it can
+//! rewrite RV64 Linux guests ahead of time: the backend supports a subset of
+//! integer and compressed instructions in static ET_EXEC files with ELF mapping symbols.
 //! It redirects ECALL and virtualizes gp using [`litebox_trampoline::riscv64::GateTls`].
 //! There is not yet a corresponding RV64 Linux userland runner.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
-// Only the runtime entry points dispatch on `target_arch`; the ahead-of-time
-// ones select the architecture from the input object and build anywhere.
+// Runtime patching requires a supported host. Ahead-of-time patching selects
+// the guest architecture from the input object instead.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!(
     "litebox_syscall_rewriter's runtime patching entry points support only x86-64 and AArch64 hosts"
@@ -357,8 +358,11 @@ const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
 ///
-/// The `trampoline` must be an absolute address if specified; if unspecified, it will be set to
-/// zeros, and it is the caller's decision to overwrite it at loading time.
+/// On x86-64 and AArch64, `trampoline` is an absolute callback address; if omitted,
+/// the address is zero for the loader to fill in. On RV64, pass `None` or `Some(0)`:
+/// the gate reads the callback from the current thread's
+/// [`GateTls::syscall_entry`](litebox_trampoline::riscv64::GateTls::syscall_entry).
+/// A nonzero address is rejected.
 ///
 /// If rewriting emits trampoline stubs, the returned executable has trampoline code appended at a
 /// page-aligned offset after the ELF file. The file layout is:
@@ -372,7 +376,7 @@ const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 ///
 /// This layout allows loaders to read just the last 32 bytes to get the metadata.
 ///
-/// When there is nothing to patch, both architectures append only a 32-byte
+/// When there is nothing to patch in the identified code ranges, the rewriter appends only a 32-byte
 /// header carrying a `trampoline_size = 0` *sentinel* (no trampoline body), so a
 /// loader can distinguish "processed, nothing to patch" from "never processed";
 /// no instructions are rewritten in that case.
@@ -383,12 +387,15 @@ const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 /// (`SVC`) instructions. See the `aarch64` module docs.
 ///
 /// Returns the rewritten binary. Binaries that cannot or do not need to be
-/// patched (relocatable objects, non-ELF files, already-hooked binaries,
-/// binaries without executable sections) are returned unchanged.
+/// patched (relocatable objects, non-ELF files, already-hooked binaries) are returned unchanged.
+/// ELFs without executable sections pass through on x86-64 and AArch64. An RV64
+/// executable must have at least one code range identified by ELF mapping symbols;
+/// otherwise rewriting returns an error.
 ///
 /// Returns `Err` for genuinely broken inputs (corrupt ELF, unsupported
 /// executables like Bun, arithmetic overflow) and for binaries that contain
-/// patch sites that could not be redirected. An unpatchable site is replaced
+/// patch sites that could not be redirected. On RV64, an unreachable gate or
+/// unsupported instruction returns an error. On x86-64 and AArch64, an unpatchable site is replaced
 /// with a trapping instruction so it faults instead of escaping to the host
 /// kernel: `icebp; hlt` on x86-64, and `BRK` on AArch64 (where a patch site is
 /// an `SVC`, `MSR TPIDR_EL0`, `MRS TPIDR_EL0`, or enabled x18 instruction).
