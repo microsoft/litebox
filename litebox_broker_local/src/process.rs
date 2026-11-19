@@ -289,26 +289,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Makes the children this process creates from now on go into a new PID
-    /// namespace with `options`, nested in this process's.
-    ///
-    /// Returns `UnsupportedOperation` if this process's children already go
-    /// to another PID namespace.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a response for another operation.
-    pub fn create_children_pid_namespace(
-        &self,
-        options: PidNamespaceOptions,
-    ) -> Result<(), Channel::Error> {
-        match self.request_process(ProcessRequest::CreateChildrenPidNamespace(options))? {
-            ProcessResponse::CreateChildrenPidNamespace => Ok(()),
-            response => panic!("broker returned unexpected process response: {response:?}"),
-        }
-    }
-
-    /// Applies all the namespace changes in one broker request.
+    /// Applies all the namespace changes to this process or its pending child
+    /// in one broker request, or none of them.
     ///
     /// # Panics
     ///
@@ -494,21 +476,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             name: buffer,
         }))? {
             ProcessResponse::SetHostName => Ok(()),
-            response => panic!("broker returned unexpected process response: {response:?}"),
-        }
-    }
-
-    /// Replaces the host names of this process or of its pending child
-    /// `process_id` with a copy that no other process shares.
-    ///
-    /// Returns `UnknownObject` if `process_id` is neither.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a response for another operation.
-    pub fn copy_host_names(&self, process_id: ProcessId) -> Result<(), Channel::Error> {
-        match self.request_process(ProcessRequest::CopyHostNames(process_id))? {
-            ProcessResponse::CopyHostNames => Ok(()),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

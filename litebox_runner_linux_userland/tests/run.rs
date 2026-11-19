@@ -1250,7 +1250,7 @@ fn run_test_broker_connection(
                                 .execute_request_with(
                                     request,
                                     |process, operation, _| {
-                                        litebox_broker_userland::shared_objects::handle_map_file(
+                                        litebox_broker_userland::shared_objects::handle_shared_object_request(
                                             shared_objects,
                                             process,
                                             operation,

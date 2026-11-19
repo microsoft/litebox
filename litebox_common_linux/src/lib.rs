@@ -61,6 +61,13 @@ pub const HOST_PAGE_SIZE: usize = 16384;
 /// Page size required by the supported Linux guest ABIs.
 pub const PAGE_SIZE: usize = 4096;
 
+// A stable non-root guest identity, rather than the host user's, keeps guest credentials aligned
+// with packaged guest files and avoids truncating high host IDs.
+/// The user ID LiteBox's Linux runners give a guest unless configured otherwise.
+pub const DEFAULT_GUEST_UID: u16 = 1000;
+/// The group ID LiteBox's Linux runners give a guest unless configured otherwise.
+pub const DEFAULT_GUEST_GID: u16 = 1000;
+
 pub const STDIN_FILENO: i32 = 0;
 pub const STDOUT_FILENO: i32 = 1;
 pub const STDERR_FILENO: i32 = 2;

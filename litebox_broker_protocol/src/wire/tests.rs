@@ -25,9 +25,9 @@ use crate::message::{
     BrokerOperation, BrokerResult, EventRequest, EventResponse, FileRequest, FileResponse,
     PipeRequest, PipeResponse, ProcessGroupRequest, ProcessGroupResponse, ProcessRequest,
     ProcessResponse, ReadinessNotification, ReadinessQueueRequest, ReadinessQueueResponse,
-    SharedFutexRequest, SharedFutexResponse, SignalRequest, SignalResponse, SocketRequest,
-    SocketResponse, ThreadRequest, ThreadResponse, TimerRequest, TimerResponse, UnixSocketRequest,
-    UnixSocketResponse,
+    SegmentRequest, SegmentResponse, SharedFutexRequest, SharedFutexResponse, SignalRequest,
+    SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse, TimerRequest,
+    TimerResponse, UnixSocketRequest, UnixSocketResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -50,6 +50,10 @@ use crate::readiness_queue::{
     AddReadinessQueueEntryRequest, CreateReadinessQueueResponse, ModifyReadinessQueueEntryRequest,
     ReadinessQueueEntryFlags, ReadinessQueueError, ReadinessQueueInterest,
     RemoveReadinessQueueEntryRequest, TakeReadyRequest, TakeReadyResponse,
+};
+use crate::segment::{
+    GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
+    SegmentStatus, SetSegmentAttachmentsRequest, SetSegmentRequest,
 };
 use crate::shared_buffer::{
     MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
@@ -99,31 +103,32 @@ const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
 fn segment_and_namespace_wire_shapes_are_pinned() {
     let request = BrokerRequest {
         request_id: RequestId(7),
-        operation: BrokerOperation::Segment(crate::segment::SegmentRequest::AdjustAttachments {
-            id: 0x1234,
-            delta: -2,
-        }),
+        operation: BrokerOperation::Segment(SegmentRequest::SetAttachments(
+            SetSegmentAttachmentsRequest {
+                id: 0x1234,
+                count: 0x0102,
+            },
+        )),
     };
     assert_eq!(
         encode_request(&request),
         [
-            1, 7, 0, 0, 0, 0, 0, 0, 0, 18, 10, 0x34, 0x12, 0, 0, 254, 255, 255, 255, 255, 255, 255,
-            255
+            1, 7, 0, 0, 0, 0, 0, 0, 0, 18, 7, 0x34, 0x12, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0
         ]
     );
     let response = BrokerResponse {
         request_id: RequestId(7),
-        result: BrokerResult::Segment(crate::segment::SegmentResponse::AttachPrepared {
-            attachment: crate::segment::SegmentAttachId(3),
+        result: BrokerResult::Segment(SegmentResponse::PrepareAttach(PreparedSegmentAttach {
+            attachment: SegmentAttachId(3),
             mapping: MapFileResponse {
                 memory: SharedMemoryId(5),
                 token: 9,
                 writable: true,
             },
             size: 257,
-        }),
+        })),
     };
-    let mut expected = alloc::vec![1, 7, 0, 0, 0, 0, 0, 0, 0, 19, 2];
+    let mut expected = alloc::vec![1, 7, 0, 0, 0, 0, 0, 0, 0, 19, 4];
     expected.extend(3_u64.to_le_bytes());
     expected.extend(5_u128.to_le_bytes());
     expected.extend(9_u64.to_le_bytes());
@@ -144,7 +149,7 @@ fn segment_and_namespace_wire_shapes_are_pinned() {
     };
     assert_eq!(
         encode_request(&request),
-        [1, 7, 0, 0, 0, 0, 0, 0, 0, 10, 24, 9, 0, 0, 0, 1, 1, 0, 0, 1]
+        [1, 7, 0, 0, 0, 0, 0, 0, 0, 10, 22, 9, 0, 0, 0, 1, 1, 0, 0, 1]
     );
 }
 
@@ -187,44 +192,36 @@ fn request_codec_round_trips_all_variants() {
     )
     .unwrap();
     let operations = alloc::vec![
-        BrokerOperation::Segment(crate::segment::SegmentRequest::Get {
+        BrokerOperation::Segment(SegmentRequest::Get(GetSegmentRequest {
             key: -7,
             size: u64::MAX,
             mode: 0o620,
             create: true,
             exclusive: false
-        }),
-        BrokerOperation::Segment(crate::segment::SegmentRequest::Status { id: 33 }),
-        BrokerOperation::Segment(crate::segment::SegmentRequest::Set {
+        })),
+        BrokerOperation::Segment(SegmentRequest::Status(33)),
+        BrokerOperation::Segment(SegmentRequest::Set(SetSegmentRequest {
             id: 7,
             owner: FileUser {
                 user: 41,
                 group: 52
             },
             mode: 0o114
-        }),
-        BrokerOperation::Segment(crate::segment::SegmentRequest::Delete { id: 63 }),
-        BrokerOperation::Segment(crate::segment::SegmentRequest::Attach {
+        })),
+        BrokerOperation::Segment(SegmentRequest::Remove(63)),
+        BrokerOperation::Segment(SegmentRequest::PrepareAttach(PrepareSegmentAttachRequest {
             id: 12,
             writable: true
-        }),
-        BrokerOperation::Segment(crate::segment::SegmentRequest::Detach { id: 89 }),
-        BrokerOperation::Segment(crate::segment::SegmentRequest::NewNamespace {
-            target: ProcessId(28)
-        }),
-        BrokerOperation::Segment(crate::segment::SegmentRequest::Inherit {
-            target: ProcessId(19)
-        }),
-        BrokerOperation::Segment(crate::segment::SegmentRequest::ConfirmAttach {
-            attachment: crate::segment::SegmentAttachId(u64::MAX)
-        }),
-        BrokerOperation::Segment(crate::segment::SegmentRequest::CancelAttach {
-            attachment: crate::segment::SegmentAttachId(17)
-        }),
-        BrokerOperation::Segment(crate::segment::SegmentRequest::AdjustAttachments {
-            id: 76,
-            delta: -2
-        }),
+        })),
+        BrokerOperation::Segment(SegmentRequest::ConfirmAttach(SegmentAttachId(u64::MAX))),
+        BrokerOperation::Segment(SegmentRequest::CancelAttach(SegmentAttachId(17))),
+        BrokerOperation::Segment(SegmentRequest::SetAttachments(
+            SetSegmentAttachmentsRequest {
+                id: 76,
+                count: u64::MAX
+            }
+        )),
+        BrokerOperation::Segment(SegmentRequest::Inherit(ProcessId(19))),
         BrokerOperation::Thread(ThreadRequest::Exit(thread_id(17))),
         BrokerOperation::CloseObject(handle),
         BrokerOperation::CheckReadiness(handle),
@@ -631,12 +628,12 @@ fn request_codec_round_trips_all_variants() {
             new_pid_namespace: Some(PidNamespaceOptions::new(false, true)),
             sibling: false,
         })),
-        BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
-            PidNamespaceOptions::default()
-        )),
-        BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
-            PidNamespaceOptions::new(true, true)
-        )),
+        BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
+            process_id: process_id(7),
+            children_pid_namespace: Some(PidNamespaceOptions::new(true, true)),
+            new_segment_namespace: false,
+            copy_host_names: false,
+        })),
         BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
             process_id: process_id(u32::MAX),
             children_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
@@ -740,7 +737,6 @@ fn request_codec_round_trips_all_variants() {
             kind: HostNameKind::Domain,
             name: sequence(0, 0),
         })),
-        BrokerOperation::Process(ProcessRequest::CopyHostNames(process_id(u32::MAX))),
         BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
             socket_type: SocketType::Stream,
             flags: FileOpenFlags::NONBLOCKING,
@@ -1076,35 +1072,38 @@ fn handshake_response_codec_round_trips_all_variants() {
 fn response_codec_round_trips_all_variants() {
     let handle = ObjectHandle(13);
     let results = alloc::vec![
-        BrokerResult::Segment(crate::segment::SegmentResponse::Id(53)),
-        BrokerResult::Segment(crate::segment::SegmentResponse::Status(
-            crate::segment::SegmentStatus {
-                key: -11,
-                size: 271,
-                creator: FileUser::ROOT,
-                owner: FileUser { user: 5, group: 8 },
-                mode: 0o640,
-                creator_pid: 28,
-                last_pid: 9,
-                attachments: 42,
-                created: 8,
-                attached: 17,
-                detached: 4,
-                removed: true,
-            }
-        )),
-        BrokerResult::Segment(crate::segment::SegmentResponse::AttachPrepared {
-            attachment: crate::segment::SegmentAttachId(13),
+        BrokerResult::Segment(SegmentResponse::Get(53)),
+        BrokerResult::Segment(SegmentResponse::Status(SegmentStatus {
+            key: -11,
+            size: 271,
+            creator: FileUser::ROOT,
+            owner: FileUser { user: 5, group: 8 },
+            mode: 0o640,
+            creator_pid: 28,
+            last_pid: 9,
+            attachments: 42,
+            change_time: 8,
+            attach_time: 17,
+            detach_time: 4,
+            removed: true,
+        })),
+        BrokerResult::Segment(SegmentResponse::Set),
+        BrokerResult::Segment(SegmentResponse::Remove),
+        BrokerResult::Segment(SegmentResponse::PrepareAttach(PreparedSegmentAttach {
+            attachment: SegmentAttachId(13),
             mapping: MapFileResponse {
                 memory: SharedMemoryId(1234),
                 token: 56,
                 writable: false
             },
             size: 751
-        }),
-        BrokerResult::Segment(crate::segment::SegmentResponse::Done),
-        BrokerResult::Segment(crate::segment::SegmentResponse::Failed(FileError::NotOwner)),
-        BrokerResult::Segment(crate::segment::SegmentResponse::Failed(FileError::Io)),
+        })),
+        BrokerResult::Segment(SegmentResponse::ConfirmAttach),
+        BrokerResult::Segment(SegmentResponse::CancelAttach),
+        BrokerResult::Segment(SegmentResponse::SetAttachments),
+        BrokerResult::Segment(SegmentResponse::Inherit),
+        BrokerResult::Segment(SegmentResponse::Failed(FileError::NotOwner)),
+        BrokerResult::Segment(SegmentResponse::Failed(FileError::Io)),
         BrokerResult::Thread(ThreadResponse::Create(thread_id(17))),
         BrokerResult::Thread(ThreadResponse::Exit),
         BrokerResult::ObjectClosed,
@@ -1439,7 +1438,6 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::Process(ProcessResponse::ReportExitStatus),
         BrokerResult::Process(ProcessResponse::SetChildExitRetention),
         BrokerResult::Process(ProcessResponse::SetOrphanAdoption),
-        BrokerResult::Process(ProcessResponse::CreateChildrenPidNamespace),
         BrokerResult::Process(ProcessResponse::CreateNamespaces),
         BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
             process_id: process_id(u32::MAX),
@@ -1530,7 +1528,6 @@ fn response_codec_round_trips_all_variants() {
             domain: 0
         })),
         BrokerResult::Process(ProcessResponse::SetHostName),
-        BrokerResult::Process(ProcessResponse::CopyHostNames),
         BrokerResult::Error(ErrorCode::PolicyDenied),
         BrokerResult::Error(ErrorCode::WouldBlock),
         BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
@@ -1918,11 +1915,16 @@ fn decode_rejects_malformed_request_frames() {
     }
     let mut invalid_children_pid_namespace = encode_request(&BrokerRequest {
         request_id: TEST_REQUEST_ID,
-        operation: BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
-            PidNamespaceOptions::default(),
+        operation: BrokerOperation::Process(ProcessRequest::CreateNamespaces(
+            CreateNamespacesRequest {
+                process_id: process_id(1),
+                children_pid_namespace: Some(PidNamespaceOptions::default()),
+                new_segment_namespace: false,
+                copy_host_names: false,
+            },
         )),
     });
-    invalid_children_pid_namespace[11] = 0b100;
+    invalid_children_pid_namespace[16] = 0b100;
     assert_eq!(
         decode_request(&invalid_children_pid_namespace),
         Err(WireError::InvalidTag)

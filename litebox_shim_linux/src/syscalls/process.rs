@@ -312,8 +312,8 @@ struct ChildRelation {
 }
 
 impl ChildRelation {
-    /// A plain child, in the PID namespace for the creating process's children, sharing its host
-    /// names.
+    /// A plain child, in the PID namespace for the creating process's children, sharing its UTS
+    /// and IPC namespaces.
     const CHILD: Self = Self {
         new_pid_namespace: false,
         sibling: false,
@@ -473,7 +473,7 @@ enum WaitTarget<Platform: ShimPlatform> {
 }
 
 /// Keeps the other threads of a process paused for `fork` until dropped.
-pub(super) struct ForkPause<'a, Platform: ShimPlatform> {
+struct ForkPause<'a, Platform: ShimPlatform> {
     process: &'a ProcessState<Platform>,
 }
 
@@ -1050,13 +1050,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 error => error.into(),
             })?;
         // On failure, dropping the child cancels it.
-        if relation.new_namespaces.contains(CloneFlags::NEWIPC) {
-            self.new_segment_namespace(child.identity().process_id)?;
-        }
-        if relation.new_namespaces.contains(CloneFlags::NEWUTS) {
-            self.global
+        if !relation.new_namespaces.is_empty() {
+            match self
+                .global
                 .litebox
-                .copy_host_names(child.identity().process_id)?;
+                .create_namespaces(CreateNamespacesRequest {
+                    process_id: child.identity().process_id,
+                    children_pid_namespace: None,
+                    new_segment_namespace: relation.new_namespaces.contains(CloneFlags::NEWIPC),
+                    copy_host_names: relation.new_namespaces.contains(CloneFlags::NEWUTS),
+                }) {
+                // Without the services, host names are fixed and there are no segments.
+                Ok(()) | Err(ProcessError::Unavailable) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(child)
     }
@@ -1257,7 +1264,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Fails with `ERESTARTNOINTR` if a signal or an exit interrupts the wait for them to pause,
     /// so `fork` restarts once the signal is handled, as Linux's does if a signal arrives while
     /// it duplicates the process.
-    pub(super) fn pause_other_threads(&self) -> Result<ForkPause<'_, Platform>, Errno> {
+    fn pause_other_threads(&self) -> Result<ForkPause<'_, Platform>, Errno> {
         let process = &self.thread.process;
         loop {
             let mut inner = process.inner.lock();

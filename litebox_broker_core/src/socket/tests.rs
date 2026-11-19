@@ -1499,7 +1499,7 @@ fn test_broker_with_policy(
             &crate::BrokerCoreLimits::DEFAULT,
         )),
         shared_futexes: Arc::default(),
-        segment_ids: Arc::new(crate::segment::SegmentIds::new(0)),
+        segments: crate::segment::SegmentService::new(&crate::BrokerCoreLimits::DEFAULT, None),
         next_process_key: core::sync::atomic::AtomicU64::new(1),
         next_pid_namespace_id: core::sync::atomic::AtomicU64::new(1),
         pid_namespaces: Arc::new(AtomicUsize::new(0)),

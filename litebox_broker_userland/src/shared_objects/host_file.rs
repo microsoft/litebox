@@ -74,9 +74,10 @@ pub(super) fn create<H: HostFile>(file: File) -> SharedFileMemory {
     }
 }
 
-/// Creates the exportable view of an already initialized host file.
+/// Wraps an already initialized host file as an object that is only exported to runners,
+/// never read or written as storage.
 #[cfg(target_os = "linux")]
-pub(super) fn exportable<H: HostFile>(file: File) -> Arc<dyn SharedFileObject> {
+pub(super) fn export_only_object<H: HostFile>(file: File) -> Arc<dyn SharedFileObject> {
     Arc::new(HostFileObject::<H>(Arc::new(file), PhantomData))
 }
 

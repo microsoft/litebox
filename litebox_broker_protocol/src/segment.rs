@@ -1,18 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Keyed, process-shared memory objects. Caller credentials are bound to
-//! the process by the deployment, never supplied on the wire.
+//! Keyed, process-shared memory segments. The deployment binds each
+//! association's segment credential; requests never carry one.
 
-use crate::ProcessId;
-use crate::fs::{FileError, FileUser, MapFileResponse};
+use crate::fs::{FileUser, MapFileResponse};
 
 wire_struct! {
     /// Metadata of one segment. Times are seconds since the Unix epoch, or zero
     /// for events that have not occurred.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct SegmentStatus {
-        /// Published key, or zero for a private or deleted segment.
+        /// Published key, or zero for a private or removed segment.
         pub key: i32,
         /// Requested byte length, before rounding to pages.
         pub size: u64,
@@ -29,12 +28,12 @@ wire_struct! {
         /// Total confirmed attachments in all processes.
         pub attachments: u64,
         /// Creation or most recent metadata change.
-        pub created: u64,
+        pub change_time: u64,
         /// Most recent attach.
-        pub attached: u64,
+        pub attach_time: u64,
         /// Most recent detach.
-        pub detached: u64,
-        /// Whether deletion is pending the last detach or provisional attachment.
+        pub detach_time: u64,
+        /// Whether removal waits for the last attachment or provisional attachment to end.
         pub removed: bool,
     }
 }
@@ -47,58 +46,68 @@ pub struct SegmentAttachId(pub u64);
 
 wire_newtype!(SegmentAttachId: u64);
 
-wire_enum! {
-    /// Operations on the caller's segment namespace or existing attachments.
+wire_struct! {
+    /// Looks up a key in the caller's namespace, optionally creating a segment.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum SegmentRequest {
-        /// Looks up a key, optionally creating a segment. Key zero always creates.
-        Get {
-            key: i32,
-            size: u64,
-            mode: u16,
-            create: bool,
-            exclusive: bool,
-        },
-        /// Reads the object's metadata.
-        Status { id: u32 },
-        /// Changes owner and permission bits, preserving creator identity.
-        Set { id: u32, owner: FileUser, mode: u16 },
-        /// Unpublishes the key and deletes the object once no attachments or reservations remain.
-        Delete { id: u32 },
-        /// Reserves an attachment and delivers the backing object without changing metadata.
-        Attach { id: u32, writable: bool },
-        /// Releases one attachment held by this process, even after a namespace switch.
-        Detach { id: u32 },
-        /// Moves self or a pending child to an empty namespace.
-        NewNamespace { target: ProcessId },
-        /// Copies attachment counts to a pending child inheriting its parent's VM.
-        Inherit { target: ProcessId },
-        /// Records a reserved attachment after the caller has mapped the backing object.
-        ConfirmAttach { attachment: SegmentAttachId },
-        /// Releases an unused reservation without recording an attach or detach.
-        CancelAttach { attachment: SegmentAttachId },
-        /// Adjusts a confirmed attachment count after splitting or releasing mapped regions.
-        AdjustAttachments { id: u32, delta: i64 },
+    pub struct GetSegmentRequest {
+        /// The key to look up, or zero to always create a private segment.
+        pub key: i32,
+        /// Byte length of a new segment; an existing one must be at least this long.
+        pub size: u64,
+        /// Permission bits of a new segment, and the access an existing one must grant.
+        pub mode: u16,
+        /// Create a segment if the key has none.
+        pub create: bool,
+        /// With `create`, fail if the key already has a segment.
+        pub exclusive: bool,
     }
 }
 
-wire_enum! {
-    /// Successful operation, or an ordinary (recoverable) guest error.
+wire_struct! {
+    /// Changes a segment's owner and permission bits, preserving its creator.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum SegmentResponse {
-        /// Result of a successful lookup or creation.
-        Id(u32),
-        /// Current metadata.
-        Status(SegmentStatus),
-        /// Reserved attachment, backing-object delivery information, and unrounded length.
-        AttachPrepared {
-            attachment: SegmentAttachId,
-            mapping: MapFileResponse,
-            size: u64,
-        },
-        /// The requested change was made.
-        Done,
-        /// Caller-visible failure.
-        Failed(FileError),
+    pub struct SetSegmentRequest {
+        /// The segment.
+        pub id: u32,
+        /// The new owning identity.
+        pub owner: FileUser,
+        /// The new permission bits.
+        pub mode: u16,
+    }
+}
+
+wire_struct! {
+    /// Reserves an attachment and delivers the segment's backing object.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PrepareSegmentAttachRequest {
+        /// The segment.
+        pub id: u32,
+        /// Whether the attachment may write.
+        pub writable: bool,
+    }
+}
+
+wire_struct! {
+    /// A reserved attachment, with the delivered backing object.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PreparedSegmentAttach {
+        /// Names the reservation to confirm or cancel.
+        pub attachment: SegmentAttachId,
+        /// The delivered backing object, covering the page-rounded segment.
+        pub mapping: MapFileResponse,
+        /// The segment's byte length, before rounding to pages.
+        pub size: u64,
+    }
+}
+
+wire_struct! {
+    /// Replaces how many attachments the caller holds of one segment.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SetSegmentAttachmentsRequest {
+        /// The segment.
+        pub id: u32,
+        /// The caller's new total, which only confirmed attaches and their splits
+        /// can raise above zero.
+        pub count: u64,
     }
 }

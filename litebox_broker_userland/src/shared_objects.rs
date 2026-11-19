@@ -5,12 +5,18 @@
 
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 
+use std::sync::Arc;
+
 use litebox_broker_core::BrokerProcess;
 use litebox_broker_core::fs::errors::MapSharedError;
-use litebox_broker_core::fs::shared_storage::{HostHandle, SharedFileObject};
+use litebox_broker_core::fs::shared_storage::{
+    HostHandle, SharedFileMemoryProvider, SharedFileObject,
+};
 use litebox_broker_host::RequestFailure;
 use litebox_broker_protocol::fs::{FileError, MapFileRequest, MapFileResponse};
-use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
+use litebox_broker_protocol::message::{
+    BrokerOperation, BrokerResult, FileRequest, FileResponse, SegmentRequest, SegmentResponse,
+};
 
 /// Delivers host shared objects to the runner of one association.
 pub trait SharedObjectDelivery: Send + Sync {
@@ -22,8 +28,11 @@ pub trait SharedObjectDelivery: Send + Sync {
     /// which the runner sees as a file it cannot share.
     fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64>;
 
-    /// Delivers segment backing, allowing platforms to impose a lower permission ceiling.
-    fn deliver_sysv(
+    /// Delivers the backing object of a keyed shared segment, as [`Self::deliver`] does a
+    /// file's. Segments are never executable: a deployment whose handles can carry that ceiling
+    /// withholds the right to map them executable, and the runner's memory manager refuses to
+    /// map them executable in any case.
+    fn deliver_segment(
         &self,
         object: &dyn SharedFileObject,
         writable: bool,
@@ -31,6 +40,18 @@ pub trait SharedObjectDelivery: Send + Sync {
     ) -> IoResult<u64> {
         self.deliver(object, writable, end)
     }
+}
+
+/// Returns this platform's provider of host shared memory, which holds the contents of shared
+/// files and keyed shared segments, if it has one.
+#[must_use]
+pub fn host_memory_provider() -> Option<Arc<dyn SharedFileMemoryProvider>> {
+    #[cfg(target_os = "linux")]
+    return Some(Arc::new(linux::MemfdFileMemoryProvider));
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    return Some(Arc::new(windows::TempFileMemoryProvider));
+    #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+    None
 }
 
 /// Returns `object`'s host handle for delivering it with `writable` rights.
@@ -49,64 +70,60 @@ fn host_handle(
     })
 }
 
-/// Handles file mapping and keyed shared segment requests, delivering shared memory through
-/// `delivery`. Returns `None` for other operations.
-///
-/// Without a delivery adapter, the broker host can handle metadata operations but cannot
-/// create backing storage or deliver an attachment.
-pub fn handle_map_file<Delivery: SharedObjectDelivery>(
+/// Handles the requests that deliver host shared objects: file mappings and segment attaches,
+/// delivering them through `delivery`. Returns `None` for other operations.
+pub fn handle_shared_object_request<Delivery: SharedObjectDelivery>(
     delivery: &Delivery,
     process: &BrokerProcess,
     operation: &BrokerOperation,
 ) -> Option<Result<BrokerResult, RequestFailure>> {
-    if let BrokerOperation::Segment(request) = *operation {
-        #[cfg(target_os = "linux")]
-        let provider = Some(
-            &linux::MemfdFileMemoryProvider
-                as &dyn litebox_broker_core::fs::shared_storage::SharedFileMemoryProvider,
-        );
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        let provider = Some(
-            &windows::TempFileMemoryProvider
-                as &dyn litebox_broker_core::fs::shared_storage::SharedFileMemoryProvider,
-        );
-        #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
-        let provider = None;
-        return Some(
-            litebox_broker_core::segment::operate(
+    match *operation {
+        BrokerOperation::Segment(SegmentRequest::PrepareAttach(request)) => {
+            let result = litebox_broker_core::segment::prepare_attach(
                 process,
                 request,
-                provider,
                 |object, writable, end| {
                     delivery
-                        .deliver_sysv(object, writable, end)
-                        .map_err(delivery_failure)
+                        .deliver_segment(object, writable, end)
+                        .map_err(report_delivery_failure)
                 },
+            );
+            Some(
+                result
+                    .map(|prepared| {
+                        BrokerResult::Segment(
+                            prepared.map_or_else(
+                                SegmentResponse::Failed,
+                                SegmentResponse::PrepareAttach,
+                            ),
+                        )
+                    })
+                    .map_err(RequestFailure::from),
             )
-            .map(BrokerResult::Segment)
-            .map_err(RequestFailure::from),
-        );
+        }
+        BrokerOperation::File(FileRequest::Map(MapFileRequest { handle, end })) => {
+            let response = match litebox_broker_core::fs::map_shared(process, handle) {
+                Err(error) => return Some(Err(RequestFailure::from(error))),
+                Ok(Err(error)) => FileResponse::Failed(error),
+                Ok(Ok(mapping)) => {
+                    match delivery.deliver(&*mapping.object, mapping.writable, end) {
+                        Ok(token) => FileResponse::Map(MapFileResponse {
+                            memory: mapping.memory_id,
+                            token,
+                            writable: mapping.writable,
+                        }),
+                        Err(error) => FileResponse::Failed(report_delivery_failure(error)),
+                    }
+                }
+            };
+            Some(Ok(BrokerResult::File(response)))
+        }
+        _ => None,
     }
-    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle, end })) = *operation else {
-        return None;
-    };
-    let response = match litebox_broker_core::fs::map_shared(process, handle) {
-        Err(error) => return Some(Err(RequestFailure::from(error))),
-        Ok(Err(error)) => FileResponse::Failed(error),
-        Ok(Ok(mapping)) => match delivery.deliver(&*mapping.object, mapping.writable, end) {
-            Ok(token) => FileResponse::Map(MapFileResponse {
-                memory: mapping.memory_id,
-                token,
-                writable: mapping.writable,
-            }),
-            Err(error) => FileResponse::Failed(delivery_failure(error)),
-        },
-    };
-    Some(Ok(BrokerResult::File(response)))
 }
 
-/// Reports and classifies a failure to deliver a shared object to the runner.
-fn delivery_failure(error: IoError) -> FileError {
+/// Logs a failure to deliver a shared object to the runner and classifies it.
+fn report_delivery_failure(error: IoError) -> FileError {
     litebox_util_log::warn!(error:% = error; "failed to deliver a shared object");
     // Unsupported delivery allows ordinary file mappings to fall back, but fails segment attaches.
     match error.kind() {

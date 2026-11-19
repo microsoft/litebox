@@ -7,7 +7,8 @@
 // the argument `unprivileged`, as another user, who can't create namespaces or set the names.
 //
 // A new IPC namespace starts without its creator's shared memory segments, though attachments
-// made before the switch stay usable.
+// made before the switch stay usable. With the argument `segments`, checks only that, as guest
+// root.
 
 #define _GNU_SOURCE
 #include <errno.h>

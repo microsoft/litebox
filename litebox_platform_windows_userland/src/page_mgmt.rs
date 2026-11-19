@@ -108,7 +108,7 @@ struct Section {
     /// Size of the section in bytes. Views cannot extend past it.
     size: usize,
     /// Maximum view permissions, also used to create or recreate a view before narrowing it.
-    permissions: MemoryRegionPermissions,
+    max_permissions: MemoryRegionPermissions,
 }
 
 /// A mapped view of a section, which native fork children share.
@@ -456,7 +456,7 @@ unsafe fn take_delivered_section(token: u64) -> Result<Section, SharedObjectRece
         handle: section_handle,
         size: usize::try_from(section.maximum_size).map_err(|_| SharedObjectReceiveError::Io)?,
         // Views allow every access the handle does, so that protection can later grant any.
-        permissions,
+        max_permissions: permissions,
     })
 }
 
@@ -564,7 +564,7 @@ fn map_view(range: &Range<usize>, section: &Section, offset: usize) -> bool {
             offset as u64,
             range.len(),
             Win32_Memory::MEM_REPLACE_PLACEHOLDER,
-            prot_flags(section.permissions),
+            prot_flags(section.max_permissions),
             core::ptr::null_mut(),
             0,
         )
@@ -767,9 +767,7 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
         let section = Arc::new(Section {
             handle: shared_section(range.len())?,
             size: range.len(),
-            permissions: MemoryRegionPermissions::READ
-                | MemoryRegionPermissions::WRITE
-                | MemoryRegionPermissions::EXEC,
+            max_permissions: MemoryRegionPermissions::all(),
         });
         map_section(range, &section, 0, permissions)
     }
@@ -784,7 +782,7 @@ fn map_section(
     offset: usize,
     permissions: MemoryRegionPermissions,
 ) -> Result<(), AllocationError> {
-    debug_assert!(section.permissions.contains(permissions));
+    debug_assert!(section.max_permissions.contains(permissions));
     let flags = prot_flags(permissions);
     let mut views = SharedViews::lock();
     SHARED_VIEWS.used.store(true, Ordering::Release);
@@ -812,7 +810,7 @@ fn map_section(
         );
         // Views are mapped with the section's full access, which also bounds later protection
         // changes, so narrow it to the requested protection separately.
-        if flags != prot_flags(section.permissions) {
+        if flags != prot_flags(section.max_permissions) {
             assert!(
                 protect(&allocation, flags),
                 "failed to protect shared view: {}",
@@ -1063,11 +1061,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         let views = SharedViews::lock();
         // Check the entire range before modifying any allocation. In particular a request to
         // execute a non-executable shared section must not change protection elsewhere first.
-        if views
-            .overlapping(&range)
-            .iter()
-            .any(|start| !views.views[start].section.permissions.contains(permissions))
-        {
+        if views.overlapping(&range).iter().any(|start| {
+            !views.views[start]
+                .section
+                .max_permissions
+                .contains(permissions)
+        }) {
             return Err(litebox::platform::page_mgmt::PermissionUpdateError::PermissionDenied);
         }
         let flags = prot_flags(permissions);
@@ -1111,7 +1110,7 @@ impl<const ALIGN: usize> litebox::platform::SharedObjectProvider<ALIGN> for Wind
             return Err(AllocationError::UnsupportedByPlatform);
         }
         let section = &object.0;
-        if !section.permissions.contains(permissions) {
+        if !section.max_permissions.contains(permissions) {
             return Err(AllocationError::PermissionDenied);
         }
         let offset = usize::try_from(offset).map_err(|_| AllocationError::OutOfMemory)?;

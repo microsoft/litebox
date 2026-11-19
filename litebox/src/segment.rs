@@ -5,15 +5,18 @@
 
 use crate::LiteBox;
 use crate::broker::error::BrokerControlError;
+use crate::broker::{BrokerControl, SegmentControlResult};
 use crate::fs::SharedFileObject;
 use crate::platform::SharedObjectProvider;
 use crate::platform::page_mgmt::SharedObjectReceiveError;
 use crate::sync::RawSyncPrimitivesProvider;
+use alloc::sync::Arc;
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::fs::{FileError, FileUser};
+use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::segment::{
-    SegmentAttachId, SegmentRequest, SegmentResponse, SegmentStatus,
+    GetSegmentRequest, PrepareSegmentAttachRequest, SegmentAttachId, SegmentStatus,
+    SetSegmentAttachmentsRequest, SetSegmentRequest,
 };
 use litebox_platform::time::TimeProvider;
 
@@ -26,7 +29,7 @@ pub enum SegmentError {
     Exists,
     #[error("no segment has this key")]
     Missing,
-    #[error("invalid segment ID or size")]
+    #[error("invalid segment ID, size or attachment")]
     Invalid,
     #[error("insufficient access rights")]
     AccessDenied,
@@ -42,158 +45,156 @@ pub enum SegmentError {
     ServiceFailed,
 }
 
+impl From<FileError> for SegmentError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::AlreadyExists => Self::Exists,
+            FileError::NoSuchFileOrDirectory => Self::Missing,
+            FileError::InvalidArgument => Self::Invalid,
+            FileError::AccessNotAllowed => Self::AccessDenied,
+            FileError::NotOwner => Self::NotOwner,
+            FileError::NoSpace => Self::NoSpace,
+            FileError::Io => Self::Io,
+            FileError::NoSuchDevice | FileError::NotSupported => Self::Unavailable,
+            _ => Self::ServiceFailed,
+        }
+    }
+}
+
+impl From<BrokerControlError> for SegmentError {
+    fn from(error: BrokerControlError) -> Self {
+        match error {
+            BrokerControlError::Broker(ErrorCode::OutOfMemory) => Self::NoMemory,
+            BrokerControlError::Broker(ErrorCode::ResourceExhausted) => Self::NoSpace,
+            // The association may not use segments, like a principal without access.
+            BrokerControlError::Broker(ErrorCode::PolicyDenied) => Self::AccessDenied,
+            BrokerControlError::Broker(ErrorCode::UnsupportedOperation) => Self::Unavailable,
+            _ => Self::ServiceFailed,
+        }
+    }
+}
+
+impl From<SharedObjectReceiveError> for SegmentError {
+    fn from(error: SharedObjectReceiveError) -> Self {
+        match error {
+            SharedObjectReceiveError::UnsupportedByPlatform => Self::Unavailable,
+            SharedObjectReceiveError::OutOfMemory => Self::NoMemory,
+            SharedObjectReceiveError::Io => Self::Io,
+        }
+    }
+}
+
+fn segment_result<T>(result: SegmentControlResult<T>) -> Result<T, SegmentError> {
+    Ok(result??)
+}
+
+/// A segment's backing object, delivered for an attachment that is not
+/// recorded until confirmed.
+pub struct PreparedAttach<Object> {
+    /// The backing object, covering the page-rounded segment.
+    pub object: SharedFileObject<Object>,
+    /// The segment's byte length, before rounding to pages.
+    pub size: u64,
+    /// Confirms the attachment or, if dropped first, cancels it.
+    pub reservation: AttachReservation,
+}
+
+/// A reserved attachment, which pins the segment without counting as an
+/// attachment. Dropping it cancels the reservation.
+pub struct AttachReservation {
+    broker: Arc<dyn BrokerControl>,
+    attachment: Option<SegmentAttachId>,
+}
+
+impl AttachReservation {
+    /// Records the attachment, once its backing object is mapped. On failure,
+    /// the reservation is cancelled.
+    pub fn confirm(mut self) -> Result<(), SegmentError> {
+        let attachment = self.attachment.take().ok_or(SegmentError::Invalid)?;
+        let result = segment_result(self.broker.confirm_segment_attach(attachment));
+        if result.is_err() {
+            self.attachment = Some(attachment);
+        }
+        result
+    }
+}
+
+impl Drop for AttachReservation {
+    fn drop(&mut self) {
+        if let Some(attachment) = self.attachment.take()
+            && let Err(error) = segment_result(self.broker.cancel_segment_attach(attachment))
+        {
+            // The broker releases the reservation when this process ends.
+            litebox_util_log::warn!(error:?; "failed to cancel a segment attach");
+        }
+    }
+}
+
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    fn segment(&self, request: SegmentRequest) -> Result<SegmentResponse, SegmentError> {
-        let control = self.broker_control().ok_or(SegmentError::Unavailable)?;
-        match control.segment(request) {
-            Ok(SegmentResponse::Failed(error)) => Err(match error {
-                FileError::AlreadyExists => SegmentError::Exists,
-                FileError::NoSuchFileOrDirectory => SegmentError::Missing,
-                FileError::InvalidArgument => SegmentError::Invalid,
-                FileError::AccessNotAllowed => SegmentError::AccessDenied,
-                FileError::NotOwner => SegmentError::NotOwner,
-                FileError::NoSpace => SegmentError::NoSpace,
-                FileError::Io => SegmentError::Io,
-                FileError::NoSuchDevice | FileError::NotSupported => SegmentError::Unavailable,
-                _ => SegmentError::ServiceFailed,
-            }),
-            Ok(response) => Ok(response),
-            Err(error) => Err(match error {
-                BrokerControlError::Broker(ErrorCode::OutOfMemory) => SegmentError::NoMemory,
-                BrokerControlError::Broker(ErrorCode::ResourceExhausted) => SegmentError::NoSpace,
-                BrokerControlError::Broker(ErrorCode::PolicyDenied) => SegmentError::NotOwner,
-                BrokerControlError::Broker(ErrorCode::UnsupportedOperation) => {
-                    SegmentError::Unavailable
-                }
-                _ => SegmentError::ServiceFailed,
-            }),
-        }
+    fn segment_broker(&self) -> Result<Arc<dyn BrokerControl>, SegmentError> {
+        self.broker_control().ok_or(SegmentError::Unavailable)
     }
 
-    fn segment_done(&self, request: SegmentRequest) -> Result<(), SegmentError> {
-        match self.segment(request)? {
-            SegmentResponse::Done => Ok(()),
-            _ => Err(SegmentError::ServiceFailed),
-        }
-    }
-
-    /// Gets the ID belonging to `key`, optionally creating a zero-filled segment.
-    pub fn get_segment(
-        &self,
-        key: i32,
-        size: u64,
-        mode: u16,
-        create: bool,
-        exclusive: bool,
-    ) -> Result<u32, SegmentError> {
-        match self.segment(SegmentRequest::Get {
-            key,
-            size,
-            mode,
-            create,
-            exclusive,
-        })? {
-            SegmentResponse::Id(id) => Ok(id),
-            _ => Err(SegmentError::ServiceFailed),
-        }
+    /// Gets the ID of the segment with `request.key`, or creates a
+    /// zero-filled one as `request` allows. Key 0 always creates.
+    pub fn get_segment(&self, request: GetSegmentRequest) -> Result<u32, SegmentError> {
+        segment_result(self.segment_broker()?.get_segment(request))
     }
 
     /// Reads the segment's metadata.
     pub fn segment_status(&self, id: u32) -> Result<SegmentStatus, SegmentError> {
-        match self.segment(SegmentRequest::Status { id })? {
-            SegmentResponse::Status(status) => Ok(status),
-            _ => Err(SegmentError::ServiceFailed),
-        }
+        segment_result(self.segment_broker()?.segment_status(id))
     }
 
-    /// Changes the segment's owner and permissions.
-    pub fn set_segment(&self, id: u32, owner: FileUser, mode: u16) -> Result<(), SegmentError> {
-        self.segment_done(SegmentRequest::Set { id, owner, mode })
+    /// Changes the segment's owner and permission bits.
+    pub fn set_segment(&self, request: SetSegmentRequest) -> Result<(), SegmentError> {
+        segment_result(self.segment_broker()?.set_segment(request))
     }
 
-    /// Removes the segment's key, but keeps existing attachments live.
-    pub fn delete_segment(&self, id: u32) -> Result<(), SegmentError> {
-        self.segment_done(SegmentRequest::Delete { id })
+    /// Unpublishes the segment's key; existing attachments keep it alive.
+    pub fn remove_segment(&self, id: u32) -> Result<(), SegmentError> {
+        segment_result(self.segment_broker()?.remove_segment(id))
     }
 
-    /// Obtains backing memory for a provisional attachment.
-    ///
-    /// After mapping succeeds, call [`Self::confirm_segment_attach`]. If mapping
-    /// fails, call [`Self::cancel_segment_attach`] instead. A reservation pins the
-    /// backing memory but does not count as an attachment.
-    pub fn attach_segment<Provider: SharedObjectProvider<ALIGN>, const ALIGN: usize>(
+    /// Reserves an attachment of segment `id` and takes its backing object
+    /// from `platform`.
+    pub fn prepare_segment_attach<Provider: SharedObjectProvider<ALIGN>, const ALIGN: usize>(
         &self,
         platform: &Provider,
         id: u32,
         writable: bool,
-    ) -> Result<
-        (
-            SharedFileObject<Provider::SharedObject>,
-            u64,
-            SegmentAttachId,
-        ),
-        SegmentError,
-    > {
-        let SegmentResponse::AttachPrepared {
-            attachment,
-            mapping,
-            size,
-        } = self.segment(SegmentRequest::Attach { id, writable })?
-        else {
-            return Err(SegmentError::ServiceFailed);
+    ) -> Result<PreparedAttach<Provider::SharedObject>, SegmentError> {
+        let broker = self.segment_broker()?;
+        let prepared = segment_result(
+            broker.prepare_segment_attach(PrepareSegmentAttachRequest { id, writable }),
+        )?;
+        let reservation = AttachReservation {
+            broker,
+            attachment: Some(prepared.attachment),
         };
-        // SAFETY: Attach delivered this handle to this process; it is consumed only here.
-        match unsafe { platform.take_shared_object(mapping.token) } {
-            Ok(object) => Ok((
-                SharedFileObject {
-                    object,
-                    memory: mapping.memory,
-                    may_write: mapping.writable && writable,
-                },
-                size,
-                attachment,
-            )),
-            Err(error) => {
-                if let Err(cancel) = self.cancel_segment_attach(attachment) {
-                    litebox_util_log::warn!(id, cancel:?; "failed to cancel a segment attach");
-                }
-                Err(match error {
-                    SharedObjectReceiveError::UnsupportedByPlatform => SegmentError::Unavailable,
-                    SharedObjectReceiveError::OutOfMemory => SegmentError::NoMemory,
-                    SharedObjectReceiveError::Io => SegmentError::Io,
-                })
-            }
-        }
+        // SAFETY: The broker delivered this handle to this process before answering; it is
+        // taken only here.
+        let object = unsafe { SharedFileObject::take(platform, prepared.mapping) }?;
+        Ok(PreparedAttach {
+            object,
+            size: prepared.size,
+            reservation,
+        })
     }
 
-    /// Records a successfully mapped attachment until [`Self::detach_segment`].
-    pub fn confirm_segment_attach(&self, attachment: SegmentAttachId) -> Result<(), SegmentError> {
-        self.segment_done(SegmentRequest::ConfirmAttach { attachment })
+    /// Replaces this process's attachment count of segment `id`, as splitting
+    /// or releasing its mapped areas changed it. Each later change publishes
+    /// the full count, so it also makes up for an earlier failed one.
+    pub fn set_segment_attachments(&self, id: u32, count: u64) -> Result<(), SegmentError> {
+        segment_result(
+            self.segment_broker()?
+                .set_segment_attachments(SetSegmentAttachmentsRequest { id, count }),
+        )
     }
 
-    /// Releases an unused provisional attachment without changing segment metadata.
-    pub fn cancel_segment_attach(&self, attachment: SegmentAttachId) -> Result<(), SegmentError> {
-        self.segment_done(SegmentRequest::CancelAttach { attachment })
-    }
-
-    /// Releases an attachment, including one inherited by a child process.
-    pub fn detach_segment(&self, id: u32) -> Result<(), SegmentError> {
-        self.segment_done(SegmentRequest::Detach { id })
-    }
-
-    /// Adjusts a confirmed attachment count when mapped regions split or are released.
-    pub fn adjust_segment_attachments(&self, id: u32, delta: i64) -> Result<(), SegmentError> {
-        self.segment_done(SegmentRequest::AdjustAttachments { id, delta })
-    }
-
-    /// Copies this process's attachments to pending child `target`, which inherits its
-    /// address space.
+    /// Copies this process's attachments to pending child `target`, which
+    /// inherits its address space.
     pub fn inherit_segments(&self, target: ProcessId) -> Result<(), SegmentError> {
-        self.segment_done(SegmentRequest::Inherit { target })
-    }
-
-    /// Moves this process or its pending child to an empty namespace. Existing attachments live on.
-    pub fn new_segment_namespace(&self, target: ProcessId) -> Result<(), SegmentError> {
-        self.segment_done(SegmentRequest::NewNamespace { target })
+        segment_result(self.segment_broker()?.inherit_segments(target))
     }
 }

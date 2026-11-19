@@ -46,10 +46,10 @@ use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
     ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse,
-    ReadinessQueueRequest, ReadinessQueueResponse, SharedFutexRequest, SharedFutexResponse,
-    SignalRequest, SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse,
-    TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse, VsockSocketRequest,
-    VsockSocketResponse,
+    ReadinessQueueRequest, ReadinessQueueResponse, SegmentRequest, SegmentResponse,
+    SharedFutexRequest, SharedFutexResponse, SignalRequest, SignalResponse, SocketRequest,
+    SocketResponse, ThreadRequest, ThreadResponse, TimerRequest, TimerResponse, UnixSocketRequest,
+    UnixSocketResponse, VsockSocketRequest, VsockSocketResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -545,11 +545,7 @@ fn handle_request<Memory: SharedMemory>(
                 .map(BrokerResult::SharedFutex)
         }
         BrokerOperation::Segment(request) => {
-            litebox_broker_core::segment::operate(process, request, None, |_, _, _| {
-                Err(FileError::NoSuchDevice)
-            })
-            .map(BrokerResult::Segment)
-            .map_err(RequestFailure::from)
+            handle_segment_request(process, request).map(BrokerResult::Segment)
         }
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
@@ -605,9 +601,6 @@ fn handle_process_request<Memory: SharedMemory>(
         }) => process
             .allocate_child_process(new_pid_namespace, sibling)
             .map(ProcessResponse::AllocateChild),
-        ProcessRequest::CreateChildrenPidNamespace(options) => process
-            .create_children_pid_namespace(options)
-            .map(|()| ProcessResponse::CreateChildrenPidNamespace),
         ProcessRequest::CreateNamespaces(request) => process
             .create_namespaces(request)
             .map(|()| ProcessResponse::CreateNamespaces),
@@ -673,9 +666,6 @@ fn handle_process_request<Memory: SharedMemory>(
                 .set_host_name(process_id, kind, name)
                 .map(|()| ProcessResponse::SetHostName)
         }
-        ProcessRequest::CopyHostNames(process_id) => process
-            .copy_host_names(process_id)
-            .map(|()| ProcessResponse::CopyHostNames),
         ProcessRequest::OpenProcessHandle(request) => process
             .open_process_handle(request.process_id, request.flags, readiness_sink)
             .map(ProcessResponse::OpenProcessHandle),
@@ -2109,6 +2099,43 @@ fn handle_event_request(
                 .map_err(RequestFailure::from)
         }
     }
+}
+
+/// Handles a keyed shared segment request. Without a deployment that delivers
+/// shared objects, a segment cannot be attached.
+fn handle_segment_request(
+    process: &BrokerProcess,
+    request: SegmentRequest,
+) -> RequestResult<SegmentResponse> {
+    use litebox_broker_core::segment;
+
+    let response = match request {
+        SegmentRequest::Get(request) => segment::get(process, request)?.map(SegmentResponse::Get),
+        SegmentRequest::Status(id) => segment::status(process, id)?.map(SegmentResponse::Status),
+        SegmentRequest::Set(request) => {
+            segment::set(process, request)?.map(|()| SegmentResponse::Set)
+        }
+        SegmentRequest::Remove(id) => {
+            segment::remove(process, id)?.map(|()| SegmentResponse::Remove)
+        }
+        SegmentRequest::PrepareAttach(request) => {
+            segment::prepare_attach(process, request, |_, _, _| Err(FileError::NoSuchDevice))?
+                .map(SegmentResponse::PrepareAttach)
+        }
+        SegmentRequest::ConfirmAttach(attachment) => {
+            segment::confirm_attach(process, attachment)?.map(|()| SegmentResponse::ConfirmAttach)
+        }
+        SegmentRequest::CancelAttach(attachment) => {
+            segment::cancel_attach(process, attachment)?.map(|()| SegmentResponse::CancelAttach)
+        }
+        SegmentRequest::SetAttachments(request) => {
+            segment::set_attachments(process, request)?.map(|()| SegmentResponse::SetAttachments)
+        }
+        SegmentRequest::Inherit(target) => {
+            segment::inherit(process, target)?.map(|()| SegmentResponse::Inherit)
+        }
+    };
+    Ok(response.unwrap_or_else(SegmentResponse::Failed))
 }
 
 fn handle_shared_futex_request(

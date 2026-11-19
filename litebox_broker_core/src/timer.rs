@@ -22,10 +22,9 @@ use crate::{BrokerError, BrokerProcess, Result};
 
 /// Trusted provider of the broker's monotonic clock and timer alarms.
 pub trait TimerProvider: Send + Sync {
-    /// Seconds since the Unix epoch, or zero when no wall clock is available.
-    fn unix_seconds(&self) -> u64 {
-        0
-    }
+    /// Seconds since the Unix epoch on the wall clock, or zero if the
+    /// deployment has none.
+    fn unix_seconds(&self) -> u64;
 
     /// Returns the current time on a monotonic clock with a fixed origin.
     fn now(&self) -> Duration;
@@ -51,6 +50,10 @@ pub trait Alarm: Send + Sync {
 pub struct UnsupportedTimerProvider;
 
 impl TimerProvider for UnsupportedTimerProvider {
+    fn unix_seconds(&self) -> u64 {
+        0
+    }
+
     fn now(&self) -> Duration {
         Duration::ZERO
     }

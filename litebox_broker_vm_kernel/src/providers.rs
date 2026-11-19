@@ -131,6 +131,7 @@ pub(crate) fn core(
         vsock,
         Arc::clone(&random),
         timers,
+        None,
     )
     .unwrap_or_else(|error| panic!("broker core: {error:?}"));
     let pid_namespace = PidNamespace::with_options(&core, pid_namespace)

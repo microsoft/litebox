@@ -33,7 +33,10 @@ use litebox_broker_protocol::readiness_queue::{
     MAX_READINESS_QUEUE_EVENTS, READY_EVENT_SIZE, ReadinessQueueError, ReadinessQueueInterest,
     ReadyEvent,
 };
-use litebox_broker_protocol::segment::{SegmentRequest, SegmentResponse};
+use litebox_broker_protocol::segment::{
+    GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
+    SegmentStatus, SetSegmentAttachmentsRequest, SetSegmentRequest,
+};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -64,6 +67,10 @@ mod shared_buffer;
 use error::BrokerControlError;
 use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 
+/// The outcome of a segment request: a guest-visible result, or a failure of the request.
+pub(crate) type SegmentControlResult<T> =
+    core::result::Result<core::result::Result<T, FileError>, BrokerControlError>;
+
 /// Local-core access to the negotiated broker control channel.
 ///
 /// LiteBox owns broker-backed local objects and constructs broker protocol
@@ -74,18 +81,11 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
-    fn segment(&self, request: SegmentRequest) -> Result<SegmentResponse, BrokerControlError>;
-
     fn allocate_child_process(
         &self,
         new_pid_namespace: Option<PidNamespaceOptions>,
         sibling: bool,
     ) -> core::result::Result<ProcessIdentity, BrokerControlError>;
-
-    fn create_children_pid_namespace(
-        &self,
-        options: PidNamespaceOptions,
-    ) -> core::result::Result<(), BrokerControlError>;
 
     fn create_namespaces(
         &self,
@@ -192,11 +192,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         process_id: litebox_broker_protocol::ProcessId,
         kind: HostNameKind,
         name: &HostName,
-    ) -> core::result::Result<(), BrokerControlError>;
-
-    fn copy_host_names(
-        &self,
-        process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn get_parent_exit_signal(
@@ -529,6 +524,33 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         end: u64,
     ) -> core::result::Result<core::result::Result<MapFileResponse, FileError>, BrokerControlError>;
+
+    fn get_segment(&self, request: GetSegmentRequest) -> SegmentControlResult<u32>;
+
+    fn segment_status(&self, id: u32) -> SegmentControlResult<SegmentStatus>;
+
+    fn set_segment(&self, request: SetSegmentRequest) -> SegmentControlResult<()>;
+
+    fn remove_segment(&self, id: u32) -> SegmentControlResult<()>;
+
+    fn prepare_segment_attach(
+        &self,
+        request: PrepareSegmentAttachRequest,
+    ) -> SegmentControlResult<PreparedSegmentAttach>;
+
+    fn confirm_segment_attach(&self, attachment: SegmentAttachId) -> SegmentControlResult<()>;
+
+    fn cancel_segment_attach(&self, attachment: SegmentAttachId) -> SegmentControlResult<()>;
+
+    fn set_segment_attachments(
+        &self,
+        request: SetSegmentAttachmentsRequest,
+    ) -> SegmentControlResult<()>;
+
+    fn inherit_segments(
+        &self,
+        target: litebox_broker_protocol::ProcessId,
+    ) -> SegmentControlResult<()>;
 
     fn read_directory(
         &self,
@@ -999,13 +1021,6 @@ where
         self.request(|local| local.allocate_child_process(new_pid_namespace, sibling))
     }
 
-    fn create_children_pid_namespace(
-        &self,
-        options: PidNamespaceOptions,
-    ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.create_children_pid_namespace(options))
-    }
-
     fn create_namespaces(
         &self,
         request: CreateNamespacesRequest,
@@ -1188,13 +1203,6 @@ where
     ) -> core::result::Result<(), BrokerControlError> {
         let lease = self.acquire_shared_buffer(name.as_bytes().len())?;
         self.request(|local| local.set_host_name(process_id, kind, lease.sequence(), name))
-    }
-
-    fn copy_host_names(
-        &self,
-        process_id: litebox_broker_protocol::ProcessId,
-    ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.copy_host_names(process_id))
     }
 
     fn get_parent_exit_signal(
@@ -1737,8 +1745,49 @@ where
         self.request(|local| local.map_file(handle, end))
     }
 
-    fn segment(&self, request: SegmentRequest) -> Result<SegmentResponse, BrokerControlError> {
-        self.request(|local| local.segment(request))
+    fn get_segment(&self, request: GetSegmentRequest) -> SegmentControlResult<u32> {
+        self.request(|local| local.get_segment(request))
+    }
+
+    fn segment_status(&self, id: u32) -> SegmentControlResult<SegmentStatus> {
+        self.request(|local| local.segment_status(id))
+    }
+
+    fn set_segment(&self, request: SetSegmentRequest) -> SegmentControlResult<()> {
+        self.request(|local| local.set_segment(request))
+    }
+
+    fn remove_segment(&self, id: u32) -> SegmentControlResult<()> {
+        self.request(|local| local.remove_segment(id))
+    }
+
+    fn prepare_segment_attach(
+        &self,
+        request: PrepareSegmentAttachRequest,
+    ) -> SegmentControlResult<PreparedSegmentAttach> {
+        self.request(|local| local.prepare_segment_attach(request))
+    }
+
+    fn confirm_segment_attach(&self, attachment: SegmentAttachId) -> SegmentControlResult<()> {
+        self.request(|local| local.confirm_segment_attach(attachment))
+    }
+
+    fn cancel_segment_attach(&self, attachment: SegmentAttachId) -> SegmentControlResult<()> {
+        self.request(|local| local.cancel_segment_attach(attachment))
+    }
+
+    fn set_segment_attachments(
+        &self,
+        request: SetSegmentAttachmentsRequest,
+    ) -> SegmentControlResult<()> {
+        self.request(|local| local.set_segment_attachments(request))
+    }
+
+    fn inherit_segments(
+        &self,
+        target: litebox_broker_protocol::ProcessId,
+    ) -> SegmentControlResult<()> {
+        self.request(|local| local.inherit_segments(target))
     }
 
     fn read_directory(

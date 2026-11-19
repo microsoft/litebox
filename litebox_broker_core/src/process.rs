@@ -252,7 +252,7 @@ pub struct BrokerProcess {
     pub(crate) segments: Mutex<crate::segment::ProcessSegments>,
     pub(crate) core: Arc<BrokerCore>,
     /// The PID namespace this process's later children get their IDs in, if
-    /// not its own (see [`Self::create_children_pid_namespace`]).
+    /// not its own (see [`Self::create_namespaces`]).
     ///
     /// No other lock is taken while this one is held.
     children_namespace: Mutex<Option<Arc<PidNamespace>>>,
@@ -328,7 +328,7 @@ struct ProcessResourceLimits {
 }
 
 /// Host names that processes share until one takes a copy (see
-/// [`BrokerProcess::copy_host_names`]).
+/// [`BrokerProcess::create_namespaces`]).
 ///
 /// No other lock is taken while this one is held.
 pub(crate) struct SharedHostNames(Mutex<HostNames>);
@@ -862,27 +862,32 @@ impl BrokerProcess {
         Ok(child)
     }
 
-    /// Gives the children this process creates later a new PID namespace with
-    /// `options`, nested in this process's.
+    /// Applies a set of namespace changes to this process or its pending
+    /// child `request.process_id`, leaving all the existing namespaces intact
+    /// on failure.
     ///
-    /// Returns `UnsupportedOperation` if this process's children already go
-    /// to another PID namespace, and `ResourceExhausted` if the namespace
-    /// can't be created.
-    pub fn create_children_pid_namespace(&self, options: PidNamespaceOptions) -> Result<()> {
-        let pid_namespace = self.new_nested_pid_namespace(options)?;
-        // Another call may have given the children a namespace since the
-        // check. The guard drops before the unused namespace does.
-        let mut children_namespace = self.children_namespace.lock();
-        if children_namespace.is_some() {
+    /// Returns `UnknownObject` if the target is neither, and
+    /// `UnsupportedOperation` if the request asks for a children's PID
+    /// namespace for a pending child or while this process's children already
+    /// go to another one. Returns `ResourceExhausted` if that namespace can't
+    /// be created, and `PolicyDenied` for a new segment namespace unless the
+    /// segment principal is privileged and the process may write.
+    pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<()> {
+        if request.new_segment_namespace {
+            self.require_object_rights(ObjectRights::WAIT | ObjectRights::WRITE)?;
+            if !self.core.policy.segment_principal.privileged {
+                return Err(BrokerError::PolicyDenied);
+            }
+        }
+        if request.children_pid_namespace.is_some() && request.process_id != self.id() {
             return Err(BrokerError::UnsupportedOperation);
         }
-        *children_namespace = Some(pid_namespace);
-        Ok(())
-    }
-
-    /// Applies a set of namespace changes to this process or its pending
-    /// child, leaving all the existing namespaces intact on failure.
-    pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<()> {
+        // Declared before the guards below, so that an unused namespace drops
+        // after them.
+        let pid_namespace = request
+            .children_pid_namespace
+            .map(|options| self.new_nested_pid_namespace(options))
+            .transpose()?;
         let mut state = self.state.lock();
         if !self.accepts_operations(&state) {
             return Err(BrokerError::PeerClosed);
@@ -890,54 +895,29 @@ impl BrokerProcess {
         let target = if request.process_id == self.id() {
             self
         } else {
-            if request.children_pid_namespace.is_some() {
-                return Err(BrokerError::UnsupportedOperation);
-            }
             &self.pending_child(&mut state, request.process_id)?.process
         };
-        let _child_state = if core::ptr::eq(target, self) {
-            None
-        } else {
-            let child_state = target.state.lock();
-            if !target.awaits_startup(&child_state) {
-                return Err(BrokerError::PeerClosed);
-            }
-            Some(child_state)
-        };
-        if request.new_segment_namespace {
-            // Use the broker's segment principal and rights, not a guest credential.
-            self.require_object_rights(ObjectRights::WAIT | ObjectRights::WRITE)?;
-            if self.core.policy.segment_user.user != 0 {
-                return Err(BrokerError::PolicyDenied);
-            }
-        }
+        // Holding the child's state keeps it pending until the changes are made.
+        let _child_state = (!core::ptr::eq(target, self)).then(|| target.state.lock());
 
-        let pid_change = if let Some(options) = request.children_pid_namespace {
-            let children_namespace = self.children_namespace.lock();
+        // The only check left, last since its lock may not nest another. Each
+        // later change locks only its own namespace and cannot fail.
+        if let Some(pid_namespace) = pid_namespace {
+            let mut children_namespace = self.children_namespace.lock();
             if children_namespace.is_some() {
                 return Err(BrokerError::UnsupportedOperation);
             }
-            let new_namespace = PidNamespace::new_child(self.pid_namespace(), self, options)?;
-            Some((children_namespace, new_namespace))
-        } else {
-            None
-        };
-        let mut host_names = request.copy_host_names.then(|| target.host_names.lock());
-        let mut segments = request
-            .new_segment_namespace
-            .then(|| target.segments.lock());
-
-        // All fallible checks and quota reservations are done. Publish while
-        // still holding the locks for each affected namespace.
-        if let Some(shared) = &mut host_names {
+            *children_namespace = Some(pid_namespace);
+        }
+        if request.copy_host_names {
+            let mut shared = target.host_names.lock();
             let copy = SharedHostNames::new(shared.0.lock().clone());
-            **shared = Arc::new(copy);
+            let previous = core::mem::replace(&mut *shared, Arc::new(copy));
+            drop(shared);
+            drop(previous);
         }
-        if let Some(segments) = &mut segments {
-            segments.reset_namespace();
-        }
-        if let Some((mut children_namespace, new_namespace)) = pid_change {
-            *children_namespace = Some(new_namespace);
+        if request.new_segment_namespace {
+            target.segments.lock().reset_namespace();
         }
         Ok(())
     }
@@ -971,7 +951,7 @@ impl BrokerProcess {
     /// even if it exits before starting its own runner.
     ///
     /// The child gets its IDs in this process's namespace for its children
-    /// (see [`Self::create_children_pid_namespace`]), or, if
+    /// (see [`Self::create_namespaces`]), or, if
     /// `new_pid_namespace` gives options, in a new namespace with those
     /// options nested in this process's, which returns `UnsupportedOperation`
     /// if this process's children already go to another namespace. Its parent
@@ -1436,19 +1416,6 @@ impl BrokerProcess {
                 HostNameKind::Domain => names.domain = name,
             }
         })
-    }
-
-    /// Replaces the host names of this process or of its pending child
-    /// `target` with a copy that no other process shares.
-    ///
-    /// Returns `UnknownObject` if `target` is neither.
-    pub fn copy_host_names(&self, target: ProcessId) -> Result<()> {
-        self.with_host_names_of(target, |shared| {
-            let mut shared = shared.lock();
-            let copy = SharedHostNames::new(shared.0.lock().clone());
-            core::mem::replace(&mut *shared, Arc::new(copy))
-        })
-        .map(drop)
     }
 
     /// Calls `f` with the host names of this process or of its pending child
@@ -4475,11 +4442,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_pid_namespace_reservation_keeps_host_names_shared() {
+    fn failed_pid_namespace_reservation_keeps_other_namespaces_shared() {
         let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true)
-                .with_segment_user(ROOT),
+                .with_segment_principal(crate::SegmentPrincipal {
+                    user: ROOT,
+                    privileged: true,
+                }),
         )
         .with_limits(BrokerCoreLimits {
             max_pid_namespaces_per_process: 0,
@@ -4511,6 +4481,26 @@ mod tests {
             &root.children_namespace(),
             root.pid_namespace()
         ));
+        let child = root.take_child_process(child_id).unwrap();
+        assert!(
+            root.segments
+                .lock()
+                .shares_namespace_with(&child.segments.lock())
+        );
+        // Without the PID namespace, the same request succeeds.
+        root.create_namespaces(CreateNamespacesRequest {
+            process_id: root.id(),
+            children_pid_namespace: None,
+            new_segment_namespace: true,
+            copy_host_names: true,
+        })
+        .unwrap();
+        assert!(
+            !root
+                .segments
+                .lock()
+                .shares_namespace_with(&child.segments.lock())
+        );
     }
 
     #[test]
@@ -4542,7 +4532,13 @@ mod tests {
             root.get_host_names(root_id).unwrap().host,
             host_name(b"shared")
         );
-        root.copy_host_names(child_id).unwrap();
+        root.create_namespaces(CreateNamespacesRequest {
+            process_id: child_id,
+            children_pid_namespace: None,
+            new_segment_namespace: false,
+            copy_host_names: true,
+        })
+        .unwrap();
         root.set_host_name(child_id, HostNameKind::Host, host_name(b"child"))
             .unwrap();
         assert_eq!(
