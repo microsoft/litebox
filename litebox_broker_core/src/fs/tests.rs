@@ -4160,7 +4160,7 @@ mod credentials {
     };
     use crate::fs::in_mem::InitialNode;
     use crate::fs::resolver::{Caller, ResolverEntry};
-    use crate::fs::shared_storage::test_memory::{VecMemoryProvider, exported_writable};
+    use crate::fs::shared_storage::test_memory::VecMemoryProvider;
     use crate::fs::shared_storage::{DEFAULT_MAX_SHARED_FILES, SharedFileLimit};
     use crate::fs::{FileTimeUpdate, FileTimestamp, SetFileTimes};
     use crate::random::TestRandomProvider;
@@ -5271,56 +5271,64 @@ mod credentials {
     }
 
     #[test]
-    fn shared_mappings_are_never_writable() {
+    fn credentialed_opens_cannot_export_live_shared_files() {
+        use crate::fs::errors::MapSharedError;
+
         let alice = Credentials::new(ALICE);
+        let limit = Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES));
         let fs = Resolver::<TestPlatform, _>::with_credentials(
             InMem::<TestPlatform>::new_initialized(
                 [("/", dir(ALL, posix(CAROL)))],
                 InodeAllocators::new().next(),
             )
-            .with_shared_memory(
-                Arc::new(VecMemoryProvider::new(false)),
-                Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
-            ),
+            .with_shared_memory(Arc::new(VecMemoryProvider::new(false)), Arc::clone(&limit)),
             profile(),
         );
-        // Grants could be added after mapping even a file without any.
-        create(&fs, &alice, "/file", ALL);
-        let mut entry = fs
-            .open(alice.caller(), "/file", OFlags::RDWR, Mode::empty())
-            .unwrap();
-        fs.write_as(alice.caller(), &mut entry, b"data", None)
-            .unwrap();
-        let mapping = fs.map_shared(&entry).unwrap();
-        assert!(!mapping.writable());
-        assert!(!exported_writable(&*mapping.host_handle(4).unwrap()));
+        for (path, mode) in [("/file", ALL), ("/program", ALL | Mode::SUID)] {
+            create(&fs, &alice, path, mode);
+            for flags in [OFlags::RDONLY, OFlags::RDWR] {
+                let entry = fs.open(alice.caller(), path, flags, Mode::empty()).unwrap();
+                assert!(matches!(
+                    fs.map_shared(&entry),
+                    Err(MapSharedError::Unsupported)
+                ));
+            }
+        }
+        assert_eq!(limit.live(), 0);
     }
 
     #[test]
     fn checked_truncation_of_mapped_files_changes_all_or_nothing() {
-        let (alice, bob) = (Credentials::new(ALICE), Credentials::new(BOB));
-        let manager = Credentials::with_privileges(ALICE, Privileges::MANAGE_ELEVATION);
+        use crate::fs::backend::{Resolution, ResolvedTarget};
+
+        let bob = Credentials::new(BOB);
         // The memory can be shrunk while mapped only by a fallback that could fail partway.
         let provider = Arc::new(VecMemoryProvider::new(false).refusing_atomic_shrink());
-        let fs = Resolver::<TestPlatform, _>::with_credentials(
-            InMem::<TestPlatform>::new_initialized(
-                [("/", dir(ALL, posix(CAROL)))],
-                InodeAllocators::new().next(),
-            )
-            .with_shared_memory(
-                provider.clone(),
-                Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
-            ),
-            profile(),
-        );
         let elevated = ALL | Mode::SUID;
-        create(&fs, &alice, "/program", elevated);
+        let backend = InMem::<TestPlatform>::new_initialized(
+            [("/program", file(elevated, posix(ALICE)))],
+            InodeAllocators::new().next(),
+        )
+        .with_shared_memory(
+            provider.clone(),
+            Arc::new(SharedFileLimit::new(DEFAULT_MAX_SHARED_FILES)),
+        );
+        // Set up shared backing inside the broker, without exporting it to a subject.
+        {
+            let Resolution::Found(ResolvedTarget::File(file)) = backend
+                .resolve(backend.root().unwrap(), &["program"], &|_| Ok(()))
+                .unwrap()
+            else {
+                panic!("expected the initialized file");
+            };
+            backend
+                .map_shared(&backend.open_file(file, OFlags::RDONLY).unwrap())
+                .unwrap();
+        }
+        let fs = Resolver::<TestPlatform, _>::with_credentials(backend, profile());
         let mut entry = fs
             .open(bob.caller(), "/program", OFlags::RDWR, Mode::empty())
             .unwrap();
-        fs.write_as(manager.caller(), &mut entry, b"data", None)
-            .unwrap();
-        fs.map_shared(&entry).unwrap();
         let memory = provider.last();
         let mode = || status(&fs, "/program").0;
 

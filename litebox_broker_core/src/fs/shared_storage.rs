@@ -39,8 +39,9 @@ pub trait SharedFileObject: Send + Sync {
     /// `end`, a byte offset that may lie past the end of the file, and written only if
     /// `writable` is set.
     ///
-    /// The handle itself must carry no more rights than that, whoever holds it: never, for
-    /// example, a writable handle to the host file holding the contents for a read-only export.
+    /// The handle itself must carry no more rights than that: never, for example, a writable
+    /// file handle for a read-only export. This does not guarantee that the host prevents the
+    /// recipient from independently acquiring stronger rights to the same storage.
     fn host_handle(
         &self,
         writable: bool,

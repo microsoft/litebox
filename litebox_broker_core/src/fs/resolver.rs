@@ -2159,9 +2159,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// file is open for writing too, as Linux allows of a shared mapping that `mprotect` may
     /// later make writable. Holders of the returned right can only narrow it.
     ///
-    /// On a resolver built with [`Self::with_credentials`], the object may never be mapped
-    /// writable: stores through a mapping change contents without the resolver, so nothing would
-    /// remove the elevation grants (see [`Self::write_as`]) that the file has or gains later.
+    /// A resolver built with [`Self::with_credentials`] returns [`MapSharedError::Unsupported`]
+    /// for readable files. A read-only native handle does not establish that the receiver
+    /// cannot obtain write access to the same storage. Writes outside the resolver would
+    /// bypass [`Self::write_as`], including for elevation grants added after the export.
     pub fn map_shared(
         &self,
         entry: &ResolverEntry<Backend>,
@@ -2178,10 +2179,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         if !entry.read_allowed {
             return Err(MapSharedError::NotForReading);
         }
+        if self.profile.is_some() {
+            return Err(MapSharedError::Unsupported);
+        }
         let file = self.backend.map_shared(file)?;
         Ok(super::shared_storage::SharedMapping::new(
             file,
-            entry.write_allowed && self.profile.is_none(),
+            entry.write_allowed,
         ))
     }
 }
