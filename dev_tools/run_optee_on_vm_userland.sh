@@ -17,8 +17,8 @@
 #
 # Runner processes' standard streams are a virtio console, backed by files:
 # TA output must reach it, and in debug builds, whose runners echo standard
-# input, so must the line fed to it. Cloud Hypervisor's console is a Unix
-# socket instead, which a relay connects the files to.
+# input, so must the line fed to it. Under Cloud Hypervisor, whose file
+# console takes no input, the input is not checked.
 #
 # Usage: dev_tools/run_optee_on_vm_userland.sh [-t <test>]... [-u] [-r] [-v]
 #   -t   test to run, e.g. ta-death or hello-ta; append @default to a TA to
@@ -109,9 +109,8 @@ prepare() {
 
 STDIN_LINE="hello from the host"
 
-# The virtio console for test $1, with its files: $WORK/$1.stdin, its input,
-# and $WORK/$1.stdout, its output (for Cloud Hypervisor, through
-# relay_console).
+# The virtio console for test $1, with its files: $WORK/$1.stdin, its input
+# (unused under Cloud Hypervisor), and $WORK/$1.stdout, its output.
 console_args() {
     printf '%s\n' "$STDIN_LINE" >"$WORK/$1.stdin"
     : >"$WORK/$1.stdout"
@@ -121,46 +120,11 @@ console_args() {
                 -chardev "file,id=con0,path=$WORK/$1.stdout,input-path=$WORK/$1.stdin" \
                 -device virtconsole,chardev=con0,bus=vs0.0
             ;;
-        cloud-hypervisor) echo --console "socket=$WORK/$1.console" ;;
+        cloud-hypervisor) echo --console "file=$WORK/$1.stdout" ;;
     esac
 }
 
-# Connects to the Unix socket $1 once it listens (within $4 seconds), sends
-# file $2, then appends what it receives to file $3 until EOF.
-CONSOLE_RELAY='
-import socket, sys, time
-deadline = time.monotonic() + float(sys.argv[4])
-while True:
-    console = socket.socket(socket.AF_UNIX)
-    try:
-        console.connect(sys.argv[1])
-        break
-    except OSError as error:
-        console.close()
-        if time.monotonic() > deadline:
-            sys.exit(f"the console did not listen in time: {error}")
-        time.sleep(0.01)
-with open(sys.argv[2], "rb") as stdin:
-    console.sendall(stdin.read())
-with open(sys.argv[3], "ab") as stdout:
-    while data := console.recv(65536):
-        stdout.write(data)
-        stdout.flush()
-'
-
-# Cloud Hypervisor's console socket for test $1, connected to its files (see
-# console_args), until the VM ends: the test's host client. The VMM buffers
-# input until the guest takes it, and output until this connects.
-relay_console() {
-    python3 -c "$CONSOLE_RELAY" "$WORK/$1.console" "$WORK/$1.stdin" "$WORK/$1.stdout" "$TIMEOUT"
-}
-[[ $VMM != cloud-hypervisor ]] || client=relay_console
-
-# Run check: TA output, and the echoed input, on the console; under Cloud
-# Hypervisor, also the kernel's success line. The relay ends at its console's
-# EOF, which a VM reset (e.g., a triple fault, which Cloud Hypervisor turns
-# into a reboot) brings too, and run_vm counts a VM its client stopped as a
-# pass.
+# Run check: TA output, and (under QEMU) the echoed input, on the console.
 check_console() {
     local out="$WORK/$1.stdout"
     if [[ ${verbose:-0} -ne 0 ]]; then
@@ -168,12 +132,8 @@ check_console() {
         cat "$out" >&2
         echo "---" >&2
     fi
-    if [[ $VMM == cloud-hypervisor ]] && ! grep -qF "$EXIT_SUCCESS" "$WORK/$1.log"; then
-        echo "guest did not report success"
-        return 1
-    fi
     grep -q "/TA:" "$out" || { echo "no TA output on the console"; return 1; }
-    if [[ $profile == debug ]] && ! grep -qF "[stdin] $STDIN_LINE" "$out"; then
+    if [[ $VMM == qemu && $profile == debug ]] && ! grep -qF "[stdin] $STDIN_LINE" "$out"; then
         echo "standard input was not echoed on the console"
         return 1
     fi

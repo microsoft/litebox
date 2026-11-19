@@ -246,15 +246,14 @@ jobs:
         run: |
           QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
-      - name: Run static and dynamic Linux programs in a Cloud Hypervisor VM with stacked runners on 2 CPUs with RAM above 4 GiB
-        # Skips the tests of QEMU's user network and virtio-9p.
+      - name: Smoke-test Linux programs and OP-TEE TAs in a Cloud Hypervisor VM with stacked runners on 2 CPUs
+        # What differs from QEMU: power-off, CPU startup, the memory map, and
+        # the console and vsock devices. The QEMU steps run the full suites.
         run: |
-          VMM=cloud-hypervisor QEMU_MEM=6G QEMU_SMP=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
-            ./dev_tools/run_linux_on_vm_userland.sh
-      - name: Run OP-TEE TAs in a Cloud Hypervisor VM with stacked runners on 2 CPUs
-        run: |
-          VMM=cloud-hypervisor QEMU_SMP=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
-            ./dev_tools/run_optee_on_vm_userland.sh
+          export VMM=cloud-hypervisor QEMU_SMP=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build"
+          QEMU_MEM=6G ./dev_tools/run_linux_on_vm_userland.sh \
+            -t hello -t pid1 -t smp -t highmem -t console_flood -t vsock_hybrid
+          ./dev_tools/run_optee_on_vm_userland.sh -t hello-ta
       - name: Save vhost-device-vsock
         if: github.event_name != 'merge_group' && steps.vhost-device-vsock.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
