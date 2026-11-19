@@ -27,10 +27,10 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
 use super::backend::{
-    AuthorizeRemoval, AuthorizeRename, Backend, BackendHandles, CreationMetadata, DirHandle,
-    EntryRemoval, EntryRename, FileHandle, HandleRef, OpenChecks, PermissionCheck, PermissionInfo,
-    Resolution, ResolvedDir as ScopedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
-    status_descriptor,
+    AuthorizeRemoval, AuthorizeRename, AuthorizeUse, Backend, BackendHandles, ContentChange,
+    CreationMetadata, DirHandle, EntryRemoval, EntryRename, FileHandle, HandleRef, OpenChecks,
+    PermissionCheck, PermissionInfo, Resolution, ResolvedDir as ScopedDir, ResolvedFile,
+    ResolvedTarget, SeekBehavior, status_descriptor,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
@@ -154,6 +154,11 @@ enum OverlayFileLayer {
         handle: FileHandle,
         /// The overlay identity of the file, under which a later copy-up records its upper handle.
         node: NodeInfo,
+        /// The logical path of the directory the file was opened in, and its name there. Renames
+        /// refuse lower-backed files and the directories holding them, so until a copy-up, this
+        /// finds the file unless it was removed or hidden.
+        parent: Vec<String>,
+        name: String,
     },
 }
 
@@ -368,21 +373,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         resolved: ResolvedDir,
         locked: NamespaceGuard<'a, Platform>,
     ) -> Result<ScopedDir<'a>, OpenError> {
-        let (_, backend, handle) = self.owning_dir(&resolved).ok_or(OpenError::Io)?;
-        let dir = ResolvedTarget::Dir(backend.walking_dir_at(handle).ok_or(OpenError::Io)?);
-        let status = backend
-            .resolved_status(&dir)
-            .map_err(file_status_to_open_error)?;
-        let permissions = layered_permissions(dir.permissions(), &status);
-        drop(dir);
-        let permissions =
-            if broker_descriptor(&permissions).is_none() || self.lowers_broker_owned(&resolved)? {
-                permissions
-            } else {
-                // Legacy resolvers check the owning layer's metadata as before; resolvers that
-                // authorize subjects refuse to search, list, or change the merged directory.
-                PermissionCheck::ByResolver(PermissionInfo::reported_posix(&status, false))
-            };
+        let permissions = self.dir_permissions(&resolved)?;
         Ok(ScopedDir::from_typed::<Self>(
             OverlayWalkingDir {
                 path,
@@ -391,6 +382,41 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             },
             permissions,
         ))
+    }
+
+    /// The permissions of the directory `resolved`, which the caller holds the namespace lock
+    /// for.
+    fn dir_permissions(&self, resolved: &ResolvedDir) -> Result<PermissionCheck, OpenError> {
+        let (_, backend, handle) = self.owning_dir(resolved).ok_or(OpenError::Io)?;
+        let dir = ResolvedTarget::Dir(backend.walking_dir_at(handle).ok_or(OpenError::Io)?);
+        let status = backend
+            .resolved_status(&dir)
+            .map_err(file_status_to_open_error)?;
+        let permissions = layered_permissions(dir.permissions(), &status);
+        drop(dir);
+        Ok(
+            if broker_descriptor(&permissions).is_none() || self.lowers_broker_owned(resolved)? {
+                permissions
+            } else {
+                // Legacy resolvers check the owning layer's metadata as before; resolvers that
+                // authorize subjects refuse to search, list, or change the merged directory.
+                PermissionCheck::ByResolver(PermissionInfo::reported_posix(&status, false))
+            },
+        )
+    }
+
+    /// Whether `authorize` allows a use of the directory that `handle` opened, as it is now
+    /// resolved, under the namespace lock `locked`.
+    fn authorize_dir(
+        &self,
+        locked: &NamespaceGuard<'_, Platform>,
+        handle: &OverlayDir,
+        authorize: AuthorizeUse<'_>,
+    ) -> Result<(ResolvedDir, bool), OpenError> {
+        let (resolved, _) = self.opened_dir(locked, handle)?;
+        let permissions = self.dir_permissions(&resolved)?;
+        let allowed = broker_descriptor(&permissions).is_some_and(authorize);
+        Ok((resolved, allowed))
     }
 
     /// Copy the lower file `lower` up into the upper backend as `name` within `upper_dir`.
@@ -1422,6 +1448,8 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                     layer,
                     handle: file,
                     node,
+                    parent,
+                    name,
                 }
             }
         } else {
@@ -2271,6 +2299,76 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })?
     }
 
+    // Changing a lower-backed file copies it up, which needs the path it was opened at; a
+    // directory handle re-resolves its path, as all its uses do. Either refuses once the path no
+    // longer leads to the object opened.
+    fn set_handle_times_checked(
+        &self,
+        h: HandleRef<'_>,
+        times: &super::SetFileTimes,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), super::errors::SetTimesError>,
+    ) -> Result<(), super::errors::SetTimesError> {
+        use super::errors::SetTimesError;
+        let locked = self.namespace.lock();
+        let target = match h {
+            HandleRef::Dir(h) => {
+                let dir = h.get_typed::<Self>();
+                let (resolved, _) = self
+                    .opened_dir(&locked, dir)
+                    .map_err(|_| SetTimesError::Io)?;
+                ResolvedTarget::Dir(
+                    self.scoped_dir(dir.path.clone(), resolved, locked)
+                        .map_err(|_| SetTimesError::Io)?,
+                )
+            }
+            HandleRef::File(h) => {
+                let file = h.get_typed::<Self>();
+                // `locked` keeps a lower-backed file from being copied up meanwhile.
+                let (parent, name, node) = match (self.migrated(file), &file.layer) {
+                    (Some(upper), _) => {
+                        drop(locked);
+                        return self.upper.set_handle_times_checked(
+                            HandleRef::File(&upper),
+                            times,
+                            authorize,
+                        );
+                    }
+                    (None, OverlayFileLayer::Upper(upper)) => {
+                        drop(locked);
+                        return self.upper.set_handle_times_checked(
+                            HandleRef::File(upper),
+                            times,
+                            authorize,
+                        );
+                    }
+                    (
+                        None,
+                        OverlayFileLayer::Lower {
+                            parent, name, node, ..
+                        },
+                    ) => (parent, name, node),
+                };
+                let resolved = self.resolve_dir(parent).map_err(|_| SetTimesError::Io)?;
+                let dir = self
+                    .scoped_dir(parent.clone(), resolved, locked)
+                    .map_err(|_| SetTimesError::Io)?;
+                let Ok(Resolution::Found(target @ ResolvedTarget::File(_))) =
+                    Backend::resolve(self, dir, &[name.as_str()], &|_| Ok(()))
+                else {
+                    return Err(SetTimesError::Io);
+                };
+                let found = self
+                    .resolved_status(&target)
+                    .map_err(|_| SetTimesError::Io)?;
+                if found.node_info != *node {
+                    return Err(SetTimesError::Io);
+                }
+                target
+            }
+        };
+        self.set_times_checked(target, times, authorize)
+    }
+
     fn update_security(
         &self,
         target: ResolvedTarget<'_>,
@@ -2309,15 +2407,28 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         self.open(file, flags, Some(checks))
     }
 
+    // The namespace lock that `dir` holds keeps its descriptor current through the open.
+    fn open_dir_checked(
+        &self,
+        dir: ScopedDir<'_>,
+        flags: OFlags,
+        admit: &dyn Fn(&SecurityDescriptor) -> Result<(), OpenError>,
+    ) -> Result<DirHandle, OpenError> {
+        admit(broker_descriptor(&dir.permissions).ok_or(OpenError::Io)?)?;
+        self.open_dir(dir, flags)
+    }
+
     fn write_checked(
         &self,
         h: &FileHandle,
         buf: &dyn WriteBuffer,
         offset: usize,
-        content_change: &dyn Fn(&mut SecurityDescriptor),
+        authorize: AuthorizeUse<'_>,
+        content_change: ContentChange<'_>,
     ) -> Result<usize, WriteError> {
         self.with_upper_file(h, WriteError::NotForWriting, |upper| {
-            self.upper.write_checked(upper, buf, offset, content_change)
+            self.upper
+                .write_checked(upper, buf, offset, authorize, content_change)
         })
     }
 
@@ -2325,10 +2436,58 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         &self,
         h: &FileHandle,
         length: usize,
-        content_change: &dyn Fn(&mut SecurityDescriptor),
+        authorize: AuthorizeUse<'_>,
+        content_change: ContentChange<'_>,
     ) -> Result<(), TruncateError> {
         self.with_upper_file(h, TruncateError::NotForWriting, |upper| {
-            self.upper.truncate_checked(upper, length, content_change)
+            self.upper
+                .truncate_checked(upper, length, authorize, content_change)
         })
+    }
+
+    // The layer backing an open file holds its overlay descriptor and checks it. A lower file's
+    // stays current only until a copy-up moves it to the upper backend, which happens under the
+    // namespace lock, so a lower-backed read holds that lock too.
+    fn read_checked(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+        authorize: AuthorizeUse<'_>,
+    ) -> Result<usize, ReadError> {
+        let file = h.get_typed::<Self>();
+        let _locked =
+            matches!(file.layer, OverlayFileLayer::Lower { .. }).then(|| self.namespace.lock());
+        self.with_file(file, |_, backend, handle| {
+            backend.read_checked(handle, buf, offset, authorize)
+        })
+    }
+
+    fn list_dir_checked(
+        &self,
+        handle: DirHandle,
+        authorize: AuthorizeUse<'_>,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
+        let locked = self.namespace.lock();
+        let (resolved, allowed) = self
+            .authorize_dir(&locked, handle.get_typed::<Self>(), authorize)
+            .map_err(|_| ReadDirError::Io)?;
+        if !allowed {
+            return Err(ReadDirError::NotOpenForReading);
+        }
+        self.entries(&resolved).map_err(|_| ReadDirError::Io)
+    }
+
+    fn authorize_handle(&self, h: HandleRef<'_>, authorize: AuthorizeUse<'_>) -> bool {
+        match h {
+            HandleRef::File(h) => self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
+                backend.authorize_handle(HandleRef::File(handle), authorize)
+            }),
+            HandleRef::Dir(h) => {
+                let locked = self.namespace.lock();
+                self.authorize_dir(&locked, h.get_typed::<Self>(), authorize)
+                    .is_ok_and(|(_, allowed)| allowed)
+            }
+        }
     }
 }

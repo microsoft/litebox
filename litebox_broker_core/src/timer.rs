@@ -16,7 +16,7 @@ use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::timer::TimerSpec;
 
-use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
+use crate::object::{HandleOperations, ObjectEntry, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
 use crate::{BrokerError, BrokerProcess, Result};
 
@@ -71,9 +71,9 @@ pub fn create(
         .policy
         .principal_object_rights(process.caller_credential)?;
     let reference = process.reserve_object_reference(rights)?;
-    let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
     let watchers = SharedReadinessWatchers::default();
-    watchers.watch(&registration)?;
+    let registration =
+        reference.watch_readiness(Arc::clone(readiness_sink), |r| watchers.watch(r))?;
     let clock = Arc::clone(&process.core.timer_provider);
     let alarm = clock.create_alarm(watchers.clone())?;
     reference.commit_with_readiness(
@@ -85,7 +85,7 @@ pub fn create(
             deadline: None,
             interval: Duration::ZERO,
         }),
-        Some(registration),
+        registration,
     )
 }
 
@@ -94,14 +94,14 @@ pub fn create(
 /// A nonzero `spec.value_ns` arms the timer relative to now; zero disarms it.
 /// Unconsumed expirations are discarded.
 pub fn set(process: &BrokerProcess, handle: ObjectHandle, spec: TimerSpec) -> Result<TimerSpec> {
-    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::ARM_TIMER)?;
     let mut object = object.write();
     Ok(object.as_timer_mut()?.set(spec))
 }
 
 /// Returns a timer's current schedule.
 pub fn get(process: &BrokerProcess, handle: ObjectHandle) -> Result<TimerSpec> {
-    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let object = process.authorized_operation(handle, HandleOperations::READ_STATE)?;
     let object = object.read();
     let timer = object.as_timer()?;
     Ok(timer.current(timer.clock.now()))
@@ -112,7 +112,7 @@ pub fn get(process: &BrokerProcess, handle: ObjectHandle) -> Result<TimerSpec> {
 /// Returns `WouldBlock` if none has passed, or `NonBlockingWouldBlock` if the
 /// timer is also non-blocking.
 pub fn read(process: &BrokerProcess, handle: ObjectHandle) -> Result<u64> {
-    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let object = process.authorized_operation(handle, HandleOperations::READ)?;
     let mut object = object.write();
     object.as_timer_mut()?.read()
 }
@@ -356,6 +356,22 @@ mod tests {
         clock.advance(Duration::from_secs(u64::MAX / 2));
         assert_eq!(super::read(&process, handle), Ok(u64::MAX));
         assert_eq!(super::get(&process, handle), Ok(spec(1, 1)));
+    }
+
+    #[test]
+    fn arming_without_wait_does_not_subscribe_to_expirations() {
+        let clock = Arc::new(ManualTimerProvider::default());
+        let process = process(builder(ObjectRights::WRITE).with_timer_provider(clock.clone()));
+        let sink = Arc::new(TestReadinessSink::default());
+        let handle = create(&process, &sink, FileOpenFlags::NONE).unwrap();
+        super::set(&process, handle, spec(1, 0)).unwrap();
+        clock.advance(Duration::from_nanos(1));
+        assert_eq!(
+            process.check_readiness(handle),
+            Err(BrokerError::InvalidRights)
+        );
+        assert!(sink.published.lock().unwrap().is_empty());
+        assert!(sink.republished.lock().unwrap().is_empty());
     }
 
     #[test]

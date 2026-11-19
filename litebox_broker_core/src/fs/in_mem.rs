@@ -15,9 +15,9 @@ use litebox_platform::sync;
 use litebox_broker_protocol::authority::{DomainId, Principal};
 
 use super::backend::{
-    AuthorizeRemoval, AuthorizeRename, ContentChange, CreationMetadata, EntryRemoval, EntryRename,
-    OpenChecks, PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile,
-    ResolvedTarget, posix_descriptor, status_mode, with_owners,
+    AuthorizeRemoval, AuthorizeRename, AuthorizeUse, ContentChange, CreationMetadata, EntryRemoval,
+    EntryRename, OpenChecks, PermissionCheck, PermissionInfo, Resolution, ResolvedDir,
+    ResolvedFile, ResolvedTarget, posix_descriptor, status_mode, with_owners,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
@@ -449,7 +449,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     }
 
     fn update_times(
-        target: ResolvedTarget<'_>,
+        node: &Node<Platform>,
         times: &SetFileTimes,
         authorize: Option<AuthorizeTimes<'_>>,
     ) -> Result<(), SetTimesError> {
@@ -459,7 +459,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
         ) {
             return Ok(());
         }
-        let node = Self::target_node(target);
         let update = |descriptor: &SecurityDescriptor, stored: &mut Option<FileTimestamps>| {
             if let Some(authorize) = authorize {
                 authorize(descriptor)?;
@@ -477,7 +476,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             }
             Ok(())
         };
-        match &node {
+        match node {
             Node::File(file) => {
                 let file = &mut *file.write();
                 update(&file.descriptor, &mut file.times)
@@ -565,9 +564,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
         h: &super::backend::FileHandle,
         buf: &dyn WriteBuffer,
         offset: usize,
+        authorize: Option<AuthorizeUse<'_>>,
         content_change: Option<ContentChange<'_>>,
     ) -> Result<usize, WriteError> {
         let file = &mut *h.get_typed::<Self>().file.write();
+        if authorize.is_some_and(|authorize| !authorize(&file.descriptor)) {
+            return Err(WriteError::NotForWriting);
+        }
         let FileContents::Regular(storage) = &mut file.contents else {
             return Err(WriteError::NotAFile);
         };
@@ -580,18 +583,37 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
         Ok(written)
     }
 
+    /// Read at `offset`, first checking `authorize` (if any) against the descriptor under the
+    /// same lock.
+    fn read_file(
+        h: &super::backend::FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+        authorize: Option<AuthorizeUse<'_>>,
+    ) -> Result<usize, ReadError> {
+        let file = h.get_typed::<Self>().file.read();
+        if authorize.is_some_and(|authorize| !authorize(&file.descriptor)) {
+            return Err(ReadError::NotForReading);
+        }
+        let FileContents::Regular(storage) = &file.contents else {
+            return Err(ReadError::NotAFile);
+        };
+        Ok(storage.read_at(offset, buf)?)
+    }
+
     /// Set the length to `length`, applying `content_change` (if any) to the descriptor under the
     /// same lock if that succeeds.
     fn truncate_file(
         h: &super::backend::FileHandle,
         length: usize,
+        authorize: Option<AuthorizeUse<'_>>,
         content_change: Option<ContentChange<'_>>,
     ) -> Result<(), TruncateError> {
-        Self::truncate_locked(
-            &mut h.get_typed::<Self>().file.write(),
-            length,
-            content_change,
-        )
+        let file = &mut *h.get_typed::<Self>().file.write();
+        if authorize.is_some_and(|authorize| !authorize(&file.descriptor)) {
+            return Err(TruncateError::NotForWriting);
+        }
+        Self::truncate_locked(file, length, content_change)
     }
 
     /// [`Self::truncate_file`], for a file whose lock the caller holds.
@@ -824,6 +846,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         ))
     }
 
+    fn open_dir_checked(
+        &self,
+        dir: ResolvedDir<'_>,
+        flags: super::OFlags,
+        admit: &dyn Fn(&SecurityDescriptor) -> Result<(), OpenError>,
+    ) -> Result<super::backend::DirHandle, OpenError> {
+        assert_supported_oflags(flags);
+        let dir = dir.into_typed::<Self>().dir;
+        // The resolved directory is pinned, so only its descriptor can change, under this lock.
+        admit(&dir.read().descriptor)?;
+        Ok(super::backend::DirHandle::from_typed::<Self>(
+            InMemDirHandle { dir, flags },
+        ))
+    }
+
     fn walking_dir_at<'a>(&'a self, dir: &super::backend::DirHandle) -> Option<ResolvedDir<'a>> {
         Some(Self::resolved_dir(InMemDirHandle {
             dir: dir.get_typed::<Self>().dir.clone(),
@@ -862,6 +899,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             .collect())
     }
 
+    fn list_dir_checked(
+        &self,
+        handle: super::backend::DirHandle,
+        authorize: AuthorizeUse<'_>,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
+        let dir = handle.into_typed::<Self>().dir;
+        let dir = dir.read();
+        if !authorize(&dir.descriptor) {
+            return Err(ReadDirError::NotOpenForReading);
+        }
+        Ok(dir
+            .children
+            .iter()
+            .map(|(name, child)| child.dir_entry(name))
+            .collect())
+    }
+
     fn lookup_at(
         &self,
         dir: &super::backend::DirHandle,
@@ -882,11 +936,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         buf: &mut dyn ReadBuffer,
         offset: usize,
     ) -> Result<usize, ReadError> {
-        let file = h.get_typed::<Self>().file.read();
-        let FileContents::Regular(storage) = &file.contents else {
-            return Err(ReadError::NotAFile);
-        };
-        Ok(storage.read_at(offset, buf)?)
+        Self::read_file(h, buf, offset, None)
+    }
+
+    fn read_checked(
+        &self,
+        h: &super::backend::FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+        authorize: AuthorizeUse<'_>,
+    ) -> Result<usize, ReadError> {
+        Self::read_file(h, buf, offset, Some(authorize))
+    }
+
+    fn authorize_handle(
+        &self,
+        h: super::backend::HandleRef<'_>,
+        authorize: AuthorizeUse<'_>,
+    ) -> bool {
+        match h {
+            super::backend::HandleRef::File(h) => {
+                authorize(&h.get_typed::<Self>().file.read().descriptor)
+            }
+            super::backend::HandleRef::Dir(h) => {
+                authorize(&h.get_typed::<Self>().dir.read().descriptor)
+            }
+        }
     }
 
     fn write(
@@ -895,7 +970,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         buf: &dyn WriteBuffer,
         offset: usize,
     ) -> Result<usize, WriteError> {
-        Self::write_file(h, buf, offset, None)
+        Self::write_file(h, buf, offset, None, None)
     }
 
     fn write_checked(
@@ -903,22 +978,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         h: &super::backend::FileHandle,
         buf: &dyn WriteBuffer,
         offset: usize,
-        content_change: &dyn Fn(&mut SecurityDescriptor),
+        authorize: AuthorizeUse<'_>,
+        content_change: ContentChange<'_>,
     ) -> Result<usize, WriteError> {
-        Self::write_file(h, buf, offset, Some(content_change))
+        Self::write_file(h, buf, offset, Some(authorize), Some(content_change))
     }
 
     fn truncate(&self, h: &super::backend::FileHandle, length: usize) -> Result<(), TruncateError> {
-        Self::truncate_file(h, length, None)
+        Self::truncate_file(h, length, None, None)
     }
 
     fn truncate_checked(
         &self,
         h: &super::backend::FileHandle,
         length: usize,
-        content_change: &dyn Fn(&mut SecurityDescriptor),
+        authorize: AuthorizeUse<'_>,
+        content_change: ContentChange<'_>,
     ) -> Result<(), TruncateError> {
-        Self::truncate_file(h, length, Some(content_change))
+        Self::truncate_file(h, length, Some(authorize), Some(content_change))
     }
 
     fn seek_behavior(&self, _h: &super::backend::FileHandle) -> super::backend::SeekBehavior {
@@ -1121,7 +1198,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         target: ResolvedTarget<'_>,
         times: &SetFileTimes,
     ) -> Result<(), SetTimesError> {
-        Self::update_times(target, times, None)
+        Self::update_times(&Self::target_node(target), times, None)
     }
 
     fn set_times_checked(
@@ -1130,7 +1207,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         times: &SetFileTimes,
         authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), SetTimesError>,
     ) -> Result<(), SetTimesError> {
-        Self::update_times(target, times, Some(authorize))
+        Self::update_times(&Self::target_node(target), times, Some(authorize))
+    }
+
+    fn set_handle_times_checked(
+        &self,
+        h: super::backend::HandleRef<'_>,
+        times: &SetFileTimes,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), SetTimesError>,
+    ) -> Result<(), SetTimesError> {
+        let node = match h {
+            super::backend::HandleRef::File(h) => Node::File(h.get_typed::<Self>().file.clone()),
+            super::backend::HandleRef::Dir(h) => Node::Dir(h.get_typed::<Self>().dir.clone()),
+        };
+        Self::update_times(&node, times, Some(authorize))
     }
 
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {

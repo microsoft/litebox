@@ -38,6 +38,8 @@ pub enum OpenError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadError {
+    #[error("filesystem subject is no longer admissible")]
+    StaleSubject,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("file descriptor does not point to a file")]
@@ -150,6 +152,10 @@ pub enum SharedObjectError {
     IsDirectory,
     #[error("file is not opened for reading")]
     NotForReading,
+    #[error("file mapping does not permit writing")]
+    NotForWriting,
+    #[error("regular file mapping exceeds the caller's range limit")]
+    RangeOverflow,
     #[error("this platform or file system cannot share the file's pages")]
     Unsupported,
     #[error("out of host shared memory")]
@@ -334,6 +340,8 @@ pub enum RmdirError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
+    #[error("filesystem subject is no longer admissible")]
+    StaleSubject,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("fd does not point to a directory")]

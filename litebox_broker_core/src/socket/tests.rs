@@ -6,7 +6,7 @@ use crate::readiness::tests::TestReadinessSink;
 use crate::test_support::{
     DatagramData, FaultingBuffer, StreamData, TestBroker, receive_data, receive_data_from,
 };
-use crate::{BrokerCore, CallerCredential};
+use crate::{BrokerCore, CallerCredential, ObjectRights};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use litebox_broker_protocol::fs::SetStatusFlagsRequest;
 use litebox_broker_protocol::socket::{AddressFamily, IpProtocol, SocketType};
@@ -1218,7 +1218,7 @@ fn zero_port_connect_fails_before_platform_dispatch() {
     // A later attempt is visible as soon as it is claimed, before the connect
     // that claimed it records its result.
     let object = process
-        .authorized_object(socket, ObjectRights::WRITE)
+        .authorized_operation(socket, HandleOperations::WRITE)
         .unwrap();
     assert_eq!(
         transport_connect(&process, &object, loopback_address()),
@@ -1250,7 +1250,7 @@ fn abandoned_connect_wakes_waiters() {
     let readiness = Arc::new(TestReadinessSink::default());
     let socket = create(&process, create_request(), readiness.clone()).unwrap();
     let object = process
-        .authorized_object(socket, ObjectRights::WRITE)
+        .authorized_operation(socket, HandleOperations::WRITE)
         .unwrap();
     readiness.republished.lock().unwrap().clear();
 
@@ -2253,7 +2253,7 @@ fn check_in_flight_connect_preserves_local_address(
     // A connect that checked the state before this attempt started sees it when claiming the
     // socket.
     let object = process
-        .authorized_object(handle, ObjectRights::WRITE)
+        .authorized_operation(handle, HandleOperations::WRITE)
         .unwrap();
     assert_eq!(
         transport_connect(&process, &object, loopback_address()),
@@ -2513,7 +2513,7 @@ fn check_duplicate_port_binding_retires_socket(broker: &TestBroker, provider: &T
         panic!("duplicate-binding test could not reserve a port");
     };
     let object = process
-        .authorized_object(handle, ObjectRights::WRITE)
+        .authorized_operation(handle, HandleOperations::WRITE)
         .unwrap();
     let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
     assert_eq!(
@@ -2756,7 +2756,7 @@ fn check_socket_operations_and_policy(broker: &TestBroker, provider: &TestSocket
         send(&process, handle, &[], SendFlags(1)),
         Err(BrokerError::UnsupportedOperation)
     );
-    let in_flight = socket_resource(&process, handle, ObjectRights::WAIT).unwrap();
+    let in_flight = socket_resource(&process, handle, HandleOperations::WAIT).unwrap();
     assert_eq!(process.close_object_reference(handle), Ok(()));
     assert_eq!(broker.core.reserved_sockets.load(Ordering::Relaxed), 1);
     // The reference's registration retires with it, while the in-flight
@@ -4424,7 +4424,7 @@ fn check_stream_status_validates_local_address(broker: &TestBroker, provider: &T
     );
     {
         let object = process
-            .authorized_object(missing_local, ObjectRights::WRITE)
+            .authorized_operation(missing_local, HandleOperations::WRITE)
             .unwrap();
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {

@@ -81,12 +81,7 @@ impl<Platform: ShimPlatform> IOPollable for File<Platform> {
     }
 
     fn check_io_events(&self) -> Events {
-        match self.status() {
-            // Linux reports regular files ready regardless of access mode or EOF.
-            Ok(status) if status.file_type == FileType::RegularFile => Events::IN | Events::OUT,
-            Ok(_) => self.file.check_io_events(),
-            Err(_) => Events::ERR,
-        }
+        self.file.check_io_events()
     }
 }
 
@@ -98,11 +93,12 @@ impl<Platform: ShimPlatform> File<Platform> {
     /// Reads into `buf` at `offset`, or at the file offset if `offset` is `None`.
     pub(crate) fn read(
         &self,
+        caller: &litebox::fs::Caller,
         buf: impl ReadBuffer,
         offset: Option<usize>,
         cx: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, Errno> {
-        Ok(self.file.read(buf, offset, cx)?)
+        Ok(self.file.read_as(caller, buf, offset, cx)?)
     }
 
     /// Writes `buf` at `offset`, or at the file offset if `offset` is `None`.
@@ -166,13 +162,6 @@ impl<Platform: ShimPlatform> File<Platform> {
         linux_status_flags(self.file.get_status_flags()?)
     }
 
-    /// Returns the access mode the open file description was opened with, or `None` if it was
-    /// opened only for path-based operations (`O_PATH`).
-    pub(super) fn access_mode(&self) -> Result<Option<FileAccessMode>, Errno> {
-        let status = self.file.get_status_flags()?;
-        Ok((!status.flags.contains(FileOpenFlags::PATH)).then_some(status.access))
-    }
-
     /// Changes the status flags in `mask` of the open file description to their values in
     /// `flags`, ignoring flags other than `O_NONBLOCK` and `O_APPEND`.
     pub(crate) fn set_status_flags(&self, mask: OFlags, flags: OFlags) -> Result<(), Errno> {
@@ -192,12 +181,17 @@ impl<Platform: ShimPlatform> File<Platform> {
 
     /// Writes the directory's entries from its current position to `dirp` as `getdents64` does,
     /// returning the number of bytes written.
-    fn getdents64(&self, dirp: UserPtrMut<u8>, count: usize) -> Result<usize, Errno> {
+    fn getdents64(
+        &self,
+        caller: &litebox::fs::Caller,
+        dirp: UserPtrMut<u8>,
+        count: usize,
+    ) -> Result<usize, Errno> {
         let mut dir_offset = self.dir_offset.lock();
         let mut dir_off = dir_offset.unwrap_or(0);
         let mut nbytes = 0;
 
-        let mut entries = self.file.read_directory()?;
+        let mut entries = self.file.read_directory_as(caller)?;
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
         for entry in entries.iter().skip(dir_off) {
@@ -1095,6 +1089,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
+    pub(crate) fn fs_caller(&self) -> litebox::fs::Caller {
+        self.fs.borrow().context.read().caller().clone()
+    }
+
     pub(crate) fn do_open(
         &self,
         path: &str,
@@ -1556,8 +1554,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let buf = core::cell::RefCell::new(buf);
         let result = fd.dispatch(
             |fd| {
+                let caller = self.fs_caller();
                 self.global.with_file(fd, |file| {
-                    file.read(&mut *buf.borrow_mut(), offset, Some(&self.wait_cx()))
+                    file.read(
+                        &caller,
+                        &mut *buf.borrow_mut(),
+                        offset,
+                        Some(&self.wait_cx()),
+                    )
                 })
             },
             |fd| {
@@ -1792,6 +1796,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .transpose()?;
         let mut kernel_buf = vec![0u8; count.min(PAGE_SIZE)];
         let mut total: usize = 0;
+        let caller = self.fs_caller();
 
         while total < count {
             let to_read = (count - total).min(kernel_buf.len());
@@ -1805,7 +1810,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             let read_result = match typed_in_fd.as_file() {
                 Some(fd) => self.global.with_file(fd, |file| {
-                    file.read(&mut kernel_buf[..to_read], cur_off, Some(&self.wait_cx()))
+                    file.read(
+                        &caller,
+                        &mut kernel_buf[..to_read],
+                        cur_off,
+                        Some(&self.wait_cx()),
+                    )
                 }),
                 None => Err(non_fs_err),
             };
@@ -4045,8 +4055,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let fd = files.typed_fd(fd)?;
         let file = fd.file_only(Errno::ENOTDIR)?;
+        let caller = self.fs_caller();
         self.global
-            .with_file(file, |file| file.getdents64(dirp, count))
+            .with_file(file, |file| file.getdents64(&caller, dirp, count))
     }
 }
 

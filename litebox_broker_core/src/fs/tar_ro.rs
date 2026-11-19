@@ -62,14 +62,29 @@ pub struct TarRo {
 
 impl TarRo {
     fn resolved_dir<'a>(&self, dir: TarRoDirHandle) -> ResolvedDir<'a> {
-        let indexed = &self.tar_index.dirs[dir.idx];
-        let owner = indexed.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER);
-        let permissions = PermissionCheck::ByResolver(PermissionInfo::new(
-            mode_descriptor(FileType::Directory, indexed.mode, owner.user, owner.group)
-                .from_trusted_configuration(),
-            true,
-        ));
+        let permissions =
+            PermissionCheck::ByResolver(PermissionInfo::new(self.dir_descriptor(dir.idx), true));
         ResolvedDir::from_typed::<Self>(dir, permissions)
+    }
+
+    /// The descriptor of directory `idx`, which never changes.
+    fn dir_descriptor(&self, idx: usize) -> SecurityDescriptor {
+        let indexed = &self.tar_index.dirs[idx];
+        let owner = indexed.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER);
+        mode_descriptor(FileType::Directory, indexed.mode, owner.user, owner.group)
+            .from_trusted_configuration()
+    }
+
+    /// The descriptor of file `idx`, which never changes.
+    fn file_descriptor(&self, idx: usize) -> SecurityDescriptor {
+        let file = &self.tar_index.files[idx];
+        mode_descriptor(
+            file.file_type(),
+            file.mode,
+            file.owner.user,
+            file.owner.group,
+        )
+        .from_trusted_configuration()
     }
 
     /// Construct a tar backend using a caller-provided inode allocator.
@@ -148,13 +163,7 @@ impl super::backend::Backend for TarRo {
                         ResolvedFile::from_typed::<Self>(
                             TarRoFileHandle { idx: *idx },
                             PermissionCheck::ByResolver(PermissionInfo::new(
-                                mode_descriptor(
-                                    file.file_type(),
-                                    file.mode,
-                                    file.owner.user,
-                                    file.owner.group,
-                                )
-                                .from_trusted_configuration(),
+                                self.file_descriptor(*idx),
                                 true,
                             )),
                             file.file_type(),
@@ -217,6 +226,26 @@ impl super::backend::Backend for TarRo {
         Ok(FileHandle::from_typed::<Self>(file.into_typed::<Self>()))
     }
 
+    fn open_dir_checked(
+        &self,
+        dir: ResolvedDir<'_>,
+        flags: OFlags,
+        admit: &dyn Fn(&SecurityDescriptor) -> Result<(), OpenError>,
+    ) -> Result<DirHandle, OpenError> {
+        // Archive entries never change, so checking their descriptors races with nothing.
+        admit(&self.dir_descriptor(dir.get_typed::<Self>().idx))?;
+        self.open_dir(dir, flags)
+    }
+
+    fn set_handle_times_checked(
+        &self,
+        _h: HandleRef<'_>,
+        _times: &super::SetFileTimes,
+        _authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), super::errors::SetTimesError>,
+    ) -> Result<(), super::errors::SetTimesError> {
+        Err(super::errors::SetTimesError::ReadOnlyFileSystem)
+    }
+
     fn open_file_checked(
         &self,
         file: ResolvedFile<'_>,
@@ -229,6 +258,42 @@ impl super::backend::Backend for TarRo {
         };
         (checks.admit)(permissions.descriptor().ok_or(OpenError::Io)?)?;
         self.open_file(file, flags)
+    }
+
+    // Archive entries never change, so checking their descriptors races with nothing.
+    fn read_checked(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
+    ) -> Result<usize, ReadError> {
+        if !authorize(&self.file_descriptor(h.get_typed::<Self>().idx)) {
+            return Err(ReadError::NotForReading);
+        }
+        self.read(h, buf, offset)
+    }
+
+    fn list_dir_checked(
+        &self,
+        handle: DirHandle,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
+        if !authorize(&self.dir_descriptor(handle.get_typed::<Self>().idx)) {
+            return Err(ReadDirError::NotOpenForReading);
+        }
+        self.list_dir_at(handle)
+    }
+
+    fn authorize_handle(
+        &self,
+        h: HandleRef<'_>,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
+    ) -> bool {
+        authorize(&match h {
+            HandleRef::File(h) => self.file_descriptor(h.get_typed::<Self>().idx),
+            HandleRef::Dir(h) => self.dir_descriptor(h.get_typed::<Self>().idx),
+        })
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {

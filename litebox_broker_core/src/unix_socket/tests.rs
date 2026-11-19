@@ -186,7 +186,7 @@ impl Fixture {
     fn socket(&self, handle: ObjectHandle) -> Weak<Socket> {
         let object = self
             .process
-            .authorized_object(handle, ObjectRights::WAIT)
+            .authorized_operation(handle, crate::HandleOperations::WAIT)
             .unwrap();
         let entry = object.read();
         Arc::downgrade(&entry.as_unix_socket().unwrap().socket)

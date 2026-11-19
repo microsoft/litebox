@@ -3,9 +3,9 @@
 
 //! Filesystem semantics for the broker-core resolver and its backends.
 //!
-//! These tests drive the resolver and the backends directly. There is deliberately no broker
-//! process, transport, or guest descriptor table involved: the semantics under test are owned by
-//! broker core.
+//! These tests drive the resolver and its backends directly, or use a broker process where the
+//! result also depends on the reference's permissions. Neither path requires a transport or a
+//! guest descriptor table.
 
 use alloc::borrow::Cow;
 
@@ -4149,7 +4149,8 @@ mod credentials {
         UserInfo, build_tar,
     };
     use crate::authority::Authority;
-    use crate::descriptor::profile::{FileSystemProfile, StorableForms};
+    use crate::descriptor::handle::HandleUse;
+    use crate::descriptor::profile::{FileSystemProfile, HandleRules, StorableForms};
     use crate::descriptor::{FileKind, SecurityDescriptor};
     use crate::fs::backend::Backend;
     use crate::fs::composer::Composer;
@@ -4261,13 +4262,45 @@ mod credentials {
         FileSystemProfile::new(StorableForms::MODE).unwrap()
     }
 
+    /// A profile whose file and directory handles follow `file` and `directory`.
+    fn profile_with(file: HandleRules, directory: HandleRules) -> FileSystemProfile {
+        FileSystemProfile::with_handle_rules(StorableForms::MODE, file, directory).unwrap()
+    }
+
+    /// Handle rules that admit `rights` at open but check each use of them again.
+    const fn checked_at_use(rights: crate::descriptor::Rights) -> HandleRules {
+        HandleRules {
+            open_gated: rights,
+            cacheable: crate::descriptor::Rights::empty(),
+        }
+    }
+
     fn in_mem<const N: usize>(
+        nodes: [(&str, InitialNode); N],
+    ) -> Resolver<TestPlatform, InMem<TestPlatform>> {
+        in_mem_with(profile(), nodes)
+    }
+
+    fn in_mem_with<const N: usize>(
+        profile: FileSystemProfile,
         nodes: [(&str, InitialNode); N],
     ) -> Resolver<TestPlatform, InMem<TestPlatform>> {
         Resolver::with_credentials(
             InMem::<TestPlatform>::new_initialized(nodes, InodeAllocators::new().next()),
-            profile(),
+            profile,
         )
+    }
+
+    /// What `who` reads from the start of `entry`'s file, leaving its offset.
+    fn read_as<B: Backend>(
+        fs: &Resolver<TestPlatform, B>,
+        who: Option<&Credentials>,
+        entry: &ResolverEntry<B>,
+    ) -> Result<alloc::vec::Vec<u8>, crate::fs::errors::ReadError> {
+        let mut buffer = alloc::vec![0; 16];
+        let (read, _) = fs.read_entry(who.map(Credentials::caller), entry, &mut buffer, Some(0))?;
+        buffer.truncate(read);
+        Ok(buffer)
     }
 
     fn create<B: Backend>(
@@ -4715,6 +4748,21 @@ mod credentials {
 
     /// Carol's tree with devices at `/dev` protected by `security`.
     fn with_devices(security: DeviceSecurity) -> Resolver<TestPlatform, Composer<TestPlatform>> {
+        with_devices_and_profile(security, profile())
+    }
+
+    fn with_devices_and_profile(
+        security: DeviceSecurity,
+        profile: FileSystemProfile,
+    ) -> Resolver<TestPlatform, Composer<TestPlatform>> {
+        with_stdio(security, profile, Arc::new(TestStdioProvider::default()))
+    }
+
+    fn with_stdio(
+        security: DeviceSecurity,
+        profile: FileSystemProfile,
+        stdio: Arc<TestStdioProvider>,
+    ) -> Resolver<TestPlatform, Composer<TestPlatform>> {
         Resolver::with_credentials(
             Composer::<TestPlatform>::builder()
                 .mount("/", |allocator| {
@@ -4724,16 +4772,12 @@ mod credentials {
                     )
                 })
                 .mount("/dev", |allocator| {
-                    Devices::new(
-                        allocator,
-                        Arc::new(TestStdioProvider::default()),
-                        Arc::new(TestRandomProvider),
-                    )
-                    .with_security(security)
+                    Devices::new(allocator, stdio, Arc::new(TestRandomProvider))
+                        .with_security(security)
                 })
                 .build()
                 .unwrap(),
-            profile(),
+            profile,
         )
     }
 
@@ -5297,6 +5341,222 @@ mod credentials {
         assert_eq!(limit.live(), 0);
     }
 
+    fn handle_test_process(
+        fs: Resolver<TestPlatform, Composer<TestPlatform>>,
+    ) -> (
+        Arc<crate::BrokerProcess>,
+        litebox_broker_protocol::ObjectHandle,
+    ) {
+        use crate::test_support::TestBrokerBuilder;
+        use crate::{CallerCredential, ObjectRights, PolicyEngine};
+
+        let carol = Credentials::new(CAROL);
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(Arc::new(fs))
+        .build()
+        .unwrap();
+        let process = broker
+            .core
+            .create_process(
+                CallerCredential::Unauthenticated,
+                Arc::new(carol.authority),
+                &broker.pid_namespace,
+                &broker.fs,
+                &broker.job,
+                broker.host_names.clone(),
+                None,
+            )
+            .unwrap();
+        process.complete_start().unwrap();
+        let subject = process.create_subject(carol.subject).unwrap();
+        (process, subject)
+    }
+
+    #[test]
+    fn queryable_handles_report_open_kind_without_granting_io() {
+        use crate::readiness::{ReadinessSink, tests::TestReadinessSink};
+        use crate::{BrokerError, HandleOperations, ObjectRights};
+        use litebox_broker_protocol::fs::{
+            FileAccessMode, FileCaller, FileError, FileMappingOptions, FileOpenFlags,
+            FileSeekWhence,
+        };
+
+        let (process, subject) = handle_test_process(with_devices(device_security()));
+        let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+        let open = |path, flags| {
+            crate::fs::open(
+                &process,
+                path,
+                FileCaller::Subject(subject),
+                FileAccessMode::ReadOnly,
+                flags,
+                Mode::RUSR | Mode::WUSR,
+                &sink,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let path = open("/dev/tty", FileOpenFlags::PATH);
+        let dir = open("/dev", FileOpenFlags::NONE);
+        let regular = open("/file", FileOpenFlags::CREATE);
+        let map = |handle| {
+            crate::fs::map_shared(&process, handle, FileMappingOptions::readable(1))
+                .map(|result| result.map(|_| ()))
+        };
+        let read = |handle| crate::fs::read(&process, handle, &mut [0u8; 1], None);
+        let list =
+            |handle| crate::fs::read_directory(&process, handle).map(|result| result.map(|_| ()));
+        let rewind =
+            |handle| crate::fs::seek(&process, handle, 0, FileSeekWhence::RelativeToBeginning);
+        let restrict = |handle, operations| {
+            process
+                .duplicate_object_operations_to(handle, &process, ObjectRights::WAIT, operations)
+                .unwrap()
+        };
+        assert_eq!(map(path), Ok(Err(FileError::PathOnly)));
+        assert_eq!(
+            map(open("/dev", FileOpenFlags::PATH)),
+            Ok(Err(FileError::PathOnly))
+        );
+        assert_eq!(map(dir), Ok(Err(FileError::IsDirectory)));
+        assert_eq!(read(dir), Ok(Err(FileError::NotFile)));
+        assert_eq!(list(regular), Ok(Err(FileError::NotDirectory)));
+        // The local directory cursor can be repositioned only through a seekable reference.
+        assert_eq!(rewind(dir), Ok(Err(FileError::NotFile)));
+        let query_dir = restrict(dir, HandleOperations::QUERY);
+        assert_eq!(rewind(query_dir), Err(BrokerError::InvalidRights));
+        assert_eq!(list(query_dir), Err(BrokerError::InvalidRights));
+        assert_eq!(read(query_dir), Ok(Err(FileError::NotFile)));
+        let query_file = restrict(regular, HandleOperations::QUERY);
+        assert_eq!(list(query_file), Ok(Err(FileError::NotDirectory)));
+        assert_eq!(read(query_file), Err(BrokerError::InvalidRights));
+        assert_eq!(map(query_file), Err(BrokerError::InvalidRights));
+        for handle in [path, dir, regular] {
+            let wait = restrict(handle, HandleOperations::WAIT);
+            assert_eq!(map(wait), Err(BrokerError::InvalidRights));
+            assert_eq!(read(wait), Err(BrokerError::InvalidRights));
+            assert_eq!(list(wait), Err(BrokerError::InvalidRights));
+        }
+    }
+
+    #[test]
+    fn mapping_polling_and_listing_use_their_own_rights() {
+        use crate::descriptor::Rights;
+        use crate::readiness::{ReadinessSink, tests::TestReadinessSink};
+        use crate::stdio::StdioStream;
+        use crate::{BrokerError, HandleOperations as Op, ObjectRights};
+        use litebox_broker_protocol::fs::{
+            FileAccessMode, FileCaller, FileError, FileMappingOptions, FileOpenFlags,
+        };
+        use litebox_broker_protocol::readiness::ReadinessFlags as Ready;
+
+        let (owner, group) = owners(posix(CAROL));
+        let stdio = Arc::new(TestStdioProvider::default().with_terminal(StdioStream::Stdin));
+        let (process, subject) = handle_test_process(with_stdio(
+            DeviceSecurity::posix(owner, group, owner, group),
+            profile_with(HandleRules::LINUX_FILE, checked_at_use(Rights::empty())),
+            Arc::clone(&stdio),
+        ));
+        let caller = FileCaller::Subject(subject);
+        let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+        let open = |path, flags| {
+            crate::fs::open(
+                &process,
+                path,
+                caller,
+                FileAccessMode::ReadOnly,
+                flags,
+                Mode::RUSR,
+                &sink,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let restrict = |handle, operations| {
+            process
+                .duplicate_object_operations_to(handle, &process, ObjectRights::WAIT, operations)
+                .unwrap()
+        };
+
+        let file = open("/file", FileOpenFlags::CREATE);
+        let readable_mapping = restrict(file, Op::READ | Op::MAP);
+        assert_eq!(
+            process.get_status_flags(readable_mapping),
+            Err(BrokerError::InvalidRights)
+        );
+        let options = FileMappingOptions::readable(4096);
+        assert_eq!(
+            crate::fs::check_mapping(&process, readable_mapping, options),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            crate::fs::map_shared(&process, readable_mapping, options).map(|r| r.map(|_| ())),
+            Ok(Err(FileError::NoSuchDevice))
+        );
+        for (request, error) in [
+            (
+                FileMappingOptions {
+                    require_write: true,
+                    ..options
+                },
+                FileError::NotForWriting,
+            ),
+            (
+                FileMappingOptions {
+                    max_regular_end: 4095,
+                    ..options
+                },
+                FileError::InvalidOffset,
+            ),
+        ] {
+            assert_eq!(
+                crate::fs::check_mapping(&process, readable_mapping, request),
+                Ok(Err(error))
+            );
+            assert_eq!(
+                crate::fs::map_shared(&process, readable_mapping, request).map(|r| r.map(|_| ())),
+                Ok(Err(error))
+            );
+        }
+        for ops in [Op::READ, Op::MAP] {
+            assert_eq!(
+                crate::fs::check_mapping(&process, restrict(file, ops), options),
+                Err(BrokerError::InvalidRights)
+            );
+        }
+
+        assert_eq!(
+            process.check_readiness(restrict(file, Op::WAIT)),
+            Ok(Ready::READ | Ready::WRITE)
+        );
+        assert_eq!(
+            process.check_readiness(readable_mapping),
+            Err(BrokerError::InvalidRights)
+        );
+        let terminal = restrict(open("/dev/stdin", FileOpenFlags::NONE), Op::WAIT);
+        assert_eq!(
+            process.get_status_flags(terminal),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(process.check_readiness(terminal), Ok(Ready::WRITE));
+        stdio.push_terminal_input(b"x");
+        assert_eq!(
+            process.check_readiness(terminal),
+            Ok(Ready::READ | Ready::WRITE)
+        );
+
+        crate::fs::mkdir(&process, "/unlisted", caller, Mode::XUSR)
+            .unwrap()
+            .unwrap();
+        let dir = restrict(open("/unlisted", FileOpenFlags::NONE), Op::LIST);
+        assert_eq!(
+            crate::fs::read_directory_as(&process, dir, Some(subject)),
+            Ok(Err(FileError::AccessNotAllowed))
+        );
+    }
+
     #[test]
     fn checked_truncation_of_mapped_files_changes_all_or_nothing() {
         use crate::fs::backend::{Resolution, ResolvedTarget};
@@ -5807,5 +6067,810 @@ mod credentials {
             legacy.open(posix(CAROL), "/dir/file", OFlags::WRONLY, Mode::empty()),
             Err(OpenError::ReadOnlyFileSystem)
         ));
+    }
+
+    #[test]
+    fn uncached_reads_and_writes_follow_the_current_subject_and_descriptor() {
+        use crate::descriptor::Rights;
+        use crate::fs::errors::ReadError;
+
+        let (bob, carol) = (Credentials::new(BOB), Credentials::new(CAROL));
+        let fs = in_mem_with(
+            profile_with(
+                checked_at_use(Rights::READ | Rights::WRITE),
+                HandleRules::LINUX_DIRECTORY,
+            ),
+            [
+                ("/", dir(ALL, posix(CAROL))),
+                ("/file", file(ALL, posix(CAROL))),
+            ],
+        );
+        let mut reader = fs
+            .open(carol.caller(), "/file", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let grants = reader.handle_grants().unwrap();
+        assert_eq!(grants.decide(Rights::READ), HandleUse::CheckAtUse);
+        assert_eq!(grants.decide(Rights::WRITE), HandleUse::Denied);
+        assert!(fs.get_static_backing_data(&reader).is_none());
+
+        // Whoever reads through the entry is checked, not whoever opened it.
+        assert_eq!(read_as(&fs, Some(&carol), &reader).unwrap(), b"data");
+        assert_eq!(read_as(&fs, Some(&bob), &reader).unwrap(), b"data");
+        let mut buffer = [0; 2];
+        assert!(matches!(
+            fs.read(&mut reader, &mut buffer, None),
+            Err(ReadError::Io)
+        ));
+        assert!(matches!(
+            fs.read_updating_position(Some(posix(CAROL).into()), &mut reader, &mut buffer, None),
+            Err(ReadError::Io)
+        ));
+        fs.chmod(carol.caller(), "/file", Mode::RWXU).unwrap();
+        assert!(matches!(
+            read_as(&fs, Some(&bob), &reader),
+            Err(ReadError::NotForReading)
+        ));
+        assert_eq!(
+            fs.read_updating_position(Some(carol.caller()), &mut reader, &mut buffer, None)
+                .unwrap(),
+            2
+        );
+        fs.chmod(carol.caller(), "/file", Mode::WUSR).unwrap();
+        assert!(matches!(
+            fs.read_updating_position(Some(carol.caller()), &mut reader, &mut buffer, None),
+            Err(ReadError::NotForReading)
+        ));
+        // A failed read leaves the offset.
+        fs.chmod(carol.caller(), "/file", ALL).unwrap();
+        fs.read_updating_position(Some(bob.caller()), &mut reader, &mut buffer, None)
+            .unwrap();
+        assert_eq!(&buffer, b"ta");
+
+        // Uncached writes are checked too, and still remove grants the writer may not keep.
+        let mut writer = fs
+            .open(carol.caller(), "/file", OFlags::WRONLY, Mode::empty())
+            .unwrap();
+        fs.chmod(carol.caller(), "/file", Mode::RWXU).unwrap();
+        assert!(matches!(
+            fs.write_as(bob.caller(), &mut writer, b"x", Some(0)),
+            Err(WriteError::NotForWriting)
+        ));
+        assert!(matches!(
+            fs.truncate_as(bob.caller(), &mut writer, 0, false),
+            Err(TruncateError::NotForWriting)
+        ));
+        assert_eq!(read_as(&fs, Some(&carol), &reader).unwrap(), b"data");
+        fs.chmod(carol.caller(), "/file", ALL | Mode::SUID).unwrap();
+        fs.write_as(bob.caller(), &mut writer, b"D", Some(0))
+            .unwrap();
+        assert_eq!(status(&fs, "/file").0, ALL);
+        assert_eq!(read_as(&fs, Some(&bob), &reader).unwrap(), b"Data");
+    }
+
+    #[test]
+    fn profiles_gate_at_open_only_the_rights_they_name() {
+        use crate::descriptor::Rights;
+        use crate::fs::errors::{ReadDirError, ReadError};
+
+        let carol = Credentials::new(CAROL);
+        let nodes = || {
+            [
+                ("/", dir(ALL, posix(CAROL))),
+                ("/write-only", file(Mode::WUSR, posix(CAROL))),
+                ("/read-only", file(Mode::RUSR, posix(CAROL))),
+                ("/unlisted", dir(Mode::XUSR, posix(CAROL))),
+            ]
+        };
+        let stock = in_mem(nodes());
+        let fs = in_mem_with(
+            profile_with(
+                HandleRules {
+                    open_gated: Rights::WRITE,
+                    cacheable: Rights::WRITE,
+                },
+                checked_at_use(Rights::empty()),
+            ),
+            nodes(),
+        );
+        for path in ["/write-only", "/unlisted"] {
+            assert!(matches!(
+                stock.open(carol.caller(), path, OFlags::RDONLY, Mode::empty()),
+                Err(OpenError::AccessNotAllowed)
+            ));
+        }
+
+        // Rights left out of the open are checked at use instead.
+        let file = fs
+            .open(carol.caller(), "/write-only", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert_eq!(
+            file.handle_grants().unwrap().decide(Rights::READ),
+            HandleUse::CheckAtUse
+        );
+        assert!(matches!(
+            read_as(&fs, Some(&carol), &file),
+            Err(ReadError::NotForReading)
+        ));
+        let directory = fs
+            .open(
+                carol.caller(),
+                "/unlisted",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        assert!(matches!(
+            fs.read_dir_as(Some(carol.caller()), &directory),
+            Err(ReadDirError::NotOpenForReading)
+        ));
+        fs.chmod(carol.caller(), "/write-only", Mode::RUSR).unwrap();
+        fs.chmod(carol.caller(), "/unlisted", Mode::RUSR).unwrap();
+        assert_eq!(read_as(&fs, Some(&carol), &file).unwrap(), b"data");
+        assert_eq!(
+            fs.read_dir_as(Some(carol.caller()), &directory)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Gated rights, and truncation's write, are still needed to open.
+        for flags in [OFlags::WRONLY, OFlags::RDONLY | OFlags::TRUNC] {
+            assert!(matches!(
+                fs.open(carol.caller(), "/read-only", flags, Mode::empty()),
+                Err(OpenError::AccessNotAllowed)
+            ));
+        }
+        let file = fs
+            .open(carol.caller(), "/read-only", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert_eq!(read_as(&fs, Some(&carol), &file).unwrap(), b"data");
+    }
+
+    #[test]
+    fn uncached_listings_follow_the_current_subject_and_descriptor() {
+        use crate::descriptor::Rights;
+        use crate::fs::errors::ReadDirError;
+
+        let (bob, carol) = (Credentials::new(BOB), Credentials::new(CAROL));
+        let fs = in_mem_with(
+            profile_with(HandleRules::LINUX_FILE, checked_at_use(Rights::LIST)),
+            [
+                ("/dir", dir(ALL, posix(CAROL))),
+                ("/dir/file", file(ALL, posix(CAROL))),
+            ],
+        );
+        let directory = fs
+            .open(
+                carol.caller(),
+                "/dir",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        let lists = |who: &Credentials| match fs.read_dir_as(Some(who.caller()), &directory) {
+            Ok(entries) => entries.iter().any(|entry| entry.name == "file"),
+            Err(ReadDirError::NotOpenForReading) => false,
+            Err(error) => panic!("{error:?}"),
+        };
+        assert!(lists(&carol) && lists(&bob));
+        assert!(matches!(fs.read_dir(&directory), Err(ReadDirError::Io)));
+        fs.chmod(carol.caller(), "/dir", Mode::RWXU).unwrap();
+        assert!(lists(&carol) && !lists(&bob));
+        fs.chmod(carol.caller(), "/dir", Mode::WUSR | Mode::XUSR)
+            .unwrap();
+        assert!(!lists(&carol));
+        fs.chmod(carol.caller(), "/dir", ALL).unwrap();
+        assert!(lists(&bob));
+
+        // The stock profile keeps the grant of its open.
+        let stock = in_mem([("/dir", dir(ALL, posix(CAROL)))]);
+        let directory = stock
+            .open(
+                carol.caller(),
+                "/dir",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        stock.chmod(carol.caller(), "/dir", Mode::empty()).unwrap();
+        assert_eq!(stock.read_dir(&directory).unwrap().len(), 2);
+        assert_eq!(directory.handle_grants().unwrap().cached(), Rights::LIST);
+    }
+
+    #[test]
+    fn created_files_gain_no_grants_beyond_their_open() {
+        use crate::descriptor::Rights;
+
+        let carol = Credentials::new(CAROL);
+        let nodes = || [("/", dir(ALL, posix(CAROL)))];
+        let create_flags = OFlags::CREAT | OFlags::EXCL | OFlags::RDWR;
+        let checked = in_mem_with(
+            profile_with(
+                checked_at_use(Rights::READ | Rights::WRITE),
+                HandleRules::LINUX_DIRECTORY,
+            ),
+            nodes(),
+        );
+        let stock = in_mem(nodes());
+        for (fs, cached) in [(&stock, true), (&checked, false)] {
+            let mut entry = fs
+                .open(carol.caller(), "/new", create_flags, Mode::empty())
+                .unwrap();
+            let grants = entry.handle_grants().unwrap();
+            assert_eq!(grants.admitted(), Rights::READ | Rights::WRITE);
+            let written = fs.write_as(carol.caller(), &mut entry, b"x", None);
+            if cached {
+                // As on Linux, the creator's open grants access its new mode does not.
+                assert_eq!(grants.cached(), Rights::READ | Rights::WRITE);
+                assert_eq!(written.unwrap(), 1);
+            } else {
+                assert_eq!(grants.cached(), Rights::empty());
+                assert!(matches!(written, Err(WriteError::NotForWriting)));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_entries_have_no_handle_grants() {
+        let fs = Resolver::<TestPlatform, _>::new(InMem::<TestPlatform>::new_initialized(
+            [("/file", file(ALL, posix(CAROL)))],
+            InodeAllocators::new().next(),
+        ));
+        let entry = fs
+            .open(posix(CAROL), "/file", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        assert!(entry.handle_grants().is_none());
+        assert!(fs.profile().is_none());
+        assert_eq!(in_mem([]).profile(), Some(profile()));
+    }
+
+    #[test]
+    fn uncached_overlay_uses_follow_copies_up() {
+        use crate::descriptor::Rights;
+        use crate::fs::errors::{ReadDirError, ReadError};
+
+        let (bob, carol) = (Credentials::new(BOB), Credentials::new(CAROL));
+        let allocators = InodeAllocators::new();
+        let fs = Resolver::<TestPlatform, _>::with_credentials(
+            Overlay::<TestPlatform>::new(
+                InMem::<TestPlatform>::new_initialized(
+                    [("/", dir(ALL, posix(CAROL)))],
+                    allocators.next(),
+                ),
+                InMem::<TestPlatform>::new_initialized(
+                    [
+                        ("/dir", dir(ALL, posix(CAROL))),
+                        ("/dir/file", file(ALL, posix(CAROL))),
+                    ],
+                    allocators.next(),
+                ),
+                allocators.next(),
+            ),
+            profile_with(
+                checked_at_use(Rights::READ | Rights::WRITE),
+                checked_at_use(Rights::LIST),
+            ),
+        );
+        let file = fs
+            .open(bob.caller(), "/dir/file", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        let directory = fs
+            .open(
+                bob.caller(),
+                "/dir",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        assert_eq!(read_as(&fs, Some(&bob), &file).unwrap(), b"data");
+        assert!(fs.read_dir_as(Some(bob.caller()), &directory).is_ok());
+
+        // Changing the lower objects' descriptors copies them up; the handles check the copies.
+        fs.chmod(carol.caller(), "/dir/file", Mode::RWXU).unwrap();
+        fs.chmod(carol.caller(), "/dir", Mode::RWXU).unwrap();
+        assert!(matches!(
+            read_as(&fs, Some(&bob), &file),
+            Err(ReadError::NotForReading)
+        ));
+        assert!(matches!(
+            fs.read_dir_as(Some(bob.caller()), &directory),
+            Err(ReadDirError::NotOpenForReading)
+        ));
+        let mut writer = fs
+            .open(carol.caller(), "/dir/file", OFlags::RDWR, Mode::empty())
+            .unwrap();
+        assert_eq!(
+            fs.write_as(carol.caller(), &mut writer, b"copy", Some(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(read_as(&fs, Some(&carol), &writer).unwrap(), b"copy");
+        assert_eq!(read_as(&fs, Some(&carol), &file).unwrap(), b"copy");
+        assert!(fs.read_dir_as(Some(carol.caller()), &directory).is_ok());
+    }
+
+    #[test]
+    fn uncached_archive_reads_check_the_archived_descriptor() {
+        use crate::descriptor::Rights;
+        use crate::fs::errors::ReadError;
+
+        let (alice, carol) = (Credentials::new(ALICE), Credentials::new(CAROL));
+        let fs = Resolver::<TestPlatform, _>::with_credentials(
+            TarRo::new(
+                build_tar(
+                    ExtensionMode::Gnu,
+                    &[
+                        ArchiveEntry::file("private", 0o600, b"data"),
+                        ArchiveEntry::file("public", 0o604, b"data"),
+                    ],
+                ),
+                InodeAllocators::new().next(),
+            ),
+            profile_with(checked_at_use(Rights::WRITE), HandleRules::LINUX_DIRECTORY),
+        );
+        for (path, readable) in [("/private", false), ("/public", true)] {
+            let entry = fs
+                .open(carol.caller(), path, OFlags::RDONLY, Mode::empty())
+                .unwrap();
+            let read = read_as(&fs, Some(&carol), &entry);
+            if readable {
+                assert_eq!(read.unwrap(), b"data");
+            } else {
+                assert!(matches!(read, Err(ReadError::NotForReading)));
+            }
+            assert_eq!(read_as(&fs, Some(&alice), &entry).unwrap(), b"data");
+        }
+    }
+
+    #[test]
+    fn uncached_device_uses_check_each_devices_descriptor() {
+        use crate::descriptor::Rights;
+        use crate::fs::errors::ReadError;
+
+        let (alice, bob) = (Credentials::new(ALICE), Credentials::new(BOB));
+        let tty = Principal::posix_group(5);
+        let operator = Credentials::with_principals(
+            Principal::posix_user(CAROL.into()),
+            tty,
+            Privileges::empty(),
+        );
+        let checked = profile_with(
+            checked_at_use(Rights::READ | Rights::WRITE),
+            HandleRules::LINUX_DIRECTORY,
+        );
+        for (profile, cached) in [(profile(), true), (checked, false)] {
+            let fs = with_devices_and_profile(
+                device_security().with_terminals(Some(tty), TERMINAL),
+                profile,
+            );
+            let (_manager, path) = open_terminal(&fs, &alice);
+            let mut subsidiary = fs
+                .open(operator.caller(), &path, OFlags::WRONLY, Mode::empty())
+                .unwrap();
+            fs.write_as(operator.caller(), &mut subsidiary, b"a", None)
+                .unwrap();
+            fs.chmod(alice.caller(), &path, Mode::RUSR | Mode::WUSR)
+                .unwrap();
+            let written = fs.write_as(operator.caller(), &mut subsidiary, b"b", None);
+            if cached {
+                assert_eq!(written.unwrap(), 1);
+            } else {
+                assert!(matches!(written, Err(WriteError::NotForWriting)));
+                assert_eq!(
+                    fs.write_as(alice.caller(), &mut subsidiary, b"b", None)
+                        .unwrap(),
+                    1
+                );
+            }
+
+            // Fixed devices keep their configured descriptors.
+            let mut stdout = fs
+                .open(alice.caller(), "/dev/stdout", OFlags::WRONLY, Mode::empty())
+                .unwrap();
+            let written = fs.write_as(bob.caller(), &mut stdout, b"out", None);
+            if cached {
+                assert_eq!(written.unwrap(), 3);
+            } else {
+                assert!(matches!(written, Err(WriteError::NotForWriting)));
+            }
+            let null = fs
+                .open(bob.caller(), "/dev/null", OFlags::RDONLY, Mode::empty())
+                .unwrap();
+            assert_eq!(read_as(&fs, Some(&bob), &null).unwrap(), b"");
+            let read = read_as(&fs, None, &null);
+            if cached {
+                assert_eq!(read.unwrap(), b"");
+            } else {
+                assert!(matches!(read, Err(ReadError::Io)));
+            }
+        }
+    }
+
+    fn explicit_times(seconds: i64) -> SetFileTimes {
+        let at = FileTimeUpdate::Set(FileTimestamp {
+            seconds,
+            nanoseconds: 0,
+        });
+        SetFileTimes {
+            access: at,
+            modify: at,
+        }
+    }
+
+    /// When the object that `entry` refers to was last accessed, in seconds, if recorded.
+    fn accessed<B: Backend>(
+        fs: &Resolver<TestPlatform, B>,
+        entry: &ResolverEntry<B>,
+    ) -> Option<i64> {
+        fs.handle_status(entry)
+            .unwrap()
+            .times
+            .map(|times| times.accessed.seconds)
+    }
+
+    #[test]
+    fn timestamp_updates_act_on_the_opened_object() {
+        let (alice, bob) = (Credentials::new(ALICE), Credentials::new(BOB));
+        let fs = in_mem([
+            ("/", dir(ALL, posix(CAROL))),
+            ("/dir", dir(ALL, posix(ALICE))),
+        ]);
+        create(
+            &fs,
+            &alice,
+            "/dir/file",
+            Mode::RUSR | Mode::WUSR | Mode::WOTH,
+        );
+        let entry = fs
+            .open(alice.caller(), "/dir/file", OFlags::PATH, Mode::empty())
+            .unwrap();
+        let by_bob = fs
+            .open(bob.caller(), "/dir/file", OFlags::PATH, Mode::empty())
+            .unwrap();
+        let now = SetFileTimes {
+            access: FileTimeUpdate::Now,
+            modify: FileTimeUpdate::Now,
+        };
+
+        // Neither the name nor the path to it matters any more.
+        fs.rename(alice.caller(), "/dir/file", "/dir/moved")
+            .unwrap();
+        create(&fs, &bob, "/dir/file", ALL);
+        fs.chmod(alice.caller(), "/dir", Mode::WUSR).unwrap();
+        fs.set_times(alice.caller(), &entry, &explicit_times(1))
+            .unwrap();
+        assert_eq!(accessed(&fs, &entry), Some(1));
+        let replacement = fs.open(bob.caller(), "/dir/file", OFlags::PATH, Mode::empty());
+        assert!(replacement.is_err());
+        fs.chmod(alice.caller(), "/dir", ALL).unwrap();
+        let replacement = fs
+            .open(bob.caller(), "/dir/file", OFlags::PATH, Mode::empty())
+            .unwrap();
+        assert_eq!(accessed(&fs, &replacement), None);
+
+        // The object's current descriptor decides, for whoever acts.
+        fs.set_times(bob.caller(), &by_bob, &now).unwrap();
+        fs.chmod(alice.caller(), "/dir/moved", Mode::RUSR | Mode::WUSR)
+            .unwrap();
+        assert!(matches!(
+            fs.set_times(bob.caller(), &by_bob, &now),
+            Err(SetTimesError::AccessNotAllowed)
+        ));
+        assert!(matches!(
+            fs.set_times(bob.caller(), &entry, &explicit_times(2)),
+            Err(SetTimesError::NotTheOwner)
+        ));
+
+        // Even once unlinked.
+        fs.unlink(alice.caller(), "/dir/moved").unwrap();
+        fs.set_times(alice.caller(), &entry, &explicit_times(3))
+            .unwrap();
+        assert_eq!(accessed(&fs, &entry), Some(3));
+        assert_eq!(accessed(&fs, &replacement), None);
+    }
+
+    #[test]
+    fn overlay_timestamp_updates_follow_handles_until_their_object_goes() {
+        let carol = Credentials::new(CAROL);
+        let allocators = InodeAllocators::new();
+        let fs = Resolver::<TestPlatform, _>::with_credentials(
+            Overlay::<TestPlatform>::new(
+                InMem::<TestPlatform>::new_initialized(
+                    [("/", dir(ALL, posix(CAROL)))],
+                    allocators.next(),
+                ),
+                InMem::<TestPlatform>::new_initialized(
+                    [
+                        ("/dir", dir(ALL, posix(CAROL))),
+                        ("/dir/lower", file(ALL, posix(CAROL))),
+                        ("/dir/removed", file(ALL, posix(CAROL))),
+                    ],
+                    allocators.next(),
+                ),
+                allocators.next(),
+            ),
+            profile(),
+        );
+        let open = |path| {
+            fs.open(carol.caller(), path, OFlags::RDONLY, Mode::empty())
+                .unwrap()
+        };
+
+        // Changing a lower file copies it up.
+        let lower = open("/dir/lower");
+        fs.set_times(carol.caller(), &lower, &explicit_times(1))
+            .unwrap();
+        assert_eq!(accessed(&fs, &open("/dir/lower")), Some(1));
+        fs.rename(carol.caller(), "/dir/lower", "/dir/copied")
+            .unwrap();
+        create(&fs, &carol, "/dir/lower", ALL);
+        let replacement = open("/dir/lower");
+        fs.set_times(carol.caller(), &replacement, &explicit_times(7))
+            .unwrap();
+        fs.set_times(carol.caller(), &lower, &explicit_times(2))
+            .unwrap();
+        assert_eq!(accessed(&fs, &lower), Some(2));
+        assert_eq!(accessed(&fs, &open("/dir/copied")), Some(2));
+        assert_eq!(accessed(&fs, &replacement), Some(7));
+
+        // An upper file can be renamed.
+        create(&fs, &carol, "/dir/upper", ALL);
+        let upper = open("/dir/upper");
+        fs.rename(carol.caller(), "/dir/upper", "/dir/moved")
+            .unwrap();
+        fs.set_times(carol.caller(), &upper, &explicit_times(3))
+            .unwrap();
+        assert_eq!(accessed(&fs, &open("/dir/moved")), Some(3));
+
+        let directory = fs
+            .open(
+                carol.caller(),
+                "/dir",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        fs.set_times(carol.caller(), &directory, &explicit_times(4))
+            .unwrap();
+        assert_eq!(accessed(&fs, &directory), Some(4));
+
+        // An open on a lower file that was never copied up cannot recreate it or update its replacement.
+        let removed = open("/dir/removed");
+        fs.unlink(carol.caller(), "/dir/removed").unwrap();
+        assert!(matches!(
+            fs.set_times(carol.caller(), &removed, &explicit_times(5)),
+            Err(SetTimesError::Io)
+        ));
+        create(&fs, &carol, "/dir/removed", ALL);
+        let replacement = open("/dir/removed");
+        fs.set_times(carol.caller(), &replacement, &explicit_times(8))
+            .unwrap();
+        assert!(matches!(
+            fs.set_times(carol.caller(), &removed, &explicit_times(5)),
+            Err(SetTimesError::Io)
+        ));
+        assert_eq!(accessed(&fs, &replacement), Some(8));
+    }
+
+    #[test]
+    fn read_only_timestamp_updates_fail_before_authorizing() {
+        let bob = Credentials::new(BOB);
+        let fs = Resolver::<TestPlatform, _>::with_credentials(
+            TarRo::new(
+                build_tar(
+                    ExtensionMode::Gnu,
+                    &[ArchiveEntry::file("file", 0o600, b"data")],
+                ),
+                InodeAllocators::new().next(),
+            ),
+            profile(),
+        );
+        for path in ["/", "/file"] {
+            let entry = fs
+                .open(bob.caller(), path, OFlags::PATH, Mode::empty())
+                .unwrap();
+            assert!(matches!(
+                fs.set_times(bob.caller(), &entry, &explicit_times(1)),
+                Err(SetTimesError::ReadOnlyFileSystem)
+            ));
+        }
+        let fs = with_devices(device_security());
+        for path in ["/dev", "/dev/pts"] {
+            let entry = fs
+                .open(bob.caller(), path, OFlags::PATH, Mode::empty())
+                .unwrap();
+            assert!(matches!(
+                fs.set_times(bob.caller(), &entry, &explicit_times(1)),
+                Err(SetTimesError::ReadOnlyFileSystem)
+            ));
+        }
+    }
+
+    #[test]
+    fn directory_opens_admit_the_current_descriptor() {
+        use crate::descriptor::Rights;
+        use crate::fs::errors::ReadDirError;
+
+        let (bob, carol) = (Credentials::new(BOB), Credentials::new(CAROL));
+        let fs = in_mem_with(
+            profile_with(HandleRules::LINUX_FILE, checked_at_use(Rights::LIST)),
+            [
+                ("/", dir(ALL, posix(CAROL))),
+                ("/dir", dir(ALL, posix(CAROL))),
+            ],
+        );
+        let open = |who: &Credentials, flags| {
+            fs.open(
+                who.caller(),
+                "/dir",
+                flags | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+        };
+        let directory = open(&bob, OFlags::RDONLY).unwrap();
+        assert_eq!(
+            directory.handle_grants().unwrap().decide(Rights::LIST),
+            HandleUse::CheckAtUse
+        );
+        fs.chmod(carol.caller(), "/dir", Mode::RWXU).unwrap();
+        assert!(matches!(
+            open(&bob, OFlags::RDONLY),
+            Err(OpenError::AccessNotAllowed)
+        ));
+        assert!(matches!(
+            fs.read_dir_as(Some(bob.caller()), &directory),
+            Err(ReadDirError::NotOpenForReading)
+        ));
+
+        // Path-only opens ask for nothing, so check nothing and grant nothing.
+        fs.chmod(carol.caller(), "/dir", Mode::empty()).unwrap();
+        let path_only = open(&bob, OFlags::PATH).unwrap();
+        let grants = path_only.handle_grants().unwrap();
+        assert_eq!(grants.admitted(), Rights::empty());
+        assert_eq!(grants.decide(Rights::LIST), HandleUse::Denied);
+        assert!(open(&carol, OFlags::RDONLY).is_err());
+        fs.chmod(carol.caller(), "/dir", Mode::RUSR).unwrap();
+        let reader = open(&carol, OFlags::RDONLY).unwrap();
+        assert!(fs.read_dir_as(Some(carol.caller()), &reader).is_ok());
+    }
+
+    #[test]
+    fn eligibility_never_makes_a_terminal_readable() {
+        use crate::descriptor::Rights;
+
+        let alice = Credentials::new(ALICE);
+        let bob = Credentials::new(BOB);
+        let checked = profile_with(
+            checked_at_use(Rights::empty()),
+            HandleRules::LINUX_DIRECTORY,
+        );
+        for (profile, cached) in [(profile(), true), (checked, false)] {
+            let fs =
+                with_devices_and_profile(device_security().with_terminals(None, TERMINAL), profile);
+            let (_manager, path) = open_terminal(&fs, &alice);
+            let open =
+                |who: &Credentials, flags| fs.open(who.caller(), &path, flags, Mode::empty());
+            let alices = open(&alice, OFlags::RDWR).unwrap();
+            assert!(fs.terminal_readable(Some(alice.caller()), &alices));
+            assert_eq!(fs.terminal_readable(None, &alices), cached);
+            let writer = open(&alice, OFlags::WRONLY).unwrap();
+            assert!(!fs.terminal_readable(Some(alice.caller()), &writer));
+            let path_only = open(&alice, OFlags::PATH).unwrap();
+            assert!(!fs.terminal_readable(Some(alice.caller()), &path_only));
+
+            if cached {
+                assert!(matches!(
+                    open(&bob, OFlags::RDWR),
+                    Err(OpenError::AccessNotAllowed)
+                ));
+                // The grant cached at open serves whoever holds the handle.
+                assert!(fs.terminal_readable(Some(bob.caller()), &alices));
+                continue;
+            }
+            // Bob may hold a handle to Alice's terminal that he may not read through.
+            let bobs = open(&bob, OFlags::RDWR).unwrap();
+            assert!(!fs.terminal_readable(Some(bob.caller()), &bobs));
+            assert!(!fs.terminal_readable(Some(bob.caller()), &alices));
+            assert!(fs.terminal_readable(Some(alice.caller()), &bobs));
+            fs.chmod(alice.caller(), &path, ALL).unwrap();
+            assert!(fs.terminal_readable(Some(bob.caller()), &bobs));
+            assert!(!fs.terminal_readable(None, &bobs));
+        }
+    }
+
+    #[test]
+    fn controlling_terminal_io_is_authorized_before_reaching_the_terminal() {
+        use crate::descriptor::Rights;
+        use crate::fs::FileType;
+        use crate::fs::backend::mode_descriptor;
+        use crate::fs::errors::ReadError;
+        use crate::stdio::StdioProvider;
+
+        let (bob, carol) = (Credentials::new(BOB), Credentials::new(CAROL));
+        let (owner, group) = owners(posix(CAROL));
+        // Only Carol may use the devices anyone usually may, such as `tty`.
+        let security = DeviceSecurity::new(
+            mode_descriptor(FileType::Directory, ALL, owner, group),
+            mode_descriptor(
+                FileType::CharacterDevice,
+                Mode::RUSR | Mode::WUSR,
+                owner,
+                group,
+            ),
+            mode_descriptor(
+                FileType::CharacterDevice,
+                Mode::RUSR | Mode::WUSR,
+                owner,
+                group,
+            ),
+        )
+        .unwrap();
+        let stdio = Arc::new(TestStdioProvider::default().with_controlling_terminal());
+        let fs = with_stdio(
+            security,
+            profile_with(
+                checked_at_use(Rights::empty()),
+                HandleRules::LINUX_DIRECTORY,
+            ),
+            Arc::clone(&stdio),
+        );
+        let open = |who: &Credentials| {
+            fs.open_with_controlling_terminal(
+                who.caller(),
+                "/dev/tty",
+                OFlags::RDWR,
+                Mode::empty(),
+                &|| stdio.terminal(),
+            )
+            .unwrap()
+        };
+        let mut tty = open(&bob);
+        stdio.push_terminal_input(b"line");
+        assert!(matches!(
+            read_as(&fs, Some(&bob), &tty),
+            Err(ReadError::NotForReading)
+        ));
+        assert!(matches!(read_as(&fs, None, &tty), Err(ReadError::Io)));
+        assert!(matches!(
+            fs.write_as(bob.caller(), &mut tty, b"x", None),
+            Err(WriteError::NotForWriting)
+        ));
+        assert!(matches!(
+            fs.write(&mut tty, b"x", None),
+            Err(WriteError::Io)
+        ));
+        assert!(!fs.terminal_readable(Some(bob.caller()), &tty));
+
+        // Nothing reached the terminal, which serves whoever `tty` lets use it: only Carol's
+        // write is there.
+        assert!(fs.terminal_readable(Some(carol.caller()), &tty));
+        assert_eq!(read_as(&fs, Some(&carol), &tty).unwrap(), b"line");
+        fs.write_as(carol.caller(), &mut tty, b"x", None).unwrap();
+        assert_eq!(stdio.terminal_writes(), [b"x".to_vec()]);
+        drop(open(&carol));
+    }
+
+    #[test]
+    fn legacy_terminals_are_readable_when_open_for_reading() {
+        use crate::stdio::StdioProvider;
+
+        let stdio = Arc::new(TestStdioProvider::default().with_controlling_terminal());
+        let fs = Resolver::<TestPlatform, _>::new(Devices::new(
+            InodeAllocators::new().next(),
+            stdio.clone(),
+            Arc::new(TestRandomProvider),
+        ));
+        for (flags, readable) in [(OFlags::RDWR, true), (OFlags::WRONLY, false)] {
+            let tty = fs
+                .open_with_controlling_terminal(posix(BOB), "/tty", flags, Mode::empty(), &|| {
+                    stdio.terminal()
+                })
+                .unwrap();
+            assert_eq!(fs.terminal_readable(None, &tty), readable);
+            assert_eq!(
+                fs.terminal_readable(Some(posix(BOB).into()), &tty),
+                readable
+            );
+        }
     }
 }

@@ -1171,6 +1171,29 @@ mod tests {
             Ok(Err(ProcessGroupError::NotControllingTerminal))
         );
         let terminal = other(&leader);
+        // A terminal control reference can query the endpoint but cannot present itself
+        // as a readable open for session acquisition.
+        let control = leader
+            .duplicate_object_operations_to(
+                terminal,
+                &leader,
+                ObjectRights::WAIT,
+                crate::HandleOperations::TERMINAL,
+            )
+            .unwrap();
+        assert!(
+            crate::fs::terminal_control(
+                &leader,
+                control,
+                litebox_broker_protocol::terminal::TerminalOperation::GetWindowSize,
+            )
+            .unwrap()
+            .is_ok()
+        );
+        assert_eq!(
+            super::set_controlling_terminal(&leader, leader.id(), control),
+            Err(BrokerError::PolicyDenied)
+        );
         for _ in 0..2 {
             assert_eq!(
                 super::set_controlling_terminal(&leader, leader.id(), terminal),

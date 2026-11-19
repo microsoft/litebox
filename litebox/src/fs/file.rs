@@ -466,6 +466,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     /// [`FileOpenFlags::NONBLOCKING`]. A failure after partial progress returns the bytes read.
     pub fn read(
         &self,
+        buf: impl ReadBuffer,
+        offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<usize, ReadError> {
+        self.read_inner(None, buf, offset, wait)
+    }
+
+    /// Reads as the current caller when the handle requires a fresh access check.
+    pub fn read_as(
+        &self,
+        caller: &Caller,
+        buf: impl ReadBuffer,
+        offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<usize, ReadError> {
+        self.read_inner(caller.content_subject(&self.broker)?, buf, offset, wait)
+    }
+
+    fn read_inner(
+        &self,
+        subject: Option<ObjectHandle>,
         mut buf: impl ReadBuffer,
         offset: Option<usize>,
         wait: Option<&WaitContext<'_, Platform>>,
@@ -483,6 +504,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
                 self.broker
                     .read_file(
                         self.handle,
+                        subject,
                         &mut (&mut buf).sub_buffer(read, length),
                         offset,
                     )?
@@ -620,19 +642,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
 
     /// Asks the broker for the host shared object holding this file's contents, so that every
     /// process mapping it shares its pages. Each call delivers a new handle to the object, which
-    /// covers the file's bytes up to `end`.
+    /// covers the file's bytes up to `options.end`.
     ///
-    /// Fails with [`SharedObjectError::Unsupported`] if `platform` cannot map shared objects or the
-    /// broker cannot share this file's pages with this process.
+    /// [`SharedObjectError::Unsupported`] means the request was admitted, but the pages cannot
+    /// be shared. A caller needing only a read-only mapping may copy through checked reads.
     pub fn request_shared_object<Provider, const ALIGN: usize>(
         &self,
         platform: &Provider,
-        end: u64,
+        options: super::FileMappingOptions,
     ) -> Result<SharedFileObject<Provider::SharedObject>, SharedObjectError>
     where
         Provider: crate::platform::SharedObjectProvider<ALIGN>,
     {
-        let response = self.broker.map_file(self.handle, end)??;
+        let response = self.broker.map_file(self.handle, options)??;
         // SAFETY: The broker delivered the object under this token before answering, and the
         // token goes nowhere else.
         let object = unsafe { platform.take_shared_object(response.token) }?;
@@ -646,7 +668,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     /// Reads the entries of the directory this file opens.
     pub fn read_directory(&self) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         self.broker
-            .read_directory(self.handle)?
+            .read_directory(self.handle, None)?
+            .map_err(ReadDirError::from)
+    }
+
+    /// Enumerates as the current caller when the handle requires a fresh access check.
+    pub fn read_directory_as(
+        &self,
+        caller: &Caller,
+    ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+        self.broker
+            .read_directory(self.handle, caller.content_subject(&self.broker)?)?
             .map_err(ReadDirError::from)
     }
 
@@ -760,8 +792,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable for Fi
     fn check_io_events(&self) -> Events {
         match self.broker.check_readiness(self.handle) {
             Ok(readiness) => readiness_events(readiness),
-            // Files that never wait, such as regular files, have no readiness.
-            Err(BrokerControlError::Broker(ErrorCode::InvalidRights)) => Events::OUT,
             Err(_) => Events::ERR,
         }
     }
@@ -904,6 +934,8 @@ impl From<FileError> for SharedObjectError {
             FileError::IsDirectory => Self::IsDirectory,
             FileError::PathOnly => Self::PathOnly,
             FileError::NotForReading | FileError::AccessNotAllowed => Self::NotForReading,
+            FileError::NotForWriting => Self::NotForWriting,
+            FileError::InvalidOffset => Self::RangeOverflow,
             FileError::NoSuchDevice => Self::Unsupported,
             FileError::NoSpace => Self::NoMemory,
             _ => Self::Io,
@@ -998,6 +1030,7 @@ impl From<FileError> for OpenError {
 impl From<FileError> for ReadError {
     fn from(error: FileError) -> Self {
         match error {
+            FileError::StaleSubject => Self::StaleSubject,
             FileError::NotFile => Self::NotAFile,
             FileError::AccessNotAllowed | FileError::NotForReading => Self::NotForReading,
             _ => Self::Io,
@@ -1171,6 +1204,7 @@ impl From<FileError> for RmdirError {
 impl From<FileError> for ReadDirError {
     fn from(error: FileError) -> Self {
         match error {
+            FileError::StaleSubject => Self::StaleSubject,
             FileError::NotDirectory => Self::NotADirectory,
             FileError::PathOnly => Self::NotOpenForReading,
             FileError::AccessNotAllowed | FileError::NotForReading => Self::NotForReading,

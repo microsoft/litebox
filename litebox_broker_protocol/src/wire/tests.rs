@@ -291,11 +291,13 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::File(FileRequest::Read(ReadFileRequest {
             handle,
+            subject: Some(ObjectHandle(73)),
             buffer: largest_sequence,
             offset: Some(u64::MAX),
         })),
         BrokerOperation::File(FileRequest::Read(ReadFileRequest {
             handle,
+            subject: None,
             buffer: SharedBufferSequence::new(&[SharedBufferSlotIndex(2)], 32).unwrap(),
             offset: None,
         })),
@@ -318,6 +320,7 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle,
+            subject: Some(ObjectHandle(74)),
             buffer: sequence(4, 256),
             start_index: 19,
         })),
@@ -403,7 +406,11 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::File(FileRequest::Map(MapFileRequest {
             handle,
-            end: 3 << 32 | 0x1000,
+            options: crate::fs::FileMappingOptions {
+                end: 3 << 32 | 0x1000,
+                max_regular_end: 1 << 48,
+                require_write: true,
+            },
         })),
         BrokerOperation::File(FileRequest::Mount(MountFileRequest {
             path: sequence(14, 9),

@@ -269,7 +269,29 @@ impl PseudoTerminal {
     }
 
     fn subsidiary_read(&self, output: &mut dyn ReadBuffer) -> Result<usize, ReadError> {
+        self.subsidiary_read_as(output, None)
+    }
+
+    /// Reads from the subsidiary like [`TerminalEndpoint::read`] once `authorize` allows its
+    /// current descriptor, under the lock that changes to it take; otherwise fails with
+    /// [`ReadError::NotForReading`].
+    pub(crate) fn subsidiary_read_checked(
+        &self,
+        output: &mut dyn ReadBuffer,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
+    ) -> Result<usize, ReadError> {
+        self.subsidiary_read_as(output, Some(authorize))
+    }
+
+    fn subsidiary_read_as(
+        &self,
+        output: &mut dyn ReadBuffer,
+        authorize: Option<&dyn Fn(&SecurityDescriptor) -> bool>,
+    ) -> Result<usize, ReadError> {
         let mut state = self.lock();
+        if authorize.is_some_and(|authorize| !authorize(&self.metadata.0.lock())) {
+            return Err(ReadError::NotForReading);
+        }
         if !state.manager_open {
             return Ok(0);
         }
@@ -281,7 +303,29 @@ impl PseudoTerminal {
     }
 
     fn subsidiary_write(&self, input: &dyn WriteBuffer) -> Result<usize, WriteError> {
+        self.subsidiary_write_as(input, None)
+    }
+
+    /// Writes to the subsidiary like [`TerminalEndpoint::write`] once `authorize` allows its
+    /// current descriptor, under the lock that changes to it take; otherwise fails with
+    /// [`WriteError::NotForWriting`].
+    pub(crate) fn subsidiary_write_checked(
+        &self,
+        input: &dyn WriteBuffer,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
+    ) -> Result<usize, WriteError> {
+        self.subsidiary_write_as(input, Some(authorize))
+    }
+
+    fn subsidiary_write_as(
+        &self,
+        input: &dyn WriteBuffer,
+        authorize: Option<&dyn Fn(&SecurityDescriptor) -> bool>,
+    ) -> Result<usize, WriteError> {
         let state = &mut *self.lock();
+        if authorize.is_some_and(|authorize| !authorize(&self.metadata.0.lock())) {
+            return Err(WriteError::NotForWriting);
+        }
         if !state.manager_open {
             return Err(WriteError::Io);
         }

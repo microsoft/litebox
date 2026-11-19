@@ -13,7 +13,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::rwlock::RwLock;
 
-use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
+use crate::object::{HandleOperations, ObjectEntry, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
 use crate::transfer::{append_to_queue, take_from_queue};
 use crate::{BrokerError, BrokerProcess, Result};
@@ -77,7 +77,7 @@ pub fn read(
     if output.len() > MAX_PIPE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
-    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let object = process.authorized_operation(handle, HandleOperations::READ)?;
     let object = object.read();
     object.as_pipe()?.read(output)
 }
@@ -92,7 +92,7 @@ pub fn write(
     if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
-    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::WRITE)?;
     let object = object.read();
     object.as_pipe()?.write(data)
 }

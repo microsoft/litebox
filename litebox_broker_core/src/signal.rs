@@ -22,7 +22,7 @@ use litebox_broker_protocol::terminal::TerminalEvents;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::Mutex;
 
-use crate::object::{ObjectEntry, ObjectRights};
+use crate::object::{HandleOperations, ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::{BrokerError, BrokerProcess, Result};
 
@@ -140,7 +140,7 @@ fn send_to_thread(
 ///
 /// Returns `WouldBlock` if no event is pending.
 pub fn take(process: &BrokerProcess, handle: ObjectHandle) -> Result<SignalEvent> {
-    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let object = process.authorized_operation(handle, HandleOperations::READ)?;
     let object = object.read();
     object.as_signals()?.signals.take()
 }

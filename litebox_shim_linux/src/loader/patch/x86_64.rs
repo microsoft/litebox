@@ -81,7 +81,10 @@ impl CodeRewriter {
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the arch state and capacity of an unpatched file's runtime trampoline.
-    pub(super) fn plan_runtime_trampoline(_file: &File<Platform>) -> (ArchPatchState, usize) {
+    pub(super) fn plan_runtime_trampoline(
+        _file: &File<Platform>,
+        _caller: &litebox::fs::Caller,
+    ) -> (ArchPatchState, usize) {
         (ArchPatchState {}, RUNTIME_TRAMPOLINE_SIZE)
     }
 

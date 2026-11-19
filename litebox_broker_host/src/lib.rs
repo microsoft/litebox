@@ -857,11 +857,12 @@ fn handle_file_request<Memory: SharedMemory>(
         }
         FileRequest::Read(ReadFileRequest {
             handle,
+            subject,
             buffer,
             offset,
         }) => {
             let mut output = shared_buffer(shared_buffers, buffer, MAX_FILE_TRANSFER_SIZE)?;
-            match litebox_broker_core::fs::read(process, handle, &mut output, offset)
+            match litebox_broker_core::fs::read_as(process, handle, subject, &mut output, offset)
                 .map_err(RequestFailure::from)?
             {
                 Ok(read) => Ok(FileResponse::Read(ReadFileResponse {
@@ -920,11 +921,12 @@ fn handle_file_request<Memory: SharedMemory>(
         }
         FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle,
+            subject,
             buffer,
             start_index,
         }) => {
             validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
-            let entries = match litebox_broker_core::fs::read_directory(process, handle)
+            let entries = match litebox_broker_core::fs::read_directory_as(process, handle, subject)
                 .map_err(RequestFailure::from)?
             {
                 Ok(entries) => entries,
@@ -1008,7 +1010,15 @@ fn handle_file_request<Memory: SharedMemory>(
         }
         // Mapping needs a way to deliver the host shared object to the caller, which only a
         // deployment's request extension provides. Without one, files cannot be shared.
-        FileRequest::Map(_) => Ok(FileResponse::Failed(FileError::NoSuchDevice)),
+        FileRequest::Map(request) => {
+            let access =
+                litebox_broker_core::fs::check_mapping(process, request.handle, request.options)
+                    .map_err(RequestFailure::from)?;
+            Ok(FileResponse::Failed(match access {
+                Ok(()) => FileError::NoSuchDevice,
+                Err(error) => error,
+            }))
+        }
         FileRequest::IsTerminal(IsTerminalFileRequest { handle }) => {
             match litebox_broker_core::fs::is_terminal(process, handle)
                 .map_err(RequestFailure::from)?
@@ -2995,6 +3005,7 @@ mod tests {
                 &process,
                 BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                     handle: opened.handle,
+                    subject: None,
                     buffer: sequence([2], 3),
                     offset: None,
                 })),
@@ -3029,6 +3040,7 @@ mod tests {
             &process,
             BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
                 handle: directory.handle,
+                subject: None,
                 buffer: single_slot_sequence(4, 64),
                 start_index: 0,
             })),

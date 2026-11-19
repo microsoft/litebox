@@ -3,7 +3,7 @@
 
 //! Broker-owned event object operations.
 
-use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
+use crate::object::{HandleOperations, ObjectEntry, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
 use crate::{BrokerError, BrokerProcess, Result};
 use litebox_broker_protocol::ObjectHandle;
@@ -36,7 +36,7 @@ pub fn create(
 /// Fails with `WouldBlock` if the count would exceed its maximum, or
 /// `NonBlockingWouldBlock` if the event is also non-blocking.
 pub fn add(process: &BrokerProcess, handle: ObjectHandle, value: u64) -> Result<ReadinessFlags> {
-    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::WRITE)?;
     let mut object = object.write();
     object.as_event_mut()?.add(value)
 }
@@ -50,7 +50,7 @@ pub fn consume(
     handle: ObjectHandle,
     mode: EventConsumeMode,
 ) -> Result<EventConsumption> {
-    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let object = process.authorized_operation(handle, HandleOperations::READ)?;
     let mut object = object.write();
     object.as_event_mut()?.consume(mode)
 }

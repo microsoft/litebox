@@ -50,7 +50,7 @@ use spin::{Mutex, MutexGuard, rwlock::RwLock};
 
 use crate::channel::{Channel, ChannelState, Waiter, Wakeups};
 use crate::fs::File;
-use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
+use crate::object::{HandleOperations, ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::socket::SocketOptions;
 use crate::transfer::{append_to_queue, copy_from_queue, take_from_queue};
@@ -95,10 +95,10 @@ pub fn create(
 ) -> Result<ObjectHandle> {
     let (rights, status) = creation_rights(process, flags)?;
     let reference = process.reserve_object_reference(rights)?;
-    let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
     let object = UnixSocketObject::new(process, socket_type, status)?;
-    object.watch(&registration)?;
-    reference.commit_with_readiness(ObjectEntry::UnixSocket(object), Some(registration))
+    let registration =
+        reference.watch_readiness(Arc::clone(readiness_sink), |r| object.watch(r))?;
+    reference.commit_with_readiness(ObjectEntry::UnixSocket(object), registration)
 }
 
 /// Creates a pair of Unix sockets connected to each other.
@@ -115,10 +115,6 @@ pub fn create_pair(
     let (rights, status) = creation_rights(process, flags)?;
     let first_reference = process.reserve_object_reference(rights)?;
     let second_reference = process.reserve_object_reference(rights)?;
-    let first_registration =
-        ReadinessRegistration::new(first_reference.handle(), Arc::clone(readiness_sink));
-    let second_registration =
-        ReadinessRegistration::new(second_reference.handle(), Arc::clone(readiness_sink));
     let first = UnixSocketObject::new(process, socket_type, status)?;
     let second = UnixSocketObject::new(process, socket_type, status)?;
     for (socket, peer) in [
@@ -130,12 +126,14 @@ pub fn create_pair(
             peer_name: UnixSocketName::Unnamed,
         };
     }
-    first.watch(&first_registration)?;
-    second.watch(&second_registration)?;
+    let first_registration =
+        first_reference.watch_readiness(Arc::clone(readiness_sink), |r| first.watch(r))?;
+    let second_registration =
+        second_reference.watch_readiness(Arc::clone(readiness_sink), |r| second.watch(r))?;
     let first = first_reference
-        .commit_with_readiness(ObjectEntry::UnixSocket(first), Some(first_registration))?;
+        .commit_with_readiness(ObjectEntry::UnixSocket(first), first_registration)?;
     match second_reference
-        .commit_with_readiness(ObjectEntry::UnixSocket(second), Some(second_registration))
+        .commit_with_readiness(ObjectEntry::UnixSocket(second), second_registration)
     {
         Ok(second) => Ok((first, second)),
         Err(error) => {
@@ -156,7 +154,7 @@ pub fn bind(
     user: FileUser,
     mode: FileMode,
 ) -> Result<UnixSocketResult<()>> {
-    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let lease = Lease::new(process.authorized_operation(handle, HandleOperations::BIND)?)?;
     let socket = &lease.socket;
     let path = {
         let mut state = socket.state.lock();
@@ -216,7 +214,7 @@ pub fn listen(
     handle: ObjectHandle,
     backlog: u32,
 ) -> Result<UnixSocketResult<()>> {
-    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let lease = Lease::new(process.authorized_operation(handle, HandleOperations::LISTEN)?)?;
     let socket = &lease.socket;
     if !socket.is_connection_oriented() {
         return Ok(Err(UnixSocketError::Unsupported));
@@ -256,7 +254,7 @@ pub fn connect(
     address: &UnixSocketAddress,
     user: FileUser,
 ) -> Result<UnixSocketResult<()>> {
-    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let lease = Lease::new(process.authorized_operation(handle, HandleOperations::CONNECT)?)?;
     let socket = &lease.socket;
     // The node stays open until the connect finishes, so its identity cannot
     // be reused meanwhile.
@@ -291,13 +289,12 @@ pub fn accept(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<UnixSocketResult<ObjectHandle>> {
     let (rights, status) = creation_rights(process, flags)?;
-    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WAIT)?)?;
+    let lease = Lease::new(process.authorized_operation(handle, HandleOperations::ACCEPT)?)?;
     let listener = &lease.socket;
     if !listener.is_connection_oriented() {
         return Ok(Err(UnixSocketError::Unsupported));
     }
     let reference = process.reserve_object_reference(rights)?;
-    let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
     let (accepted, wakeups) = {
         let mut state = listener.state.lock();
         let Connection::Listening { backlog, .. } = &mut state.connection else {
@@ -321,9 +318,10 @@ pub fn accept(
     };
     wakeups.wake();
     let object = UnixSocketObject::from_socket(accepted, status);
-    object.watch(&registration)?;
+    let registration =
+        reference.watch_readiness(Arc::clone(readiness_sink), |r| object.watch(r))?;
     reference
-        .commit_with_readiness(ObjectEntry::UnixSocket(object), Some(registration))
+        .commit_with_readiness(ObjectEntry::UnixSocket(object), registration)
         .map(Ok)
 }
 
@@ -344,7 +342,7 @@ pub fn send(
     if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
-    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let lease = Lease::new(process.authorized_operation(handle, HandleOperations::WRITE)?)?;
     let socket = &lease.socket;
     match socket.kind {
         SocketType::Stream => socket.send_stream(address.is_some(), data, lease.nonblocking),
@@ -396,7 +394,7 @@ pub fn receive(
     if output.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
-    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WAIT)?)?;
+    let lease = Lease::new(process.authorized_operation(handle, HandleOperations::READ)?)?;
     let socket = &lease.socket;
     let nonblocking = nonblocking || lease.nonblocking;
     match socket.kind {
@@ -422,7 +420,7 @@ pub fn shutdown(
         ShutdownMode::Both => (true, true),
         _ => return Err(BrokerError::UnsupportedOperation),
     };
-    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let lease = Lease::new(process.authorized_operation(handle, HandleOperations::SHUTDOWN)?)?;
     let socket = &lease.socket;
     let (peer, wakeups) = socket.shut_down(read, write);
     wakeups.wake();
@@ -442,10 +440,7 @@ pub fn name(
     handle: ObjectHandle,
     peer: bool,
 ) -> Result<UnixSocketResult<UnixSocketName>> {
-    let lease = Lease::new(
-        process
-            .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?,
-    )?;
+    let lease = Lease::new(process.authorized_operation(handle, HandleOperations::QUERY)?)?;
     let state = lease.socket.state.lock();
     if !peer {
         return Ok(Ok(state.name.clone()));
@@ -464,7 +459,7 @@ pub fn set_option(
     handle: ObjectHandle,
     value: SocketOptionValue,
 ) -> Result<()> {
-    let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let lease = Lease::new(process.authorized_operation(handle, HandleOperations::SET_OPTION)?)?;
     lease.socket.state.lock().options.set(value)
 }
 
@@ -474,10 +469,7 @@ pub fn get_option(
     handle: ObjectHandle,
     name: SocketOptionName,
 ) -> Result<SocketOptionValue> {
-    let lease = Lease::new(
-        process
-            .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?,
-    )?;
+    let lease = Lease::new(process.authorized_operation(handle, HandleOperations::QUERY)?)?;
     lease.socket.state.lock().options.get(name)
 }
 

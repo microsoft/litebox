@@ -33,7 +33,7 @@ use litebox_broker_protocol::shared_futex::{
 use sha2::Sha256;
 use spin::{Mutex, Once};
 
-use crate::object::{ObjectEntry, ObjectRights};
+use crate::object::{HandleOperations, ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::{BrokerError, BrokerProcess, Result};
 
@@ -156,7 +156,8 @@ pub fn futex_arm(process: &BrokerProcess, request: FutexArmRequest) -> Result<()
     process.core.shared_futexes.authorize(request.key.memory)?;
     // Holding the waiter's object defers a concurrent close, whose disarm then dequeues the
     // arming, until after this request's locks are released.
-    let waiter_object = process.authorized_object(request.waiter, ObjectRights::WAIT)?;
+    let waiter_object =
+        process.authorized_operation(request.waiter, HandleOperations::ARM_WAITER)?;
     let waiter = Arc::clone(&waiter_object.read().as_futex_waiter()?.0);
     let mut bucket = waiter.futexes.bucket(request.key).lock();
     let mut state = waiter.state.lock();
@@ -228,7 +229,7 @@ pub fn futex_wake(process: &BrokerProcess, request: FutexWakeRequest) -> Result<
 ///
 /// Disarming an idle waiter returns `false`.
 pub fn futex_disarm(process: &BrokerProcess, request: FutexDisarmRequest) -> Result<bool> {
-    let waiter = process.authorized_object(request.waiter, ObjectRights::WAIT)?;
+    let waiter = process.authorized_operation(request.waiter, HandleOperations::ARM_WAITER)?;
     let waiter = Arc::clone(&waiter.read().as_futex_waiter()?.0);
     Ok(waiter.disarm_and_take_woken())
 }

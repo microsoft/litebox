@@ -17,9 +17,9 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, EntryRemoval, EntryRename, FileHandle,
-    HandleRef, OpenChecks, PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile,
-    ResolvedTarget, SeekBehavior, status_descriptor,
+    AdmitDir, AuthorizeUse, Backend, BackendHandles, ContentChange, CreationMetadata, DirHandle,
+    EntryRemoval, EntryRename, FileHandle, HandleRef, OpenChecks, PermissionCheck, PermissionInfo,
+    Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior, status_descriptor,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
@@ -403,6 +403,45 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         }
     }
 
+    /// Open the resolved directory `dir`, admitting the open with `admit` (if any) as
+    /// [`Backend::open_dir_checked`] does.
+    fn open_composed_dir(
+        &self,
+        dir: ResolvedDir<'_>,
+        flags: OFlags,
+        admit: Option<AdmitDir<'_>>,
+    ) -> Result<DirHandle, OpenError> {
+        let dir = dir.into_typed::<Self>();
+        let inner = match dir.inner {
+            ComposerWalkingDirHandleInner::Virtual { path } => {
+                // Configuration fixes a virtual directory's descriptor.
+                if let Some(admit) = admit {
+                    admit(&self.virtual_dir_descriptor(&path))?;
+                }
+                ComposerDirHandleInner::Virtual { path }
+            }
+            ComposerWalkingDirHandleInner::Mounted {
+                path,
+                mount_index,
+                target,
+            } => {
+                let ResolvedTarget::Dir(handle) = target else {
+                    unreachable!()
+                };
+                let backend = self.backend(mount_index);
+                ComposerDirHandleInner::Mounted {
+                    path,
+                    mount_index,
+                    handle: match admit {
+                        Some(admit) => backend.open_dir_checked(handle, flags, admit)?,
+                        None => backend.open_dir(handle, flags)?,
+                    },
+                }
+            }
+        };
+        Ok(DirHandle::from_typed::<Self>(ComposerDirHandle { inner }))
+    }
+
     /// The mount that a rename between `old_dir` and `new_dir` happens in, and both directories in
     /// its backend.
     fn rename_mount(
@@ -493,19 +532,20 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
 
     fn resolved_dir<'a>(&self, dir: ComposerWalkingDirHandle<'a>) -> ResolvedDir<'a> {
         let permissions = match &dir.inner {
-            ComposerWalkingDirHandleInner::Virtual { path } => {
-                let status = self.virtual_dir_status(path);
-                PermissionCheck::ByResolver(PermissionInfo::new(
-                    status_descriptor(&status).from_trusted_configuration(),
-                    true,
-                ))
-            }
+            ComposerWalkingDirHandleInner::Virtual { path } => PermissionCheck::ByResolver(
+                PermissionInfo::new(self.virtual_dir_descriptor(path), true),
+            ),
             ComposerWalkingDirHandleInner::Mounted { target, .. } => match target {
                 ResolvedTarget::Dir(handle) => handle.permissions.clone(),
                 ResolvedTarget::File(_) => unreachable!(),
             },
         };
         ResolvedDir::from_typed::<Self>(dir, permissions)
+    }
+
+    /// The descriptor of a virtual directory, which configuration fixes.
+    fn virtual_dir_descriptor(&self, path: &[String]) -> SecurityDescriptor {
+        status_descriptor(&self.virtual_dir_status(path)).from_trusted_configuration()
     }
 
     fn virtual_dir_status(&self, path: &[String]) -> FileStatus {
@@ -830,27 +870,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
-        let dir = dir.into_typed::<Self>();
-        let inner = match dir.inner {
-            ComposerWalkingDirHandleInner::Virtual { path } => {
-                ComposerDirHandleInner::Virtual { path }
-            }
-            ComposerWalkingDirHandleInner::Mounted {
-                path,
-                mount_index,
-                target,
-            } => {
-                let ResolvedTarget::Dir(handle) = target else {
-                    unreachable!()
-                };
-                ComposerDirHandleInner::Mounted {
-                    path,
-                    mount_index,
-                    handle: self.backend(mount_index).open_dir(handle, flags)?,
-                }
-            }
-        };
-        Ok(DirHandle::from_typed::<Self>(ComposerDirHandle { inner }))
+        self.open_composed_dir(dir, flags, None)
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
@@ -1346,6 +1366,36 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
             .set_times_checked(target, times, authorize)
     }
 
+    fn set_handle_times_checked(
+        &self,
+        h: HandleRef<'_>,
+        times: &super::SetFileTimes,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), SetTimesError>,
+    ) -> Result<(), SetTimesError> {
+        match h {
+            HandleRef::File(h) => {
+                let h = h.get_typed::<Self>();
+                self.backend(h.mount_index).set_handle_times_checked(
+                    HandleRef::File(&h.handle),
+                    times,
+                    authorize,
+                )
+            }
+            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
+                ComposerDirHandleInner::Virtual { .. } => Err(SetTimesError::ReadOnlyFileSystem),
+                ComposerDirHandleInner::Mounted {
+                    mount_index,
+                    handle,
+                    ..
+                } => self.backend(*mount_index).set_handle_times_checked(
+                    HandleRef::Dir(handle),
+                    times,
+                    authorize,
+                ),
+            },
+        }
+    }
+
     fn update_security(
         &self,
         target: ResolvedTarget<'_>,
@@ -1378,27 +1428,98 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         }))
     }
 
+    fn open_dir_checked(
+        &self,
+        dir: ResolvedDir<'_>,
+        flags: OFlags,
+        admit: &dyn Fn(&SecurityDescriptor) -> Result<(), OpenError>,
+    ) -> Result<DirHandle, OpenError> {
+        self.open_composed_dir(dir, flags, Some(admit))
+    }
+
     fn write_checked(
         &self,
         h: &FileHandle,
         buf: &dyn WriteBuffer,
         offset: usize,
-        content_change: &dyn Fn(&mut SecurityDescriptor),
+        authorize: AuthorizeUse<'_>,
+        content_change: ContentChange<'_>,
     ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         self.backend(h.mount_index)
-            .write_checked(&h.handle, buf, offset, content_change)
+            .write_checked(&h.handle, buf, offset, authorize, content_change)
     }
 
     fn truncate_checked(
         &self,
         h: &FileHandle,
         length: usize,
-        content_change: &dyn Fn(&mut SecurityDescriptor),
+        authorize: AuthorizeUse<'_>,
+        content_change: ContentChange<'_>,
     ) -> Result<(), TruncateError> {
         let h = h.get_typed::<Self>();
         self.backend(h.mount_index)
-            .truncate_checked(&h.handle, length, content_change)
+            .truncate_checked(&h.handle, length, authorize, content_change)
+    }
+
+    fn read_checked(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+        authorize: AuthorizeUse<'_>,
+    ) -> Result<usize, ReadError> {
+        let h = h.get_typed::<Self>();
+        self.backend(h.mount_index)
+            .read_checked(&h.handle, buf, offset, authorize)
+    }
+
+    fn list_dir_checked(
+        &self,
+        handle: DirHandle,
+        authorize: AuthorizeUse<'_>,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
+        match handle.into_typed::<Self>().inner {
+            // Configuration fixes a virtual directory's descriptor.
+            ComposerDirHandleInner::Virtual { path } => {
+                if !authorize(&self.virtual_dir_descriptor(&path)) {
+                    return Err(ReadDirError::NotOpenForReading);
+                }
+                Ok(self.list_mount_children(&path))
+            }
+            ComposerDirHandleInner::Mounted {
+                path,
+                mount_index,
+                handle,
+            } => {
+                let entries = self
+                    .backend(mount_index)
+                    .list_dir_checked(handle, authorize)?;
+                Ok(self.merge_mount_children(entries, &path))
+            }
+        }
+    }
+
+    fn authorize_handle(&self, h: HandleRef<'_>, authorize: AuthorizeUse<'_>) -> bool {
+        match h {
+            HandleRef::File(h) => {
+                let h = h.get_typed::<Self>();
+                self.backend(h.mount_index)
+                    .authorize_handle(HandleRef::File(&h.handle), authorize)
+            }
+            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
+                ComposerDirHandleInner::Virtual { path } => {
+                    authorize(&self.virtual_dir_descriptor(path))
+                }
+                ComposerDirHandleInner::Mounted {
+                    mount_index,
+                    handle,
+                    ..
+                } => self
+                    .backend(*mount_index)
+                    .authorize_handle(HandleRef::Dir(handle), authorize),
+            },
+        }
     }
 }
 

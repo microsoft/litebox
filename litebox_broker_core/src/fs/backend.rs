@@ -367,6 +367,22 @@ pub trait Backend: Send + Sync + Any {
         Err(SetTimesError::Io)
     }
 
+    /// Like [`Self::set_times_checked`], but changes the object that the open handle `h` pins,
+    /// wherever it is now linked, rather than one found by path: under the lock that keeps the
+    /// object's descriptor current, `authorize` it and, only if allowed, change the times.
+    ///
+    /// An object on a file system that rejects writes (see [`PermissionInfo::on_read_only_fs`])
+    /// fails with [`SetTimesError::ReadOnlyFileSystem`] before authorizing anything.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn set_handle_times_checked(
+        &self,
+        h: HandleRef<'_>,
+        times: &SetFileTimes,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), SetTimesError>,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::Io)
+    }
+
     /// Replace a resolved target's descriptor with what `update` computes from its current one,
     /// without following symbolic links. The backend stores the result exactly or fails.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
@@ -398,29 +414,90 @@ pub trait Backend: Send + Sync + Any {
         Err(OpenError::Io)
     }
 
-    /// Like [`Self::write`], but applies `content_change` to the file's descriptor if the write
-    /// writes anything.
+    /// Like [`Self::open_dir`], but first passes to `admit` the current descriptor of the
+    /// directory that `dir` pins, under the lock that changes to that descriptor take, and opens
+    /// that same directory only if admitted: the admission orders with any change to the
+    /// descriptor, and nothing replaces the directory in between. Admitting reads only the
+    /// descriptor, never the directory's entries.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn open_dir_checked(
+        &self,
+        dir: ResolvedDir<'_>,
+        flags: OFlags,
+        admit: &dyn Fn(&SecurityDescriptor) -> Result<(), OpenError>,
+    ) -> Result<DirHandle, OpenError> {
+        Err(OpenError::Io)
+    }
+
+    /// Like [`Self::write`], but first passes the file's current descriptor to `authorize`, failing
+    /// with [`WriteError::NotForWriting`] if it refuses, and applies `content_change` to the
+    /// file's descriptor if the write writes anything, all under one lock.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn write_checked(
         &self,
         h: &FileHandle,
         buf: &dyn WriteBuffer,
         offset: usize,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
         content_change: &dyn Fn(&mut SecurityDescriptor),
     ) -> Result<usize, WriteError> {
         Err(WriteError::Io)
     }
 
-    /// Like [`Self::truncate`], but applies `content_change` to the file's descriptor if the
-    /// truncation succeeds, even if the length is unchanged (as Linux does).
+    /// Like [`Self::truncate`], but first passes the file's current descriptor to `authorize`,
+    /// failing with [`TruncateError::NotForWriting`] if it refuses, and applies `content_change`
+    /// to the file's descriptor if the truncation succeeds, even if the length is unchanged (as
+    /// Linux does), all under one lock.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn truncate_checked(
         &self,
         h: &FileHandle,
         length: usize,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
         content_change: &dyn Fn(&mut SecurityDescriptor),
     ) -> Result<(), TruncateError> {
         Err(TruncateError::Io)
+    }
+
+    // The handle uses below serve credential-enabled resolvers whose handles did not cache the
+    // right a use needs. Each passes the current descriptor of the object the handle pins to
+    // `authorize` and, only if it allows the use, performs it under the same lock, so no change
+    // to the descriptor orders between the check and the use. They never resolve a path.
+
+    /// Like [`Self::read`], but first `authorize`s the read, failing with
+    /// [`ReadError::NotForReading`] if refused.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn read_checked(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
+    ) -> Result<usize, ReadError> {
+        Err(ReadError::Io)
+    }
+
+    /// Like [`Self::list_dir_at`], but first `authorize`s the listing, failing with
+    /// [`ReadDirError::NotOpenForReading`] if refused.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn list_dir_checked(
+        &self,
+        handle: DirHandle,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
+        Err(ReadDirError::Io)
+    }
+
+    /// Whether `authorize` allows a use of `h` whose effect does not depend on the pinned object's
+    /// own contents or descriptor, such as I/O with the terminal that a `tty` handle routes to,
+    /// given the object's current descriptor. The default refuses.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn authorize_handle(
+        &self,
+        h: HandleRef<'_>,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
+    ) -> bool {
+        false
     }
 }
 
@@ -444,6 +521,14 @@ pub(crate) type AuthorizeRename<'a> = &'a dyn Fn(&EntryRename<'_>) -> Result<(),
 /// A content-change callback of [`Backend::write_checked`] and its kin, for backends sharing
 /// their implementation with the unchecked operations.
 pub(crate) type ContentChange<'a> = &'a dyn Fn(&mut SecurityDescriptor);
+
+/// An `authorize` callback of [`Backend::read_checked`] and its kin, for backends sharing their
+/// implementation with the unchecked operations.
+pub(crate) type AuthorizeUse<'a> = &'a dyn Fn(&SecurityDescriptor) -> bool;
+
+/// An `admit` callback of [`Backend::open_dir_checked`], for backends sharing its implementation
+/// with [`Backend::open_dir`].
+pub(crate) type AdmitDir<'a> = &'a dyn Fn(&SecurityDescriptor) -> Result<(), OpenError>;
 
 /// What [`Backend::open_file_checked`] checks and applies for a credential-enabled resolver.
 #[derive(Clone, Copy)]

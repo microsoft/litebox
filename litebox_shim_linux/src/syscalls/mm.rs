@@ -21,7 +21,7 @@ use crate::Task;
 use crate::UserPtrMut;
 use crate::guest_buffer::GuestReadBuffer;
 use crate::syscalls::file::AnyTypedFd;
-use litebox_broker_protocol::fs::{FileAccessMode, FileType};
+use litebox_broker_protocol::fs::FileAccessMode;
 
 pub(crate) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
     let mut prot = ProtFlags::PROT_NONE;
@@ -139,7 +139,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         Errno::EISDIR => MappingError::NotAFile,
                         Errno::EACCES => MappingError::NotForReading,
                         Errno::EFAULT => MappingError::MemoryAccess,
-                        _ => unimplemented!(),
+                        error => MappingError::FileRead(error),
                     })?;
                 if size == 0 {
                     break;
@@ -259,38 +259,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
             });
         };
         let object = self.global.with_file(file_fd, |file| {
-            // Only regular files have a size limit, which Linux checks after refusing an `O_PATH`
-            // descriptor and before checking access. `sys_mmap` checked that this does not
-            // overflow.
-            if offset + len > MAX_FILE_SIZE {
-                file.access_mode()?.ok_or(Errno::EBADF)?;
-                if file.file().status().map_err(Errno::from)?.file_type == FileType::RegularFile {
-                    return Err(Errno::EOVERFLOW);
-                }
-            }
-            // The broker already refuses `O_PATH` descriptors, directories, and unreadable files,
-            // so a successful request needs no access-mode round trip. Linux reports a refused
-            // access before `ENODEV` or `ENOMEM`, so recheck access on those failures.
+            let options = litebox::fs::FileMappingOptions {
+                end: (offset + len) as u64,
+                max_regular_end: MAX_FILE_SIZE as u64,
+                require_write: wants_write,
+            };
             match file
                 .file()
-                .request_shared_object::<_, PAGE_SIZE>(self.global.platform, (offset + len) as u64)
+                .request_shared_object::<_, PAGE_SIZE>(self.global.platform, options)
             {
                 Ok(object) if wants_write && !object.may_write => Err(Errno::EACCES),
                 Ok(object) => Ok(Some(object)),
-                Err(
-                    error @ (SharedObjectError::IsDirectory
-                    | SharedObjectError::Unsupported
-                    | SharedObjectError::NoMemory
-                    | SharedObjectError::Io),
-                ) => {
-                    if refused_access(file.access_mode()?.ok_or(Errno::EBADF)?) {
-                        Err(Errno::EACCES)
-                    } else if matches!(error, SharedObjectError::Unsupported) && !wants_write {
-                        Ok(None)
-                    } else {
-                        Err(error.into())
-                    }
-                }
+                // Unsupported is reported only for a reference that permits a readable
+                // mapping. Copy through checked reads; querying metadata is a separate right.
+                Err(SharedObjectError::Unsupported) if !wants_write => Ok(None),
                 Err(error) => Err(error.into()),
             }
         })?;

@@ -18,9 +18,9 @@ use litebox_broker_protocol::authority::{
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileCaller, FileDirectoryEntry, FileError, FileLockOperation, FileMode,
-    FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
-    MapFileResponse, SetFileTimes,
+    FileAccessMode, FileCaller, FileDirectoryEntry, FileError, FileLockOperation,
+    FileMappingOptions, FileMode, FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags,
+    FileUser, MAX_FILE_TRANSFER_SIZE, MapFileResponse, SetFileTimes,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
@@ -513,6 +513,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn read_file(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
         data: &mut dyn ReadBuffer,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError>;
@@ -549,12 +550,13 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn map_file(
         &self,
         handle: ObjectHandle,
-        end: u64,
+        options: FileMappingOptions,
     ) -> core::result::Result<core::result::Result<MapFileResponse, FileError>, BrokerControlError>;
 
     fn read_directory(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
     ) -> core::result::Result<
         core::result::Result<Vec<FileDirectoryEntry>, FileError>,
         BrokerControlError,
@@ -1732,13 +1734,14 @@ where
     fn read_file(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
         data: &mut dyn ReadBuffer,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
         let length = data.len().min(MAX_FILE_TRANSFER_SIZE as usize);
         let data = &mut data.sub_buffer(0, length);
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.read_file(handle, lease.sequence(), data, offset))
+        self.request(|local| local.read_file(handle, subject, lease.sequence(), data, offset))
     }
 
     fn write_file(
@@ -1784,15 +1787,16 @@ where
     fn map_file(
         &self,
         handle: ObjectHandle,
-        end: u64,
+        options: FileMappingOptions,
     ) -> core::result::Result<core::result::Result<MapFileResponse, FileError>, BrokerControlError>
     {
-        self.request(|local| local.map_file(handle, end))
+        self.request(|local| local.map_file(handle, options))
     }
 
     fn read_directory(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
     ) -> core::result::Result<
         core::result::Result<Vec<FileDirectoryEntry>, FileError>,
         BrokerControlError,
@@ -1801,8 +1805,9 @@ where
         let mut start_index = 0;
         loop {
             let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
-            let response =
-                self.request(|local| local.read_directory(handle, lease.sequence(), start_index))?;
+            let response = self.request(|local| {
+                local.read_directory(handle, subject, lease.sequence(), start_index)
+            })?;
             let (mut chunk, next_index) = match response {
                 Ok(response) => response,
                 Err(error) => return Ok(Err(error)),
