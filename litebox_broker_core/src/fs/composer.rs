@@ -343,6 +343,10 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         mount: &Mount,
         dir: &DirHandle,
     ) -> Result<Option<Vec<String>>, WalkError> {
+        // Mount paths never contain empty components. Use this marker to keep walking
+        // the held directory (including `..`) without matching mounts at its old name.
+        const UNLINKED_ROUTE_COMPONENT: &str = "";
+
         if !self.initialized_mounts().any(|(_, other)| {
             other.path.len() > mount.path.len() && other.path.starts_with(&mount.path)
         }) {
@@ -352,10 +356,8 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         match mount.backend.dir_path(dir) {
             Ok(Some(path)) => route.extend(path),
             Ok(None) => return Ok(None),
-            // An unlinked directory still supports `..`; an empty component cannot match any
-            // mount path.
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
-                route.push(String::new());
+                route.push(UNLINKED_ROUTE_COMPONENT.to_string());
             }
             Err(error) => return Err(error),
         }
@@ -628,6 +630,8 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 let mount = self.initialized_mount(*mount_index);
                 if let Some(parent) = mount.backend.parent_dir(handle)? {
                     let route = self.current_route(mount, &parent)?.unwrap_or_else(|| {
+                        // Approximate the parent's route from the saved child route.
+                        // The backend returned a parent inside this mount, so keep the mount prefix.
                         let mut recorded = path.clone();
                         if recorded.len() > mount.path.len() {
                             recorded.pop();
