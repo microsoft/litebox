@@ -285,8 +285,13 @@ impl Backend for ShareFs {
         self.0.unlink_at(dir, name)
     }
 
-    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
-        self.0.rmdir_at(dir, name)
+    fn rmdir_at(
+        &self,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
+        self.0.rmdir_at(dir, name, may_remove)
     }
 
     fn rename_at(
@@ -295,8 +300,10 @@ impl Backend for ShareFs {
         old_name: &str,
         new_dir: DirHandle,
         new_name: &str,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
-        self.0.rename_at(old_dir, old_name, new_dir, new_name)
+        self.0
+            .rename_at(old_dir, old_name, new_dir, new_name, may_move)
     }
 
     fn set_times(

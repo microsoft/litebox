@@ -548,7 +548,7 @@ fn invalid_components_are_rejected() {
             "{bad:?}"
         );
         assert!(
-            local.rmdir_at(local.root().unwrap(), bad).is_err(),
+            local.rmdir_at(local.root().unwrap(), bad, Ok(())).is_err(),
             "{bad:?}"
         );
     }
@@ -824,7 +824,9 @@ fn direct_backend_mutations_and_flags() {
     assert!(local.status(HandleRef::Dir(&dir)).is_ok());
     assert!(local.walking_dir_at(&dir).is_some());
     local.unlink_at(local.root().unwrap(), "new").unwrap();
-    local.rmdir_at(local.root().unwrap(), "dir").unwrap();
+    local
+        .rmdir_at(local.root().unwrap(), "dir", Ok(()))
+        .unwrap();
     assert!(!temp.path().join("new").exists());
     assert!(!temp.path().join("dir").exists());
 }
@@ -1023,7 +1025,11 @@ fn final_symlink_removal_does_not_follow_the_link() {
     symlink("missing", temp.path().join("file_link")).unwrap();
     let local = backend(temp.path());
 
-    assert!(local.rmdir_at(local.root().unwrap(), "dir_link").is_err());
+    assert!(
+        local
+            .rmdir_at(local.root().unwrap(), "dir_link", Ok(()))
+            .is_err()
+    );
     assert!(temp.path().join("directory").is_dir());
     assert!(
         fs::symlink_metadata(temp.path().join("dir_link"))

@@ -131,10 +131,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
 
         // `Tremove` removes whatever a fid names (and clunks it), so it needs a fid of its own.
-        let fid = self
-            .client
-            .walk(&dir.fid.fid, &[name])?
-            .into_complete_fid()?;
+        let walk = self.client.walk(&dir.fid.fid, &[name])?;
+        let fid = walk.fid.ok_or(Error::Remote(ENOENT))?;
+        // A complete single-component walk has exactly one qid. Unlike Tunlinkat,
+        // Tremove has no flag to enforce the kind of entry being removed.
+        if walk.wqids[0].typ.contains(fcall::QidType::DIR) == is_file {
+            self.client.clunk(fid);
+            return Err(Error::Remote(if is_file { EISDIR } else { ENOTDIR }));
+        }
         self.client.remove(fid)
     }
 }
@@ -550,7 +554,13 @@ where
         Ok(self.remove_at(&dir.into_typed::<Self>(), name, true)?)
     }
 
-    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
+        may_remove?;
         Ok(self.remove_at(&dir.into_typed::<Self>(), name, false)?)
     }
 
@@ -560,6 +570,7 @@ where
         old_name: &str,
         new_dir: DirHandle,
         new_name: &str,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         if [old_name, new_name].iter().any(|name| {
             name.is_empty() || matches!(*name, "." | "..") || name.contains(['/', '\0'])
@@ -574,6 +585,7 @@ where
                 .walk(&old_dir.fid.fid, &[old_name])?
                 .into_complete_fid()?,
         );
+        may_move?;
         Ok(self
             .client
             .rename(&source.fid, &new_dir.fid.fid, new_name)?)

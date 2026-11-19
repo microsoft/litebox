@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    ChildExit, ChildProcessFlags, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
@@ -41,7 +41,7 @@ use crate::vsock_socket::VsockSocket;
 /// Error returned by the broker-backed process service.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProcessError {
-    /// This LiteBox process has no broker process service.
+    /// This process has no process service, or the service does not support the requested operation.
     #[error("process creation is unavailable")]
     Unavailable,
     /// The broker association failed.
@@ -83,7 +83,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// [`Self::create_children_pid_namespace`]), unless `new_pid_namespace`
     /// gives options, in which case it is the first process of a new
     /// namespace with those options, nested in this process's. The child's
-    /// parent is this process, or this process's parent if `sibling` is set.
+    /// parent is this process, or this process's parent with [`ChildProcessFlags::SIBLING`].
+    /// With [`ChildProcessFlags::PRIVATE_MOUNT_VIEW`] the child gets its own copy of the
+    /// creator's mount layout instead of sharing later mounts. If the file service cannot
+    /// copy the layout, allocation fails with [`ProcessError::Unavailable`].
     ///
     /// Fails with [`ProcessError::InvalidChild`] if the child's namespace has
     /// ended, and with [`ProcessError::ResourceExhausted`] at a process limit
@@ -91,10 +94,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn allocate_child_process(
         &self,
         new_pid_namespace: Option<PidNamespaceOptions>,
-        sibling: bool,
+        flags: ChildProcessFlags,
     ) -> Result<PendingChild, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        let identity = broker.allocate_child_process(new_pid_namespace, sibling)?;
+        let identity = broker.allocate_child_process(new_pid_namespace, flags)?;
         Ok(PendingChild {
             broker,
             identity,
@@ -807,6 +810,7 @@ impl From<BrokerControlError> for ProcessError {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicUsize;
+    use litebox_broker_protocol::process::ChildProcessFlags;
 
     use litebox_broker_local::test_support::test_broker_local;
     use litebox_broker_protocol::message::{
@@ -830,10 +834,16 @@ mod tests {
             test_broker_local(ChildChannel(cancels.clone()), test_shared_memory()),
         );
 
-        drop(litebox.allocate_child_process(None, false).unwrap());
+        drop(
+            litebox
+                .allocate_child_process(None, ChildProcessFlags::empty())
+                .unwrap(),
+        );
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
 
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child = litebox
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap();
         child.exit(ProcessExitStatus::Exited { code: 0 }).unwrap();
         drop(child);
         assert_eq!(cancels.load(Ordering::SeqCst), 1);

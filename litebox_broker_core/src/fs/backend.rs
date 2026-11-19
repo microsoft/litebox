@@ -189,6 +189,19 @@ pub trait Backend: Send + Sync + Any {
     /// Query metadata without consuming or opening the resolved target.
     fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError>;
 
+    /// Identity of a resolved directory for protecting mountpoints. Alternate names for the
+    /// same directory must compare equal within this backend. This does not affect mount lookup.
+    fn mount_directory_id(
+        &self,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<(u64, u128), FileStatusError> {
+        if !matches!(target, ResolvedTarget::Dir(_)) {
+            return Err(FileStatusError::Io);
+        }
+        let node = self.resolved_status(target)?.node_info;
+        Ok((node.dev, node.ino.into()))
+    }
+
     /// The terminal that an open file handle refers to. A file is a terminal
     /// exactly when it refers to one.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
@@ -228,22 +241,33 @@ pub trait Backend: Send + Sync + Any {
         metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError>;
 
-    /// Remove `name` after the resolver authorizes search and write access to `parent`.
+    /// Remove a non-directory `name` after the resolver authorizes search and write access to
+    /// `parent`. An existing directory must be left intact.
     fn unlink_at(&self, parent: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError>;
 
-    /// Remove the directory `name` at `parent`.
+    /// Remove the directory `name` at `parent`. Run the usual non-mutating checks, then
+    /// propagate any `may_remove` error before attempting removal.
     // XXX(jayb): I don't like that unlink and rmdir exist separately, we should probably merge them.
-    fn rmdir_at(&self, parent: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError>;
+    fn rmdir_at(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError>;
 
     /// Atomically move an entry, replacing a compatible destination without following final
     /// symbolic links. Backends must reject directory cycles and preserve open file contents.
     /// Directory handles retain the backend's documented object or path-locator semantics.
+    /// Run the usual non-mutating checks, then propagate any `may_move` error before
+    /// attempting the move. A backend that proves the rename is a no-op may return success
+    /// without performing it, even when `may_move` is an error.
     fn rename_at(
         &self,
         old_dir: DirHandle,
         old_name: &str,
         new_dir: DirHandle,
         new_name: &str,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError>;
 
     /// Update timestamps after resolver authorization, without following symbolic links.
@@ -568,8 +592,21 @@ pub struct CreationMetadata {
 pub enum PermissionCheck {
     /// The backend is self-enforcing permissions for this item.
     ByBackend,
+    /// The backend checks permissions, but refuses file writes or directory entry changes.
+    /// Metadata operations remain backend-authorized.
+    ByReadOnlyBackend,
     /// The resolver should check this permission metadata.
     ByResolver(PermissionInfo),
+}
+
+impl PermissionCheck {
+    pub(super) fn on_read_only_fs(&self) -> bool {
+        match self {
+            Self::ByBackend => false,
+            Self::ByReadOnlyBackend => true,
+            Self::ByResolver(info) => info.on_read_only_fs,
+        }
+    }
 }
 
 /// Permission information for a particular component of the walk.

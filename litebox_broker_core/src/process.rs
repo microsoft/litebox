@@ -23,8 +23,9 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest,
 };
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
-    ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
+    ChildExit, ChildProcessFlags, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
+    ResourceLimit, ThreadInfo,
 };
 
 use crate::pid_namespace::PerNamespaceIds;
@@ -254,9 +255,6 @@ pub struct BrokerProcess {
     ///
     /// No other lock is taken while this one is held.
     children_namespace: Mutex<Option<Arc<PidNamespace>>>,
-    /// The file service through which it opens files: its parent's, for a
-    /// child.
-    pub(crate) fs: Arc<dyn FileService>,
     /// The job that accounts for it: its parent's, for a child.
     pub(crate) job: Arc<Job>,
     /// This process's IDs in its own namespace, [`Self::pid_namespace`], which
@@ -522,6 +520,8 @@ impl ObjectEntry {
 
 struct BrokerProcessState {
     status: ProcessStatus,
+    /// Path lookups use this view until teardown. Open files hold their own references.
+    fs: Option<Arc<dyn FileService>>,
     /// Final termination status reported by the running process.
     reported_exit_status: Option<ProcessExitStatus>,
     /// Child retained until this process requests startup.
@@ -640,7 +640,6 @@ impl BrokerProcess {
         Self {
             core,
             children_namespace: Mutex::new(None),
-            fs,
             job,
             ids,
             key,
@@ -662,6 +661,7 @@ impl BrokerProcess {
             }),
             state: Mutex::new(BrokerProcessState {
                 status: ProcessStatus::Starting,
+                fs: Some(fs),
                 reported_exit_status: None,
                 pending_child_process: None,
                 retirement: ProcessRetirement::Active { abnormal: false },
@@ -789,11 +789,16 @@ impl BrokerProcess {
         &self.core
     }
 
+    pub(crate) fn file_service(&self) -> Result<Arc<dyn FileService>> {
+        self.state.lock().fs.clone().ok_or(BrokerError::PeerClosed)
+    }
+
     /// Creates one child of this process and its initial thread, with IDs in
     /// `pid_namespace`, which is this process's namespace or nested in it, in
-    /// this process's job, with its file service, credential and host names.
+    /// this process's job, with its credential, host names and either its file service
+    /// or a private copy of that service's mount layout.
     ///
-    /// With `sibling`, the child's parent is this process's parent, and this
+    /// With [`ChildProcessFlags::SIBLING`], the child's parent is this process's parent, and this
     /// returns `PolicyDenied` if it has none. Either way, this process owns the
     /// child until it starts. Returns `PeerClosed` if this process's owner
     /// died, it exited or its job is terminating. If initial-thread creation
@@ -801,8 +806,14 @@ impl BrokerProcess {
     pub(crate) fn create_child(
         &self,
         pid_namespace: &Arc<PidNamespace>,
-        sibling: bool,
+        flags: ChildProcessFlags,
     ) -> Result<Arc<BrokerProcess>> {
+        let sibling = flags.contains(ChildProcessFlags::SIBLING);
+        // Snapshot the creator's view, even for a sibling, without holding the process tree lock.
+        let mut fs = self.file_service()?;
+        if flags.contains(ChildProcessFlags::PRIVATE_MOUNT_VIEW) {
+            fs = fs.copy_mount_view()?;
+        }
         let child = {
             // The tree lock orders the new link against this process's and
             // the parent's exits.
@@ -833,7 +844,7 @@ impl BrokerProcess {
                 self.core.register_process(
                     self.caller_credential,
                     pid_namespace,
-                    &self.fs,
+                    &fs,
                     &self.job,
                     &host_names,
                     Some(&parent),
@@ -906,8 +917,10 @@ impl BrokerProcess {
     /// `new_pid_namespace` gives options, in a new namespace with those
     /// options nested in this process's, which returns `UnsupportedOperation`
     /// if this process's children already go to another namespace. Its parent
-    /// is this process, or with `sibling` this process's parent, and this
-    /// returns `PolicyDenied` if it has none. Its job, file service,
+    /// is this process, or with [`ChildProcessFlags::SIBLING`] this process's parent, and this
+    /// returns `PolicyDenied` if it has none. [`ChildProcessFlags::PRIVATE_MOUNT_VIEW`]
+    /// copies this process's mount layout, failing with `UnsupportedOperation` if the file
+    /// service doesn't support it; otherwise the child shares the file service. Its job,
     /// credential, group, session, limits and host names are this process's
     /// either way.
     /// The returned IDs are in this process's namespace, plus the child's
@@ -915,7 +928,7 @@ impl BrokerProcess {
     pub fn allocate_child_process(
         &self,
         new_pid_namespace: Option<PidNamespaceOptions>,
-        sibling: bool,
+        flags: ChildProcessFlags,
     ) -> Result<ProcessIdentity> {
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
@@ -934,7 +947,7 @@ impl BrokerProcess {
             Some(options) => self.new_nested_pid_namespace(options)?,
             None => self.children_namespace(),
         };
-        let child = self.create_child(&pid_namespace, sibling)?;
+        let child = self.create_child(&pid_namespace, flags)?;
         let result = {
             let mut state = self.state.lock();
             if !self.accepts_operations(&state) {
@@ -2281,8 +2294,12 @@ impl BrokerProcess {
                 }
             }
         }
-        // Like a failed start, a failed child's threads end.
+        // As in fail_start, release resources outside the tree lock, even if a supervisor
+        // still holds the failed process.
         for child in &failed_children {
+            if child.release_references() {
+                child.state.lock().retirement.mark_abnormal();
+            }
             child.end_threads(false);
         }
         if !failed_children.is_empty() {
@@ -3077,6 +3094,10 @@ impl BrokerProcess {
         // run while its lock is held.
         let socket_account = self.socket_account.lock().take();
         drop(socket_account);
+        // A zombie must not pin its namespace's runtime mount slots. The last reference may
+        // destroy backends, so release it outside the state lock.
+        let fs = self.state.lock().fs.take();
+        drop(fs);
         invariant_fault
     }
 
@@ -3264,8 +3285,8 @@ mod tests {
         FileType, FileUser, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
-        ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
-        ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
+        ChildExit, ChildProcessFlags, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+        PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::readiness_queue::{
@@ -3298,7 +3319,9 @@ mod tests {
 
     /// Creates a starting child of `parent`.
     fn child_of(parent: &BrokerProcess) -> Arc<BrokerProcess> {
-        parent.create_child(parent.pid_namespace(), false).unwrap()
+        parent
+            .create_child(parent.pid_namespace(), ChildProcessFlags::empty())
+            .unwrap()
     }
 
     /// Starts `process` if it is starting, then has it exit with
@@ -3420,7 +3443,9 @@ mod tests {
         let parent_sink = readiness_sink();
         let child_sink = readiness_sink();
         let (reader, writer) = crate::pipe::create(&parent, 4, 2, FileOpenFlags::NONE).unwrap();
-        let identity = parent.allocate_child_process(None, false).unwrap();
+        let identity = parent
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap();
         // Sharing only the write end still lets the child wake the parent's reader.
         let child_writer = parent
             .duplicate_object_references_to_child(
@@ -3492,7 +3517,9 @@ mod tests {
         let parent_sink = readiness_sink();
         let child_sink = readiness_sink();
         let event = crate::event::create(&parent, 0, FileOpenFlags::NONE).unwrap();
-        let identity = parent.allocate_child_process(None, false).unwrap();
+        let identity = parent
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap();
         let child_event = parent
             .duplicate_object_references_to_child(
                 identity.process_id,
@@ -3562,6 +3589,56 @@ mod tests {
         assert_eq!(take_republished(&parent_sink), []);
         assert_eq!(child.close_object_reference(child_event), Ok(()));
         assert_eq!(*child_sink.retired.lock().unwrap(), [child_event]);
+    }
+
+    #[test]
+    fn private_mount_view_is_released_before_child_is_reaped() {
+        use crate::fs::{self, composer::Composer, in_mem::InMem, resolver::Resolver};
+
+        let fs = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child = parent
+            .create_child(
+                parent.pid_namespace(),
+                ChildProcessFlags::PRIVATE_MOUNT_VIEW,
+            )
+            .unwrap();
+        child.complete_start().unwrap();
+        fs::mkdir(&parent, "/container", ROOT, FileMode::RWXU)
+            .unwrap()
+            .unwrap();
+        fs::mkdir(&parent, "/container/data", ROOT, FileMode::RWXU)
+            .unwrap()
+            .unwrap();
+        fs::mount_in_mem(&child, "/container/data", ROOT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::rename(&parent, "/container", "/moved", ROOT),
+            Ok(Err(FileError::Busy))
+        );
+        assert_eq!(
+            fs::rmdir(&parent, "/container/data", ROOT),
+            Ok(Err(FileError::Busy))
+        );
+        child.complete_exit(EXITED, CpuTime::default()).unwrap();
+        assert!(broker.pid_namespace.is_registered(child.id()));
+        fs::rename(&parent, "/container", "/moved", ROOT)
+            .unwrap()
+            .unwrap();
+        fs::rmdir(&parent, "/moved/data", ROOT).unwrap().unwrap();
     }
 
     #[test]
@@ -3897,7 +3974,9 @@ mod tests {
         )
         .unwrap();
         let child = child_of(&parent);
-        let nested_child = parent.create_child(&nested_namespace, false).unwrap();
+        let nested_child = parent
+            .create_child(&nested_namespace, ChildProcessFlags::empty())
+            .unwrap();
         let signals = [&child, &nested_child].map(|process| {
             process.complete_start().unwrap();
             open_signals(process).0
@@ -3939,7 +4018,7 @@ mod tests {
         let creator = child_of(&parent);
         creator.complete_start().unwrap();
         let sibling_id = creator
-            .allocate_child_process(None, true)
+            .allocate_child_process(None, ChildProcessFlags::SIBLING)
             .unwrap()
             .process_id;
         creator.set_parent_exit_signal(sibling_id, 10).unwrap();
@@ -3970,7 +4049,10 @@ mod tests {
             .unwrap();
         root.complete_start().unwrap();
         let first_id = root
-            .allocate_child_process(Some(PidNamespaceOptions::new(true, true)), false)
+            .allocate_child_process(
+                Some(PidNamespaceOptions::new(true, true)),
+                ChildProcessFlags::empty(),
+            )
             .unwrap()
             .process_id;
         let first = root.take_child_process(first_id).unwrap();
@@ -4015,7 +4097,7 @@ mod tests {
 
         // A new process has none.
         let child_id = parent
-            .allocate_child_process(None, false)
+            .allocate_child_process(None, ChildProcessFlags::empty())
             .unwrap()
             .process_id;
         assert_eq!(parent.get_parent_exit_signal(child_id), Ok(0));
@@ -4280,7 +4362,7 @@ mod tests {
             .unwrap();
         parent.complete_start().unwrap();
         assert_eq!(
-            parent.allocate_child_process(None, false),
+            parent.allocate_child_process(None, ChildProcessFlags::empty()),
             Err(BrokerError::PolicyDenied)
         );
     }
@@ -4298,10 +4380,12 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
-        let identity = parent.allocate_child_process(None, false).unwrap();
+        let identity = parent
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap();
         let process_id = identity.process_id;
         assert_eq!(
-            parent.allocate_child_process(None, false),
+            parent.allocate_child_process(None, ChildProcessFlags::empty()),
             Err(BrokerError::WouldBlock)
         );
         assert_eq!(parent.references.lock().handles, []);
@@ -4360,7 +4444,7 @@ mod tests {
         // A pending child starts with its creator's limits, which its creator
         // can change separately from its own.
         let child_id = parent
-            .allocate_child_process(None, false)
+            .allocate_child_process(None, ChildProcessFlags::empty())
             .unwrap()
             .process_id;
         assert_eq!(
@@ -4423,7 +4507,10 @@ mod tests {
         assert_eq!(root.get_host_names(root_id), Ok(root_names.clone()));
 
         // A pending child shares its creator's names until it takes a copy.
-        let child_id = root.allocate_child_process(None, false).unwrap().process_id;
+        let child_id = root
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap()
+            .process_id;
         assert_eq!(root.get_host_names(child_id), Ok(root_names));
         root.set_host_name(child_id, HostNameKind::Host, host_name(b"shared"))
             .unwrap();
@@ -4446,7 +4533,10 @@ mod tests {
         // A sibling shares its creator's names, not its parent's.
         let child = root.take_child_process(child_id).unwrap();
         child.complete_start().unwrap();
-        let sibling_id = child.allocate_child_process(None, true).unwrap().process_id;
+        let sibling_id = child
+            .allocate_child_process(None, ChildProcessFlags::SIBLING)
+            .unwrap()
+            .process_id;
         child
             .set_host_name(sibling_id, HostNameKind::Domain, host_name(b"sibling"))
             .unwrap();
@@ -4483,13 +4573,15 @@ mod tests {
         let thread = parent.create_thread().unwrap();
         assert_eq!(parent.create_thread(), Err(BrokerError::ResourceExhausted));
         assert_eq!(
-            parent.allocate_child_process(None, false).err(),
+            parent
+                .allocate_child_process(None, ChildProcessFlags::empty())
+                .err(),
             Some(BrokerError::ResourceExhausted)
         );
 
         parent.exit_thread(thread).unwrap();
         let child_id = parent
-            .allocate_child_process(None, false)
+            .allocate_child_process(None, ChildProcessFlags::empty())
             .unwrap()
             .process_id;
         assert_eq!(parent.create_thread(), Err(BrokerError::ResourceExhausted));
@@ -4577,7 +4669,7 @@ mod tests {
         parent.complete_start().unwrap();
         let (signals, _) = open_signals(&parent);
         let process_id = parent
-            .allocate_child_process(None, false)
+            .allocate_child_process(None, ChildProcessFlags::empty())
             .unwrap()
             .process_id;
         let child = parent.with_pending_child(process_id, Arc::clone).unwrap();
@@ -4614,15 +4706,23 @@ mod tests {
         drop(child);
         assert!(!broker.pid_namespace.is_registered(process_id));
         // The pending slot is free again.
-        parent.allocate_child_process(None, false).unwrap();
+        parent
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap();
     }
 
     #[test]
     fn owner_death_fails_and_retires_pending_child_process() {
+        use crate::fs::{composer::Composer, in_mem::InMem, resolver::Resolver};
+        let fs = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
         let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
         .unwrap();
         let parent = broker
@@ -4630,7 +4730,7 @@ mod tests {
             .unwrap();
         parent.complete_start().unwrap();
         let process_id = parent
-            .allocate_child_process(None, false)
+            .allocate_child_process(None, ChildProcessFlags::PRIVATE_MOUNT_VIEW)
             .unwrap()
             .process_id;
         let child = broker
@@ -4641,8 +4741,10 @@ mod tests {
             .and_then(alloc::sync::Weak::upgrade)
             .unwrap();
 
+        let view = Arc::downgrade(&child.file_service().unwrap());
         parent.handle_owner_death();
 
+        assert!(view.upgrade().is_none());
         assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
         assert!(child.is_released());
         assert!(parent.tree_node.lock().children.is_empty());
@@ -4668,7 +4770,7 @@ mod tests {
         parent.complete_start().unwrap();
         let (signals, sink) = open_signals(&parent);
         let process_id = parent
-            .allocate_child_process(None, false)
+            .allocate_child_process(None, ChildProcessFlags::empty())
             .unwrap()
             .process_id;
         let changes = lifecycle.changes.load(Ordering::Relaxed);
@@ -4734,7 +4836,7 @@ mod tests {
         };
 
         let process_id = parent
-            .allocate_child_process(None, false)
+            .allocate_child_process(None, ChildProcessFlags::empty())
             .unwrap()
             .process_id;
         assert_eq!(
@@ -4771,7 +4873,7 @@ mod tests {
         // A child cancelled or started without its connection drops it.
         for cancel in [true, false] {
             let process_id = parent
-                .allocate_child_process(None, false)
+                .allocate_child_process(None, ChildProcessFlags::empty())
                 .unwrap()
                 .process_id;
             connect(process_id, 4).unwrap();
@@ -4819,7 +4921,7 @@ mod tests {
             .unwrap();
         parent.complete_start().unwrap();
         let process_id = parent
-            .allocate_child_process(None, false)
+            .allocate_child_process(None, ChildProcessFlags::empty())
             .unwrap()
             .process_id;
         let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4904,7 +5006,7 @@ mod tests {
                 .unwrap();
             parent.complete_start().unwrap();
             let child = parent
-                .allocate_child_process(None, false)
+                .allocate_child_process(None, ChildProcessFlags::empty())
                 .unwrap()
                 .process_id;
             (parent, child)
@@ -4965,7 +5067,9 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
-        let identity = parent.allocate_child_process(None, false).unwrap();
+        let identity = parent
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap();
 
         parent.handle_owner_death();
 
@@ -4989,7 +5093,7 @@ mod tests {
             .unwrap();
         parent.complete_start().unwrap();
         let child_id = parent
-            .allocate_child_process(None, false)
+            .allocate_child_process(None, ChildProcessFlags::empty())
             .unwrap()
             .process_id;
         let child = broker
@@ -5036,7 +5140,9 @@ mod tests {
         );
 
         // A child that fails to start also releases them while its parent still holds it.
-        let identity = parent.allocate_child_process(None, false).unwrap();
+        let identity = parent
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap();
         parent
             .duplicate_object_references_to_child(identity.process_id, &[first], &sink)
             .unwrap();
@@ -5084,7 +5190,9 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
-        let child = parent.create_child(parent.pid_namespace(), false).unwrap();
+        let child = parent
+            .create_child(parent.pid_namespace(), ChildProcessFlags::empty())
+            .unwrap();
         let shutdowns = Arc::new(AtomicUsize::new(0));
         let shutdown_count = Arc::clone(&shutdowns);
         child.install_shutdown(Arc::new(move || {
@@ -5113,7 +5221,7 @@ mod tests {
         parent.handle_owner_death();
 
         assert!(matches!(
-            parent.create_child(parent.pid_namespace(), false),
+            parent.create_child(parent.pid_namespace(), ChildProcessFlags::empty()),
             Err(BrokerError::PeerClosed)
         ));
     }
@@ -5129,7 +5237,9 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         root.complete_start().unwrap();
-        let parent = root.create_child(root.pid_namespace(), false).unwrap();
+        let parent = root
+            .create_child(root.pid_namespace(), ChildProcessFlags::empty())
+            .unwrap();
         parent.complete_start().unwrap();
 
         let (locked_sender, locked_receiver) = std::sync::mpsc::sync_channel(0);
@@ -5452,7 +5562,7 @@ mod tests {
         process.complete_start().unwrap();
         let thread_id = process.create_thread().unwrap();
         let child_id = process
-            .allocate_child_process(None, false)
+            .allocate_child_process(None, ChildProcessFlags::empty())
             .unwrap()
             .process_id;
         let child = process.with_pending_child(child_id, Arc::clone).unwrap();
@@ -5499,7 +5609,9 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         parent.complete_start().unwrap();
-        let child = parent.create_child(parent.pid_namespace(), false).unwrap();
+        let child = parent
+            .create_child(parent.pid_namespace(), ChildProcessFlags::empty())
+            .unwrap();
         let thread_id = child.create_thread().unwrap();
         assert_eq!(broker.core.active_thread_count.load(Ordering::Relaxed), 3);
 
@@ -6557,7 +6669,9 @@ mod tests {
         root.set_child_exit_retention(true).unwrap();
 
         // A pending child that its creator cancels.
-        let identity = root.allocate_child_process(None, false).unwrap();
+        let identity = root
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap();
         let cancelled = root
             .with_pending_child(identity.process_id, Arc::clone)
             .unwrap();
@@ -6592,7 +6706,10 @@ mod tests {
         let broker = process_handle_broker();
         let root = started_root(&broker);
         let identity = root
-            .allocate_child_process(Some(PidNamespaceOptions::new(true, false)), false)
+            .allocate_child_process(
+                Some(PidNamespaceOptions::new(true, false)),
+                ChildProcessFlags::empty(),
+            )
             .unwrap();
         let first = root.take_child_process(identity.process_id).unwrap();
         let other = child_of(&first);
@@ -6663,7 +6780,10 @@ mod tests {
         let target = child_of(&root);
         let (handle, _) = open_process_handle(&root, &target);
         let identity = root
-            .allocate_child_process(Some(PidNamespaceOptions::default()), false)
+            .allocate_child_process(
+                Some(PidNamespaceOptions::default()),
+                ChildProcessFlags::empty(),
+            )
             .unwrap();
         let inherited = root
             .duplicate_object_references_to_child(

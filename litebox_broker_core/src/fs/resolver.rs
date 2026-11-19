@@ -14,6 +14,7 @@ use litebox_broker_protocol::fs::FileLockOperation;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::RawSyncPrimitivesProvider;
 
+use super::composer::{Composer, RmdirCheck};
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SeekError, SetTimesError,
@@ -39,7 +40,7 @@ const MAX_SYMLINKS: usize = 40;
 pub struct Resolver<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
 {
     backend: Backend,
-    flocks: super::flock::FlockTable<Platform>,
+    flocks: Arc<super::flock::FlockTable<Platform>>,
     _sync: PhantomData<fn() -> Platform>,
 }
 
@@ -51,9 +52,25 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     pub fn new(backend: Backend) -> Self {
         Self {
             backend,
-            flocks: super::flock::FlockTable::new(),
+            flocks: Arc::new(super::flock::FlockTable::new()),
             _sync: PhantomData,
         }
+    }
+
+    fn composer(&self) -> Option<&Composer<Platform>> {
+        (&self.backend as &dyn core::any::Any).downcast_ref()
+    }
+
+    /// Resolve paths against a private copy of the mount layout. Locks on shared files
+    /// still conflict across views. Existing open descriptions keep their original resolver.
+    /// Copies share the runtime mount budget; copying the layout consumes no mount slots.
+    #[must_use]
+    pub(super) fn copy_mount_view(&self) -> Option<Resolver<Platform, Composer<Platform>>> {
+        Some(Resolver {
+            backend: self.composer()?.copy_mount_view(),
+            flocks: Arc::clone(&self.flocks),
+            _sync: PhantomData,
+        })
     }
 }
 
@@ -134,11 +151,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         user: UserInfo,
         path: &str,
     ) -> Result<(), litebox_broker_protocol::fs::FileError> {
-        use super::composer::{Composer, MountError};
+        use super::composer::MountError;
         use super::in_mem::{InMem, InitialNode};
         use super::service::file_walk_error;
         use litebox_broker_protocol::fs::FileError;
 
+        let composer = self.composer();
+        let _paths = composer.map(|c| c.mount_paths.lock());
         let context = Context::new(user);
         let path = self
             .resolve_path(&context, path, true, false)
@@ -149,37 +168,38 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         else {
             return Err(FileError::NotDirectory);
         };
-        if user.user != UserInfo::ROOT.user {
-            // XXX(jayb): Linux requires CAP_SYS_ADMIN; we let non-root mount over directories they own.
-            if !matches!(&target.permissions, PermissionCheck::ByResolver(info) if info.owner.user == user.user)
-            {
-                return Err(FileError::NotOwner);
-            }
-            // Overlay walking handles hold its namespace lock; release it before rewalking.
-            drop(target);
-            // XXX(jayb): Path-based mount can race renames; refusing foreign sticky ancestors is a
-            // stopgap.
-            for len in 0..path.components.len() {
-                let components: Vec<_> =
-                    path.components[..len].iter().map(String::as_str).collect();
+        let privileged = user.user == UserInfo::ROOT.user;
+        // XXX(jayb): Linux requires CAP_SYS_ADMIN; we let non-root mount over directories they own.
+        if !privileged
+            && !matches!(&target.permissions, PermissionCheck::ByResolver(info) if info.owner.user == user.user)
+        {
+            return Err(FileError::NotOwner);
+        }
+        // Overlay walking handles hold its namespace lock; release it before rewalking.
+        drop(target);
+        if !privileged {
+            let components: Vec<_> = path.components.iter().map(String::as_str).collect();
+            for i in 0..components.len() {
                 let Resolution::Found(ResolvedTarget::Dir(ancestor)) = self
-                    .resolve_components(&context, &components)
+                    .resolve_components(&context, &components[..i])
                     .map_err(|error| file_walk_error(error.error))?
                 else {
                     return Err(FileError::NotOwner);
                 };
-                match ancestor.permissions {
-                    PermissionCheck::ByResolver(info)
-                        if info.owner.user == user.user || !info.mode.contains(Mode::SVTX) => {}
-                    _ => return Err(FileError::NotOwner),
+                if !matches!(&ancestor.permissions, PermissionCheck::ByResolver(info) if info.owner.user == user.user || !info.mode.contains(Mode::SVTX))
+                {
+                    return Err(FileError::NotOwner);
                 }
             }
         }
-        let composer = (&self.backend as &dyn core::any::Any)
-            .downcast_ref::<Composer<Platform>>()
-            .ok_or(FileError::NotSupported)?;
+        let composer = composer.ok_or(FileError::NotSupported)?;
+        let pins = composer
+            .mount_pins(&path.components, &|info| {
+                Self::check_search_permission(&context, info)
+            })
+            .map_err(file_walk_error)?;
         composer
-            .mount(&path.to_absolute(), |allocator| {
+            .mount_with_pins(&path.to_absolute(), pins, |allocator| {
                 InMem::<Platform>::new_initialized(
                     [(
                         "/",
@@ -425,15 +445,15 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         read_only: E,
         no_write_perms: E,
     ) -> Result<(), E> {
-        match &dir.permissions {
-            PermissionCheck::ByResolver(permissions) if permissions.on_read_only_fs => {
-                Err(read_only)
-            }
-            PermissionCheck::ByResolver(permissions) if !context.can_write(permissions) => {
-                Err(no_write_perms)
-            }
-            PermissionCheck::ByBackend | PermissionCheck::ByResolver(_) => Ok(()),
+        if dir.permissions.on_read_only_fs() {
+            return Err(read_only);
         }
+        if let PermissionCheck::ByResolver(permissions) = &dir.permissions
+            && !context.can_write(permissions)
+        {
+            return Err(no_write_perms);
+        }
+        Ok(())
     }
 
     fn resolve_target(
@@ -659,15 +679,15 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     return Err(PathError::ComponentNotADirectory.into());
                 }
                 let wants_write = write_allowed || flags.contains(OFlags::TRUNC);
-                if !path_only && let PermissionCheck::ByResolver(permissions) = &file.permissions {
-                    if wants_write && permissions.on_read_only_fs {
-                        return Err(OpenError::ReadOnlyFileSystem);
-                    }
-                    if (read_allowed && !context.can_read(permissions))
-                        || (wants_write && !context.can_write(permissions))
-                    {
-                        return Err(OpenError::AccessNotAllowed);
-                    }
+                if !path_only && wants_write && file.permissions.on_read_only_fs() {
+                    return Err(OpenError::ReadOnlyFileSystem);
+                }
+                if !path_only
+                    && let PermissionCheck::ByResolver(permissions) = &file.permissions
+                    && ((read_allowed && !context.can_read(permissions))
+                        || (wants_write && !context.can_write(permissions)))
+                {
+                    return Err(OpenError::AccessNotAllowed);
                 }
                 let file = self.backend.open_file(file, flags)?;
                 let seek_behavior = self.backend.seek_behavior(&file);
@@ -1062,6 +1082,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
     /// Unlink a file
     pub fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
+        let _paths = self.composer().map(|c| c.mount_paths.lock());
         let context = Context::new(user);
         let trailing_slash = path.ends_with('/');
         let Some((parent, name)) =
@@ -1082,8 +1103,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             UnlinkError::ReadOnlyFileSystem,
             UnlinkError::NoWritePerms,
         );
-        // Linux checks for a read-only mount before looking up the name.
-        if matches!(writable, Err(UnlinkError::ReadOnlyFileSystem)) {
+        // A resolver-enforced read-only mount wins before lookup. For a backend-enforced
+        // restriction a trailing slash still requires the ordinary directory lookup first.
+        if matches!(writable, Err(UnlinkError::ReadOnlyFileSystem))
+            && !(trailing_slash && matches!(parent.permissions, PermissionCheck::ByReadOnlyBackend))
+        {
             return writable;
         }
         if trailing_slash {
@@ -1184,6 +1208,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         old_path: &str,
         new_path: &str,
     ) -> Result<(), RenameError> {
+        let _paths = self.composer().map(|c| c.mount_paths.lock());
         let context = Context::new(user);
         let map_walk_error = |error| match error {
             WalkError::Io => RenameError::Io,
@@ -1205,12 +1230,19 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             if matches!(name.as_str(), "." | "..") {
                 return Err(RenameError::Busy);
             }
-            let writable = Self::check_dir_entries_change(
-                &context,
-                &parent,
-                RenameError::ReadOnlyFileSystem,
-                RenameError::NoWritePerms,
-            );
+            let backend_read_only =
+                matches!(parent.permissions, PermissionCheck::ByReadOnlyBackend);
+            let writable = if backend_read_only {
+                // Preserve backend ordering, including the resolver's ordinary trailing-slash check.
+                Ok(())
+            } else {
+                Self::check_dir_entries_change(
+                    &context,
+                    &parent,
+                    RenameError::ReadOnlyFileSystem,
+                    RenameError::NoWritePerms,
+                )
+            };
             // Own this directory before walking the other parent: walking handles may retain locks.
             let dir = self
                 .backend
@@ -1223,22 +1255,23 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     }
                     _ => RenameError::Io,
                 })?;
-            Ok((dir, name, writable))
+            Ok((dir, name, writable, backend_read_only))
         };
-        let (old_dir, old_name, old_writable) = parent(old_path)?;
-        let (new_dir, new_name, new_writable) = parent(new_path)?;
-        // Linux checks for a cross-mount rename, then for a read-only mount, before looking up
-        // either name. Only the backend knows whether the directories are on different mounts;
-        // asking it relies on every backend that sets `on_read_only_fs` (TarRo, ReadOnly,
-        // Composer virtual directories) refusing the rename without mutating anything.
+        let (old_dir, old_name, old_writable, old_backend_ro) = parent(old_path)?;
+        let (new_dir, new_name, new_writable, new_backend_ro) = parent(new_path)?;
+        // A read-only parent rules out mutation, but only the backend can identify a
+        // cross-mount rename or a protected name in the current view.
         if [&old_writable, &new_writable]
             .into_iter()
             .any(|writable| matches!(writable, Err(RenameError::ReadOnlyFileSystem)))
         {
-            return match self
-                .backend
-                .rename_at(old_dir, &old_name, new_dir, &new_name)
-            {
+            return match self.backend.rename_at(
+                old_dir,
+                &old_name,
+                new_dir,
+                &new_name,
+                Err(RenameError::ReadOnlyFileSystem),
+            ) {
                 Err(RenameError::CrossDevice) => Err(RenameError::CrossDevice),
                 _ => Err(RenameError::ReadOnlyFileSystem),
             };
@@ -1272,12 +1305,20 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         old_writable.and(new_writable)?;
         // XXX(jayb): like unlink, rename omits sticky-bit checks and write permission on a moved
         // directory for updating `..`.
+        let may_move = if old_backend_ro || new_backend_ro {
+            Err(RenameError::ReadOnlyFileSystem)
+        } else {
+            Ok(())
+        };
         self.backend
-            .rename_at(old_dir, &old_name, new_dir, &new_name)
+            .rename_at(old_dir, &old_name, new_dir, &new_name, may_move)
     }
 
     /// Create a new directory
     pub fn mkdir(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
+        // A failed mkdir may roll back a temporarily visible directory. A related view
+        // must not mount it between creation and rollback.
+        let _paths = self.composer().map(|c| c.mount_paths.lock());
         let context = Context::new(user);
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, path)
@@ -1328,41 +1369,55 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
     /// Remove a directory
     pub fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
+        let composer = self.composer();
+        let _paths = composer.map(|c| c.mount_paths.lock());
         let context = Context::new(user);
-        let Some((parent, name)) =
-            self.parent_dir_and_name(&context, path)
-                .map_err(|error| match error {
-                    WalkError::Io => RmdirError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
-        else {
-            return Err(RmdirError::Busy);
-        };
-        match name.as_str() {
-            "." => return Err(PathError::InvalidPathname.into()),
-            ".." => return Err(RmdirError::NotEmpty),
-            _ => {}
-        }
-        let writable = Self::check_dir_entries_change(
-            &context,
-            &parent,
-            RmdirError::ReadOnlyFileSystem,
-            RmdirError::NoWritePerms,
-        );
-        // Linux checks for a read-only mount before looking up the name.
-        if matches!(writable, Err(RmdirError::ReadOnlyFileSystem)) {
-            return writable;
-        }
-        if let Err(error) = writable {
-            return Err(
-                if matches!(self.name_exists(&context, parent, &name), Ok(false)) {
-                    PathError::NoSuchFileOrDirectory.into()
-                } else {
-                    error
-                },
+        let authorized_parent = || {
+            let Some((parent, name)) =
+                self.parent_dir_and_name(&context, path)
+                    .map_err(|error| match error {
+                        WalkError::Io => RmdirError::Io,
+                        WalkError::PathError(error) => error.into(),
+                    })?
+            else {
+                return Err(RmdirError::Busy);
+            };
+            match name.as_str() {
+                "." => return Err(PathError::InvalidPathname.into()),
+                ".." => return Err(RmdirError::NotEmpty),
+                _ => {}
+            }
+            let writable = Self::check_dir_entries_change(
+                &context,
+                &parent,
+                RmdirError::ReadOnlyFileSystem,
+                RmdirError::NoWritePerms,
             );
-        }
-        self.backend.rmdir_at(parent, &name)
+            // Linux checks for a read-only mount before looking up the name.
+            if matches!(writable, Err(RmdirError::ReadOnlyFileSystem)) {
+                return Err(RmdirError::ReadOnlyFileSystem);
+            }
+            if let Err(error) = writable {
+                return Err(
+                    if matches!(self.name_exists(&context, parent, &name), Ok(false)) {
+                        PathError::NoSuchFileOrDirectory.into()
+                    } else {
+                        error
+                    },
+                );
+            }
+            Ok((parent, name))
+        };
+        let (parent, name) = authorized_parent()?;
+        let (parent, may_remove) = if let Some(composer) = composer {
+            match composer.check_rmdir_pins(parent, &name)? {
+                RmdirCheck::UseParent(parent) => (parent, Ok(())),
+                RmdirCheck::Rewalk(may_remove) => (authorized_parent()?.0, may_remove),
+            }
+        } else {
+            (parent, Ok(()))
+        };
+        self.backend.rmdir_at(parent, &name, may_remove)
     }
 
     /// Read directory entries from a directory file descriptor.

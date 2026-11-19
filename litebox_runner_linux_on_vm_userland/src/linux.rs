@@ -56,7 +56,7 @@ use alloc::vec::Vec;
 use litebox::platform::ForkError;
 use litebox::process::ProcessError;
 use litebox::utils::TruncateExt as _;
-use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
+use litebox_broker_protocol::process::{ChildProcessFlags, ProcessExitStatus, ProcessStartupData};
 use litebox_common_linux::program_startup::{LinuxProcessStartup, LinuxProgramStartup};
 use litebox_common_vm_abi::program::{self, ExitStatus, Program};
 use litebox_common_vm_abi::{CallId, CallSet, LogLevel, Message, ProtSet, StartupInfo, UserRange};
@@ -209,7 +209,7 @@ fn check_process_clones(litebox: &litebox::LiteBox<Platform>) {
     let pending = encode_clone_descriptor(pending);
     for descriptor in [&replaced[..], &unissued, &zero, &pending[..4]] {
         let child = litebox
-            .allocate_child_process(None, false)
+            .allocate_child_process(None, ChildProcessFlags::empty())
             .expect("a child process");
         assert_eq!(
             child.start_with_existing_runner(descriptor, &[]),

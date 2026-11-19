@@ -414,6 +414,91 @@ fn test_nine_p_unlink_and_rmdir() {
 }
 
 #[test]
+fn private_mount_preserves_9p_directory_ancestry_errors() {
+    use crate::fs::{UserInfo, composer::Composer, errors::RenameError};
+    let server = DiodServer::start();
+    std::fs::create_dir_all(server.export_path().join("p/child")).unwrap();
+    std::fs::write(server.export_path().join("p/file"), []).unwrap();
+    let fs = Resolver::<TestPlatform, _>::new(
+        Composer::<TestPlatform>::builder()
+            .mount("/", |ids| attach(server.connect(), &server, ids))
+            .build()
+            .unwrap(),
+    );
+    let private = fs.copy_mount_view().unwrap();
+    private.mount_in_mem(UserInfo::ROOT, "/p").unwrap();
+    assert!(matches!(
+        fs.rename(USER, "/p", "/p/new"),
+        Err(RenameError::InvalidArgument)
+    ));
+    assert!(matches!(
+        fs.rename(USER, "/p/child", "/p"),
+        Err(RenameError::NotEmpty)
+    ));
+    assert!(matches!(
+        fs.rename(USER, "/p/file", "/p"),
+        Err(RenameError::NotEmpty)
+    ));
+}
+
+#[test]
+fn private_mount_leaves_unrelated_9p_renames_to_the_server() {
+    use crate::fs::{
+        UserInfo,
+        composer::Composer,
+        errors::{PathError, RenameError},
+    };
+    let server = DiodServer::start();
+    for dir in ["target", "unrelated"] {
+        std::fs::create_dir(server.export_path().join(dir)).unwrap();
+    }
+    let fs = Resolver::<TestPlatform, _>::new(
+        Composer::<TestPlatform>::builder()
+            .mount("/", |ids| attach(server.connect(), &server, ids))
+            .build()
+            .unwrap(),
+    );
+    // Unlike LocalFs, diod rejects the overlong leaf before the subtree move.
+    let dest = alloc::format!("/unrelated/{}", "x".repeat(256));
+    let check = || {
+        assert!(matches!(
+            fs.rename(USER, "/unrelated", &dest),
+            Err(RenameError::PathError(PathError::InvalidPathname))
+        ));
+    };
+    check();
+    let private = fs.copy_mount_view().unwrap();
+    private.mount_in_mem(UserInfo::ROOT, "/target").unwrap();
+    check();
+}
+
+#[test]
+fn tremove_fallback_preserves_entries_of_the_wrong_kind() {
+    let server = DiodServer::start();
+    std::fs::write(server.export_path().join("file"), b"keep").unwrap();
+    std::fs::create_dir(server.export_path().join("dir")).unwrap();
+    let backend = attach(server.connect(), &server, InodeAllocators::new().next());
+    backend.unlinkat_supported.store(false, Ordering::SeqCst);
+    let fs = Resolver::<TestPlatform, _>::new(backend);
+
+    assert!(matches!(
+        fs.unlink(USER, "/dir"),
+        Err(UnlinkError::IsADirectory)
+    ));
+    assert!(matches!(
+        fs.rmdir(USER, "/file"),
+        Err(RmdirError::NotADirectory)
+    ));
+    assert!(server.export_path().join("dir").is_dir());
+    assert_eq!(
+        std::fs::read(server.export_path().join("file")).unwrap(),
+        b"keep"
+    );
+    fs.unlink(USER, "/file").unwrap();
+    fs.rmdir(USER, "/dir").unwrap();
+}
+
+#[test]
 fn test_nine_p_seek_and_partial_read() {
     let server = DiodServer::start();
     let fs = connect_9p(&server);

@@ -277,6 +277,34 @@ fn identity(metadata: &fs::Metadata, canonical_path: &Path) -> HostIdentity {
     }
 }
 
+/// Prove that two parent spellings reach the same directory entry. An unavailable proof
+/// leaves the caller's mount veto in place; it never authorizes a host rename.
+fn same_rename_parent(old: &Path, new: &Path) -> std::io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{Mode, OFlags, fstat, open};
+        use std::os::fd::AsRawFd as _;
+        let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let old = open(old, flags, Mode::empty())?;
+        let new = open(new, flags, Mode::empty())?;
+        let a = fstat(&old)?;
+        let b = fstat(&new)?;
+        // A bind alias may share the inode without being the same location. Compare the
+        // kernel-resolved names of the held directories, not case-folded guest strings.
+        let resolved = |fd| fs::read_link(format!("/proc/self/fd/{fd}"));
+        Ok((a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+            && resolved(old.as_raw_fd())? == resolved(new.as_raw_fd())?)
+    }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        Ok(windows::directory_id(old)? == windows::directory_id(new)?)
+    }
+    #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+    {
+        Ok(fs::canonicalize(old)? == fs::canonicalize(new)?)
+    }
+}
+
 /// Type of a host object described by metadata that did not follow a final symlink.
 fn host_file_type(metadata: &fs::Metadata) -> std::io::Result<FileType> {
     if metadata.file_type().is_symlink() {
@@ -913,6 +941,32 @@ impl Backend for LocalFs {
             .map_err(|_| FileStatusError::Io)
     }
 
+    /// Identifies a directory by its host volume serial number and 128-bit file ID rather than by
+    /// its path-keyed inode ID, so every spelling of one host directory shares an identity.
+    ///
+    /// Only directories are identified: a file target, or one from another `LocalFs`, reports
+    /// [`FileStatusError::Io`].
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn mount_directory_id(
+        &self,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<(u64, u128), FileStatusError> {
+        let ResolvedTarget::Dir(dir) = target else {
+            return Err(FileStatusError::Io);
+        };
+        let dir = dir.get_typed::<Self>();
+        if !self.valid_dir(dir) {
+            return Err(FileStatusError::Io);
+        }
+        windows::directory_id(&dir.canonical_path).map_err(|error| {
+            litebox_util_log::debug!(
+                path:? = dir.canonical_path, error:? = error;
+                "failed to identify host directory by file ID"
+            );
+            FileStatusError::Io
+        })
+    }
+
     fn create_file_at(
         &self,
         dir: ResolvedDir<'_>,
@@ -1048,7 +1102,12 @@ impl Backend for LocalFs {
         }
     }
 
-    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
         validate_name(name)?;
         let dir = dir.into_typed::<Self>();
         if !self.valid_dir(&dir) {
@@ -1059,6 +1118,7 @@ impl Backend for LocalFs {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(RmdirError::NotADirectory);
         }
+        may_remove?;
         fs::remove_dir(path).map_err(rmdir_error)
     }
 
@@ -1068,6 +1128,7 @@ impl Backend for LocalFs {
         old_name: &str,
         new_dir: DirHandle,
         new_name: &str,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         validate_name(old_name)?;
         validate_name(new_name)?;
@@ -1097,10 +1158,21 @@ impl Backend for LocalFs {
                 if source_is_dir && !destination_is_dir {
                     return Err(RenameError::NotADirectory);
                 }
+                if matches!(may_move, Err(RenameError::Busy))
+                    && source_is_dir
+                    && old_name == new_name
+                    && matches!(
+                        same_rename_parent(&old_dir.canonical_path, &new_dir.canonical_path),
+                        Ok(true)
+                    )
+                {
+                    return Ok(()); // A verified self-rename; never issue a mutating operation.
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(rename_error(error)),
         }
+        may_move?;
         fs::rename(old_path, new_path).map_err(rename_error)
     }
 
@@ -1241,3 +1313,6 @@ impl Backend for LocalFs {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -693,7 +693,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
     }
 
-    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
         // TODO(jayb): Nothing checks write permission on the parent directory before removing;
         // the resolver should do so before calling this.
         let parent = dir.into_typed::<Self>();
@@ -705,6 +710,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 Err(RmdirError::NotEmpty)
             }
             Some(Node::Dir(_)) => {
+                may_remove?;
                 parent.children.remove(name);
                 Ok(())
             }
@@ -717,6 +723,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         old_name: &str,
         new_dir: super::backend::DirHandle,
         new_name: &str,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         for name in [old_name, new_name] {
             if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
@@ -785,6 +792,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 }
                 _ => {}
             }
+            may_move?;
             let moved = old
                 .children
                 .remove(old_name)

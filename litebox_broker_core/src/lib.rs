@@ -459,10 +459,10 @@ impl BrokerCore {
 
     /// Creates a root process, one with no parent, and its initial thread. The
     /// process is in `pid_namespace` and `job`, opens files through `fs`, and
-    /// starts with the host names `host_names`, which no other root shares; its
-    /// descendants share `job`, `fs` and those host names (until one takes a
-    /// copy, see [`BrokerProcess::copy_host_names`]), and are in
-    /// `pid_namespace` or in namespaces nested in it.
+    /// starts with the host names `host_names`, which no other root shares.
+    /// Descendants share `job` and live in `pid_namespace` or a nested namespace.
+    /// A child shares its creator's mount view unless created with a private copy.
+    /// Host names are shared independently until [`BrokerProcess::copy_host_names`].
     ///
     /// If `pid_namespace` has no first process yet, this process becomes it
     /// once its creation succeeds (see [`BrokerProcess::is_first_process`]);
@@ -530,9 +530,9 @@ impl BrokerCore {
 
     /// Counts and registers one process, without an initial thread, in
     /// `pid_namespace` and `job`, opening files through `fs` and using the
-    /// host names `host_names`. With `parent`, the process is its child,
-    /// `parent` must have the same `job` and `fs`, and `pid_namespace` is
-    /// `parent`'s namespace or one nested in it.
+    /// host names `host_names`. A child shares its parent's `job` and lives
+    /// in its parent's PID namespace or one nested in it. Its `fs` is the
+    /// creator's shared or copied mount view, even when the creator is not its parent.
     ///
     /// This publishes the process before its creation is final: a caller whose
     /// later step fails undoes the registration by discarding the process. So

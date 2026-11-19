@@ -47,8 +47,8 @@ impl<B: Backend> ReadOnly<B> {
 fn mark_read_only(permissions: &mut PermissionCheck) {
     match permissions {
         PermissionCheck::ByResolver(permissions) => permissions.on_read_only_fs = true,
-        PermissionCheck::ByBackend => {
-            // ByBackend backends are covered by the open-flag and mutation checks below.
+        PermissionCheck::ByBackend | PermissionCheck::ByReadOnlyBackend => {
+            *permissions = PermissionCheck::ByReadOnlyBackend;
         }
     }
 }
@@ -158,6 +158,13 @@ impl<B: Backend> Backend for ReadOnly<B> {
         self.inner.resolved_status(target)
     }
 
+    fn mount_directory_id(
+        &self,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<(u64, u128), FileStatusError> {
+        self.inner.mount_directory_id(target)
+    }
+
     fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {
         self.inner.terminal(h)
     }
@@ -198,7 +205,12 @@ impl<B: Backend> Backend for ReadOnly<B> {
         Err(UnlinkError::ReadOnlyFileSystem)
     }
 
-    fn rmdir_at(&self, _parent: ResolvedDir<'_>, _name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        _parent: ResolvedDir<'_>,
+        _name: &str,
+        _may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
@@ -208,6 +220,7 @@ impl<B: Backend> Backend for ReadOnly<B> {
         _old_name: &str,
         _new_dir: DirHandle,
         _new_name: &str,
+        _may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         Err(RenameError::ReadOnlyFileSystem)
     }

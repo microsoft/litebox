@@ -332,6 +332,13 @@ pub enum DeviceDirHandle {
     Pts,
 }
 
+impl DeviceDirHandle {
+    fn resolved<'a>(self) -> ResolvedDir<'a> {
+        // Device nodes support I/O, but callers cannot change directory entries.
+        ResolvedDir::from_typed::<Devices>(self, PermissionCheck::ByReadOnlyBackend)
+    }
+}
+
 impl BackendHandles for Devices {
     type ResolvedDir<'a> = DeviceDirHandle;
     type ResolvedFile<'a> = DeviceResolvedFile;
@@ -349,10 +356,7 @@ impl Backend for Devices {
     }
 
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        Ok(ResolvedDir::from_typed::<Self>(
-            DeviceDirHandle::Root,
-            PermissionCheck::ByBackend,
-        ))
+        Ok(DeviceDirHandle::Root.resolved())
     }
 
     fn resolve<'a>(
@@ -400,7 +404,7 @@ impl Backend for Devices {
                 }
                 None if index + 1 == components.len() => {
                     return Ok(Resolution::MissingFinal {
-                        parent: ResolvedDir::from_typed::<Self>(dir, PermissionCheck::ByBackend),
+                        parent: dir.resolved(),
                     });
                 }
                 None => {
@@ -411,9 +415,7 @@ impl Backend for Devices {
                 }
             }
         }
-        Ok(Resolution::Found(ResolvedTarget::Dir(
-            ResolvedDir::from_typed::<Self>(dir, PermissionCheck::ByBackend),
-        )))
+        Ok(Resolution::Found(ResolvedTarget::Dir(dir.resolved())))
     }
 
     fn read_link_at(&self, _dir: &ResolvedDir<'_>, _name: &str) -> Result<String, WalkError> {
@@ -425,10 +427,7 @@ impl Backend for Devices {
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
-        Some(ResolvedDir::from_typed::<Self>(
-            *dir.get_typed::<Self>(),
-            PermissionCheck::ByBackend,
-        ))
+        Some(dir.get_typed::<Self>().resolved())
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
@@ -667,11 +666,17 @@ impl Backend for Devices {
         _old_name: &str,
         _new_dir: DirHandle,
         _new_name: &str,
+        _may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         Err(RenameError::ReadOnlyFileSystem)
     }
 
-    fn rmdir_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        _dir: ResolvedDir<'_>,
+        _name: &str,
+        _may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
         Err(RmdirError::ReadOnlyFileSystem)
     }
 

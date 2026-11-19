@@ -329,7 +329,12 @@ impl super::backend::Backend for TarRo {
         Err(UnlinkError::ReadOnlyFileSystem)
     }
 
-    fn rmdir_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        _dir: ResolvedDir<'_>,
+        _name: &str,
+        _may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
@@ -339,6 +344,7 @@ impl super::backend::Backend for TarRo {
         _old_name: &str,
         _new_dir: DirHandle,
         _new_name: &str,
+        _may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         Err(RenameError::ReadOnlyFileSystem)
     }
