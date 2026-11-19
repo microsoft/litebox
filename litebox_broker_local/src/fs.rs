@@ -199,9 +199,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn map_file(
         &self,
         handle: ObjectHandle,
-        end: u64,
+        options: litebox_broker_protocol::fs::FileMappingOptions,
     ) -> Result<FileOperationResult<MapFileResponse>, Channel::Error> {
-        match self.request_file(FileRequest::Map(MapFileRequest { handle, end }))? {
+        match self.request_file(FileRequest::Map(MapFileRequest { handle, options }))? {
             FileResponse::Map(response) => Ok(Ok(response)),
             FileResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected file map response: {response:?}"),

@@ -5379,7 +5379,8 @@ mod credentials {
         use crate::readiness::{ReadinessSink, tests::TestReadinessSink};
         use crate::{BrokerError, HandleOperations, ObjectRights};
         use litebox_broker_protocol::fs::{
-            FileAccessMode, FileCaller, FileError, FileOpenFlags, FileSeekWhence,
+            FileAccessMode, FileCaller, FileError, FileMappingOptions, FileOpenFlags,
+            FileSeekWhence,
         };
 
         let (process, subject) = handle_test_process(with_devices(device_security()));
@@ -5400,7 +5401,10 @@ mod credentials {
         let path = open("/dev/tty", FileOpenFlags::PATH);
         let dir = open("/dev", FileOpenFlags::NONE);
         let regular = open("/file", FileOpenFlags::CREATE);
-        let map = |handle| crate::fs::map_shared(&process, handle).map(|result| result.map(|_| ()));
+        let map = |handle| {
+            crate::fs::map_shared(&process, handle, FileMappingOptions::readable(1))
+                .map(|result| result.map(|_| ()))
+        };
         let read = |handle| crate::fs::read(&process, handle, &mut [0u8; 1], None);
         let list =
             |handle| crate::fs::read_directory(&process, handle).map(|result| result.map(|_| ()));
@@ -5443,7 +5447,9 @@ mod credentials {
         use crate::readiness::{ReadinessSink, tests::TestReadinessSink};
         use crate::stdio::StdioStream;
         use crate::{BrokerError, HandleOperations as Op, ObjectRights};
-        use litebox_broker_protocol::fs::{FileAccessMode, FileCaller, FileError, FileOpenFlags};
+        use litebox_broker_protocol::fs::{
+            FileAccessMode, FileCaller, FileError, FileMappingOptions, FileOpenFlags,
+        };
         use litebox_broker_protocol::readiness::ReadinessFlags as Ready;
 
         let (owner, group) = owners(posix(CAROL));
@@ -5480,17 +5486,43 @@ mod credentials {
             process.get_status_flags(readable_mapping),
             Err(BrokerError::InvalidRights)
         );
+        let options = FileMappingOptions::readable(4096);
         assert_eq!(
-            crate::fs::check_mapping(&process, readable_mapping),
+            crate::fs::check_mapping(&process, readable_mapping, options),
             Ok(Ok(()))
         );
         assert_eq!(
-            crate::fs::map_shared(&process, readable_mapping).map(|r| r.map(|_| ())),
+            crate::fs::map_shared(&process, readable_mapping, options).map(|r| r.map(|_| ())),
             Ok(Err(FileError::NoSuchDevice))
         );
+        for (request, error) in [
+            (
+                FileMappingOptions {
+                    require_write: true,
+                    ..options
+                },
+                FileError::NotForWriting,
+            ),
+            (
+                FileMappingOptions {
+                    max_regular_end: 4095,
+                    ..options
+                },
+                FileError::InvalidOffset,
+            ),
+        ] {
+            assert_eq!(
+                crate::fs::check_mapping(&process, readable_mapping, request),
+                Ok(Err(error))
+            );
+            assert_eq!(
+                crate::fs::map_shared(&process, readable_mapping, request).map(|r| r.map(|_| ())),
+                Ok(Err(error))
+            );
+        }
         for ops in [Op::READ, Op::MAP] {
             assert_eq!(
-                crate::fs::check_mapping(&process, restrict(file, ops)),
+                crate::fs::check_mapping(&process, restrict(file, ops), options),
                 Err(BrokerError::InvalidRights)
             );
         }

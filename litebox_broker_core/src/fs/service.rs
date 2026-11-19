@@ -9,9 +9,9 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::authority::Scope;
 use litebox_broker_protocol::fs::FileSecurityUpdate;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileCaller, FileDirectoryEntry, FileError, FileLockOperation, FileMode,
-    FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, MAX_FILE_TRANSFER_SIZE,
-    SetFileTimes,
+    FileAccessMode, FileCaller, FileDirectoryEntry, FileError, FileLockOperation,
+    FileMappingOptions, FileMode, FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags,
+    MAX_FILE_TRANSFER_SIZE, SetFileTimes,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
@@ -872,8 +872,12 @@ pub fn truncate(
 /// Checks a reference's eligibility for a mapping without allocating or exporting shared storage.
 /// Hosts without a delivery mechanism must still check this before reporting an unsupported
 /// mapping: a client may then copy the file using separately authorized reads.
-pub fn check_mapping(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<()>> {
-    Ok(file_for_read(process, handle, ReadOperation::Mapping)?.map(|_| ()))
+pub fn check_mapping(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    options: FileMappingOptions,
+) -> Result<FileResult<()>> {
+    Ok(file_for_mapping(process, handle, options)?.map(|_| ()))
 }
 
 /// Returns the right to map the host shared object holding a broker-owned open file's contents,
@@ -886,18 +890,19 @@ pub fn check_mapping(process: &BrokerProcess, handle: ObjectHandle) -> Result<Fi
 pub fn map_shared(
     process: &BrokerProcess,
     handle: ObjectHandle,
+    options: FileMappingOptions,
 ) -> Result<FileResult<SharedFileMapping>> {
-    let file = match file_for_read(process, handle, ReadOperation::Mapping)? {
-        Ok(file) => file,
+    let (file, writable) = match file_for_mapping(process, handle, options)? {
+        Ok(grant) => grant,
         Err(error) => return Ok(Err(error)),
     };
-    let handle_writable = process
-        .authorized_operation(handle, HandleOperations::WRITE)
-        .is_ok();
     let mapping = match file.state.map_shared()? {
-        Ok(mapping) => mapping.restrict(handle_writable),
+        Ok(mapping) => mapping.restrict(writable),
         Err(error) => return Ok(Err(error)),
     };
+    if options.require_write && !mapping.writable() {
+        return Ok(Err(FileError::NotForWriting));
+    }
     let memory_id = mapping.memory_id(|| crate::shared_futex::issue_shared_memory_id(process))?;
     Ok(Ok(SharedFileMapping::new(memory_id, mapping)))
 }
@@ -1214,7 +1219,48 @@ fn file(process: &BrokerProcess, handle: ObjectHandle, required: HandleOperation
 enum ReadOperation {
     Data,
     Directory,
-    Mapping,
+}
+
+/// Resolves a mapping request without exporting storage. QUERY alone may explain a refusal;
+/// it can never return a grant. Legacy references may carry more operations than their open.
+fn file_for_mapping(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    options: FileMappingOptions,
+) -> ServiceResult<(File, bool)> {
+    let required = HandleOperations::MAP | HandleOperations::READ;
+    let (file, may_map) = match file(process, handle, required) {
+        Ok(file) => (file, true),
+        Err(BrokerError::InvalidRights) => (file(process, handle, HandleOperations::QUERY)?, false),
+        Err(error) => return Err(error),
+    };
+    let status = file.get_status_flags();
+    if status.flags.contains(FileOpenFlags::PATH) {
+        return Ok(Err(FileError::PathOnly));
+    }
+    if file.kind == FileType::RegularFile && options.end > options.max_regular_end {
+        return Ok(Err(FileError::InvalidOffset));
+    }
+    if status.access == FileAccessMode::WriteOnly {
+        return Ok(Err(FileError::NotForReading));
+    }
+    if options.require_write && status.access != FileAccessMode::ReadWrite {
+        return Ok(Err(FileError::NotForWriting));
+    }
+    if file.kind == FileType::Directory {
+        return Ok(Err(FileError::IsDirectory));
+    }
+    if !may_map || !file.operations.contains(required) {
+        return Err(BrokerError::InvalidRights);
+    }
+    let writable = file.operations.contains(HandleOperations::WRITE)
+        && process
+            .authorized_operation(handle, HandleOperations::WRITE)
+            .is_ok();
+    if options.require_write && !writable {
+        return Ok(Err(FileError::NotForWriting));
+    }
+    Ok(Ok((file, writable)))
 }
 
 fn file_for_read(
@@ -1225,13 +1271,8 @@ fn file_for_read(
     let required = match op {
         ReadOperation::Data => HandleOperations::READ,
         ReadOperation::Directory => HandleOperations::LIST,
-        ReadOperation::Mapping => HandleOperations::MAP | HandleOperations::READ,
     };
     match file(process, handle, required) {
-        // Legacy references can carry MAP even for a directory, a path-only open, or a
-        // write-only open. Check the open itself before authorizing a mapping fallback.
-        Ok(file) if matches!(op, ReadOperation::Mapping) && !file.operations.contains(required) => {
-        }
         Ok(file) => return Ok(Ok(file)),
         Err(BrokerError::InvalidRights) => {}
         Err(error) => return Err(error),
@@ -1242,11 +1283,6 @@ fn file_for_read(
     let status = file.get_status_flags();
     let path_only = status.flags.contains(FileOpenFlags::PATH);
     let error = match op {
-        ReadOperation::Mapping if path_only => FileError::PathOnly,
-        ReadOperation::Mapping if status.access == FileAccessMode::WriteOnly => {
-            FileError::NotForReading
-        }
-        ReadOperation::Mapping if file.kind == FileType::Directory => FileError::IsDirectory,
         ReadOperation::Data if !path_only && file.kind == FileType::Directory => FileError::NotFile,
         ReadOperation::Directory
             if !path_only

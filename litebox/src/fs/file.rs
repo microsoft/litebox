@@ -642,19 +642,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
 
     /// Asks the broker for the host shared object holding this file's contents, so that every
     /// process mapping it shares its pages. Each call delivers a new handle to the object, which
-    /// covers the file's bytes up to `end`.
+    /// covers the file's bytes up to `options.end`.
     ///
-    /// [`SharedObjectError::Unsupported`] means the reference permits a readable mapping, but
-    /// the pages cannot be shared. A caller may instead copy the contents through checked reads.
+    /// [`SharedObjectError::Unsupported`] means the request was admitted, but the pages cannot
+    /// be shared. A caller needing only a read-only mapping may copy through checked reads.
     pub fn request_shared_object<Provider, const ALIGN: usize>(
         &self,
         platform: &Provider,
-        end: u64,
+        options: super::FileMappingOptions,
     ) -> Result<SharedFileObject<Provider::SharedObject>, SharedObjectError>
     where
         Provider: crate::platform::SharedObjectProvider<ALIGN>,
     {
-        let response = self.broker.map_file(self.handle, end)??;
+        let response = self.broker.map_file(self.handle, options)??;
         // SAFETY: The broker delivered the object under this token before answering, and the
         // token goes nowhere else.
         let object = unsafe { platform.take_shared_object(response.token) }?;
@@ -934,6 +934,8 @@ impl From<FileError> for SharedObjectError {
             FileError::IsDirectory => Self::IsDirectory,
             FileError::PathOnly => Self::PathOnly,
             FileError::NotForReading | FileError::AccessNotAllowed => Self::NotForReading,
+            FileError::NotForWriting => Self::NotForWriting,
+            FileError::InvalidOffset => Self::RangeOverflow,
             FileError::NoSuchDevice => Self::Unsupported,
             FileError::NoSpace => Self::NoMemory,
             _ => Self::Io,

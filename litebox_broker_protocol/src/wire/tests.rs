@@ -406,7 +406,11 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::File(FileRequest::Map(MapFileRequest {
             handle,
-            end: 3 << 32 | 0x1000,
+            options: crate::fs::FileMappingOptions {
+                end: 3 << 32 | 0x1000,
+                max_regular_end: 1 << 48,
+                require_write: true,
+            },
         })),
         BrokerOperation::File(FileRequest::Mount(MountFileRequest {
             path: sequence(14, 9),

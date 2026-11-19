@@ -45,13 +45,14 @@ pub fn handle_map_file<Delivery: SharedObjectDelivery>(
     process: &BrokerProcess,
     operation: &BrokerOperation,
 ) -> Option<Result<BrokerResult, RequestFailure>> {
-    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle, end })) = *operation else {
+    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle, options })) = *operation
+    else {
         return None;
     };
-    let response = match litebox_broker_core::fs::map_shared(process, handle) {
+    let response = match litebox_broker_core::fs::map_shared(process, handle, options) {
         Err(error) => return Some(Err(RequestFailure::from(error))),
         Ok(Err(error)) => FileResponse::Failed(error),
-        Ok(Ok(mapping)) => match delivery.deliver(mapping.mapping(), end) {
+        Ok(Ok(mapping)) => match delivery.deliver(mapping.mapping(), options.end) {
             Ok(token) => FileResponse::Map(MapFileResponse {
                 memory: mapping.memory_id(),
                 token,

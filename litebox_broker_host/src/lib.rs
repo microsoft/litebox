@@ -1011,8 +1011,9 @@ fn handle_file_request<Memory: SharedMemory>(
         // Mapping needs a way to deliver the host shared object to the caller, which only a
         // deployment's request extension provides. Without one, files cannot be shared.
         FileRequest::Map(request) => {
-            let access = litebox_broker_core::fs::check_mapping(process, request.handle)
-                .map_err(RequestFailure::from)?;
+            let access =
+                litebox_broker_core::fs::check_mapping(process, request.handle, request.options)
+                    .map_err(RequestFailure::from)?;
             Ok(FileResponse::Failed(match access {
                 Ok(()) => FileError::NoSuchDevice,
                 Err(error) => error,

@@ -2122,6 +2122,8 @@ pub enum MappingError {
     NotAFile,
     #[error("file not open for reading")]
     NotForReading,
+    #[error("failed to populate mapping: {0}")]
+    FileRead(crate::errno::Errno),
     #[error("invalid memory permissions")]
     InvalidPermissions,
 

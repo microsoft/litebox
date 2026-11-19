@@ -3428,8 +3428,8 @@ mod tests {
     };
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::fs::{
-        FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags,
-        FileType, FileUser, SetStatusFlagsRequest,
+        FileAccessMode, FileError, FileMappingOptions, FileMode, FileOpenFlags, FileSeekWhence,
+        FileStatusFlags, FileType, FileUser, SetStatusFlagsRequest,
     };
     use litebox_broker_protocol::process::{
         ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
@@ -6056,7 +6056,10 @@ mod tests {
                 &*mapping.mapping().host_handle(0).unwrap(),
             )
         };
-        let mapping = crate::fs::map_shared(&source, file).unwrap().unwrap();
+        let options = FileMappingOptions::readable(0);
+        let mapping = crate::fs::map_shared(&source, file, options)
+            .unwrap()
+            .unwrap();
         assert!(mapping.writable());
         assert!(exported_writable(&mapping));
 
@@ -6066,7 +6069,9 @@ mod tests {
         let reader = source
             .duplicate_object_reference_to(file, &target, ObjectRights::WAIT)
             .unwrap();
-        let shared = crate::fs::map_shared(&target, reader).unwrap().unwrap();
+        let shared = crate::fs::map_shared(&target, reader, options)
+            .unwrap()
+            .unwrap();
         assert!(!shared.writable());
         assert!(!exported_writable(&shared));
         assert_eq!(shared.memory_id(), mapping.memory_id());
@@ -6075,7 +6080,7 @@ mod tests {
             .duplicate_object_reference_to(file, &target, ObjectRights::WRITE)
             .unwrap();
         assert_eq!(
-            crate::fs::map_shared(&target, writer).map(|_| ()),
+            crate::fs::map_shared(&target, writer, options).map(|_| ()),
             Err(BrokerError::InvalidRights)
         );
 
@@ -6128,7 +6133,7 @@ mod tests {
         );
         assert_eq!(
             source.check_readiness(file),
-            Err(BrokerError::InvalidRights)
+            Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
         );
         assert_eq!(
             crate::fs::open(

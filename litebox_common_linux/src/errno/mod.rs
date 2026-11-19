@@ -417,6 +417,7 @@ impl From<crate::vmem::MappingError> for Errno {
             // Linux has no `mmap` for directories.
             crate::vmem::MappingError::NotAFile => Errno::ENODEV,
             crate::vmem::MappingError::NotForReading => Errno::EACCES,
+            crate::vmem::MappingError::FileRead(error) => error,
             crate::vmem::MappingError::InvalidPermissions => Errno::EINVAL,
             crate::vmem::MappingError::MapError(e) => e.into(),
             crate::vmem::MappingError::ProtectError(e) => e.into(),
@@ -967,7 +968,9 @@ impl From<litebox::fs::errors::SharedObjectError> for Errno {
             | litebox::fs::errors::SharedObjectError::PathOnly => Errno::EBADF,
             litebox::fs::errors::SharedObjectError::IsDirectory
             | litebox::fs::errors::SharedObjectError::Unsupported => Errno::ENODEV,
-            litebox::fs::errors::SharedObjectError::NotForReading => Errno::EACCES,
+            litebox::fs::errors::SharedObjectError::NotForReading
+            | litebox::fs::errors::SharedObjectError::NotForWriting => Errno::EACCES,
+            litebox::fs::errors::SharedObjectError::RangeOverflow => Errno::EOVERFLOW,
             // `mmap` has no `EIO`; it reports a failure to set the mapping up as `ENOMEM`.
             litebox::fs::errors::SharedObjectError::NoMemory
             | litebox::fs::errors::SharedObjectError::Io => Errno::ENOMEM,

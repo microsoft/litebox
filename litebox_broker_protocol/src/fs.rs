@@ -555,14 +555,39 @@ wire_struct! {
 }
 
 wire_struct! {
+    /// Requirements on a file mapping, independent of how its storage is delivered.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FileMappingOptions {
+        /// Exclusive end of the range to map.
+        pub end: u64,
+        /// Largest exclusive end the caller can represent for a regular file.
+        pub max_regular_end: u64,
+        /// Refuse a mapping whose storage cannot be written through this reference.
+        pub require_write: bool,
+    }
+}
+
+impl FileMappingOptions {
+    /// Requests readable storage with no caller-imposed range limit.
+    #[must_use]
+    pub const fn readable(end: u64) -> Self {
+        Self {
+            end,
+            max_regular_end: u64::MAX,
+            require_write: false,
+        }
+    }
+}
+
+wire_struct! {
     /// Requests the host shared object holding an open regular file's contents, so that the caller
     /// can map it as a `MAP_SHARED` file mapping.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MapFileRequest {
         /// Broker-owned file handle.
         pub handle: ObjectHandle,
-        /// Exclusive end, which may lie past the end of the file.
-        pub end: u64,
+        /// Range and access required by the caller.
+        pub options: FileMappingOptions,
     }
 }
 

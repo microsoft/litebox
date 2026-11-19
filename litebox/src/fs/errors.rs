@@ -152,6 +152,10 @@ pub enum SharedObjectError {
     IsDirectory,
     #[error("file is not opened for reading")]
     NotForReading,
+    #[error("file mapping does not permit writing")]
+    NotForWriting,
+    #[error("regular file mapping exceeds the caller's range limit")]
+    RangeOverflow,
     #[error("this platform or file system cannot share the file's pages")]
     Unsupported,
     #[error("out of host shared memory")]
