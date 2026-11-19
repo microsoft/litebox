@@ -671,7 +671,9 @@ wire_struct! {
 }
 
 wire_struct! {
-    /// Reads the current physical absolute path of a directory, or the name of a file as opened.
+    /// Reads the current physical absolute path of a directory (or, where the backend cannot
+    /// name it, the name it was opened by), or the name of a file as opened. A removed directory
+    /// fails with [`FileError::NoSuchFileOrDirectory`].
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct HandleFilePathRequest {
         /// Broker-owned file handle.

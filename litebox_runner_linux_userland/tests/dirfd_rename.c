@@ -23,15 +23,28 @@ static void test_search_permission(const char *tmp) {
     TEST_ASSERT(close(parent) == 0 && chmod("..", 0700) == 0 && chdir(tmp) == 0,
                 "restore ancestor");
 
+    int perm = open("perm", O_PATH | O_DIRECTORY);
+    TEST_ASSERT(perm >= 0, "open perm");
     TEST_ASSERT(chmod("perm/child", 0) == 0, "deny search on start");
     expect_errno(openat(fd, "..", O_PATH | O_DIRECTORY), EACCES, "dot-dot without search");
     expect_errno(fstatat(fd, ".", &st, 0), EACCES, "dot without search");
-    TEST_ASSERT(chmod("perm/child", 0700) == 0 && close(fd) == 0 && rmdir("perm/child") == 0 &&
+    expect_errno(openat(fd, "new", O_CREAT | O_WRONLY, 0600), EACCES, "create without search");
+    expect_errno(mkdirat(perm, "child/new", 0700), EACCES, "mkdir below unsearchable directory");
+    TEST_ASSERT(chmod("perm/child", 0700) == 0, "restore search on start");
+    expect_errno(fstatat(fd, "new", &st, 0), ENOENT, "denied creation left no file");
+    TEST_ASSERT(close(perm) == 0 && close(fd) == 0 && rmdir("perm/child") == 0 &&
                 rmdir("perm") == 0, "cleanup perm tree");
 }
 
-int main(void) {
-    char tmp[] = "/tmp/lb-dirfd-XXXXXX";
+// Usage: dirfd_rename [base-directory [no-symlinks]]. The working directory is created under
+// `base-directory` (default `/tmp`); `no-symlinks` skips the steps that create symlinks, for
+// filesystems that cannot create them.
+int main(int argc, char **argv) {
+    const char *base = argc > 1 ? argv[1] : "/tmp";
+    int symlinks = !(argc > 2 && strcmp(argv[2], "no-symlinks") == 0);
+    char tmp[64];
+    TEST_ASSERT(snprintf(tmp, sizeof(tmp), "%s/lb-dirfd-XXXXXX", base) < (int)sizeof(tmp),
+                "base directory name is short");
     TEST_ASSERT(mkdtemp(tmp) != NULL && chdir(tmp) == 0, "create working directory");
     test_search_permission(tmp);
     TEST_ASSERT(mkdir("old", 0700) == 0 && mkdir("old/sub", 0700) == 0, "create subtree");
@@ -58,9 +71,16 @@ int main(void) {
 
     int replaced = open("old/sub", O_RDONLY | O_DIRECTORY);
     TEST_ASSERT(replaced >= 0, "open rename destination");
-    TEST_ASSERT(symlinkat("../marker", fd, "link") == 0, "create relative symlink");
+    // Without symlinks, a regular file stands in for the link so the renames still run.
+    if (symlinks) {
+        TEST_ASSERT(symlinkat("../marker", fd, "link") == 0, "create relative symlink");
+    } else {
+        create_test_file("new/sub/link", 0600);
+    }
     create_test_file("old/marker", 0600);
-    expect_errno(fstatat(fd, "link", &st, 0), ENOENT, "link does not resolve in replacement");
+    if (symlinks) {
+        expect_errno(fstatat(fd, "link", &st, 0), ENOENT, "link does not resolve in replacement");
+    }
     TEST_ASSERT(rename("new/sub", "old/sub") == 0, "move open directory over replacement");
     TEST_ASSERT(fstatat(fd, "link", &st, 0) == 0, "relative link follows new parent");
     expect_errno(fstatat(replaced, "original", &st, 0), ENOENT, "replaced fd stays detached");
@@ -82,6 +102,21 @@ int main(void) {
                 "remove entries through moved directory fd");
     TEST_ASSERT(rmdir("old/sub") == 0 && mkdir("old/sub", 0700) == 0, "replace removed directory");
     expect_errno(mkdirat(fd, "absent", 0700), ENOENT, "cannot create in removed directory");
+    expect_errno(openat(fd, "absent", O_CREAT | O_WRONLY, 0600), ENOENT,
+                 "cannot create file in removed directory");
+    if (symlinks) {
+        expect_errno(symlinkat("target", fd, "absent"), ENOENT,
+                     "cannot create symlink in removed directory");
+    }
+    create_test_file("new/source", 0600);
+    int live = open("new", O_PATH | O_DIRECTORY);
+    TEST_ASSERT(live >= 0, "open live directory");
+    expect_errno(renameat(live, "source", fd, "absent"), ENOENT,
+                 "cannot rename into removed directory");
+    expect_errno(renameat(AT_FDCWD, "new/source", fd, "absent"), ENOENT,
+                 "cannot rename from cwd into removed directory");
+    TEST_ASSERT(fstatat(live, "source", &st, 0) == 0 && unlinkat(live, "source", 0) == 0 &&
+                close(live) == 0, "rename source is untouched");
     TEST_ASSERT(close(fd) == 0 && rmdir("old/sub") == 0 && rmdir("old") == 0 &&
                 rmdir("new") == 0 && chdir("/") == 0 && rmdir(tmp) == 0, "cleanup");
     puts("All directory fd rename tests passed.");

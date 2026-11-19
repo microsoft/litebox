@@ -822,7 +822,7 @@ fn direct_backend_mutations_and_flags() {
     };
     let dir = local.open_dir(dir, OFlags::PATH).unwrap();
     assert!(local.status(HandleRef::Dir(&dir)).is_ok());
-    assert!(local.walking_dir_at(&dir).is_some());
+    assert!(local.walking_dir_at(&dir).is_ok());
     local.unlink_at(local.root().unwrap(), "new").unwrap();
     local.rmdir_at(local.root().unwrap(), "dir").unwrap();
     assert!(!temp.path().join("new").exists());
@@ -1113,7 +1113,7 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
     );
     let foreign = first.open_dir(first.root().unwrap(), OFlags::PATH).unwrap();
     assert!(second.list_dir_at(foreign.clone()).is_err());
-    assert!(second.walking_dir_at(&foreign).is_none());
+    assert!(second.walking_dir_at(&foreign).is_err());
     assert!(second.unlink_at(first.root().unwrap(), "f").is_err());
     assert_eq!(fs::read(a.path().join("f")).unwrap(), b"one");
     let file = first
@@ -1317,4 +1317,43 @@ fn symlinks_are_bounded_when_windows_allows_test_symlink_creation() {
     local.unlink(USER, "/inside_link").unwrap();
     assert!(fs::symlink_metadata(root.join("inside_link")).is_err());
     assert_eq!(fs::read(root.join("target")).unwrap(), b"inside");
+}
+
+#[cfg(unix)]
+#[test]
+fn held_directory_moved_under_a_nested_mount_by_the_host_has_no_name() {
+    use litebox_broker_core::fs::in_mem::InMem;
+
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("x")).unwrap();
+    // The nested mount covers the host's `n`, as a Linux mount point would.
+    fs::create_dir(temp.path().join("n")).unwrap();
+    let composer = Composer::<TestPlatform>::builder()
+        .try_mount("/m", |ids| LocalFs::new(temp.path(), ids))
+        .unwrap()
+        .mount("/m/n", InMem::<TestPlatform>::new)
+        .build()
+        .unwrap();
+    let resolver: Resolver<TestPlatform, _> = Resolver::new(composer);
+    let x = resolver
+        .open(
+            USER,
+            "/m/x",
+            OFlags::PATH | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap();
+    assert_eq!(resolver.handle_path(&x).unwrap(), "/m/x");
+
+    // A host rename that stays visible through the mount is followed.
+    fs::rename(temp.path().join("x"), temp.path().join("y")).unwrap();
+    assert_eq!(resolver.handle_path(&x).unwrap(), "/m/y");
+
+    // Under the nested mount, `/m/n/x` names the in-memory backend instead, so the held directory
+    // is unreachable by any path.
+    fs::rename(temp.path().join("y"), temp.path().join("n").join("x")).unwrap();
+    assert!(matches!(
+        resolver.handle_path(&x),
+        Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+    ));
 }

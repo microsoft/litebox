@@ -249,6 +249,32 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
+    /// The LiteBox file behind `fd`, failing with `ENOTDIR` for other kinds of descriptor.
+    pub(crate) fn file_of(
+        &self,
+        fd: &AnyTypedFd<Platform>,
+    ) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
+        self.with_file(fd.file_only(Errno::ENOTDIR)?, |file| {
+            Ok(Arc::clone(file.file()))
+        })
+    }
+
+    /// Opens the directory at the absolute `path` for path-only use, such as a working directory.
+    pub(crate) fn open_path_dir(
+        &self,
+        context: &litebox::fs::Context,
+        path: &str,
+    ) -> Result<litebox::fs::File<Platform>, Errno> {
+        Ok(self.litebox.open_file(
+            context,
+            None,
+            path,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+            Mode::empty(),
+        )?)
+    }
+
     /// Adopts a file this process inherited from its parent as `handle`.
     pub(crate) fn adopt_inherited_file(
         &self,
@@ -800,6 +826,15 @@ struct LookupPath<Platform: ShimPlatform> {
     path: String,
 }
 
+/// `path` named under the directory named `dir`.
+fn name_under(mut dir: String, path: &str) -> String {
+    if !dir.ends_with('/') {
+        dir.push('/');
+    }
+    dir.push_str(path);
+    dir
+}
+
 /// Maximum size of a file path
 pub const PATH_MAX: usize = 4096;
 
@@ -1020,14 +1055,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if let Some(dir) = fs.cwd_handle() {
             return Ok(dir);
         }
-        let dir = self.global.litebox.open_file(
-            &fs.context.read(),
-            None,
-            "/",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
-            Mode::empty(),
-        )?;
+        let dir = self.global.open_path_dir(&fs.context.read(), "/")?;
         Ok(fs.pin_cwd(Arc::new(dir)))
     }
 
@@ -1036,13 +1064,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(self.pinned_cwd_dir()?.path()?)
     }
 
-    /// The file a dirfd refers to. Whether it is a directory is checked by its consumer.
+    /// The file a dirfd refers to, which need not be a directory.
     fn file_for_dirfd(&self, fd: i32) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
-        let fd = self.typed_fd(fd)?;
-        self.global
-            .with_file(fd.file_only(Errno::ENOTDIR)?, |file| {
-                Ok(Arc::clone(&file.file))
-            })
+        self.global.file_of(&self.typed_fd(fd)?)
     }
 
     fn lookup_relative(&self, fd: i32, path: String) -> Result<LookupPath<Platform>, Errno> {
@@ -1057,20 +1081,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
         })
     }
 
-    /// The absolute name of a relative lookup that lexically spells a `/proc/self/fd/` entry,
-    /// which an absolute path would reach through [`Self::proc_self_fd`].
-    fn proc_self_fd_name(&self, path: &LookupPath<Platform>) -> Option<String> {
-        let dir = path.dir.as_deref()?;
-        // Only these paths can complete the prefix, so others skip the broker round trip.
-        if !path.path.contains("fd/") {
-            return None;
+    /// Rewrites a relative lookup that lexically spells a `/proc/self/fd/` entry to its absolute
+    /// name, which [`Self::proc_self_fd`] then reaches as an absolute path would.
+    fn spell_proc_self_fd(&self, path: LookupPath<Platform>) -> LookupPath<Platform> {
+        // Skip the broker round trip unless `path` itself spells `fd/`; this assumes no directory
+        // named `/proc/self/fd` (or below it) exists.
+        let Some(dir) = path.dir.as_deref().filter(|_| path.path.contains("fd/")) else {
+            return path;
+        };
+        match dir.path() {
+            Ok(dir) => {
+                let name = name_under(dir, &path.path);
+                if name.starts_with("/proc/self/fd/") {
+                    return LookupPath {
+                        dir: None,
+                        path: name,
+                    };
+                }
+                path
+            }
+            Err(_) => path,
         }
-        let mut name = dir.path().ok()?;
-        if !name.ends_with('/') {
-            name.push('/');
-        }
-        name.push_str(&path.path);
-        name.starts_with("/proc/self/fd/").then_some(name)
     }
 
     /// Names a path for interfaces that require an absolute name, querying the broker for the
@@ -1083,12 +1114,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let path = if path.starts_with('/') {
             String::from(path)
         } else {
-            let mut cwd = self.query_cwd_name()?;
-            if !cwd.ends_with('/') {
-                cwd.push('/');
-            }
-            cwd.push_str(path);
-            cwd
+            name_under(self.query_cwd_name()?, path)
         };
         if path.contains('\0') {
             return Err(Errno::EINVAL);
@@ -1398,7 +1424,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             FsPath::FdRelative { fd, path } => self.lookup_relative(fd, path)?,
         };
         let user = self.fs.borrow().context.read().acting_user();
-        // Like fchmodat, path forms resolve in the shim; the broker only sets times by handle.
+        // The broker only sets times by handle, so path forms first open an `O_PATH` handle.
         let flags = if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
             OFlags::PATH | OFlags::NOFOLLOW
         } else {
@@ -2547,11 +2573,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: &str,
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
-        let pathname = self.lookup_path_at(dirfd, pathname)?;
-        let path = match self.proc_self_fd_name(&pathname) {
-            Some(name) => self.do_readlink(None, &name)?,
-            None => self.do_readlink(pathname.dir.as_deref(), &pathname.path)?,
-        };
+        let pathname = self.spell_proc_self_fd(self.lookup_path_at(dirfd, pathname)?);
+        let path = self.do_readlink(pathname.dir.as_deref(), &pathname.path)?;
         let bytes = path.as_bytes();
         let min_len = core::cmp::min(buf.len(), bytes.len());
         buf[..min_len].copy_from_slice(&bytes[..min_len]);
@@ -2713,11 +2736,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
             FsPath::FdRelative { fd, path } => {
-                let path = self.lookup_relative(fd, path)?;
-                match self.proc_self_fd_name(&path) {
-                    Some(name) => self.do_path_stat(None, &name, follow_symlink),
-                    None => self.do_path_stat(path.dir.as_deref(), &path.path, follow_symlink),
-                }
+                let path = self.spell_proc_self_fd(self.lookup_relative(fd, path)?);
+                self.do_path_stat(path.dir.as_deref(), &path.path, follow_symlink)
             }
         }
     }

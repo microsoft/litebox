@@ -174,8 +174,8 @@ pub struct NinePDirHandle<
     Platform: sync::RawSyncPrimitivesProvider,
     T: transport::Read + transport::Write,
 > {
-    // Twalk requires an unopened fid, even for directories opened for reading.
     fid: Arc<OwnedFid<Platform, T>>,
+    /// Opened clone used for `Treaddir`; `fid` stays unopened because Twalk requires that.
     reader: Option<Arc<OwnedFid<Platform, T>>>,
 }
 impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write> Clone
@@ -344,8 +344,8 @@ where
         }))
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
-        Some(ResolvedDir::from_typed::<Self>(
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError> {
+        Ok(ResolvedDir::from_typed::<Self>(
             NinePWalkingDirHandle {
                 fid: Arc::clone(&dir.get_typed::<Self>().fid),
             },
@@ -424,6 +424,19 @@ where
         let entries = self
             .client
             .readdir_all(&handle.reader.as_ref().unwrap_or(&handle.fid).fid)?;
+        // Servers may list a removed directory as empty (glibc's readdir hides the ENOENT that
+        // Linux reports), and only an empty directory can be removed, so check its link count.
+        if entries
+            .iter()
+            .all(|entry| matches!(&*entry.name, b"." | b".."))
+        {
+            let attr = self
+                .client
+                .getattr(&handle.fid.fid, fcall::GetattrMask::NLINK)?;
+            if attr.valid.contains(fcall::GetattrMask::NLINK) && attr.stat.nlink == 0 {
+                return Err(ReadDirError::Removed);
+            }
+        }
         Ok(entries
             .into_iter()
             .filter(|entry| {

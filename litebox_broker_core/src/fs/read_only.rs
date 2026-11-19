@@ -19,8 +19,9 @@ use alloc::vec::Vec;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
-    Backend, CreationMetadata, DirHandle, FileHandle, FileTerminal, HandleRef, PermissionCheck,
-    PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+    Backend, CreationMetadata, DirHandle, DirPath, FileHandle, FileTerminal, HandleRef,
+    PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
+    SeekBehavior,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, ReadDirError,
@@ -62,18 +63,6 @@ fn read_only_flags(flags: OFlags) -> Result<OFlags, OpenError> {
 }
 
 impl<B: Backend> Backend for ReadOnly<B> {
-    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
-        self.inner.check_search(dir)
-    }
-
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
-        self.inner.dir_path(dir)
-    }
-
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
-        self.inner.parent_dir(dir)
-    }
-
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         let mut dir = self.inner.root()?;
         mark_read_only(&mut dir.permissions);
@@ -105,10 +94,31 @@ impl<B: Backend> Backend for ReadOnly<B> {
         self.inner.open_dir(dir, read_only_flags(flags)?)
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError> {
         let mut dir = self.inner.walking_dir_at(dir)?;
         mark_read_only(&mut dir.permissions);
-        Some(dir)
+        Ok(dir)
+    }
+
+    fn walking_dir_with_path<'a>(
+        &'a self,
+        dir: &DirHandle,
+    ) -> Result<(ResolvedDir<'a>, DirPath), WalkError> {
+        let (mut dir, path) = self.inner.walking_dir_with_path(dir)?;
+        mark_read_only(&mut dir.permissions);
+        Ok((dir, path))
+    }
+
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+        self.inner.dir_path(dir)
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        self.inner.parent_dir(dir)
+    }
+
+    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        self.inner.check_search(dir)
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {

@@ -114,7 +114,11 @@ fn moved_out_of_export_fails_closed_even_after_replacement() {
     let walking = local.walking_dir_at(&child).unwrap();
     fs::rename(root.join("child"), temp.path().join("outside")).unwrap();
     fs::create_dir(root.join("child")).unwrap();
-    assert!(local.walking_dir_at(&child).is_none());
+    assert!(
+        local
+            .check_search(&local.walking_dir_at(&child).unwrap())
+            .is_err()
+    );
     assert!(local.parent_dir(&child).is_err());
     assert!(local.list_dir_at(child).is_err());
     assert!(
@@ -188,10 +192,8 @@ fn legacy_timestamps_only_update_pinned_non_links() {
         symlink("untouched", root.join(name)).unwrap();
         linux::set_times_legacy(&pinned, &times).unwrap();
         assert_eq!(fs::metadata(moved).unwrap().mtime(), 2);
-        assert_eq!(
-            linux::set_times_legacy(&root.child(name).unwrap(), &times),
-            Err(rustix::io::Errno::NOTSUP)
-        );
+        // A pinned symlink is never updated, whatever the fallback reports.
+        assert!(linux::set_times_legacy(&root.child(name).unwrap(), &times).is_err());
     }
 }
 

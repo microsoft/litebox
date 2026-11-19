@@ -222,7 +222,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(MkdirError::from)
     }
 
-    /// Mount a fresh in-memory filesystem at a directory path.
+    /// Mount a fresh in-memory filesystem at an absolute directory path.
     pub fn mount_in_mem(&self, context: &Context, path: &str) -> Result<(), FileError> {
         let broker = self.broker_control().ok_or(FileError::Io)?;
         // Mounting names an absolute path.

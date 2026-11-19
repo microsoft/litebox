@@ -1200,3 +1200,74 @@ fn nine_p_held_directories_name_and_walk() {
         fs.file_status(USER, "/d", true).unwrap().node_info
     );
 }
+
+#[test]
+fn nine_p_held_directory_search_is_checked_by_the_server() {
+    use crate::fs::errors::PathError;
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = DiodServer::start();
+    let fs = connect_9p(&server);
+    let host = server.export_path().join("d");
+    std::fs::create_dir(&host).unwrap();
+    let d = fs
+        .open(USER, "/d", OFlags::PATH | OFlags::DIRECTORY, Mode::empty())
+        .unwrap();
+    assert!(fs.file_status_at(USER, Some(&d), ".", true).is_ok());
+
+    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // The server enforces its own credentials, so match what the host allows: an unprivileged
+    // server is refused, as Linux refuses `fstatat(fd, ".")`/`openat(fd, "..")` without search.
+    let host_allows_search = std::fs::metadata(host.join(".")).is_ok();
+    let status = fs.file_status_at(USER, Some(&d), ".", true);
+    let parent = fs.open_at(USER, Some(&d), "..", OFlags::PATH, Mode::empty());
+    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    if host_allows_search {
+        assert!(status.is_ok());
+        assert!(parent.is_ok());
+    } else {
+        assert!(matches!(
+            status,
+            Err(FileStatusError::PathError(PathError::NoSearchPerms))
+        ));
+        assert!(matches!(
+            parent,
+            Err(OpenError::PathError(PathError::NoSearchPerms))
+        ));
+    }
+    // Restoring search permission makes the held directory walkable again.
+    assert!(fs.file_status_at(USER, Some(&d), ".", true).is_ok());
+    let parent = fs
+        .open_at(USER, Some(&d), "..", OFlags::PATH, Mode::empty())
+        .unwrap();
+    assert_eq!(fs.handle_path(&parent).unwrap(), "/");
+}
+
+#[test]
+fn nine_p_removed_held_directory_has_no_name() {
+    use crate::fs::errors::{PathError, WalkError};
+
+    let server = DiodServer::start();
+    let fs = connect_9p(&server);
+    fs.mkdir(USER, "/gone", Mode::RWXU).unwrap();
+    let held = [OFlags::RDONLY, OFlags::PATH].map(|flags| {
+        fs.open(USER, "/gone", flags | OFlags::DIRECTORY, Mode::empty())
+            .unwrap()
+    });
+    for gone in &held {
+        assert_eq!(fs.handle_path(gone).unwrap(), "/gone");
+    }
+
+    fs.rmdir(USER, "/gone").unwrap();
+
+    // Like Linux, an unlinked directory has no name, rather than the name it was opened by.
+    for gone in &held {
+        assert!(matches!(
+            fs.handle_path(gone),
+            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+    }
+    // Linux: getdents64 on a removed directory fails with ENOENT (probed natively).
+    assert!(matches!(fs.read_dir(&held[0]), Err(ReadDirError::Removed)));
+}

@@ -2078,7 +2078,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         )?;
         let value_name = crate::nt_types::read_unicode_string::<Platform>(value_name)?;
         let value = key.with_entry(|key| {
-            // TODO: Open the value relative to `key.fd` once the FS has an openat-style API.
+            // TODO: Open the value relative to `key.fd` by passing it as `LiteBox::open_file`'s `dir`.
             self.global
                 .registry
                 .read_value_at_path(&key.path, &value_name)

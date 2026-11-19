@@ -63,6 +63,9 @@ pub enum SeekBehavior {
     PositionBased,
 }
 
+/// The result of [`Backend::dir_path`].
+pub type DirPath = Result<Option<Vec<String>>, WalkError>;
+
 /// A backend that can be used to support a (full or subset of) a LiteBox filesystem.
 pub trait Backend: Send + Sync + Any {
     /// Resolve the root directory.
@@ -99,12 +102,20 @@ pub trait Backend: Send + Sync + Any {
     /// Obtain a resolved directory from an existing owned directory handle, without opening it.
     ///
     /// Walk the directory the handle refers to, even if it has been renamed. If the backend
-    /// can no longer walk that directory (for example, because a network handle is stale),
-    /// return `None` rather than using a different directory now at the original path.
-    ///
-    /// XXX(jayb): We will likely migrate away from `Option` here when we do a bit of an overhaul of
-    /// the `errors` module in order to more consistently support stale errors everywhere.
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>>;
+    /// can no longer walk that directory (for example, because a network handle is stale), fail
+    /// with [`super::errors::PathError::NoSuchFileOrDirectory`] rather than using a different
+    /// directory now at the original path; other failures report [`WalkError::Io`].
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError>;
+
+    /// [`Self::walking_dir_at`] together with [`Self::dir_path`], both taken from one snapshot
+    /// of the directory's location where the backend can provide that.
+    fn walking_dir_with_path<'a>(
+        &'a self,
+        dir: &DirHandle,
+    ) -> Result<(ResolvedDir<'a>, DirPath), WalkError> {
+        let path = self.dir_path(dir);
+        Ok((self.walking_dir_at(dir)?, path))
+    }
 
     /// Current physical name, as components relative to this backend's root (empty at root).
     /// Use the directory identity without requiring permission to search or list ancestors.
@@ -118,7 +129,8 @@ pub trait Backend: Send + Sync + Any {
     /// Implementations must not follow `..` beyond their exported subtree.
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError>;
 
-    /// Check search permission on `dir`.
+    /// Check the caller's search permission on `dir`. Called only for directories reporting
+    /// [`PermissionCheck::ByBackend`].
     fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError>;
 
     /// Open the already-resolved file after resolver authorization, validating `flags`.
@@ -253,7 +265,8 @@ pub trait Backend: Send + Sync + Any {
 
     /// Atomically move an entry, replacing a compatible destination without following final
     /// symbolic links. Backends must reject directory cycles and preserve open file contents.
-    /// Directory handles retain the backend's documented object or path-locator semantics.
+    /// Directory handles keep referring to the same directories across the rename (see
+    /// [`Self::walking_dir_at`]).
     fn rename_at(
         &self,
         old_dir: DirHandle,

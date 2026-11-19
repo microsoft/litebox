@@ -312,7 +312,7 @@ where
         controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
     ) -> ServiceResult<File> {
         let flags = open_flags(access, flags)?;
-        let entry = match self.open_with_controlling_terminal_at(
+        let entry = match self.open_with_controlling_terminal(
             user,
             self.directory_entry(directory)?.as_ref(),
             path,
@@ -692,7 +692,7 @@ where
 }
 
 /// Opens a path and installs its broker-owned open state in `process`, resolving a relative
-/// `path` from `directory`. With no directory, `path` must be absolute.
+/// `path` from `directory`. `directory` must be given exactly when `path` is relative.
 ///
 /// If reads or writes of the file can fail with [`BrokerError::WouldBlock`], the new reference
 /// publishes the file's readiness through `readiness_sink`. A file that refers to the opener's
@@ -951,7 +951,7 @@ pub fn terminal_control(
 }
 
 /// Returns status for a path, resolving a relative `path` from `directory`.
-/// With no directory, `path` must be absolute.
+/// `directory` must be given exactly when `path` is relative.
 pub fn path_status(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -966,7 +966,7 @@ pub fn path_status(
 }
 
 /// Reads the target of a symbolic link, resolving a relative `path` from `directory`.
-/// With no directory, `path` must be absolute.
+/// `directory` must be given exactly when `path` is relative.
 pub fn read_link(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -992,7 +992,7 @@ pub fn set_times(
 }
 
 /// Changes mode bits, resolving a relative `path` from `directory`.
-/// With no directory, `path` must be absolute.
+/// `directory` must be given exactly when `path` is relative.
 pub fn chmod(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -1007,7 +1007,7 @@ pub fn chmod(
 }
 
 /// Changes ownership, resolving a relative `path` from `directory`.
-/// With no directory, `path` must be absolute.
+/// `directory` must be given exactly when `path` is relative.
 pub fn chown(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -1023,7 +1023,7 @@ pub fn chown(
 }
 
 /// Removes a file, resolving a relative `path` from `directory`.
-/// With no directory, `path` must be absolute.
+/// `directory` must be given exactly when `path` is relative.
 pub fn unlink(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -1036,8 +1036,8 @@ pub fn unlink(
     })
 }
 
-/// Renames a file or directory. Each relative path resolves from its own optional directory;
-/// a path with no directory must be absolute.
+/// Renames a file or directory. Each relative path resolves from its own directory; each path
+/// must have a directory exactly when it is relative.
 pub fn rename(
     process: &BrokerProcess,
     old_directory: Option<ObjectHandle>,
@@ -1057,7 +1057,7 @@ pub fn rename(
 }
 
 /// Creates a directory, resolving a relative `path` from `directory`.
-/// With no directory, `path` must be absolute.
+/// `directory` must be given exactly when `path` is relative.
 pub fn mkdir(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
@@ -1081,7 +1081,7 @@ pub fn mount_in_mem(process: &BrokerProcess, path: &str, user: FileUser) -> Resu
 }
 
 /// Creates a symbolic link storing `target` without resolving it, resolving a relative
-/// `linkpath` from `directory`. With no directory, `linkpath` must be absolute.
+/// `linkpath` from `directory`. `directory` must be given exactly when `linkpath` is relative.
 pub fn symlink(
     process: &BrokerProcess,
     target: &str,
@@ -1096,7 +1096,7 @@ pub fn symlink(
 }
 
 /// Removes a directory, resolving a relative `path` from `directory`.
-/// With no directory, `path` must be absolute.
+/// `directory` must be given exactly when `path` is relative.
 pub fn rmdir(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,

@@ -4,7 +4,12 @@
 //! Guest descriptor namespace and LiteBox file operations.
 
 use crate::{ShimPlatform, Task};
-use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicU32, Ordering};
 use litebox::{
     LiteBox,
@@ -101,24 +106,6 @@ pub(super) fn from_cwd(path: &str) -> Cow<'_, str> {
     } else {
         Cow::Owned(alloc::format!("/{path}"))
     }
-}
-
-/// `path` relative to the root, which is every guest's working directory,
-/// with `.` and `..` components resolved lexically.
-fn absolute_path(path: &str) -> String {
-    let mut components: Vec<&str> = Vec::new();
-    for component in path.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                components.pop();
-            }
-            component => components.push(component),
-        }
-    }
-    let mut absolute = String::from("/");
-    absolute.push_str(&components.join("/"));
-    absolute
 }
 
 pub(crate) struct FilesState<P: ShimPlatform> {
@@ -371,7 +358,7 @@ impl<P: ShimPlatform> Task<P> {
         let mut descriptors = self.global.litebox.descriptor_table_mut();
         let fd = descriptors.insert::<FileSubsystem<P>>(File {
             description: Arc::new(file),
-            opened_path: Some(Arc::from(absolute_path(path))),
+            opened_path: Some(Arc::from(litebox::fs::ResolvedPath::new(path).to_string())),
             xnu_status: Arc::new(AtomicU32::new(0)),
         });
         if flags.contains(OpenFlags::CLOEXEC) {

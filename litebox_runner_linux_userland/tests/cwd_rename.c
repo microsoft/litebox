@@ -11,8 +11,15 @@ static void *enter_parent(void *unused) {
     return NULL;
 }
 
-int main(void) {
-    char tmp[] = "/tmp/lb-cwd-XXXXXX";
+// Usage: cwd_rename [base-directory [no-symlinks]]. The working directory is created under
+// `base-directory` (default `/tmp`); `no-symlinks` skips the steps that create symlinks, for
+// filesystems that cannot create them.
+int main(int argc, char **argv) {
+    const char *base = argc > 1 ? argv[1] : "/tmp";
+    int symlinks = !(argc > 2 && strcmp(argv[2], "no-symlinks") == 0);
+    char tmp[64];
+    TEST_ASSERT(snprintf(tmp, sizeof(tmp), "%s/lb-cwd-XXXXXX", base) < (int)sizeof(tmp),
+                "base directory name is short");
     TEST_ASSERT(mkdtemp(tmp) && chdir(tmp) == 0, "enter temporary directory");
     int root = open(".", O_PATH | O_DIRECTORY);
     TEST_ASSERT(root >= 0 && mkdir("a", 0700) == 0 && mkdir("a/sub", 0700) == 0, "setup");
@@ -44,10 +51,13 @@ int main(void) {
                 unlinkat(root, "b/sub/rel.sock", 0) == 0, "remove socket");
     TEST_ASSERT(mkdir("created", 0700) == 0 && unlinkat(root, "b/sub/created", AT_REMOVEDIR) == 0,
                 "relative creation targets original cwd");
-    TEST_ASSERT(symlink("../..", "up") == 0 && chdir("up") == 0,
-                "follow relative symlink from renamed cwd");
-    TEST_ASSERT(getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, tmp), "symlink reaches real ancestor");
-    TEST_ASSERT(unlinkat(root, "b/sub/up", 0) == 0, "remove relative symlink");
+    if (symlinks) {
+        TEST_ASSERT(symlink("../..", "up") == 0 && chdir("up") == 0,
+                    "follow relative symlink from renamed cwd");
+        TEST_ASSERT(getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, tmp),
+                    "symlink reaches real ancestor");
+        TEST_ASSERT(unlinkat(root, "b/sub/up", 0) == 0, "remove relative symlink");
+    }
     TEST_ASSERT(fchdir(root) == 0 && fchdir(sub) == 0, "enter renamed fd");
     TEST_ASSERT(unlinkat(root, "b/sub", AT_REMOVEDIR) == 0, "remove cwd");
     char link[64], target[4096];

@@ -107,35 +107,6 @@ impl super::backend::BackendHandles for TarRo {
 }
 
 impl super::backend::Backend for TarRo {
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
-        let mut child = dir.get_typed::<Self>().idx;
-        let mut path = Vec::new();
-        while let Some(parent) = self.tar_index.dirs[child].parent {
-            let name = self.tar_index.dirs[parent]
-                .children
-                .iter()
-                .find_map(|(name, node)| {
-                    matches!(node, IndexedChild::Dir(idx) if *idx == child).then(|| name.clone())
-                })
-                .ok_or(WalkError::Io)?;
-            path.push(name);
-            child = parent;
-        }
-        path.reverse();
-        Ok(Some(path))
-    }
-
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
-        Ok(self.tar_index.dirs[dir.get_typed::<Self>().idx]
-            .parent
-            .map(|idx| DirHandle::from_typed::<Self>(TarRoDirHandle { idx })))
-    }
-
-    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
-        // Search permissions are enforced by the resolver.
-        Ok(())
-    }
-
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(self.resolved_dir(TarRoDirHandle { idx: 0 }))
     }
@@ -211,8 +182,37 @@ impl super::backend::Backend for TarRo {
         Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
-        Some(self.resolved_dir(dir.get_typed::<Self>().clone()))
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError> {
+        Ok(self.resolved_dir(dir.get_typed::<Self>().clone()))
+    }
+
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+        let mut child = dir.get_typed::<Self>().idx;
+        let mut path = Vec::new();
+        while let Some(parent) = self.tar_index.dirs[child].parent {
+            let name = self.tar_index.dirs[parent]
+                .children
+                .iter()
+                .find_map(|(name, node)| {
+                    matches!(node, IndexedChild::Dir(idx) if *idx == child).then(|| name.clone())
+                })
+                .ok_or(WalkError::Io)?;
+            path.push(name);
+            child = parent;
+        }
+        path.reverse();
+        Ok(Some(path))
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        Ok(self.tar_index.dirs[dir.get_typed::<Self>().idx]
+            .parent
+            .map(|idx| DirHandle::from_typed::<Self>(TarRoDirHandle { idx })))
+    }
+
+    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        // Search permissions are enforced by the resolver.
+        Ok(())
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {

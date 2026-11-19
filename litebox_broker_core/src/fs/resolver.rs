@@ -512,10 +512,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     fn walk_start(&self, anchor: Option<&WalkAnchor>) -> Result<ResolvedDir<'_>, WalkError> {
         match anchor {
             None => self.backend.root(),
-            Some(anchor) => self
-                .backend
-                .walking_dir_at(&anchor.dir)
-                .ok_or_else(|| PathError::NoSuchFileOrDirectory.into()),
+            Some(anchor) => self.backend.walking_dir_at(&anchor.dir),
         }
     }
 
@@ -601,10 +598,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         flags: OFlags,
         mode: Mode,
     ) -> Result<ResolverEntry<Backend>, OpenError> {
-        self.open_with_controlling_terminal_at(user, anchor, path, flags, mode, &|| None)
+        self.open_with_controlling_terminal(user, anchor, path, flags, mode, &|| None)
     }
 
-    /// Opens a file like [`open`](Self::open), binding a file that refers to
+    /// Opens a file like [`open_at`](Self::open_at), binding a file that refers to
     /// the opener's controlling terminal to `controlling_terminal()`, which it
     /// holds open (see [`TerminalEndpoint::reopen`]) and through which its I/O
     /// then goes.
@@ -613,18 +610,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// [`OpenError::NoSuchDevice`] if the opener has no controlling terminal,
     /// while opening it only for path-based operations does not.
     pub fn open_with_controlling_terminal(
-        &self,
-        user: UserInfo,
-        path: &str,
-        flags: OFlags,
-        mode: Mode,
-        controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
-    ) -> Result<ResolverEntry<Backend>, OpenError> {
-        self.open_with_controlling_terminal_at(user, None, path, flags, mode, controlling_terminal)
-    }
-
-    /// Like [`Self::open_at`], with controlling-terminal binding.
-    pub fn open_with_controlling_terminal_at(
         &self,
         user: UserInfo,
         anchor: Option<&ResolverEntry<Backend>>,
@@ -683,10 +668,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         }
 
         let context = Context::new(user);
-        let map_walk_error = |error| match error {
-            WalkError::Io => OpenError::Io,
-            WalkError::PathError(error) => error.into(),
-        };
         let trailing_create = flags.contains(OFlags::CREAT) && path.ends_with('/');
         if trailing_create
             && !matches!(
@@ -697,7 +678,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             // Linux resolves the parent but rejects O_CREAT with a trailing slash before
             // looking up an ordinary final name (even when it is missing or a symlink).
             self.parent_dir_and_name(&context, anchor, path)
-                .map_err(map_walk_error)?;
+                .map_err(OpenError::from)?;
             return Err(OpenError::IsDirectory);
         }
         let path = self
@@ -708,7 +689,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 !flags.contains(OFlags::NOFOLLOW) && !flags.contains(OFlags::CREAT | OFlags::EXCL),
                 flags.contains(OFlags::CREAT),
             )
-            .map_err(map_walk_error)?;
+            .map_err(OpenError::from)?;
         if trailing_create && !flags.contains(OFlags::EXCL) {
             return Err(OpenError::IsDirectory);
         }
@@ -735,7 +716,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
         let resolution = self
             .resolve_components(&context, path.anchor.as_ref(), &components)
-            .map_err(|error| map_walk_error(error.error))?;
+            .map_err(|error| OpenError::from(error.error))?;
         match resolution {
             Resolution::Found(_) if flags.contains(OFlags::CREAT | OFlags::EXCL) => {
                 Err(OpenError::AlreadyExists)
@@ -795,12 +776,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     unreachable!()
                 };
                 if let PermissionCheck::ByResolver(permissions) = &parent.permissions {
-                    Self::check_search_permission(&context, permissions).map_err(|error| {
-                        match error {
-                            WalkError::Io => OpenError::Io,
-                            WalkError::PathError(error) => error.into(),
-                        }
-                    })?;
+                    Self::check_search_permission(&context, permissions)?;
                 }
                 Self::check_dir_entries_change(
                     &context,
@@ -1099,9 +1075,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         let context = Context::new(user);
         let target = match &entry.handle {
             // A directory handle is walkable by its identity, which renames cannot redirect.
-            Handle::Dir(dir) => {
-                ResolvedTarget::Dir(self.backend.walking_dir_at(dir).ok_or(SetTimesError::Io)?)
-            }
+            Handle::Dir(dir) => ResolvedTarget::Dir(
+                self.backend
+                    .walking_dir_at(dir)
+                    .map_err(|_| SetTimesError::Io)?,
+            ),
             Handle::File(_) => self.rewalk_open_file(&context, entry)?,
         };
         Self::authorize_set_times(&context, &target, times)?;
@@ -1468,7 +1446,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             let walking = self
                 .backend
                 .walking_dir_at(&old_dir)
-                .ok_or(RenameError::Io)?;
+                .map_err(|_| RenameError::Io)?;
             match self
                 .backend
                 .resolve(walking, &[&old_name], &|permissions| {
@@ -1725,8 +1703,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     ) -> crate::Result<Result<(), FileStatusError>> {
         let request = match operation {
             FileLockOperation::Shared | FileLockOperation::Exclusive => {
-                // TODO(jayb): overlay dir flock identity follows the stored path; after a
-                // rename-while-open it may lock the wrong dir or fail.
                 let status = match self.handle_status(entry) {
                     Ok(status) => status,
                     Err(error) => return Ok(Err(error)),
@@ -1835,7 +1811,8 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     /// Later renames or removals of the object are not reflected.
     path: String,
     /// Symlink-expanded, handle-relative location for backend operations requiring a rewalk.
-    /// `path` cannot identify this location after a rename of the anchor.
+    /// `path` cannot identify this location after a rename of the anchor. `None` for unanchored
+    /// opens, which rewalk `path`.
     anchored_path: Option<Arc<ResolvedPath>>,
     /// The controlling terminal that the file referred to when it was opened,
     /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
@@ -1932,9 +1909,6 @@ mod tests {
         fs.mkdir(user, "/bridge/fs/old", mode).unwrap();
         fs.mkdir(user, "/bridge/fs/old/child", mode).unwrap();
         let dir = open("/bridge/fs/old/child");
-        let file = fs
-            .open(user, "/bridge/fs/old/file", OFlags::CREAT, mode)
-            .unwrap();
         let anchored = fs
             .open_at(
                 user,
@@ -1948,7 +1922,6 @@ mod tests {
             .unwrap();
         fs.mkdir(user, "/bridge/fs/old", mode).unwrap();
         assert_eq!(fs.handle_path(&dir).unwrap(), "/bridge/fs/moved/child");
-        assert_eq!(fs.handle_path(&file).unwrap(), "/bridge/fs/old/file");
         // A file opened relative to a directory is named under the directory's current name.
         assert_eq!(
             fs.handle_path(&anchored).unwrap(),

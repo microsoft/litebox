@@ -1038,14 +1038,7 @@ fn handle_file_request<Memory: SharedMemory>(
             user,
         }) => {
             let data = read_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
-            if path_length > buffer.length() {
-                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
-            }
-            let (linkpath, target) = data.split_at(path_length as usize);
-            let linkpath = core::str::from_utf8(linkpath)
-                .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
-            let target = core::str::from_utf8(target)
-                .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
+            let (linkpath, target) = split_file_paths(&data, path_length)?;
             Ok(
                 match litebox_broker_core::fs::symlink(process, target, dir, linkpath, user)
                     .map_err(RequestFailure::from)?
@@ -1063,7 +1056,7 @@ fn handle_file_request<Memory: SharedMemory>(
             user,
         }) => {
             let data = read_shared_buffer(shared_buffers, paths, SHARED_BUFFER_SLOT_SIZE)?;
-            let (old_path, new_path) = rename_file_paths(&data, old_path_length)?;
+            let (old_path, new_path) = split_file_paths(&data, old_path_length)?;
             Ok(
                 match litebox_broker_core::fs::rename(
                     process, old_dir, old_path, new_dir, new_path, user,
@@ -1410,14 +1403,15 @@ fn shared_buffer_access_failure(error: SharedBufferError) -> RequestFailure {
     }
 }
 
-fn rename_file_paths(data: &[u8], old_path_length: u32) -> RequestResult<(&str, &str)> {
+/// Splits a buffer holding two UTF-8 strings at `first_length`.
+fn split_file_paths(data: &[u8], first_length: u32) -> RequestResult<(&str, &str)> {
     let malformed = || RequestFailure::Abort(ErrorCode::MalformedRequest);
-    let split = usize::try_from(old_path_length).map_err(|_| malformed())?;
-    let old_path =
+    let split = usize::try_from(first_length).map_err(|_| malformed())?;
+    let first =
         core::str::from_utf8(data.get(..split).ok_or_else(malformed)?).map_err(|_| malformed())?;
-    let new_path =
+    let second =
         core::str::from_utf8(data.get(split..).ok_or_else(malformed)?).map_err(|_| malformed())?;
-    Ok((old_path, new_path))
+    Ok((first, second))
 }
 
 fn read_file_path<Memory: SharedMemory>(

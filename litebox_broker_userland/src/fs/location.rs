@@ -25,7 +25,7 @@ pub(super) struct Location {
 // Other Unix hosts retain a directory fd as an identity witness, not a path locator. They
 // reject stale names. Serialize the checks and operations with guest renames/removals across
 // *all* LocalFs instances, even when two exports overlap. External host namespace changes
-// must not race operations on these hosts, as for the original path-based backend.
+// must not race operations on these hosts.
 #[cfg(all(unix, not(target_os = "linux")))]
 #[derive(Debug)]
 struct CheckedDir {
@@ -105,8 +105,8 @@ impl Location {
             Ok(name)
         }
         // Other hosts name directories by path. Windows holds the directory and its ancestors
-        // without FILE_SHARE_DELETE; other Unix hosts reject a stale name for every operation,
-        // so a moved directory has no name.
+        // without FILE_SHARE_DELETE; other Unix hosts reject a stale name for every operation
+        // with `NotFound`, so a moved directory has no name.
         #[cfg(not(target_os = "linux"))]
         {
             self.host_name()
@@ -145,16 +145,18 @@ impl Location {
         fs::symlink_metadata(&self.path)
     }
 
+    /// Fails with `NotFound` unless the recorded name still names the pinned directory.
     fn check_directory(&self) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt;
+        let stale = || io::Error::new(io::ErrorKind::NotFound, "directory was moved or replaced");
         // A symlink to the moved original must not authorize its new location outside the root.
         if fs::canonicalize(&self.directory.path)? != self.directory.path {
-            return Err(super::invalid_path());
+            return Err(stale());
         }
         let named = fs::symlink_metadata(&self.directory.path)?;
         let pinned = self.directory.file.metadata()?;
         if (pinned.dev(), pinned.ino()) != (named.dev(), named.ino()) {
-            return Err(super::invalid_path());
+            return Err(stale());
         }
         Ok(())
     }

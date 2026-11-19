@@ -500,29 +500,19 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         cwd: &litebox_common_linux::program_startup::InheritedCwd,
         mut inherited: impl Iterator<Item = litebox_common_linux::program_startup::InheritedFd>,
     ) -> Result<(), Errno> {
-        use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags};
         use litebox_common_linux::program_startup::InheritedCwd;
         let file = match cwd {
             InheritedCwd::Path(path) => {
                 if !path.starts_with('/') {
                     return Err(Errno::EINVAL);
                 }
-                Arc::new(self.0.litebox.open_file(
-                    &fs.context.read(),
-                    None,
-                    path,
-                    FileAccessMode::ReadOnly,
-                    FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
-                    FileMode::empty(),
-                )?)
+                Arc::new(self.0.open_path_dir(&fs.context.read(), path)?)
             }
             InheritedCwd::File(handle) => {
                 // Broker inheritance deduplicates references. If fchdir used an fd that was
                 // also inherited, share its already adopted file; never own its handle twice.
                 if let Some(fd) = inherited.find(|fd| fd.handle == *handle) {
-                    let fd = files.typed_fd_from_raw(fd.fd as usize)?;
-                    self.0
-                        .with_file(fd.file_only(Errno::ENOTDIR)?, |f| Ok(Arc::clone(f.file())))?
+                    self.0.file_of(&files.typed_fd_from_raw(fd.fd as usize)?)?
                 } else {
                     Arc::new(self.0.litebox.adopt_inherited_file(*handle)?)
                 }

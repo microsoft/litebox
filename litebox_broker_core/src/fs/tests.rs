@@ -3291,6 +3291,77 @@ mod overlay {
             .unwrap();
         assert_eq!(fs.handle_path(&parent).unwrap(), "/");
     }
+
+    #[test]
+    fn held_directories_follow_rename_over_an_empty_directory() {
+        let fs = overlay_fs(upper([]));
+        for path in ["/a", "/a/sub", "/b"] {
+            fs.mkdir(USER, path, ALL_PERMS).unwrap();
+        }
+        let [a, sub, old_b] = ["/a", "/a/sub", "/b"].map(|path| {
+            fs.open(USER, path, OFlags::PATH | OFlags::DIRECTORY, Mode::empty())
+                .unwrap()
+        });
+        let old_b_node = fs.handle_status(&old_b).unwrap().node_info;
+
+        fs.rename(USER, "/a", "/b").unwrap();
+
+        // Like Linux, held directories (and their descendants) move with the rename.
+        assert_eq!(fs.handle_path(&a).unwrap(), "/b");
+        assert_eq!(fs.handle_path(&sub).unwrap(), "/b/sub");
+        let b_node = fs.file_status(USER, "/b", true).unwrap().node_info;
+        assert_eq!(fs.handle_status(&a).unwrap().node_info, b_node);
+        assert_ne!(b_node, old_b_node);
+        let sub_parent = fs
+            .open_at(USER, Some(&sub), "..", OFlags::PATH, Mode::empty())
+            .unwrap();
+        assert_eq!(fs.handle_status(&sub_parent).unwrap().node_info, b_node);
+        assert_eq!(fs.handle_path(&sub_parent).unwrap(), "/b");
+
+        // The replaced directory is unlinked: it has no name, but `..` still reaches its former
+        // parent rather than the directory that took its name.
+        assert!(matches!(
+            fs.handle_path(&old_b),
+            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        assert!(matches!(
+            fs.file_status_at(USER, Some(&old_b), "sub", true),
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        let old_b_parent = fs
+            .open_at(USER, Some(&old_b), "..", OFlags::PATH, Mode::empty())
+            .unwrap();
+        assert_eq!(fs.handle_path(&old_b_parent).unwrap(), "/");
+        assert_eq!(
+            fs.handle_status(&old_b_parent).unwrap().node_info,
+            fs.file_status(USER, "/", true).unwrap().node_info
+        );
+    }
+
+    #[test]
+    fn removed_held_directory_keeps_its_status() {
+        let fs = overlay_fs(upper([]));
+        fs.mkdir(USER, "/d", ALL_PERMS).unwrap();
+        let d = fs
+            .open(USER, "/d", OFlags::PATH | OFlags::DIRECTORY, Mode::empty())
+            .unwrap();
+        let before = fs.handle_status(&d).unwrap();
+        assert_eq!(before.file_type, FileType::Directory);
+
+        fs.rmdir(USER, "/d").unwrap();
+
+        // As with fstat on Linux, the held directory still describes itself once unlinked.
+        let after = fs.handle_status(&d).unwrap();
+        assert_eq!(after.node_info, before.node_info);
+        assert_eq!(after.file_type, FileType::Directory);
+        // A new directory taking the name must not be confused with the held one.
+        fs.mkdir(USER, "/d", ALL_PERMS).unwrap();
+        assert_ne!(
+            fs.file_status(USER, "/d", true).unwrap().node_info,
+            before.node_info
+        );
+        assert_eq!(fs.handle_status(&d).unwrap().node_info, before.node_info);
+    }
 }
 
 mod devices {
@@ -3375,9 +3446,14 @@ mod devices {
         let fs = devices_fs(provider.clone());
 
         let mut tty = fs
-            .open_with_controlling_terminal(USER, "/dev/tty", OFlags::RDWR, Mode::empty(), &|| {
-                provider.terminal()
-            })
+            .open_with_controlling_terminal(
+                USER,
+                None,
+                "/dev/tty",
+                OFlags::RDWR,
+                Mode::empty(),
+                &|| provider.terminal(),
+            )
             .expect("Failed to open /dev/tty");
         let mut stdin = fs
             .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
@@ -3427,6 +3503,7 @@ mod devices {
         let mut tty = fs
             .open_with_controlling_terminal(
                 USER,
+                None,
                 "/dev/tty",
                 OFlags::WRONLY,
                 Mode::empty(),

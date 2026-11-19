@@ -408,3 +408,20 @@ impl From<StorageError> for FileStatusError {
         Self::Io
     }
 }
+
+impl From<WalkError> for OpenError {
+    fn from(error: WalkError) -> Self {
+        match error {
+            WalkError::PathError(error) => Self::PathError(error),
+            WalkError::Io => Self::Io,
+        }
+    }
+}
+
+/// Keeps path errors from an internal open used for walking; everything else is [`WalkError::Io`].
+pub(crate) fn open_to_walk_error(error: OpenError) -> WalkError {
+    match error {
+        OpenError::PathError(error) => WalkError::PathError(error),
+        _ => WalkError::Io,
+    }
+}

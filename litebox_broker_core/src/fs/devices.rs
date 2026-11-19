@@ -340,25 +340,6 @@ impl BackendHandles for Devices {
 }
 
 impl Backend for Devices {
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
-        Ok(Some(match dir.get_typed::<Self>() {
-            DeviceDirHandle::Root => Vec::new(),
-            DeviceDirHandle::Pts => alloc::vec!["pts".into()],
-        }))
-    }
-
-    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
-        // Device directories are searchable by everyone.
-        Ok(())
-    }
-
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
-        Ok(match dir.get_typed::<Self>() {
-            DeviceDirHandle::Root => None,
-            DeviceDirHandle::Pts => Some(DirHandle::from_typed::<Self>(DeviceDirHandle::Root)),
-        })
-    }
-
     fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {
         match &h.get_typed::<Self>().0 {
             DeviceFile::Device(Device::Tty) => Some(FileTerminal::OpenersControlling),
@@ -443,11 +424,30 @@ impl Backend for Devices {
         Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
-        Some(ResolvedDir::from_typed::<Self>(
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError> {
+        Ok(ResolvedDir::from_typed::<Self>(
             *dir.get_typed::<Self>(),
             PermissionCheck::ByBackend,
         ))
+    }
+
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+        Ok(Some(match dir.get_typed::<Self>() {
+            DeviceDirHandle::Root => Vec::new(),
+            DeviceDirHandle::Pts => alloc::vec!["pts".into()],
+        }))
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        Ok(match dir.get_typed::<Self>() {
+            DeviceDirHandle::Root => None,
+            DeviceDirHandle::Pts => Some(DirHandle::from_typed::<Self>(DeviceDirHandle::Root)),
+        })
+    }
+
+    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        // Device directories are searchable by everyone.
+        Ok(())
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {

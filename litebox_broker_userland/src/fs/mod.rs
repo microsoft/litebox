@@ -48,8 +48,12 @@ use location::Location;
 macro_rules! guard_path_operations {
     ($this:expr, $failure:expr) => {
         #[cfg(all(unix, not(target_os = "linux")))]
-        let Ok(_namespace) = location::namespace_guard(&$this.root) else {
-            return $failure;
+        let _namespace = match location::namespace_guard(&$this.root) {
+            Ok(namespace) => namespace,
+            Err(error) => {
+                litebox_util_log::debug!(error:? = error; "LocalFs namespace guard failed");
+                return $failure;
+            }
         };
     };
 }
@@ -512,19 +516,27 @@ impl LocalFs {
     }
 
     fn valid_dir(&self, dir: &LocalDir) -> bool {
+        self.check_dir(dir).is_ok()
+    }
+
+    /// Fails unless `dir` belongs to this instance and is still inside the root. A stale
+    /// directory fails with `NotFound` (see [`Location::directory_name`]).
+    fn check_dir(&self, dir: &LocalDir) -> std::io::Result<()> {
         if !self.instance_tag.same_instance(&dir.instance_tag) {
-            return false;
+            return Err(invalid_path());
         }
         // Every absolute lookup starts from a clone of the root, which is trivially inside itself;
         // skip the two procfs readlinks.
         #[cfg(target_os = "linux")]
         if Arc::ptr_eq(&dir.location.pin, &self.root.pin) {
-            return true;
+            return Ok(());
         }
-        self.root
-            .host_name()
-            .and_then(|root| dir.location.host_name().map(|name| name.starts_with(root)))
-            .unwrap_or(false)
+        let root = self.root.host_name()?;
+        if dir.location.host_name()?.starts_with(root) {
+            Ok(())
+        } else {
+            Err(invalid_path())
+        }
     }
 
     fn valid_file(&self, file: &LocalFile) -> bool {
@@ -589,14 +601,6 @@ impl LocalFs {
 }
 
 impl Backend for LocalFs {
-    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
-        guard_path_operations!(self, Err(WalkError::Io));
-        let dir = dir.get_typed::<Self>();
-        if !self.valid_dir(dir) {
-            return Err(WalkError::Io);
-        }
-        dir.location.check_search().map_err(walk_error)
-    }
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(ResolvedDir::from_typed::<Self>(
             self.root_dir(),
@@ -775,13 +779,14 @@ impl Backend for LocalFs {
         Ok(DirHandle::from_typed::<Self>(dir))
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
-        guard_path_operations!(self, None);
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError> {
         let dir = dir.get_typed::<Self>();
-        if !self.valid_dir(dir) {
-            return None;
+        if !self.instance_tag.same_instance(&dir.instance_tag) {
+            return Err(WalkError::Io);
         }
-        Some(ResolvedDir::from_typed::<Self>(
+        // Every operation on the result checks containment itself; checking here too would
+        // repeat the host lookups once more per walk.
+        Ok(ResolvedDir::from_typed::<Self>(
             dir.clone(),
             PermissionCheck::ByBackend,
         ))
@@ -816,6 +821,15 @@ impl Backend for LocalFs {
                 location,
             })
         }))
+    }
+
+    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        guard_path_operations!(self, Err(WalkError::Io));
+        let dir = dir.get_typed::<Self>();
+        if !self.valid_dir(dir) {
+            return Err(WalkError::Io);
+        }
+        dir.location.check_search().map_err(walk_error)
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
@@ -889,14 +903,12 @@ impl Backend for LocalFs {
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         guard_path_operations!(self, Err(ReadDirError::Io));
         let dir = handle.into_typed::<Self>();
-        if !self.valid_dir(&dir) {
-            return Err(ReadDirError::Io);
-        }
-        // Like Linux, a host listing of a removed directory fails with ENOENT.
+        // Like Linux, listing a removed directory fails with ENOENT.
         let removed = |error: std::io::Error| match error.kind() {
             std::io::ErrorKind::NotFound => ReadDirError::Removed,
             _ => ReadDirError::Io,
         };
+        self.check_dir(&dir).map_err(removed)?;
         let entries = fs::read_dir(&dir.location).map_err(removed)?;
         let mut result = Vec::new();
         for entry in entries {
@@ -920,6 +932,11 @@ impl Backend for LocalFs {
                 file_type,
                 ino_info: Some(self.node(&metadata, &entry.path())),
             });
+        }
+        // std's listing (glibc's readdir) reports a removed directory as empty instead of failing,
+        // and only an empty directory can be removed.
+        if result.is_empty() {
+            dir.location.directory_name().map_err(removed)?;
         }
         Ok(result)
     }

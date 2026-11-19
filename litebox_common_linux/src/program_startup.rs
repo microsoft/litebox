@@ -44,8 +44,7 @@ pub enum InheritedCwd {
 }
 
 impl InheritedCwd {
-    // Keep the existing pathname format. A zero pathname length (previously invalid)
-    // indicates a fixed-size broker handle in place of the pathname bytes.
+    // A zero pathname length indicates a fixed-size broker handle in place of the pathname bytes.
     fn path_len(&self) -> usize {
         match self {
             Self::Path(path) => path.len(),

@@ -458,13 +458,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         ))
     }
 
-    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
-        // Search permissions are enforced by the resolver.
-        Ok(())
-    }
-
-    fn walking_dir_at<'a>(&'a self, dir: &super::backend::DirHandle) -> Option<ResolvedDir<'a>> {
-        Some(Self::resolved_dir(InMemDirHandle {
+    fn walking_dir_at<'a>(
+        &'a self,
+        dir: &super::backend::DirHandle,
+    ) -> Result<ResolvedDir<'a>, WalkError> {
+        Ok(Self::resolved_dir(InMemDirHandle {
             dir: dir.get_typed::<Self>().dir.clone(),
             flags: super::OFlags::PATH,
         }))
@@ -513,6 +511,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 ))
             })
             .transpose()
+    }
+
+    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        // Search permissions are enforced by the resolver.
+        Ok(())
     }
 
     fn open_file(
@@ -654,9 +657,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         // the resolver should do so before calling this.
         let parent = dir.into_typed::<Self>();
         let mut parent = parent.dir.write();
-        if parent.detached_from.is_some() {
-            return Err(PathError::NoSuchFileOrDirectory.into());
-        }
+        parent.ensure_linked()?;
         if parent.children.contains_key(name) {
             return Err(OpenError::AlreadyExists);
         }
@@ -687,9 +688,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     ) -> Result<(), SymlinkError> {
         let parent = dir.into_typed::<Self>();
         let mut parent = parent.dir.write();
-        if parent.detached_from.is_some() {
-            return Err(PathError::NoSuchFileOrDirectory.into());
-        }
+        parent.ensure_linked()?;
         if parent.children.contains_key(name) {
             return Err(SymlinkError::AlreadyExists);
         }
@@ -717,9 +716,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         let parent = dir.into_typed::<Self>();
         let parent_node = Arc::downgrade(&parent.dir);
         let mut parent = parent.dir.write();
-        if parent.detached_from.is_some() {
-            return Err(PathError::NoSuchFileOrDirectory.into());
-        }
+        parent.ensure_linked()?;
         if parent.children.contains_key(name) {
             return Err(MkdirError::AlreadyExists);
         }
@@ -1079,6 +1076,16 @@ struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
     children: HashMap<String, Node<Platform>>,
     node_info: NodeInfo,
     times: Option<FileTimestamps>,
+}
+
+impl<Platform: sync::RawSyncPrimitivesProvider> DirData<Platform> {
+    /// Fails once the directory has been removed, so that no entry is created unreachable.
+    fn ensure_linked(&self) -> Result<(), PathError> {
+        if self.detached_from.is_some() {
+            return Err(PathError::NoSuchFileOrDirectory);
+        }
+        Ok(())
+    }
 }
 
 type FileNode<Platform> = Arc<sync::RwLock<Platform, FileData>>;
