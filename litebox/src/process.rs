@@ -41,7 +41,7 @@ use crate::vsock_socket::VsockSocket;
 /// Error returned by the broker-backed process service.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProcessError {
-    /// This LiteBox process has no broker process service.
+    /// This process has no process service, or the service does not support the requested operation.
     #[error("process creation is unavailable")]
     Unavailable,
     /// The broker association failed.
@@ -85,7 +85,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// namespace with those options, nested in this process's. The child's
     /// parent is this process, or this process's parent with [`ChildProcessFlags::SIBLING`].
     /// With [`ChildProcessFlags::PRIVATE_MOUNT_VIEW`] the child gets its own copy of the
-    /// creator's mount layout instead of sharing later mounts.
+    /// creator's mount layout instead of sharing later mounts. If the file service cannot
+    /// copy the layout, allocation fails with [`ProcessError::Unavailable`].
     ///
     /// Fails with [`ProcessError::InvalidChild`] if the child's namespace has
     /// ended, and with [`ProcessError::ResourceExhausted`] at a process limit

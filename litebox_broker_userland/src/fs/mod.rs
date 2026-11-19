@@ -270,8 +270,6 @@ fn identity(metadata: &fs::Metadata, canonical_path: &Path) -> HostIdentity {
         // one guest inode ID.
         // XXX: Windows identity is path-keyed, so a rename changes the inode ID seen through the
         // new name; retained handles still use the old path.
-        // Mountpoint protection instead identifies directories by host file ID; see
-        // `windows::directory_id`.
         let _ = metadata;
         HostIdentity {
             canonical_path: canonical_path.to_owned(),
@@ -1316,7 +1314,5 @@ impl Backend for LocalFs {
     }
 }
 
-// Other Windows targets lack the file-ID override, so their mount protection still keys host
-// directories by spelling.
-#[cfg(all(test, any(unix, all(windows, target_arch = "x86_64"))))]
+#[cfg(test)]
 mod tests;

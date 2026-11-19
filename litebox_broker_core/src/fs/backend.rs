@@ -245,8 +245,8 @@ pub trait Backend: Send + Sync + Any {
     /// `parent`. An existing directory must be left intact.
     fn unlink_at(&self, parent: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError>;
 
-    /// Remove the directory `name` at `parent`. Check `may_remove` after normal
-    /// validation, before mutating the directory or its parent.
+    /// Remove the directory `name` at `parent`. Run the usual non-mutating checks, then
+    /// propagate any `may_remove` error before attempting removal.
     // XXX(jayb): I don't like that unlink and rmdir exist separately, we should probably merge them.
     fn rmdir_at(
         &self,
@@ -258,8 +258,9 @@ pub trait Backend: Send + Sync + Any {
     /// Atomically move an entry, replacing a compatible destination without following final
     /// symbolic links. Backends must reject directory cycles and preserve open file contents.
     /// Directory handles retain the backend's documented object or path-locator semantics.
-    /// Validate the rename normally, then propagate `may_move` before the first mutation.
-    /// This lets a mount view protect an entry without duplicating backend validation.
+    /// Run the usual non-mutating checks, then propagate any `may_move` error before
+    /// attempting the move. A backend that proves the rename is a no-op may return success
+    /// without performing it, even when `may_move` is an error.
     fn rename_at(
         &self,
         old_dir: DirHandle,

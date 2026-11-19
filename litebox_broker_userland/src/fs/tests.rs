@@ -139,8 +139,10 @@ fn private_mount_guards_its_host_directories_under_other_spellings() {
         parent.rename("/Work/Target", "/Else/Target", ROOT).unwrap(),
         Err(FileError::Busy)
     );
-    // Only a case-insensitive host gives one directory a second spelling.
-    if !temp.path().join("WORK").join("TARGET").is_dir() {
+    // Alias checks need a case-insensitive filesystem and, on Windows, the x86-64 file-ID support.
+    if cfg!(all(windows, not(target_arch = "x86_64")))
+        || !temp.path().join("WORK").join("TARGET").is_dir()
+    {
         return;
     }
     parent

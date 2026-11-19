@@ -35,8 +35,8 @@ use thiserror::Error;
 pub struct Composer<Platform: RawSyncPrimitivesProvider> {
     state: RwLock<Platform, MountState>,
     resources: Arc<MountResources>,
-    /// Path-based backends need stable names from lookup through mutation, including while
-    /// checking directory IDs. Mounts and destructive operations take this lock before lookup.
+    /// The resolver holds this lock from lookup through mount publication, mkdir, unlink,
+    /// rmdir, or rename so directory names stay stable while it checks mountpoint identities.
     pub(super) mount_paths: Arc<Mutex<Platform, ()>>,
 }
 
