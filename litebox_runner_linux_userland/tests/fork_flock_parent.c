@@ -1,12 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// A forked child shares its parent's `flock` ownership through the open file description they
+// share, while a fresh open of the file conflicts with it.
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -98,11 +102,15 @@ static void child_checks(const char *path, int inherited, int request, int reply
     _exit(0);
 }
 
-int main(int argc, char **argv) {
-    TEST_ASSERT(argc == 2, "expected lock file path");
+int main(void) {
+    const char *directory = getenv("TMPDIR");
+    char path[256];
+    snprintf(path, sizeof path, "%s/fork_flock_lock", directory == NULL ? "/tmp" : directory);
     set_handler(SIGALRM, on_timeout, 0);
     alarm(30);
-    int fd = open(argv[1], O_RDONLY);
+    int created = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    TEST_ASSERT(created >= 0 && close(created) == 0, "create lock file");
+    int fd = open(path, O_RDONLY);
     TEST_ASSERT(fd >= 0, "parent open");
     TEST_ASSERT(flock(fd, LOCK_EX | LOCK_NB) == 0, "parent exclusive lock");
     int request[2], reply[2];
@@ -112,7 +120,7 @@ int main(int argc, char **argv) {
     if (child == 0) {
         close(request[1]);
         close(reply[0]);
-        child_checks(argv[1], fd, request[0], reply[1]);
+        child_checks(path, fd, request[0], reply[1]);
     }
     close(request[0]);
     close(reply[1]);
@@ -150,6 +158,7 @@ int main(int argc, char **argv) {
     close(request[1]);
     close(reply[0]);
     alarm(0);
+    TEST_ASSERT(unlink(path) == 0, "remove lock file");
     puts("flock-fork inherited=1 conflict=1 shared=1 blocked=1 close=1 interrupted=1 exit=1");
     return 0;
 }

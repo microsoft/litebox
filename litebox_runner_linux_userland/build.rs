@@ -11,19 +11,13 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "aarch64_hwcaps.c",
     "async_x16.c",
     "fork_chain_parent.c",
-    "fork_parent.c",
-    "fork_threads_parent.c",
     "fork_aarch64_state.c",
-    "fork_flock_parent.c",
-    "fork_inet_parent.c",
     "fork_shared_futex_parent.c",
-    "fork_unix_parent.c",
     "gate_signals.c",
     "native_tp.c",
     "inherited_ignored_signals.c",
     "pid_namespace.c",
     "root_init.c",
-    "shared_file_mapping.c",
     "sigreturn.c",
     "sigreturn_simd.c",
     "svc_scratch_regs.c",
@@ -33,21 +27,12 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "sve_x18.c",
     "tty.c",
     "uts_ipc_namespace.c",
-    "vfork_fault_parent.c",
-    "vfork_exec_child.c",
-    "vfork_fd_parent.c",
-    "vfork_fd_ops_parent.c",
-    "vfork_exec_parent.c",
     "vfork_job_control_parent.c",
-    "vfork_kill_parent.c",
-    "vfork_pipe_parent.c",
-    "vfork_exit_parent.c",
-    "vfork_reap_parent.c",
-    "vfork_sigchld_parent.c",
     "vfork_shell_parent.c",
-    "vfork_signal_parent.c",
-    "vfork_spawn_parent.c",
 ];
+
+// Programs that other tests run, which are no tests themselves.
+const HELPER_C_PROGRAMS: &[&str] = &["vfork_exec_child.c"];
 
 // Programs that create processes, which LiteBox allows only with `--allow-process-duplication`.
 const PROCESS_DUPLICATION_C_TESTS: &[&str] = &[
@@ -56,16 +41,38 @@ const PROCESS_DUPLICATION_C_TESTS: &[&str] = &[
     "ctty_parent.c",
     "fork_epoll_parent.c",
     "fork_event_parent.c",
+    "fork_flock_parent.c",
     "fork_interrupt_parent.c",
+    "fork_parent.c",
+    "fork_threads_parent.c",
     "parent_death_signal.c",
     "pidfd_parent.c",
     "prctl_flags.c",
     "process_group_parent.c",
     "process_tree_parent.c",
     "rlimit_parent.c",
+    "shared_file_mapping.c",
     "sigtimedwait_fork_parent.c",
     "thread_kill_process_parent.c",
+    "vfork_exit_parent.c",
+    "vfork_fault_parent.c",
     "waitid_parent.c",
+];
+
+// Programs that create processes and take, as their only argument, the path of
+// `vfork_exec_child.c` built like them, which they execute.
+const EXEC_CHILD_C_TESTS: &[&str] = &[
+    "fork_inet_parent.c",
+    "fork_unix_parent.c",
+    "vfork_exec_parent.c",
+    "vfork_fd_ops_parent.c",
+    "vfork_fd_parent.c",
+    "vfork_kill_parent.c",
+    "vfork_pipe_parent.c",
+    "vfork_reap_parent.c",
+    "vfork_sigchld_parent.c",
+    "vfork_signal_parent.c",
+    "vfork_spawn_parent.c",
 ];
 
 const BROKER_ONLY_C_TESTS: &[&str] = &[
@@ -96,6 +103,9 @@ fn main() -> std::io::Result<()> {
         String::from("macro_rules! for_each_c_test {\n    ($callback:ident) => {\n");
     for path in files {
         let name = path.file_name().unwrap().to_str().unwrap();
+        if HELPER_C_PROGRAMS.contains(&name) {
+            continue;
+        }
         let stem = path.file_stem().unwrap().to_str().unwrap();
         assert!(
             !matches!(stem, "_" | "self" | "Self" | "super" | "crate")
@@ -112,6 +122,8 @@ fn main() -> std::io::Result<()> {
             "broker"
         } else if PROCESS_DUPLICATION_C_TESTS.contains(&name) {
             "forking"
+        } else if EXEC_CHILD_C_TESTS.contains(&name) {
+            "exec_child"
         } else {
             "plain"
         };

@@ -19,7 +19,8 @@ use std::process::{Command, Stdio};
 
 /// Runs a program natively, as [`super::runner::Runner`] runs one in LiteBox: with the environment
 /// LiteBox gives the guest, no standard input, and standard error passed through. Its working
-/// directory is a new, empty one, which ends with the `Native`.
+/// directory is a new, empty one, which ends with the `Native`, and `TMPDIR` names it, so that a
+/// program that uses `TMPDIR`, rather than `/tmp`, keeps its files out of the host's.
 pub(crate) struct Native {
     command: Command,
     directory: tempfile::TempDir,
@@ -34,25 +35,15 @@ impl Native {
         command
             .env_clear()
             .env("HOME", "/")
+            .env("TMPDIR", directory.path())
             .current_dir(directory.path())
             .stdin(Stdio::null())
             .stderr(Stdio::inherit());
         Some(Self { command, directory })
     }
 
-    /// The program's working directory.
-    pub(crate) fn directory(&self) -> &Path {
-        self.directory.path()
-    }
-
     pub(crate) fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
         self.command.arg(arg);
-        self
-    }
-
-    /// Sets the environment variable `name` to `value`.
-    pub(crate) fn env(&mut self, name: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
-        self.command.env(name, value);
         self
     }
 
@@ -182,9 +173,19 @@ fn isolate(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
     if program == 0 {
         // SAFETY: the program doesn't need the descriptor.
         unsafe { libc::close(status_writer) };
-        // Like LiteBox's initial process, the program leads its own process group and session.
-        // SAFETY: `setsid` affects only this process, which leads no group yet.
-        return check(unsafe { libc::setsid() });
+        // Like LiteBox's initial process, the program starts with only the standard streams, not
+        // whatever the test inherited, and leads its own process group and session.
+        // SAFETY: marking this process's descriptors close-on-exec affects nothing else, and
+        // `setsid` affects only this process, which leads no group yet.
+        unsafe {
+            check(libc::syscall(
+                libc::SYS_close_range,
+                3,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) as libc::c_int)?;
+            return check(libc::setsid());
+        }
     }
     keep_only_standard_streams_and(status_writer);
     loop {

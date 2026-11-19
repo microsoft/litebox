@@ -1,12 +1,22 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// A vfork child's termination signals its parent, whose `SIGCHLD` handler learns the child's
+// process ID, termination, and user, and interrupts the parent's `pause` or wait as on Linux.
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+// The signal `__builtin_trap` raises (`ud2` on x86-64, `brk` on AArch64).
+#if defined(__x86_64__)
+#define TRAP_SIGNAL SIGILL
+#elif defined(__aarch64__)
+#define TRAP_SIGNAL SIGTRAP
+#endif
 
 static const char *child_path;
 
@@ -91,6 +101,13 @@ static void report(const char *name, pid_t child, pid_t waited) {
            chld_count, chld_pid, chld_code, chld_status, chld_uid_matches);
 }
 
+// Returns whether the handler ran once, for `child`, which `code` and `status` ended, and named
+// this process's user.
+static int handled(pid_t child, int code, int status) {
+    return chld_count == 1 && chld_pid == child && chld_code == code && chld_status == status &&
+           chld_uid_matches;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || argv[1][0] != '/') {
         fprintf(stderr, "usage: %s /absolute/child/path\n", argv[0]);
@@ -105,6 +122,7 @@ int main(int argc, char **argv) {
     pid_t waited = waitpid(child, NULL, 0);
     report("exited", child, waited);
     printf(" early=%d\n", early);
+    int failures = waited != child || !handled(child, CLD_EXITED, 7) || early != 1;
 
     // A child killed in its vfork window signals the parent.
     catch_sigchld(SA_RESTART);
@@ -121,6 +139,10 @@ int main(int argc, char **argv) {
     waited = waitpid(child, NULL, 0);
     report("killed", child, waited);
     printf(" early=%d\n", early);
+    // Linux reports `CLD_DUMPED` instead when the host dumps the child's core.
+    failures += waited != child ||
+                !(handled(child, CLD_KILLED, TRAP_SIGNAL) || handled(child, CLD_DUMPED, TRAP_SIGNAL)) ||
+                early != 1;
 
     // An exec'd child's exit interrupts the sleeping parent.
     catch_sigchld(0);
@@ -132,6 +154,7 @@ int main(int argc, char **argv) {
     waited = waitpid(child, NULL, 0);
     report("paused", child, waited);
     printf(" early=%d eintr=%d\n", early, pause_eintr);
+    failures += waited != child || !handled(child, CLD_EXITED, 42) || early != 0 || !pause_eintr;
 
     // Like Linux, a wait interrupted by the waited child's SIGCHLD reports the child, even
     // without SA_RESTART.
@@ -141,6 +164,8 @@ int main(int argc, char **argv) {
     waited = waitpid(child, &status, 0);
     report("waited", child, waited);
     printf(" exited=%d exit=%d\n", WIFEXITED(status), WEXITSTATUS(status));
+    failures += waited != child || !handled(child, CLD_EXITED, 42) || !WIFEXITED(status) ||
+                WEXITSTATUS(status) != 42;
 
     // A child reaped as it terminates still signals the parent's handler with its status.
     catch_sigchld(SA_RESTART | SA_NOCLDWAIT);
@@ -148,8 +173,10 @@ int main(int argc, char **argv) {
     early = await_sigchld();
     errno = 0;
     waited = waitpid(child, NULL, 0);
+    int echild = waited == -1 && errno == ECHILD;
     report("nocldwait", child, waited);
-    printf(" early=%d echild=%d\n", early, waited == -1 && errno == ECHILD);
+    printf(" early=%d echild=%d\n", early, echild);
+    failures += !handled(child, CLD_EXITED, 9) || early != 1 || !echild;
 
     // Like Linux, a child terminating while SIGCHLD is ignored sends no signal, even if blocked.
     sigset_t chld_set;
@@ -170,6 +197,7 @@ int main(int argc, char **argv) {
         return 6;
     }
     printf("ignored-blocked child=%d waited=%d count=%d\n", child, waited, chld_count);
+    failures += waited != -1 || chld_count != 0;
 
     // The default SIGCHLD action does not interrupt the sleeping parent. This runs last since
     // vfork fails once an alarm has been set.
@@ -185,5 +213,7 @@ int main(int argc, char **argv) {
     waited = waitpid(child, &status, 0);
     printf("default child=%d waited=%d alarmed=%d eintr=%d exit=%d\n", child, waited, alarmed,
            pause_eintr, WEXITSTATUS(status));
-    return 0;
+    failures += waited != child || !alarmed || !pause_eintr || WEXITSTATUS(status) != 42;
+    printf("vfork-sigchld failures=%d\n", failures);
+    return failures != 0;
 }

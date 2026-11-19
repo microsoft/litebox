@@ -273,7 +273,9 @@ int main(int argc, char **argv) {
         return exec_child();
     }
     name_files(getpid());
-    const char *self = argc >= 2 ? argv[1] : NULL;
+    // The program reruns itself, from its own path, for the exec check.
+    const char *self = argv[0][0] == '/' ? argv[0] : NULL;
+    CHECK(self != NULL);
     long page = sysconf(_SC_PAGESIZE);
     // Ends the test, as failed, if anything hangs, well before the harness gives up on it.
     signal(SIGALRM, on_watchdog);

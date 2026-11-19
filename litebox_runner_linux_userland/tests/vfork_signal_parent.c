@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// A vfork child has its own signal state: its handlers, dispositions, mask, alternate stack, and
+// pending signals change without affecting its parent's, and carry over to its `execve` as on
+// Linux.
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <signal.h>
@@ -54,6 +58,11 @@ static void on_ill(int signal, siginfo_t *info, void *context) {
 #endif
 }
 
+// Returns whether `child`, reaped as `waited` with `status`, exited with `code`.
+static int exited_with(pid_t child, pid_t waited, int status, int code) {
+    return waited == child && WIFEXITED(status) && WEXITSTATUS(status) == code;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || argv[1][0] != '/') {
         fprintf(stderr, "usage: %s /absolute/child/path\n", argv[0]);
@@ -95,6 +104,8 @@ int main(int argc, char **argv) {
     pid_t waited = waitpid(fault_child, &status, 0);
     printf("fault child=%d waited=%d exited=%d code=%d handler_pid=%d\n", fault_child, waited,
            WIFEXITED(status), WEXITSTATUS(status), ill_pid);
+    int failures = fault_child == getpid() || !exited_with(fault_child, waited, status, 55) ||
+                   ill_pid != fault_child;
 
     // Ignoring signals in the child discards none of the parent's pending ones.
     kill(getpid(), SIGTERM);
@@ -112,9 +123,12 @@ int main(int argc, char **argv) {
     waited = waitpid(ignore_child, &status, 0);
     uint64_t parent_pending = 0;
     syscall(SYS_rt_sigpending, &parent_pending, sizeof(parent_pending));
+    int usr2_pending = (int)(parent_pending >> (SIGUSR2 - 1) & 1);
+    int term_pending = (int)(parent_pending >> (SIGTERM - 1) & 1);
     printf("ignore child=%d waited=%d exited=%d code=%d usr2_pending=%d term_pending=%d\n",
-           ignore_child, waited, WIFEXITED(status), WEXITSTATUS(status),
-           (int)(parent_pending >> (SIGUSR2 - 1) & 1), (int)(parent_pending >> (SIGTERM - 1) & 1));
+           ignore_child, waited, WIFEXITED(status), WEXITSTATUS(status), usr2_pending,
+           term_pending);
+    failures += !exited_with(ignore_child, waited, status, 60) || !usr2_pending || !term_pending;
 
     // Like Linux, the SIGPIPE a child raises names the child, not its parent, as its sender.
     int pipe_fds[2];
@@ -138,6 +152,7 @@ int main(int argc, char **argv) {
     waited = waitpid(pipe_child, &status, 0);
     printf("sigpipe child=%d waited=%d code=%d sender=%d\n", pipe_child, waited,
            WEXITSTATUS(status), pipe_sender);
+    failures += !exited_with(pipe_child, waited, status, 70) || pipe_sender != pipe_child;
 
     // A child may signal itself, and its fatal signal ends only the child.
     pid_t kill_self_child = vfork();
@@ -152,6 +167,7 @@ int main(int argc, char **argv) {
     waited = waitpid(kill_self_child, &status, 0);
     printf("kill-self child=%d waited=%d signaled=%d signal=%d\n", kill_self_child, waited,
            WIFSIGNALED(status), WTERMSIG(status));
+    failures += waited != kill_self_child || !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL;
 
     // Unlike Linux, LiteBox refuses any other target in a child, whose requests go to the broker
     // as its parent's.
@@ -166,9 +182,17 @@ int main(int argc, char **argv) {
     waited = waitpid(kill_other_child, &status, 0);
     printf("kill-other child=%d waited=%d exited=%d code=%d\n", kill_other_child, waited,
            WIFEXITED(status), WEXITSTATUS(status));
+    failures += !exited_with(kill_other_child, waited, status, 81);
 
-    // The child changes its own signal state, and leaves signals pending, before exec.
-    char *child_argv[] = {argv[1], "signals", NULL};
+    // The child changes its own signal state, and leaves signals pending, before exec. Like Linux
+    // `execve`, ignored dispositions and the blocked mask survive while handlers reset to the
+    // default. The signals pending for the child, but not the parent's, survive, each for the
+    // process or the thread it was pending for, and with its sender, if it had one. In the order
+    // `vfork_exec_child.c` reports them: SIGPIPE and SIGHUP ignored, SIGUSR2 and SIGILL default,
+    // SIGTERM but not SIGUSR2 blocked, SIGUSR1 but not SIGTERM pending, SIGUSR1 from itself,
+    // SIGPIPE for the main thread only, and one real-time signal without a sender and two from
+    // itself.
+    char *child_argv[] = {argv[1], "signals", "1111101010112", NULL};
     char *child_envp[] = {NULL};
     int broken_pipe[2];
     struct rlimit sigpending_limit;
@@ -215,6 +239,7 @@ int main(int argc, char **argv) {
     waited = waitpid(exec_child, &status, 0);
     printf("exec child=%d waited=%d exited=%d code=%d\n", exec_child, waited, WIFEXITED(status),
            WEXITSTATUS(status));
+    failures += !exited_with(exec_child, waited, status, 42);
 
     // The children's signal changes did not affect the parent.
     struct sigaction hup;
@@ -225,9 +250,16 @@ int main(int argc, char **argv) {
     sigaltstack(NULL, &altstack);
     pid_t usr2_before_unblock = usr2_pid;
     sigprocmask(SIG_UNBLOCK, &usr2_set, NULL);
+    int hup_default = hup.sa_handler == SIG_DFL;
+    int term_blocked = sigismember(&current, SIGTERM);
+    int altstack_disabled = (altstack.ss_flags & SS_DISABLE) != 0;
     printf("parent pid=%d hup_default=%d term_blocked=%d altstack_disabled=%d "
            "usr2_before_unblock=%d usr2_pid=%d\n",
-           getpid(), hup.sa_handler == SIG_DFL, sigismember(&current, SIGTERM),
-           (altstack.ss_flags & SS_DISABLE) != 0, usr2_before_unblock, usr2_pid);
-    return 0;
+           getpid(), hup_default, term_blocked, altstack_disabled, usr2_before_unblock, usr2_pid);
+    // The parent's dispositions, pending SIGUSR2, blocked mask, and alternate stack survive its
+    // children's changes.
+    failures += !hup_default || term_blocked != 1 || !altstack_disabled ||
+                usr2_before_unblock != 0 || usr2_pid != getpid();
+    printf("vfork-signal failures=%d\n", failures);
+    return failures != 0;
 }

@@ -103,7 +103,11 @@ int main(int argc, char **argv) {
         }
         printf("child-kill count=%d pid=%d ppid=%d code=%d uid=%d\n", usr1_count, usr1_pid,
                getppid(), usr1_code, usr1_uid_matches);
-        return 42;
+        // The parent's signal names the parent as its sender and matches this process's user.
+        return usr1_count == 1 && usr1_pid == getppid() && usr1_code == SI_USER &&
+                       usr1_uid_matches
+                   ? 42
+                   : 43;
     }
     if (strcmp(marker, "reap-inherited") == 0) {
         printf("reap-inherited reaped=%d\n", child_is_reaped(24));
@@ -123,7 +127,9 @@ int main(int argc, char **argv) {
         printf("reap-reset reaped=%d\n", child_is_reaped(25));
         return 42;
     }
-    if (strcmp(marker, "signals") == 0) {
+    // Reports its signal state, and returns whether it matches `argv[2]`, which has a character for
+    // each value reported, in order: its digit, `-` for -1, or `.` for any.
+    if (strcmp(marker, "signals") == 0 && argc > 2) {
         sigset_t blocked;
         sigset_t pending;
         sigprocmask(SIG_BLOCK, NULL, &blocked);
@@ -147,15 +153,29 @@ int main(int argc, char **argv) {
         if (take_now(SIGRTMIN, &info) != -1 || errno != EAGAIN) {
             rt_from_self = -1;
         }
+        int values[] = {disposition_is(SIGPIPE, SIG_IGN), disposition_is(SIGHUP, SIG_IGN),
+                        disposition_is(SIGUSR2, SIG_DFL), disposition_is(SIGILL, SIG_DFL),
+                        sigismember(&blocked, SIGTERM), sigismember(&blocked, SIGUSR2),
+                        sigismember(&pending, SIGUSR1), sigismember(&pending, SIGTERM),
+                        usr1_from_self, pipe_from_worker, pipe_from_main, rt_without_sender,
+                        rt_from_self};
         printf("child-signals pipe_ignored=%d hup_ignored=%d usr2_default=%d "
                "ill_default=%d term_blocked=%d usr2_blocked=%d usr1_pending=%d term_pending=%d "
                "usr1_from_self=%d pipe_from_worker=%d pipe_from_main=%d rt_without_sender=%d "
                "rt_from_self=%d\n",
-               disposition_is(SIGPIPE, SIG_IGN), disposition_is(SIGHUP, SIG_IGN),
-               disposition_is(SIGUSR2, SIG_DFL), disposition_is(SIGILL, SIG_DFL),
-               sigismember(&blocked, SIGTERM), sigismember(&blocked, SIGUSR2),
-               sigismember(&pending, SIGUSR1), sigismember(&pending, SIGTERM), usr1_from_self,
-               pipe_from_worker, pipe_from_main, rt_without_sender, rt_from_self);
+               values[0], values[1], values[2], values[3], values[4], values[5], values[6],
+               values[7], values[8], values[9], values[10], values[11], values[12]);
+        const char *expected = argv[2];
+        size_t count = sizeof values / sizeof values[0];
+        if (strlen(expected) != count) {
+            return 43;
+        }
+        for (size_t i = 0; i < count; i++) {
+            char actual = values[i] == -1 ? '-' : (char)('0' + values[i]);
+            if (expected[i] != '.' && expected[i] != actual) {
+                return 43;
+            }
+        }
         return 42;
     }
     if (strcmp(marker, "fds") == 0 && argc > 4) {
@@ -188,7 +208,7 @@ int main(int argc, char **argv) {
         int hidden_closed = fcntl(hidden, F_GETFD) == -1 && errno == EBADF;
         printf("child-%.4s stream=%d sent=%d replied=%d hidden_closed=%d\n", marker, is_stream,
                sent, replied, hidden_closed);
-        return 42;
+        return is_stream && sent && replied && hidden_closed ? 42 : 43;
     }
     if (strcmp(marker, "stdout-mode") == 0) {
         printf("child-stdout wronly=%d\n", (fcntl(1, F_GETFL) & O_ACCMODE) == O_WRONLY);
@@ -204,7 +224,8 @@ int main(int argc, char **argv) {
         printf("\n");
         return 42;
     }
-    if (strcmp(marker, "cat") == 0) {
+    // Reads its stdin to end-of-file, checking for the stream its parent wrote, `argv[2]` bytes.
+    if (strcmp(marker, "cat") == 0 && argc > 2) {
         int flags = fcntl(0, F_GETFL);
         size_t total = 0;
         int ok = 1;
@@ -229,19 +250,29 @@ int main(int argc, char **argv) {
             total += n;
         }
         ok &= fcntl(0, F_SETFL, flags & ~O_NONBLOCK) == 0;
-        printf("child-cat bytes=%zu ok=%d rdonly=%d nonblock=%d\n", total, ok,
-               (flags & O_ACCMODE) == O_RDONLY, (flags & O_NONBLOCK) != 0);
-        return 42;
+        int rdonly = (flags & O_ACCMODE) == O_RDONLY;
+        int nonblock = (flags & O_NONBLOCK) != 0;
+        printf("child-cat bytes=%zu ok=%d rdonly=%d nonblock=%d\n", total, ok, rdonly, nonblock);
+        return ok && rdonly && nonblock && total == strtoul(argv[2], NULL, 10) ? 42 : 43;
     }
-    if (strcmp(marker, "read-byte") == 0) {
+    // Reads one byte from its stdin, expecting the first character of `argv[2]`.
+    if (strcmp(marker, "read-byte") == 0 && argc > 2) {
         char byte = 0;
         ssize_t n = read(0, &byte, 1);
         printf("child-read-byte n=%zd byte=%c\n", n, byte);
-        return 42;
+        return n == 1 && byte == argv[2][0] ? 42 : 43;
     }
     const char *environment = getenv("VFORK_EXEC_TEST");
     printf("child pid=%d ppid=%d tid=%ld marker=%s env=%s\n", getpid(),
            getppid(), syscall(SYS_gettid), marker,
            environment == NULL ? "" : environment);
+    // A parent that names itself expects this process to be its only thread, the parent's child,
+    // and to have the marker `from-<VFORK_EXEC_TEST>`.
+    const char *parent = getenv("VFORK_EXEC_PARENT");
+    if (parent != NULL &&
+        (syscall(SYS_gettid) != getpid() || getppid() != atoi(parent) || environment == NULL ||
+         strncmp(marker, "from-", 5) != 0 || strcmp(marker + 5, environment) != 0)) {
+        return 43;
+    }
     return 42;
 }

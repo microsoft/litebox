@@ -150,5 +150,5 @@ int main(void) {
     pthread_join(counter, NULL);
     printf("threads-fork code=%d failures=%ld read=%ld slept=%ld\n", code, failures, (long)read_ok,
            (long)slept);
-    return 0;
+    return code == 7 && failures == 0 && (long)read_ok == 1 && (long)slept == 1 ? 0 : 1;
 }

@@ -1,10 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// A vfork child's `execve` keeps the descriptors not marked close-on-exec, which share their open
+// file descriptions, offsets and status flags, with the parent's.
+
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -60,5 +64,15 @@ int main(int argc, char **argv) {
     if (length > 0) {
         fwrite(contents, 1, length, stdout);
     }
-    return 0;
+    // The child wrote, in order, through both descriptors that share the log's offset.
+    static const char expected[] = "child-fds via-stdout\n"
+                                   "child-fds via-log\n"
+                                   "child-fds stdin_setfl=1 hidden_closed=1\n";
+    int logged = length == (ssize_t)(sizeof expected - 1) &&
+                 memcmp(contents, expected, sizeof expected - 1) == 0;
+    // The child's `F_SETFL` changed the open file description the parent's stdin shares.
+    return waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 42 && logged &&
+                   offset == length && stdin_nonblock == 1
+               ? 0
+               : 1;
 }

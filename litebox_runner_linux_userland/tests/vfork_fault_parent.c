@@ -3,11 +3,21 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+// The signal `__builtin_trap` raises (`ud2` on x86-64, `brk` on AArch64).
+#if defined(__x86_64__)
+#define TRAP_SIGNAL SIGILL
+#elif defined(__aarch64__)
+#define TRAP_SIGNAL SIGTRAP
+#endif
+
+// A vfork child that faults dies of the fault's signal, and its parent resumes as itself and
+// reaps it.
 int main(void) {
     pid_t parent_before = getpid();
     printf("vfork-started\n");
@@ -28,9 +38,16 @@ int main(void) {
     pid_t waited = waitpid(child_pid, &status, 0);
     pid_t again = waitpid(-1, NULL, WNOHANG);
     int again_errno = errno;
+    int echild = again == -1 && again_errno == ECHILD;
     printf("parent before=%d after=%d child=%d waited=%d signaled=%d "
            "signal=%d echild=%d\n",
            parent_before, getpid(), child_pid, waited, WIFSIGNALED(status),
-           WTERMSIG(status), again == -1 && again_errno == ECHILD);
-    return waited == child_pid ? 0 : 3;
+           WTERMSIG(status), echild);
+    if (waited != child_pid) {
+        return 3;
+    }
+    return getpid() == parent_before && child_pid != parent_before && WIFSIGNALED(status) &&
+                   WTERMSIG(status) == TRAP_SIGNAL && echild
+               ? 0
+               : 4;
 }
