@@ -1251,10 +1251,17 @@ fn with_litebox_user_the_vm_runs_as_that_user() {
     // The device daemon and QEMU.
     let children = processes_with(1, guardian);
     assert_eq!(children.len(), 2, "{children:?}");
-    let kvm = std::fs::metadata("/dev/kvm").unwrap().gid();
-    let overflow = std::fs::read_to_string("/proc/sys/kernel/overflowgid").unwrap();
-    let expected: Vec<String> = (![0, overflow.trim().parse().unwrap()].contains(&kvm))
-        .then(|| kvm.to_string())
+    // `/dev/kvm`'s group, unless there is none (TCG), or it is root's or the overflow group.
+    let overflow: u32 = std::fs::read_to_string("/proc/sys/kernel/overflowgid")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let expected: Vec<String> = std::fs::metadata("/dev/kvm")
+        .ok()
+        .map(|kvm| kvm.gid())
+        .filter(|kvm| ![0, overflow].contains(kvm))
+        .map(|kvm| kvm.to_string())
         .into_iter()
         .collect();
     for pid in [guardian].into_iter().chain(children) {
@@ -1900,12 +1907,16 @@ fn refused_or_unsupported_specs_and_annotations_fail_create(backend: Backend) {
             serde_json::json!({"io.litebox.publish.tcp": "127.0.0.1:20881:80"}),
             Code::UNIMPLEMENTED,
         ));
-        // A directory bind's guest path is its share's 9p mount tag, which QEMU limits to 31
-        // bytes.
-        let deep = "/a/directory/bind/beyond/31/bytes";
+        // One directory bind at most, at a guest path of at most 31 bytes, its 9p mount tag.
+        let bind = |destination: &str| serde_json::json!({"destination": destination, "type": "bind", "source": data, "options": ["ro"]});
         cases.push((
             "mounts",
-            serde_json::json!([{"destination": deep, "type": "bind", "source": data, "options": ["ro"]}]),
+            serde_json::json!([bind("/first"), bind("/second")]),
+            Code::UNIMPLEMENTED,
+        ));
+        cases.push((
+            "mounts",
+            serde_json::json!([bind("/a/directory/bind/beyond/31/bytes")]),
             Code::UNIMPLEMENTED,
         ));
     }

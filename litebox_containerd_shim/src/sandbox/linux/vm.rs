@@ -5,8 +5,9 @@
 //! The guardian runs QEMU, whose pid is the broker's, and `vhost-device-vsock`, whose hybrid vsock
 //! bridge reaches the guest service.
 //!
-//! The payload, QEMU's initrd, holds the VM's Linux runner and the root archive. Each directory
-//! bind is a read-only virtio-9p device. The VM has no network device. QEMU's stdout is the
+//! The payload, QEMU's initrd, holds the VM's Linux runner and the root archive. The VM serves one
+//! directory bind at most for now, as a read-only virtio-9p device whose mount tag is its guest
+//! path. The VM has no network device. QEMU's stdout is the
 //! kernel's log, and its stderr the processes' output.
 //!
 //! The kernel, the runner and the daemon are next to this executable unless `LITEBOX_VM_KERNEL`,
@@ -101,13 +102,23 @@ pub fn guardian_arguments(
     binds: &[Bind],
     resources: &Resources,
 ) -> Result<()> {
+    // TODO: serve any number of directory and file binds, nested ones too, live, through one
+    // device for the sandbox exporting a tree the host composes: a device per bind takes a PCI
+    // slot each, whatever the transport (9p or virtio-fs), and file binds are copies in the root
+    // archive.
+    if binds.len() > 1 {
+        return Err(unsupported(format!(
+            "the VM backend serves one directory bind at most for now, not {}",
+            binds.len()
+        )));
+    }
     if let Some(bind) = binds
         .iter()
         .find(|bind| bind.destination.len() > MAX_MOUNT_TAG)
     {
         return Err(unsupported(format!(
-            "the directory bind at {} is too deep for the VM, whose shares are mounted at their \
-             9p mount tags, of at most {MAX_MOUNT_TAG} bytes",
+            "the directory bind at {} is too deep for the VM, whose share is mounted at its 9p \
+             mount tag, of at most {MAX_MOUNT_TAG} bytes",
             bind.destination
         )));
     }
