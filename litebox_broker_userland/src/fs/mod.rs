@@ -279,6 +279,34 @@ fn identity(metadata: &fs::Metadata, canonical_path: &Path) -> HostIdentity {
     }
 }
 
+/// Prove that two parent spellings reach the same directory entry. An unavailable proof
+/// leaves the caller's mount veto in place; it never authorizes a host rename.
+fn same_rename_parent(old: &Path, new: &Path) -> std::io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{Mode, OFlags, fstat, open};
+        use std::os::fd::AsRawFd as _;
+        let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let old = open(old, flags, Mode::empty())?;
+        let new = open(new, flags, Mode::empty())?;
+        let a = fstat(&old)?;
+        let b = fstat(&new)?;
+        // A bind alias may share the inode without being the same location. Compare the
+        // kernel-resolved names of the held directories, not case-folded guest strings.
+        let resolved = |fd| fs::read_link(format!("/proc/self/fd/{fd}"));
+        Ok((a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+            && resolved(old.as_raw_fd())? == resolved(new.as_raw_fd())?)
+    }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        Ok(windows::directory_id(old)? == windows::directory_id(new)?)
+    }
+    #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+    {
+        Ok(fs::canonicalize(old)? == fs::canonicalize(new)?)
+    }
+}
+
 /// Type of a host object described by metadata that did not follow a final symlink.
 fn host_file_type(metadata: &fs::Metadata) -> std::io::Result<FileType> {
     if metadata.file_type().is_symlink() {
@@ -1131,6 +1159,16 @@ impl Backend for LocalFs {
                 }
                 if source_is_dir && !destination_is_dir {
                     return Err(RenameError::NotADirectory);
+                }
+                if matches!(may_move, Err(RenameError::Busy))
+                    && source_is_dir
+                    && old_name == new_name
+                    && matches!(
+                        same_rename_parent(&old_dir.canonical_path, &new_dir.canonical_path),
+                        Ok(true)
+                    )
+                {
+                    return Ok(()); // A verified self-rename; never issue a mutating operation.
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

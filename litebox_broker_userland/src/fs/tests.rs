@@ -102,20 +102,55 @@ fn private_mount_does_not_hide_invalid_subtree_rename() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn private_mount_proven_self_rename_needs_no_host_mutation() {
+    use litebox_broker_core::fs::backend::{Backend, DirHandle};
+    use litebox_broker_core::fs::errors::RenameError;
+    use litebox_broker_core::fs::inode_allocator::InodeAllocators;
+
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("target")).unwrap();
+    fs::create_dir(temp.path().join("other")).unwrap();
+    let local = LocalFs::new(temp.path(), InodeAllocators::new().next()).unwrap();
+    // Two host locators for the same parent, including on a case-sensitive filesystem.
+    let parent = local.root_dir();
+    let mut alias = parent.clone();
+    alias.canonical_path = parent.canonical_path.join("other").join("..");
+    let old = DirHandle::from_typed::<LocalFs>(parent);
+    let new = DirHandle::from_typed::<LocalFs>(alias);
+    local
+        .rename_at(old, "target", new, "target", Err(RenameError::Busy))
+        .unwrap();
+    assert!(temp.path().join("target").is_dir());
+}
+
 #[test]
 fn private_mount_guards_its_host_directories_under_other_spellings() {
     let temp = tempfile::tempdir().unwrap();
-    for dir in ["Work", "Work/Target", "Work/Other"] {
+    for dir in ["Work", "Work/Target", "Work/Other", "Else", "Else/Target"] {
         fs::create_dir(temp.path().join(dir)).unwrap();
-    }
-    // Only a case-insensitive host gives one directory a second spelling.
-    if !temp.path().join("WORK").join("TARGET").is_dir() {
-        return;
     }
     let parent = host_service(temp.path());
     let child = parent.copy_mount_view().unwrap();
     child.mount_in_mem("/Work/Target", ROOT).unwrap().unwrap();
 
+    assert_eq!(
+        parent.rename("/Work/Target", "/Else/Target", ROOT).unwrap(),
+        Err(FileError::Busy)
+    );
+    // Only a case-insensitive host gives one directory a second spelling.
+    if !temp.path().join("WORK").join("TARGET").is_dir() {
+        return;
+    }
+    parent
+        .rename("/Work/Target", "/WORK/Target", ROOT)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        parent.rename("/Work/Target", "/WORK/TARGET", ROOT).unwrap(),
+        Err(FileError::Busy)
+    );
     assert_eq!(
         parent.rename("/WORK", "/Moved", ROOT).unwrap(),
         Err(FileError::Busy)
