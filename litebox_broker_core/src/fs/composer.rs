@@ -1378,6 +1378,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     if matches!(source, BackingEntry::Missing) {
                         return Err(PathError::NoSuchFileOrDirectory.into());
                     }
+                    if !path_pinned
+                        && matches!(source, BackingEntry::Directory { pinned: false })
+                        && new_path.starts_with(&old_path)
+                    {
+                        // Backends must reject directory cycles. No protected source or
+                        // descendant can move; leave destination validation to the backend.
+                        return Ok(());
+                    }
                     let destination = lookup(&new_handle, new_name)?;
                     if !path_pinned
                         && ![source, destination]

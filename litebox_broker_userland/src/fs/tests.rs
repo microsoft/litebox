@@ -79,6 +79,7 @@ fn private_mount_pins_do_not_bypass_host_directory_search() {
 #[test]
 #[cfg(target_os = "linux")]
 fn private_mount_does_not_hide_invalid_subtree_rename() {
+    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     for dir in ["p", "other"] {
         fs::create_dir(temp.path().join(dir)).unwrap();
@@ -91,6 +92,12 @@ fn private_mount_does_not_hide_invalid_subtree_rename() {
         parent.rename("/p", &destination, ROOT).unwrap(),
         Err(FileError::InvalidArgument)
     );
+    // LocalFs rejects the cycle without looking up the leaf, even if /p is not searchable.
+    let p = temp.path().join("p");
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+    let rename = parent.rename("/p", "/p/new", ROOT).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(rename, Err(FileError::InvalidArgument));
 }
 
 #[test]
