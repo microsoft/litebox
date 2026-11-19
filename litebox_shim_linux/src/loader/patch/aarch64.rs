@@ -207,13 +207,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Returns the arch state and the page-aligned trampoline capacity. Falls
     /// back to one page (with trap fallback on exhaustion) if scanning fails.
-    pub(super) fn plan_runtime_trampoline(file: &File<Platform>) -> (ArchPatchState, usize) {
+    pub(super) fn plan_runtime_trampoline(
+        file: &File<Platform>,
+        caller: &litebox::fs::Caller,
+    ) -> (ArchPatchState, usize) {
         let scanned = file.status().ok().and_then(|stat| {
             let file_size = usize::try_from(stat.size).ok()?;
             let word_len = file_size.div_ceil(8);
             let mut words = u64::new_vec_zeroed(word_len).ok()?;
             let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
-            read_file_exact_at(file, &mut bytes[..file_size], 0).ok()?;
+            read_file_exact_at(file, caller, &mut bytes[..file_size], 0).ok()?;
             let metadata = ElfCodeMetadata::parse_aligned_in_place(&mut words, file_size).ok()?;
             let upper_bound = metadata
                 .trampoline_size_upper_bound(

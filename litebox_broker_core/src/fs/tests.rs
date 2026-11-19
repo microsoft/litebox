@@ -5342,11 +5342,13 @@ mod credentials {
     }
 
     #[test]
-    fn mapping_a_queryable_path_only_terminal_reports_path_only() {
+    fn queryable_handles_report_open_kind_without_granting_io() {
         use crate::readiness::{ReadinessSink, tests::TestReadinessSink};
         use crate::test_support::TestBrokerBuilder;
         use crate::{BrokerError, CallerCredential, HandleOperations, ObjectRights, PolicyEngine};
-        use litebox_broker_protocol::fs::{FileAccessMode, FileCaller, FileError, FileOpenFlags};
+        use litebox_broker_protocol::fs::{
+            FileAccessMode, FileCaller, FileError, FileOpenFlags, FileSeekWhence,
+        };
 
         let carol = Credentials::new(CAROL);
         let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
@@ -5370,28 +5372,55 @@ mod credentials {
         process.complete_start().unwrap();
         let subject = process.create_subject(carol.subject).unwrap();
         let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
-        let path = crate::fs::open(
-            &process,
-            "/dev/tty",
-            FileCaller::Subject(subject),
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::PATH,
-            Mode::empty(),
-            &sink,
-        )
-        .unwrap()
-        .unwrap();
-        let map = |handle| crate::fs::map_shared(&process, handle).map(|result| result.map(|_| ()));
-        assert_eq!(map(path), Ok(Err(FileError::PathOnly)));
-        let wait_only = process
-            .duplicate_object_operations_to(
-                path,
+        let open = |path, flags| {
+            crate::fs::open(
                 &process,
-                ObjectRights::WAIT,
-                HandleOperations::WAIT,
+                path,
+                FileCaller::Subject(subject),
+                FileAccessMode::ReadOnly,
+                flags,
+                Mode::RUSR | Mode::WUSR,
+                &sink,
             )
-            .unwrap();
-        assert_eq!(map(wait_only), Err(BrokerError::InvalidRights));
+            .unwrap()
+            .unwrap()
+        };
+        let path = open("/dev/tty", FileOpenFlags::PATH);
+        let dir = open("/dev", FileOpenFlags::NONE);
+        let regular = open("/file", FileOpenFlags::CREATE);
+        let map = |handle| crate::fs::map_shared(&process, handle).map(|result| result.map(|_| ()));
+        let read = |handle| crate::fs::read(&process, handle, &mut [0u8; 1], None);
+        let list =
+            |handle| crate::fs::read_directory(&process, handle).map(|result| result.map(|_| ()));
+        let rewind =
+            |handle| crate::fs::seek(&process, handle, 0, FileSeekWhence::RelativeToBeginning);
+        let restrict = |handle, operations| {
+            process
+                .duplicate_object_operations_to(handle, &process, ObjectRights::WAIT, operations)
+                .unwrap()
+        };
+        assert_eq!(map(path), Ok(Err(FileError::PathOnly)));
+        assert_eq!(
+            map(open("/dev", FileOpenFlags::PATH)),
+            Ok(Err(FileError::PathOnly))
+        );
+        assert_eq!(map(dir), Ok(Err(FileError::IsDirectory)));
+        assert_eq!(read(dir), Ok(Err(FileError::NotFile)));
+        assert_eq!(list(regular), Ok(Err(FileError::NotDirectory)));
+        // The local directory cursor can be repositioned only through a seekable reference.
+        assert_eq!(rewind(dir), Ok(Err(FileError::NotFile)));
+        let query_dir = restrict(dir, HandleOperations::QUERY);
+        assert_eq!(rewind(query_dir), Err(BrokerError::InvalidRights));
+        assert_eq!(list(query_dir), Err(BrokerError::InvalidRights));
+        let query_file = restrict(regular, HandleOperations::QUERY);
+        assert_eq!(read(query_file), Err(BrokerError::InvalidRights));
+        assert_eq!(map(query_file), Err(BrokerError::InvalidRights));
+        for handle in [path, dir, regular] {
+            let wait = restrict(handle, HandleOperations::WAIT);
+            assert_eq!(map(wait), Err(BrokerError::InvalidRights));
+            assert_eq!(read(wait), Err(BrokerError::InvalidRights));
+            assert_eq!(list(wait), Err(BrokerError::InvalidRights));
+        }
     }
 
     #[test]

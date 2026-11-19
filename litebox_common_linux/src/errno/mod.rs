@@ -284,6 +284,7 @@ impl From<litebox::fs::errors::ReadError> for Errno {
             litebox::fs::errors::ReadError::ClosedFd => Errno::EBADF,
             litebox::fs::errors::ReadError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::ReadError::NotForReading => Errno::EBADF,
+            litebox::fs::errors::ReadError::StaleSubject => Errno::EACCES,
             litebox::fs::errors::ReadError::WouldBlock => Errno::EAGAIN,
             litebox::fs::errors::ReadError::WaitError(e) => match e {
                 litebox::event::wait::WaitError::Interrupted => Errno::ERESTARTSYS,
@@ -291,7 +292,7 @@ impl From<litebox::fs::errors::ReadError> for Errno {
             },
             litebox::fs::errors::ReadError::Io => Errno::EIO,
             litebox::fs::errors::ReadError::Fault => Errno::EFAULT,
-            _ => unimplemented!(),
+            _ => Errno::EIO,
         }
     }
 }
@@ -323,9 +324,10 @@ impl From<litebox::fs::errors::SeekError> for Errno {
             }
             litebox::fs::errors::SeekError::InvalidOffset => Errno::EINVAL,
             litebox::fs::errors::SeekError::NonSeekable => Errno::ESPIPE,
-            litebox::fs::errors::SeekError::NotOpenForSeeking => Errno::EBADF,
+            litebox::fs::errors::SeekError::NotOpenForSeeking
+            | litebox::fs::errors::SeekError::NotForSeeking => Errno::EBADF,
             litebox::fs::errors::SeekError::Io => Errno::EIO,
-            _ => unimplemented!(),
+            _ => Errno::EIO,
         }
     }
 }
@@ -810,8 +812,11 @@ impl From<litebox::fs::errors::ReadDirError> for Errno {
     fn from(value: litebox::fs::errors::ReadDirError) -> Self {
         match value {
             litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
-            litebox::fs::errors::ReadDirError::NotOpenForReading => Errno::EBADF,
-            _ => unimplemented!(),
+            litebox::fs::errors::ReadDirError::NotOpenForReading
+            | litebox::fs::errors::ReadDirError::NotForReading
+            | litebox::fs::errors::ReadDirError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::ReadDirError::StaleSubject => Errno::EACCES,
+            _ => Errno::EIO,
         }
     }
 }
@@ -1009,6 +1014,18 @@ impl From<litebox::platform::ArchSpecificError> for Errno {
 mod tests {
     use super::Errno;
     use litebox::process::ProcessError;
+
+    #[test]
+    fn file_handle_errors_preserve_wrong_kind_and_permission_denials() {
+        use litebox::fs::errors::{ReadDirError, ReadError, SeekError};
+        assert_eq!(Errno::from(ReadError::NotAFile), Errno::EISDIR);
+        assert_eq!(Errno::from(ReadDirError::NotADirectory), Errno::ENOTDIR);
+        assert_eq!(Errno::from(SeekError::NotForSeeking), Errno::EBADF);
+        assert_eq!(Errno::from(ReadDirError::NotForReading), Errno::EBADF);
+        assert_eq!(Errno::from(ReadDirError::ClosedFd), Errno::EBADF);
+        assert_eq!(Errno::from(ReadError::StaleSubject), Errno::EACCES);
+        assert_eq!(Errno::from(ReadDirError::StaleSubject), Errno::EACCES);
+    }
 
     #[test]
     fn process_errors_map_to_linux_errno() {

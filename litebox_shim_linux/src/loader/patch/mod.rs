@@ -206,11 +206,12 @@ pub(crate) type ElfPatchCache<Platform> = BTreeMap<ElfPatchKey<Platform>, ElfPat
 /// Fills `data` from `file` at `offset`, failing with `EIO` at end of file.
 fn read_file_exact_at<Platform: ShimPlatform>(
     file: &File<Platform>,
+    caller: &litebox::fs::Caller,
     mut data: &mut [u8],
     mut offset: usize,
 ) -> Result<(), Errno> {
     while !data.is_empty() {
-        let read = file.read(&mut *data, Some(offset), None)?;
+        let read = file.read(caller, &mut *data, Some(offset), None)?;
         if read == 0 {
             return Err(Errno::EIO);
         }
@@ -224,6 +225,7 @@ fn read_file_exact_at<Platform: ShimPlatform>(
 /// Returns `Ok(None)` if the file is unreadable or carries no LiteBox header.
 fn read_trampoline_layout<Platform: ShimPlatform>(
     file: &File<Platform>,
+    caller: &litebox::fs::Caller,
 ) -> Result<Option<TrampolineLayout>, TrampolineHeaderError> {
     let Ok(stat) = file.status() else {
         return Ok(None);
@@ -236,7 +238,7 @@ fn read_trampoline_layout<Platform: ShimPlatform>(
     };
 
     let mut tail = [0u8; TRAMPOLINE_HEADER_SIZE];
-    match file.read(&mut tail, Some(read_offset), None) {
+    match file.read(caller, &mut tail, Some(read_offset), None) {
         Ok(n) if n == TRAMPOLINE_HEADER_SIZE => {}
         _ => return Ok(None),
     }
@@ -384,9 +386,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let metadata = if (syscall_entry != 0 || !prot.contains(ProtFlags::PROT_EXEC))
             && !self.global.elf_patch_cache.lock().contains_key(&key)
         {
+            let caller = self.fs_caller();
             Some(
                 self.global
-                    .with_file(file, |file| Ok(Self::read_elf_patch_metadata(file, offset)))
+                    .with_file(file, |file| {
+                        Ok(Self::read_elf_patch_metadata(file, &caller, offset))
+                    })
                     .unwrap_or(Err(ElfPatchInit::Untracked)),
             )
         } else {
@@ -675,11 +680,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Requires the supported architectures' common 64-bit ELF layout.
     fn read_elf_patch_metadata(
         file: &File<Platform>,
+        caller: &litebox::fs::Caller,
         file_offset: usize,
     ) -> Result<ElfPatchMetadata, ElfPatchInit> {
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
-        match file.read(&mut ehdr_buf, Some(0), None) {
+        match file.read(caller, &mut ehdr_buf, Some(0), None) {
             Ok(n) if n == ehdr_buf.len() => {}
             _ => return Err(ElfPatchInit::Untracked), // Not readable or short read, skip
         }
@@ -712,7 +718,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(ElfPatchInit::Untracked); // Sanity check
         }
         let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
-        match file.read(&mut phdrs_buf, Some(e_phoff), None) {
+        match file.read(caller, &mut phdrs_buf, Some(e_phoff), None) {
             Ok(n) if n == phdrs_buf.len() => {}
             _ => return Err(ElfPatchInit::Untracked),
         }
@@ -756,7 +762,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(ElfPatchInit::Untracked); // No PT_LOAD segments
         }
 
-        let trampoline_layout = match read_trampoline_layout(file) {
+        let trampoline_layout = match read_trampoline_layout(file, caller) {
             Err(error) => {
                 litebox_util_log::debug!(
                     file_offset:? = file_offset, error:? = error;
@@ -771,7 +777,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Pre-patched files carry their own trampoline.
             (arch::ArchPatchState::default(), 0)
         } else {
-            Self::plan_runtime_trampoline(file)
+            Self::plan_runtime_trampoline(file, caller)
         };
         let min_load_start: usize = min_load_start.trunc();
         let max_load_end: usize = max_load_end.trunc();
@@ -1012,10 +1018,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
         let file_off = state.trampoline_file_offset.trunc();
         let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
+        let caller = self.fs_caller();
         if self
             .global
             .with_file(&fd.0, |file| {
-                read_file_exact_at(file, &mut tramp_data, file_off)
+                read_file_exact_at(file, &caller, &mut tramp_data, file_off)
             })
             .is_err()
         {

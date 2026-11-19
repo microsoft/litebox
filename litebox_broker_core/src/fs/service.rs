@@ -69,6 +69,7 @@ fn with_file_subject<T>(
 #[derive(Clone)]
 pub struct File {
     state: Arc<dyn OpenFile>,
+    is_directory: bool,
     /// The issuing service's trusted policy, including when a different service holds the file.
     pub(crate) profile: Option<FileSystemProfile>,
     /// Directions and descriptor operations compatible with this immutable open, independent
@@ -314,6 +315,7 @@ where
         Ok(Ok(File {
             profile: self.profile(),
             operations,
+            is_directory: entry.is_directory(),
             state: Arc::new(ResolverFile {
                 entry: RwLock::new(entry),
                 resolver: self,
@@ -432,11 +434,10 @@ fn file_operations<B: super::backend::Backend>(entry: &ResolverEntry<B>) -> Hand
         permits(Rights::TOUCH | Rights::WRITE_ATTRIBUTES),
     );
     if !entry.is_path_only() {
-        ops |= Op::LOCK | Op::SET_FLAGS;
+        ops |= Op::LOCK | Op::SET_FLAGS | Op::SEEK;
         if entry.is_directory() {
             ops.set(Op::LIST, entry.allows_read() && permits(Rights::LIST));
         } else {
-            ops |= Op::SEEK;
             ops.set(
                 Op::READ | Op::MAP,
                 entry.allows_read() && permits(Rights::READ),
@@ -802,7 +803,10 @@ pub fn read_as(
     if output.len() > MAX_FILE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
-    let file = file(process, handle, HandleOperations::READ)?;
+    let file = match file_for_read(process, handle, ReadOperation::Data)? {
+        Ok(file) => file,
+        Err(error) => return Ok(Err(error)),
+    };
     match subject {
         Some(subject) => with_file_subject(process, subject, |caller| {
             file.state.read(Some(caller), output, offset)
@@ -873,23 +877,9 @@ pub fn map_shared(
     process: &BrokerProcess,
     handle: ObjectHandle,
 ) -> Result<FileResult<SharedFileMapping>> {
-    let file = match file(
-        process,
-        handle,
-        HandleOperations::MAP | HandleOperations::READ,
-    ) {
+    let file = match file_for_read(process, handle, ReadOperation::Mapping)? {
         Ok(file) => file,
-        // A holder allowed to query the open mode can distinguish a path-only handle.
-        // This error does not require, or grant, access to the mapping.
-        Err(BrokerError::InvalidRights)
-            if process
-                .get_status_flags(handle)?
-                .flags
-                .contains(FileOpenFlags::PATH) =>
-        {
-            return Ok(Err(FileError::PathOnly));
-        }
-        Err(error) => return Err(error),
+        Err(error) => return Ok(Err(error)),
     };
     let handle_writable = process
         .authorized_operation(handle, HandleOperations::WRITE)
@@ -928,7 +918,10 @@ pub fn read_directory_as(
     handle: ObjectHandle,
     subject: Option<ObjectHandle>,
 ) -> Result<FileResult<Vec<FileDirectoryEntry>>> {
-    let file = file(process, handle, HandleOperations::LIST)?;
+    let file = match file_for_read(process, handle, ReadOperation::Directory)? {
+        Ok(file) => file,
+        Err(error) => return Ok(Err(error)),
+    };
     match subject {
         Some(subject) => with_file_subject(process, subject, |caller| {
             file.state.read_directory(Some(caller))
@@ -1205,6 +1198,47 @@ fn file(process: &BrokerProcess, handle: ObjectHandle, required: HandleOperation
     let object = process.authorized_operation(handle, required)?;
     let object = object.read();
     object.as_file().cloned()
+}
+
+#[derive(Clone, Copy)]
+enum ReadOperation {
+    Data,
+    Directory,
+    Mapping,
+}
+
+fn file_for_read(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    op: ReadOperation,
+) -> ServiceResult<File> {
+    let required = match op {
+        ReadOperation::Data => HandleOperations::READ,
+        ReadOperation::Directory => HandleOperations::LIST,
+        ReadOperation::Mapping => HandleOperations::MAP | HandleOperations::READ,
+    };
+    match file(process, handle, required) {
+        Ok(file) => return Ok(Ok(file)),
+        Err(BrokerError::InvalidRights) => {}
+        Err(error) => return Err(error),
+    }
+
+    // QUERY allows reporting the open kind and mode, not performing an otherwise denied operation.
+    let file = file(process, handle, HandleOperations::QUERY)?;
+    let status = file.get_status_flags();
+    let path_only = status.flags.contains(FileOpenFlags::PATH);
+    let error = match op {
+        ReadOperation::Mapping if path_only => FileError::PathOnly,
+        ReadOperation::Mapping if file.is_directory => FileError::IsDirectory,
+        ReadOperation::Data if !path_only && file.is_directory => FileError::NotFile,
+        ReadOperation::Directory
+            if !path_only && !file.is_directory && status.access != FileAccessMode::WriteOnly =>
+        {
+            FileError::NotDirectory
+        }
+        _ => return Err(BrokerError::InvalidRights),
+    };
+    Ok(Err(error))
 }
 
 fn open_flags(access: FileAccessMode, flags: FileOpenFlags) -> Result<OFlags> {
