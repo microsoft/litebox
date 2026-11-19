@@ -1313,7 +1313,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         old_name: &str,
         new_dir: DirHandle,
         new_name: &str,
-        mut may_move: Result<(), RenameError>,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         if [old_name, new_name].iter().any(|name| {
             name.is_empty() || matches!(*name, "." | "..") || name.contains(['/', '\0'])
@@ -1356,10 +1356,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                         may_move,
                     );
                 }
-                let pins = mount.live_directory_pins();
-                let old_pinned = mount.protects(&old_path);
-                let new_pinned = mount.protects(&new_path);
-                if may_move.is_ok() && (old_pinned || new_pinned || !pins.is_empty()) {
+                let may_move = may_move.and_then(|()| {
+                    let pins = mount.live_directory_pins();
+                    let path_pinned = mount.protects(&old_path) || mount.protects(&new_path);
+                    if !path_pinned && pins.is_empty() {
+                        return Ok(());
+                    }
                     let lookup = |handle: &DirHandle, name: &str| {
                         let parent = mount
                             .backend
@@ -1374,38 +1376,40 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     };
                     let source = lookup(&old_handle, old_name)?;
                     if matches!(source, BackingEntry::Missing) {
-                        may_move = Err(PathError::NoSuchFileOrDirectory.into());
-                    } else if matches!(source, BackingEntry::Directory { .. })
-                        && new_path.starts_with(&old_path)
-                    {
-                        // The destination parent is inside the source, independently of
-                        // the destination leaf or a server's ability to validate a veto.
-                        may_move = Err(RenameError::InvalidArgument);
-                    } else {
-                        let destination = lookup(&new_handle, new_name)?;
-                        if old_pinned
-                            || new_pinned
-                            || [source, destination]
-                                .iter()
-                                .any(|e| matches!(e, BackingEntry::Directory { pinned: true }))
-                        {
-                            // Backends validate before honoring this veto; don't attempt a
-                            // mutation to discover errors enforced only by the host or server.
-                            may_move = Err(match (source, destination) {
-                                (
-                                    BackingEntry::Directory { .. },
-                                    BackingEntry::Directory { .. },
-                                ) if old_path.starts_with(&new_path) => RenameError::NotEmpty,
-                                (BackingEntry::File, BackingEntry::Directory { .. }) => {
-                                    RenameError::IsADirectory
-                                }
-                                (BackingEntry::Directory { .. }, BackingEntry::File) => {
-                                    RenameError::NotADirectory
-                                }
-                                _ => RenameError::Busy,
-                            });
-                        }
+                        return Err(PathError::NoSuchFileOrDirectory.into());
                     }
+                    let destination = lookup(&new_handle, new_name)?;
+                    if !path_pinned
+                        && ![source, destination]
+                            .iter()
+                            .any(|e| matches!(e, BackingEntry::Directory { pinned: true }))
+                    {
+                        return Ok(());
+                    }
+                    // Describe only a move the view actually vetoes. Otherwise the
+                    // backend decides, including servers that do not support rename.
+                    Err(match (source, destination) {
+                        (BackingEntry::Directory { .. }, _) if new_path.starts_with(&old_path) => {
+                            RenameError::InvalidArgument
+                        }
+                        (_, BackingEntry::Directory { .. }) if old_path.starts_with(&new_path) => {
+                            RenameError::NotEmpty
+                        }
+                        (BackingEntry::File, BackingEntry::Directory { .. }) => {
+                            RenameError::IsADirectory
+                        }
+                        (BackingEntry::Directory { .. }, BackingEntry::File) => {
+                            RenameError::NotADirectory
+                        }
+                        _ => RenameError::Busy,
+                    })
+                });
+                // A failed search is authoritative; don't inspect the protected name further.
+                if matches!(
+                    may_move,
+                    Err(RenameError::PathError(PathError::NoSearchPerms))
+                ) {
+                    return may_move;
                 }
                 mount
                     .backend

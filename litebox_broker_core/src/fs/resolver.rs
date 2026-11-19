@@ -1103,8 +1103,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             UnlinkError::ReadOnlyFileSystem,
             UnlinkError::NoWritePerms,
         );
-        // Linux checks for a read-only mount before looking up the name.
-        if matches!(writable, Err(UnlinkError::ReadOnlyFileSystem)) {
+        // A resolver-enforced read-only mount wins before lookup. For a backend-enforced
+        // restriction a trailing slash still requires the ordinary directory lookup first.
+        if matches!(writable, Err(UnlinkError::ReadOnlyFileSystem))
+            && !(trailing_slash && matches!(parent.permissions, PermissionCheck::ByReadOnlyBackend))
+        {
             return writable;
         }
         if trailing_slash {

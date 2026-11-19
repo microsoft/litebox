@@ -3514,6 +3514,12 @@ mod devices {
     #[test]
     fn private_mount_keeps_device_directory_entries_read_only() {
         let fs = devices_fs(Arc::new(TestStdioProvider::default()));
+        assert!(matches!(
+            fs.unlink(USER, "/dev/null/"),
+            Err(crate::fs::errors::UnlinkError::PathError(
+                PathError::ComponentNotADirectory
+            ))
+        ));
         let child = fs.copy_mount_view().unwrap();
         child.mount_in_mem(super::ROOT, "/dev/pts").unwrap();
         assert!(matches!(

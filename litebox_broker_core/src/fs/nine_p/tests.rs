@@ -418,6 +418,7 @@ fn private_mount_preserves_9p_directory_ancestry_errors() {
     use crate::fs::{UserInfo, composer::Composer, errors::RenameError};
     let server = DiodServer::start();
     std::fs::create_dir_all(server.export_path().join("p/child")).unwrap();
+    std::fs::write(server.export_path().join("p/file"), []).unwrap();
     let fs = Resolver::<TestPlatform, _>::new(
         Composer::<TestPlatform>::builder()
             .mount("/", |ids| attach(server.connect(), &server, ids))
@@ -434,6 +435,41 @@ fn private_mount_preserves_9p_directory_ancestry_errors() {
         fs.rename(USER, "/p/child", "/p"),
         Err(RenameError::NotEmpty)
     ));
+    assert!(matches!(
+        fs.rename(USER, "/p/file", "/p"),
+        Err(RenameError::NotEmpty)
+    ));
+}
+
+#[test]
+fn private_mount_leaves_unrelated_9p_renames_to_the_server() {
+    use crate::fs::{
+        UserInfo,
+        composer::Composer,
+        errors::{PathError, RenameError},
+    };
+    let server = DiodServer::start();
+    for dir in ["target", "unrelated"] {
+        std::fs::create_dir(server.export_path().join(dir)).unwrap();
+    }
+    let fs = Resolver::<TestPlatform, _>::new(
+        Composer::<TestPlatform>::builder()
+            .mount("/", |ids| attach(server.connect(), &server, ids))
+            .build()
+            .unwrap(),
+    );
+    // Unlike LocalFs, diod rejects the overlong leaf before the subtree move.
+    let dest = alloc::format!("/unrelated/{}", "x".repeat(256));
+    let check = || {
+        assert!(matches!(
+            fs.rename(USER, "/unrelated", &dest),
+            Err(RenameError::PathError(PathError::InvalidPathname))
+        ));
+    };
+    check();
+    let private = fs.copy_mount_view().unwrap();
+    private.mount_in_mem(UserInfo::ROOT, "/target").unwrap();
+    check();
 }
 
 #[test]
