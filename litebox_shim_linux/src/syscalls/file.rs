@@ -20,6 +20,7 @@ use litebox::{
     sync::Mutex,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
+use litebox_broker_protocol::authority::DomainId;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileLockOperation, FileMode as Mode, FileOpenFlags,
     FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate, FileTimestamp,
@@ -107,11 +108,12 @@ impl<Platform: ShimPlatform> File<Platform> {
     /// Writes `buf` at `offset`, or at the file offset if `offset` is `None`.
     pub(crate) fn write(
         &self,
+        caller: &litebox::fs::Caller,
         buf: impl WriteBuffer,
         offset: Option<usize>,
         cx: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, Errno> {
-        Ok(self.file.write(buf, offset, cx)?)
+        Ok(self.file.write_as(caller, buf, offset, cx)?)
     }
 
     /// Moves the file offset, or a directory's position in its entries, as `lseek` does.
@@ -133,8 +135,12 @@ impl<Platform: ShimPlatform> File<Platform> {
     }
 
     /// Truncates or extends the file to `length` bytes, keeping the file offset.
-    pub(crate) fn truncate(&self, length: usize) -> Result<(), Errno> {
-        Ok(self.file.truncate(length, false)?)
+    pub(crate) fn truncate(
+        &self,
+        caller: &litebox::fs::Caller,
+        length: usize,
+    ) -> Result<(), Errno> {
+        Ok(self.file.truncate_as(caller, length, false)?)
     }
 
     pub(crate) fn status(&self) -> Result<FileStatus, Errno> {
@@ -272,11 +278,18 @@ struct AccessUserInfo {
     group: u32,
 }
 
-impl From<FileUser> for AccessUserInfo {
-    fn from(value: FileUser) -> Self {
+/// A file's owner and group as far as Linux ids name them; `None` matches no caller.
+#[derive(Clone, Copy)]
+struct AccessOwner {
+    user: Option<u32>,
+    group: Option<u32>,
+}
+
+impl From<&FileStatus> for AccessOwner {
+    fn from(status: &FileStatus) -> Self {
         Self {
-            user: u32::from(value.user),
-            group: u32::from(value.group),
+            user: litebox_common_linux::linux_id(status.owner, DomainId::POSIX_USER),
+            group: litebox_common_linux::linux_id(status.group, DomainId::POSIX_GROUP),
         }
     }
 }
@@ -1354,7 +1367,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
             FsPath::FdRelative { fd, path } => self.resolve_fd_relative(fd, &path)?,
         };
-        let user = self.fs.borrow().context.read().acting_user();
+        let caller = self.fs.borrow().context.read().caller().clone();
         // Like fchmodat, path forms resolve in the shim; the broker only sets times by handle.
         let flags = if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
             OFlags::PATH | OFlags::NOFOLLOW
@@ -1362,16 +1375,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             OFlags::PATH
         };
         let file = self.do_open(&path, flags, Mode::empty())?;
-        Ok(file.set_times(user, &times)?)
+        Ok(file.set_times(caller, &times)?)
     }
 
     fn set_fd_times(&self, fd: i32, times: &SetFileTimes) -> Result<(), Errno> {
-        let user = self.fs.borrow().context.read().acting_user();
+        let caller = self.fs.borrow().context.read().caller().clone();
         // XXX: the NULL-path form does not reject O_PATH fds (Linux: EBADF).
         self.with_typed_fd(fd, |fd| match fd.as_file() {
             Some(fd) => self
                 .global
-                .with_file(fd, |file| Ok(file.file().set_times(user, times)?)),
+                .with_file(fd, |file| Ok(file.file().set_times(caller, times)?)),
             None => Ok(()),
         })
     }
@@ -1394,15 +1407,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             log_unsupported!("fchownat flags: {flags:?}");
             return Err(Errno::ENOSYS);
         }
-        let to_id = |id| {
-            if id == u32::MAX {
-                Ok(None)
-            } else {
-                u16::try_from(id).map(Some).map_err(|_| Errno::EINVAL)
-            }
-        };
-        let owner = to_id(owner)?;
-        let group = to_id(group)?;
+        let owner = (owner != u32::MAX).then(|| litebox::credential::Principal::posix_user(owner));
+        let group = (group != u32::MAX).then(|| litebox::credential::Principal::posix_group(group));
         let path = self.resolve_path_at(dirfd, pathname)?;
         let fs = self.fs.borrow();
         let context = fs.context.read();
@@ -1417,7 +1423,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let fd = files.typed_fd(fd)?;
         fd.dispatch(
-            |fd| self.global.with_file(fd, |file| file.truncate(length)),
+            |fd| {
+                let caller = self.fs.borrow().context.read().caller().clone();
+                self.global
+                    .with_file(fd, |file| file.truncate(&caller, length))
+            },
             |_fd| todo!("net"),
             |_fd| todo!("pipes"),
             |_fd| Err(Errno::EINVAL),
@@ -1658,8 +1668,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let is_message_oriented = core::cell::Cell::new(false);
         let result = fd.dispatch(
             |fd| {
-                self.global
-                    .with_file(fd, |file| file.write(&buf, offset, Some(&self.wait_cx())))
+                let caller = self.fs.borrow().context.read().caller().clone();
+                self.global.with_file(fd, |file| {
+                    file.write(&caller, &buf, offset, Some(&self.wait_cx()))
+                })
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
@@ -2314,7 +2326,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn do_access_mode(
         mode: Mode,
-        owner: AccessUserInfo,
+        owner: AccessOwner,
         caller: AccessUserInfo,
         access_mode: &AccessFlags,
     ) -> Result<(), Errno> {
@@ -2331,9 +2343,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         // TODO: Linux also uses group bits when `owner.group` is in the caller's supplementary
         // group list. `AccessUserInfo` only carries the real/effective primary group today.
-        let (read, write, execute) = if caller.user == owner.user {
+        let (read, write, execute) = if owner.user == Some(caller.user) {
             (Mode::RUSR, Mode::WUSR, Mode::XUSR)
-        } else if caller.group == owner.group {
+        } else if owner.group == Some(caller.group) {
             (Mode::RGRP, Mode::WGRP, Mode::XGRP)
         } else {
             (Mode::ROTH, Mode::WOTH, Mode::XOTH)
@@ -2378,8 +2390,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .litebox
                 .path_file_status(&context, pathname, follow_symlink)?
         };
-        let owner = status.owner.into();
-        Self::do_access_mode(status.mode, owner, caller, &mode)
+        Self::do_access_mode(status.mode, (&status).into(), caller, &mode)
     }
 
     /// Handle syscall `faccessat`
@@ -2412,13 +2423,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let typed_fd = files.typed_fd(fd)?;
                 if let Some(file) = typed_fd.as_file() {
                     let status = self.global.with_file(file, File::status)?;
-                    return Self::do_access_mode(status.mode, status.owner.into(), caller, &mode);
+                    return Self::do_access_mode(status.mode, (&status).into(), caller, &mode);
                 }
                 drop(files);
                 let stat: FileStat = self.do_stat(&typed_fd)?;
-                let owner = AccessUserInfo {
-                    user: stat.st_uid,
-                    group: stat.st_gid,
+                let owner = AccessOwner {
+                    user: Some(stat.st_uid),
+                    group: Some(stat.st_gid),
                 };
                 Self::do_access_mode(
                     Mode::from_u32_bits_truncate(stat.st_mode & 0o7777),
@@ -3018,7 +3029,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // when it was opened; root can search any directory.
         let caller = self.access_user(&AtFlags::AT_EACCESS);
         if caller.user != 0 {
-            Self::do_access_mode(status.mode, status.owner.into(), caller, &AccessFlags::X_OK)?;
+            Self::do_access_mode(status.mode, (&status).into(), caller, &AccessFlags::X_OK)?;
         }
         let fs = self.fs.borrow();
         let cwd = fs.context.read().resolve(&path);

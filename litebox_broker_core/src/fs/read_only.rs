@@ -19,16 +19,18 @@ use alloc::vec::Vec;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
-    Backend, CreationMetadata, DirHandle, FileHandle, FileTerminal, HandleRef, PermissionCheck,
-    PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+    Backend, CreationMetadata, DirHandle, EntryRemoval, EntryRename, FileHandle, FileTerminal,
+    HandleRef, OpenChecks, PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile,
+    ResolvedTarget, SeekBehavior,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, ReadDirError,
-    ReadError, RenameError, ResolutionError, RmdirError, SetTimesError, SymlinkError,
-    TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RenameError, ResolutionError, RmdirError, SetSecurityError, SetTimesError,
+    SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::shared_storage::SharedFile;
-use super::{DirEntry, FileStatus, FileType, Mode, OFlags};
+use super::{DirEntry, FileStatus, Mode, OFlags};
+use crate::descriptor::SecurityDescriptor;
 use crate::readiness::ReadinessSource;
 
 /// A [`Backend`] that refuses changes to an inner backend.
@@ -46,18 +48,18 @@ impl<B: Backend> ReadOnly<B> {
 
 fn mark_read_only(permissions: &mut PermissionCheck) {
     match permissions {
-        PermissionCheck::ByResolver(permissions) => permissions.on_read_only_fs = true,
+        PermissionCheck::ByResolver(permissions) => permissions.set_read_only_fs(),
         PermissionCheck::ByBackend => {
             // ByBackend backends are covered by the open-flag and mutation checks below.
         }
     }
 }
 
-// Strip APPEND so an Overlay inner backend doesn't copy up on a read-only open.
 fn read_only_flags(flags: OFlags) -> Result<OFlags, OpenError> {
     if flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::TRUNC) {
         return Err(OpenError::ReadOnlyFileSystem);
     }
+    // A read-only open must not trigger copy-up in an inner overlay.
     Ok(flags - OFlags::APPEND)
 }
 
@@ -89,6 +91,10 @@ impl<B: Backend> Backend for ReadOnly<B> {
         self.inner.read_link_at(dir, name)
     }
 
+    fn read_resolved_link(&self, file: &ResolvedFile<'_>) -> Result<String, WalkError> {
+        self.inner.read_resolved_link(file)
+    }
+
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
         self.inner.open_dir(dir, read_only_flags(flags)?)
     }
@@ -100,11 +106,6 @@ impl<B: Backend> Backend for ReadOnly<B> {
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
-        if matches!(file.file_type, FileType::CharacterDevice)
-            && flags.intersects(OFlags::WRONLY | OFlags::RDWR)
-        {
-            unimplemented!("writable device open on a read-only filesystem");
-        }
         self.inner.open_file(file, read_only_flags(flags)?)
     }
 
@@ -231,5 +232,109 @@ impl<B: Backend> Backend for ReadOnly<B> {
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
         Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn create_file_checked(
+        &self,
+        _parent: ResolvedDir<'_>,
+        _name: &str,
+        _authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, OpenError>,
+    ) -> Result<FileHandle, OpenError> {
+        Err(OpenError::ReadOnlyFileSystem)
+    }
+
+    fn symlink_checked(
+        &self,
+        _dir: ResolvedDir<'_>,
+        _name: &str,
+        _target: &str,
+        _authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, SymlinkError>,
+    ) -> Result<(), SymlinkError> {
+        Err(SymlinkError::ReadOnlyFileSystem)
+    }
+
+    fn mkdir_checked(
+        &self,
+        _parent: ResolvedDir<'_>,
+        _name: &str,
+        _authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, MkdirError>,
+    ) -> Result<DirHandle, MkdirError> {
+        Err(MkdirError::ReadOnlyFileSystem)
+    }
+
+    fn unlink_checked(
+        &self,
+        _parent: ResolvedDir<'_>,
+        _name: &str,
+        _authorize: &dyn Fn(&EntryRemoval<'_>) -> Result<(), UnlinkError>,
+    ) -> Result<(), UnlinkError> {
+        Err(UnlinkError::ReadOnlyFileSystem)
+    }
+
+    fn rmdir_checked(
+        &self,
+        _parent: ResolvedDir<'_>,
+        _name: &str,
+        _authorize: &dyn Fn(&EntryRemoval<'_>) -> Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
+        Err(RmdirError::ReadOnlyFileSystem)
+    }
+
+    fn rename_checked(
+        &self,
+        _old_dir: DirHandle,
+        _old_name: &str,
+        _new_dir: DirHandle,
+        _new_name: &str,
+        _authorize: &dyn Fn(&EntryRename<'_>) -> Result<(), RenameError>,
+    ) -> Result<(), RenameError> {
+        Err(RenameError::ReadOnlyFileSystem)
+    }
+
+    fn set_times_checked(
+        &self,
+        _target: ResolvedTarget<'_>,
+        _times: &super::SetFileTimes,
+        _authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), SetTimesError>,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
+    }
+
+    fn update_security(
+        &self,
+        _target: ResolvedTarget<'_>,
+        _update: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, SetSecurityError>,
+    ) -> Result<(), SetSecurityError> {
+        Err(SetSecurityError::ReadOnlyFileSystem)
+    }
+
+    // Truncating opens fail (see `read_only_flags`), so opens change no contents.
+    fn open_file_checked(
+        &self,
+        file: ResolvedFile<'_>,
+        flags: OFlags,
+        checks: &OpenChecks<'_>,
+    ) -> Result<FileHandle, OpenError> {
+        self.inner
+            .open_file_checked(file, read_only_flags(flags)?, checks)
+    }
+
+    fn write_checked(
+        &self,
+        _h: &FileHandle,
+        _buf: &dyn WriteBuffer,
+        _offset: usize,
+        _content_change: &dyn Fn(&mut SecurityDescriptor),
+    ) -> Result<usize, WriteError> {
+        Err(WriteError::NotForWriting)
+    }
+
+    fn truncate_checked(
+        &self,
+        _h: &FileHandle,
+        _length: usize,
+        _content_change: &dyn Fn(&mut SecurityDescriptor),
+    ) -> Result<(), TruncateError> {
+        Err(TruncateError::NotForWriting)
     }
 }

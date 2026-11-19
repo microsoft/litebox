@@ -84,8 +84,9 @@ use litebox_broker_core::fs::errors::{
     TruncateError, UnlinkError, WalkError, WriteError,
 };
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
-use litebox_broker_core::fs::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use litebox_broker_core::fs::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags};
 use litebox_broker_core::transfer::bounce_buffer;
+use litebox_broker_protocol::authority::Principal;
 use litebox_broker_protocol::fs::{FileTimestamp, FileTimestamps, SetFileTimes};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
@@ -348,17 +349,18 @@ fn status_from_metadata(
     node_info: NodeInfo,
 ) -> std::io::Result<FileStatus> {
     let file_type = host_file_type(metadata)?;
-    let (mode, owner, blksize) = {
+    let (mode, (owner, group), blksize) = {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            let owner = UserInfo {
-                user: u16::try_from(metadata.uid()).unwrap_or(65534),
-                group: u16::try_from(metadata.gid()).unwrap_or(65534),
-            };
+            // The host's ids are reported in full; guests choose how to present them.
+            let owners = (
+                Principal::posix_user(metadata.uid()),
+                Principal::posix_group(metadata.gid()),
+            );
             (
                 Mode::from_u32_bits_truncate(metadata.mode()),
-                owner,
+                owners,
                 metadata.blksize(),
             )
         }
@@ -383,7 +385,11 @@ fn status_from_metadata(
             litebox_util_log::debug!(
                 "reporting a 4096-byte block size because Windows reports none"
             );
-            (mode, UserInfo::ROOT, 4096)
+            (
+                mode,
+                (Principal::posix_user(0), Principal::posix_group(0)),
+                4096,
+            )
         }
     };
     Ok(FileStatus {
@@ -391,6 +397,7 @@ fn status_from_metadata(
         mode,
         size: metadata.len(),
         owner,
+        group,
         node_info,
         blksize,
         times: Some(timestamps_from_metadata(metadata)?),
@@ -1215,7 +1222,7 @@ impl Backend for LocalFs {
                 {
                     litebox_util_log::debug!(
                         uid = metadata.uid(), gid = metadata.gid();
-                        "rejecting chown of a host owner that stat reports as 65534"
+                        "rejecting chown of a host owner whose ids exceed 16 bits"
                     );
                 }
                 return Err(ChownError::NotTheOwner);
@@ -1231,8 +1238,9 @@ impl Backend for LocalFs {
                 user:? = user, group:? = group;
                 "emulating Windows chown against the reported root owner"
             );
-            if user.is_some_and(|user| user != UserInfo::ROOT.user)
-                || group.is_some_and(|group| group != UserInfo::ROOT.group)
+            let root = litebox_broker_core::fs::UserInfo::ROOT;
+            if user.is_some_and(|user| user != root.user)
+                || group.is_some_and(|group| group != root.group)
             {
                 Err(ChownError::NotTheOwner)
             } else {

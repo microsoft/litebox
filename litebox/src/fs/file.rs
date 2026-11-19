@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode as Mode,
+    FileAccessMode, FileCaller, FileDirectoryEntry, FileError, FileLockOperation, FileMode as Mode,
     FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
     MAX_FILE_TRANSFER_SIZE, SetFileTimes,
 };
@@ -21,6 +21,7 @@ use litebox_platform::time::TimeProvider;
 
 use crate::broker::error::BrokerControlError;
 use crate::broker::{BrokerControl, BrokerPollableRegistry, readiness_events};
+use crate::credential::RegisteredSubject;
 use crate::event::observer::Observer;
 use crate::event::polling::{Pollee, TryOpError};
 use crate::event::wait::WaitContext;
@@ -56,6 +57,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         context.resolve(path).to_string()
     }
 
+    fn file_caller(
+        &self,
+        context: &Context,
+    ) -> Result<(Arc<dyn BrokerControl>, FileCaller), FileError> {
+        let broker = self.broker_control().ok_or(FileError::Io)?;
+        let caller = context.caller().for_broker(&broker)?;
+        Ok((broker, caller))
+    }
+
     /// Opens a file.
     ///
     /// `access` and `flags` use the architecture-independent broker contract.
@@ -72,15 +82,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         if FileOpenFlags::from_bits(flags.bits()).is_none() {
             return Err(OpenError::AccessNotAllowed);
         }
-        let broker = self.broker_control().ok_or(OpenError::Io)?;
+        let (broker, caller) = self.file_caller(context)?;
         let handle = broker
-            .open_file(
-                &path,
-                context.acting_user(),
-                access,
-                flags,
-                mode & Mode::SUPPORTED,
-            )
+            .open_file(&path, caller, access, flags, mode & Mode::SUPPORTED)
             .map_err(|_| OpenError::Io)??;
         Ok(File::new(self, broker, handle))
     }
@@ -102,12 +106,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
 
     /// Change the permissions of a file.
     pub fn chmod_file(&self, context: &Context, path: &str, mode: Mode) -> Result<(), ChmodError> {
-        let path = Self::broker_path(context, path);
-        self.broker_control()
-            .ok_or(ChmodError::Io)?
-            .chmod_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
-            .map_err(|_| ChmodError::Io)?
-            .map_err(ChmodError::from)
+        self.set_file_security(
+            context,
+            path,
+            super::SecurityUpdate {
+                mode: Some(mode & Mode::SUPPORTED),
+                ..Default::default()
+            },
+        )
+        .map_err(ChmodError::from)
     }
 
     /// Change the owner of a file.
@@ -115,15 +122,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         &self,
         context: &Context,
         path: &str,
-        user: Option<u16>,
-        group: Option<u16>,
+        owner: Option<crate::credential::Principal>,
+        group: Option<crate::credential::Principal>,
     ) -> Result<(), ChownError> {
+        self.set_file_security(
+            context,
+            path,
+            super::SecurityUpdate {
+                owner,
+                group,
+                mode: None,
+            },
+        )
+        .map_err(ChownError::from)
+    }
+
+    /// Changes access and ownership atomically, preserving fields not present in the update.
+    pub fn set_file_security(
+        &self,
+        context: &Context,
+        path: &str,
+        update: super::SecurityUpdate,
+    ) -> Result<(), FileError> {
         let path = Self::broker_path(context, path);
-        self.broker_control()
-            .ok_or(ChownError::Io)?
-            .chown_file(&path, context.acting_user(), user, group)
-            .map_err(|_| ChownError::Io)?
-            .map_err(ChownError::from)
+        let (broker, caller) = self.file_caller(context)?;
+        broker
+            .set_file_security(&path, caller, update)
+            .map_err(|_| FileError::Io)?
     }
 
     /// Create a symbolic link at `linkpath`, storing `target` verbatim.
@@ -137,9 +162,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         linkpath: &str,
     ) -> Result<(), SymlinkError> {
         let linkpath = Self::broker_path(context, linkpath);
-        self.broker_control()
-            .ok_or(SymlinkError::Io)?
-            .symlink_file(target, &linkpath, context.acting_user())
+        let (broker, caller) = self.file_caller(context)?;
+        broker
+            .symlink_file(target, &linkpath, caller)
             .map_err(|_| SymlinkError::Io)?
             .map_err(SymlinkError::from)
     }
@@ -147,9 +172,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// Unlink a file.
     pub fn unlink_file(&self, context: &Context, path: &str) -> Result<(), UnlinkError> {
         let path = Self::broker_path(context, path);
-        self.broker_control()
-            .ok_or(UnlinkError::Io)?
-            .unlink_file(&path, context.acting_user())
+        let (broker, caller) = self.file_caller(context)?;
+        broker
+            .unlink_file(&path, caller)
             .map_err(|_| UnlinkError::Io)?
             .map_err(UnlinkError::from)
     }
@@ -177,13 +202,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             absolute.push_str(path);
             absolute
         };
-        self.broker_control()
-            .ok_or(RenameError::Io)?
-            .rename_file(
-                &absolute_path(old_path),
-                &absolute_path(new_path),
-                context.acting_user(),
-            )
+        let (broker, caller) = self.file_caller(context)?;
+        broker
+            .rename_file(&absolute_path(old_path), &absolute_path(new_path), caller)
             .map_err(|_| RenameError::Io)?
             .map_err(RenameError::from)
     }
@@ -191,9 +212,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// Create a new directory.
     pub fn mkdir_file(&self, context: &Context, path: &str, mode: Mode) -> Result<(), MkdirError> {
         let path = Self::broker_path(context, path);
-        self.broker_control()
-            .ok_or(MkdirError::Io)?
-            .mkdir_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
+        let (broker, caller) = self.file_caller(context)?;
+        broker
+            .mkdir_file(&path, caller, mode & Mode::SUPPORTED)
             .map_err(|_| MkdirError::Io)?
             .map_err(MkdirError::from)
     }
@@ -214,18 +235,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             absolute.push_str(path);
             absolute
         };
-        self.broker_control()
-            .ok_or(FileError::Io)?
-            .mount_in_mem(&path, context.acting_user())
+        let (broker, caller) = self.file_caller(context)?;
+        broker
+            .mount_in_mem(&path, caller)
             .map_err(|_| FileError::Io)?
     }
 
     /// Remove a directory.
     pub fn rmdir_file(&self, context: &Context, path: &str) -> Result<(), RmdirError> {
         let path = Self::broker_path(context, path);
-        self.broker_control()
-            .ok_or(RmdirError::Io)?
-            .rmdir_file(&path, context.acting_user())
+        let (broker, caller) = self.file_caller(context)?;
+        broker
+            .rmdir_file(&path, caller)
             .map_err(|_| RmdirError::Io)?
             .map_err(RmdirError::from)
     }
@@ -240,9 +261,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         follow_symlinks: bool,
     ) -> Result<FileStatus, FileStatusError> {
         let path = Self::broker_path(context, path);
-        self.broker_control()
-            .ok_or(FileStatusError::Io)?
-            .path_file_status(&path, context.acting_user(), follow_symlinks)
+        let (broker, caller) = self.file_caller(context)?;
+        broker
+            .path_file_status(&path, caller, follow_symlinks)
             .map_err(|_| FileStatusError::Io)?
             .map_err(FileStatusError::from)
     }
@@ -250,9 +271,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// Read a symbolic link's stored target, without following the final link.
     pub fn read_link_file(&self, context: &Context, path: &str) -> Result<String, WalkError> {
         let path = Self::broker_path(context, path);
-        self.broker_control()
-            .ok_or(WalkError::Io)?
-            .read_link_file(&path, context.acting_user())
+        let (broker, caller) = self.file_caller(context)?;
+        broker
+            .read_link_file(&path, caller)
             .map_err(|_| WalkError::Io)?
             .map_err(WalkError::from)
     }
@@ -264,33 +285,75 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         path: &str,
     ) -> Result<ResolvedPath, WalkError> {
         let path = Self::broker_path(context, path);
-        let resolved = self
-            .broker_control()
-            .ok_or(WalkError::Io)?
-            .resolve_file_path(&path, context.acting_user())
+        let (broker, caller) = self.file_caller(context)?;
+        let resolved = broker
+            .resolve_file_path(&path, caller)
             .map_err(|_| WalkError::Io)?
             .map_err(WalkError::from)?;
         Ok(Context::new().resolve(&resolved))
     }
 }
 
-/// Caller-owned filesystem context containing a working directory and acting user.
+/// Identity used for a filesystem operation. A registered subject stays live
+/// across cloned contexts and can only be used with the service that registered it.
+#[derive(Clone, Debug)]
+pub enum Caller {
+    /// Numerical IDs for a file service that has not enabled credentials.
+    Legacy(UserInfo),
+    /// A process-private subject, checked by the service at each request.
+    Subject(Arc<RegisteredSubject>),
+}
+
+impl Caller {
+    fn content_subject(
+        &self,
+        broker: &Arc<dyn BrokerControl>,
+    ) -> Result<Option<ObjectHandle>, FileError> {
+        match self.for_broker(broker)? {
+            FileCaller::Legacy(_) => Ok(None),
+            FileCaller::Subject(handle) => Ok(Some(handle)),
+        }
+    }
+
+    fn for_broker(&self, broker: &Arc<dyn BrokerControl>) -> Result<FileCaller, FileError> {
+        match self {
+            Self::Legacy(user) => Ok(FileCaller::Legacy(*user)),
+            Self::Subject(subject) => subject
+                .handle_for(broker)
+                .map(FileCaller::Subject)
+                .ok_or(FileError::AccessNotAllowed),
+        }
+    }
+}
+
+impl From<UserInfo> for Caller {
+    fn from(user: UserInfo) -> Self {
+        Self::Legacy(user)
+    }
+}
+
+/// Caller-owned filesystem context containing a working directory and a caller identity.
 #[derive(Clone, Debug)]
 pub struct Context {
     cwd: Arc<ResolvedPath>,
-    user_info: UserInfo,
+    caller: Caller,
 }
 
 impl Context {
-    /// The user that operations on this context act as.
+    /// The identity used for operations on this context.
     #[must_use]
-    pub fn acting_user(&self) -> UserInfo {
-        self.user_info
+    pub fn caller(&self) -> &Caller {
+        &self.caller
     }
 
-    /// Set the user that operations on this context act as.
+    /// Select numerical IDs for a legacy file service.
     pub fn set_acting_user(&mut self, user: UserInfo) {
-        self.user_info = user;
+        self.caller = Caller::Legacy(user);
+    }
+
+    /// Select a registered subject instead of presenting unverified user IDs.
+    pub fn set_subject(&mut self, subject: Arc<RegisteredSubject>) {
+        self.caller = Caller::Subject(subject);
     }
 
     /// The current working directory.
@@ -309,10 +372,10 @@ impl Context {
     pub fn new() -> Self {
         Self {
             cwd: Arc::new(ResolvedPath { components: vec![] }),
-            user_info: UserInfo {
+            caller: Caller::Legacy(UserInfo {
                 user: 1000,
                 group: 1000,
-            },
+            }),
         }
     }
 
@@ -452,6 +515,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         offset: Option<usize>,
         wait: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, WriteError> {
+        self.write_inner(None, buf, offset, wait)
+    }
+
+    /// Writes as the current caller, which need not be the caller that opened the file.
+    /// A credential-enabled file service requires this in place of [`Self::write`].
+    pub fn write_as(
+        &self,
+        caller: &Caller,
+        buf: impl WriteBuffer,
+        offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<usize, WriteError> {
+        self.write_inner(caller.content_subject(&self.broker)?, buf, offset, wait)
+    }
+
+    fn write_inner(
+        &self,
+        subject: Option<ObjectHandle>,
+        buf: impl WriteBuffer,
+        offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<usize, WriteError> {
         let offset = offset
             .map(u64::try_from)
             .transpose()
@@ -462,7 +547,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             let offset = offset.map(|offset| offset.saturating_add(written as u64));
             match self.wait(wait, Events::OUT, || {
                 self.broker
-                    .write_file(self.handle, &(&buf).sub_buffer(written, length), offset)?
+                    .write_file(
+                        self.handle,
+                        subject,
+                        &(&buf).sub_buffer(written, length),
+                        offset,
+                    )?
                     .map_err(|error| TryOpError::Other(error.into()))
             }) {
                 Ok(count) => {
@@ -486,9 +576,30 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
 
     /// Truncates the file to the specified length.
     pub fn truncate(&self, length: usize, reset_offset: bool) -> Result<(), TruncateError> {
+        self.truncate_inner(None, length, reset_offset)
+    }
+
+    /// Changes the length as the current caller. A credential-enabled file service
+    /// requires this in place of [`Self::truncate`].
+    pub fn truncate_as(
+        &self,
+        caller: &Caller,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), TruncateError> {
+        self.truncate_inner(caller.content_subject(&self.broker)?, length, reset_offset)
+    }
+
+    fn truncate_inner(
+        &self,
+        subject: Option<ObjectHandle>,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), TruncateError> {
         self.broker
             .truncate_file(
                 self.handle,
+                subject,
                 u64::try_from(length).map_err(|_| TruncateError::Io)?,
                 reset_offset,
             )?
@@ -546,10 +657,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(FileStatusError::from)
     }
 
-    /// Changes this open file's access and modification timestamps as `user`.
-    pub fn set_times(&self, user: UserInfo, times: &SetFileTimes) -> Result<(), SetTimesError> {
+    /// Changes this open file's access and modification timestamps as `caller`.
+    pub fn set_times(
+        &self,
+        caller: impl Into<Caller>,
+        times: &SetFileTimes,
+    ) -> Result<(), SetTimesError> {
+        let caller = caller.into().for_broker(&self.broker)?;
         self.broker
-            .set_file_times(self.handle, user, times)?
+            .set_file_times(self.handle, caller, times)?
             .map_err(SetTimesError::from)
     }
 
@@ -847,6 +963,7 @@ impl From<BrokerControlError> for StatusFlagsError {
 // broadening every LiteBox file API to the full set of `FileError` variants.
 fn path_error(error: FileError) -> Option<PathError> {
     match error {
+        FileError::StaleSubject => Some(PathError::StaleSubject),
         FileError::NoSuchFileOrDirectory => Some(PathError::NoSuchFileOrDirectory),
         FileError::NoSearchPermissions => Some(PathError::NoSearchPerms),
         FileError::InvalidPathname => Some(PathError::InvalidPathname),
@@ -891,6 +1008,7 @@ impl From<FileError> for ReadError {
 impl From<FileError> for WriteError {
     fn from(error: FileError) -> Self {
         match error {
+            FileError::StaleSubject => Self::StaleSubject,
             FileError::NotFile => Self::NotAFile,
             FileError::AccessNotAllowed | FileError::NotForWriting => Self::NotForWriting,
             FileError::NoSpace => Self::NoSpace,
@@ -915,6 +1033,7 @@ impl From<FileError> for SeekError {
 impl From<FileError> for TruncateError {
     fn from(error: FileError) -> Self {
         match error {
+            FileError::StaleSubject => Self::StaleSubject,
             FileError::IsDirectory => Self::IsDirectory,
             FileError::AccessNotAllowed | FileError::NotForWriting => Self::NotForWriting,
             FileError::PathOnly => Self::NotOpenForWriting,
@@ -945,6 +1064,7 @@ impl From<FileError> for ChownError {
             return error.into();
         }
         match error {
+            FileError::InvalidArgument => Self::InvalidOwner,
             FileError::NotOwner => Self::NotTheOwner,
             FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
             _ => Self::Io,
@@ -989,6 +1109,7 @@ impl From<FileError> for UnlinkError {
         }
         match error {
             FileError::NoWritePermissions => Self::NoWritePerms,
+            FileError::NotOwner => Self::NotOwner,
             FileError::IsDirectory => Self::IsADirectory,
             FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
             _ => Self::Io,
@@ -1003,6 +1124,7 @@ impl From<FileError> for RenameError {
         }
         match error {
             FileError::NoWritePermissions => Self::NoWritePerms,
+            FileError::NotOwner => Self::NotOwner,
             FileError::Busy => Self::Busy,
             FileError::CrossDevice => Self::CrossDevice,
             FileError::InvalidArgument => Self::InvalidArgument,
@@ -1036,6 +1158,7 @@ impl From<FileError> for RmdirError {
         }
         match error {
             FileError::NoWritePermissions => Self::NoWritePerms,
+            FileError::NotOwner => Self::NotOwner,
             FileError::Busy => Self::Busy,
             FileError::NotEmpty => Self::NotEmpty,
             FileError::NotDirectory => Self::NotADirectory,

@@ -5827,17 +5827,25 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let exported_writable = |mapping: &crate::fs::shared_storage::SharedFileMapping| {
+            crate::fs::shared_storage::test_memory::exported_writable(
+                &*mapping.mapping().host_handle(0).unwrap(),
+            )
+        };
         let mapping = crate::fs::map_shared(&source, file).unwrap().unwrap();
-        assert!(mapping.writable);
+        assert!(mapping.writable());
+        assert!(exported_writable(&mapping));
 
         // A reference that grants only reading maps the same memory, by the same ID, but only
-        // read-only, even though the file is open for writing.
+        // read-only, even though the file is open for writing: the host object it exports
+        // allows only reading too.
         let reader = source
             .duplicate_object_reference_to(file, &target, ObjectRights::WAIT)
             .unwrap();
         let shared = crate::fs::map_shared(&target, reader).unwrap().unwrap();
-        assert!(!shared.writable);
-        assert_eq!(shared.memory_id, mapping.memory_id);
+        assert!(!shared.writable());
+        assert!(!exported_writable(&shared));
+        assert_eq!(shared.memory_id(), mapping.memory_id());
         // One that grants only writing cannot read the file through a mapping either.
         let writer = source
             .duplicate_object_reference_to(file, &target, ObjectRights::WRITE)
@@ -5875,7 +5883,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(crate::fs::write(&source, file, b"abcdef", None), Ok(Ok(6)));
+        assert_eq!(
+            crate::fs::write(&source, file, None, b"abcdef", None),
+            Ok(Ok(6))
+        );
         assert_eq!(
             crate::fs::seek(&source, file, 0, FileSeekWhence::RelativeToBeginning),
             Ok(Ok(0))
@@ -6016,7 +6027,7 @@ mod tests {
         let write_only_random = Arc::clone(&broker.fs)
             .open(
                 "/dev/urandom",
-                ROOT,
+                ROOT.into(),
                 FileAccessMode::WriteOnly,
                 FileOpenFlags::NONE,
                 FileMode::default(),
@@ -6032,7 +6043,7 @@ mod tests {
         let read_only_null = Arc::clone(&broker.fs)
             .open(
                 "/dev/null",
-                ROOT,
+                ROOT.into(),
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::NONE,
                 FileMode::default(),
@@ -6060,11 +6071,11 @@ mod tests {
             .duplicate_object_reference_to(stdout, &target, ObjectRights::WRITE)
             .unwrap();
         assert_eq!(
-            crate::fs::write(&source, stdout, b"source", None),
+            crate::fs::write(&source, stdout, None, b"source", None),
             Ok(Ok(6))
         );
         assert_eq!(
-            crate::fs::write(&target, duplicated_stdout, b"target", None),
+            crate::fs::write(&target, duplicated_stdout, None, b"target", None),
             Ok(Ok(6))
         );
         assert_eq!(

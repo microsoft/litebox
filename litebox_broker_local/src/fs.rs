@@ -7,15 +7,15 @@ use alloc::vec::Vec;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
-    ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
-    FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
-    FilePathResponse, FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest,
-    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MAX_FILE_TRANSFER_SIZE,
-    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
-    RenameFileRequest, ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes,
-    SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
+    DirectoryPayloadError, DirectoryTransferError, FileAccessMode, FileCaller, FileDirectoryEntry,
+    FileError, FileLockOperation, FileMode, FileOpenFlags, FilePathResponse, FileSecurityUpdate,
+    FileSeekWhence, FileStatus, HandleFilePathRequest, HandleFileStatusRequest,
+    IsTerminalFileRequest, LockFileRequest, MAX_FILE_TRANSFER_SIZE, MapFileRequest,
+    MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest, RenameFileRequest,
+    ResolvePathFileRequest, RmdirFileRequest, SeekFileRequest, SetFileSecurityRequest,
+    SetFileTimes, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -39,7 +39,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
+        caller: impl Into<FileCaller>,
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: FileMode,
@@ -47,7 +47,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Open(OpenFileRequest {
             path: path_buffer,
-            user,
+            caller: caller.into(),
             access,
             flags,
             mode,
@@ -100,6 +100,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn write_file(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
         buffer: SharedBufferSequence,
         data: &dyn WriteBuffer,
         offset: Option<u64>,
@@ -108,6 +109,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         self.copy_to_shared_buffer(buffer, 0, data)?;
         match self.request_file(FileRequest::Write(WriteFileRequest {
             handle,
+            subject,
             buffer,
             offset,
         }))? {
@@ -153,11 +155,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn truncate_file(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
         length: u64,
         reset_offset: bool,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         match self.request_file(FileRequest::Truncate(TruncateFileRequest {
             handle,
+            subject,
             length,
             reset_offset,
         }))? {
@@ -271,13 +275,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
+        caller: impl Into<FileCaller>,
         follow_symlinks: bool,
     ) -> Result<FileOperationResult<FileStatus>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::PathStatus(PathFileStatusRequest {
             path: path_buffer,
-            user,
+            caller: caller.into(),
             follow_symlinks,
         }))? {
             FileResponse::PathStatus(status) => Ok(Ok(status)),
@@ -316,12 +320,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn set_file_times(
         &self,
         handle: ObjectHandle,
-        user: FileUser,
+        caller: impl Into<FileCaller>,
         times: &SetFileTimes,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         match self.request_file(FileRequest::SetTimes(SetTimesFileRequest {
             handle,
-            user,
+            caller: caller.into(),
             times: *times,
         }))? {
             FileResponse::SetTimes => Ok(Ok(())),
@@ -370,55 +374,28 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Changes mode bits for an absolute path.
+    /// Updates the object's security metadata in one operation.
     ///
     /// # Panics
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
-    pub fn chmod_file(
+    pub fn set_file_security(
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
-        mode: FileMode,
+        caller: impl Into<FileCaller>,
+        update: FileSecurityUpdate,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
-        match self.request_file(FileRequest::Chmod(ChmodFileRequest {
+        match self.request_file(FileRequest::SetSecurity(SetFileSecurityRequest {
             path: path_buffer,
-            user,
-            mode,
+            caller: caller.into(),
+            update,
         }))? {
-            FileResponse::Chmod => Ok(Ok(())),
+            FileResponse::SetSecurity => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected file chmod response: {response:?}"),
-        }
-    }
-
-    /// Changes ownership for an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer sequence is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn chown_file(
-        &self,
-        path_buffer: SharedBufferSequence,
-        path: &str,
-        acting_user: FileUser,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
-        match self.request_file(FileRequest::Chown(ChownFileRequest {
-            path: path_buffer,
-            acting_user,
-            user,
-            group,
-        }))? {
-            FileResponse::Chown => Ok(Ok(())),
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected file chown response: {response:?}"),
+            response => panic!("broker returned unexpected set-security response: {response:?}"),
         }
     }
 
@@ -432,12 +409,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
+        caller: impl Into<FileCaller>,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Unlink(UnlinkFileRequest {
             path: path_buffer,
-            user,
+            caller: caller.into(),
         }))? {
             FileResponse::Unlink => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -456,7 +433,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         paths_buffer: SharedBufferSequence,
         old_path: &str,
         new_path: &str,
-        user: FileUser,
+        caller: impl Into<FileCaller>,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         let length = old_path
             .len()
@@ -470,7 +447,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         match self.request_file(FileRequest::Rename(RenameFileRequest {
             paths: paths_buffer,
             old_path_length,
-            user,
+            caller: caller.into(),
         }))? {
             FileResponse::Rename => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -488,13 +465,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
+        caller: impl Into<FileCaller>,
         mode: FileMode,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Mkdir(MkdirFileRequest {
             path: path_buffer,
-            user,
+            caller: caller.into(),
             mode,
         }))? {
             FileResponse::Mkdir => Ok(Ok(())),
@@ -513,12 +490,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
+        caller: impl Into<FileCaller>,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Mount(MountFileRequest {
             path: path_buffer,
-            user,
+            caller: caller.into(),
         }))? {
             FileResponse::Mount => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -536,12 +513,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         path_buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
+        caller: impl Into<FileCaller>,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Rmdir(RmdirFileRequest {
             path: path_buffer,
-            user,
+            caller: caller.into(),
         }))? {
             FileResponse::Rmdir => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -562,7 +539,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         target: &str,
         linkpath: &str,
-        user: FileUser,
+        caller: impl Into<FileCaller>,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
         let length = linkpath
             .len()
@@ -577,7 +554,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         match self.request_file(FileRequest::Symlink(SymlinkFileRequest {
             buffer,
             path_length,
-            user,
+            caller: caller.into(),
         }))? {
             FileResponse::Symlink => Ok(Ok(())),
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -597,13 +574,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
+        caller: impl Into<FileCaller>,
     ) -> Result<FileOperationResult<String>, Channel::Error> {
         let path_length = self.write_path_query_buffer(buffer, path)?;
         match self.request_file(FileRequest::ReadLink(ReadLinkFileRequest {
             buffer,
             path_length,
-            user,
+            caller: caller.into(),
         }))? {
             FileResponse::ReadLink(response) => {
                 Ok(Ok(self.read_path_response_buffer(buffer, response)?))
@@ -625,13 +602,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         buffer: SharedBufferSequence,
         path: &str,
-        user: FileUser,
+        caller: impl Into<FileCaller>,
     ) -> Result<FileOperationResult<String>, Channel::Error> {
         let path_length = self.write_path_query_buffer(buffer, path)?;
         match self.request_file(FileRequest::ResolvePath(ResolvePathFileRequest {
             buffer,
             path_length,
-            user,
+            caller: caller.into(),
         }))? {
             FileResponse::ResolvePath(response) => {
                 Ok(Ok(self.read_path_response_buffer(buffer, response)?))
@@ -748,9 +725,10 @@ mod tests {
     use super::*;
     use alloc::sync::Arc;
     use core::{cell::RefCell, convert::Infallible};
+    use litebox_broker_protocol::authority::{DomainId, Principal};
     use litebox_broker_protocol::fs::{
-        FileNodeInfo, FileType, OpenFileResponse, ReadDirectoryResponse, ReadFileResponse,
-        SeekFileResponse, WriteFileResponse, encode_directory_entries,
+        FileNodeInfo, FileType, FileUser, OpenFileResponse, ReadDirectoryResponse,
+        ReadFileResponse, SeekFileResponse, WriteFileResponse, encode_directory_entries,
     };
     use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
     use litebox_broker_protocol::shared_buffer::{
@@ -771,7 +749,13 @@ mod tests {
             file_type: FileType::RegularFile,
             mode: FileMode::from_bits(0o600).unwrap(),
             size: 3,
-            owner: ROOT,
+            // The local API reports owners as the broker stores them, beyond 16 bits and in
+            // domains outside POSIX alike.
+            owner: Principal::posix_user(100_000),
+            group: Principal {
+                domain: DomainId(9),
+                id: 4,
+            },
             node_info: FileNodeInfo {
                 dev: 1,
                 ino: 2,
@@ -823,7 +807,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .write_file(handle, sequence([1], 3), b"abc", None)
+                .write_file(handle, None, sequence([1], 3), b"abc", None)
                 .unwrap(),
             Ok(3)
         );
@@ -906,8 +890,10 @@ mod tests {
             local.mount_in_mem(buffer, "/mount", user).unwrap(),
             Err(FileError::AccessNotAllowed)
         );
-        let request =
-            BrokerOperation::File(FileRequest::Mount(MountFileRequest { path: buffer, user }));
+        let request = BrokerOperation::File(FileRequest::Mount(MountFileRequest {
+            path: buffer,
+            caller: user.into(),
+        }));
         assert_eq!(request.shared_buffer(), Some(buffer));
         assert_eq!(
             local.channel.sent_operations.borrow().as_slice(),
@@ -947,7 +933,7 @@ mod tests {
         );
         let request = BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
             handle,
-            user,
+            caller: user.into(),
             times,
         }));
         assert_eq!(
@@ -1012,7 +998,7 @@ mod tests {
             Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))
         ));
         assert!(matches!(
-            local.write_file(ObjectHandle(1), oversized, &[], None),
+            local.write_file(ObjectHandle(1), None, oversized, &[], None),
             Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))
         ));
         assert!(local.channel.sent_operations.borrow().is_empty());
@@ -1038,7 +1024,7 @@ mod tests {
 
         assert_eq!(
             local
-                .write_file(ObjectHandle(1), buffer, &data, None)
+                .write_file(ObjectHandle(1), None, buffer, &data, None)
                 .unwrap(),
             Ok(length)
         );

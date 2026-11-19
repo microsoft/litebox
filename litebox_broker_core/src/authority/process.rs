@@ -79,8 +79,20 @@ impl BrokerProcess {
         scope: Option<Scope>,
         operation: impl FnOnce(&Subject) -> R,
     ) -> Result<R> {
+        self.with_subject_authority(handle, scope, |subject, _| operation(subject))
+    }
+
+    /// Supplies the same authority snapshot that admitted the subject for
+    /// this request. A descriptor mutation checks delegation against that
+    /// snapshot, not against a separately sampled process authority.
+    pub(crate) fn with_subject_authority<R>(
+        &self,
+        handle: ObjectHandle,
+        scope: Option<Scope>,
+        operation: impl FnOnce(&Subject, &Authority) -> R,
+    ) -> Result<R> {
         let object = self.authorized_object(handle, ObjectRights::empty())?;
-        let subject = {
+        let (subject, authority) = {
             let mut object = object.write();
             let ObjectEntry::Subject(registered) = &mut *object else {
                 return Err(BrokerError::InvalidRights);
@@ -95,9 +107,9 @@ impl BrokerProcess {
                 }
                 registered.admitted_under = Arc::downgrade(&current);
             }
-            Arc::clone(&registered.subject)
+            (Arc::clone(&registered.subject), current)
         };
-        Ok(operation(&subject))
+        Ok(operation(&subject, &authority))
     }
 }
 

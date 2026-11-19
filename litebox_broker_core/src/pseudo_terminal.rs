@@ -28,6 +28,7 @@ use litebox_broker_protocol::terminal::{
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, MutexGuard};
 
+use crate::descriptor::SecurityDescriptor;
 use crate::fs::FileResult;
 use crate::fs::errors::{OpenError, PathError, ReadError, WriteError};
 use crate::pid_namespace::PidNamespaceId;
@@ -118,13 +119,24 @@ pub(crate) struct PseudoTerminal {
     /// The PID namespace the subsidiary belongs to.
     owner: TerminalOwner,
     state: Mutex<State>,
+    metadata: Arc<SubsidiaryMetadata>,
+}
+
+/// Path handles retain this metadata without retaining the pair or its index.
+pub(crate) struct SubsidiaryMetadata(Mutex<SecurityDescriptor>);
+
+impl SubsidiaryMetadata {
+    pub(crate) fn descriptor(&self) -> SecurityDescriptor {
+        self.0.lock().clone()
+    }
 }
 
 impl PseudoTerminal {
-    fn new(index: u32) -> Self {
+    fn new(index: u32, descriptor: SecurityDescriptor) -> Self {
         Self {
             index,
             owner: TerminalOwner::default(),
+            metadata: Arc::new(SubsidiaryMetadata(Mutex::new(descriptor))),
             state: Mutex::new(State {
                 engine: TerminalEngine::default(),
                 output: VecDeque::new(),
@@ -147,10 +159,20 @@ impl PseudoTerminal {
     /// Opens a file on the subsidiary. Fails if the manager has closed, or
     /// with [`OpenError::Io`] if the subsidiary is locked.
     pub(crate) fn open_subsidiary(self: &Arc<Self>) -> Result<SubsidiaryFile, OpenError> {
+        self.open_subsidiary_checked(&|_| Ok(()))
+    }
+
+    /// Like [`Self::open_subsidiary`], but first `admit`s the open against
+    /// the subsidiary's descriptor, under the lock that changes to it take.
+    pub(crate) fn open_subsidiary_checked(
+        self: &Arc<Self>,
+        admit: &dyn Fn(&SecurityDescriptor) -> Result<(), OpenError>,
+    ) -> Result<SubsidiaryFile, OpenError> {
         let mut state = self.lock();
         if !state.manager_open {
             return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
         }
+        admit(&self.metadata.0.lock())?;
         if state.locked {
             return Err(OpenError::Io);
         }
@@ -160,6 +182,32 @@ impl PseudoTerminal {
             state.publish();
         }
         Ok(SubsidiaryFile(Arc::clone(self)))
+    }
+
+    /// The subsidiary's descriptor.
+    pub(crate) fn descriptor(&self) -> SecurityDescriptor {
+        self.metadata.descriptor()
+    }
+
+    pub(crate) fn metadata(&self) -> Arc<SubsidiaryMetadata> {
+        Arc::clone(&self.metadata)
+    }
+
+    /// Replaces the subsidiary's descriptor with what `update` computes from
+    /// the current one, under the lock that opens of it take. Fails with
+    /// `hung_up` once the manager has closed, when the subsidiary has no name.
+    pub(crate) fn update_descriptor<E>(
+        &self,
+        update: impl FnOnce(&SecurityDescriptor) -> Result<SecurityDescriptor, E>,
+        hung_up: E,
+    ) -> Result<(), E> {
+        let state = self.lock();
+        if !state.manager_open {
+            return Err(hung_up);
+        }
+        let mut descriptor = self.metadata.0.lock();
+        *descriptor = update(&descriptor)?;
+        Ok(())
     }
 
     fn attach(&self, sink: Arc<dyn TerminalEventSink>) {
@@ -455,9 +503,13 @@ impl PseudoTerminals {
         Self(Mutex::new(Vec::with_capacity(MAX_PSEUDO_TERMINALS)))
     }
 
-    /// Creates a pair with the lowest free index and opens its manager. Fails
-    /// with [`OpenError::NoSpace`] if every index is in use.
-    pub(crate) fn open_manager(&self) -> Result<ManagerFile, OpenError> {
+    /// Creates a pair with the lowest free index, whose subsidiary has
+    /// `descriptor`, and opens its manager. Fails with [`OpenError::NoSpace`]
+    /// if every index is in use.
+    pub(crate) fn open_manager(
+        &self,
+        descriptor: SecurityDescriptor,
+    ) -> Result<ManagerFile, OpenError> {
         let mut pairs = self.0.lock();
         let index = match pairs.iter().position(|pair| pair.strong_count() == 0) {
             Some(index) => index,
@@ -469,6 +521,7 @@ impl PseudoTerminals {
         };
         let pair = Arc::new(PseudoTerminal::new(
             u32::try_from(index).expect("pseudo-terminal limit fits in u32"),
+            descriptor,
         ));
         pairs[index] = Arc::downgrade(&pair);
         Ok(ManagerFile(Arc::new(PseudoTerminalManager(pair))))
@@ -502,6 +555,7 @@ mod tests {
 
     use super::*;
     use crate::readiness::tests::TestReadinessSink;
+    use litebox_broker_protocol::authority::Principal;
 
     const R: ReadinessFlags = ReadinessFlags::READ;
     const W: ReadinessFlags = ReadinessFlags::WRITE;
@@ -520,9 +574,23 @@ mod tests {
         }
     }
 
+    /// A subsidiary descriptor, mode 0620 for `owner` and a group.
+    fn owned_by(owner: u32) -> SecurityDescriptor {
+        crate::fs::backend::mode_descriptor(
+            crate::fs::FileType::CharacterDevice,
+            crate::fs::Mode::RUSR | crate::fs::Mode::WUSR | crate::fs::Mode::WGRP,
+            Principal::posix_user(owner),
+            Principal::posix_group(5),
+        )
+    }
+
+    fn descriptor() -> SecurityDescriptor {
+        owned_by(1000)
+    }
+
     /// An unlocked pair with one open subsidiary file.
     fn open_pair(terminals: &PseudoTerminals) -> (ManagerFile, SubsidiaryFile) {
-        let manager = terminals.open_manager().unwrap();
+        let manager = terminals.open_manager(descriptor()).unwrap();
         let pair = Arc::clone(&manager.endpoint().0);
         assert_eq!(
             manager
@@ -583,7 +651,7 @@ mod tests {
     #[test]
     fn subsidiary_opens_only_when_unlocked_and_managed() {
         let terminals = PseudoTerminals::new();
-        let manager = terminals.open_manager().unwrap();
+        let manager = terminals.open_manager(descriptor()).unwrap();
         let pair = terminals.get(0).unwrap();
         let endpoint = manager.endpoint().as_ref();
         assert_eq!(
@@ -621,12 +689,58 @@ mod tests {
     }
 
     #[test]
+    fn subsidiary_opens_are_admitted_against_its_current_descriptor() {
+        let terminals = PseudoTerminals::new();
+        let manager = terminals.open_manager(descriptor()).unwrap();
+        control(
+            manager.endpoint().as_ref(),
+            TerminalOperation::SetSubsidiaryLock(false),
+        )
+        .unwrap();
+        let pair = terminals.get(0).unwrap();
+        let admit_owner = |owner| {
+            move |descriptor: &SecurityDescriptor| {
+                if descriptor.owner() == Principal::posix_user(owner) {
+                    Ok(())
+                } else {
+                    Err(OpenError::AccessNotAllowed)
+                }
+            }
+        };
+        let _subsidiary = pair.open_subsidiary_checked(&admit_owner(1000)).unwrap();
+        assert_eq!(
+            pair.update_descriptor(
+                |current| {
+                    assert_eq!(*current, descriptor());
+                    Ok::<_, ()>(owned_by(1001))
+                },
+                (),
+            ),
+            Ok(())
+        );
+        assert_eq!(pair.descriptor(), owned_by(1001));
+        assert!(matches!(
+            pair.open_subsidiary_checked(&admit_owner(1000)),
+            Err(OpenError::AccessNotAllowed)
+        ));
+        pair.open_subsidiary_checked(&admit_owner(1001)).unwrap();
+        // A refused change keeps the descriptor, as does any once the subsidiary is unnamed.
+        assert_eq!(pair.update_descriptor(|_| Err(1), 0), Err(1));
+        drop(manager);
+        assert_eq!(pair.update_descriptor(|_| Ok(descriptor()), 0), Err(0));
+        assert_eq!(pair.descriptor(), owned_by(1001));
+    }
+
+    #[test]
     fn indices_are_bounded_and_reused_once_unreferenced() {
         let terminals = PseudoTerminals::new();
         let mut managers: Vec<_> = (0..MAX_PSEUDO_TERMINALS)
-            .map(|_| Some(terminals.open_manager().unwrap()))
+            .map(|_| Some(terminals.open_manager(descriptor()).unwrap()))
             .collect();
-        assert!(matches!(terminals.open_manager(), Err(OpenError::NoSpace)));
+        assert!(matches!(
+            terminals.open_manager(descriptor()),
+            Err(OpenError::NoSpace)
+        ));
         assert_eq!(terminals.indices().len(), MAX_PSEUDO_TERMINALS);
 
         // An open subsidiary keeps its index, but not its name.
@@ -641,20 +755,31 @@ mod tests {
         managers[5] = None;
         assert!(terminals.get(5).is_none());
         assert!(!terminals.indices().contains(&5));
-        assert!(matches!(terminals.open_manager(), Err(OpenError::NoSpace)));
+        assert!(matches!(
+            terminals.open_manager(descriptor()),
+            Err(OpenError::NoSpace)
+        ));
 
         drop(subsidiary);
-        let manager = terminals.open_manager().unwrap();
+        let manager = terminals.open_manager(descriptor()).unwrap();
         assert_eq!(manager.endpoint().0.index, 5);
         managers[2] = None;
         managers[9] = None;
-        assert_eq!(terminals.open_manager().unwrap().endpoint().0.index, 2);
+        assert_eq!(
+            terminals
+                .open_manager(descriptor())
+                .unwrap()
+                .endpoint()
+                .0
+                .index,
+            2
+        );
     }
 
     #[test]
     fn manager_reads_fail_only_while_the_subsidiary_is_closed() {
         let terminals = PseudoTerminals::new();
-        let manager_file = terminals.open_manager().unwrap();
+        let manager_file = terminals.open_manager(descriptor()).unwrap();
         let manager = manager_file.endpoint().as_ref();
         let pair = terminals.get(0).unwrap();
         control(manager, TerminalOperation::SetSubsidiaryLock(false)).unwrap();

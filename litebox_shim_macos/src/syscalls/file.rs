@@ -908,7 +908,7 @@ fn open_error(error: OpenError) -> Errno {
         OpenError::TruncateError(error) => match error {
             TruncateError::ClosedFd => Errno::EBADF,
             TruncateError::IsDirectory => Errno::EISDIR,
-            TruncateError::NotForWriting => Errno::EACCES,
+            TruncateError::NotForWriting | TruncateError::StaleSubject => Errno::EACCES,
             TruncateError::NotOpenForWriting | TruncateError::IsTerminalDevice => Errno::EINVAL,
             TruncateError::Busy => Errno::ETXTBSY,
             TruncateError::NoSpace => Errno::ENOSPC,
@@ -928,7 +928,7 @@ fn file_path_error(error: FilePathError) -> Errno {
 fn path_error(error: PathError) -> Errno {
     match error {
         PathError::NoSuchFileOrDirectory | PathError::MissingComponent => Errno::ENOENT,
-        PathError::NoSearchPerms => Errno::EACCES,
+        PathError::NoSearchPerms | PathError::StaleSubject => Errno::EACCES,
         PathError::InvalidPathname => Errno::EINVAL,
         PathError::ComponentNotADirectory => Errno::ENOTDIR,
         // XNU's `namei` and `vn_authorize_open_existing` (`O_NOFOLLOW` on a link) return ELOOP.
@@ -1254,11 +1254,11 @@ mod tests {
             .unwrap();
         assert_eq!(status.mode, FileMode::from_u32_bits_truncate(0o644));
         assert_eq!(
-            status.owner,
-            FileUser {
-                user: 1000,
-                group: 1000
-            }
+            (status.owner, status.group),
+            (
+                litebox_broker_protocol::authority::Principal::posix_user(1000),
+                litebox_broker_protocol::authority::Principal::posix_group(1000)
+            )
         );
         assert_eq!(
             open(nr::OPEN_NOCANCEL, path, flags, 0o666),

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_storage::{
-    HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
+    HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedMapping,
 };
 use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -25,12 +25,20 @@ impl HostFile for Memfd {
         host_len::<Self>(file)
     }
 
-    fn resize(&mut self, file: &File, length: u64) -> Result<(), StorageError> {
+    /// `ftruncate` either resizes the memfd, even while it is mapped, or changes nothing, so
+    /// every resize is atomic.
+    fn resize(&mut self, file: &File, length: u64, _atomically: bool) -> Result<(), StorageError> {
         file.set_len(length)
             .map_err(|error| storage_error::<Self>(&error))
     }
 
-    fn export(memfd: &File, writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
+    /// Mappings of a memfd may extend past its end without any further right, so `end` does not
+    /// matter.
+    fn export(
+        memfd: &File,
+        writable: bool,
+        _end: u64,
+    ) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
         use std::os::fd::{AsFd as _, AsRawFd as _};
 
         if writable {
@@ -125,10 +133,10 @@ impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
 pub struct MemfdDelivery(pub Arc<SharedObjectSender>);
 
 impl SharedObjectDelivery for MemfdDelivery {
-    fn deliver(&self, object: &dyn SharedFileObject, writable: bool, _end: u64) -> IoResult<u64> {
+    fn deliver(&self, mapping: &SharedMapping, end: u64) -> IoResult<u64> {
         // The object lends a descriptor whose access mode allows writable mappings exactly
-        // when `writable` is set.
-        let handle = super::host_handle(object, writable)?;
+        // when `mapping` does.
+        let handle = super::host_handle(mapping, end)?;
         let raw = std::os::fd::RawFd::try_from(handle.raw())
             .map_err(|_| IoError::other("host handle is not a descriptor"))?;
         // SAFETY: `handle` lends a descriptor that stays open while it is borrowed, which
@@ -157,7 +165,7 @@ mod tests {
         let memory =
             super::super::host_file::tests::create_with(&MemfdFileMemoryProvider, b"hello").object;
         let before = open_descriptors();
-        let reader = memory.host_handle(false).unwrap();
+        let reader = memory.host_handle(false, 0).unwrap();
         let raw = libc::c_int::try_from(reader.raw()).unwrap();
         // SAFETY: The handle lends a live descriptor.
         assert_eq!(
@@ -167,7 +175,7 @@ mod tests {
         drop(reader);
         assert_eq!(open_descriptors(), before);
 
-        let writer = memory.host_handle(true).unwrap();
+        let writer = memory.host_handle(true, 0).unwrap();
         let raw = libc::c_int::try_from(writer.raw()).unwrap();
         // SAFETY: The handle lends a live descriptor.
         assert_eq!(
@@ -218,7 +226,7 @@ mod tests {
             unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const exhausted) },
             0
         );
-        let reader = memory.host_handle(false).map(|_| ());
+        let reader = memory.host_handle(false, 0).map(|_| ());
         drop(restore);
         // Running short of descriptors is no reason for a runner to copy the file instead.
         assert!(
@@ -229,6 +237,7 @@ mod tests {
 
     mod delivery {
         use super::*;
+        use litebox_broker_core::fs::shared_storage::{SharedFile, SharedFileLimit};
         use litebox_platform_linux_userland::shared_objects::SharedObjectChannel;
         use std::os::fd::{AsRawFd as _, OwnedFd};
 
@@ -242,8 +251,12 @@ mod tests {
                 &[0; 4096],
             )
             .object;
-            let read_only = delivery.deliver(&*memory, false, 0).unwrap();
-            let writable = delivery.deliver(&*memory, true, 0).unwrap();
+            let slot = Arc::new(SharedFileLimit::new(1)).reserve().unwrap();
+            let mapping = SharedMapping::new(Arc::new(SharedFile::new(memory, slot)), true);
+            let writable = delivery.deliver(&mapping, 4096).unwrap();
+            // A mapping narrowed to reading delivers only a read-only descriptor, however
+            // writable the file's own is.
+            let read_only = delivery.deliver(&mapping.restrict(false), 4096).unwrap();
 
             let map = |fd: &OwnedFd, prot| {
                 // SAFETY: Maps fresh pages that nothing else uses.

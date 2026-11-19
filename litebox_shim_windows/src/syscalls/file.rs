@@ -2822,6 +2822,7 @@ fn map_open_error(error: OpenError, create_disposition: CreateDisposition) -> Nt
             PathError::ComponentNotADirectory => NtStatus::NOT_A_DIRECTORY,
             PathError::InvalidPathname => NtStatus::INVALID_PARAMETER,
             PathError::NoSearchPerms => NtStatus::UNSUCCESSFUL,
+            PathError::StaleSubject => NtStatus::ACCESS_DENIED,
             PathError::TooManySymlinks => NtStatus::REPARSE_POINT_NOT_RESOLVED,
         },
         OpenError::AccessNotAllowed | OpenError::NoWritePerms | OpenError::ReadOnlyFileSystem => {
@@ -3503,7 +3504,7 @@ mod tests {
             )
             .unwrap();
         file.set_times(
-            task.fs_context.acting_user(),
+            task.fs_context.caller().clone(),
             &SetFileTimes {
                 access: FileTimeUpdate::Set(FileTimestamp {
                     seconds: -1,

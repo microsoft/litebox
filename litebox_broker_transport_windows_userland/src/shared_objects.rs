@@ -49,13 +49,14 @@ impl SectionSender {
         Ok(Self { process })
     }
 
-    /// Moves `section` into the runner, where it may be queried and mapped readable and
+    /// Duplicates `section` into the runner, where it may be queried and mapped readable and
     /// executable, and also writable if `writable` is set, returning the token the runner takes
     /// it with.
     ///
     /// The runner gets no right to extend the section, nor to write it unless `writable` is set,
-    /// whatever rights `section` has here.
-    pub fn send(&self, section: OwnedHandle, writable: bool) -> IoResult<u64> {
+    /// whatever rights `section` has here. `section` should have at least the rights the runner
+    /// gets, since the host checks the section's security to grant more.
+    pub fn send(&self, section: BorrowedHandle<'_>, writable: bool) -> IoResult<u64> {
         let access = SECTION_QUERY
             | SECTION_MAP_READ
             | SECTION_MAP_EXECUTE
@@ -72,6 +73,7 @@ impl SectionSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::AsHandle as _;
     use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Memory::{
         CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
@@ -111,11 +113,11 @@ mod tests {
             }
             !view.Value.is_null()
         };
-        let read_only = sender.send(section(), false).unwrap();
+        let read_only = sender.send(section().as_handle(), false).unwrap();
         assert!(!maps(read_only, FILE_MAP_READ | FILE_MAP_WRITE));
-        let read_only = sender.send(section(), false).unwrap();
+        let read_only = sender.send(section().as_handle(), false).unwrap();
         assert!(maps(read_only, FILE_MAP_READ));
-        let writable = sender.send(section(), true).unwrap();
+        let writable = sender.send(section().as_handle(), true).unwrap();
         assert!(maps(writable, FILE_MAP_READ | FILE_MAP_WRITE));
     }
 }

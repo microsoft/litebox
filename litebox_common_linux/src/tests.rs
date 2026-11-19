@@ -25,10 +25,8 @@ fn stat_conversions_preserve_optional_signed_timestamps() {
             file_type: FileType::RegularFile,
             mode: FileMode::RUSR,
             size: 12,
-            owner: FileUser {
-                user: 10,
-                group: 20,
-            },
+            owner: Principal::posix_user(10),
+            group: Principal::posix_group(20),
             node_info: FileNodeInfo {
                 dev: 0,
                 ino: 42,
@@ -67,6 +65,57 @@ fn stat_conversions_preserve_optional_signed_timestamps() {
         }
         assert_eq!(statx.stx_btime.tv_sec, 0);
         assert_eq!(statx.stx_btime.tv_nsec, 0);
+    }
+}
+
+#[test]
+fn stat_conversions_present_owners_linux_cannot_map_as_overflow() {
+    let outsider = Principal {
+        domain: DomainId(7),
+        id: 10,
+    };
+    for (owner, group, expected) in [
+        (
+            Principal::posix_user(100_000),
+            Principal::posix_group(u32::MAX - 1),
+            (100_000, u32::MAX - 1),
+        ),
+        (
+            Principal::posix_user(u32::MAX),
+            Principal::posix_group(u32::MAX),
+            (OVERFLOW_ID, OVERFLOW_ID),
+        ),
+        (outsider, outsider, (OVERFLOW_ID, OVERFLOW_ID)),
+        (
+            Principal::UNMAPPED,
+            Principal::UNMAPPED,
+            (OVERFLOW_ID, OVERFLOW_ID),
+        ),
+        // A POSIX group as owner (or user as group) is in the wrong domain.
+        (
+            Principal::posix_group(10),
+            Principal::posix_user(20),
+            (OVERFLOW_ID, OVERFLOW_ID),
+        ),
+    ] {
+        let status = FileStatus {
+            file_type: FileType::RegularFile,
+            mode: FileMode::RUSR,
+            size: 0,
+            owner,
+            group,
+            node_info: FileNodeInfo {
+                dev: 0,
+                ino: 1,
+                rdev: None,
+            },
+            blksize: 4096,
+            times: None,
+        };
+        let stat = FileStat::try_from(status).unwrap();
+        assert_eq!((stat.st_uid, stat.st_gid), expected);
+        let statx = Statx::try_from(status).unwrap();
+        assert_eq!((statx.stx_uid, statx.stx_gid), expected);
     }
 }
 

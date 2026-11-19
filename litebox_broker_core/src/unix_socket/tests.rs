@@ -373,11 +373,14 @@ fn path_connections_require_write_permission() {
         connect(&fixture.process, client, &address, other).unwrap(),
         Err(UnixSocketError::File(FileError::AccessNotAllowed))
     );
-    crate::fs::chmod(
+    crate::fs::set_security(
         &fixture.process,
         "/server",
         USER,
-        FileMode::RWXU | FileMode::WOTH,
+        litebox_broker_protocol::fs::FileSecurityUpdate {
+            mode: Some(FileMode::RWXU | FileMode::WOTH),
+            ..Default::default()
+        },
     )
     .unwrap()
     .unwrap();

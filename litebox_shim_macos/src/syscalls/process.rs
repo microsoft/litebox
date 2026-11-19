@@ -8,9 +8,10 @@
 //! process.
 
 use crate::{ShimPlatform, Task};
+use litebox_broker_protocol::authority::DomainId;
 use litebox_broker_protocol::fs::{FileMode, FileType};
 use litebox_common_macos::{
-    SIGABRT, SIGKILL,
+    SIGABRT, SIGKILL, darwin_id,
     errno::Errno,
     syscall::{AccessFlags, SigSet, SigmaskHow},
     user_pointers::{UserPtr, UserPtrMut},
@@ -245,25 +246,26 @@ impl<P: ShimPlatform> Task<P> {
             }
             return Ok(());
         }
-        let (read, write, execute) = if u32::from(status.owner.user) == self.params.uid {
-            (
-                status.mode.contains(FileMode::RUSR),
-                status.mode.contains(FileMode::WUSR),
-                status.mode.contains(FileMode::XUSR),
-            )
-        } else if u32::from(status.owner.group) == self.params.gid {
-            (
-                status.mode.contains(FileMode::RGRP),
-                status.mode.contains(FileMode::WGRP),
-                status.mode.contains(FileMode::XGRP),
-            )
-        } else {
-            (
-                status.mode.contains(FileMode::ROTH),
-                status.mode.contains(FileMode::WOTH),
-                status.mode.contains(FileMode::XOTH),
-            )
-        };
+        let (read, write, execute) =
+            if darwin_id(status.owner, DomainId::POSIX_USER) == Some(self.params.uid) {
+                (
+                    status.mode.contains(FileMode::RUSR),
+                    status.mode.contains(FileMode::WUSR),
+                    status.mode.contains(FileMode::XUSR),
+                )
+            } else if darwin_id(status.group, DomainId::POSIX_GROUP) == Some(self.params.gid) {
+                (
+                    status.mode.contains(FileMode::RGRP),
+                    status.mode.contains(FileMode::WGRP),
+                    status.mode.contains(FileMode::XGRP),
+                )
+            } else {
+                (
+                    status.mode.contains(FileMode::ROTH),
+                    status.mode.contains(FileMode::WOTH),
+                    status.mode.contains(FileMode::XOTH),
+                )
+            };
         if (mode.contains(AccessFlags::R_OK) && !read)
             || (mode.contains(AccessFlags::W_OK) && !write)
             || (mode.contains(AccessFlags::X_OK) && !execute)

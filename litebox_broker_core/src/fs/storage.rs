@@ -7,6 +7,7 @@
 //! elsewhere is up to the backend.
 
 use alloc::borrow::Cow;
+use alloc::vec::Vec;
 use core::any::Any;
 
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
@@ -73,6 +74,14 @@ pub trait FileStorageMut: FileStorage {
 
     /// Truncates or zero-extends the contents to `len` bytes.
     fn set_len(&mut self, len: usize) -> Result<(), StorageError>;
+
+    /// Truncates or zero-extends the contents to `len` bytes as [`Self::set_len`] does, or fails
+    /// without changing them.
+    ///
+    /// Storage whose [`Self::set_len`] could change some bytes and then fail, such as by zeroing
+    /// a tail that the host cannot cut off, must refuse instead, with [`StorageError::Busy`] when
+    /// the host is what stops it.
+    fn set_len_atomically(&mut self, len: usize) -> Result<(), StorageError>;
 }
 
 /// Heap-backed storage that keeps borrowed static data borrowed until the first write.
@@ -83,6 +92,23 @@ impl MemoryStorage {
     #[must_use]
     pub fn new(data: Cow<'static, [u8]>) -> Self {
         Self(data)
+    }
+
+    /// Reserve before replacing borrowed storage so a failed allocation leaves it untouched.
+    fn owned_with_capacity(&mut self, len: usize) -> Result<&mut Vec<u8>, StorageError> {
+        match &mut self.0 {
+            Cow::Borrowed(bytes) => {
+                let mut data = Vec::new();
+                data.try_reserve_exact(len.max(bytes.len()))
+                    .map_err(|_| StorageError::NoSpace)?;
+                data.extend_from_slice(bytes);
+                self.0 = Cow::Owned(data);
+            }
+            Cow::Owned(data) => data
+                .try_reserve(len.saturating_sub(data.len()))
+                .map_err(|_| StorageError::NoSpace)?,
+        }
+        Ok(self.0.to_mut())
     }
 }
 
@@ -113,25 +139,61 @@ impl FileStorageMut for MemoryStorage {
             return Ok(0);
         }
         let end = offset.checked_add(buf.len()).ok_or(StorageError::NoSpace)?;
-        let data = self.0.to_mut();
-        let previous_len = data.len();
-        if end > previous_len {
+        // A fault can leave some bytes copied without reporting a count. Only publish bytes
+        // after the copy succeeds, including when overwriting existing contents.
+        let mut staged =
+            crate::transfer::bounce_buffer(buf.len()).map_err(|_| StorageError::NoSpace)?;
+        buf.copy_to_slice_at(0, &mut staged)?;
+        let data = self.owned_with_capacity(end)?;
+        if end > data.len() {
             data.resize(end, 0);
         }
-        // XXX(jayb): a fault partway through discards the whole write rather than reporting the
-        // bytes copied so far as a short count, as `FileStorageMut::write_at` permits.
-        if let Err(fault) = buf.copy_to_slice_at(0, &mut data[offset..end]) {
-            data.truncate(previous_len);
-            return Err(fault.into());
-        }
+        data[offset..end].copy_from_slice(&staged);
         Ok(buf.len())
     }
 
     fn set_len(&mut self, len: usize) -> Result<(), StorageError> {
         match &mut self.0 {
             Cow::Borrowed(data) if len <= data.len() => *data = &data[..len],
-            data => data.to_mut().resize(len, 0),
+            _ => self.owned_with_capacity(len)?.resize(len, 0),
         }
         Ok(())
+    }
+
+    /// Resizing never fails partway.
+    fn set_len_atomically(&mut self, len: usize) -> Result<(), StorageError> {
+        self.set_len(len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::FaultingBuffer;
+
+    #[test]
+    fn failed_growth_preserves_borrowed_and_owned_storage() {
+        let initial = b"hello".as_slice();
+        for bytes in [Cow::Borrowed(initial), Cow::Owned(initial.to_vec())] {
+            let mut storage = MemoryStorage::new(bytes);
+            let before = storage.static_bytes();
+            assert!(matches!(
+                storage.set_len_atomically(usize::MAX),
+                Err(StorageError::NoSpace)
+            ));
+            assert_eq!(storage.0.as_ref(), initial);
+            assert_eq!(storage.static_bytes(), before);
+        }
+    }
+
+    #[test]
+    fn memory_storage_publishes_only_completed_writes() {
+        let initial = b"hello".as_slice();
+        let mut storage = MemoryStorage::new(Cow::Borrowed(initial));
+        let result = storage.write_at(3, &FaultingBuffer::new(4, 2));
+        assert!(matches!(result, Err(StorageError::Fault)));
+        assert_eq!(storage.static_bytes(), Some(initial));
+        assert_eq!(storage.write_at(3, &b"pful".as_slice()).unwrap(), 4);
+        assert_eq!(&*storage.0, b"helpful");
     }
 }

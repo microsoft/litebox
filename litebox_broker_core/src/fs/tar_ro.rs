@@ -34,16 +34,19 @@ use tar_core::{EntryType, PAX_GID, PAX_MTIME, PAX_SIZE, PAX_UID, PaxExtensions};
 
 use super::{DirEntry, FileType};
 
+use crate::descriptor::SecurityDescriptor;
+use litebox_broker_protocol::authority::Principal;
+
 use super::{
-    Mode, NodeInfo, OFlags, UserInfo,
+    Mode, NodeInfo, OFlags,
     backend::{
-        CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck, PermissionInfo,
-        Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
+        CreationMetadata, DirHandle, FileHandle, HandleRef, OpenChecks, PermissionCheck,
+        PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, mode_descriptor,
     },
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
-        RenameError, ResolutionError, RmdirError, SymlinkError, TruncateError, UnlinkError,
-        WalkError, WriteError,
+        RenameError, ResolutionError, RmdirError, SetSecurityError, SymlinkError, TruncateError,
+        UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
 };
@@ -60,11 +63,12 @@ pub struct TarRo {
 impl TarRo {
     fn resolved_dir<'a>(&self, dir: TarRoDirHandle) -> ResolvedDir<'a> {
         let indexed = &self.tar_index.dirs[dir.idx];
-        let permissions = PermissionCheck::ByResolver(PermissionInfo {
-            mode: indexed.mode,
-            owner: indexed.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-            on_read_only_fs: true,
-        });
+        let owner = indexed.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER);
+        let permissions = PermissionCheck::ByResolver(PermissionInfo::new(
+            mode_descriptor(FileType::Directory, indexed.mode, owner.user, owner.group)
+                .from_trusted_configuration(),
+            true,
+        ));
         ResolvedDir::from_typed::<Self>(dir, permissions)
     }
 
@@ -143,11 +147,16 @@ impl super::backend::Backend for TarRo {
                     return Ok(Resolution::Found(ResolvedTarget::File(
                         ResolvedFile::from_typed::<Self>(
                             TarRoFileHandle { idx: *idx },
-                            PermissionCheck::ByResolver(PermissionInfo {
-                                mode: file.mode,
-                                owner: file.owner,
-                                on_read_only_fs: true,
-                            }),
+                            PermissionCheck::ByResolver(PermissionInfo::new(
+                                mode_descriptor(
+                                    file.file_type(),
+                                    file.mode,
+                                    file.owner.user,
+                                    file.owner.group,
+                                )
+                                .from_trusted_configuration(),
+                                true,
+                            )),
                             file.file_type(),
                         ),
                     )));
@@ -175,6 +184,13 @@ impl super::backend::Backend for TarRo {
         }
     }
 
+    fn read_resolved_link(&self, file: &ResolvedFile<'_>) -> Result<String, WalkError> {
+        match &self.tar_index.files[file.get_typed::<Self>().idx].content {
+            IndexedContent::Symlink(target) => Ok(target.clone()),
+            IndexedContent::Regular(_) => Err(PathError::InvalidPathname.into()),
+        }
+    }
+
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
         if flags.intersects(OFlags::CREAT | OFlags::TRUNC | OFlags::WRONLY | OFlags::RDWR) {
             return Err(OpenError::ReadOnlyFileSystem);
@@ -199,6 +215,20 @@ impl super::backend::Backend for TarRo {
             return Err(OpenError::ReadOnlyFileSystem);
         }
         Ok(FileHandle::from_typed::<Self>(file.into_typed::<Self>()))
+    }
+
+    fn open_file_checked(
+        &self,
+        file: ResolvedFile<'_>,
+        flags: OFlags,
+        checks: &OpenChecks<'_>,
+    ) -> Result<FileHandle, OpenError> {
+        // Archive entries never change, so `file` still carries the current descriptor.
+        let PermissionCheck::ByResolver(permissions) = &file.permissions else {
+            unreachable!()
+        };
+        (checks.admit)(permissions.descriptor().ok_or(OpenError::Io)?)?;
+        self.open_file(file, flags)
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
@@ -262,7 +292,8 @@ impl super::backend::Backend for TarRo {
                     mode: file.mode,
                     size: u64::try_from(self.tar_index.file_data(idx).len())
                         .map_err(|_| super::errors::FileStatusError::Io)?,
-                    owner: file.owner,
+                    owner: file.owner.user,
+                    group: file.owner.group,
                     times: file.times,
                     node_info: file.node_info,
                     blksize: BLOCK_SIZE,
@@ -274,7 +305,8 @@ impl super::backend::Backend for TarRo {
                     file_type: FileType::Directory,
                     mode: dir.mode,
                     size: super::DEFAULT_DIRECTORY_SIZE,
-                    owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
+                    owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER).user,
+                    group: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER).group,
                     times: dir.times,
                     node_info: dir.node_info,
                     blksize: BLOCK_SIZE,
@@ -355,6 +387,14 @@ impl super::backend::Backend for TarRo {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 
+    fn update_security(
+        &self,
+        _target: ResolvedTarget<'_>,
+        _update: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, SetSecurityError>,
+    ) -> Result<(), SetSecurityError> {
+        Err(SetSecurityError::ReadOnlyFileSystem)
+    }
+
     fn chown(
         &self,
         _h: ResolvedTarget<'_>,
@@ -372,7 +412,7 @@ struct IndexedFile {
     content: IndexedContent,
     times: Option<super::FileTimestamps>,
     mode: Mode,
-    owner: UserInfo,
+    owner: Owner,
     node_info: NodeInfo,
 }
 
@@ -397,13 +437,13 @@ struct IndexedDir {
     times: Option<super::FileTimestamps>,
     mode: Mode,
     /// Set by the directory's own archive entry, or else by the first entry beneath it.
-    owner: Option<UserInfo>,
+    owner: Option<Owner>,
     node_info: NodeInfo,
     children: HashMap<String, IndexedChild>,
 }
 
 impl IndexedDir {
-    fn new(owner: Option<UserInfo>, inode_allocator: &InodeAllocator) -> Self {
+    fn new(owner: Option<Owner>, inode_allocator: &InodeAllocator) -> Self {
         Self {
             times: None,
             mode: DEFAULT_DIR_MODE,
@@ -458,10 +498,10 @@ impl TarIndex {
             litebox_util_log::warn!(path = path; "skipping tar path containing `..`");
             return;
         };
-        let mode = Mode::from_bits_truncate(u16::try_from(entry.mode & 0o777).unwrap());
-        let owner = UserInfo {
-            user: u16::try_from(entry.uid).unwrap_or(OVERFLOW_ID),
-            group: u16::try_from(entry.gid).unwrap_or(OVERFLOW_ID),
+        let mode = Mode::from_bits_truncate(u16::try_from(entry.mode & 0o7777).unwrap());
+        let owner = Owner {
+            user: u32::try_from(entry.uid).map_or(Principal::UNMAPPED, Principal::posix_user),
+            group: u32::try_from(entry.gid).map_or(Principal::UNMAPPED, Principal::posix_group),
         };
         // tar only records mtime; report it for all three.
         let times = i64::try_from(entry.mtime).ok().map(|seconds| {
@@ -561,7 +601,7 @@ impl TarIndex {
         &mut self,
         path: &str,
         components: &[&str],
-        owner: UserInfo,
+        owner: Owner,
         inode_allocator: &InodeAllocator,
     ) -> usize {
         let mut dir = 0;
@@ -753,10 +793,15 @@ const DEFAULT_DIR_MODE: Mode =
 
 const SYMLINK_MODE: Mode = DEFAULT_DIR_MODE;
 
-const DEFAULT_DIRECTORY_OWNER: UserInfo = UserInfo {
-    user: 1000,
-    group: 1000,
+const DEFAULT_DIRECTORY_OWNER: Owner = Owner {
+    user: Principal::posix_user(1000),
+    group: Principal::posix_group(1000),
 };
 
-/// The id that user and group ids beyond `u16` map to: Linux's default overflow id.
-pub(super) const OVERFLOW_ID: u16 = 65534;
+/// The owner and group an archive entry records. Ids beyond `u32` cannot name a POSIX principal,
+/// so they are [`Principal::UNMAPPED`].
+#[derive(Clone, Copy)]
+struct Owner {
+    user: Principal,
+    group: Principal,
+}

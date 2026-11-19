@@ -4,23 +4,23 @@
 use super::*;
 use core::time::Duration;
 
-use crate::authority::RestrictChildAuthorityRequest;
+use crate::authority::{DomainId, Principal, RestrictChildAuthorityRequest};
 use crate::error::ErrorCode;
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
     CreateEventResponse, EventConsumeMode, EventConsumption,
 };
 use crate::fs::{
-    ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileLockOperation, FileMode,
-    FileNodeInfo, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
-    FileTimeUpdate, FileTimestamp, FileTimestamps, FileType, FileUser, HandleFilePathRequest,
-    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MapFileRequest,
-    MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SetFileTimes, SetStatusFlagsRequest, SetTimesFileRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse,
+    FileAccessMode, FileCaller, FileError, FileLockOperation, FileMode, FileNodeInfo,
+    FileOpenFlags, FilePathResponse, FileSecurityUpdate, FileSeekWhence, FileStatus,
+    FileStatusFlags, FileTimeUpdate, FileTimestamp, FileTimestamps, FileType, FileUser,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
+    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, ResolvePathFileRequest,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileSecurityRequest, SetFileTimes,
+    SetStatusFlagsRequest, SetTimesFileRequest, TerminalControlFileRequest, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::message::{
     BrokerOperation, BrokerResult, EventRequest, EventResponse, FileRequest, FileResponse,
@@ -284,7 +284,7 @@ fn request_codec_round_trips_all_variants() {
         BrokerOperation::FillRandom(sequence(7, 256)),
         BrokerOperation::File(FileRequest::Open(OpenFileRequest {
             path: sequence(1, 7),
-            user: FileUser { user: 2, group: 3 },
+            caller: FileCaller::Subject(handle),
             access: FileAccessMode::ReadWrite,
             flags: FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE | FileOpenFlags::NO_FOLLOW,
             mode: FileMode::from_bits(0o640).unwrap(),
@@ -301,6 +301,7 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::File(FileRequest::Write(WriteFileRequest {
             handle,
+            subject: Some(ObjectHandle(71)),
             buffer: SharedBufferSequence::new(&[SharedBufferSlotIndex(3)], 17).unwrap(),
             offset: Some(11),
         })),
@@ -311,6 +312,7 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::File(FileRequest::Truncate(TruncateFileRequest {
             handle,
+            subject: Some(ObjectHandle(72)),
             length: 4096,
             reset_offset: true,
         })),
@@ -321,12 +323,12 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
             path: sequence(5, 9),
-            user: FileUser { user: 2, group: 3 },
+            caller: FileUser { user: 2, group: 3 }.into(),
             follow_symlinks: true,
         })),
         BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
             path: sequence(5, 9),
-            user: FileUser { user: 2, group: 3 },
+            caller: FileUser { user: 2, group: 3 }.into(),
             follow_symlinks: false,
         })),
         BrokerOperation::File(FileRequest::HandleStatus(HandleFileStatusRequest {
@@ -334,7 +336,7 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
             handle,
-            user: FileUser::ROOT,
+            caller: FileUser::ROOT.into(),
             times: SetFileTimes {
                 access: FileTimeUpdate::Set(FileTimestamp::default()),
                 modify: FileTimeUpdate::Set(FileTimestamp::default()),
@@ -352,39 +354,48 @@ fn request_codec_round_trips_all_variants() {
                 timing: crate::terminal::ChangeTiming::Now,
             },
         })),
-        BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
+        BrokerOperation::File(FileRequest::SetSecurity(SetFileSecurityRequest {
             path: sequence(6, 9),
-            user: FileUser { user: 2, group: 3 },
-            mode: FileMode::from_bits(0o755).unwrap(),
+            caller: FileUser { user: 2, group: 3 }.into(),
+            update: FileSecurityUpdate {
+                mode: Some(FileMode::from_bits(0o755).unwrap()),
+                ..Default::default()
+            },
         })),
-        BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
-            path: sequence(7, 9),
-            acting_user: FileUser { user: 0, group: 0 },
-            user: Some(2),
-            group: None,
+        BrokerOperation::File(FileRequest::SetSecurity(SetFileSecurityRequest {
+            path: largest_sequence,
+            caller: FileCaller::Subject(handle),
+            update: FileSecurityUpdate {
+                owner: Some(Principal {
+                    domain: DomainId(52),
+                    id: 70000
+                }),
+                group: Some(Principal::posix_group(u32::MAX)),
+                mode: Some(FileMode::SUPPORTED)
+            },
         })),
         BrokerOperation::File(FileRequest::Unlink(UnlinkFileRequest {
             path: sequence(8, 9),
-            user: FileUser { user: 2, group: 3 },
+            caller: FileUser { user: 2, group: 3 }.into(),
         })),
         BrokerOperation::File(FileRequest::Mkdir(MkdirFileRequest {
             path: sequence(9, 9),
-            user: FileUser { user: 2, group: 3 },
+            caller: FileUser { user: 2, group: 3 }.into(),
             mode: FileMode::from_bits(0o750).unwrap(),
         })),
         BrokerOperation::File(FileRequest::Rmdir(RmdirFileRequest {
             path: sequence(10, 9),
-            user: FileUser { user: 2, group: 3 },
+            caller: FileUser { user: 2, group: 3 }.into(),
         })),
         BrokerOperation::File(FileRequest::ReadLink(ReadLinkFileRequest {
             buffer: sequence(11, 256),
             path_length: 9,
-            user: FileUser { user: 2, group: 3 },
+            caller: FileUser { user: 2, group: 3 }.into(),
         })),
         BrokerOperation::File(FileRequest::ResolvePath(ResolvePathFileRequest {
             buffer: sequence(12, 256),
             path_length: 9,
-            user: FileUser { user: 2, group: 3 },
+            caller: FileUser { user: 2, group: 3 }.into(),
         })),
         BrokerOperation::File(FileRequest::HandlePath(HandleFilePathRequest {
             handle,
@@ -396,7 +407,7 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::File(FileRequest::Mount(MountFileRequest {
             path: sequence(14, 9),
-            user: FileUser { user: 2, group: 3 },
+            caller: FileUser { user: 2, group: 3 }.into(),
         })),
         BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
             address_family: AddressFamily::Ipv4,
@@ -746,7 +757,7 @@ fn request_codec_round_trips_all_variants() {
             Err(WireError::WrongMessagePhase)
         );
     }
-    assert_eq!(maximum_encoded_size, MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+    assert_eq!(maximum_encoded_size, 1 + BrokerRequest::MAX_SIZE);
 }
 
 #[test]
@@ -920,6 +931,10 @@ fn file_error_wire_values_are_stable_and_round_trip() {
         (FileError::TooManySymlinks, 24),
         (FileError::NoSuchDevice, 25),
         (FileError::NoSpace, 26),
+        (FileError::NotSupported, 27),
+        (FileError::CrossDevice, 28),
+        (FileError::InvalidArgument, 29),
+        (FileError::StaleSubject, 30),
     ] {
         let response = BrokerResponse {
             request_id: TEST_REQUEST_ID,
@@ -1228,9 +1243,10 @@ fn response_codec_round_trips_all_variants() {
             file_type: FileType::CharacterDevice,
             mode: FileMode::from_bits(0o620).unwrap(),
             size: u64::MAX,
-            owner: FileUser {
-                user: u16::MAX,
-                group: u16::MAX
+            owner: Principal::posix_user(u32::MAX),
+            group: Principal {
+                domain: DomainId(u32::MAX),
+                id: u32::MAX - 1,
             },
             node_info: FileNodeInfo {
                 dev: u64::MAX,
@@ -1257,10 +1273,8 @@ fn response_codec_round_trips_all_variants() {
             file_type: FileType::CharacterDevice,
             mode: FileMode::from_bits(0o620).unwrap(),
             size: u64::MAX,
-            owner: FileUser {
-                user: u16::MAX,
-                group: u16::MAX
-            },
+            owner: Principal::UNMAPPED,
+            group: Principal::posix_group(65_536),
             node_info: FileNodeInfo {
                 dev: u64::MAX,
                 ino: u64::MAX,
@@ -1277,8 +1291,7 @@ fn response_codec_round_trips_all_variants() {
                 crate::terminal::TerminalSettings::default()
             )
         )),
-        BrokerResult::File(FileResponse::Chmod),
-        BrokerResult::File(FileResponse::Chown),
+        BrokerResult::File(FileResponse::SetSecurity),
         BrokerResult::File(FileResponse::Unlink),
         BrokerResult::File(FileResponse::Mkdir),
         BrokerResult::File(FileResponse::Mount),
@@ -1441,7 +1454,7 @@ fn response_codec_round_trips_all_variants() {
             Err(WireError::WrongMessagePhase)
         );
     }
-    assert_eq!(maximum_encoded_size, 96);
+    assert_eq!(maximum_encoded_size, 1 + BrokerResponse::MAX_SIZE);
 }
 
 #[test]
@@ -1868,7 +1881,7 @@ fn file_time_requests_round_trip() {
                 let times = SetFileTimes { access, modify };
                 let operation = BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
                     handle: ObjectHandle(u64::MAX),
-                    user: FileUser { user: 2, group: 3 },
+                    caller: FileUser { user: 2, group: 3 }.into(),
                     times,
                 }));
                 assert_eq!(operation.shared_buffer(), None);
@@ -1900,7 +1913,7 @@ fn decode_rejects_invalid_file_time_requests() {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::File(FileRequest::SetTimes(SetTimesFileRequest {
                 handle: ObjectHandle(7),
-                user: FileUser::ROOT,
+                caller: FileUser::ROOT.into(),
                 times,
             })),
         })
@@ -1947,7 +1960,8 @@ fn decode_rejects_invalid_file_status_times() {
         file_type: FileType::RegularFile,
         mode: FileMode::default(),
         size: 0,
-        owner: FileUser::ROOT,
+        owner: Principal::posix_user(0),
+        group: Principal::posix_group(0),
         node_info: FileNodeInfo {
             dev: 1,
             ino: 2,
@@ -1995,12 +2009,46 @@ fn decode_rejects_invalid_file_status_times() {
 }
 
 #[test]
+fn file_status_carries_full_owner_and_group_principals() {
+    let response = BrokerResponse {
+        request_id: TEST_REQUEST_ID,
+        result: BrokerResult::File(FileResponse::HandleStatus(FileStatus {
+            file_type: FileType::RegularFile,
+            mode: FileMode::from_bits(0o640).unwrap(),
+            size: 0,
+            owner: Principal::posix_user(70_000),
+            group: Principal {
+                domain: DomainId(0x0102_0304),
+                id: 0x0506_0708,
+            },
+            node_info: FileNodeInfo {
+                dev: 1,
+                ino: 2,
+                rdev: None,
+            },
+            blksize: 4096,
+            times: None,
+        })),
+    };
+    let frame = encode_response(&response);
+    // Phase, request ID, result and response tags, file type, mode and size precede the owner.
+    assert_eq!(
+        frame[22..38],
+        [
+            1, 0, 0, 0, 0x70, 0x11, 0x01, 0, // owner: POSIX user 70000
+            4, 3, 2, 1, 8, 7, 6, 5, // group: an outsider domain's principal
+        ]
+    );
+    assert_eq!(decode_response(&frame), Ok(response));
+}
+
+#[test]
 fn decode_rejects_malformed_fs_request_frames() {
     let open = BrokerRequest {
         request_id: TEST_REQUEST_ID,
         operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
             path: sequence(1, 9),
-            user: FileUser { user: 2, group: 3 },
+            caller: FileUser { user: 2, group: 3 }.into(),
             access: FileAccessMode::ReadOnly,
             flags: FileOpenFlags::CREATE,
             mode: FileMode::from_bits(0o640).unwrap(),
@@ -2016,17 +2064,20 @@ fn decode_rejects_malformed_fs_request_frames() {
     );
 
     let open = encode_request(&open);
+    let mut unknown_caller = open.clone();
+    unknown_caller[20] = 0xff;
+    assert_eq!(decode_request(&unknown_caller), Err(WireError::InvalidTag));
     let mut unknown_access = open.clone();
-    unknown_access[24] = 0xff;
+    unknown_access[25] = 0xff;
     assert_eq!(decode_request(&unknown_access), Err(WireError::InvalidTag));
     let mut unsupported_flags = open.clone();
-    unsupported_flags[25..27].copy_from_slice(&(1u16 << 15).to_le_bytes());
+    unsupported_flags[26..28].copy_from_slice(&(1u16 << 15).to_le_bytes());
     assert_eq!(
         decode_request(&unsupported_flags),
         Err(WireError::InvalidTag)
     );
     let mut unsupported_mode = open.clone();
-    unsupported_mode[27..29].copy_from_slice(&0o10000u16.to_le_bytes());
+    unsupported_mode[28..30].copy_from_slice(&0o10000u16.to_le_bytes());
     assert_eq!(
         decode_request(&unsupported_mode),
         Err(WireError::InvalidTag)
@@ -2035,6 +2086,7 @@ fn decode_rejects_malformed_fs_request_frames() {
         request_id: TEST_REQUEST_ID,
         operation: BrokerOperation::File(FileRequest::Truncate(TruncateFileRequest {
             handle: ObjectHandle(13),
+            subject: None,
             length: 17,
             reset_offset: false,
         })),
@@ -2057,15 +2109,17 @@ fn decode_rejects_malformed_fs_request_frames() {
 
     let chown = BrokerRequest {
         request_id: TEST_REQUEST_ID,
-        operation: BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
+        operation: BrokerOperation::File(FileRequest::SetSecurity(SetFileSecurityRequest {
             path: sequence(1, 9),
-            acting_user: FileUser { user: 0, group: 0 },
-            user: Some(2),
-            group: None,
+            caller: FileUser { user: 0, group: 0 }.into(),
+            update: FileSecurityUpdate {
+                owner: Some(Principal::posix_user(2)),
+                ..Default::default()
+            },
         })),
     };
     let mut invalid_user = encode_request(&chown);
-    let user_tag = invalid_user.len() - 4;
+    let user_tag = invalid_user.len() - 11;
     invalid_user[user_tag] = 2;
     assert_eq!(decode_request(&invalid_user), Err(WireError::InvalidTag));
 }
@@ -2078,7 +2132,8 @@ fn decode_rejects_malformed_fs_response_frames() {
             file_type: FileType::RegularFile,
             mode: FileMode::from_bits(0o640).unwrap(),
             size: 17,
-            owner: FileUser { user: 2, group: 3 },
+            owner: Principal::posix_user(2),
+            group: Principal::posix_group(3),
             node_info: FileNodeInfo {
                 dev: 5,
                 ino: 7,
@@ -2726,14 +2781,14 @@ fn fs_open_request_wire_shape_is_pinned() {
             request_id: RequestId(13),
             operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: sequence(2, 3),
-                user: FileUser { user: 5, group: 7 },
+                caller: FileUser { user: 5, group: 7 }.into(),
                 access: FileAccessMode::ReadWrite,
                 flags: FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE | FileOpenFlags::NO_FOLLOW,
                 mode: FileMode::from_bits(0o640).unwrap(),
             })),
         }),
         [
-            1, 13, 0, 0, 0, 0, 0, 0, 0, 9, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0,
+            1, 13, 0, 0, 0, 0, 0, 0, 0, 9, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0,
             160, 1
         ]
     );

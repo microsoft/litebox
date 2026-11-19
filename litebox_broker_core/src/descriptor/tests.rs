@@ -12,6 +12,8 @@ use super::process::{ProcessAce, ProcessDescriptor, ProcessRights, SignalMask, S
 use super::profile::{FileSystemProfile, StorableForms};
 use super::*;
 
+mod mutation;
+
 const fn user(id: u32) -> Principal {
     Principal {
         domain: DomainId::POSIX_USER,

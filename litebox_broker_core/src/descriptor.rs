@@ -41,6 +41,7 @@ use thiserror::Error;
 
 pub mod acl;
 mod mode;
+pub mod mutation;
 pub mod process;
 pub mod profile;
 
@@ -102,6 +103,13 @@ pub enum FileKind {
     File,
     /// A directory.
     Directory,
+}
+
+/// Which part of the entry removal check refused the subject.
+#[derive(Clone, Copy)]
+pub(crate) enum RemovalDenied {
+    Access,
+    NotOwner,
 }
 
 impl FileKind {
@@ -207,6 +215,8 @@ pub struct SecurityDescriptor {
     owner: Principal,
     group: Principal,
     access: Access,
+    /// Only broker configuration can opt out of the guest storage profile.
+    trusted_initial: bool,
     /// Whether some subject's walk grants [`Rights::EXECUTE`], which
     /// [`Privileges::EXECUTE_ANY`] requires. Computed once from the rest.
     executable: bool,
@@ -241,6 +251,7 @@ impl SecurityDescriptor {
             owner,
             group,
             access: Access::Mode(mode),
+            trusted_initial: false,
             executable,
         })
     }
@@ -286,8 +297,17 @@ impl SecurityDescriptor {
                 flags,
                 grants,
             },
+            trusted_initial: false,
             executable,
         })
+    }
+
+    /// Marks a descriptor taken directly from trusted configuration, not from a guest store.
+    /// Copy-up preserves this origin; guest creation and replacement never do.
+    #[must_use]
+    pub fn from_trusted_configuration(mut self) -> Self {
+        self.trusted_initial = true;
+        self
     }
 
     /// Clones the descriptor, reporting allocation failure.
@@ -433,21 +453,38 @@ impl SecurityDescriptor {
     /// the entry (see [`Self::is_owned_by`]).
     #[must_use]
     pub fn allows_remove(&self, entry: &SecurityDescriptor, subject: &Subject) -> bool {
+        self.check_remove(entry, subject).is_ok()
+    }
+
+    pub(crate) fn check_remove(
+        &self,
+        entry: &SecurityDescriptor,
+        subject: &Subject,
+    ) -> Result<(), RemovalDenied> {
         if self.kind != FileKind::Directory {
-            return false;
+            return Err(RemovalDenied::Access);
         }
         let parent = self.granted_file_rights(
             subject,
             Rights::TRAVERSE | Rights::ADD_ENTRY | Rights::DELETE_CHILD,
         );
-        parent.contains(Rights::TRAVERSE)
-            && (parent.contains(Rights::DELETE_CHILD)
-                || entry.allows_file(subject, Rights::DELETE)
-                || (self
-                    .directory_flags()
-                    .contains(DirectoryFlags::RESTRICTED_DELETION)
-                    && parent.contains(Rights::ADD_ENTRY)
-                    && (self.is_owned_by(subject) || entry.is_owned_by(subject))))
+        if !parent.contains(Rights::TRAVERSE) {
+            return Err(RemovalDenied::Access);
+        }
+        if parent.contains(Rights::DELETE_CHILD) || entry.allows_file(subject, Rights::DELETE) {
+            return Ok(());
+        }
+        if self
+            .directory_flags()
+            .contains(DirectoryFlags::RESTRICTED_DELETION)
+            && parent.contains(Rights::ADD_ENTRY)
+        {
+            if self.is_owned_by(subject) || entry.is_owned_by(subject) {
+                return Ok(());
+            }
+            return Err(RemovalDenied::NotOwner);
+        }
+        Err(RemovalDenied::Access)
     }
 
     /// Rights `privileges` add after the walk, for a request of `requested`.

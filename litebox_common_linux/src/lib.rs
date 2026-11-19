@@ -10,7 +10,8 @@ use core::ffi::{c_char, c_uint};
 use core::time::Duration;
 use int_enum::IntEnum;
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _};
-use litebox_broker_protocol::fs::{FileMode, FileNodeInfo, FileStatus, FileType, FileUser};
+use litebox_broker_protocol::authority::{DomainId, Principal};
+use litebox_broker_protocol::fs::{FileMode, FileNodeInfo, FileStatus, FileType};
 use litebox_broker_protocol::terminal::{
     ControlCharacters, GUEST_ATTRIBUTES_LEN, InputFlags, LocalFlags, OutputFlags, TerminalSettings,
     WindowSize,
@@ -480,6 +481,21 @@ pub struct IoReadVec {
 /// `iovec` struct for both read and write
 pub type IoVec = IoReadVec;
 
+/// The id Linux presents for an owner or group it cannot map (its default `overflowuid` and
+/// `overflowgid`).
+pub const OVERFLOW_ID: u32 = 65534;
+
+/// The Linux id that `principal` names in `domain` ([`DomainId::POSIX_USER`] or
+/// [`DomainId::POSIX_GROUP`]), if any; `(uid_t)-1` is not one.
+pub fn linux_id(principal: Principal, domain: DomainId) -> Option<u32> {
+    principal.id_in(domain).filter(|&id| id != u32::MAX)
+}
+
+/// The id Linux presents for `principal` in `domain`: its [`linux_id`], or [`OVERFLOW_ID`].
+pub fn presented_id(principal: Principal, domain: DomainId) -> u32 {
+    linux_id(principal, domain).unwrap_or(OVERFLOW_ID)
+}
+
 impl TryFrom<FileStatus> for FileStat {
     type Error = errno::Errno;
 
@@ -489,7 +505,8 @@ impl TryFrom<FileStatus> for FileStat {
             file_type,
             mode,
             size,
-            owner: FileUser { user, group },
+            owner,
+            group,
             node_info: FileNodeInfo { dev, ino, rdev },
             blksize: block_size,
             times,
@@ -504,8 +521,8 @@ impl TryFrom<FileStatus> for FileStat {
             st_ino: ino,
             st_nlink: 1,
             st_mode: (u32::from(mode.bits()) | InodeType::from(file_type) as u32).trunc(),
-            st_uid: <_>::from(user),
-            st_gid: <_>::from(group),
+            st_uid: presented_id(owner, DomainId::POSIX_USER),
+            st_gid: presented_id(group, DomainId::POSIX_GROUP),
             st_rdev: rdev.map_or(0, core::num::NonZeroU64::get),
             #[cfg(target_arch = "x86_64")]
             st_size: usize::try_from(size).map_err(|_| errno::Errno::EOVERFLOW)?,
@@ -637,7 +654,8 @@ impl TryFrom<FileStatus> for Statx {
             file_type,
             mode,
             size,
-            owner: FileUser { user, group },
+            owner,
+            group,
             node_info: FileNodeInfo { dev, ino, rdev },
             blksize: block_size,
             times,
@@ -647,8 +665,8 @@ impl TryFrom<FileStatus> for Statx {
             stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
             stx_blksize: u32::try_from(block_size).map_err(|_| errno::Errno::EOVERFLOW)?,
             stx_nlink: 1,
-            stx_uid: u32::from(user),
-            stx_gid: u32::from(group),
+            stx_uid: presented_id(owner, DomainId::POSIX_USER),
+            stx_gid: presented_id(group, DomainId::POSIX_GROUP),
             stx_mode: (u32::from(mode.bits()) | InodeType::from(file_type) as u32).trunc(),
             stx_ino: ino,
             stx_size: size,

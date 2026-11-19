@@ -27,7 +27,11 @@ use litebox_broker_core::fs::errors::{
 };
 #[cfg(unix)]
 use litebox_broker_core::fs::errors::{TruncateError, WriteError};
+#[cfg(unix)]
+use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::inode_allocator::InodeAllocators;
+#[cfg(unix)]
+use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::read_only::ReadOnly;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::{FileType, Mode, OFlags, UserInfo};
@@ -1012,6 +1016,144 @@ fn unreadable_directory_is_not_an_empty_listing() {
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o000)).unwrap();
     assert!(local.list_dir_at(dir).is_err());
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// The names an overlay `resolver` lists in the directory `path`, if it can list them.
+#[cfg(unix)]
+fn overlay_listing<B: Backend>(
+    resolver: &Resolver<TestPlatform, B>,
+    path: &str,
+) -> Option<Vec<String>> {
+    let dir = resolver
+        .open(
+            USER,
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .ok()?;
+    let mut names: Vec<_> = resolver
+        .read_dir(&dir)
+        .ok()?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    names.sort();
+    Some(names)
+}
+
+#[cfg(unix)]
+#[test]
+fn overlay_metadata_access_never_reads_a_search_only_upper_directory() {
+    // Root may legitimately bypass DAC, so this requires an unprivileged host test run.
+    let temp = tempfile::tempdir().unwrap();
+    if fs::metadata(temp.path()).unwrap().uid() == 0 {
+        return;
+    }
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let search_only = temp.path().join("dir");
+    fs::create_dir(&search_only).unwrap();
+    let all = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+    let allocators = InodeAllocators::new();
+    let lower = InMem::<TestPlatform>::new_initialized(
+        [
+            (
+                "/",
+                InitialNode::Directory {
+                    mode: all,
+                    owner: USER,
+                },
+            ),
+            (
+                "/dir",
+                InitialNode::Directory {
+                    mode: all,
+                    owner: USER,
+                },
+            ),
+            (
+                "/dir/lower",
+                InitialNode::File {
+                    mode: all,
+                    owner: USER,
+                    data: (&[][..]).into(),
+                },
+            ),
+        ],
+        allocators.next(),
+    );
+    let resolver: Resolver<TestPlatform, _> = Resolver::new(Overlay::<TestPlatform>::new(
+        LocalFs::new(temp.path(), allocators.next()).unwrap(),
+        lower,
+        allocators.next(),
+    ));
+    assert_eq!(
+        overlay_listing(&resolver, "/dir").unwrap(),
+        [".", "..", "lower"]
+    );
+
+    fs::set_permissions(&search_only, fs::Permissions::from_mode(0o111)).unwrap();
+    let status = resolver.file_status(USER, "/dir", true);
+    let path_status = resolver
+        .open(
+            USER,
+            "/dir",
+            OFlags::PATH | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .map(|handle| resolver.handle_status(&handle));
+    // Which lower entries the directory merges depends on markers that only reading it reveals.
+    let child = resolver.file_status(USER, "/dir/lower", true);
+    fs::set_permissions(&search_only, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let status = status.unwrap();
+    assert_eq!(status.file_type, FileType::Directory);
+    assert_eq!(status.mode.bits() & 0o777, 0o111);
+    assert_eq!(path_status.unwrap().unwrap().node_info, status.node_info);
+    assert!(child.is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn overlay_reads_only_the_lower_directories_an_upper_directory_merges() {
+    // Root may legitimately bypass DAC, so this requires an unprivileged host test run.
+    let upper = tempfile::tempdir().unwrap();
+    if fs::metadata(upper.path()).unwrap().uid() == 0 {
+        return;
+    }
+    let lower = tempfile::tempdir().unwrap();
+    for root in [upper.path(), lower.path()] {
+        fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["opaque", "merged"] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    fs::write(upper.path().join("opaque/.litebox-overlay-opaque"), b"").unwrap();
+    fs::write(upper.path().join("opaque/upper"), b"").unwrap();
+    let allocators = InodeAllocators::new();
+    let resolver: Resolver<TestPlatform, _> = Resolver::new(Overlay::<TestPlatform>::new(
+        LocalFs::new(upper.path(), allocators.next()).unwrap(),
+        LocalFs::new(lower.path(), allocators.next()).unwrap(),
+        allocators.next(),
+    ));
+
+    let unreadable = |mode| {
+        for name in ["opaque", "merged"] {
+            fs::set_permissions(lower.path().join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+    };
+    unreadable(0o000);
+    let opaque = overlay_listing(&resolver, "/opaque");
+    let merged_status = resolver.file_status(USER, "/merged", true);
+    let merged = overlay_listing(&resolver, "/merged");
+    unreadable(0o755);
+
+    // An opaque upper directory hides the lower one, which is never read.
+    assert_eq!(opaque.unwrap(), [".", "..", "upper"]);
+    // A merged directory's metadata is the upper's, but its entries need every layer's.
+    assert_eq!(merged_status.unwrap().file_type, FileType::Directory);
+    assert_eq!(merged, None);
 }
 
 #[cfg(unix)]

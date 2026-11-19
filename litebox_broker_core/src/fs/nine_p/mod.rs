@@ -27,6 +27,7 @@ use super::errors::{
     ReadError, RenameError, ResolutionError, RmdirError, SeekError, SymlinkError, TruncateError,
     UnlinkError, WalkError, WriteError,
 };
+use litebox_broker_protocol::authority::{DomainId, Principal};
 use litebox_platform::buffer::{Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
 
@@ -483,6 +484,7 @@ where
         name: &str,
         metadata: super::backend::CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
+        let gid = creation_gid(&metadata).ok_or(OpenError::Io)?;
         // `Tlcreate` turns the directory fid into the new file's fid server-side, so it must be
         // handed a private clone rather than the caller's directory handle.
         let dir = dir.into_typed::<Self>();
@@ -491,13 +493,13 @@ where
         // the caller's read/write intent via its own `read_allowed`/`write_allowed`.
         //
         // XXX: `Tlcreate` only carries a gid; the owning uid is whichever user the connection
-        // attached as, so `metadata.owner.user` cannot be honored here.
+        // attached as, so the descriptor's owner cannot be honored here.
         let (_, fid) = self.client.create(
             fid,
             name,
             fcall::LOpenFlags::O_RDWR,
             metadata.mode.bits().into(),
-            u32::from(metadata.owner.group),
+            gid,
         )?;
         Ok(FileHandle::from_typed::<Self>(NinePFileHandle {
             fid: self.own(fid),
@@ -523,14 +525,11 @@ where
         name: &str,
         metadata: super::backend::CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
+        let gid = creation_gid(&metadata).ok_or(MkdirError::Io)?;
         let dir = dir.into_typed::<Self>();
         // XXX: as in `create_file_at`, `Tmkdir` cannot set the owning uid.
-        self.client.mkdir(
-            &dir.fid.fid,
-            name,
-            metadata.mode.bits().into(),
-            u32::from(metadata.owner.group),
-        )?;
+        self.client
+            .mkdir(&dir.fid.fid, name, metadata.mode.bits().into(), gid)?;
         // `Tmkdir` only reports the new directory's qid, so a walk is needed to address it.
         //
         // TODO(jayb): the resolver discards this handle, so the walk is pure overhead, and worse, a
@@ -753,11 +752,10 @@ fn qid_type_to_file_type(qid_type: fcall::QidType) -> super::FileType {
     }
 }
 
-/// A server's user or group id as the guest's: one beyond `u16` (e.g., the host's, which QEMU's
-/// `security_model=none` passes through) is the overflow id, as for the userland broker's host
-/// files.
-fn guest_id(id: u32) -> u16 {
-    u16::try_from(id).unwrap_or(super::tar_ro::OVERFLOW_ID)
+/// The gid a new node is created with: its descriptor's group, which must be a POSIX group as
+/// that is all 9P can store.
+fn creation_gid(metadata: &super::backend::CreationMetadata) -> Option<u32> {
+    metadata.descriptor.group().id_in(DomainId::POSIX_GROUP)
 }
 
 /// Convert getattr response to FileStatus
@@ -796,10 +794,8 @@ fn rgetattr_to_file_status(
             file_type,
             mode: super::Mode::from_u32_bits_truncate(attr.stat.mode),
             size: attr.stat.size,
-            owner: super::UserInfo {
-                user: guest_id(attr.stat.uid),
-                group: guest_id(attr.stat.gid),
-            },
+            owner: Principal::posix_user(attr.stat.uid),
+            group: Principal::posix_group(attr.stat.gid),
             node_info: super::NodeInfo {
                 dev: device_id,
                 ino: attr.qid.path,
@@ -821,17 +817,16 @@ fn rgetattr_to_file_status(
             } else {
                 0
             },
-            owner: super::UserInfo {
-                user: if attr.valid.contains(fcall::GetattrMask::UID) {
-                    guest_id(attr.stat.uid)
-                } else {
-                    0
-                },
-                group: if attr.valid.contains(fcall::GetattrMask::GID) {
-                    guest_id(attr.stat.gid)
-                } else {
-                    0
-                },
+            // An owner the server does not report is unknown, not root.
+            owner: if attr.valid.contains(fcall::GetattrMask::UID) {
+                Principal::posix_user(attr.stat.uid)
+            } else {
+                Principal::UNMAPPED
+            },
+            group: if attr.valid.contains(fcall::GetattrMask::GID) {
+                Principal::posix_group(attr.stat.gid)
+            } else {
+                Principal::UNMAPPED
             },
             node_info: super::NodeInfo {
                 dev: device_id,

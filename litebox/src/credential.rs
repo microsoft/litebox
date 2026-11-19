@@ -104,6 +104,18 @@ pub struct RegisteredSubject {
     handle: ObjectHandle,
 }
 
+impl RegisteredSubject {
+    pub(crate) fn handle_for(&self, broker: &Arc<dyn BrokerControl>) -> Option<ObjectHandle> {
+        Arc::ptr_eq(&self.broker, broker).then_some(self.handle)
+    }
+}
+
+impl core::fmt::Debug for RegisteredSubject {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RegisteredSubject").finish_non_exhaustive()
+    }
+}
+
 impl Drop for RegisteredSubject {
     fn drop(&mut self) {
         let _ = self.broker.close_object(self.handle);
@@ -528,6 +540,16 @@ mod tests {
     /// Connects a LiteBox to a root process of a real in-process broker,
     /// created with `authority` as trusted broker configuration.
     fn litebox_with_in_process_broker(authority: &[Term]) -> LiteBox<MockPlatform> {
+        litebox_with_file_service(
+            authority,
+            Arc::new(litebox_broker_core::fs::UnsupportedFileService),
+        )
+    }
+
+    fn litebox_with_file_service(
+        authority: &[Term],
+        fs: Arc<dyn litebox_broker_core::fs::FileService>,
+    ) -> LiteBox<MockPlatform> {
         use litebox_broker_core::authority::Authority;
         use litebox_broker_core::test_support::TestBrokerBuilder;
         use litebox_broker_core::{CallerCredential, ObjectRights, PolicyEngine};
@@ -538,6 +560,7 @@ mod tests {
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
+        .with_file_service(fs)
         .build()
         .unwrap();
         let root = broker
@@ -558,6 +581,206 @@ mod tests {
         })
         .unwrap();
         LiteBox::new_with_broker_local(MockPlatform::new(), local)
+    }
+
+    fn litebox_with_credential_files(privileges: Privileges) -> LiteBox<MockPlatform> {
+        use litebox_broker_core::descriptor::profile::{FileSystemProfile, StorableForms};
+        use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
+        use litebox_broker_core::fs::inode_allocator::InodeAllocators;
+        use litebox_broker_core::fs::resolver::Resolver;
+        use litebox_broker_core::test_platform::TestPlatform;
+        use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
+
+        let directory = InitialNode::Directory {
+            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+            owner: UserInfo::ROOT,
+        };
+        let fs = Resolver::<TestPlatform, _>::with_credentials(
+            InMem::<TestPlatform>::new_initialized(
+                [("/", directory)],
+                InodeAllocators::new().next(),
+            ),
+            FileSystemProfile::new(StorableForms::MODE).unwrap(),
+        );
+        litebox_with_file_service(&[term(1000, privileges)], Arc::new(fs))
+    }
+
+    #[test]
+    fn file_requests_admit_the_current_access_subject() {
+        use crate::fs::Context;
+        use crate::fs::errors::{OpenError, PathError, TruncateError, WriteError};
+        use litebox_broker_protocol::fs::{
+            FileAccessMode, FileMode as Mode, FileOpenFlags, FileUser as UserInfo,
+        };
+        let litebox = litebox_with_credential_files(Privileges::MANAGE_ELEVATION);
+        let access = Subject {
+            scope: Scope::Access,
+            owner: user(1000),
+            group: group(100),
+            identities: SortedSet::new(),
+            deny_only: SortedSet::new(),
+            privileges: Privileges::empty(),
+        };
+        let select = |subject| {
+            let mut context = Context::new();
+            context.set_subject(Arc::new(litebox.register_subject(&subject).unwrap()));
+            context
+        };
+        let writer = select(access.clone());
+        let manager = select(Subject {
+            privileges: Privileges::MANAGE_ELEVATION,
+            ..access.clone()
+        });
+        let identity = select(Subject {
+            scope: Scope::Identity,
+            ..access
+        });
+        let mut legacy_root = Context::new();
+        legacy_root.set_acting_user(UserInfo::ROOT);
+        let elevated = Mode::RWXU | Mode::SUID;
+        let create = |caller| {
+            litebox.open_file(
+                caller,
+                "/program",
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
+                elevated,
+            )
+        };
+        assert!(matches!(
+            create(&legacy_root),
+            Err(OpenError::PathError(PathError::NoSearchPerms))
+        ));
+        assert!(matches!(
+            create(&identity),
+            Err(OpenError::AccessNotAllowed)
+        ));
+        let file = create(&manager).unwrap();
+        assert_eq!(
+            file.write_as(manager.caller(), b"a", None, None).unwrap(),
+            1
+        );
+        assert_eq!(file.status().unwrap().mode, elevated);
+        assert_eq!(
+            file.write_as(writer.caller(), b"b", Some(0), None).unwrap(),
+            1
+        );
+        assert_eq!(file.status().unwrap().mode, Mode::RWXU);
+
+        litebox.chmod_file(&writer, "/program", elevated).unwrap();
+        litebox
+            .restrict_authority(&[term(1000, Privileges::empty())])
+            .unwrap();
+        assert!(matches!(
+            create(&manager),
+            Err(OpenError::PathError(PathError::StaleSubject))
+        ));
+        assert!(matches!(
+            file.write_as(manager.caller(), b"b", None, None),
+            Err(WriteError::StaleSubject)
+        ));
+        assert!(matches!(
+            file.truncate_as(manager.caller(), 0, true),
+            Err(TruncateError::StaleSubject)
+        ));
+        let unchanged = file.status().unwrap();
+        assert_eq!((unchanged.size, unchanged.mode), (1, elevated));
+        file.truncate_as(writer.caller(), 0, false).unwrap();
+        assert_eq!(file.status().unwrap().mode, Mode::RWXU);
+    }
+
+    #[test]
+    fn mixed_file_security_update_is_atomic_and_keeps_full_principals() {
+        use crate::fs::{Context, SecurityUpdate};
+        use litebox_broker_protocol::fs::{
+            FileAccessMode, FileError, FileMode as Mode, FileOpenFlags,
+        };
+        let litebox = litebox_with_credential_files(Privileges::SET_ANY_OWNER);
+        let caller = Subject {
+            scope: Scope::Access,
+            owner: user(1000),
+            group: group(100),
+            identities: SortedSet::new(),
+            deny_only: SortedSet::new(),
+            privileges: Privileges::SET_ANY_OWNER,
+        };
+        let mut context = Context::new();
+        context.set_subject(Arc::new(litebox.register_subject(&caller).unwrap()));
+        let file = litebox
+            .open_file(
+                &context,
+                "/file",
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
+            .unwrap();
+        let owner = Principal {
+            domain: DomainId(7),
+            id: 1000,
+        };
+        let group = group(0x1_0001);
+        litebox
+            .set_file_security(
+                &context,
+                "/file",
+                SecurityUpdate {
+                    owner: Some(owner),
+                    group: Some(group),
+                    mode: Some(Mode::RUSR),
+                },
+            )
+            .unwrap();
+        let metadata = || {
+            let status = file.status().unwrap();
+            (status.owner, status.group, status.mode)
+        };
+        assert_eq!(metadata(), (owner, group, Mode::RUSR));
+        // SET_ANY_OWNER permits taking the file back, not changing the old owner's access.
+        assert_eq!(
+            litebox.set_file_security(
+                &context,
+                "/file",
+                SecurityUpdate {
+                    owner: Some(caller.owner),
+                    group: Some(caller.group),
+                    mode: Some(Mode::RWXU),
+                }
+            ),
+            Err(FileError::NotOwner)
+        );
+        assert_eq!(metadata(), (owner, group, Mode::RUSR));
+    }
+
+    #[test]
+    fn file_subject_cannot_be_used_on_another_association() {
+        use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
+        let (first, _) = litebox_with_broker(vec![]);
+        let (second, _) = litebox_with_broker(vec![]);
+        let mut context = crate::fs::Context::new();
+        context.set_subject(Arc::new(
+            first
+                .register_subject(&Subject {
+                    scope: Scope::Access,
+                    owner: user(1000),
+                    group: group(100),
+                    identities: SortedSet::new(),
+                    deny_only: SortedSet::new(),
+                    privileges: Privileges::empty(),
+                })
+                .unwrap(),
+        ));
+        // The second channel must never receive the first channel's handle.
+        assert!(matches!(
+            second.open_file(
+                &context.clone(),
+                "/",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
+                litebox_broker_protocol::fs::FileMode::empty()
+            ),
+            Err(crate::fs::errors::OpenError::AccessNotAllowed)
+        ));
     }
 
     #[test]

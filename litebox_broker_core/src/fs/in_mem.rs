@@ -12,13 +12,17 @@ use hashbrown::HashMap;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
 
+use litebox_broker_protocol::authority::{DomainId, Principal};
+
 use super::backend::{
-    PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
+    AuthorizeRemoval, AuthorizeRename, ContentChange, CreationMetadata, EntryRemoval, EntryRename,
+    OpenChecks, PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile,
+    ResolvedTarget, posix_descriptor, status_mode, with_owners,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SetTimesError, StorageError,
-    SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SetSecurityError,
+    SetTimesError, StorageError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::shared_storage::{SharedFile, SharedFileLimit, SharedFileMemoryProvider, SharedStorage};
@@ -27,6 +31,11 @@ use super::{
     DirEntry, FileStatus, FileTimeUpdate, FileTimestamps, FileType, Mode, NodeInfo, SetFileTimes,
     UserInfo,
 };
+use crate::descriptor::{FileKind as DescriptorKind, SecurityDescriptor};
+
+fn initial_descriptor(file_type: FileType, mode: Mode, owner: UserInfo) -> SecurityDescriptor {
+    posix_descriptor(file_type, mode, owner).from_trusted_configuration()
+}
 
 /// A [`super::backend::Backend`] that stores all files in memory.
 ///
@@ -49,7 +58,7 @@ pub struct InMem<Platform: sync::RawSyncPrimitivesProvider> {
 
 impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     fn resolved_dir<'a>(dir: InMemDirHandle<Platform>) -> ResolvedDir<'a> {
-        let permissions = dir.dir.read().perms.permission_check();
+        let permissions = permission_check(&dir.dir.read().descriptor);
         ResolvedDir::from_typed::<Self>(dir, permissions)
     }
 
@@ -58,10 +67,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     pub fn new(inode_allocator: InodeAllocator) -> Self {
         let root = Arc::new(sync::RwLock::new(DirData {
             instance: Arc::new(()),
-            perms: Permissions {
-                mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-                userinfo: UserInfo::ROOT,
-            },
+            descriptor: initial_descriptor(
+                FileType::Directory,
+                Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                UserInfo::ROOT,
+            ),
             children: HashMap::default(),
             node_info: inode_allocator.next(),
             times: None,
@@ -136,10 +146,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             let InitialNode::Directory { mode, owner } = node else {
                 panic!("the root directory must be initialized as a directory")
             };
-            self.root.write().perms = Permissions {
-                mode,
-                userinfo: owner,
-            };
+            self.root.write().descriptor = initial_descriptor(FileType::Directory, mode, owner);
             return;
         };
 
@@ -161,10 +168,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
         let mut dir = dir.write();
         match (dir.children.get(name), node) {
             (Some(Node::Dir(existing)), InitialNode::Directory { mode, owner }) => {
-                existing.write().perms = Permissions {
-                    mode,
-                    userinfo: owner,
-                };
+                existing.write().descriptor = initial_descriptor(FileType::Directory, mode, owner);
             }
             (Some(Node::File(existing)), InitialNode::File { mode, owner, data }) => {
                 let mut existing = existing.write();
@@ -173,10 +177,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     FileType::RegularFile,
                     "{path:?} already exists with a different type"
                 );
-                existing.perms = Permissions {
-                    mode,
-                    userinfo: owner,
-                };
+                existing.descriptor = initial_descriptor(FileType::RegularFile, mode, owner);
                 existing.contents = FileContents::regular(data);
             }
             (
@@ -193,20 +194,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                     FileType::SymbolicLink,
                     "{path:?} already exists with a different type"
                 );
-                existing.perms = Permissions {
-                    mode,
-                    userinfo: owner,
-                };
+                existing.descriptor = initial_descriptor(FileType::SymbolicLink, mode, owner);
                 existing.contents = FileContents::Symlink(target);
             }
             (Some(_), _) => panic!("{path:?} already exists with a different type"),
             (None, InitialNode::Directory { mode, owner }) => {
                 let child = Arc::new(sync::RwLock::new(DirData {
                     instance: dir.instance.clone(),
-                    perms: Permissions {
-                        mode,
-                        userinfo: owner,
-                    },
+                    descriptor: initial_descriptor(FileType::Directory, mode, owner),
                     children: HashMap::default(),
                     node_info: self.inode_allocator.next(),
                     times: None,
@@ -215,10 +210,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             }
             (None, InitialNode::File { mode, owner, data }) => {
                 let child = Arc::new(sync::RwLock::new(FileData {
-                    perms: Permissions {
-                        mode,
-                        userinfo: owner,
-                    },
+                    descriptor: initial_descriptor(FileType::RegularFile, mode, owner),
                     contents: FileContents::regular(data),
                     node_info: self.inode_allocator.next(),
                     times: None,
@@ -234,10 +226,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                 },
             ) => {
                 let child = Arc::new(sync::RwLock::new(FileData {
-                    perms: Permissions {
-                        mode,
-                        userinfo: owner,
-                    },
+                    descriptor: initial_descriptor(FileType::SymbolicLink, mode, owner),
                     contents: FileContents::Symlink(target),
                     node_info: self.inode_allocator.next(),
                     times: None,
@@ -260,6 +249,379 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             }));
         }
         false
+    }
+
+    /// Insert the node `make` builds as `name` in `parent`, with the descriptor of `kind` that
+    /// `authorize` computes from the parent's under the parent's lock, unless the name exists.
+    fn insert_child<E>(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        kind: DescriptorKind,
+        (exists, wrong_kind): (E, E),
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, E>,
+        make: impl FnOnce(&DirData<Platform>, SecurityDescriptor, NodeInfo) -> Node<Platform>,
+    ) -> Result<Node<Platform>, E> {
+        let parent = parent.into_typed::<Self>();
+        let mut parent = parent.dir.write();
+        if parent.children.contains_key(name) {
+            return Err(exists);
+        }
+        let descriptor = authorize(&parent.descriptor)?;
+        if descriptor.kind() != kind {
+            return Err(wrong_kind);
+        }
+        let node = make(&parent, descriptor, self.inode_allocator.next());
+        let old = parent.children.insert(name.into(), node.clone());
+        debug_assert!(old.is_none());
+        Ok(node)
+    }
+
+    fn new_file(
+        descriptor: SecurityDescriptor,
+        contents: FileContents,
+        node_info: NodeInfo,
+    ) -> Node<Platform> {
+        Node::File(Arc::new(sync::RwLock::new(FileData {
+            descriptor,
+            contents,
+            node_info,
+            times: None,
+        })))
+    }
+
+    fn new_dir(
+        parent: &DirData<Platform>,
+        descriptor: SecurityDescriptor,
+        node_info: NodeInfo,
+    ) -> Node<Platform> {
+        Node::Dir(Arc::new(sync::RwLock::new(DirData {
+            instance: parent.instance.clone(),
+            descriptor,
+            children: HashMap::default(),
+            node_info,
+            times: None,
+        })))
+    }
+
+    /// Remove `name` from `parent` once `authorize` (if any) accepts the removal of the object it
+    /// names and `check` accepts that object, all under the parent's lock.
+    fn remove_child<E: From<PathError>>(
+        parent: ResolvedDir<'_>,
+        name: &str,
+        authorize: Option<AuthorizeRemoval<'_, E>>,
+        check: impl FnOnce(&LockedNode<'_, Platform>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let parent = parent.into_typed::<Self>();
+        let mut parent = parent.dir.write();
+        let child = parent
+            .children
+            .get(name)
+            .cloned()
+            .ok_or(PathError::NoSuchFileOrDirectory)?;
+        let child = child.read();
+        if let Some(authorize) = authorize {
+            authorize(&EntryRemoval {
+                parent: &parent.descriptor,
+                entry: child.descriptor(),
+            })?;
+        }
+        check(&child)?;
+        parent.children.remove(name);
+        Ok(())
+    }
+
+    fn rename(
+        &self,
+        old_dir: super::backend::DirHandle,
+        old_name: &str,
+        new_dir: super::backend::DirHandle,
+        new_name: &str,
+        authorize: Option<AuthorizeRename<'_>>,
+    ) -> Result<(), RenameError> {
+        for name in [old_name, new_name] {
+            if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
+                return Err(PathError::InvalidPathname.into());
+            }
+        }
+        // XXX(jayb): racing rmdir can detach a resolved parent, as for create and mkdir; fix all
+        // three together as part of broader atomicity fixups.
+        let old_dir = old_dir.into_typed::<Self>().dir;
+        let new_dir = new_dir.into_typed::<Self>().dir;
+        let _rename = self.rename_lock.lock();
+        let instance = self.root.read().instance.clone();
+        let old_instance = old_dir.read().instance.clone();
+        let new_instance = new_dir.read().instance.clone();
+        if !Arc::ptr_eq(&old_instance, &instance) || !Arc::ptr_eq(&new_instance, &instance) {
+            return Err(RenameError::Io);
+        }
+        let source = old_dir
+            .read()
+            .children
+            .get(old_name)
+            .cloned()
+            .ok_or(PathError::NoSuchFileOrDirectory)?;
+        let destination = new_dir.read().children.get(new_name).cloned();
+        let same_parent = Arc::ptr_eq(&old_dir, &new_dir);
+        let new_above_old = !same_parent && Self::contains_dir(&new_dir, &old_dir);
+        let source_has_new = match &source {
+            Node::Dir(dir) => Self::contains_dir(dir, &new_dir),
+            Node::File(_) => false,
+        };
+        let destination_has_old = match &destination {
+            Some(Node::Dir(dir)) if new_above_old => Self::contains_dir(dir, &old_dir),
+            _ => false,
+        };
+        let replace = |old: &mut DirData<Platform>, new: Option<&mut DirData<Platform>>| {
+            let current = old
+                .children
+                .get(old_name)
+                .cloned()
+                .ok_or(PathError::NoSuchFileOrDirectory)?;
+            let target = match &new {
+                Some(new) => new.children.get(new_name),
+                None => old.children.get(new_name),
+            }
+            .cloned();
+            if target.as_ref().is_some_and(|target| current.ptr_eq(target)) {
+                return Ok(());
+            }
+            // Ancestry was checked before locking, so it only holds for unchanged entries; a
+            // concurrently created replacement cannot contain either existing parent.
+            if source_has_new && current.ptr_eq(&source) {
+                return Err(RenameError::InvalidArgument);
+            }
+            if let Some(target @ Node::Dir(dir)) = &target
+                && (Arc::ptr_eq(dir, &old_dir)
+                    || (destination_has_old
+                        && destination
+                            .as_ref()
+                            .is_some_and(|prior| target.ptr_eq(prior))))
+            {
+                return Err(RenameError::NotEmpty);
+            }
+            // Renames are serialized. Neither child can be either locked parent or the other's
+            // ancestor here. Hold their descriptors together until the namespace change commits.
+            let current = current.read();
+            let target = target.as_ref().map(Node::read);
+            if let Some(authorize) = authorize {
+                authorize(&EntryRename {
+                    old_parent: &old.descriptor,
+                    new_parent: new.as_ref().map_or(&old.descriptor, |new| &new.descriptor),
+                    same_parent,
+                    source: current.descriptor(),
+                    replaced: target.as_ref().map(LockedNode::descriptor),
+                })?;
+            }
+            match (&current, &target) {
+                (LockedNode::Dir(_), Some(LockedNode::File(_))) => {
+                    return Err(RenameError::NotADirectory);
+                }
+                (LockedNode::File(_), Some(LockedNode::Dir(_))) => {
+                    return Err(RenameError::IsADirectory);
+                }
+                (LockedNode::Dir(_), Some(LockedNode::Dir(dir))) if !dir.children.is_empty() => {
+                    return Err(RenameError::NotEmpty);
+                }
+                _ => {}
+            }
+            let moved = old
+                .children
+                .remove(old_name)
+                .expect("source was checked under lock");
+            match new {
+                Some(new) => new.children.insert(new_name.into(), moved),
+                None => old.children.insert(new_name.into(), moved),
+            };
+            Ok(())
+        };
+        // XXX(jayb): nested directory locks are taken ancestor-first, with ancestry checked before
+        // either write lock; revisit as part of broader atomicity fixups.
+        if same_parent {
+            replace(&mut old_dir.write(), None)
+        } else if new_above_old {
+            let mut new = new_dir.write();
+            replace(&mut old_dir.write(), Some(&mut new))
+        } else {
+            let mut old = old_dir.write();
+            replace(&mut old, Some(&mut new_dir.write()))
+        }
+    }
+
+    fn update_times(
+        target: ResolvedTarget<'_>,
+        times: &SetFileTimes,
+        authorize: Option<AuthorizeTimes<'_>>,
+    ) -> Result<(), SetTimesError> {
+        if matches!(
+            (times.access, times.modify),
+            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
+        ) {
+            return Ok(());
+        }
+        let node = Self::target_node(target);
+        let update = |descriptor: &SecurityDescriptor, stored: &mut Option<FileTimestamps>| {
+            if let Some(authorize) = authorize {
+                authorize(descriptor)?;
+            }
+            // Fields never set, including ctime, read as zero.
+            if let FileTimeUpdate::Set(time) = times.access {
+                stored.get_or_insert_default().accessed = time;
+            }
+            if let FileTimeUpdate::Set(time) = times.modify {
+                stored.get_or_insert_default().modified = time;
+            }
+            if times.access == FileTimeUpdate::Now || times.modify == FileTimeUpdate::Now {
+                // XXX(jayb): in-mem has no clock, so NOW (e.g. plain `touch`) changes nothing.
+                litebox_util_log::warn!("in-mem timestamps ignore NOW updates");
+            }
+            Ok(())
+        };
+        match &node {
+            Node::File(file) => {
+                let file = &mut *file.write();
+                update(&file.descriptor, &mut file.times)
+            }
+            Node::Dir(dir) => {
+                let dir = &mut *dir.write();
+                update(&dir.descriptor, &mut dir.times)
+            }
+        }
+    }
+
+    /// Replace the descriptor of the non-symlink `target` with what `update` computes from it.
+    fn update_descriptor<E>(
+        target: ResolvedTarget<'_>,
+        is_symlink: E,
+        update: impl FnOnce(&SecurityDescriptor) -> Result<SecurityDescriptor, E>,
+        wrong_kind: E,
+    ) -> Result<(), E> {
+        let node = Self::target_node(target);
+        let store = |descriptor: &mut SecurityDescriptor| {
+            let new = update(descriptor)?;
+            if new.kind() != descriptor.kind() {
+                return Err(wrong_kind);
+            }
+            *descriptor = new;
+            Ok(())
+        };
+        match &node {
+            Node::File(file) => {
+                let mut file = file.write();
+                if file.file_type() == FileType::SymbolicLink {
+                    return Err(is_symlink);
+                }
+                store(&mut file.descriptor)
+            }
+            Node::Dir(dir) => store(&mut dir.write().descriptor),
+        }
+    }
+
+    fn unlinkable(node: &LockedNode<'_, Platform>) -> Result<(), UnlinkError> {
+        match node {
+            LockedNode::Dir(_) => Err(UnlinkError::IsADirectory),
+            LockedNode::File(_) => Ok(()),
+        }
+    }
+
+    fn removable_dir(node: &LockedNode<'_, Platform>) -> Result<(), RmdirError> {
+        match node {
+            LockedNode::File(_) => Err(RmdirError::NotADirectory),
+            LockedNode::Dir(child) if !child.children.is_empty() => Err(RmdirError::NotEmpty),
+            LockedNode::Dir(_) => Ok(()),
+        }
+    }
+
+    /// Open `file`, first admitting the open under the file's lock if `checks` say so (see
+    /// [`super::backend::Backend::open_file_checked`]).
+    fn open(
+        file: ResolvedFile<'_>,
+        flags: super::OFlags,
+        checks: Option<&OpenChecks<'_>>,
+    ) -> Result<super::backend::FileHandle, OpenError> {
+        assert_supported_oflags(flags);
+        if flags.contains(super::OFlags::DIRECTORY) {
+            return Err(PathError::ComponentNotADirectory.into());
+        }
+        let handle = super::backend::FileHandle::from_typed::<Self>(file.into_typed::<Self>());
+        {
+            let file = &mut *handle.get_typed::<Self>().file.write();
+            if let Some(checks) = checks {
+                (checks.admit)(&file.descriptor)?;
+            }
+            if flags.contains(super::OFlags::TRUNC) && !flags.contains(super::OFlags::PATH) {
+                // Linux truncates whenever the open succeeds, regardless of the access mode (an
+                // `O_RDONLY|O_TRUNC` open of a writable file does truncate it); `O_PATH` opens
+                // ignore `O_TRUNC` entirely.
+                Self::truncate_locked(file, 0, checks.map(|checks| checks.content_change))?;
+            }
+        }
+        Ok(handle)
+    }
+
+    /// Write `buf` at `offset`, applying `content_change` (if any) to the descriptor under the
+    /// same lock if anything is written.
+    fn write_file(
+        h: &super::backend::FileHandle,
+        buf: &dyn WriteBuffer,
+        offset: usize,
+        content_change: Option<ContentChange<'_>>,
+    ) -> Result<usize, WriteError> {
+        let file = &mut *h.get_typed::<Self>().file.write();
+        let FileContents::Regular(storage) = &mut file.contents else {
+            return Err(WriteError::NotAFile);
+        };
+        let written = storage.write_at(offset, buf)?;
+        if written > 0
+            && let Some(content_change) = content_change
+        {
+            content_change(&mut file.descriptor);
+        }
+        Ok(written)
+    }
+
+    /// Set the length to `length`, applying `content_change` (if any) to the descriptor under the
+    /// same lock if that succeeds.
+    fn truncate_file(
+        h: &super::backend::FileHandle,
+        length: usize,
+        content_change: Option<ContentChange<'_>>,
+    ) -> Result<(), TruncateError> {
+        Self::truncate_locked(
+            &mut h.get_typed::<Self>().file.write(),
+            length,
+            content_change,
+        )
+    }
+
+    /// [`Self::truncate_file`], for a file whose lock the caller holds.
+    ///
+    /// A truncation with a `content_change` either completes or changes nothing, so that
+    /// contents never change without it (see [`FileStorageMut::set_len_atomically`]).
+    fn truncate_locked(
+        file: &mut FileData,
+        length: usize,
+        content_change: Option<ContentChange<'_>>,
+    ) -> Result<(), TruncateError> {
+        let FileContents::Regular(storage) = &mut file.contents else {
+            // XXX(jayb): consider a `TruncateError::NotAFile` variant.
+            unreachable!("symlinks are only opened path-only, which the resolver never truncates")
+        };
+        match content_change {
+            Some(content_change) => {
+                storage.set_len_atomically(length)?;
+                content_change(&mut file.descriptor);
+            }
+            None => storage.set_len(length)?,
+        }
+        Ok(())
+    }
+
+    fn target_node(target: ResolvedTarget<'_>) -> Node<Platform> {
+        match target {
+            ResolvedTarget::File(h) => Node::File(h.into_typed::<Self>().file),
+            ResolvedTarget::Dir(h) => Node::Dir(h.into_typed::<Self>().dir),
+        }
     }
 
     /// Initialize a primarily read-heavy file with static data.
@@ -375,18 +737,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError> {
-        let mut current = from;
+        let mut dir = from.into_typed::<Self>();
         for (index, component) in components.iter().enumerate() {
             let fail = |error| ResolutionError {
                 component: Some(index),
                 error,
             };
-            let PermissionCheck::ByResolver(permissions) = &current.permissions else {
-                unreachable!()
+            let child = {
+                let parent = dir.dir.read();
+                authorize_dir_lookup(&PermissionInfo::new(parent.descriptor.clone(), false))
+                    .map_err(fail)?;
+                parent.children.get(*component).cloned()
             };
-            authorize_dir_lookup(permissions).map_err(fail)?;
-            let dir = current.into_typed::<Self>();
-            let child = dir.dir.read().children.get(*component).cloned();
             let Some(child) = child else {
                 if index + 1 == components.len() {
                     return Ok(Resolution::MissingFinal {
@@ -397,10 +759,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             };
             match child {
                 Node::Dir(child) => {
-                    current = Self::resolved_dir(InMemDirHandle {
+                    dir = InMemDirHandle {
                         dir: child,
                         flags: super::OFlags::PATH,
-                    });
+                    };
                 }
                 Node::File(file) => {
                     if index + 1 != components.len() {
@@ -411,7 +773,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                     }
                     let (permissions, file_type) = {
                         let file = file.read();
-                        (file.perms.permission_check(), file.file_type())
+                        (permission_check(&file.descriptor), file.file_type())
                     };
                     return Ok(Resolution::Found(ResolvedTarget::File(
                         ResolvedFile::from_typed::<Self>(
@@ -423,7 +785,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 }
             }
         }
-        Ok(Resolution::Found(ResolvedTarget::Dir(current)))
+        Ok(Resolution::Found(ResolvedTarget::Dir(Self::resolved_dir(
+            dir,
+        ))))
     }
 
     fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
@@ -434,6 +798,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             None => return Err(PathError::NoSuchFileOrDirectory.into()),
         };
         match &file.contents {
+            FileContents::Symlink(target) => Ok(target.clone()),
+            FileContents::Regular(_) => Err(PathError::InvalidPathname.into()),
+        }
+    }
+
+    fn read_resolved_link(&self, file: &ResolvedFile<'_>) -> Result<String, WalkError> {
+        match &file.get_typed::<Self>().file.read().contents {
             FileContents::Symlink(target) => Ok(target.clone()),
             FileContents::Regular(_) => Err(PathError::InvalidPathname.into()),
         }
@@ -465,18 +836,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         file: ResolvedFile<'_>,
         flags: super::OFlags,
     ) -> Result<super::backend::FileHandle, OpenError> {
-        assert_supported_oflags(flags);
-        if flags.contains(super::OFlags::DIRECTORY) {
-            return Err(PathError::ComponentNotADirectory.into());
-        }
-        let handle = super::backend::FileHandle::from_typed::<Self>(file.into_typed::<Self>());
-        if flags.contains(super::OFlags::TRUNC) && !flags.contains(super::OFlags::PATH) {
-            // Linux truncates whenever the open succeeds, regardless of the access mode (an
-            // `O_RDONLY|O_TRUNC` open of a writable file does truncate it); `O_PATH` opens ignore
-            // `O_TRUNC` entirely.
-            self.truncate(&handle, 0)?;
-        }
-        Ok(handle)
+        Self::open(file, flags, None)
+    }
+
+    fn open_file_checked(
+        &self,
+        file: ResolvedFile<'_>,
+        flags: super::OFlags,
+        checks: &OpenChecks<'_>,
+    ) -> Result<super::backend::FileHandle, OpenError> {
+        Self::open(file, flags, Some(checks))
     }
 
     fn list_dir_at(
@@ -526,21 +895,30 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         buf: &dyn WriteBuffer,
         offset: usize,
     ) -> Result<usize, WriteError> {
-        let mut file = h.get_typed::<Self>().file.write();
-        let FileContents::Regular(storage) = &mut file.contents else {
-            return Err(WriteError::NotAFile);
-        };
-        Ok(storage.write_at(offset, buf)?)
+        Self::write_file(h, buf, offset, None)
+    }
+
+    fn write_checked(
+        &self,
+        h: &super::backend::FileHandle,
+        buf: &dyn WriteBuffer,
+        offset: usize,
+        content_change: &dyn Fn(&mut SecurityDescriptor),
+    ) -> Result<usize, WriteError> {
+        Self::write_file(h, buf, offset, Some(content_change))
     }
 
     fn truncate(&self, h: &super::backend::FileHandle, length: usize) -> Result<(), TruncateError> {
-        let mut file = h.get_typed::<Self>().file.write();
-        let FileContents::Regular(storage) = &mut file.contents else {
-            // XXX(jayb): consider a `TruncateError::NotAFile` variant.
-            unreachable!("symlinks are only opened path-only, which the resolver never truncates")
-        };
-        storage.set_len(length)?;
-        Ok(())
+        Self::truncate_file(h, length, None)
+    }
+
+    fn truncate_checked(
+        &self,
+        h: &super::backend::FileHandle,
+        length: usize,
+        content_change: &dyn Fn(&mut SecurityDescriptor),
+    ) -> Result<(), TruncateError> {
+        Self::truncate_file(h, length, Some(content_change))
     }
 
     fn seek_behavior(&self, _h: &super::backend::FileHandle) -> super::backend::SeekBehavior {
@@ -553,9 +931,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 let file = h.get_typed::<Self>().file.read();
                 Ok(FileStatus {
                     file_type: file.file_type(),
-                    mode: file.perms.mode,
+                    mode: status_mode(&file.descriptor),
                     size: u64::try_from(file.contents.len()?).map_err(|_| FileStatusError::Io)?,
-                    owner: file.perms.userinfo,
+                    owner: file.descriptor.owner(),
+                    group: file.descriptor.group(),
                     times: file.times,
                     node_info: file.node_info,
                     blksize: BLOCK_SIZE,
@@ -565,9 +944,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 let dir = h.get_typed::<Self>().dir.read();
                 Ok(FileStatus {
                     file_type: FileType::Directory,
-                    mode: dir.perms.mode,
+                    mode: status_mode(&dir.descriptor),
                     size: super::DEFAULT_DIRECTORY_SIZE,
-                    owner: dir.perms.userinfo,
+                    owner: dir.descriptor.owner(),
+                    group: dir.descriptor.group(),
                     times: dir.times,
                     node_info: dir.node_info,
                     blksize: BLOCK_SIZE,
@@ -591,28 +971,34 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         &self,
         dir: ResolvedDir<'_>,
         name: &str,
-        metadata: super::backend::CreationMetadata,
+        metadata: CreationMetadata,
     ) -> Result<super::backend::FileHandle, OpenError> {
-        // TODO(jayb): Nothing checks write permission on the parent directory before creating;
-        // the resolver should do so before calling this.
-        let parent = dir.into_typed::<Self>();
-        let mut parent = parent.dir.write();
-        if parent.children.contains_key(name) {
-            return Err(OpenError::AlreadyExists);
-        }
-        let file = Arc::new(sync::RwLock::new(FileData {
-            perms: Permissions {
-                mode: metadata.mode,
-                userinfo: metadata.owner,
+        self.create_file_checked(dir, name, &|_| Ok(metadata.descriptor.clone()))
+    }
+
+    fn create_file_checked(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, OpenError>,
+    ) -> Result<super::backend::FileHandle, OpenError> {
+        let node = self.insert_child(
+            parent,
+            name,
+            DescriptorKind::File,
+            (OpenError::AlreadyExists, OpenError::Io),
+            authorize,
+            |_, descriptor, node_info| {
+                Self::new_file(
+                    descriptor,
+                    FileContents::regular(Vec::new().into()),
+                    node_info,
+                )
             },
-            contents: FileContents::regular(Vec::new().into()),
-            node_info: self.inode_allocator.next(),
-            times: None,
-        }));
-        let old = parent
-            .children
-            .insert(name.into(), Node::File(file.clone()));
-        assert!(old.is_none());
+        )?;
+        let Node::File(file) = node else {
+            unreachable!("a file was inserted")
+        };
         Ok(super::backend::FileHandle::from_typed::<Self>(
             InMemFileHandle { file },
         ))
@@ -623,23 +1009,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         dir: ResolvedDir<'_>,
         name: &str,
         target: &str,
-        metadata: super::backend::CreationMetadata,
+        metadata: CreationMetadata,
     ) -> Result<(), SymlinkError> {
-        let parent = dir.into_typed::<Self>();
-        let mut parent = parent.dir.write();
-        if parent.children.contains_key(name) {
-            return Err(SymlinkError::AlreadyExists);
-        }
-        let file = Arc::new(sync::RwLock::new(FileData {
-            perms: Permissions {
-                mode: metadata.mode,
-                userinfo: metadata.owner,
+        self.symlink_checked(dir, name, target, &|_| Ok(metadata.descriptor.clone()))
+    }
+
+    fn symlink_checked(
+        &self,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        target: &str,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, SymlinkError>,
+    ) -> Result<(), SymlinkError> {
+        self.insert_child(
+            dir,
+            name,
+            DescriptorKind::File,
+            (SymlinkError::AlreadyExists, SymlinkError::Io),
+            authorize,
+            |_, descriptor, node_info| {
+                Self::new_file(descriptor, FileContents::Symlink(target.into()), node_info)
             },
-            contents: FileContents::Symlink(target.into()),
-            node_info: self.inode_allocator.next(),
-            times: None,
-        }));
-        parent.children.insert(name.into(), Node::File(file));
+        )?;
         Ok(())
     }
 
@@ -647,31 +1038,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         &self,
         dir: ResolvedDir<'_>,
         name: &str,
-        metadata: super::backend::CreationMetadata,
+        metadata: CreationMetadata,
     ) -> Result<super::backend::DirHandle, MkdirError> {
-        // TODO(jayb): Nothing checks write permission on the parent directory before creating;
-        // the resolver should do so before calling this.
-        let parent = dir.into_typed::<Self>();
-        let mut parent = parent.dir.write();
-        if parent.children.contains_key(name) {
-            return Err(MkdirError::AlreadyExists);
-        }
-        let child = Arc::new(sync::RwLock::new(DirData {
-            instance: parent.instance.clone(),
-            perms: Permissions {
-                mode: metadata.mode,
-                userinfo: metadata.owner,
-            },
-            children: HashMap::default(),
-            node_info: self.inode_allocator.next(),
-            times: None,
-        }));
-        parent
-            .children
-            .insert(name.into(), Node::Dir(child.clone()));
+        self.mkdir_checked(dir, name, &|_| Ok(metadata.descriptor.clone()))
+    }
+
+    fn mkdir_checked(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, MkdirError>,
+    ) -> Result<super::backend::DirHandle, MkdirError> {
+        let node = self.insert_child(
+            parent,
+            name,
+            DescriptorKind::Directory,
+            (MkdirError::AlreadyExists, MkdirError::Io),
+            authorize,
+            Self::new_dir,
+        )?;
+        let Node::Dir(dir) = node else {
+            unreachable!("a directory was inserted")
+        };
         Ok(super::backend::DirHandle::from_typed::<Self>(
             InMemDirHandle {
-                dir: child,
+                dir,
                 // TODO(jayb): is this the right set of flags here?
                 flags: super::OFlags::PATH,
             },
@@ -679,36 +1070,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     }
 
     fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
-        // TODO(jayb): Nothing checks write permission on the parent directory before removing;
-        // the resolver should do so before calling this.
-        let parent = dir.into_typed::<Self>();
-        let mut parent = parent.dir.write();
-        match parent.children.get(name) {
-            None => Err(PathError::NoSuchFileOrDirectory.into()),
-            Some(Node::Dir(_)) => Err(UnlinkError::IsADirectory),
-            Some(Node::File(_)) => {
-                parent.children.remove(name);
-                Ok(())
-            }
-        }
+        Self::remove_child(dir, name, None, Self::unlinkable)
+    }
+
+    fn unlink_checked(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&EntryRemoval<'_>) -> Result<(), UnlinkError>,
+    ) -> Result<(), UnlinkError> {
+        Self::remove_child(parent, name, Some(authorize), Self::unlinkable)
     }
 
     fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
-        // TODO(jayb): Nothing checks write permission on the parent directory before removing;
-        // the resolver should do so before calling this.
-        let parent = dir.into_typed::<Self>();
-        let mut parent = parent.dir.write();
-        match parent.children.get(name) {
-            None => Err(PathError::NoSuchFileOrDirectory.into()),
-            Some(Node::File(_)) => Err(RmdirError::NotADirectory),
-            Some(Node::Dir(child)) if !child.read().children.is_empty() => {
-                Err(RmdirError::NotEmpty)
-            }
-            Some(Node::Dir(_)) => {
-                parent.children.remove(name);
-                Ok(())
-            }
-        }
+        Self::remove_child(dir, name, None, Self::removable_dir)
+    }
+
+    fn rmdir_checked(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        authorize: &dyn Fn(&EntryRemoval<'_>) -> Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
+        Self::remove_child(parent, name, Some(authorize), Self::removable_dir)
     }
 
     fn rename_at(
@@ -718,94 +1102,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         new_dir: super::backend::DirHandle,
         new_name: &str,
     ) -> Result<(), RenameError> {
-        for name in [old_name, new_name] {
-            if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
-                return Err(PathError::InvalidPathname.into());
-            }
-        }
-        // XXX(jayb): racing rmdir can detach a resolved parent, as for create and mkdir; fix all
-        // three together as part of broader atomicity fixups.
-        let old_dir = old_dir.into_typed::<Self>().dir;
-        let new_dir = new_dir.into_typed::<Self>().dir;
-        let _rename = self.rename_lock.lock();
-        let instance = self.root.read().instance.clone();
-        let old_instance = old_dir.read().instance.clone();
-        let new_instance = new_dir.read().instance.clone();
-        if !Arc::ptr_eq(&old_instance, &instance) || !Arc::ptr_eq(&new_instance, &instance) {
-            return Err(RenameError::Io);
-        }
-        let source = old_dir
-            .read()
-            .children
-            .get(old_name)
-            .cloned()
-            .ok_or(PathError::NoSuchFileOrDirectory)?;
-        let destination = new_dir.read().children.get(new_name).cloned();
-        let same_parent = Arc::ptr_eq(&old_dir, &new_dir);
-        let new_above_old = !same_parent && Self::contains_dir(&new_dir, &old_dir);
-        let source_has_new = match &source {
-            Node::Dir(dir) => Self::contains_dir(dir, &new_dir),
-            Node::File(_) => false,
-        };
-        let destination_has_old = match &destination {
-            Some(Node::Dir(dir)) if new_above_old => Self::contains_dir(dir, &old_dir),
-            _ => false,
-        };
-        let replace = |old: &mut DirData<Platform>, new: Option<&mut DirData<Platform>>| {
-            let current = old
-                .children
-                .get(old_name)
-                .ok_or(PathError::NoSuchFileOrDirectory)?;
-            let target = match &new {
-                Some(new) => new.children.get(new_name),
-                None => old.children.get(new_name),
-            };
-            if target.is_some_and(|target| current.ptr_eq(target)) {
-                return Ok(());
-            }
-            // Ancestry was checked before locking, so it only holds for unchanged entries; a
-            // concurrently created replacement cannot contain either existing parent.
-            if source_has_new && current.ptr_eq(&source) {
-                return Err(RenameError::InvalidArgument);
-            }
-            if let Some(target @ Node::Dir(dir)) = target
-                && (Arc::ptr_eq(dir, &old_dir)
-                    || (destination_has_old
-                        && destination
-                            .as_ref()
-                            .is_some_and(|prior| target.ptr_eq(prior))))
-            {
-                return Err(RenameError::NotEmpty);
-            }
-            match (current, target) {
-                (Node::Dir(_), Some(Node::File(_))) => return Err(RenameError::NotADirectory),
-                (Node::File(_), Some(Node::Dir(_))) => return Err(RenameError::IsADirectory),
-                (Node::Dir(_), Some(Node::Dir(dir))) if !dir.read().children.is_empty() => {
-                    return Err(RenameError::NotEmpty);
-                }
-                _ => {}
-            }
-            let moved = old
-                .children
-                .remove(old_name)
-                .expect("source was checked under lock");
-            match new {
-                Some(new) => new.children.insert(new_name.into(), moved),
-                None => old.children.insert(new_name.into(), moved),
-            };
-            Ok(())
-        };
-        // XXX(jayb): nested directory locks are taken ancestor-first, with ancestry checked before
-        // either write lock; revisit as part of broader atomicity fixups.
-        if same_parent {
-            replace(&mut old_dir.write(), None)
-        } else if new_above_old {
-            let mut new = new_dir.write();
-            replace(&mut old_dir.write(), Some(&mut new))
-        } else {
-            let mut old = old_dir.write();
-            replace(&mut old, Some(&mut new_dir.write()))
-        }
+        self.rename(old_dir, old_name, new_dir, new_name, None)
+    }
+
+    fn rename_checked(
+        &self,
+        old_dir: super::backend::DirHandle,
+        old_name: &str,
+        new_dir: super::backend::DirHandle,
+        new_name: &str,
+        authorize: &dyn Fn(&EntryRename<'_>) -> Result<(), RenameError>,
+    ) -> Result<(), RenameError> {
+        self.rename(old_dir, old_name, new_dir, new_name, Some(authorize))
     }
 
     fn set_times(
@@ -813,51 +1121,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         target: ResolvedTarget<'_>,
         times: &SetFileTimes,
     ) -> Result<(), SetTimesError> {
-        if matches!(
-            (times.access, times.modify),
-            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
-        ) {
-            return Ok(());
-        }
-        let node = match target {
-            ResolvedTarget::File(h) => Node::File(h.into_typed::<Self>().file),
-            ResolvedTarget::Dir(h) => Node::Dir(h.into_typed::<Self>().dir),
-        };
-        let mut stored = match &node {
-            Node::File(file) => sync::RwLockWriteGuard::map(file.write(), |f| &mut f.times),
-            Node::Dir(dir) => sync::RwLockWriteGuard::map(dir.write(), |d| &mut d.times),
-        };
-        // Fields never set, including ctime, read as zero.
-        if let FileTimeUpdate::Set(time) = times.access {
-            stored.get_or_insert_default().accessed = time;
-        }
-        if let FileTimeUpdate::Set(time) = times.modify {
-            stored.get_or_insert_default().modified = time;
-        }
-        if times.access == FileTimeUpdate::Now || times.modify == FileTimeUpdate::Now {
-            // XXX(jayb): in-mem has no clock, so NOW (e.g. plain `touch`) changes nothing.
-            litebox_util_log::warn!("in-mem timestamps ignore NOW updates");
-        }
-        Ok(())
+        Self::update_times(target, times, None)
+    }
+
+    fn set_times_checked(
+        &self,
+        target: ResolvedTarget<'_>,
+        times: &SetFileTimes,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), SetTimesError>,
+    ) -> Result<(), SetTimesError> {
+        Self::update_times(target, times, Some(authorize))
     }
 
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
-        let node = match h {
-            ResolvedTarget::File(h) => Node::File(h.into_typed::<Self>().file),
-            ResolvedTarget::Dir(h) => Node::Dir(h.into_typed::<Self>().dir),
-        };
-        let mut perms = match &node {
-            Node::File(file) => {
-                let file = file.write();
-                if file.file_type() == FileType::SymbolicLink {
-                    return Err(ChmodError::IsSymlink);
-                }
-                sync::RwLockWriteGuard::map(file, |f| &mut f.perms)
-            }
-            Node::Dir(dir) => sync::RwLockWriteGuard::map(dir.write(), |d| &mut d.perms),
-        };
-        perms.mode = mode;
-        Ok(())
+        Self::update_descriptor(
+            h,
+            ChmodError::IsSymlink,
+            |descriptor| {
+                SecurityDescriptor::from_mode(
+                    descriptor.kind(),
+                    descriptor.owner(),
+                    descriptor.group(),
+                    mode & Mode::SUPPORTED,
+                )
+                .map_err(|_| ChmodError::Io)
+            },
+            ChmodError::Io,
+        )
     }
 
     fn chown(
@@ -866,27 +1156,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let node = match h {
-            ResolvedTarget::File(h) => Node::File(h.into_typed::<Self>().file),
-            ResolvedTarget::Dir(h) => Node::Dir(h.into_typed::<Self>().dir),
-        };
-        let mut perms = match &node {
-            Node::File(file) => {
-                let file = file.write();
-                if file.file_type() == FileType::SymbolicLink {
-                    return Err(ChownError::IsSymlink);
-                }
-                sync::RwLockWriteGuard::map(file, |f| &mut f.perms)
-            }
-            Node::Dir(dir) => sync::RwLockWriteGuard::map(dir.write(), |d| &mut d.perms),
-        };
-        if let Some(new_user) = user {
-            perms.userinfo.user = new_user;
-        }
-        if let Some(new_group) = group {
-            perms.userinfo.group = new_group;
-        }
-        Ok(())
+        Self::update_descriptor(
+            h,
+            ChownError::IsSymlink,
+            |descriptor| {
+                let owner = user.map_or(descriptor.owner(), |user| Principal {
+                    domain: DomainId::POSIX_USER,
+                    id: user.into(),
+                });
+                let group = group.map_or(descriptor.group(), |group| Principal {
+                    domain: DomainId::POSIX_GROUP,
+                    id: group.into(),
+                });
+                with_owners(descriptor, owner, group).ok_or(ChownError::Io)
+            },
+            ChownError::Io,
+        )
+    }
+
+    fn update_security(
+        &self,
+        target: ResolvedTarget<'_>,
+        update: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, SetSecurityError>,
+    ) -> Result<(), SetSecurityError> {
+        Self::update_descriptor(
+            target,
+            SetSecurityError::IsSymlink,
+            update,
+            SetSecurityError::WrongKind,
+        )
     }
 
     fn get_static_backing_data(&self, h: &super::backend::FileHandle) -> Option<&'static [u8]> {
@@ -959,6 +1257,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Clone for Node<Platform> {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> Node<Platform> {
+    fn read(&self) -> LockedNode<'_, Platform> {
+        match self {
+            Node::File(file) => LockedNode::File(file.read()),
+            Node::Dir(dir) => LockedNode::Dir(dir.read()),
+        }
+    }
+
     fn ptr_eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Dir(left), Self::Dir(right)) => Arc::ptr_eq(left, right),
@@ -984,10 +1289,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Node<Platform> {
     }
 }
 
+enum LockedNode<'a, Platform: sync::RawSyncPrimitivesProvider> {
+    File(sync::RwLockReadGuard<'a, Platform, FileData>),
+    Dir(sync::RwLockReadGuard<'a, Platform, DirData<Platform>>),
+}
+
+impl<Platform: sync::RawSyncPrimitivesProvider> LockedNode<'_, Platform> {
+    fn descriptor(&self) -> &SecurityDescriptor {
+        match self {
+            Self::File(file) => &file.descriptor,
+            Self::Dir(dir) => &dir.descriptor,
+        }
+    }
+}
+
+// Checks that mutations run on what they are about to change; legacy operations pass none.
+type AuthorizeTimes<'a> = &'a dyn Fn(&SecurityDescriptor) -> Result<(), SetTimesError>;
+
 type DirNode<Platform> = Arc<sync::RwLock<Platform, DirData<Platform>>>;
 struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
     instance: Arc<()>,
-    perms: Permissions,
+    descriptor: SecurityDescriptor,
     children: HashMap<String, Node<Platform>>,
     node_info: NodeInfo,
     times: Option<FileTimestamps>,
@@ -995,7 +1317,7 @@ struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
 
 type FileNode<Platform> = Arc<sync::RwLock<Platform, FileData>>;
 struct FileData {
-    perms: Permissions,
+    descriptor: SecurityDescriptor,
     contents: FileContents,
     node_info: NodeInfo,
     // XXX(jayb): in-mem has no clock; times exist only once set_times sets them explicitly.
@@ -1029,20 +1351,8 @@ impl FileContents {
     }
 }
 
-#[derive(Clone, Debug)]
-struct Permissions {
-    mode: Mode,
-    userinfo: UserInfo,
-}
-
-impl Permissions {
-    fn permission_check(&self) -> PermissionCheck {
-        PermissionCheck::ByResolver(PermissionInfo {
-            mode: self.mode,
-            owner: self.userinfo,
-            on_read_only_fs: false,
-        })
-    }
+fn permission_check(descriptor: &SecurityDescriptor) -> PermissionCheck {
+    PermissionCheck::ByResolver(PermissionInfo::new(descriptor.clone(), false))
 }
 
 #[cfg(test)]
@@ -1280,6 +1590,26 @@ mod tests {
     }
 
     #[test]
+    fn lookup_from_a_pinned_directory_uses_its_current_descriptor() {
+        let backend = InMem::<TestPlatform>::new(InodeAllocators::new().next());
+        let pinned = backend.root().unwrap();
+        let mode = Mode::RUSR | Mode::XUSR;
+        backend
+            .chmod(ResolvedTarget::Dir(backend.root().unwrap()), mode)
+            .unwrap();
+
+        let observed = core::cell::Cell::new(None);
+        let result = backend
+            .resolve(pinned, &["entry"], &|info| {
+                observed.set(info.descriptor().and_then(SecurityDescriptor::mode));
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(result, Resolution::MissingFinal { .. }));
+        assert_eq!(observed.get(), Some(mode));
+    }
+
+    #[test]
     fn lookup_authorization_precedes_missing_and_target_metadata() {
         let backend = InMem::<TestPlatform>::new_initialized(
             [
@@ -1309,10 +1639,10 @@ mod tests {
         ] {
             let calls = RefCell::new(Vec::new());
             let result = backend.resolve(backend.root().unwrap(), components, &|permissions| {
-                calls
-                    .borrow_mut()
-                    .push((permissions.mode, permissions.owner));
-                if permissions.owner == OWNER {
+                let descriptor = permissions.descriptor().unwrap();
+                let owner = (descriptor.owner(), descriptor.group());
+                calls.borrow_mut().push((status_mode(descriptor), owner));
+                if owner == (OWNER.user_principal(), OWNER.group_principal()) {
                     Err(PathError::NoSearchPerms.into())
                 } else {
                     Ok(())
@@ -1326,7 +1656,13 @@ mod tests {
                 })
             ));
             assert_eq!(calls.borrow().len(), 2);
-            assert_eq!(calls.borrow()[1], (Mode::RUSR, OWNER));
+            assert_eq!(
+                calls.borrow()[1],
+                (
+                    Mode::RUSR,
+                    (OWNER.user_principal(), OWNER.group_principal())
+                )
+            );
         }
 
         assert!(matches!(

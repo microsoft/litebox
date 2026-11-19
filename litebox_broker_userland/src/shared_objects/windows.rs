@@ -8,16 +8,22 @@ use std::os::windows::io::{BorrowedHandle, FromRawHandle as _, OwnedHandle};
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_storage::{
-    HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
+    HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedMapping,
 };
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_broker_transport_windows_userland::shared_objects::SectionSender;
 use litebox_platform::buffer::{Buffer as _, ReadBuffer, WriteBuffer};
-use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE};
+use windows_sys::Win32::Foundation::{
+    DuplicateHandle, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
 };
-use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_EXECUTE_READWRITE};
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, PAGE_EXECUTE_READWRITE, SECTION_MAP_EXECUTE, SECTION_MAP_READ,
+    SECTION_MAP_WRITE, SECTION_QUERY,
+};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use super::SharedObjectDelivery;
 use super::host_file::{
@@ -30,8 +36,9 @@ use super::host_file::{
 /// file extend it, and Windows refuses to shrink a file while any section of it exists, which
 /// runners hold for as long as they map the file. A shrink it refuses therefore zeroes the bytes
 /// past the new end and lowers this size only, leaving the host file longer until a later
-/// resize can shrink it. Runners receive no right to resize sections, so only the broker changes
-/// the host file's size. Runners may still store past the end through their mappings, where
+/// resize can shrink it, or, if it must be atomic, fails instead, since zeroing can fail partway.
+/// Runners receive no right to resize sections, so only the broker changes the host file's
+/// size. Runners may still store past the end through their mappings, where
 /// Linux would raise `SIGBUS`, and those bytes become part of the file again if it grows over
 /// them.
 #[derive(Default)]
@@ -64,8 +71,9 @@ impl HostFile for TempFile {
     }
 
     /// A shrink the host refuses while the file is mapped zeroes the bytes past the new size
-    /// instead, so that mappings no longer see them.
-    fn resize(&mut self, file: &File, length: u64) -> Result<(), StorageError> {
+    /// instead, so that mappings no longer see them, unless it must be atomic, when it fails
+    /// with [`StorageError::Busy`] before changing anything.
+    fn resize(&mut self, file: &File, length: u64, atomically: bool) -> Result<(), StorageError> {
         let old_host_len = host_len::<Self>(file)?;
         let host_len = if length == old_host_len {
             length
@@ -76,6 +84,10 @@ impl HostFile for TempFile {
                     if length < old_host_len
                         && storage_error::<Self>(&error) == StorageError::Busy =>
                 {
+                    // Only bytes of the file need zeroing, which an atomic shrink cannot do.
+                    if atomically && length < self.len {
+                        return Err(StorageError::Busy);
+                    }
                     old_host_len
                 }
                 Err(error) => return Err(storage_error::<Self>(&error)),
@@ -92,15 +104,27 @@ impl HostFile for TempFile {
         self.len = self.len.max(end);
     }
 
-    /// Returns `file`'s own handle.
+    /// Returns a new section of `file` that covers `end`, through which the section can only be
+    /// queried and mapped readable and executable, and also writable if `writable` is set.
     ///
-    /// The handle never leaves the broker: the deployment derives a section from it, and the
-    /// section's protection and the rights of the section handle sent to a runner enforce
-    /// `writable`, so readers and writers share the file's own handle.
-    fn export(file: &File, _writable: bool) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
-        use std::os::windows::io::AsHandle as _;
+    /// The file's own handle is never exported, and the section handle grants no right to
+    /// extend the section or change its protection.
+    fn export(
+        file: &File,
+        writable: bool,
+        end: u64,
+    ) -> Result<Box<dyn HostHandle + '_>, MapSharedError> {
+        use std::os::windows::io::AsRawHandle as _;
 
-        Ok(Box::new(Exported(file.as_handle())))
+        let error = |error: IoError| MapSharedError::from(storage_error::<Self>(&error));
+        // Only a writable section can extend the file to cover `end`, so the section is created
+        // writable and only a narrower handle to it is exported.
+        let section = section(file.as_raw_handle(), end).map_err(error)?;
+        let access = SECTION_QUERY
+            | SECTION_MAP_READ
+            | SECTION_MAP_EXECUTE
+            | if writable { SECTION_MAP_WRITE } else { 0 };
+        Ok(Box::new(Exported(narrow(&section, access).map_err(error)?)))
     }
 
     /// As many bytes as positions address.
@@ -256,17 +280,43 @@ impl SectionDelivery {
 }
 
 impl SharedObjectDelivery for SectionDelivery {
-    fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64> {
-        // The object lends the file's handle, from which the section derives the rights.
-        let file = super::host_handle(object, writable)?;
-        let file = usize::try_from(file.raw())
+    fn deliver(&self, mapping: &SharedMapping, end: u64) -> IoResult<u64> {
+        // The export is a section that covers `end`, with exactly the rights the runner receives.
+        let export = super::host_handle(mapping, end)?;
+        let section = usize::try_from(export.raw())
             .map_err(|_| IoError::other("host handle does not fit a pointer"))?
             as windows_sys::Win32::Foundation::HANDLE;
-        // Only a writable section can extend the file to cover `end`. A runner that may only read
-        // the file still cannot map it writable: it receives no right to.
-        let section = section(file, end)?;
-        self.0.send(section, writable)
+        // SAFETY: `export` holds the section handle open until it is dropped after the send.
+        self.0.send(
+            unsafe { BorrowedHandle::borrow_raw(section) },
+            mapping.writable(),
+        )
     }
+}
+
+/// Returns a new handle to `section` with only the rights `access`, a subset of its own.
+fn narrow(section: &OwnedHandle, access: u32) -> IoResult<OwnedHandle> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    let mut narrowed = std::ptr::null_mut();
+    // SAFETY: `section` is a live handle, both process handles name this process, and the
+    // output is writable.
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            section.as_raw_handle(),
+            GetCurrentProcess(),
+            &raw mut narrowed,
+            access,
+            0,
+            0,
+        )
+    } == 0
+    {
+        return Err(IoError::last_os_error());
+    }
+    // SAFETY: DuplicateHandle returned a new handle that this process owns.
+    Ok(unsafe { OwnedHandle::from_raw_handle(narrowed) })
 }
 
 /// Creates a writable section of the file `file`, `size` bytes long, extending the file if it
@@ -310,56 +360,48 @@ mod tests {
 
     #[test]
     fn shrinking_mapped_memory_hides_and_zeroes_the_tail() {
-        use std::mem::ManuallyDrop;
-        use std::os::windows::io::FromRawHandle as _;
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-        use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
-        };
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
 
+        let file = temp_file().unwrap();
+        let probe = file.try_clone().unwrap();
         let SharedFileMemory {
             storage: mut memory,
             object,
-        } = super::super::host_file::tests::create_with(&TempFileMemoryProvider, b"hello");
-        let handle = usize::try_from(object.host_handle(true).unwrap().raw()).unwrap() as HANDLE;
-        let host_len = || {
-            // SAFETY: The handle stays open while `object` lives, and `ManuallyDrop` leaves
-            // closing it to `object`.
-            let file = ManuallyDrop::new(unsafe { File::from_raw_handle(handle) });
-            file.metadata().unwrap().len()
-        };
+        } = super::super::host_file::create::<TempFile>(file);
+        assert_eq!(memory.write_at(0, &b"hello".as_slice()).unwrap(), 5);
+        let host_len = || probe.metadata().unwrap().len();
         let contents = |memory: &dyn FileStorage, length: usize| {
             let mut bytes = vec![0u8; length + 1];
             let read = memory.read_at(0, &mut bytes.as_mut_slice()).unwrap();
             bytes.truncate(read);
             bytes
         };
-        // SAFETY: `handle` is a live file handle lent by `object`, and the call creates a
-        // new section handle.
-        let section = unsafe {
-            CreateFileMappingW(
-                handle,
-                std::ptr::null(),
-                PAGE_READWRITE,
-                0,
-                0,
-                std::ptr::null(),
-            )
-        };
-        assert!(!section.is_null());
-        // SAFETY: `section` is a live section handle, and the call maps a new view of it.
-        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 0) };
+        let section = object.host_handle(true, 5).unwrap();
+        let handle = usize::try_from(section.raw()).unwrap() as HANDLE;
+        // SAFETY: `handle` is a live section handle that `section` holds, and the call maps a
+        // new view of it.
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, 0) };
         assert!(!view.Value.is_null());
         let byte = view.Value.cast::<u8>();
         // SAFETY: The view maps the five bytes of the file as they were mapped, which the
         // host may change behind the reference-free volatile accesses.
         let peek = |index: usize| unsafe { byte.add(index).read_volatile() };
 
+        // A shrink that must be atomic fails before changing anything, and growing still works.
+        assert_eq!(memory.set_len_atomically(1), Err(StorageError::Busy));
+        assert_eq!(contents(&*memory, 8), b"hello");
+        assert_eq!(host_len(), 5);
+        assert_eq!((0..5).map(peek).collect::<Vec<_>>(), b"hello");
+        memory.set_len_atomically(6).unwrap();
+        assert_eq!(contents(&*memory, 8), b"hello\0");
+        assert_eq!(host_len(), 6);
+
         // The host cannot shrink the mapped file, so the bytes past the new end read as
         // gone and become zeros in the mapping.
         memory.set_len(1).unwrap();
         assert_eq!(memory.len().unwrap(), 1);
-        assert_eq!(host_len(), 5);
+        assert_eq!(host_len(), 6);
         assert_eq!(contents(&*memory, 8), b"h");
         assert_eq!((1..5).map(peek).collect::<Vec<_>>(), [0; 4]);
 
@@ -368,20 +410,59 @@ mod tests {
         assert_eq!(contents(&*memory, 8), b"h\0\0\0\0\0!");
         assert_eq!(host_len(), 7);
 
-        // SAFETY: `view` and `section` were created above and are not used again.
-        unsafe {
-            assert_ne!(UnmapViewOfFile(view), 0);
-            assert_ne!(CloseHandle(section), 0);
-        }
-        // Once nothing maps the file, resizing it shrinks the host file too.
+        // SAFETY: `view` was mapped above and is not used again.
+        assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
+        drop(section);
+        // Once nothing maps the file, resizing it shrinks the host file too, atomically or not.
         memory.set_len(2).unwrap();
         assert_eq!(memory.len().unwrap(), 2);
         assert_eq!(host_len(), 2);
+        memory.set_len_atomically(1).unwrap();
+        assert_eq!(contents(&*memory, 8), b"h");
+        assert_eq!(host_len(), 1);
+    }
+
+    #[test]
+    fn read_only_exports_allow_only_reading() {
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+        use windows_sys::Win32::System::Memory::{
+            FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+
+        let object =
+            super::super::host_file::tests::create_with(&TempFileMemoryProvider, &[0; 4096]).object;
+        let export = object.host_handle(false, 4096).unwrap();
+        let handle = usize::try_from(export.raw()).unwrap() as HANDLE;
+        // SAFETY: `handle` is a live section handle that `export` holds, and the call maps no
+        // view, since the handle grants no right to write.
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, 4096) };
+        assert!(view.Value.is_null());
+        // SAFETY: As above, but mapping a readable view, unmapped right away.
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 4096) };
+        assert!(!view.Value.is_null());
+        // SAFETY: Unmaps the view just mapped.
+        assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
+        // Nor is the handle one to the file holding the contents, which could write them.
+        let mut written = 0;
+        // SAFETY: The buffer is valid for one byte, and `written` for the count.
+        let succeeded = unsafe {
+            WriteFile(
+                handle,
+                b"x".as_ptr(),
+                1,
+                &raw mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(succeeded, 0);
     }
 
     mod delivery {
         use super::*;
+        use litebox_broker_core::fs::shared_storage::{SharedFile, SharedFileLimit};
         use std::os::windows::io::AsRawHandle as _;
+        use std::sync::Arc;
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::System::Memory::{
             FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -401,8 +482,12 @@ mod tests {
                 &TempFileMemoryProvider,
                 &[0; 4096],
             );
+            let slot = Arc::new(SharedFileLimit::new(1)).reserve().unwrap();
+            let mapping = SharedMapping::new(Arc::new(SharedFile::new(object, slot)), true);
             let take = |writable, end| {
-                let token = delivery.deliver(&*object, writable, end).unwrap();
+                let token = delivery
+                    .deliver(&mapping.clone().restrict(writable), end)
+                    .unwrap();
                 // SAFETY: The token is a section handle that `deliver` duplicated into this
                 // process for this caller alone.
                 unsafe { OwnedHandle::from_raw_handle(usize::try_from(token).unwrap() as HANDLE) }

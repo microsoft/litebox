@@ -100,6 +100,27 @@ impl Principal {
         domain: DomainId::UNMAPPED,
         id: 0,
     };
+
+    /// The POSIX user `id`.
+    pub const fn posix_user(id: u32) -> Self {
+        Self {
+            domain: DomainId::POSIX_USER,
+            id,
+        }
+    }
+
+    /// The POSIX group `id`.
+    pub const fn posix_group(id: u32) -> Self {
+        Self {
+            domain: DomainId::POSIX_GROUP,
+            id,
+        }
+    }
+
+    /// The identifier this principal has in `domain`, or `None` if it is in another domain.
+    pub fn id_in(self, domain: DomainId) -> Option<u32> {
+        (self.domain == domain).then_some(self.id)
+    }
 }
 
 /// Exact principals plus wildcards for entire domains. There is no wildcard
