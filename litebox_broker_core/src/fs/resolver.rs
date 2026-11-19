@@ -2107,8 +2107,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         Ok(Ok(()))
     }
 
-    /// Shared terminal backing a non-path-only entry.
-    pub fn terminal(&self, entry: &ResolverEntry<Backend>) -> Option<Arc<dyn TerminalEndpoint>> {
+    /// Raw endpoint for the file service. Public terminal I/O must respect the entry's open mode.
+    pub(super) fn terminal(
+        &self,
+        entry: &ResolverEntry<Backend>,
+    ) -> Option<Arc<dyn TerminalEndpoint>> {
         match self.entry_handle(entry)? {
             Handle::File(file) if !entry.path_only => match self.backend.terminal(file)? {
                 FileTerminal::Fixed(terminal) => Some(terminal),
