@@ -98,8 +98,9 @@ pub trait Backend: Send + Sync + Any {
 
     /// Obtain a resolved directory from an existing owned directory handle, without opening it.
     ///
-    /// Returns `None` if the backend can no longer walk the directory, for example if a
-    /// network handle is stale. Never return the directory replacing it at its original path.
+    /// Walk the directory the handle refers to, even if it has been renamed. If the backend
+    /// can no longer walk that directory (for example, because a network handle is stale),
+    /// return `None` rather than using a different directory now at the original path.
     ///
     /// XXX(jayb): We will likely migrate away from `Option` here when we do a bit of an overhaul of
     /// the `errors` module in order to more consistently support stale errors everywhere.
@@ -117,8 +118,7 @@ pub trait Backend: Send + Sync + Any {
     /// Implementations must not follow `..` beyond their exported subtree.
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError>;
 
-    /// Authorize consuming a dot component when the backend, rather than the resolver,
-    /// enforces search permissions ([`PermissionCheck::ByBackend`]). Wrappers must forward this.
+    /// Check search permission on `dir`.
     fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError>;
 
     /// Open the already-resolved file after resolver authorization, validating `flags`.

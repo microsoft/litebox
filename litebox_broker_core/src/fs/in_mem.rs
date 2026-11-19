@@ -1071,7 +1071,9 @@ type DirNode<Platform> = Arc<sync::RwLock<Platform, DirData<Platform>>>;
 struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
     instance: Arc<()>,
     parent: Option<Weak<sync::RwLock<Platform, DirData<Platform>>>>,
-    // Once the parent no longer owns this child, the child can pin it for `..`.
+    // Set when this dir is unlinked (rmdir/rename-over). Holds a strong ref to the
+    // former parent so `parent` (Weak) stays upgradable for `..`; safe because the
+    // parent no longer owns us, so no cycle. Also marks the dir as deleted.
     detached_from: Option<DirNode<Platform>>,
     perms: Permissions,
     children: HashMap<String, Node<Platform>>,
