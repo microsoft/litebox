@@ -29,6 +29,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "sve_signal.c",
     "sve_syscall_abi.c",
     "sve_x18.c",
+    "tcp_broker_mirrored.c",
     "tty.c",
     "uts_ipc_namespace.c",
     "vfork_job_control_parent.c",

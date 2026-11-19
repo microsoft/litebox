@@ -19,8 +19,8 @@ use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, epoll, eventfd, p
 use rustix::io::{Errno as RustixErrno, ioctl_fionread, read, write};
 use rustix::net::{
     AddressFamily, Protocol, RecvFlags, SendFlags, Shutdown as HostShutdown, SocketFlags,
-    SocketType, acceptfrom_with, bind, connect, getpeername, getsockname, ipproto, listen,
-    shutdown, socket_with, sockopt,
+    SocketType, acceptfrom_with, bind, connect, connect_unspec, getpeername, getsockname, ipproto,
+    listen, shutdown, socket_with, sockopt,
 };
 
 use super::{
@@ -66,6 +66,7 @@ impl HostErrno for Errno {
     const HOSTUNREACH: Self = Self(RustixErrno::HOSTUNREACH);
     const TIMEDOUT: Self = Self(RustixErrno::TIMEDOUT);
     const INVAL: Self = Self(RustixErrno::INVAL);
+    const ACCES: Self = Self(RustixErrno::ACCESS);
 
     fn broker_resource_error(self) -> Option<BrokerError> {
         match self.0 {
@@ -94,6 +95,67 @@ impl fmt::Display for Errno {
 pub(crate) struct Socket(OwnedFd);
 
 impl Socket {
+    /// Ask the kernel's local IPv4 table directly: flow routing can mask broadcast addresses,
+    /// and Linux permits a TCP bind to them even though they cannot name a stream endpoint.
+    fn is_directed_broadcast(ip: Ipv4Addr) -> Result<bool, Errno> {
+        use rustix::io::retry_on_intr;
+        use rustix::net::netlink::{FIB_LOOKUP, SocketAddrNetlink};
+        use rustix::net::{recvfrom, sendto};
+
+        // NETLINK_FIB_LOOKUP echoes a 16-byte nlmsghdr and a 20-byte fib_result_nl.
+        // The latter starts with a network-order address and ends with a native-endian errno.
+        const HEADER: usize = 16;
+        const LEN: usize = HEADER + 20;
+        let mut query = [0u8; LEN];
+        query[..4].copy_from_slice(&u32::try_from(LEN).unwrap().to_ne_bytes());
+        query[HEADER..HEADER + 4].copy_from_slice(&ip.octets());
+        query[HEADER + 10] = libc::RT_TABLE_LOCAL; // tb_id_in
+        let fd = socket_with(
+            AddressFamily::NETLINK,
+            SocketType::DGRAM,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            Some(FIB_LOOKUP),
+        )
+        .map_err(Errno)?;
+        let kernel = SocketAddrNetlink::new(0, 0);
+        let sent =
+            retry_on_intr(|| sendto(&fd, &query, SendFlags::empty(), &kernel)).map_err(Errno)?;
+        if sent != LEN {
+            return Err(Errno(RustixErrno::IO));
+        }
+        // Linux dispatches this single lookup synchronously during sendto. Never block if
+        // the reply was dropped (for example, under memory pressure).
+        let mut reply = [0u8; LEN];
+        let (_, len, sender) =
+            retry_on_intr(|| recvfrom(&fd, &mut reply[..], RecvFlags::TRUNC)).map_err(Errno)?;
+        if len != LEN
+            || sender.and_then(|s| SocketAddrNetlink::try_from(s).ok()) != Some(kernel)
+            || reply[..HEADER + 11] != query[..HEADER + 11]
+        {
+            return Err(Errno(RustixErrno::PROTO));
+        }
+        match i32::from_ne_bytes(reply[HEADER + 16..].try_into().unwrap()) {
+            0 => Ok(reply[HEADER + 14] == libc::RTN_BROADCAST),
+            // No table, no matching entry, or a negative route, not a broadcast entry.
+            err if [
+                -libc::ENOENT,
+                -libc::EAGAIN,
+                -libc::EINVAL,
+                -libc::EACCES,
+                -libc::EHOSTUNREACH,
+            ]
+            .contains(&err) =>
+            {
+                Ok(false)
+            }
+            err => Err(Errno(
+                err.checked_neg()
+                    .filter(|n| *n > 0 && *n < 4096)
+                    .map_or(RustixErrno::PROTO, RustixErrno::from_raw_os_error),
+            )),
+        }
+    }
+
     fn open(socket_type: SocketType, protocol: Protocol) -> Result<Self, Errno> {
         socket_with(
             AddressFamily::INET,
@@ -134,6 +196,21 @@ impl HostSocket for Socket {
         Self::open(SocketType::DGRAM, ipproto::UDP)
     }
 
+    fn owns_address(address: Ipv4Addr) -> Result<bool, Errno> {
+        if address.is_unspecified() || address.is_multicast() || address.is_broadcast() {
+            return Ok(false);
+        }
+        // Selecting an interface by address uses Linux's ip_dev_find: assigned addresses and
+        // local unicast routes (including loopback aliases), not a route for a particular flow.
+        // This only sets an option on a private fd; it neither joins a group nor sends traffic.
+        let probe = Self::udp()?;
+        match sockopt::set_ip_multicast_if(&probe.0, &address) {
+            Ok(()) => Ok(true),
+            Err(RustixErrno::ADDRNOTAVAIL) => Ok(false),
+            Err(error) => Err(Errno(error)),
+        }
+    }
+
     /// `SO_REUSEADDR` lets the bind take a port whose connections linger in `TIME_WAIT`; it stays
     /// on, as other binds of a listener's port fail all the same.
     fn tcp_listening(address: SocketAddrV4) -> Result<Self, Errno> {
@@ -164,6 +241,17 @@ impl HostSocket for Socket {
         self.bind(address)
     }
 
+    /// Linux's `SO_REUSEADDR` shares an address only between sockets that all set it, while none
+    /// listens, so the guest's setting applies as is.
+    fn bind_as_guest(&self, address: SocketAddrV4, reuse_address: bool) -> Result<(), Errno> {
+        let ip = *address.ip();
+        if !ip.is_unspecified() && !Self::owns_address(ip)? && Self::is_directed_broadcast(ip)? {
+            return Err(Errno::ADDRNOTAVAIL);
+        }
+        sockopt::set_socket_reuseaddr(&self.0, reuse_address).map_err(Errno)?;
+        self.bind(address)
+    }
+
     fn connect(&self, address: SocketAddrV4) -> Result<(), Errno> {
         connect(&self.0, &address).map_err(Errno)
     }
@@ -180,6 +268,15 @@ impl HostSocket for Socket {
             Shutdown::Both => HostShutdown::Both,
         };
         shutdown(&self.0, how).map_err(Errno)
+    }
+
+    fn disconnect(&self) -> Result<(), Errno> {
+        loop {
+            match connect_unspec(&self.0) {
+                Err(RustixErrno::INTR) => {}
+                result => return result.map_err(Errno),
+            }
+        }
     }
 
     fn send(&self, data: RawParts<'_>, destination: Option<SocketAddrV4>) -> Result<usize, Errno> {
@@ -345,6 +442,14 @@ impl HostSocket for Socket {
 
     fn set_linger_zero(&self) -> Result<(), Errno> {
         sockopt::set_socket_linger(&self.0, Some(Duration::ZERO)).map_err(Errno)
+    }
+
+    fn set_reuse_address(&self, value: bool) -> Result<(), Errno> {
+        sockopt::set_socket_reuseaddr(&self.0, value).map_err(Errno)
+    }
+
+    fn reuse_address(&self) -> Result<bool, Errno> {
+        sockopt::socket_reuseaddr(&self.0).map_err(Errno)
     }
 
     fn set_receive_buffer_size(&self, size: usize) -> Result<(), Errno> {

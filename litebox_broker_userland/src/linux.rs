@@ -54,6 +54,7 @@ pub(super) fn run(
     mut args: super::CliArgs,
     stdio: Arc<UserlandStdioProvider>,
 ) -> Result<(), Box<dyn Error>> {
+    super::check_network_arguments(&args)?;
     let uid_map = std::fs::read_to_string("/proc/self/uid_map").ok();
     let root = rustix::process::geteuid().is_root();
     if is_host_root(root, uid_map.as_deref()) {
@@ -80,15 +81,21 @@ pub(super) fn run(
             args.runner_user,
         )?)
     };
+    // The proxy listens at the host's loopback, which a mirrored guest shares and an isolated one
+    // reaches at its gateway.
+    let proxy_ip = match args.network {
+        super::NetworkMode::Isolated => HOST_GATEWAY_IPV4_ADDRESS,
+        super::NetworkMode::Mirrored => Ipv4Addr::LOCALHOST,
+    };
     if let Some(proxy) = &proxy {
-        let proxy_destination = format!("{HOST_GATEWAY_IPV4_ADDRESS}/32:{}", proxy.port)
+        let proxy_destination = format!("{proxy_ip}/32:{}", proxy.port)
             .parse()
             .map_err(|error: String| IoError::new(ErrorKind::InvalidData, error))?;
         args.allow_tcp_destination.push(proxy_destination);
     }
     let proxy_url = proxy
         .as_ref()
-        .map(|proxy| format!("http://{HOST_GATEWAY_IPV4_ADDRESS}:{}", proxy.port));
+        .map(|proxy| format!("http://{proxy_ip}:{}", proxy.port));
 
     let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
         .with_socket_policy(configured_socket_policy(

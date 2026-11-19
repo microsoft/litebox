@@ -3,17 +3,19 @@
 
 //! TCP socket state and transport-specific helpers.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Error, Result as IoResult};
 use std::net::{Shutdown, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::socket::GUEST_IPV4_ADDRESS;
 use litebox_broker_core::socket::stream::{StreamEnd, StreamError, stream_pair};
 use litebox_broker_core::socket::{
-    GuestSocketBinding, GuestSourceLease, PlatformConnectError, PlatformSocketStatus,
-    host_socket_destination, is_internal_socket_address, normalize_socket_destination,
+    GuestSocketBinding, GuestSourceLease, HostBindRequest, PlatformConnectError,
+    PlatformSocketStatus, SocketAddressing, SocketEgress, host_socket_destination,
+    is_internal_socket_address, normalize_socket_destination,
 };
 use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
 use litebox_broker_protocol::ObjectHandle;
@@ -33,9 +35,9 @@ use super::host::{
 };
 use super::{
     HookPoint, SocketEntry, SocketInbox, SocketKind, SocketState, SocketTransportState, Topology,
-    UserlandSocket, admits, broker_error_from_errno, guest_visible_client, lock,
-    republish_own_readiness, reserve_published, set_own_readiness, socket_error_from_errno,
-    socket_operation_error_from_errno, zeroed_vec,
+    UserlandSocket, broker_error_from_errno, lock, republish_own_readiness, reserve_published,
+    set_own_readiness, socket_error_from_errno, socket_operation_error_from_errno, sources_contain,
+    zeroed_vec,
 };
 
 pub(super) struct AcceptedEndpoints {
@@ -76,8 +78,19 @@ pub(super) const PEEK_WAITALL_INTEREST: Duration = Duration::from_secs(1);
 /// rest of the token is the rule's index. Socket IDs stay below it.
 pub(super) const PUBLISHED_EVENT_TOKEN_FLAG: u64 = 1 << 62;
 
+/// Marks the event tokens of mirrored listeners' host sockets; the rest of the token is the
+/// socket's ID, which stays below it. Such a host socket is watched from before it listens, so
+/// that a failed watch leaves no listener, and events from before it listened would describe a
+/// socket that does not; under their own token, they reach no connect the socket makes after a
+/// failed listen.
+pub(super) const LISTENER_EVENT_TOKEN_FLAG: u64 = 1 << 61;
+
 /// Most clients that one accept or one event of an idle host socket resets.
 const MAX_RESETS_AT_ONCE: usize = 64;
+
+/// Most times a mirrored bind at port 0 has the host choose again a port that another socket
+/// took before the bind could.
+const MAX_PORT_CHOICES: usize = 8;
 
 /// The data that waiting `MSG_PEEK | MSG_WAITALL` peeks need.
 #[derive(Clone, Copy)]
@@ -148,6 +161,10 @@ impl TcpPendingErrors {
 }
 
 /// TCP descriptor and transport-specific state guarded by the socket's `state`.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "socket lifecycle latches are independent"
+)]
 pub(super) struct TcpSocketState {
     pub(super) descriptor: TcpDescriptor,
     /// The socket is a listener; its queue lives in [`TcpTopology`].
@@ -168,23 +185,186 @@ pub(super) struct TcpSocketState {
     /// whatever the host socket still reports.
     pub(super) connection_failed: bool,
     options: TcpOptions,
+    /// A mirrored socket was bound at a port the guest named, rather than one the host chose,
+    /// which, as on Linux, stays bound when the socket stops listening or connecting.
+    named_port: bool,
+    /// A mirrored socket's share of the port that its in-memory connections name: a
+    /// connector's own, or a listener's, which the connections it accepts share.
+    port_share: Option<PortShare>,
+    /// Names a mirrored socket's connection through the host in [`MirroredTcpPairs`].
+    host_connection: Option<Arc<HostConnection>>,
+}
+
+/// The host port that a mirrored socket's in-memory connections name, which no other host
+/// socket may take while one of them, or the socket itself if it still names the port, is open,
+/// as no other could take the port of a host connection.
+///
+/// The port's host socket, bound but neither listening nor connected, holds it here once its
+/// guest socket stops using it: a connector's when it connects in memory, and a listener's when
+/// it stops listening. A listener at the wildcard address thus holds its port at every host
+/// address for the connections it accepted, more than their own host sockets would. Each guest
+/// socket that names the port holds a [`PortShare`], and the lease that names a connector to
+/// its peer holds the port alone; the port is released once the last of these closes.
+///
+/// `state` is a leaf lock. No drop of a [`HeldPort`] takes a lock, so its last holder may drop
+/// it under any.
+struct HeldPort {
+    state: Mutex<HeldPortState>,
+}
+
+struct HeldPortState {
+    /// The port's host socket, once its guest socket stopped using it.
+    socket: Option<Socket>,
+    /// How many of the [`PortShare`]s of the port do not share it with others, by
+    /// `SO_REUSEADDR`, as their sockets last set it. A share counts while its socket is open,
+    /// and a connector's until the port is released, as a host socket's closed connection keeps
+    /// the port, as the socket last set it, while its peer is open.
+    exclusive: usize,
+}
+
+impl HeldPort {
+    /// Holds a stopped listener's host socket, which stops listening here, resetting the host
+    /// clients it did not accept, but stays bound, sharing its port as the guest sockets that
+    /// share it do. A host that fails to stop it closes it, which releases the port early,
+    /// rather than leave a listener nobody serves.
+    fn hold_listener(&self, listener: Socket) {
+        let mut state = lock(&self.state);
+        let stopped = listener
+            .set_reuse_address(state.exclusive == 0)
+            .and_then(|()| listener.disconnect());
+        if stopped.is_ok() {
+            state.socket = Some(listener);
+        }
+    }
+
+    /// A new port that holds `socket`, if any, which already shares its address as one guest
+    /// socket whose `SO_REUSEADDR` is `reuse_address` directs, for that socket's
+    /// [`PortShare`], which counts it already.
+    fn new(socket: Option<Socket>, reuse_address: bool) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(HeldPortState {
+                socket,
+                exclusive: usize::from(!reuse_address),
+            }),
+        })
+    }
+}
+
+/// A guest socket's share of a [`HeldPort`], as which its `SO_REUSEADDR` counts until it drops,
+/// or, if it `lingers`, until the port is released.
+///
+/// A drop takes the port's leaf lock, so none happens under another leaf lock.
+struct PortShare {
+    port: Arc<HeldPort>,
+    reuse_address: bool,
+    lingers: bool,
+}
+
+impl PortShare {
+    /// Shares a new [`HeldPort`] with the listener it serves, whose `SO_REUSEADDR` is
+    /// `reuse_address`.
+    fn first(reuse_address: bool) -> Self {
+        Self {
+            port: HeldPort::new(None, reuse_address),
+            reuse_address,
+            lingers: false,
+        }
+    }
+
+    /// The share of the connector whose new `port` [`HeldPort::new`] counted with its
+    /// `reuse_address`.
+    fn connector(port: Arc<HeldPort>, reuse_address: bool) -> Self {
+        Self {
+            port,
+            reuse_address,
+            lingers: true,
+        }
+    }
+
+    /// Shares `port` with a socket whose `SO_REUSEADDR` is `reuse_address`.
+    fn new(port: &Arc<HeldPort>, reuse_address: bool) -> BrokerResult<Self> {
+        let mut state = lock(&port.state);
+        let exclusive = state.exclusive + usize::from(!reuse_address);
+        if let Some(socket) = &state.socket {
+            socket
+                .set_reuse_address(exclusive == 0)
+                .map_err(broker_error_from_errno)?;
+        }
+        state.exclusive = exclusive;
+        drop(state);
+        Ok(Self {
+            port: Arc::clone(port),
+            reuse_address,
+            lingers: false,
+        })
+    }
+
+    /// Changes the socket's `SO_REUSEADDR` to `reuse_address`.
+    fn set_reuse_address(&mut self, reuse_address: bool) -> BrokerResult<()> {
+        if reuse_address == self.reuse_address {
+            return Ok(());
+        }
+        let mut state = lock(&self.port.state);
+        let exclusive = if reuse_address {
+            state.exclusive - 1
+        } else {
+            state.exclusive + 1
+        };
+        if let Some(socket) = &state.socket {
+            socket
+                .set_reuse_address(exclusive == 0)
+                .map_err(broker_error_from_errno)?;
+        }
+        state.exclusive = exclusive;
+        drop(state);
+        self.reuse_address = reuse_address;
+        Ok(())
+    }
+}
+
+impl Drop for PortShare {
+    /// Ends the share's refusal to share the port, if any, unless it lingers. The port's host
+    /// socket then shares it once no other share refuses; a host that fails to make it share
+    /// keeps the port as exclusive as it was.
+    fn drop(&mut self) {
+        if self.reuse_address || self.lingers {
+            return;
+        }
+        let mut state = lock(&self.port.state);
+        state.exclusive -= 1;
+        if state.exclusive == 0
+            && let Some(socket) = &state.socket
+        {
+            let _ = socket.set_reuse_address(true);
+        }
+    }
 }
 
 /// Socket options the broker applies to a TCP socket's host descriptor.
 #[derive(Clone, Copy, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "socket options are independent"
+)]
 struct TcpOptions {
     no_delay: bool,
     keep_alive: bool,
+    /// A mirrored socket's `SO_REUSEADDR`, which the provider rather than core keeps, so that
+    /// a change reaches its host sockets in order with its bind.
+    reuse_address: bool,
     /// The host socket refused the options, so it gets them if it connects.
     deferred: bool,
 }
 
 pub(super) enum TcpDescriptor {
     Unrealized,
+    /// A mirrored socket's host socket, bound but neither listening nor connected.
+    Bound(Socket),
     ExternalInet(Socket),
     /// This socket's end of an internal connection.
     Internal(StreamEnd),
-    /// A published port's host socket, listening while the socket listens.
+    /// A published port's host socket, or a mirrored socket's own, listening while the socket
+    /// listens.
     Listener(Socket),
 }
 
@@ -193,7 +373,9 @@ impl TcpDescriptor {
     pub(super) fn socket(&self) -> BrokerResult<&Socket> {
         match self {
             Self::ExternalInet(socket) => Ok(socket),
-            Self::Internal(_) | Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
+            Self::Internal(_) | Self::Unrealized | Self::Bound(_) | Self::Listener(_) => {
+                Err(BrokerError::Internal)
+            }
         }
     }
 
@@ -201,7 +383,9 @@ impl TcpDescriptor {
     fn socket_mut(&mut self) -> BrokerResult<&mut Socket> {
         match self {
             Self::ExternalInet(socket) => Ok(socket),
-            Self::Internal(_) | Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
+            Self::Internal(_) | Self::Unrealized | Self::Bound(_) | Self::Listener(_) => {
+                Err(BrokerError::Internal)
+            }
         }
     }
 
@@ -218,7 +402,7 @@ impl TcpDescriptor {
         match self {
             Self::ExternalInet(socket) => socket.queued_bytes().map_err(broker_error_from_errno),
             Self::Internal(end) => Ok(end.available()),
-            Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
+            Self::Unrealized | Self::Bound(_) | Self::Listener(_) => Err(BrokerError::Internal),
         }
     }
 
@@ -228,7 +412,7 @@ impl TcpDescriptor {
         match self {
             Self::ExternalInet(socket) => socket.stream_readable().map_err(broker_error_from_errno),
             Self::Internal(end) => Ok(end.readiness().readable),
-            Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
+            Self::Unrealized | Self::Bound(_) | Self::Listener(_) => Err(BrokerError::Internal),
         }
     }
 
@@ -240,7 +424,7 @@ impl TcpDescriptor {
         match self {
             Self::ExternalInet(socket) => Ok(socket.send(data, None)),
             Self::Internal(end) => errno_from_stream(end.write(data.parts())),
-            Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
+            Self::Unrealized | Self::Bound(_) | Self::Listener(_) => Err(BrokerError::Internal),
         }
     }
 
@@ -255,7 +439,7 @@ impl TcpDescriptor {
             Self::ExternalInet(socket) => Ok(socket.receive(output, mode)),
             Self::Internal(end) if mode.is_peek() => errno_from_stream(end.peek(output.parts())),
             Self::Internal(end) => errno_from_stream(end.read(output.parts())),
-            Self::Unrealized | Self::Listener(_) => Err(BrokerError::Internal),
+            Self::Unrealized | Self::Bound(_) | Self::Listener(_) => Err(BrokerError::Internal),
         }
     }
 }
@@ -263,6 +447,24 @@ impl TcpDescriptor {
 /// The event token of the idle host socket of the rule at `index`.
 fn idle_token(index: usize) -> u64 {
     PUBLISHED_EVENT_TOKEN_FLAG | index as u64
+}
+
+/// The event token of the host socket of the mirrored listener `id`.
+fn listener_token(id: u64) -> u64 {
+    LISTENER_EVENT_TOKEN_FLAG | id
+}
+
+/// Returns `address` at a port that the host chooses as it would bind a TCP socket there at
+/// port 0, and leaves free, or the error of that bind.
+fn host_chosen_port(address: SocketAddrV4) -> BrokerResult<Result<SocketAddrV4, Errno>> {
+    let probe = Socket::tcp().map_err(broker_error_from_errno)?;
+    if let Err(error) = probe.bind_as_guest(address, false) {
+        return Ok(Err(error));
+    }
+    probe
+        .local_address()
+        .map(Ok)
+        .map_err(broker_error_from_errno)
 }
 
 /// Opens each rule's host socket; a TCP one listening, watched under its idle token.
@@ -395,6 +597,16 @@ struct TcpListener {
     inbox: Arc<SocketInbox>,
     backlog: usize,
     queue: VecDeque<QueuedGuestTcpConnection>,
+    /// A mirrored listener's port, which its connections share from when they are queued.
+    port: Option<ListenerPort>,
+}
+
+/// A mirrored listener's [`HeldPort`], and its `SO_REUSEADDR` as it last set it, which a
+/// connection queued on it takes then, as a host connection takes its listener's when the host
+/// connects it, whatever the listener sets before the accept.
+struct ListenerPort {
+    port: Arc<HeldPort>,
+    reuse_address: bool,
 }
 
 struct QueuedGuestTcpConnection {
@@ -403,6 +615,8 @@ struct QueuedGuestTcpConnection {
     connector_process_key: ProcessKey,
     local_address: SocketAddrV4,
     guest_source_lease: GuestSourceLease,
+    /// The connection's share of its mirrored listener's port, with the `SO_REUSEADDR` it took.
+    port_share: Option<PortShare>,
 }
 
 /// One end of an internal connection, identified by its connector's socket ID.
@@ -423,6 +637,125 @@ enum GuestTcpResetState {
 struct TcpLink {
     connector: Arc<SocketInbox>,
     peer: TcpLinkPeer,
+}
+
+/// The pairs of addresses of the mirrored sockets' connections, in memory or through the host,
+/// which no other of their connections shares, in either direction, while one lives, as the host
+/// keeps its connections' pairs distinct. A connection through the host names its pair from the
+/// start of its connect, or its accept, until it fails before it connected, or its socket aborts
+/// or closes; the host decides for itself whether it shares a pair with another such one.
+///
+/// Pairs that ended are swept once their map fills, so that sweeps take constant time per
+/// connection over time.
+#[derive(Default)]
+struct MirroredTcpPairs {
+    /// Each in-memory connection's pair, which lives as long as its connector's [`HeldPort`],
+    /// which the connector and the lease that names it to its peer share, so no close needs
+    /// `topology` to end one.
+    memory: HashMap<TcpPair, Weak<HeldPort>>,
+    /// Each connection's pair through the host, which lives as long as its socket's
+    /// [`TcpSocketState::host_connection`].
+    host: HashMap<TcpPair, Weak<HostConnection>>,
+}
+
+/// The two ends of a connection, in order, so that each connection has one whichever end
+/// connected.
+type TcpPair = (SocketAddrV4, SocketAddrV4);
+
+fn tcp_pair(one: SocketAddrV4, other: SocketAddrV4) -> TcpPair {
+    (one.min(other), one.max(other))
+}
+
+/// Names a mirrored socket's connection through the host in [`MirroredTcpPairs`] while the
+/// socket holds it.
+struct HostConnection;
+
+impl MirroredTcpPairs {
+    /// Whether a live connection of the mirrored sockets, in memory or through the host, connects
+    /// `one` and `other`.
+    fn in_use(&self, one: SocketAddrV4, other: SocketAddrV4) -> bool {
+        let pair = tcp_pair(one, other);
+        self.memory_in_use(pair)
+            || self
+                .host
+                .get(&pair)
+                .is_some_and(|connection| connection.strong_count() > 0)
+    }
+
+    /// Whether a live in-memory connection connects the ends of `pair`.
+    fn memory_in_use(&self, pair: TcpPair) -> bool {
+        self.memory
+            .get(&pair)
+            .is_some_and(|held_port| held_port.strong_count() > 0)
+    }
+
+    /// Makes room for one more in-memory pair, so that inserting it next cannot fail. A full map
+    /// first sweeps the pairs whose connections closed, and then makes room for as many again as
+    /// remain.
+    fn try_reserve_memory(&mut self) -> BrokerResult<()> {
+        if self.memory.len() < self.memory.capacity() {
+            return Ok(());
+        }
+        self.memory.retain(|_, port| port.strong_count() > 0);
+        self.memory
+            .try_reserve(self.memory.len().max(1))
+            .map_err(|_| BrokerError::OutOfMemory)
+    }
+
+    /// Makes room for one more host pair, as [`Self::try_reserve_memory`] does.
+    fn try_reserve_host(&mut self) -> BrokerResult<()> {
+        if self.host.len() < self.host.capacity() {
+            return Ok(());
+        }
+        self.host
+            .retain(|_, connection| connection.strong_count() > 0);
+        self.host
+            .try_reserve(self.host.len().max(1))
+            .map_err(|_| BrokerError::OutOfMemory)
+    }
+
+    /// Records an in-memory connection of `source` to `destination` until `held_port` drops,
+    /// after [`Self::try_reserve_memory`] made room for it and [`Self::in_use`] found its pair
+    /// free.
+    fn insert_memory(
+        &mut self,
+        source: SocketAddrV4,
+        destination: SocketAddrV4,
+        held_port: &Arc<HeldPort>,
+    ) {
+        self.memory
+            .insert(tcp_pair(source, destination), Arc::downgrade(held_port));
+    }
+
+    /// Records a connection through the host of `local` and `peer`, after
+    /// [`Self::try_reserve_host`] made room for it, and returns what keeps it recorded. Both ends
+    /// of a connection of the provider's own sockets keep the same one.
+    fn insert_host(&mut self, local: SocketAddrV4, peer: SocketAddrV4) -> Arc<HostConnection> {
+        let entry = self.host.entry(tcp_pair(local, peer));
+        if let Entry::Occupied(entry) = &entry
+            && let Some(connection) = entry.get().upgrade()
+        {
+            return connection;
+        }
+        let connection = Arc::new(HostConnection);
+        entry.insert_entry(Arc::downgrade(&connection));
+        connection
+    }
+
+    /// Records a connection through the host of `local` and `peer`, as [`Self::insert_host`]
+    /// does, unless a live in-memory connection connects them, which the host, knowing nothing of
+    /// it, lets one through it take too; then returns `None`.
+    fn try_insert_host(
+        &mut self,
+        local: SocketAddrV4,
+        peer: SocketAddrV4,
+    ) -> BrokerResult<Option<Arc<HostConnection>>> {
+        if self.memory_in_use(tcp_pair(local, peer)) {
+            return Ok(None);
+        }
+        self.try_reserve_host()?;
+        Ok(Some(self.insert_host(local, peer)))
+    }
 }
 
 enum TcpLinkPeer {
@@ -465,6 +798,9 @@ fn tcp_socket_state(
         abortive_close: false,
         connection_failed: false,
         options,
+        named_port: false,
+        port_share: None,
+        host_connection: None,
     }
 }
 
@@ -482,6 +818,7 @@ pub(super) struct TcpTopology {
     bindings: TcpBindings,
     listeners: HashMap<u64, TcpListener>,
     links: HashMap<u64, TcpLink>,
+    mirrored_pairs: MirroredTcpPairs,
     pub(super) queued_guest_connection_count: usize,
 }
 
@@ -590,7 +927,48 @@ fn consume_synchronous_error(socket: &mut SocketEntry<'_>) -> BrokerResult<()> {
 #[derive(Clone)]
 struct TcpBinding {
     socket_id: u64,
-    guest_binding: GuestSocketBinding,
+    address: TcpBindingAddress,
+}
+
+/// Where a [`TcpBinding`] binds.
+#[derive(Clone)]
+enum TcpBindingAddress {
+    /// The guest address that core reserved for an isolated socket.
+    Guest(GuestSocketBinding),
+    /// The host address at which a mirrored socket listens. Only listeners are recorded, as the
+    /// host lets sockets that do not listen share an address, and only a listener serves one.
+    Host(SocketAddrV4),
+}
+
+impl TcpBinding {
+    fn local_address(&self) -> SocketAddrV4 {
+        match &self.address {
+            TcpBindingAddress::Guest(binding) => binding.local_address(),
+            TcpBindingAddress::Host(address) => *address,
+        }
+    }
+
+    fn is_wildcard(&self) -> bool {
+        match &self.address {
+            TcpBindingAddress::Guest(binding) => binding.is_wildcard(),
+            TcpBindingAddress::Host(address) => address.ip().is_unspecified(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        match &self.address {
+            TcpBindingAddress::Guest(binding) => binding.is_valid(),
+            TcpBindingAddress::Host(address) => address.port() != 0,
+        }
+    }
+
+    /// Returns an isolated socket's guest binding.
+    fn guest(&self) -> Option<&GuestSocketBinding> {
+        match &self.address {
+            TcpBindingAddress::Guest(binding) => Some(binding),
+            TcpBindingAddress::Host(_) => None,
+        }
+    }
 }
 
 enum ResolvedTcpDestination {
@@ -603,36 +981,50 @@ enum ResolvedTcpDestination {
 
 impl TcpTopology {
     fn insert_binding(&mut self, binding: TcpBinding) -> BrokerResult<()> {
-        let local_address = binding.guest_binding.local_address();
-        if !binding.guest_binding.is_valid()
-            || if binding.guest_binding.is_wildcard() {
-                self.bindings.wildcard.contains_key(&local_address.port())
-                    || self
+        if !self.admits_binding(&binding) {
+            return Err(BrokerError::Internal);
+        }
+        self.reserve_binding(&binding)?;
+        self.insert_reserved_binding(binding);
+        Ok(())
+    }
+
+    /// Whether `binding` is valid and overlaps no other.
+    fn admits_binding(&self, binding: &TcpBinding) -> bool {
+        let local_address = binding.local_address();
+        binding.is_valid()
+            && if binding.is_wildcard() {
+                !self.bindings.wildcard.contains_key(&local_address.port())
+                    && !self
                         .bindings
                         .exact
                         .keys()
                         .any(|address| address.port() == local_address.port())
             } else {
-                self.bindings.wildcard.contains_key(&local_address.port())
-                    || self.bindings.exact.contains_key(&local_address)
+                !self.bindings.wildcard.contains_key(&local_address.port())
+                    && !self.bindings.exact.contains_key(&local_address)
             }
-        {
-            return Err(BrokerError::Internal);
+    }
+
+    /// Makes room for `binding`, so that inserting it next cannot fail.
+    fn reserve_binding(&mut self, binding: &TcpBinding) -> BrokerResult<()> {
+        if binding.is_wildcard() {
+            self.bindings.wildcard.try_reserve(1)
+        } else {
+            self.bindings.exact.try_reserve(1)
         }
-        if binding.guest_binding.is_wildcard() {
-            self.bindings
-                .wildcard
-                .try_reserve(1)
-                .map_err(|_| BrokerError::OutOfMemory)?;
+        .map_err(|_| BrokerError::OutOfMemory)
+    }
+
+    /// Inserts `binding`, which [`Self::admits_binding`] admits, after [`Self::reserve_binding`]
+    /// made room for it.
+    fn insert_reserved_binding(&mut self, binding: TcpBinding) {
+        let local_address = binding.local_address();
+        if binding.is_wildcard() {
             self.bindings.wildcard.insert(local_address.port(), binding);
         } else {
-            self.bindings
-                .exact
-                .try_reserve(1)
-                .map_err(|_| BrokerError::OutOfMemory)?;
             self.bindings.exact.insert(local_address, binding);
         }
-        Ok(())
     }
 
     fn remove_binding(&mut self, port: u16, socket_id: u64) {
@@ -657,7 +1049,7 @@ impl TcpTopology {
             .exact
             .get(&address)
             .or_else(|| self.bindings.wildcard.get(&address.port()))
-            .filter(|binding| binding.guest_binding.covers(address))
+            .filter(|binding| binding.guest().is_some_and(|guest| guest.covers(address)))
             .cloned()
     }
 
@@ -690,6 +1082,68 @@ impl TcpTopology {
             concrete_address: destination,
         })
     }
+
+    /// Resolves a mirrored socket's connect to `destination`: to the listener of the provider's
+    /// own that serves it, if any, and otherwise as `egress` lets it reach the host. A listener
+    /// serves only a destination that is one of the host's own addresses, as `local` says: one at
+    /// the wildcard address serves each, and one at an exact address that one, which a host that
+    /// lets sockets bind addresses it does not own reaches by its routes instead. A host refuses
+    /// rather than policy denies an unserved destination only if it is its own. Returns `None` if
+    /// the answer depends on whether `destination` is the host's own, and `local` does not say.
+    fn resolve_mirrored(
+        &self,
+        destination: SocketAddrV4,
+        egress: SocketEgress,
+        local: Option<bool>,
+    ) -> Option<MirroredTcpDestination> {
+        let listening = |binding: &TcpBinding| {
+            self.listeners
+                .contains_key(&binding.socket_id)
+                .then_some(binding.socket_id)
+        };
+        if let Some(listener_id) = self
+            .bindings
+            .exact
+            .get(&destination)
+            .and_then(listening)
+            .or_else(|| {
+                self.bindings
+                    .wildcard
+                    .get(&destination.port())
+                    .and_then(listening)
+            })
+            && local != Some(false)
+        {
+            return local.map(|_| MirroredTcpDestination::Internal(listener_id));
+        }
+        Some(match egress {
+            SocketEgress::Permitted => MirroredTcpDestination::External,
+            SocketEgress::ServedOnly if local? => MirroredTcpDestination::Refused,
+            SocketEgress::ServedOnly => MirroredTcpDestination::Denied,
+        })
+    }
+}
+
+/// Where a mirrored socket's connect goes.
+enum MirroredTcpDestination {
+    /// In memory, to the provider's own listener with this ID.
+    Internal(u64),
+    /// To the host, from the socket's host socket.
+    External,
+    /// Nowhere: the host would refuse it, as at a local port nobody listens at.
+    Refused,
+    /// Nowhere: policy denies it.
+    Denied,
+}
+
+/// What a mirrored connect asks the host, as [`SocketEntry::connect_mirrored_tcp`] describes.
+enum HostQuestion {
+    /// Whether the destination is one of the host's own addresses.
+    DestinationOwned,
+    /// Which source address the host's route to the destination selects.
+    RouteSource,
+    /// Whether the exact address the socket is bound to is one of the host's own.
+    SourceOwned,
 }
 
 impl Topology {
@@ -906,6 +1360,10 @@ fn fail_connection(socket: &mut SocketEntry<'_>, error: SocketError) {
     match socket.connection_status {
         SocketConnectionStatus::Connecting => {
             socket.connection_status = SocketConnectionStatus::Failed(error);
+            // The host's failed connect holds its pair of addresses no longer.
+            if let Ok(tcp) = socket.tcp_state_mut() {
+                tcp.host_connection = None;
+            }
             let readiness = socket.own() | ReadinessFlags::ERROR;
             set_own_readiness(socket, readiness);
         }
@@ -970,17 +1428,30 @@ fn fail_with_taken_error(socket: &mut SocketEntry<'_>, error: Errno) -> BrokerRe
 /// host socket, which resets the connection should the host complete it
 /// first, and fails the connect with a reset.
 fn abort_pending_connect(socket: &mut SocketEntry<'_>) -> BrokerResult<()> {
-    socket
-        .tcp_state()?
-        .descriptor
-        .socket()?
-        .set_linger_zero()
-        .map_err(broker_error_from_errno)?;
-    if let TcpDescriptor::ExternalInet(mut host_socket) = core::mem::replace(
-        &mut socket.tcp_state_mut()?.descriptor,
-        TcpDescriptor::Unrealized,
-    ) {
-        socket.core().unwatch_host_socket(&mut host_socket);
+    let core = socket.core();
+    let tcp = socket.tcp_state_mut()?;
+    // As on Linux, a mirrored socket keeps a port the guest named until it closes.
+    let keep_port = core.mirrored() && tcp.named_port;
+    if !keep_port {
+        tcp.descriptor
+            .socket()?
+            .set_linger_zero()
+            .map_err(broker_error_from_errno)?;
+    }
+    if let TcpDescriptor::ExternalInet(mut host_socket) =
+        core::mem::replace(&mut tcp.descriptor, TcpDescriptor::Unrealized)
+    {
+        core.unwatch_host_socket(&mut host_socket);
+        tcp.host_connection = None;
+        if keep_port {
+            // A host that cannot stop the connect so closes the socket, which releases the port.
+            match host_socket.disconnect() {
+                Ok(()) => tcp.descriptor = TcpDescriptor::Bound(host_socket),
+                Err(_) => {
+                    let _ = host_socket.set_linger_zero();
+                }
+            }
+        }
     }
     socket.connection_status = SocketConnectionStatus::Failed(SocketError::ConnectionReset);
     set_own_readiness(socket, ReadinessFlags::ERROR);
@@ -1261,8 +1732,10 @@ fn shutdown_tcp_stream(
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
     // A failed socket has no connection to shut down.
-    if matches!(socket.tcp_state()?.descriptor, TcpDescriptor::Unrealized)
-        || matches!(socket.connection_status, SocketConnectionStatus::Failed(_))
+    if matches!(
+        socket.tcp_state()?.descriptor,
+        TcpDescriptor::Unrealized | TcpDescriptor::Bound(_) | TcpDescriptor::Listener(_)
+    ) || matches!(socket.connection_status, SocketConnectionStatus::Failed(_))
     {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
@@ -1362,31 +1835,38 @@ fn shutdown_tcp_stream(
     Ok(SocketOutcome::Completed(()))
 }
 
-/// Applies host `events` to the socket.
+/// Applies host `events`, raised under `token`, to the socket.
 ///
 /// Returns whether the event thread should apply an empty event soon,
 /// because a peek waits for more data than the socket holds and its host
 /// does not report each arrival.
 pub(super) fn handle_socket_event(
     socket: &mut SocketEntry<'_>,
+    token: u64,
     events: SocketEvents,
 ) -> BrokerResult<bool> {
+    let listener_event = token & LISTENER_EVENT_TOKEN_FLAG != 0;
     // An internal endpoint's wakeups carry no events; its stream's state is
     // the source of truth.
     let (mut events, polled) = match &socket.tcp_state()?.descriptor {
-        TcpDescriptor::Internal(end) => (stream_events(end), false),
-        TcpDescriptor::ExternalInet(_) => (events, !Poller::REPORTS_EVERY_ARRIVAL),
-        TcpDescriptor::Unrealized => (events, false),
         // A host listener's event may mean a connection to accept, or an error the accept reports.
         // An accept may have taken the connection since, so an edge counts only while one waits.
+        // A mirrored listener's host socket polled as hung up before it listened, so its hang-up
+        // means nothing.
         TcpDescriptor::Listener(listener) => {
-            let failed = events.intersects(SocketEvents::ERROR | SocketEvents::HANGUP);
+            let failed = events.contains(SocketEvents::ERROR)
+                || (!listener_event && events.contains(SocketEvents::HANGUP));
             let readable = events.contains(SocketEvents::READABLE);
             if failed || (readable && listener.stream_readable() != Ok(false)) {
                 add_readiness(socket, ReadinessFlags::READ);
             }
             return Ok(false);
         }
+        // An event of a host socket from a listen that failed.
+        _ if listener_event => return Ok(false),
+        TcpDescriptor::Internal(end) => (stream_events(end), false),
+        TcpDescriptor::ExternalInet(_) => (events, !Poller::REPORTS_EVERY_ARRIVAL),
+        TcpDescriptor::Unrealized | TcpDescriptor::Bound(_) => (events, false),
     };
     // A connection's failure, once reported, raises no more errors.
     if socket.tcp_state()?.connection_failed {
@@ -1582,6 +2062,9 @@ impl SocketEntry<'_> {
         if self.kind() != SocketKind::Tcp {
             return Err(BrokerError::UnsupportedOperation);
         }
+        if let SocketOptionValue::ReuseAddress(value) = value {
+            return self.set_mirrored_reuse_address(value);
+        }
         let mut options = self.tcp_state()?.options;
         match value {
             SocketOptionValue::NoDelay(value) => options.no_delay = value,
@@ -1608,8 +2091,56 @@ impl SocketEntry<'_> {
         match name {
             SocketOptionName::NoDelay => Ok(SocketOptionValue::NoDelay(options.no_delay)),
             SocketOptionName::KeepAlive => Ok(SocketOptionValue::KeepAlive(options.keep_alive)),
+            SocketOptionName::ReuseAddress if self.core().mirrored() => {
+                Ok(SocketOptionValue::ReuseAddress(options.reuse_address))
+            }
             _ => Err(BrokerError::UnsupportedOperation),
         }
+    }
+
+    /// Sets a mirrored socket's `SO_REUSEADDR` on its host socket, if any, for the host's binds
+    /// and listens that follow and the connections it accepts, on the port it shares with
+    /// its in-memory connections, if any, and, for a listener, for the connections queued on it
+    /// next.
+    fn set_mirrored_reuse_address(&mut self, value: bool) -> BrokerResult<()> {
+        if !self.core().mirrored() {
+            return Err(BrokerError::UnsupportedOperation);
+        }
+        let tcp = self.tcp_state_mut()?;
+        let host = match &tcp.descriptor {
+            TcpDescriptor::Bound(host)
+            | TcpDescriptor::ExternalInet(host)
+            | TcpDescriptor::Listener(host) => Some(host),
+            TcpDescriptor::Unrealized | TcpDescriptor::Internal(_) => None,
+        };
+        if let Some(host) = host {
+            host.set_reuse_address(value)
+                .map_err(broker_error_from_errno)?;
+        }
+        if let Some(share) = &mut tcp.port_share
+            && let Err(error) = share.set_reuse_address(value)
+        {
+            if let Some(host) = host {
+                // Best effort: the host just took the option, so it takes it back.
+                let _ = host.set_reuse_address(tcp.options.reuse_address);
+            }
+            return Err(error);
+        }
+        tcp.options.reuse_address = value;
+        if tcp.listening {
+            // The connections queued on the listener from now on take the option.
+            let id = self.id();
+            if let Some(port) = self
+                .topology()
+                .tcp
+                .listeners
+                .get_mut(&id)
+                .and_then(|listener| listener.port.as_mut())
+            {
+                port.reuse_address = value;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn shutdown_tcp_socket(
@@ -1632,6 +2163,14 @@ impl SocketEntry<'_> {
             .listeners
             .remove(&self.id())
             .ok_or(BrokerError::Internal)?;
+        if self.core().mirrored()
+            && let Some(address) = self.guest_local_address
+        {
+            topology.tcp.remove_binding(address.port(), self.id());
+            // As on Linux, the socket keeps a port the guest named until it closes.
+            let named_port = self.tcp_state()?.named_port;
+            self.stop_mirrored_listener(named_port);
+        }
         let tcp = self.tcp_state_mut()?;
         tcp.listening = false;
         tcp.peek_waitall = None;
@@ -1646,6 +2185,31 @@ impl SocketEntry<'_> {
         drop(topology);
         self.close_host_listener();
         Ok(SocketOutcome::Completed(()))
+    }
+
+    /// Stops a mirrored listener's host socket, which stops listening and leaves no client of
+    /// the host's to accept, but stays bound in the listener's [`HeldPort`] for the connections
+    /// the listener accepted in memory, and, if `keep_port`, for the listener itself.
+    ///
+    /// Runs under `topology`, once the listener's binding is gone from it, so that from then on
+    /// no connect, in memory or through the host, reaches the listener.
+    fn stop_mirrored_listener(&mut self, keep_port: bool) {
+        let core = self.core();
+        let Ok(tcp) = self.tcp_state_mut() else {
+            return;
+        };
+        if let TcpDescriptor::Listener(_) = tcp.descriptor
+            && let TcpDescriptor::Listener(mut host) =
+                core::mem::replace(&mut tcp.descriptor, TcpDescriptor::Unrealized)
+        {
+            core.unwatch_host_socket(&mut host);
+            if let Some(share) = &tcp.port_share {
+                share.port.hold_listener(host);
+            }
+        }
+        if !keep_port {
+            tcp.port_share = None;
+        }
     }
 
     /// Hands back a listener's host socket, if any: a rule's resets its clients until a guest
@@ -1673,17 +2237,103 @@ impl SocketEntry<'_> {
         let guest_address = binding.local_address();
         self.topology().tcp.insert_binding(TcpBinding {
             socket_id: self.id(),
-            guest_binding: binding,
+            address: TcpBindingAddress::Guest(binding),
         })?;
         self.guest_local_address = Some(guest_address);
         Ok(SocketOutcome::Completed(guest_address))
+    }
+
+    /// Binds a mirrored socket's host socket as `request` asks and the socket's `SO_REUSEADDR`
+    /// directs, and returns the address the host bound. A failed bind leaves the socket unbound.
+    ///
+    /// For port 0, the host chooses a port as it would for its own socket, but the socket then
+    /// binds it as one the guest named, which, unlike one the host chose, stays bound when the
+    /// socket stops listening or connecting, as the connections it served in memory need. The
+    /// port is the guest's only once bound so; if another socket takes it in between, the host
+    /// chooses again.
+    pub(super) fn bind_mirrored_tcp(
+        &mut self,
+        request: HostBindRequest,
+    ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
+        if self.guest_local_address.is_some()
+            || !matches!(self.tcp_state()?.descriptor, TcpDescriptor::Unrealized)
+        {
+            return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+        }
+        // Read under the socket's `state`, as a set of the option is, so that the bind follows
+        // the latest.
+        let reuse_address = self.tcp_state()?.options.reuse_address;
+        let named_port = request.address().port() != 0;
+        let mut choices = 0;
+        let bound = loop {
+            let address = if named_port {
+                request.address()
+            } else {
+                match host_chosen_port(request.address())? {
+                    Ok(address) => address,
+                    Err(error) => break Err(error),
+                }
+            };
+            let host = Socket::tcp().map_err(broker_error_from_errno)?;
+            // A port the host chose binds exclusively, as it would, and shares only after.
+            match host.bind_as_guest(address, named_port && reuse_address) {
+                Ok(()) => break Ok(host),
+                Err(Errno::ADDRINUSE) if !named_port && choices < MAX_PORT_CHOICES => choices += 1,
+                Err(error) => break Err(error),
+            }
+        };
+        let host = match bound {
+            Ok(host) => host,
+            // The guest sees the host's refusal as Linux's `EACCES`, which only a denial reports.
+            Err(Errno::ACCES) => return Ok(SocketOutcome::Failed(SocketError::PolicyDenied)),
+            Err(error) => {
+                return socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
+            }
+        };
+        if !named_port && reuse_address {
+            host.set_reuse_address(true)
+                .map_err(broker_error_from_errno)?;
+        }
+        let local_address = host.local_address().map_err(broker_error_from_errno)?;
+        let tcp = self.tcp_state_mut()?;
+        tcp.descriptor = TcpDescriptor::Bound(host);
+        tcp.named_port = named_port;
+        self.guest_local_address = Some(local_address);
+        Ok(SocketOutcome::Completed(local_address))
+    }
+
+    pub(super) fn release_mirrored_connect_bind(
+        &mut self,
+        address: SocketAddrV4,
+    ) -> BrokerResult<()> {
+        if !self.core().mirrored()
+            || self.guest_local_address != Some(address)
+            || self.connection_status != SocketConnectionStatus::Unconnected
+        {
+            return Err(BrokerError::Internal);
+        }
+        let tcp = self.tcp_state_mut()?;
+        if tcp.named_port || !matches!(tcp.descriptor, TcpDescriptor::Bound(_)) {
+            return Err(BrokerError::Internal);
+        }
+        // A bound non-listener has neither a topology entry nor a poller watch.
+        tcp.descriptor = TcpDescriptor::Unrealized;
+        self.guest_local_address = None;
+        Ok(())
     }
 
     pub(super) fn connect_tcp_destination(
         &mut self,
         requested_destination: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
+        egress: SocketEgress,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
+        if self.core().mirrored() {
+            // The provider names a mirrored socket's port itself.
+            drop(guest_source_lease);
+            return self.connect_mirrored_tcp(requested_destination, egress);
+        }
+        debug_assert_eq!(egress, SocketEgress::Permitted);
         if self.guest_local_address.is_none() {
             return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal));
         }
@@ -1709,8 +2359,8 @@ impl SocketEntry<'_> {
                 concrete_address,
             } => {
                 let source_address = binding
-                    .guest_binding
-                    .source_address_for_destination(concrete_address)
+                    .guest()
+                    .and_then(|guest| guest.source_address_for_destination(concrete_address))
                     .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
                 let guest_source_lease = guest_source_lease
                     .filter(|lease| lease.source_address() == source_address)
@@ -1726,73 +2376,358 @@ impl SocketEntry<'_> {
                 drop(topology);
                 drop(guest_source_lease);
                 let guest_local_address = binding
-                    .guest_binding
-                    .source_address_for_destination(external_destination)
+                    .guest()
+                    .and_then(|guest| guest.source_address_for_destination(external_destination))
                     .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
                 self.connect_external_tcp_socket(
                     host_socket_destination(external_destination),
                     guest_local_address,
+                    None,
                 )
             }
         }
     }
 
+    /// Connects a mirrored socket to `requested_destination`: in memory if a listener of the
+    /// provider's own serves it, and otherwise from its host socket, if `egress` lets it. One that
+    /// policy denies, or whose addresses another connection uses, leaves the socket as it was, as
+    /// does one that cannot learn what it needs of the host.
+    fn connect_mirrored_tcp(
+        &mut self,
+        requested_destination: SocketAddrV4,
+        egress: SocketEgress,
+    ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
+        let local_address = self
+            .guest_local_address
+            .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
+        if self.connection_status != SocketConnectionStatus::Unconnected
+            || !matches!(
+                self.tcp_state()
+                    .map_err(PlatformConnectError::PeerUnchanged)?
+                    .descriptor,
+                TcpDescriptor::Bound(_)
+            )
+        {
+            return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal));
+        }
+        let destination = match SocketAddressing::Host.normalize_destination(requested_destination)
+        {
+            Ok(destination) => destination,
+            Err(error) => return Ok(self.fail_mirrored_connect(error)),
+        };
+        // What the host says: whether the destination is one of the host's own addresses; for a
+        // socket bound to the wildcard address, which source address the host's route to it
+        // selects; and for one bound to an exact address, whether that is the host's own, as a
+        // host that lets sockets bind others sends from no route from them. Asking takes system
+        // calls, made outside `topology` and only once an answer matters. None depends on the
+        // provider's sockets, while whether a listener serves the destination, and which pairs
+        // of addresses their connections hold, do, so those are decided under `topology`, along
+        // with the connect, so that neither changes in between. Each pass but the last learns
+        // one answer, so there are at most three.
+        let bound_ip = *local_address.ip();
+        let mut local = None;
+        let mut route_source = None;
+        let mut source_owned = None;
+        let (mut topology, resolved) = loop {
+            let topology = self.topology();
+            let resolved = topology.tcp.resolve_mirrored(destination, egress, local);
+            let source_unknown = bound_ip.is_unspecified() && route_source.is_none();
+            let question = match resolved {
+                None => HostQuestion::DestinationOwned,
+                Some(MirroredTcpDestination::Internal(_)) if source_unknown => {
+                    HostQuestion::RouteSource
+                }
+                Some(MirroredTcpDestination::Internal(_))
+                    if !bound_ip.is_unspecified() && source_owned.is_none() =>
+                {
+                    HostQuestion::SourceOwned
+                }
+                Some(resolved) => break (topology, resolved),
+            };
+            drop(topology);
+            match question {
+                HostQuestion::DestinationOwned => {
+                    let owned = Socket::owns_address(*destination.ip());
+                    local = Some(owned.map_err(rejected_from_errno)?);
+                }
+                HostQuestion::RouteSource => {
+                    // This local listener's concrete IP is a valid source even without a UDP
+                    // route hint. The connection itself never leaves broker memory.
+                    route_source = Some(
+                        Socket::preferred_source_for(destination)
+                            .map_err(rejected_from_errno)?
+                            .unwrap_or(*destination.ip()),
+                    );
+                }
+                HostQuestion::SourceOwned => {
+                    source_owned = Some(match local {
+                        Some(owned) if bound_ip == *destination.ip() => owned,
+                        _ => Socket::owns_address(bound_ip).map_err(rejected_from_errno)?,
+                    });
+                }
+            }
+        };
+        match resolved {
+            MirroredTcpDestination::Internal(listener_id) => {
+                // As the host fails a connect from no route, without changing the socket.
+                if source_owned == Some(false) {
+                    return Err(PlatformConnectError::Rejected(
+                        SocketError::NetworkUnreachable,
+                    ));
+                }
+                let source =
+                    SocketAddrV4::new(route_source.unwrap_or(bound_ip), local_address.port());
+                self.connect_mirrored_internal(&mut topology, listener_id, source, destination)
+            }
+            // The connect starts under `topology`, so that a listener of the provider's own that
+            // starts listening at the destination meanwhile cannot take it as a host client, and
+            // no in-memory connection takes its pair. As the host would, it fails if one holds
+            // the pair already; one through the host the host checks itself.
+            MirroredTcpDestination::External => {
+                let pairs = &mut topology.tcp.mirrored_pairs;
+                // Only an exact bind identifies the source before TCP connects. For a wildcard
+                // bind the actual pair is checked below, still under the same topology lock.
+                if !bound_ip.is_unspecified()
+                    && pairs.memory_in_use(tcp_pair(local_address, destination))
+                {
+                    return Err(PlatformConnectError::Rejected(
+                        SocketError::AddressNotAvailable,
+                    ));
+                }
+                pairs
+                    .try_reserve_host()
+                    .map_err(PlatformConnectError::PeerUnchanged)?;
+                let status =
+                    self.connect_external_tcp_socket(destination, local_address, Some(topology))?;
+                adopt_host_local_address(self);
+                Ok(status)
+            }
+            MirroredTcpDestination::Refused => {
+                drop(topology);
+                Ok(self.fail_mirrored_connect(SocketError::ConnectionRefused))
+            }
+            // A denial leaves the socket as it was, for another attempt.
+            MirroredTcpDestination::Denied => {
+                Err(PlatformConnectError::Rejected(SocketError::PolicyDenied))
+            }
+        }
+    }
+
+    /// Fails a mirrored socket's connect with `error`, keeping its host socket bound.
+    fn fail_mirrored_connect(&mut self, error: SocketError) -> SocketConnectionStatus {
+        let status = SocketConnectionStatus::Failed(error);
+        self.connection_status = status;
+        set_own_readiness(self, ReadinessFlags::ERROR);
+        status
+    }
+
+    /// Fails a mirrored socket's connect from its host socket with `error`, as one the host
+    /// rejected, leaving the socket bound as it was for another attempt. A connect the host
+    /// `started` stops first, which keeps the host socket's binding, as the provider always names
+    /// its port; a host that cannot stop it closes it, which ends the socket's connect.
+    fn reject_mirrored_connect(
+        &mut self,
+        started: bool,
+        error: SocketError,
+    ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
+        let tcp = self
+            .tcp_state_mut()
+            .map_err(PlatformConnectError::PeerIndeterminate)?;
+        let TcpDescriptor::ExternalInet(host) =
+            core::mem::replace(&mut tcp.descriptor, TcpDescriptor::Unrealized)
+        else {
+            return Err(PlatformConnectError::PeerIndeterminate(
+                BrokerError::Internal,
+            ));
+        };
+        if !started || host.disconnect().is_ok() {
+            tcp.descriptor = TcpDescriptor::Bound(host);
+            self.connection_status = SocketConnectionStatus::Unconnected;
+            return Err(PlatformConnectError::Rejected(error));
+        }
+        let _ = host.set_linger_zero();
+        drop(host);
+        let status = SocketConnectionStatus::Failed(error);
+        self.connection_status = status;
+        set_own_readiness(self, ReadinessFlags::ERROR);
+        Ok(status)
+    }
+
+    /// Connects a mirrored socket in memory from `source_address`, its bound port at the address
+    /// the host would send from, to `destination`, at which the provider's own listener
+    /// `listener_id` listens. The socket's bound host socket keeps its port until both ends of the
+    /// connection close, so that no host socket takes the port that names the connector.
+    fn connect_mirrored_internal(
+        &mut self,
+        topology: &mut Topology,
+        listener_id: u64,
+        source_address: SocketAddrV4,
+        destination: SocketAddrV4,
+    ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
+        // Sockets sharing a port by SO_REUSEADDR could otherwise connect the same pair of
+        // addresses, in either direction; as the host would, the later one finds it taken.
+        let pairs = &mut topology.tcp.mirrored_pairs;
+        if pairs.in_use(source_address, destination) {
+            return Err(PlatformConnectError::Rejected(
+                SocketError::AddressNotAvailable,
+            ));
+        }
+        pairs
+            .try_reserve_memory()
+            .map_err(PlatformConnectError::PeerUnchanged)?;
+        let tcp = self
+            .tcp_state_mut()
+            .map_err(PlatformConnectError::PeerUnchanged)?;
+        let reuse_address = tcp.options.reuse_address;
+        let TcpDescriptor::Bound(host) =
+            core::mem::replace(&mut tcp.descriptor, TcpDescriptor::Unrealized)
+        else {
+            return Err(PlatformConnectError::PeerIndeterminate(
+                BrokerError::Internal,
+            ));
+        };
+        let port = HeldPort::new(Some(host), reuse_address);
+        let guest_source_lease =
+            GuestSourceLease::retaining(source_address, Arc::clone(&port) as _);
+        let result =
+            self.connect_internal_tcp(topology, listener_id, destination, guest_source_lease);
+        let tcp = self
+            .tcp_state_mut()
+            .map_err(PlatformConnectError::PeerIndeterminate)?;
+        if matches!(result, Ok(SocketConnectionStatus::Connected)) {
+            topology
+                .tcp
+                .mirrored_pairs
+                .insert_memory(source_address, destination, &port);
+            tcp.port_share = Some(PortShare::connector(port, reuse_address));
+        } else if let Ok(port) = Arc::try_unwrap(port)
+            && let Ok(HeldPortState {
+                socket: Some(host), ..
+            }) = port.state.into_inner()
+            && matches!(tcp.descriptor, TcpDescriptor::Unrealized)
+        {
+            // The connect failed, and dropped its lease, so the socket stays bound.
+            tcp.descriptor = TcpDescriptor::Bound(host);
+        }
+        result
+    }
+
+    /// Connects the socket from a host socket to `address`, the one it bound or a new one, and
+    /// names it `guest_local_address`. Holds `topology`, if given, until the connect starts.
     fn connect_external_tcp_socket(
         &mut self,
         address: SocketAddrV4,
         guest_local_address: SocketAddrV4,
+        topology: Option<MutexGuard<'_, Topology>>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         if self.connection_status != SocketConnectionStatus::Unconnected {
             return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal));
         }
-        let (options, unrealized) = {
+        let (options, bound) = {
             let tcp = self
                 .tcp_state()
                 .map_err(PlatformConnectError::PeerUnchanged)?;
-            (
-                tcp.options,
-                matches!(tcp.descriptor, TcpDescriptor::Unrealized),
-            )
+            let bound = match tcp.descriptor {
+                TcpDescriptor::Unrealized => false,
+                TcpDescriptor::Bound(_) => true,
+                _ => return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal)),
+            };
+            (tcp.options, bound)
         };
-        if !unrealized {
-            return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal));
+        // A mirrored socket connects from the host socket it bound, and any other from a new one.
+        let external_socket = if bound {
+            let tcp = self
+                .tcp_state_mut()
+                .map_err(PlatformConnectError::PeerUnchanged)?;
+            let TcpDescriptor::Bound(socket) =
+                core::mem::replace(&mut tcp.descriptor, TcpDescriptor::Unrealized)
+            else {
+                return Err(PlatformConnectError::PeerIndeterminate(
+                    BrokerError::Internal,
+                ));
+            };
+            socket
+        } else {
+            Socket::tcp().map_err(|error| {
+                PlatformConnectError::PeerUnchanged(broker_error_from_errno(error))
+            })?
+        };
+        if let Err(error) = apply_tcp_options(&external_socket, options) {
+            if bound {
+                self.tcp_state_mut()
+                    .map_err(PlatformConnectError::PeerIndeterminate)?
+                    .descriptor = TcpDescriptor::Bound(external_socket);
+            }
+            return Err(PlatformConnectError::PeerUnchanged(
+                broker_error_from_errno(error),
+            ));
         }
-        let external_socket = Socket::tcp()
-            .map_err(|error| PlatformConnectError::PeerUnchanged(broker_error_from_errno(error)))?;
-        apply_tcp_options(&external_socket, options)
-            .map_err(|error| PlatformConnectError::PeerUnchanged(broker_error_from_errno(error)))?;
         self.tcp_state_mut()
             .map_err(PlatformConnectError::PeerUnchanged)?
             .descriptor = TcpDescriptor::ExternalInet(external_socket);
         self.connection_status = SocketConnectionStatus::Connecting;
+        let host = self
+            .tcp_state()
+            .and_then(|tcp| tcp.descriptor.socket())
+            .map_err(PlatformConnectError::PeerIndeterminate)?;
         let status = loop {
-            match self
-                .tcp_state()
-                .map_err(PlatformConnectError::PeerIndeterminate)?
-                .descriptor
-                .socket()
-                .map_err(PlatformConnectError::PeerIndeterminate)?
-                .connect(address)
-            {
-                Ok(()) | Err(Errno::ISCONN) => break SocketConnectionStatus::Connected,
+            match host.connect(address) {
+                Ok(()) | Err(Errno::ISCONN) => break Ok(SocketConnectionStatus::Connected),
                 Err(Errno::INTR) => {}
                 Err(Errno::INPROGRESS | Errno::ALREADY) => {
-                    break SocketConnectionStatus::Connecting;
+                    break Ok(SocketConnectionStatus::Connecting);
+                }
+                // The host fails a bound socket's connect whose pair of addresses another of its
+                // connections holds before the socket changes, so it stays bound.
+                Err(Errno::ADDRNOTAVAIL) if bound => {
+                    drop(topology);
+                    return self.reject_mirrored_connect(false, SocketError::AddressNotAvailable);
                 }
                 Err(error) => {
-                    let error = match socket_operation_error_from_errno(error) {
-                        Ok(error) => error,
-                        Err(error) => {
-                            self.connection_status =
-                                SocketConnectionStatus::Failed(SocketError::Other);
-                            set_own_readiness(self, ReadinessFlags::ERROR);
-                            return Err(PlatformConnectError::PeerIndeterminate(error));
-                        }
-                    };
-                    break SocketConnectionStatus::Failed(error);
+                    break socket_operation_error_from_errno(error)
+                        .map(SocketConnectionStatus::Failed);
                 }
             }
         };
+        // A mirrored socket's connection names its pair of addresses, as the host chose them,
+        // before any in-memory connect can take the pair. A wildcard socket acquires its concrete
+        // source only here; stop rather than publish a pair that a live in-memory stream holds.
+        let mut host_connection = None;
+        let status = match (status, topology) {
+            (
+                Ok(
+                    status @ (SocketConnectionStatus::Connected
+                    | SocketConnectionStatus::Connecting),
+                ),
+                Some(mut topology),
+            ) => match host.local_address() {
+                Ok(local_address) => {
+                    let pairs = &mut topology.tcp.mirrored_pairs;
+                    if pairs.memory_in_use(tcp_pair(local_address, address)) {
+                        drop(topology);
+                        return self
+                            .reject_mirrored_connect(true, SocketError::AddressNotAvailable);
+                    }
+                    host_connection = Some(pairs.insert_host(local_address, address));
+                    Ok(status)
+                }
+                Err(error) => Err(broker_error_from_errno(error)),
+            },
+            (status, _) => status,
+        };
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                self.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+                set_own_readiness(self, ReadinessFlags::ERROR);
+                return Err(PlatformConnectError::PeerIndeterminate(error));
+            }
+        };
+        if host_connection.is_some() {
+            self.tcp_state_mut()
+                .map_err(PlatformConnectError::PeerIndeterminate)?
+                .host_connection = host_connection;
+        }
         self.connection_status = status;
         let readiness = match status {
             SocketConnectionStatus::Connected => ReadinessFlags::WRITE,
@@ -1870,6 +2805,14 @@ impl SocketEntry<'_> {
             .queue
             .try_reserve(1)
             .map_err(|_| PlatformConnectError::PeerUnchanged(BrokerError::OutOfMemory))?;
+        // The connection shares a mirrored listener's port from now on, with the listener's
+        // `SO_REUSEADDR` as it is now.
+        let port_share = listener
+            .port
+            .as_ref()
+            .map(|port| PortShare::new(&port.port, port.reuse_address))
+            .transpose()
+            .map_err(PlatformConnectError::PeerUnchanged)?;
         topology
             .tcp
             .links
@@ -1902,6 +2845,7 @@ impl SocketEntry<'_> {
             connector_process_key: self.process_key(),
             local_address,
             guest_source_lease,
+            port_share,
         });
         publish_listener_queue(listener);
         topology.charge_queued_connection(self.process_key());
@@ -1931,11 +2875,14 @@ impl SocketEntry<'_> {
         {
             return socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
         }
+        if self.core().mirrored() && !self.tcp_state()?.listening {
+            return self.listen_mirrored(guest_address, backlog);
+        }
         let mut topology = self.topology();
         let binding = topology
             .tcp
             .binding_for_socket(self.id())
-            .filter(|binding| binding.guest_binding.local_address() == guest_address)
+            .filter(|binding| binding.local_address() == guest_address)
             .ok_or(BrokerError::Internal)?;
         let host_backlog = backlog;
         let backlog = usize::try_from(backlog)
@@ -1954,8 +2901,8 @@ impl SocketEntry<'_> {
             let core = self.core();
             let port = guest_address.port();
             if binding
-                .guest_binding
-                .covers(SocketAddrV4::new(GUEST_IPV4_ADDRESS, port))
+                .guest()
+                .is_some_and(|guest| guest.covers(SocketAddrV4::new(GUEST_IPV4_ADDRESS, port)))
             {
                 // Host calls run outside `topology`; a failure fails the listen.
                 drop(topology);
@@ -1985,11 +2932,88 @@ impl SocketEntry<'_> {
                     inbox: Arc::clone(&self.socket.inbox),
                     backlog,
                     queue: VecDeque::new(),
+                    port: None,
                 },
             );
         }
         self.tcp_state_mut()?.listening = true;
         Ok(SocketOutcome::Completed(guest_address))
+    }
+
+    /// Makes a mirrored socket's bound host socket at `local_address` a listener, which both host
+    /// clients and the provider's own sockets reach.
+    ///
+    /// A host socket cannot stop listening, so it listens last, once all else that can fail has,
+    /// and a listen that fails leaves it bound and unwatched. Its watch is thus the poller's from
+    /// before it listens, when it polls as writable and hung up, so the watch has a token of its
+    /// own, which tells [`handle_socket_event`] which events to take as a listener's, rather than
+    /// complete a later connect early.
+    fn listen_mirrored(
+        &mut self,
+        local_address: SocketAddrV4,
+        backlog: u32,
+    ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
+        let queue_backlog = usize::try_from(backlog)
+            .map_err(|_| BrokerError::UnsupportedOperation)?
+            .max(1);
+        if self.connection_status != SocketConnectionStatus::Unconnected
+            || !matches!(self.tcp_state()?.descriptor, TcpDescriptor::Bound(_))
+        {
+            return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+        }
+        let (core, id) = (self.core(), self.id());
+        let inbox = Arc::clone(&self.socket.inbox);
+        let binding = TcpBinding {
+            socket_id: id,
+            address: TcpBindingAddress::Host(local_address),
+        };
+        // Neither the watch nor `listen` blocks. Under `topology`, the provider's own sockets find
+        // the listener as soon as host clients can.
+        let mut topology = self.topology();
+        if !topology.tcp.admits_binding(&binding) {
+            // Another of the provider's listeners listens at an overlapping address, so the host
+            // would refuse this one.
+            return Ok(SocketOutcome::Failed(SocketError::AddressInUse));
+        }
+        topology
+            .tcp
+            .listeners
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        topology.tcp.reserve_binding(&binding)?;
+        let tcp = self.tcp_state_mut()?;
+        let TcpDescriptor::Bound(host) = &mut tcp.descriptor else {
+            return Err(BrokerError::Internal);
+        };
+        core.watch_host_socket(host, listener_token(id), Interest::Stream)?;
+        if let Err(error) = host.listen(backlog) {
+            core.unwatch_host_socket(host);
+            return socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
+        }
+        topology.tcp.insert_reserved_binding(binding);
+        // The port that the connections the listener accepts in memory name.
+        let port_share = PortShare::first(tcp.options.reuse_address);
+        topology.tcp.listeners.insert(
+            id,
+            TcpListener {
+                inbox,
+                backlog: queue_backlog,
+                queue: VecDeque::new(),
+                port: Some(ListenerPort {
+                    port: Arc::clone(&port_share.port),
+                    reuse_address: port_share.reuse_address,
+                }),
+            },
+        );
+        drop(topology);
+        if let TcpDescriptor::Bound(host) =
+            core::mem::replace(&mut tcp.descriptor, TcpDescriptor::Unrealized)
+        {
+            tcp.descriptor = TcpDescriptor::Listener(host);
+        }
+        tcp.listening = true;
+        tcp.port_share = Some(port_share);
+        Ok(SocketOutcome::Completed(local_address))
     }
 
     /// Accepts the first queued connection into `accepted`, a new closed
@@ -2041,6 +3065,7 @@ impl SocketEntry<'_> {
             connector_socket_id,
             local_address,
             guest_source_lease,
+            port_share,
             ..
         } = listener.queue.pop_front().ok_or(BrokerError::Internal)?;
         publish_listener_queue(listener);
@@ -2049,16 +3074,25 @@ impl SocketEntry<'_> {
         }
         drop(topology);
         socket.set_waker(Some(core.stream_waker(accepted.id)));
+        // A mirrored connection's SO_REUSEADDR is the one it took as it was queued.
+        let reuse_address = port_share
+            .as_ref()
+            .map_or(options.reuse_address, |share| share.reuse_address);
+        let mut tcp = tcp_socket_state(
+            TcpDescriptor::Internal(socket),
+            Some(GuestTcpEndpoint {
+                connector_socket_id,
+                reset_state: GuestTcpResetState::None,
+            }),
+            TcpOptions {
+                reuse_address,
+                ..options
+            },
+        );
+        tcp.port_share = port_share;
         *state = SocketState {
             closed: false,
-            transport: SocketTransportState::Tcp(tcp_socket_state(
-                TcpDescriptor::Internal(socket),
-                Some(GuestTcpEndpoint {
-                    connector_socket_id,
-                    reset_state: GuestTcpResetState::None,
-                }),
-                options,
-            )),
+            transport: SocketTransportState::Tcp(tcp),
             connection_status: SocketConnectionStatus::Connected,
             read_shutdown: false,
             write_shutdown: false,
@@ -2089,28 +3123,90 @@ impl SocketEntry<'_> {
             return Err(BrokerError::WouldBlock);
         };
         let (core, process_key) = (self.core(), self.process_key());
+        let port = self.guest_local_address.map_or(0, |address| address.port());
+        // A mirrored connection's local address is its host socket's; a published one's is the
+        // guest's own. A mirrored connection's SO_REUSEADDR is the one its host socket took from
+        // the listener as the host connected it, which a later change of the listener's misses.
+        let local_address_of = |host: &Socket| {
+            if core.mirrored() {
+                host.local_address()
+            } else {
+                Ok(SocketAddrV4::new(GUEST_IPV4_ADDRESS, port))
+            }
+        };
+        let reuse_address_of = |host: &Socket| {
+            if core.mirrored() {
+                host.reuse_address()
+            } else {
+                Ok(options.reuse_address)
+            }
+        };
         core.charge_socket(process_key)?;
+        // Resets a client unseen, and tells whether the accept goes on to the next client. One
+        // that stops early announces READ again for the clients it left.
         let mut refused = 0;
-        let (host, peer) = loop {
+        let mut refuse = |host: &Socket| {
+            let _ = host.set_linger_zero();
+            refused += 1;
+            refused < MAX_RESETS_AT_ONCE
+        };
+        let admitted = loop {
             let error = match listener.accept() {
-                // A client from outside the allowed sources is reset unseen. An accept that stops
-                // early announces READ again for the clients it left.
-                Ok((host, peer)) if !admits(&core.tcp_sources, peer) => {
-                    let _ = host.set_linger_zero();
-                    refused += 1;
-                    if refused < MAX_RESETS_AT_ONCE {
+                // A client from outside the allowed sources is refused.
+                Ok((host, peer))
+                    if !sources_contain(&core.tcp_sources, core.guest_client(peer)) =>
+                {
+                    if refuse(&host) {
                         continue;
                     }
-                    core.release_socket_charge(process_key);
-                    super::republish_own_readiness(self, self.own() | ReadinessFlags::READ);
-                    return Err(BrokerError::WouldBlock);
+                    break None;
                 }
-                Ok((host, peer)) => match apply_tcp_options(&host, options) {
-                    Ok(()) => break (host, peer),
-                    // The client reset since the accept (Windows reports it here).
-                    Err(Errno::NOTCONN | Errno::CONNRESET | Errno::CONNABORTED) => continue,
-                    Err(error) => error,
-                },
+                Ok((host, peer)) => {
+                    let accepted = apply_tcp_options(&host, options)
+                        .and_then(|()| local_address_of(&host))
+                        .and_then(|local_address| Ok((local_address, reuse_address_of(&host)?)));
+                    match accepted {
+                        Ok((local_address, reuse_address)) if !core.mirrored() => {
+                            break Some((host, peer, local_address, reuse_address, None));
+                        }
+                        // A mirrored connection names its pair of addresses before the guest can
+                        // use it. One whose pair an in-memory connection holds already is refused:
+                        // the host knows nothing of that connection, so a client's host socket
+                        // that shares the port of one of its ends can connect it again.
+                        Ok((local_address, reuse_address)) => {
+                            let named = self
+                                .topology()
+                                .tcp
+                                .mirrored_pairs
+                                .try_insert_host(local_address, peer);
+                            match named {
+                                Ok(connection @ Some(_)) => {
+                                    break Some((
+                                        host,
+                                        peer,
+                                        local_address,
+                                        reuse_address,
+                                        connection,
+                                    ));
+                                }
+                                Ok(None) => {
+                                    if refuse(&host) {
+                                        continue;
+                                    }
+                                    break None;
+                                }
+                                Err(error) => {
+                                    let _ = host.set_linger_zero();
+                                    core.release_socket_charge(process_key);
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        // The client reset since the accept (Windows reports it here).
+                        Err(Errno::NOTCONN | Errno::CONNRESET | Errno::CONNABORTED) => continue,
+                        Err(error) => error,
+                    }
+                }
                 // Windows reports a client that reset before the accept to it.
                 Err(Errno::INTR | Errno::CONNABORTED | Errno::CONNRESET) => continue,
                 Err(error) => error,
@@ -2122,23 +3218,37 @@ impl SocketEntry<'_> {
             }
             return socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
         };
+        let Some((host, peer, local_address, reuse_address, host_connection)) = admitted else {
+            core.release_socket_charge(process_key);
+            super::republish_own_readiness(self, self.own() | ReadinessFlags::READ);
+            return Err(BrokerError::WouldBlock);
+        };
         // With the last waiting connection taken, READ goes. Windows reports the next one only once
         // the listener is watched again, as an accept that would block does.
-        let id = self.id();
+        let token = if core.mirrored() {
+            listener_token(self.id())
+        } else {
+            self.id()
+        };
         if let TcpDescriptor::Listener(listener) = &mut self.tcp_state_mut()?.descriptor
             && listener.stream_readable() == Ok(false)
-            && core.poller.modify(listener, id, Interest::Stream).is_ok()
+            && core
+                .poller
+                .modify(listener, token, Interest::Stream)
+                .is_ok()
         {
             clear_readiness(self, ReadinessFlags::READ);
         }
-        let port = self.guest_local_address.map_or(0, |address| address.port());
-        let local_address = SocketAddrV4::new(GUEST_IPV4_ADDRESS, port);
         state.closed = false;
         state.connection_status = SocketConnectionStatus::Connected;
         state.guest_local_address = Some(local_address);
         let tcp = state.tcp_state_mut()?;
         tcp.descriptor = TcpDescriptor::ExternalInet(host);
-        tcp.options = options;
+        tcp.options = TcpOptions {
+            reuse_address,
+            ..options
+        };
+        tcp.host_connection = host_connection;
         core.register(accepted)?;
         accepted.inbox.lock().set_own(ReadinessFlags::WRITE);
         // Adding the socket to the poller reports the data that arrived before.
@@ -2146,7 +3256,7 @@ impl SocketEntry<'_> {
         core.watch_host_socket(host, accepted.id, Interest::Stream)?;
         Ok(SocketOutcome::Completed(AcceptedEndpoints {
             local_address,
-            guest_source_lease: GuestSourceLease::external(guest_visible_client(peer)),
+            guest_source_lease: GuestSourceLease::external(core.guest_client(peer)),
         }))
     }
 
@@ -2160,6 +3270,9 @@ impl SocketEntry<'_> {
             }
             if let Some(listener) = topology.tcp.listeners.remove(&id) {
                 topology.discard_listener_queue(listener.queue);
+            }
+            if self.core().mirrored() {
+                self.stop_mirrored_listener(false);
             }
             self.unlink_guest_endpoint(&mut topology);
             topology.release_socket(self.process_key());
@@ -2187,8 +3300,12 @@ impl SocketEntry<'_> {
                 drop(end);
                 core.hook(HookPoint::EndpointClosed(id));
             }
+            TcpDescriptor::Bound(socket) => drop(socket),
             TcpDescriptor::Unrealized => {}
         }
+        // The port stays held while another holder of it remains.
+        tcp.port_share = None;
+        tcp.host_connection = None;
     }
 
     /// Detaches a retiring internal endpoint from its connection, posting a
@@ -2255,6 +3372,7 @@ pub(super) fn status_tcp_socket(
     if query_socket_error && let Some(error) = take_socket_error(socket)? {
         fail_with_taken_error(socket, error)?;
     }
+    adopt_host_local_address(socket);
     let pending_guest_reset = guest_reset_pending(socket)?;
     let status = socket.connection_status;
     let local_address = socket.guest_local_address;
@@ -2288,6 +3406,36 @@ pub(super) fn status_tcp_socket(
         socket.inbox().publish();
     }
     Ok(response)
+}
+
+/// Gives a mirrored socket that connected from the wildcard address the local address its host
+/// socket connected from, once the host reports one.
+fn adopt_host_local_address(socket: &mut SocketEntry<'_>) {
+    if !socket.core().mirrored()
+        || !socket
+            .guest_local_address
+            .is_some_and(|address| address.ip().is_unspecified())
+    {
+        return;
+    }
+    let observed = socket
+        .tcp_state()
+        .and_then(|tcp| tcp.descriptor.socket())
+        .map(Socket::local_address);
+    if let Ok(Ok(address)) = observed
+        && !address.ip().is_unspecified()
+    {
+        socket.guest_local_address = Some(address);
+    }
+}
+
+/// The failure of a connect that could not learn what it needed of the host, which leaves the
+/// socket as it was.
+fn rejected_from_errno(error: Errno) -> PlatformConnectError {
+    match socket_operation_error_from_errno(error) {
+        Ok(error) => PlatformConnectError::Rejected(error),
+        Err(error) => PlatformConnectError::PeerUnchanged(error),
+    }
 }
 
 fn take_socket_error(socket: &SocketEntry<'_>) -> BrokerResult<Option<Errno>> {
@@ -2370,7 +3518,9 @@ impl super::ProviderCore {
             let descriptor = socket.call(|socket| {
                 Ok(match socket.tcp_state()?.descriptor {
                     TcpDescriptor::Unrealized => &mut counts.0,
-                    TcpDescriptor::ExternalInet(_) | TcpDescriptor::Listener(_) => &mut counts.1,
+                    TcpDescriptor::Bound(_)
+                    | TcpDescriptor::ExternalInet(_)
+                    | TcpDescriptor::Listener(_) => &mut counts.1,
                     TcpDescriptor::Internal(_) => &mut counts.2,
                 })
             });
@@ -2389,7 +3539,7 @@ impl super::ProviderCore {
             .and_then(std::sync::Weak::upgrade)
             .unwrap();
         socket
-            .call(|socket| handle_socket_event(socket, events))
+            .call(|socket| handle_socket_event(socket, id, events))
             .unwrap();
     }
 
