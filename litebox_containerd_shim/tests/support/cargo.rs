@@ -31,6 +31,7 @@ pub(crate) fn build_programs(backend: Backend, destination: &Path) -> (PathBuf, 
     let guest_service = build_static_guest_service();
     let (program, runner) = match backend {
         Backend::Userland => build_broker_and_runner(&target),
+        #[cfg(target_os = "linux")]
         Backend::Vm => build_vm_kernel_and_runner(&target),
     };
     std::fs::create_dir_all(destination).unwrap();
@@ -45,6 +46,7 @@ pub(crate) fn build_programs(backend: Backend, destination: &Path) -> (PathBuf, 
 /// The flags of a build: the caller's, with these added; or none, so that the configuration's apply.
 enum RustFlags<'a> {
     Added(&'a [&'a str]),
+    #[cfg(target_os = "linux")]
     Configured,
 }
 
@@ -58,6 +60,9 @@ fn cargo_build(dir: &str, args: &[&str], target_dir: &Path, rustflags: RustFlags
         .arg("--target-dir")
         .arg(target_dir)
         .current_dir(workspace_root().join(dir));
+    #[cfg(windows)]
+    let RustFlags::Added(rustflags) = rustflags;
+    #[cfg(target_os = "linux")]
     let rustflags = match rustflags {
         RustFlags::Added(rustflags) => rustflags,
         RustFlags::Configured => {
@@ -91,35 +96,52 @@ fn cargo_build(dir: &str, args: &[&str], target_dir: &Path, rustflags: RustFlags
     );
 }
 
-/// Builds the guest service static for the host's glibc target, in a target directory of its own
-/// so that its flags keep the workspace's build cache, and returns its path.
+/// A separate target directory isolates the static-link flags. On Windows, musl with `rust-lld`
+/// avoids a Linux link toolchain.
 fn build_static_guest_service() -> PathBuf {
-    let target = format!("{}-unknown-linux-gnu", std::env::consts::ARCH);
+    #[cfg(target_os = "linux")]
+    let (libc, rustflags) = ("gnu", ["-C", "target-feature=+crt-static"].as_slice());
+    #[cfg(windows)]
+    let (libc, rustflags) = (
+        "musl",
+        [
+            "-C",
+            "linker=rust-lld",
+            "-C",
+            "linker-flavor=ld.lld",
+            "-C",
+            "target-feature=+crt-static",
+        ]
+        .as_slice(),
+    );
+    let target = format!("{}-unknown-linux-{libc}", std::env::consts::ARCH);
     let dir = target_dir().join("static-guest-service");
     let args = ["-p", "litebox_guest_service", "--target", &target];
-    let rustflags = RustFlags::Added(&["-C", "target-feature=+crt-static"]);
-    cargo_build("", &args, &dir, rustflags);
+    cargo_build("", &args, &dir, RustFlags::Added(rustflags));
     dir.join(&target).join("debug/litebox-guest-service")
 }
 
-/// Builds the broker and LiteBox's Linux runner, and returns their paths.
 fn build_broker_and_runner(target: &Path) -> (PathBuf, PathBuf) {
-    let args = [
-        "-p",
-        "litebox_broker_userland",
-        "-p",
-        "litebox_runner_linux_userland",
-    ];
-    cargo_build("", &args, target, RustFlags::Added(&[]));
-    let debug = target.join("debug");
-    (
-        debug.join("litebox-broker-userland"),
-        debug.join("litebox_runner_linux_userland"),
-    )
+    #[cfg(target_os = "linux")]
+    let runner = "litebox_runner_linux_userland";
+    #[cfg(windows)]
+    let runner = "litebox_runner_linux_on_windows_userland";
+    cargo_build(
+        "",
+        &["-p", "litebox_broker_userland", "-p", runner],
+        target,
+        RustFlags::Added(&[]),
+    );
+    let executable = |name: &str| {
+        let suffix = std::env::consts::EXE_SUFFIX;
+        target.join("debug").join(format!("{name}{suffix}"))
+    };
+    (executable("litebox-broker-userland"), executable(runner))
 }
 
 /// Builds the VM kernel and the VM's Linux runner, as `dev_tools/run_linux_on_vm_userland.sh`
 /// does; returns their paths.
+#[cfg(target_os = "linux")]
 fn build_vm_kernel_and_runner(target: &Path) -> (PathBuf, PathBuf) {
     const TARGET: &str = "x86_64-unknown-none";
     let args = ["--target", TARGET];

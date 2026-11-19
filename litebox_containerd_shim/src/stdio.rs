@@ -2,15 +2,27 @@
 // Licensed under the MIT license.
 
 //! A process's standard streams: the host ends that containerd names, `binary://` logging
-//! programs, and the threads that copy between the host ends and the guest service.
+//! programs (Unix only), and the threads that copy between the host ends and the guest service.
 
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+#[cfg(unix)]
+use std::io::Write as _;
+use std::io::{self, Read as _};
+#[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -22,30 +34,32 @@ use litebox_guest_service_protocol::guest_service::{
     CloseStdinRequest, ReadStreamRequest, WriteStreamRequest,
 };
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
+#[cfg(unix)]
 use rustix::event::{PollFd, PollFlags, Timespec};
 use url::Url;
 
+#[cfg(windows)]
+use self::windows::Output;
 use crate::{Result, internal, unsupported};
 
 /// The most bytes one read carries.
 const CHUNK: u32 = 64 * 1024;
 
+/// How often a waiting input checks whether to end.
+const INPUT_POLL: Duration = Duration::from_millis(100);
+
 /// How long a blocked write to a host end waits before it checks again whether to give up.
-const WRITE_POLL: Timespec = Timespec {
-    tv_sec: 1,
-    tv_nsec: 0,
-};
+const WRITE_POLL: Duration = Duration::from_secs(1);
 
 /// How long a logging program may take to exit once its inputs end, before `SIGTERM`.
+#[cfg(unix)]
 const LOGGER_GRACE: Duration = Duration::from_secs(1);
 /// How long it may take to exit after `SIGTERM`, before `SIGKILL`: containerd's.
+#[cfg(unix)]
 const LOGGER_TERM_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// Opens the host end that `uri` names: a FIFO (a path, or `fifo://`), or for an output a
-/// regular file (`file://`, percent-decoded as containerd does) to append to, whose missing
-/// directories are created as runc's shim creates them; `None` for none. A FIFO is opened
-/// read-write, so that opening it never blocks, and an input ends only with `CloseIO`, as with
-/// runc; and non-blocking, so that a write to it can give up (see [`write_all`]).
+/// A Unix FIFO is opened read-write to avoid blocking; stdin needs `CloseIO` to get EOF.
+/// Windows named-pipe stdin also reaches EOF when containerd closes its end.
 fn open(uri: &str, input: bool) -> Result<Option<File>> {
     let (path, fifo) = match uri.split_once("://") {
         _ if uri.is_empty() => return Ok(None),
@@ -56,26 +70,61 @@ fn open(uri: &str, input: bool) -> Result<Option<File>> {
     };
     let mut options = OpenOptions::new();
     if fifo {
+        #[cfg(unix)]
         options
             .read(true)
             .write(true)
             .custom_flags(libc::O_NONBLOCK);
+        #[cfg(windows)]
+        options.read(input).write(!input);
     } else {
         if let Some(parent) = path.parent() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o755)
-                .create(parent)
-                .map_err(|error| {
-                    internal(format!("cannot create {}: {error}", parent.display()))
-                })?;
+            let mut directories = std::fs::DirBuilder::new();
+            directories.recursive(true);
+            #[cfg(unix)]
+            directories.mode(0o755);
+            directories.create(parent).map_err(|error| {
+                internal(format!("cannot create {}: {error}", parent.display()))
+            })?;
         }
-        options.append(true).create(true).mode(0o644);
+        options.append(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o644);
     }
-    let file = options
-        .open(&path)
-        .map_err(|error| internal(format!("cannot open {}: {error}", path.display())))?;
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OVERLAPPED, SECURITY_IDENTIFICATION,
+        };
+        options.security_qos_flags(SECURITY_IDENTIFICATION);
+        if !input {
+            options.custom_flags(FILE_FLAG_OVERLAPPED);
+        }
+    }
+    #[cfg(unix)]
+    let file = options.open(&path);
+    #[cfg(windows)]
+    let file = if fifo {
+        self::windows::open_pipe(&options, &path)
+    } else {
+        options.open(&path)
+    };
+    let file =
+        file.map_err(|error| internal(format!("cannot open {}: {error}", path.display())))?;
     Ok(Some(file))
+}
+
+fn open_output(uri: &str) -> Result<Option<Output>> {
+    let Some(file) = open(uri, false)? else {
+        return Ok(None);
+    };
+    #[cfg(unix)]
+    let output: io::Result<Output> = Ok(Output(file));
+    #[cfg(windows)]
+    let output = Output::new(file);
+    output
+        .map(Some)
+        .map_err(|error| internal(format!("cannot open {uri}: {error}")))
 }
 
 /// The URI `uri`, which must have no host, and its percent-decoded path.
@@ -86,10 +135,26 @@ fn parse(uri: &str) -> Result<(Url, PathBuf)> {
     Ok((url, path))
 }
 
-/// The host ends of a process's streams: stdin, stdout and stderr.
+#[cfg(unix)]
+struct Output(File);
+
+#[cfg(unix)]
+impl Output {
+    fn write_all(&self, data: &[u8], deleted: &AtomicBool) -> io::Result<()> {
+        write_all(&self.0, data, deleted)
+    }
+}
+
+#[derive(Default)]
+pub struct Ends {
+    stdin: Option<File>,
+    stdout: Option<Output>,
+    stderr: Option<Output>,
+}
+
 pub struct Host {
-    pub files: [Option<File>; 3],
-    /// After `files`, so that its inputs end before it is reaped.
+    pub ends: Ends,
+    /// After `ends`, so that its inputs end before it is reaped.
     pub logger: Option<Logger>,
 }
 
@@ -101,32 +166,54 @@ impl Host {
         let stdin = open(&io.stdin, true)?;
         if io.stdout.starts_with("binary://") {
             let (logger, stdout, stderr) = Logger::spawn(&io.stdout, id, namespace)?;
+            let ends = Ends {
+                stdin,
+                stdout: Some(stdout),
+                stderr: (!io.terminal).then_some(stderr),
+            };
             return Ok(Self {
-                files: [stdin, Some(stdout), (!io.terminal).then_some(stderr)],
+                ends,
                 logger: Some(logger),
             });
         }
         let stderr = if io.terminal {
             None
         } else {
-            open(&io.stderr, false)?
+            open_output(&io.stderr)?
         };
-        Ok(Self {
-            files: [stdin, open(&io.stdout, false)?, stderr],
-            logger: None,
-        })
+        let ends = Ends {
+            stdin,
+            stdout: open_output(&io.stdout)?,
+            stderr,
+        };
+        Ok(Self { ends, logger: None })
     }
 }
 
 /// A logging program, run as containerd's runc shim runs it: descriptors 3 and 4 read the
 /// process's stdout and stderr, and it closes or writes to 5 once ready. Dropping it reaps it,
 /// as containerd's runc shim ends it: `SIGTERM`, then `SIGKILL`.
+#[cfg(unix)]
 pub struct Logger(Child);
 
+/// Not supported on Windows yet.
+#[cfg(windows)]
+pub enum Logger {}
+
+#[cfg(windows)]
+impl Logger {
+    fn spawn(uri: &str, _id: &str, _namespace: &str) -> Result<(Self, Output, Output)> {
+        Err(unsupported(format!(
+            "the I/O URI {uri:?}: logging programs are not supported on Windows"
+        )))
+    }
+}
+
+#[cfg(unix)]
 impl Logger {
     /// Spawns the logging program of the `binary://` URI `uri`; returns it once it is ready, and
     /// the write ends of its stdout and stderr.
-    fn spawn(uri: &str, id: &str, namespace: &str) -> Result<(Self, File, File)> {
+    fn spawn(uri: &str, id: &str, namespace: &str) -> Result<(Self, Output, Output)> {
         let (url, program) = parse(uri)?;
         let failed = |error: &dyn std::fmt::Display| {
             internal(format!(
@@ -180,12 +267,13 @@ impl Logger {
         }
         Ok((
             logger,
-            OwnedFd::from(stdout_end).into(),
-            OwnedFd::from(stderr_end).into(),
+            Output(OwnedFd::from(stdout_end).into()),
+            Output(OwnedFd::from(stderr_end).into()),
         ))
     }
 }
 
+#[cfg(unix)]
 impl Drop for Logger {
     fn drop(&mut self) {
         let pid = rustix::process::Pid::from_child(&self.0);
@@ -232,7 +320,11 @@ impl Pumps {
     pub fn start(
         client: &Arc<GuestServiceClient>,
         guest_id: &str,
-        [stdin, stdout, stderr]: [Option<File>; 3],
+        Ends {
+            stdin,
+            stdout,
+            stderr,
+        }: Ends,
         terminal: bool,
         closing: Arc<AtomicBool>,
         deleted: Arc<AtomicBool>,
@@ -329,18 +421,12 @@ fn copy_input(
     // Once closing, what is left of what was readable then.
     let mut left: Option<usize> = None;
     while !stop.load(Ordering::SeqCst) {
-        if closing.load(Ordering::SeqCst) {
-            let pending = rustix::io::ioctl_fionread(fifo).unwrap_or(0);
-            if *left.get_or_insert(usize::try_from(pending).unwrap_or(usize::MAX)) == 0 {
-                break;
-            }
+        if closing.load(Ordering::SeqCst) && *left.get_or_insert_with(|| pending(fifo)) == 0 {
+            break;
         }
-        let mut fds = [PollFd::new(fifo, PollFlags::IN)];
-        let timeout = Timespec {
-            tv_sec: 0,
-            tv_nsec: 100_000_000,
-        };
-        let _ = rustix::event::poll(&mut fds, Some(&timeout));
+        if !wait_readable(fifo) {
+            continue;
+        }
         let limit = left.unwrap_or(buffer.len()).min(buffer.len());
         let read = match (&*fifo).read(&mut buffer[..limit]) {
             Ok(0) => break,
@@ -367,6 +453,61 @@ fn copy_input(
     }
 }
 
+/// 0 if unknown.
+#[cfg(unix)]
+fn pending(fifo: &File) -> usize {
+    rustix::io::ioctl_fionread(fifo)
+        .map_or(0, |pending| usize::try_from(pending).unwrap_or(usize::MAX))
+}
+
+#[cfg(windows)]
+fn pending(fifo: &File) -> usize {
+    peek(fifo).unwrap_or(0)
+}
+
+/// Waits up to [`INPUT_POLL`]; then reading is always safe, as the FIFO is non-blocking.
+#[cfg(unix)]
+fn wait_readable(fifo: &File) -> bool {
+    let timeout = Timespec::try_from(INPUT_POLL).expect("the poll interval fits a timespec");
+    let _ = rustix::event::poll(&mut [PollFd::new(fifo, PollFlags::IN)], Some(&timeout));
+    true
+}
+
+/// Peek before reading so blocked stdin can still observe `CloseIO`.
+#[cfg(windows)]
+fn wait_readable(fifo: &File) -> bool {
+    if peek(fifo).is_ok_and(|available| available == 0) {
+        std::thread::sleep(INPUT_POLL);
+        return false;
+    }
+    true
+}
+
+#[cfg(windows)]
+fn peek(pipe: &File) -> io::Result<usize> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let mut available = 0;
+    // SAFETY: the handle is open for as long as `pipe` is borrowed; with no buffer, only
+    // `available` is written, which outlives the call.
+    let peeked = unsafe {
+        PeekNamedPipe(
+            pipe.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &raw mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if peeked == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(usize::try_from(available).unwrap_or(usize::MAX))
+}
+
 /// Copies an output to `sink` until its end, noting it in `activity`; a sink that fails, or
 /// blocks once `deleted` is set, is dropped, and the rest drained, so that the process does not
 /// block.
@@ -374,7 +515,7 @@ fn copy_output(
     client: &GuestServiceClient,
     guest_id: String,
     stderr: bool,
-    mut sink: Option<File>,
+    mut sink: Option<Output>,
     activity: &Mutex<Activity>,
     deleted: &AtomicBool,
 ) {
@@ -394,8 +535,8 @@ fn copy_output(
             break;
         }
         activity.lock().expect("not poisoned").copying += 1;
-        if let Some(file) = &sink
-            && write_all(file, &response.data, deleted).is_err()
+        if let Some(output) = &sink
+            && output.write_all(&response.data, deleted).is_err()
         {
             sink = None;
         }
@@ -407,6 +548,7 @@ fn copy_output(
 
 /// Writes `data` to `file`, waiting without a time limit while a non-blocking `file` is full,
 /// until `deleted` is set (seen within [`WRITE_POLL`]) or its reader hangs up.
+#[cfg(unix)]
 fn write_all(file: &File, mut data: &[u8], deleted: &AtomicBool) -> io::Result<()> {
     while !data.is_empty() {
         match (&*file).write(data) {
@@ -417,14 +559,22 @@ fn write_all(file: &File, mut data: &[u8], deleted: &AtomicBool) -> io::Result<(
                 if deleted.load(Ordering::SeqCst) {
                     return Err(error);
                 }
-                let mut fds = [PollFd::new(file, PollFlags::OUT)];
-                let _ = rustix::event::poll(&mut fds, Some(&WRITE_POLL));
-                if fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP) {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                }
+                wait_writable(file)?;
             }
             Err(error) => return Err(error),
         }
+    }
+    Ok(())
+}
+
+/// Fails once the reader hung up.
+#[cfg(unix)]
+fn wait_writable(file: &File) -> io::Result<()> {
+    let timeout = Timespec::try_from(WRITE_POLL).expect("the poll interval fits a timespec");
+    let mut fds = [PollFd::new(file, PollFlags::OUT)];
+    let _ = rustix::event::poll(&mut fds, Some(&timeout));
+    if fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP) {
+        return Err(io::ErrorKind::BrokenPipe.into());
     }
     Ok(())
 }
@@ -440,8 +590,9 @@ mod tests {
         GuestService, GuestServiceClient, create_guest_service,
     };
 
-    use super::{Logger, Pumps};
+    use super::Pumps;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_child_that_cannot_be_waited_for_is_killed_and_reaped() {
         // Its process's descriptor limit is lowered: only safe with a process to itself.
@@ -465,7 +616,7 @@ mod tests {
         };
         rustix::process::setrlimit(rustix::process::Resource::Nofile, none).unwrap();
         let waited = crate::wait_or_kill(&mut hook, Some(Duration::from_secs(60)));
-        drop(Logger(logger));
+        drop(super::Logger(logger));
         rustix::process::setrlimit(rustix::process::Resource::Nofile, limit).unwrap();
         assert!(waited.is_err());
         for pid in pids {
@@ -496,8 +647,14 @@ mod tests {
 
     #[test]
     fn closing_a_missing_stdin_does_not_wait_for_the_answer() {
-        let dir = tempfile::tempdir().unwrap();
-        let address = format!("unix://{}", dir.path().join("socket").display());
+        #[cfg(unix)]
+        let (_dir, address) = {
+            let dir = tempfile::tempdir().unwrap();
+            let address = format!("unix://{}", dir.path().join("socket").display());
+            (dir, address)
+        };
+        #[cfg(windows)]
+        let address = format!(r"\\.\pipe\litebox-shim-stdio-test-{}", std::process::id());
         let (called, calls) = mpsc::channel();
         let (unblock, blocked) = mpsc::channel();
         let gate = Mutex::new(blocked);
@@ -507,14 +664,23 @@ mod tests {
             .unwrap()
             .register_service(create_guest_service(service));
         server.start().unwrap();
-        let client = ttrpc::Client::connect(&address).unwrap();
+        // On Windows, the server creates its pipe once it runs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let client = loop {
+            match ttrpc::Client::connect(&address) {
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                client => break client.unwrap(),
+            }
+        };
         let client = Arc::new(GuestServiceClient::new(client));
         let (done, returned) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let pumps = Pumps::start(
                 &client,
                 "1",
-                [None, None, None],
+                super::Ends::default(),
                 false,
                 Arc::default(),
                 Arc::default(),

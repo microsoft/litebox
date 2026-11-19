@@ -1,23 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The container's root archive, which the broker serves (`--fs-initial-files`): the image's
-//! directories, symlinks and regular files, the guest service and the file binds, all owned by the
-//! guest user ([`GUEST_ID`]), which every guest process runs as for now.
-//!
-//! The image is one directory: the spec's root, or where the shim mounted containerd's root file
-//! system. Its paths are untrusted: they are read without following symlinks, beneath its root,
-//! and only regular files are read.
+//! Repackages an image for the broker, assigning ownership to the fixed guest user ([`GUEST_ID`]).
+//! Windows requires a tar to preserve Linux metadata. On Unix, directory images are read beneath
+//! their root without following host symlinks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::net::IpAddr;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+#[cfg(unix)]
 use rustix::io::Errno;
 use tar_core::EntryType;
 use tar_core::builder::EntryBuilder;
@@ -33,8 +33,7 @@ pub const GUEST_SERVICE_PATH: &str = "/.litebox/guest-service";
 const NEW_DIRECTORY: Node = Node::Directory { mode: 0o755 };
 /// Bounds the symlinks followed while resolving one path, as Linux does.
 const MAX_SYMLINKS: usize = 40;
-/// Bounds how deep below its root an image's directories nest, and so [`scan`]'s recursion and
-/// the directories it holds open: far beyond real images.
+/// Caps open directories during traversal and parent paths created per tar entry.
 const MAX_IMAGE_DEPTH: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,17 +46,44 @@ enum Node {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Source {
     /// The file at this path in the image.
+    #[cfg(unix)]
     Image(String),
+    Archive {
+        offset: u64,
+        size: u64,
+    },
     /// A host file, the operator's: a bind source or the guest service.
     Host(PathBuf),
     Data(Vec<u8>),
+}
+
+#[derive(Debug)]
+enum Image {
+    #[cfg(unix)]
+    Directory(OwnedFd),
+    Archive(File),
+}
+
+#[cfg(unix)]
+fn host_mode(metadata: &std::fs::Metadata) -> u32 {
+    metadata.mode()
+}
+
+/// Host files on Windows have no execute bit to preserve.
+#[cfg(windows)]
+fn host_mode(metadata: &std::fs::Metadata) -> u32 {
+    if metadata.permissions().readonly() {
+        0o555
+    } else {
+        0o755
+    }
 }
 
 /// The guest's file system, by path relative to `/`.
 #[derive(Debug)]
 pub struct RootFs {
     nodes: BTreeMap<String, Node>,
-    image: OwnedFd,
+    image: Image,
     /// The directory binds, read-only, which the broker serves (`--mount-ro`), at their resolved
     /// destinations: relative to `/` while `build` runs, absolute once it returns.
     pub binds: Vec<Bind>,
@@ -90,23 +116,31 @@ fn components(path: &str) -> impl DoubleEndedIterator<Item = &str> {
         .filter(|component| !component.is_empty() && *component != ".")
 }
 
+fn check_depth(path: &str) -> Result<()> {
+    if components(path).count() > MAX_IMAGE_DEPTH {
+        return Err(unsupported(format!(
+            "the image's directories are nested deeper than {MAX_IMAGE_DEPTH} levels"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn errno(what: &str) -> impl Fn(Errno) -> crate::ttrpc::Error + '_ {
     move |error| internal(format!("{what}: {error}"))
 }
 
 /// Opens the directory `name` in `directory`, never through a symlink.
+#[cfg(unix)]
 fn open_directory(directory: &OwnedFd, name: &str) -> rustix::io::Result<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     rustix::fs::openat(directory, name, flags, Mode::empty())
 }
 
 /// Indexes the image's directory `directory`, at `path`, and below it.
+#[cfg(unix)]
 fn scan(nodes: &mut BTreeMap<String, Node>, path: &str, directory: &OwnedFd) -> Result<()> {
-    if components(path).count() > MAX_IMAGE_DEPTH {
-        return Err(unsupported(format!(
-            "the image's directories are nested deeper than {MAX_IMAGE_DEPTH} levels"
-        )));
-    }
+    check_depth(path)?;
     let failed = errno("cannot read the image");
     let entries = match rustix::fs::Dir::read_from(directory) {
         Err(Errno::ACCESS) => return Ok(()),
@@ -166,15 +200,219 @@ fn scan(nodes: &mut BTreeMap<String, Node>, path: &str, directory: &OwnedFd) -> 
     Ok(())
 }
 
+fn open_image(path: &Path, nodes: &mut BTreeMap<String, Node>) -> Result<Image> {
+    #[cfg(unix)]
+    if std::fs::metadata(path)
+        .map_err(|error| internal(format!("cannot read the image {}: {error}", path.display())))?
+        .is_dir()
+    {
+        return open_image_directory(path, nodes);
+    }
+    let archive = open_archive(path)?;
+    scan_archive(nodes, &archive)?;
+    Ok(Image::Archive(archive))
+}
+
+fn open_archive(path: &Path) -> Result<File> {
+    let failed =
+        |error: io::Error| internal(format!("cannot read the image {}: {error}", path.display()));
+    let archive = open_host(path).map_err(failed)?;
+    let metadata = archive.metadata().map_err(failed)?;
+    #[cfg(windows)]
+    if metadata.is_dir() {
+        return Err(unsupported(format!(
+            "the image {} is a directory, whose files lost their Linux modes and symlinks on \
+             Windows: use a tar archive of the image instead",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(failed(io::Error::other("not a regular file")));
+    }
+    Ok(archive)
+}
+
+/// For a path the spec names: it never waits for a FIFO's writer (Unix), nor lets a pipe server
+/// impersonate the shim (Windows).
+fn open_host(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, SECURITY_IDENTIFICATION,
+        };
+        options
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .security_qos_flags(SECURITY_IDENTIFICATION);
+    }
+    options.open(path)
+}
+
+fn host_metadata(path: &Path) -> io::Result<std::fs::Metadata> {
+    #[cfg(unix)]
+    return std::fs::metadata(path);
+    #[cfg(windows)]
+    return open_host(path)?.metadata();
+}
+
+#[cfg(unix)]
+fn open_image_directory(path: &Path, nodes: &mut BTreeMap<String, Node>) -> Result<Image> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let directory = rustix::fs::open(path, flags, Mode::empty())
+        .map_err(errno(&format!("cannot read the image {}", path.display())))?;
+    scan(nodes, "", &directory)?;
+    Ok(Image::Directory(directory))
+}
+
+fn unreadable(error: impl std::fmt::Display) -> crate::ttrpc::Error {
+    internal(format!("cannot read the image's archive: {error}"))
+}
+
+/// Does not follow symlink parents or resolve forward hard links.
+fn scan_archive(nodes: &mut BTreeMap<String, Node>, archive: &File) -> Result<()> {
+    // The tar crate ends quietly where a truncated archive ends.
+    let length = archive.metadata().map_err(unreadable)?.len();
+    let mut entries = tar::Archive::new(archive);
+    for entry in entries.entries_with_seek().map_err(unreadable)? {
+        add(nodes, &entry.map_err(unreadable)?, length)?;
+    }
+    Ok(())
+}
+
+fn add(
+    nodes: &mut BTreeMap<String, Node>,
+    entry: &tar::Entry<'_, impl Read>,
+    length: u64,
+) -> Result<()> {
+    let raw = entry.path_bytes();
+    let Some(path) = std::str::from_utf8(&raw).ok().and_then(normalize) else {
+        let raw = String::from_utf8_lossy(&raw);
+        log::warn!("left {raw:?} out of the root archive: it is not UTF-8, or leaves the root");
+        return Ok(());
+    };
+    let Some(top) = components(&path).next() else {
+        return Ok(());
+    };
+    if SERVED_PATHS.iter().any(|served| served[1..] == *top) {
+        nodes.insert(top.to_owned(), NEW_DIRECTORY);
+        return Ok(());
+    }
+    let header = entry.header();
+    let directory = if header.entry_type().is_dir() {
+        path.as_str()
+    } else {
+        parent(&path)
+    };
+    check_depth(directory)?;
+    let mode = header.mode().map_err(unreadable)? & 0o777;
+    let link_name = || {
+        let name = entry.link_name_bytes()?.into_owned();
+        String::from_utf8(name).ok()
+    };
+    let node = match header.entry_type() {
+        // The unprivileged guest user needs to traverse directories owned by root in the image.
+        tar::EntryType::Directory => Ok(Node::Directory { mode: mode | 0o700 }),
+        tar::EntryType::Regular | tar::EntryType::Continuous => {
+            let (offset, size) = (entry.raw_file_position(), entry.size());
+            // A PAX header sets `size` to any `u64`.
+            if offset.checked_add(size).is_none_or(|end| end > length) {
+                return Err(unreadable("it is truncated"));
+            }
+            let source = Source::Archive { offset, size };
+            Ok(Node::File { source, mode })
+        }
+        tar::EntryType::Symlink => link_name()
+            .map(Node::Symlink)
+            .ok_or_else(|| "its target is not UTF-8".to_owned()),
+        tar::EntryType::Link => link_name()
+            .as_deref()
+            .and_then(normalize)
+            .and_then(|target| nodes.get(&target))
+            .filter(|node| matches!(node, Node::File { .. } | Node::Symlink(_)))
+            .cloned()
+            .ok_or_else(|| "it links to no earlier file".to_owned()),
+        tar::EntryType::XGlobalHeader => return Ok(()),
+        other => Err(format!("it is a {other:?} entry")),
+    };
+    match node {
+        Ok(node) if create_parents(nodes, &path) => {
+            let replaces_directory = matches!(nodes.get(&path), Some(Node::Directory { .. }));
+            if replaces_directory && !matches!(node, Node::Directory { .. }) {
+                nodes.retain(|key, _| !is_at_or_below(key, &path));
+            }
+            nodes.insert(path, node);
+        }
+        Ok(_) => {}
+        Err(why) => {
+            // Unsupported entries still shadow earlier entries.
+            log::warn!("left {path:?} out of the root archive: {why}");
+            nodes.retain(|key, _| !is_at_or_below(key, &path));
+        }
+    }
+    Ok(())
+}
+
+fn create_parents(nodes: &mut BTreeMap<String, Node>, path: &str) -> bool {
+    let mut directory = String::new();
+    for component in components(parent(path)) {
+        directory = join(&directory, component);
+        if !matches!(
+            nodes.entry(directory.clone()).or_insert(NEW_DIRECTORY),
+            Node::Directory { .. }
+        ) {
+            log::warn!("left {path:?} out of the root archive: {directory:?} is no directory");
+            return false;
+        }
+    }
+    true
+}
+
+fn normalize(path: &str) -> Option<String> {
+    let mut normalized: Vec<&str> = Vec::new();
+    for component in components(path) {
+        if component == ".." {
+            return None;
+        }
+        normalized.push(component);
+    }
+    Some(normalized.join("/"))
+}
+
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(unix)]
+    return std::os::unix::fs::FileExt::read_at(file, buffer, offset);
+    #[cfg(windows)]
+    return std::os::windows::fs::FileExt::seek_read(file, buffer, offset);
+}
+
+struct Slice<'file> {
+    file: &'file File,
+    offset: u64,
+    left: u64,
+}
+
+impl Read for Slice<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let length = usize::try_from(self.left).map_or(buffer.len(), |left| left.min(buffer.len()));
+        if length == 0 {
+            return Ok(0);
+        }
+        let read = read_at(self.file, &mut buffer[..length], self.offset)?;
+        self.offset += read as u64;
+        self.left -= read as u64;
+        Ok(read)
+    }
+}
+
 impl RootFs {
-    /// The guest's file system: the image in the directory `image`, the guest service, the spec's
-    /// `binds`, and the working directory `cwd`, which is created as runc creates it.
+    /// `cwd` is created as runc creates it.
     pub fn build(image: &Path, guest_service: &Path, binds: &[Bind], cwd: &str) -> Result<Self> {
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-        let image = rustix::fs::open(image, flags, Mode::empty())
-            .map_err(errno(&format!("cannot read the image {}", image.display())))?;
         let mut nodes = BTreeMap::new();
-        scan(&mut nodes, "", &image)?;
+        let image = open_image(image, &mut nodes)?;
         let mut fs = Self {
             nodes,
             image,
@@ -287,7 +525,7 @@ impl RootFs {
     /// still gives the bound content.
     fn bind(&mut self, bind: &Bind) -> Result<()> {
         let at = &bind.destination;
-        let metadata = std::fs::metadata(&bind.source).map_err(|error| {
+        let metadata = host_metadata(&bind.source).map_err(|error| {
             invalid(format!(
                 "cannot inspect the source of the bind at {at}: {error}"
             ))
@@ -339,9 +577,12 @@ impl RootFs {
             self.create_directories(parent(&resolved))?;
             let resolv_conf = self.resolve("/etc/resolv.conf", false);
             let source = if resolv_conf.is_ok_and(|path| path == resolved) {
-                let content = std::fs::read(&bind.source).map_err(|error| {
-                    internal(format!("cannot read {}: {error}", bind.source.display()))
-                })?;
+                let mut content = Vec::new();
+                open_host(&bind.source)
+                    .and_then(|mut file| file.read_to_end(&mut content))
+                    .map_err(|error| {
+                        internal(format!("cannot read {}: {error}", bind.source.display()))
+                    })?;
                 let fallback =
                     || std::fs::read("/run/systemd/resolve/resolv.conf").unwrap_or_default();
                 Source::Data(rewrite_resolv_conf(&content, fallback))
@@ -349,7 +590,7 @@ impl RootFs {
                 Source::Host(bind.source.clone())
             };
             // A read-only bind's copy has no write permission.
-            let mode = metadata.mode() & if bind.read_only { 0o555 } else { 0o777 };
+            let mode = host_mode(&metadata) & if bind.read_only { 0o555 } else { 0o777 };
             self.nodes.insert(resolved, Node::File { source, mode });
         } else {
             return Err(unsupported(format!(
@@ -359,23 +600,41 @@ impl RootFs {
         Ok(())
     }
 
-    /// Opens a file's content: an image file beneath the image's root, never through a symlink,
-    /// and only if it is a regular file. Returns it with its size.
+    /// An image directory's file is opened beneath its root, never through a symlink, and only if
+    /// it is a regular file. Returns it with its size.
     fn open<'a>(&'a self, source: &'a Source) -> io::Result<(Box<dyn Read + 'a>, u64)> {
         let file = match source {
             Source::Data(data) => return Ok((Box::new(data.as_slice()), data.len() as u64)),
-            Source::Host(path) => File::open(path)?,
+            Source::Archive { offset, size } => {
+                #[cfg(unix)]
+                let Image::Archive(file) = &self.image else {
+                    return Err(io::Error::other("the image is no archive"));
+                };
+                #[cfg(windows)]
+                let Image::Archive(file) = &self.image;
+                let slice = Slice {
+                    file,
+                    offset: *offset,
+                    left: *size,
+                };
+                return Ok((Box::new(slice), *size));
+            }
+            Source::Host(path) => open_host(path)?,
+            #[cfg(unix)]
             Source::Image(path) => {
+                let Image::Directory(image) = &self.image else {
+                    return Err(io::Error::other("the image is no directory"));
+                };
                 let (parents, name) = path.rsplit_once('/').unwrap_or(("", path));
                 let mut directory = None;
                 for component in components(parents) {
                     let flags =
                         OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-                    let at = directory.as_ref().unwrap_or(&self.image);
+                    let at = directory.as_ref().unwrap_or(image);
                     directory = Some(rustix::fs::openat(at, component, flags, Mode::empty())?);
                 }
                 let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-                let at = directory.as_ref().unwrap_or(&self.image);
+                let at = directory.as_ref().unwrap_or(image);
                 File::from(rustix::fs::openat(at, name, flags, Mode::empty())?)
             }
         };
@@ -391,28 +650,46 @@ impl RootFs {
     pub fn write_archive(&self, output: &Path) -> Result<File> {
         let failed =
             |error: io::Error| internal(format!("cannot write {}: {error}", output.display()));
-        // Never through a symlink: the broker's user may own the directory. The daemon's alone,
-        // whatever the umask, until granted.
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(output)
-            .map_err(failed)?;
+        // Never through a symlink: the broker's user may own the directory.
+        let mut options = File::options();
+        options.read(true).write(true).create_new(true);
+        // The daemon's alone, whatever the umask, until granted.
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(output).map_err(failed)?;
         let mut writer = BufWriter::new(file);
+        // An image's hard links write their content once, under the first name; the broker still
+        // gives each name an inode of its own, with its target's mode.
+        let mut payloads = HashMap::new();
         for (path, node) in &self.nodes {
             let mut entry = EntryBuilder::new_gnu();
             entry.path(path);
             let empty = || Box::new(io::empty());
-            let (entry_type, mode, content, size): (_, _, Box<dyn Read>, _) = match node {
-                Node::Directory { mode } => (EntryType::Directory, *mode, empty(), 0),
-                Node::Symlink(target) => {
+            let payload = match node {
+                Node::File {
+                    source: Source::Archive { offset, .. },
+                    mode,
+                } => Some((*offset, *mode)),
+                _ => None,
+            };
+            let first = payload.and_then(|payload| payloads.get(&payload).copied());
+            let (entry_type, mode, content, size): (_, _, Box<dyn Read>, _) = match (node, first) {
+                (Node::Directory { mode }, _) => (EntryType::Directory, *mode, empty(), 0),
+                (Node::Symlink(target), _) => {
                     entry.link_name(target);
                     (EntryType::Symlink, 0o777, empty(), 0)
                 }
-                Node::File { source, mode } => match self.open(source) {
-                    Ok((content, size)) => (EntryType::Regular, *mode, content, size),
+                (Node::File { mode, .. }, Some(first)) => {
+                    entry.link_name(first);
+                    (EntryType::Link, *mode, empty(), 0)
+                }
+                (Node::File { source, mode }, None) => match self.open(source) {
+                    Ok((content, size)) => {
+                        if let Some(payload) = payload {
+                            payloads.insert(payload, path.as_str());
+                        }
+                        (EntryType::Regular, *mode, content, size)
+                    }
                     // The host's files, the guest service and file binds, are no image's to lose.
                     Err(error) if matches!(source, Source::Host(_)) => {
                         return Err(internal(format!("cannot archive {path:?}: {error}")));
@@ -510,8 +787,11 @@ fn rewrite_resolv_conf(content: &[u8], fallback: impl FnOnce() -> Vec<u8>) -> Ve
 
 #[cfg(test)]
 mod tests {
+    use tar_core::parse::{Limits, ParseEvent, Parser};
+
     use super::*;
 
+    #[cfg(unix)]
     fn files(root: &Path, paths: &[&str]) {
         for path in paths {
             std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
@@ -526,10 +806,127 @@ mod tests {
         }
     }
 
+    type Entry = (String, EntryType, u32, Option<String>, Vec<u8>);
+
+    fn entry(path: &str, entry_type: EntryType, mode: u32, content: &[u8]) -> Entry {
+        (path.to_owned(), entry_type, mode, None, content.to_vec())
+    }
+
+    fn link(path: &str, entry_type: EntryType, target: &str) -> Entry {
+        (
+            path.to_owned(),
+            entry_type,
+            0o777,
+            Some(target.to_owned()),
+            Vec::new(),
+        )
+    }
+
+    fn archive(entries: &[Entry]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for (path, entry_type, mode, target, content) in entries {
+            let mut builder = EntryBuilder::new_gnu();
+            builder.path(path).entry_type(*entry_type);
+            if let Some(target) = target {
+                builder.link_name(target);
+            }
+            let size = content.len() as u64;
+            append(&mut data, &mut builder, *mode, Box::new(&content[..]), size).unwrap();
+        }
+        data.extend_from_slice(&[0; 1024]);
+        data
+    }
+
+    fn entries(data: &[u8]) -> Vec<Entry> {
+        let (mut parser, mut offset, mut entries) = (Parser::new(Limits::default()), 0, Vec::new());
+        while let ParseEvent::Entry { consumed, entry } = parser.parse(&data[offset..]).unwrap() {
+            assert_eq!((entry.uid, entry.gid), (1000, 1000));
+            let text = |bytes: &[u8]| String::from_utf8(bytes.to_vec()).unwrap();
+            let target = entry.link_target.as_deref().map(text);
+            let content = &data[offset + consumed..][..usize::try_from(entry.size).unwrap()];
+            let path = text(&entry.path);
+            entries.push((path, entry.entry_type, entry.mode, target, content.to_vec()));
+            offset += consumed + usize::try_from(entry.size.next_multiple_of(512)).unwrap();
+        }
+        entries
+    }
+
+    #[test]
+    fn an_archive_image_is_taken_as_extracting_it_would_create_it() {
+        use EntryType::{Char, Directory, Link, Regular, Symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image.tar");
+        let passwd = b"root:x:0:0::/root:/bin/sh\n";
+        let image_entries = [
+            entry("./", Directory, 0o755, b""),
+            // The guest user stands in for root (see `scan`).
+            entry("./usr/", Directory, 0o500, b""),
+            entry("./usr/bin/tool", Regular, 0o755, b"tool"),
+            link("bin", Symlink, "usr/bin"),
+            link("usr/bin/again", Link, "./usr/bin/tool"),
+            entry("../escape", Regular, 0o644, b"x"),
+            entry("usr/../../escape", Regular, 0o644, b"x"),
+            entry("dev/null", Char, 0o666, b""),
+            entry("old/gone", Regular, 0o644, b"gone"),
+            entry("old", Regular, 0o600, b"new"),
+            entry("bin/below", Regular, 0o644, b"x"),
+            link("early", Link, "etc/passwd"),
+            entry("etc/passwd", Regular, 0o644, passwd),
+        ];
+        std::fs::write(&image, archive(&image_entries)).unwrap();
+        let guest = dir.path().join("guest");
+        std::fs::write(&guest, "guest").unwrap();
+        let fs = RootFs::build(&image, &guest, &[], "/bin/work").unwrap();
+        assert_eq!(fs.cwd, "/usr/bin/work");
+        assert_eq!(home(&fs.passwd, 0), "/root");
+        let output = dir.path().join("rootfs.tar");
+        fs.write_archive(&output).unwrap();
+        assert_eq!(
+            entries(&std::fs::read(&output).unwrap()),
+            [
+                entry(".litebox", Directory, 0o755, b""),
+                entry(".litebox/guest-service", Regular, 0o755, b"guest"),
+                link("bin", Symlink, "usr/bin"),
+                entry("dev", Directory, 0o755, b""),
+                entry("etc", Directory, 0o755, b""),
+                entry("etc/passwd", Regular, 0o644, passwd),
+                entry("old", Regular, 0o600, b"new"),
+                entry("usr", Directory, 0o700, b""),
+                entry("usr/bin", Directory, 0o755, b""),
+                entry("usr/bin/again", Regular, 0o755, b"tool"),
+                (
+                    "usr/bin/tool".to_owned(),
+                    Link,
+                    0o755,
+                    Some("usr/bin/again".to_owned()),
+                    Vec::new()
+                ),
+                entry("usr/bin/work", Directory, 0o755, b""),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_truncated_archive_image_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (image, guest) = (dir.path().join("image.tar"), dir.path().join("guest"));
+        std::fs::write(&guest, "guest").unwrap();
+        let data = archive(&[entry("file", EntryType::Regular, 0o644, &[1; 1000])]);
+        // Without its end-of-archive marker, it is whole.
+        std::fs::write(&image, &data[..512 + 1024]).unwrap();
+        RootFs::build(&image, &guest, &[], "/").unwrap();
+        // Without some of its content, or of its header, it is not.
+        for length in [512 + 100, 300] {
+            std::fs::write(&image, &data[..length]).unwrap();
+            let built = RootFs::build(&image, &guest, &[], "/");
+            assert_eq!(code(built), crate::ttrpc::Code::INTERNAL, "{length}");
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn the_archive_holds_the_images_directories_symlinks_and_files() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
-        use tar_core::parse::{Limits, ParseEvent, Parser};
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("rootfs");
         let long = format!("usr/{}/f", "d".repeat(100));
@@ -625,6 +1022,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_image_nested_too_deep_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -637,6 +1035,7 @@ mod tests {
         assert_eq!(code(built), crate::ttrpc::Code::UNIMPLEMENTED);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_file_bind_that_cannot_be_read_fails_the_archive() {
         let dir = tempfile::tempdir().unwrap();
@@ -661,6 +1060,7 @@ mod tests {
         assert!(status.message.contains("etc/hosts"), "{status:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn binds_cannot_resolve_to_reserved_paths() {
         let dir = tempfile::tempdir().unwrap();

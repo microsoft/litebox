@@ -24,9 +24,14 @@ retries = 2
 # many of these tests run at once, so that the suite does not overload the machine by itself.
 [test-groups]
 litebox-brokers = { max-threads = 8 }
+litebox-windows-brokers = { max-threads = 2 }
 [[profile.default.overrides]]
 filter = 'package(litebox_containerd_shim) and kind(test)'
 test-group = 'litebox-brokers'
+# Prebuilt Windows fixtures can reach runner startup all at once.
+[[profile.ci.overrides]]
+filter = 'package(litebox_containerd_shim) and binary(=shim_windows)'
+test-group = 'litebox-windows-brokers'
 # On a loaded machine the same runner setup timeout can still make a guest `fork` fail with `EIO`.
 [[profile.ci.overrides]]
 filter = 'package(litebox_containerd_shim) and kind(test)'
