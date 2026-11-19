@@ -7,6 +7,7 @@
 //! elsewhere is up to the backend.
 
 use alloc::borrow::Cow;
+use alloc::vec::Vec;
 use core::any::Any;
 
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
@@ -92,6 +93,23 @@ impl MemoryStorage {
     pub fn new(data: Cow<'static, [u8]>) -> Self {
         Self(data)
     }
+
+    /// Reserve before replacing borrowed storage so a failed allocation leaves it untouched.
+    fn owned_with_capacity(&mut self, len: usize) -> Result<&mut Vec<u8>, StorageError> {
+        match &mut self.0 {
+            Cow::Borrowed(bytes) => {
+                let mut data = Vec::new();
+                data.try_reserve_exact(len.max(bytes.len()))
+                    .map_err(|_| StorageError::NoSpace)?;
+                data.extend_from_slice(bytes);
+                self.0 = Cow::Owned(data);
+            }
+            Cow::Owned(data) => data
+                .try_reserve(len.saturating_sub(data.len()))
+                .map_err(|_| StorageError::NoSpace)?,
+        }
+        Ok(self.0.to_mut())
+    }
 }
 
 impl FileStorage for MemoryStorage {
@@ -126,10 +144,8 @@ impl FileStorageMut for MemoryStorage {
         let mut staged =
             crate::transfer::bounce_buffer(buf.len()).map_err(|_| StorageError::NoSpace)?;
         buf.copy_to_slice_at(0, &mut staged)?;
-        let data = self.0.to_mut();
+        let data = self.owned_with_capacity(end)?;
         if end > data.len() {
-            data.try_reserve(end - data.len())
-                .map_err(|_| StorageError::NoSpace)?;
             data.resize(end, 0);
         }
         data[offset..end].copy_from_slice(&staged);
@@ -139,7 +155,7 @@ impl FileStorageMut for MemoryStorage {
     fn set_len(&mut self, len: usize) -> Result<(), StorageError> {
         match &mut self.0 {
             Cow::Borrowed(data) if len <= data.len() => *data = &data[..len],
-            data => data.to_mut().resize(len, 0),
+            _ => self.owned_with_capacity(len)?.resize(len, 0),
         }
         Ok(())
     }
@@ -154,6 +170,21 @@ impl FileStorageMut for MemoryStorage {
 mod tests {
     use super::*;
     use crate::test_support::FaultingBuffer;
+
+    #[test]
+    fn failed_growth_preserves_borrowed_and_owned_storage() {
+        let initial = b"hello".as_slice();
+        for bytes in [Cow::Borrowed(initial), Cow::Owned(initial.to_vec())] {
+            let mut storage = MemoryStorage::new(bytes);
+            let before = storage.static_bytes();
+            assert!(matches!(
+                storage.set_len_atomically(usize::MAX),
+                Err(StorageError::NoSpace)
+            ));
+            assert_eq!(storage.0.as_ref(), initial);
+            assert_eq!(storage.static_bytes(), before);
+        }
+    }
 
     #[test]
     fn memory_storage_publishes_only_completed_writes() {
