@@ -928,8 +928,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             })?;
         let append_mode = flags.contains(OFlags::APPEND);
         let nonblocking = flags.contains(OFlags::NONBLOCK);
-        let entry = |handle, seek_behavior, grants| ResolverEntry {
+        let entry = |handle, file_type, seek_behavior, grants| ResolverEntry {
             handle,
+            file_type,
             grants,
             instance: Arc::clone(&self.instance),
             _backend: core::marker::PhantomData,
@@ -1022,6 +1023,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 };
                 Ok(entry(
                     Handle::Dir(handle),
+                    FileType::Directory,
                     SeekBehavior::NonSeekable,
                     grants,
                 ))
@@ -1081,6 +1083,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                         return Err(OpenError::AccessNotAllowed);
                     }
                 }
+                let file_type = file.file_type;
                 let (file, grants) = match &context {
                     Context::Legacy(_) => (self.backend.open_file(file, flags)?, None),
                     Context::Credentialed(context) => {
@@ -1123,7 +1126,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     }
                 };
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(entry(Handle::File(file), seek_behavior, grants))
+                Ok(entry(Handle::File(file), file_type, seek_behavior, grants))
             }
             Resolution::MissingFinal { parent } if flags.contains(OFlags::CREAT) => {
                 let Some(name) = components.last() else {
@@ -1173,7 +1176,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     }
                 };
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(entry(Handle::File(file), seek_behavior, grants))
+                Ok(entry(
+                    Handle::File(file),
+                    FileType::RegularFile,
+                    seek_behavior,
+                    grants,
+                ))
             }
             Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
         }
@@ -2555,6 +2563,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 /// entry may operate on it, even if another resolver uses the same backend type or policy.
 pub struct ResolverEntry<Backend: super::backend::Backend> {
     handle: Handle,
+    file_type: FileType,
     /// What the handle may do with its object's descriptor rights, for an entry that a resolver
     /// built with [`Resolver::with_credentials`] opened.
     grants: Option<HandleGrants>,
@@ -2589,9 +2598,8 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
         self.path_only
     }
 
-    /// Whether the entry refers to a directory.
-    pub(crate) fn is_directory(&self) -> bool {
-        matches!(self.handle, Handle::Dir(_))
+    pub(crate) const fn file_type(&self) -> FileType {
+        self.file_type
     }
 
     /// What the handle may do with its object's descriptor rights: its operation mask, the rights

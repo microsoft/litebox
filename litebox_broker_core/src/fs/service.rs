@@ -18,7 +18,6 @@ use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
-use super::OFlags;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
@@ -26,6 +25,7 @@ use super::errors::{
 };
 use super::resolver::{Caller, Resolver, ResolverEntry};
 use super::shared_storage::{SharedFileMapping, SharedMapping};
+use super::{FileType, OFlags};
 use crate::descriptor::Rights;
 use crate::descriptor::profile::FileSystemProfile;
 use crate::object::{HandleOperations, ObjectEntry, ObjectRights};
@@ -69,7 +69,7 @@ fn with_file_subject<T>(
 #[derive(Clone)]
 pub struct File {
     state: Arc<dyn OpenFile>,
-    is_directory: bool,
+    kind: FileType,
     /// The issuing service's trusted policy, including when a different service holds the file.
     pub(crate) profile: Option<FileSystemProfile>,
     /// Directions and descriptor operations compatible with this immutable open, independent
@@ -131,12 +131,15 @@ impl File {
             .watch(registration)
     }
 
-    /// Returns this file's readiness, if its reads or writes can fail with `WouldBlock`.
-    pub(crate) fn readiness(&self) -> Result<ReadinessFlags> {
-        self.readiness
-            .as_ref()
-            .map(|source| source.readiness())
-            .ok_or(BrokerError::InvalidRights)
+    /// Samples readiness without querying metadata or granting access to the data.
+    pub(crate) fn readiness(&self) -> ReadinessFlags {
+        match &self.readiness {
+            Some(source) => source.readiness(),
+            None if self.kind == FileType::RegularFile => {
+                ReadinessFlags::READ | ReadinessFlags::WRITE
+            }
+            None => ReadinessFlags::WRITE,
+        }
     }
 }
 
@@ -315,7 +318,7 @@ where
         Ok(Ok(File {
             profile: self.profile(),
             operations,
-            is_directory: entry.is_directory(),
+            kind: entry.file_type(),
             state: Arc::new(ResolverFile {
                 entry: RwLock::new(entry),
                 resolver: self,
@@ -435,7 +438,7 @@ fn file_operations<B: super::backend::Backend>(entry: &ResolverEntry<B>) -> Hand
     );
     if !entry.is_path_only() {
         ops |= Op::LOCK | Op::SET_FLAGS | Op::SEEK;
-        if entry.is_directory() {
+        if entry.file_type() == FileType::Directory {
             ops.set(Op::LIST, entry.allows_read() && permits(Rights::LIST));
         } else {
             ops.set(
@@ -866,6 +869,13 @@ pub fn truncate(
     }
 }
 
+/// Checks a reference's eligibility for a mapping without allocating or exporting shared storage.
+/// Hosts without a delivery mechanism must still check this before reporting an unsupported
+/// mapping: a client may then copy the file using separately authorized reads.
+pub fn check_mapping(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<()>> {
+    Ok(file_for_read(process, handle, ReadOperation::Mapping)?.map(|_| ()))
+}
+
 /// Returns the right to map the host shared object holding a broker-owned open file's contents,
 /// so that the caller can map the file `MAP_SHARED`, and the ID naming it for futexes.
 ///
@@ -1218,6 +1228,10 @@ fn file_for_read(
         ReadOperation::Mapping => HandleOperations::MAP | HandleOperations::READ,
     };
     match file(process, handle, required) {
+        // Legacy references can carry MAP even for a directory, a path-only open, or a
+        // write-only open. Check the open itself before authorizing a mapping fallback.
+        Ok(file) if matches!(op, ReadOperation::Mapping) && !file.operations.contains(required) => {
+        }
         Ok(file) => return Ok(Ok(file)),
         Err(BrokerError::InvalidRights) => {}
         Err(error) => return Err(error),
@@ -1229,10 +1243,15 @@ fn file_for_read(
     let path_only = status.flags.contains(FileOpenFlags::PATH);
     let error = match op {
         ReadOperation::Mapping if path_only => FileError::PathOnly,
-        ReadOperation::Mapping if file.is_directory => FileError::IsDirectory,
-        ReadOperation::Data if !path_only && file.is_directory => FileError::NotFile,
+        ReadOperation::Mapping if status.access == FileAccessMode::WriteOnly => {
+            FileError::NotForReading
+        }
+        ReadOperation::Mapping if file.kind == FileType::Directory => FileError::IsDirectory,
+        ReadOperation::Data if !path_only && file.kind == FileType::Directory => FileError::NotFile,
         ReadOperation::Directory
-            if !path_only && !file.is_directory && status.access != FileAccessMode::WriteOnly =>
+            if !path_only
+                && file.kind != FileType::Directory
+                && status.access != FileAccessMode::WriteOnly =>
         {
             FileError::NotDirectory
         }
@@ -1448,7 +1467,7 @@ fn file_rmdir_error(error: RmdirError) -> FileError {
 fn file_read_directory_error(error: ReadDirError) -> FileError {
     match error {
         ReadDirError::NotADirectory => FileError::NotDirectory,
-        ReadDirError::NotOpenForReading => FileError::PathOnly,
+        ReadDirError::NotOpenForReading => FileError::AccessNotAllowed,
         ReadDirError::ClosedFd | ReadDirError::Io => FileError::Io,
     }
 }

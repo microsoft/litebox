@@ -644,8 +644,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     /// process mapping it shares its pages. Each call delivers a new handle to the object, which
     /// covers the file's bytes up to `end`.
     ///
-    /// Fails with [`SharedObjectError::Unsupported`] if `platform` cannot map shared objects or the
-    /// broker cannot share this file's pages with this process.
+    /// [`SharedObjectError::Unsupported`] means the reference permits a readable mapping, but
+    /// the pages cannot be shared. A caller may instead copy the contents through checked reads.
     pub fn request_shared_object<Provider, const ALIGN: usize>(
         &self,
         platform: &Provider,
@@ -792,8 +792,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable for Fi
     fn check_io_events(&self) -> Events {
         match self.broker.check_readiness(self.handle) {
             Ok(readiness) => readiness_events(readiness),
-            // Files that never wait, such as regular files, have no readiness.
-            Err(BrokerControlError::Broker(ErrorCode::InvalidRights)) => Events::OUT,
             Err(_) => Events::ERR,
         }
     }

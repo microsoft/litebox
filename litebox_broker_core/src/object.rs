@@ -235,7 +235,7 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
         let object = object.read();
         match &*object {
             ObjectEntry::Event(event) => return Ok(event.readiness()),
-            ObjectEntry::File(file) => return file.readiness(),
+            ObjectEntry::File(file) => return Ok(file.readiness()),
             ObjectEntry::UnixSocket(socket) => return Ok(socket.readiness()),
             ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
             ObjectEntry::Signals(signals) => return Ok(signals.readiness()),

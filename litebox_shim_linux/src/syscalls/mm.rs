@@ -277,6 +277,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             {
                 Ok(object) if wants_write && !object.may_write => Err(Errno::EACCES),
                 Ok(object) => Ok(Some(object)),
+                // Unsupported is reported only for a reference that permits a readable
+                // mapping. Copy through checked reads; querying metadata is a separate right.
+                Err(SharedObjectError::Unsupported) if !wants_write => Ok(None),
                 Err(
                     error @ (SharedObjectError::IsDirectory
                     | SharedObjectError::Unsupported
@@ -285,8 +288,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 ) => {
                     if refused_access(file.access_mode()?.ok_or(Errno::EBADF)?) {
                         Err(Errno::EACCES)
-                    } else if matches!(error, SharedObjectError::Unsupported) && !wants_write {
-                        Ok(None)
                     } else {
                         Err(error.into())
                     }

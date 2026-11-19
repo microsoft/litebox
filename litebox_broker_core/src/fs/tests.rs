@@ -5341,20 +5341,20 @@ mod credentials {
         assert_eq!(limit.live(), 0);
     }
 
-    #[test]
-    fn queryable_handles_report_open_kind_without_granting_io() {
-        use crate::readiness::{ReadinessSink, tests::TestReadinessSink};
+    fn handle_test_process(
+        fs: Resolver<TestPlatform, Composer<TestPlatform>>,
+    ) -> (
+        Arc<crate::BrokerProcess>,
+        litebox_broker_protocol::ObjectHandle,
+    ) {
         use crate::test_support::TestBrokerBuilder;
-        use crate::{BrokerError, CallerCredential, HandleOperations, ObjectRights, PolicyEngine};
-        use litebox_broker_protocol::fs::{
-            FileAccessMode, FileCaller, FileError, FileOpenFlags, FileSeekWhence,
-        };
+        use crate::{CallerCredential, ObjectRights, PolicyEngine};
 
         let carol = Credentials::new(CAROL);
         let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
-        .with_file_service(Arc::new(with_devices(device_security())))
+        .with_file_service(Arc::new(fs))
         .build()
         .unwrap();
         let process = broker
@@ -5371,6 +5371,18 @@ mod credentials {
             .unwrap();
         process.complete_start().unwrap();
         let subject = process.create_subject(carol.subject).unwrap();
+        (process, subject)
+    }
+
+    #[test]
+    fn queryable_handles_report_open_kind_without_granting_io() {
+        use crate::readiness::{ReadinessSink, tests::TestReadinessSink};
+        use crate::{BrokerError, HandleOperations, ObjectRights};
+        use litebox_broker_protocol::fs::{
+            FileAccessMode, FileCaller, FileError, FileOpenFlags, FileSeekWhence,
+        };
+
+        let (process, subject) = handle_test_process(with_devices(device_security()));
         let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
         let open = |path, flags| {
             crate::fs::open(
@@ -5412,7 +5424,9 @@ mod credentials {
         let query_dir = restrict(dir, HandleOperations::QUERY);
         assert_eq!(rewind(query_dir), Err(BrokerError::InvalidRights));
         assert_eq!(list(query_dir), Err(BrokerError::InvalidRights));
+        assert_eq!(read(query_dir), Ok(Err(FileError::NotFile)));
         let query_file = restrict(regular, HandleOperations::QUERY);
+        assert_eq!(list(query_file), Ok(Err(FileError::NotDirectory)));
         assert_eq!(read(query_file), Err(BrokerError::InvalidRights));
         assert_eq!(map(query_file), Err(BrokerError::InvalidRights));
         for handle in [path, dir, regular] {
@@ -5421,6 +5435,94 @@ mod credentials {
             assert_eq!(read(wait), Err(BrokerError::InvalidRights));
             assert_eq!(list(wait), Err(BrokerError::InvalidRights));
         }
+    }
+
+    #[test]
+    fn mapping_polling_and_listing_use_their_own_rights() {
+        use crate::descriptor::Rights;
+        use crate::readiness::{ReadinessSink, tests::TestReadinessSink};
+        use crate::stdio::StdioStream;
+        use crate::{BrokerError, HandleOperations as Op, ObjectRights};
+        use litebox_broker_protocol::fs::{FileAccessMode, FileCaller, FileError, FileOpenFlags};
+        use litebox_broker_protocol::readiness::ReadinessFlags as Ready;
+
+        let (owner, group) = owners(posix(CAROL));
+        let stdio = Arc::new(TestStdioProvider::default().with_terminal(StdioStream::Stdin));
+        let (process, subject) = handle_test_process(with_stdio(
+            DeviceSecurity::posix(owner, group, owner, group),
+            profile_with(HandleRules::LINUX_FILE, checked_at_use(Rights::empty())),
+            Arc::clone(&stdio),
+        ));
+        let caller = FileCaller::Subject(subject);
+        let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+        let open = |path, flags| {
+            crate::fs::open(
+                &process,
+                path,
+                caller,
+                FileAccessMode::ReadOnly,
+                flags,
+                Mode::RUSR,
+                &sink,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let restrict = |handle, operations| {
+            process
+                .duplicate_object_operations_to(handle, &process, ObjectRights::WAIT, operations)
+                .unwrap()
+        };
+
+        let file = open("/file", FileOpenFlags::CREATE);
+        let readable_mapping = restrict(file, Op::READ | Op::MAP);
+        assert_eq!(
+            process.get_status_flags(readable_mapping),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(
+            crate::fs::check_mapping(&process, readable_mapping),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            crate::fs::map_shared(&process, readable_mapping).map(|r| r.map(|_| ())),
+            Ok(Err(FileError::NoSuchDevice))
+        );
+        for ops in [Op::READ, Op::MAP] {
+            assert_eq!(
+                crate::fs::check_mapping(&process, restrict(file, ops)),
+                Err(BrokerError::InvalidRights)
+            );
+        }
+
+        assert_eq!(
+            process.check_readiness(restrict(file, Op::WAIT)),
+            Ok(Ready::READ | Ready::WRITE)
+        );
+        assert_eq!(
+            process.check_readiness(readable_mapping),
+            Err(BrokerError::InvalidRights)
+        );
+        let terminal = restrict(open("/dev/stdin", FileOpenFlags::NONE), Op::WAIT);
+        assert_eq!(
+            process.get_status_flags(terminal),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(process.check_readiness(terminal), Ok(Ready::WRITE));
+        stdio.push_terminal_input(b"x");
+        assert_eq!(
+            process.check_readiness(terminal),
+            Ok(Ready::READ | Ready::WRITE)
+        );
+
+        crate::fs::mkdir(&process, "/unlisted", caller, Mode::XUSR)
+            .unwrap()
+            .unwrap();
+        let dir = restrict(open("/unlisted", FileOpenFlags::NONE), Op::LIST);
+        assert_eq!(
+            crate::fs::read_directory_as(&process, dir, Some(subject)),
+            Ok(Err(FileError::AccessNotAllowed))
+        );
     }
 
     #[test]
