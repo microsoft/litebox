@@ -3,10 +3,8 @@
 
 //! An implementation of [`HostInterface`] for LVBS
 
-use crate::{
-    Errno, HostInterface, arch::ioport::serial_print_string,
-    host::per_cpu_variables::with_per_cpu_variables,
-};
+use crate::{Errno, HostInterface, host::per_cpu_variables::with_per_cpu_variables};
+use core::fmt::Write as _;
 use digest::Digest;
 use litebox_common_lvbs::PRK_LEN;
 use rand_core::{RngCore, SeedableRng};
@@ -355,7 +353,9 @@ impl HostInterface for HostLvbsInterface {
     }
 
     fn log(msg: &str) {
-        serial_print_string(msg);
+        crate::crash_log::crash_logger()
+            .write_str(msg)
+            .expect("Failed to write log");
     }
 
     fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {
