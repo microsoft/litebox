@@ -671,7 +671,12 @@ impl Backend for Devices {
         Err(RenameError::ReadOnlyFileSystem)
     }
 
-    fn rmdir_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        _dir: ResolvedDir<'_>,
+        _name: &str,
+        _may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
         Err(RmdirError::ReadOnlyFileSystem)
     }
 

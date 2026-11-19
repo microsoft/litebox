@@ -108,6 +108,11 @@ enum BackingEntry {
     Directory { pinned: bool },
 }
 
+pub(super) enum RmdirCheck<'a> {
+    UseParent(ResolvedDir<'a>),
+    Rewalk(Result<(), RmdirError>),
+}
+
 impl Mount {
     fn pin(&self, path: &Arc<[String]>) {
         let mut points = self.points.lock();
@@ -574,19 +579,19 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         &'a self,
         parent: ResolvedDir<'a>,
         name: &str,
-    ) -> Result<Option<ResolvedDir<'a>>, RmdirError> {
+    ) -> Result<RmdirCheck<'a>, RmdirError> {
         let ComposerWalkingDirHandleInner::Mounted {
             path, mount_index, ..
         } = &parent.get_typed::<Self>().inner
         else {
-            return Ok(Some(parent));
+            return Ok(RmdirCheck::UseParent(parent));
         };
         let mount = self.mount_at(*mount_index).expect("initialized mount");
         let pins = mount.live_directory_pins();
         let path = self.checked_child_path(path.clone(), name, RmdirError::ReadOnlyFileSystem)?;
         let path_pinned = mount.protects(&path);
         if pins.is_empty() && !path_pinned {
-            return Ok(Some(parent));
+            return Ok(RmdirCheck::UseParent(parent));
         }
         let ComposerWalkingDirHandleInner::Mounted {
             target: ResolvedTarget::Dir(handle),
@@ -599,9 +604,9 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
             Ok(BackingEntry::Missing) => Err(PathError::NoSuchFileOrDirectory.into()),
             Ok(BackingEntry::File) => Err(RmdirError::NotADirectory),
             Ok(BackingEntry::Directory { pinned }) if path_pinned || pinned => {
-                Err(RmdirError::Busy)
+                Ok(RmdirCheck::Rewalk(Err(RmdirError::Busy)))
             }
-            Ok(BackingEntry::Directory { .. }) => Ok(None),
+            Ok(BackingEntry::Directory { .. }) => Ok(RmdirCheck::Rewalk(Ok(()))),
             Err(WalkError::PathError(e)) => Err(RmdirError::PathError(e)),
             Err(WalkError::Io) => Err(RmdirError::Io),
         }
@@ -1277,7 +1282,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         }
     }
 
-    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
             ComposerWalkingDirHandleInner::Virtual { .. } => Err(RmdirError::ReadOnlyFileSystem),
@@ -1290,8 +1300,9 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     unreachable!()
                 };
                 let path = self.checked_child_path(path, name, RmdirError::ReadOnlyFileSystem)?;
-                self.check_backing_mount(mount_index, &path, RmdirError::Busy)?;
-                self.backend(mount_index).rmdir_at(handle, name)
+                let may_remove = may_remove
+                    .and_then(|()| self.check_backing_mount(mount_index, &path, RmdirError::Busy));
+                self.backend(mount_index).rmdir_at(handle, name, may_remove)
             }
         }
     }
@@ -1364,6 +1375,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     let source = lookup(&old_handle, old_name)?;
                     if matches!(source, BackingEntry::Missing) {
                         may_move = Err(PathError::NoSuchFileOrDirectory.into());
+                    } else if matches!(source, BackingEntry::Directory { .. })
+                        && new_path.starts_with(&old_path)
+                    {
+                        // The destination parent is inside the source, independently of
+                        // the destination leaf or a server's ability to validate a veto.
+                        may_move = Err(RenameError::InvalidArgument);
                     } else {
                         let destination = lookup(&new_handle, new_name)?;
                         if old_pinned
@@ -1375,6 +1392,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                             // Backends validate before honoring this veto; don't attempt a
                             // mutation to discover errors enforced only by the host or server.
                             may_move = Err(match (source, destination) {
+                                (
+                                    BackingEntry::Directory { .. },
+                                    BackingEntry::Directory { .. },
+                                ) if old_path.starts_with(&new_path) => RenameError::NotEmpty,
                                 (BackingEntry::File, BackingEntry::Directory { .. }) => {
                                     RenameError::IsADirectory
                                 }
@@ -1663,7 +1684,7 @@ mod tests {
             .mount("/host/child", InMem::<TestPlatform>::new)
             .unwrap();
         let host = composer.backend(0);
-        host.rmdir_at(host.root().unwrap(), "host").unwrap();
+        host.rmdir_at(host.root().unwrap(), "host", Ok(())).unwrap();
 
         let virtual_status = || {
             let Resolution::Found(target) = composer

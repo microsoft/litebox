@@ -414,6 +414,29 @@ fn test_nine_p_unlink_and_rmdir() {
 }
 
 #[test]
+fn private_mount_preserves_9p_directory_ancestry_errors() {
+    use crate::fs::{UserInfo, composer::Composer, errors::RenameError};
+    let server = DiodServer::start();
+    std::fs::create_dir_all(server.export_path().join("p/child")).unwrap();
+    let fs = Resolver::<TestPlatform, _>::new(
+        Composer::<TestPlatform>::builder()
+            .mount("/", |ids| attach(server.connect(), &server, ids))
+            .build()
+            .unwrap(),
+    );
+    let private = fs.copy_mount_view().unwrap();
+    private.mount_in_mem(UserInfo::ROOT, "/p").unwrap();
+    assert!(matches!(
+        fs.rename(USER, "/p", "/p/new"),
+        Err(RenameError::InvalidArgument)
+    ));
+    assert!(matches!(
+        fs.rename(USER, "/p/child", "/p"),
+        Err(RenameError::NotEmpty)
+    ));
+}
+
+#[test]
 fn tremove_fallback_preserves_entries_of_the_wrong_kind() {
     let server = DiodServer::start();
     std::fs::write(server.export_path().join("file"), b"keep").unwrap();

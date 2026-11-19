@@ -1076,7 +1076,12 @@ impl Backend for LocalFs {
         }
     }
 
-    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
         validate_name(name)?;
         let dir = dir.into_typed::<Self>();
         if !self.valid_dir(&dir) {
@@ -1087,6 +1092,7 @@ impl Backend for LocalFs {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(RmdirError::NotADirectory);
         }
+        may_remove?;
         fs::remove_dir(path).map_err(rmdir_error)
     }
 

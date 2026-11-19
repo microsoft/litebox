@@ -554,7 +554,13 @@ where
         Ok(self.remove_at(&dir.into_typed::<Self>(), name, true)?)
     }
 
-    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        dir: ResolvedDir<'_>,
+        name: &str,
+        may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
+        may_remove?;
         Ok(self.remove_at(&dir.into_typed::<Self>(), name, false)?)
     }
 

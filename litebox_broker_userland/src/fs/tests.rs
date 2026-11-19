@@ -77,6 +77,23 @@ fn private_mount_pins_do_not_bypass_host_directory_search() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn private_mount_does_not_hide_invalid_subtree_rename() {
+    let temp = tempfile::tempdir().unwrap();
+    for dir in ["p", "other"] {
+        fs::create_dir(temp.path().join(dir)).unwrap();
+    }
+    let parent = host_service(temp.path());
+    let child = parent.copy_mount_view().unwrap();
+    child.mount_in_mem("/other", ROOT).unwrap().unwrap();
+    let destination = format!("/p/{}", "x".repeat(256));
+    assert_eq!(
+        parent.rename("/p", &destination, ROOT).unwrap(),
+        Err(FileError::InvalidArgument)
+    );
+}
+
+#[test]
 fn private_mount_guards_its_host_directories_under_other_spellings() {
     let temp = tempfile::tempdir().unwrap();
     for dir in ["Work", "Work/Target", "Work/Other"] {

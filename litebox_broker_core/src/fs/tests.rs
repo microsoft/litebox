@@ -270,6 +270,11 @@ fn private_mount_pins_do_not_hide_earlier_rename_errors() {
         parent.unlink(ROOT, "/pinned"),
         Err(UnlinkError::IsADirectory)
     ));
+    parent.mkdir(ROOT, "/pinned/child", Mode::RWXU).unwrap();
+    assert!(matches!(
+        parent.rmdir(ROOT, "/pinned"),
+        Err(super::errors::RmdirError::NotEmpty)
+    ));
 }
 
 #[test]
@@ -297,6 +302,11 @@ fn private_mount_keeps_overlay_rename_validation() {
     assert!(matches!(
         fs.rename(ROOT, "/pinned", "/pinned/new"),
         Err(RenameError::InvalidArgument)
+    ));
+    fs.mkdir(ROOT, "/pinned/child", Mode::RWXU).unwrap();
+    assert!(matches!(
+        fs.rmdir(ROOT, "/pinned"),
+        Err(super::errors::RmdirError::NotEmpty)
     ));
 }
 
@@ -3509,6 +3519,12 @@ mod devices {
         assert!(matches!(
             child.rename(USER, "/dev/pts", "/dev/moved"),
             Err(crate::fs::errors::RenameError::Busy)
+        ));
+        assert!(matches!(
+            child.rename(USER, "/dev/null/", "/dev/pts"),
+            Err(crate::fs::errors::RenameError::PathError(
+                PathError::ComponentNotADirectory
+            ))
         ));
         assert!(matches!(
             fs.rename(USER, "/dev/missing", "/dev/new"),

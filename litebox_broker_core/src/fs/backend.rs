@@ -245,9 +245,15 @@ pub trait Backend: Send + Sync + Any {
     /// `parent`. An existing directory must be left intact.
     fn unlink_at(&self, parent: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError>;
 
-    /// Remove the directory `name` at `parent`.
+    /// Remove the directory `name` at `parent`. Check `may_remove` after normal
+    /// validation, before mutating the directory or its parent.
     // XXX(jayb): I don't like that unlink and rmdir exist separately, we should probably merge them.
-    fn rmdir_at(&self, parent: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError>;
+    fn rmdir_at(
+        &self,
+        parent: ResolvedDir<'_>,
+        name: &str,
+        may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError>;
 
     /// Atomically move an entry, replacing a compatible destination without following final
     /// symbolic links. Backends must reject directory cycles and preserve open file contents.

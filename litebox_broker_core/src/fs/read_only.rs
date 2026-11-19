@@ -205,7 +205,12 @@ impl<B: Backend> Backend for ReadOnly<B> {
         Err(UnlinkError::ReadOnlyFileSystem)
     }
 
-    fn rmdir_at(&self, _parent: ResolvedDir<'_>, _name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        _parent: ResolvedDir<'_>,
+        _name: &str,
+        _may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
         Err(RmdirError::ReadOnlyFileSystem)
     }
 

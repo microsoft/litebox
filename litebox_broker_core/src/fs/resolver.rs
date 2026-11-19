@@ -14,7 +14,7 @@ use litebox_broker_protocol::fs::FileLockOperation;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::RawSyncPrimitivesProvider;
 
-use super::composer::Composer;
+use super::composer::{Composer, RmdirCheck};
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SeekError, SetTimesError,
@@ -1227,13 +1227,19 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             if matches!(name.as_str(), "." | "..") {
                 return Err(RenameError::Busy);
             }
-            let writable = Self::check_dir_entries_change(
-                &context,
-                &parent,
-                RenameError::ReadOnlyFileSystem,
-                RenameError::NoWritePerms,
-            );
-            let resolver_read_only = matches!(&parent.permissions, PermissionCheck::ByResolver(info) if info.on_read_only_fs);
+            let backend_read_only =
+                matches!(parent.permissions, PermissionCheck::ByReadOnlyBackend);
+            let writable = if backend_read_only {
+                // Preserve backend ordering, including the resolver's ordinary trailing-slash check.
+                Ok(())
+            } else {
+                Self::check_dir_entries_change(
+                    &context,
+                    &parent,
+                    RenameError::ReadOnlyFileSystem,
+                    RenameError::NoWritePerms,
+                )
+            };
             // Own this directory before walking the other parent: walking handles may retain locks.
             let dir = self
                 .backend
@@ -1246,10 +1252,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     }
                     _ => RenameError::Io,
                 })?;
-            Ok((dir, name, writable, resolver_read_only))
+            Ok((dir, name, writable, backend_read_only))
         };
-        let (old_dir, old_name, old_writable, old_resolver_ro) = parent(old_path)?;
-        let (new_dir, new_name, new_writable, new_resolver_ro) = parent(new_path)?;
+        let (old_dir, old_name, old_writable, old_backend_ro) = parent(old_path)?;
+        let (new_dir, new_name, new_writable, new_backend_ro) = parent(new_path)?;
         // A read-only parent rules out mutation, but only the backend can identify a
         // cross-mount rename or a protected name in the current view.
         if [&old_writable, &new_writable]
@@ -1264,9 +1270,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 Err(RenameError::ReadOnlyFileSystem),
             ) {
                 Err(RenameError::CrossDevice) => Err(RenameError::CrossDevice),
-                Err(RenameError::Busy) if !old_resolver_ro && !new_resolver_ro => {
-                    Err(RenameError::Busy)
-                }
                 _ => Err(RenameError::ReadOnlyFileSystem),
             };
         }
@@ -1299,8 +1302,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         old_writable.and(new_writable)?;
         // XXX(jayb): like unlink, rename omits sticky-bit checks and write permission on a moved
         // directory for updating `..`.
+        let may_move = if old_backend_ro || new_backend_ro {
+            Err(RenameError::ReadOnlyFileSystem)
+        } else {
+            Ok(())
+        };
         self.backend
-            .rename_at(old_dir, &old_name, new_dir, &new_name, Ok(()))
+            .rename_at(old_dir, &old_name, new_dir, &new_name, may_move)
     }
 
     /// Create a new directory
@@ -1398,15 +1406,15 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             Ok((parent, name))
         };
         let (parent, name) = authorized_parent()?;
-        let parent = if let Some(composer) = composer {
+        let (parent, may_remove) = if let Some(composer) = composer {
             match composer.check_rmdir_pins(parent, &name)? {
-                Some(parent) => parent,
-                None => authorized_parent()?.0,
+                RmdirCheck::UseParent(parent) => (parent, Ok(())),
+                RmdirCheck::Rewalk(may_remove) => (authorized_parent()?.0, may_remove),
             }
         } else {
-            parent
+            (parent, Ok(()))
         };
-        self.backend.rmdir_at(parent, &name)
+        self.backend.rmdir_at(parent, &name, may_remove)
     }
 
     /// Read directory entries from a directory file descriptor.

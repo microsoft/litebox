@@ -363,7 +363,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             Err(error) => {
                 if let Some(parent) = self.upper.walking_dir_at(upper_dir) {
                     if status.file_type == FileType::Directory {
-                        let _rollback_result = self.upper.rmdir_at(parent, name);
+                        let _rollback_result = self.upper.rmdir_at(parent, name, Ok(()));
                     } else {
                         let _rollback_result = self.upper.unlink_at(parent, name);
                     }
@@ -1453,7 +1453,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 .upper
                 .walking_dir_at(&upper)
                 .ok_or(RmdirError::Io)
-                .and_then(|dir| self.upper.rmdir_at(dir, name));
+                .and_then(|dir| self.upper.rmdir_at(dir, name, Ok(())));
             return Err(error);
         }
 
@@ -1507,7 +1507,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         Ok(())
     }
 
-    fn rmdir_at(&self, dir: ScopedDir<'_>, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(
+        &self,
+        dir: ScopedDir<'_>,
+        name: &str,
+        may_remove: Result<(), RmdirError>,
+    ) -> Result<(), RmdirError> {
         fn open_to_rmdir_error(error: OpenError) -> RmdirError {
             match error {
                 OpenError::PathError(error) => RmdirError::PathError(error),
@@ -1542,6 +1547,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             return Err(RmdirError::NotEmpty);
         }
 
+        may_remove?;
         // As in `unlink_at`, hide the lower directory before removing the upper one.
         let upper = match entry.lower {
             Some(_) => {
@@ -1562,6 +1568,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             if let Err(error) = self.upper.rmdir_at(
                 self.upper.walking_dir_at(&upper).ok_or(RmdirError::Io)?,
                 name,
+                Ok(()),
             ) {
                 for marker in cleared {
                     let _rollback_marker = self.create_marker(&locked, child, &marker);
