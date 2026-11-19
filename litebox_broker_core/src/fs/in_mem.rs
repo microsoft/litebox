@@ -717,6 +717,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         old_name: &str,
         new_dir: super::backend::DirHandle,
         new_name: &str,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         for name in [old_name, new_name] {
             if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
@@ -785,6 +786,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 }
                 _ => {}
             }
+            may_move?;
             let moved = old
                 .children
                 .remove(old_name)

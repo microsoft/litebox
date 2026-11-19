@@ -564,6 +564,7 @@ where
         old_name: &str,
         new_dir: DirHandle,
         new_name: &str,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         if [old_name, new_name].iter().any(|name| {
             name.is_empty() || matches!(*name, "." | "..") || name.contains(['/', '\0'])
@@ -578,6 +579,7 @@ where
                 .walk(&old_dir.fid.fid, &[old_name])?
                 .into_complete_fid()?,
         );
+        may_move?;
         Ok(self
             .client
             .rename(&source.fid, &new_dir.fid.fid, new_name)?)

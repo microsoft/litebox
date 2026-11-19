@@ -1233,6 +1233,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 RenameError::ReadOnlyFileSystem,
                 RenameError::NoWritePerms,
             );
+            let resolver_read_only = matches!(&parent.permissions, PermissionCheck::ByResolver(info) if info.on_read_only_fs);
             // Own this directory before walking the other parent: walking handles may retain locks.
             let dir = self
                 .backend
@@ -1245,23 +1246,27 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     }
                     _ => RenameError::Io,
                 })?;
-            Ok((dir, name, writable))
+            Ok((dir, name, writable, resolver_read_only))
         };
-        let (old_dir, old_name, old_writable) = parent(old_path)?;
-        let (new_dir, new_name, new_writable) = parent(new_path)?;
-        // Linux checks for a cross-mount rename, then for a read-only mount, before looking up
-        // either name. Only the backend knows whether the directories are on different mounts;
-        // asking it relies on every backend that sets `on_read_only_fs` (TarRo, ReadOnly,
-        // Composer virtual directories) refusing the rename without mutating anything.
+        let (old_dir, old_name, old_writable, old_resolver_ro) = parent(old_path)?;
+        let (new_dir, new_name, new_writable, new_resolver_ro) = parent(new_path)?;
+        // A read-only parent rules out mutation, but only the backend can identify a
+        // cross-mount rename or a protected name in the current view.
         if [&old_writable, &new_writable]
             .into_iter()
             .any(|writable| matches!(writable, Err(RenameError::ReadOnlyFileSystem)))
         {
-            return match self
-                .backend
-                .rename_at(old_dir, &old_name, new_dir, &new_name)
-            {
+            return match self.backend.rename_at(
+                old_dir,
+                &old_name,
+                new_dir,
+                &new_name,
+                Err(RenameError::ReadOnlyFileSystem),
+            ) {
                 Err(RenameError::CrossDevice) => Err(RenameError::CrossDevice),
+                Err(RenameError::Busy) if !old_resolver_ro && !new_resolver_ro => {
+                    Err(RenameError::Busy)
+                }
                 _ => Err(RenameError::ReadOnlyFileSystem),
             };
         }
@@ -1295,7 +1300,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         // XXX(jayb): like unlink, rename omits sticky-bit checks and write permission on a moved
         // directory for updating `..`.
         self.backend
-            .rename_at(old_dir, &old_name, new_dir, &new_name)
+            .rename_at(old_dir, &old_name, new_dir, &new_name, Ok(()))
     }
 
     /// Create a new directory

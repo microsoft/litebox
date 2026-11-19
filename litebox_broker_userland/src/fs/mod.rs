@@ -1096,6 +1096,7 @@ impl Backend for LocalFs {
         old_name: &str,
         new_dir: DirHandle,
         new_name: &str,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         validate_name(old_name)?;
         validate_name(new_name)?;
@@ -1129,6 +1130,7 @@ impl Backend for LocalFs {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(rename_error(error)),
         }
+        may_move?;
         fs::rename(old_path, new_path).map_err(rename_error)
     }
 

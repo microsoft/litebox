@@ -252,12 +252,15 @@ pub trait Backend: Send + Sync + Any {
     /// Atomically move an entry, replacing a compatible destination without following final
     /// symbolic links. Backends must reject directory cycles and preserve open file contents.
     /// Directory handles retain the backend's documented object or path-locator semantics.
+    /// Validate the rename normally, then propagate `may_move` before the first mutation.
+    /// This lets a mount view protect an entry without duplicating backend validation.
     fn rename_at(
         &self,
         old_dir: DirHandle,
         old_name: &str,
         new_dir: DirHandle,
         new_name: &str,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError>;
 
     /// Update timestamps after resolver authorization, without following symbolic links.

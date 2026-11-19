@@ -1578,6 +1578,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         old_name: &str,
         new_dir: DirHandle,
         new_name: &str,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         fn open_to_rename_error(error: OpenError) -> RenameError {
             match error {
@@ -1641,7 +1642,8 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                     }
                     // XXX(jayb): a logically empty destination can still hold hidden markers;
                     // handle this by clearing them (with rollback) as Linux overlayfs does.
-                    if let Some(upper) = &child.upper
+                    if may_move.is_ok()
+                        && let Some(upper) = &child.upper
                         && self
                             .upper
                             .list_dir_at(upper.clone())
@@ -1655,6 +1657,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 (false, false) => {}
             }
         }
+        may_move?;
         // Never emulate rename with copy/delete: lower-backed sources and directories with lower
         // contributions at either endpoint cannot be moved atomically.
         if !source.upper
@@ -1679,7 +1682,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 .map_err(open_to_rename_error)?;
         }
         self.upper
-            .rename_at(old_upper, old_name, new_upper, new_name)
+            .rename_at(old_upper, old_name, new_upper, new_name, Ok(()))
     }
 
     fn set_times(

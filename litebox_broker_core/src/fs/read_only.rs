@@ -215,6 +215,7 @@ impl<B: Backend> Backend for ReadOnly<B> {
         _old_name: &str,
         _new_dir: DirHandle,
         _new_name: &str,
+        _may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         Err(RenameError::ReadOnlyFileSystem)
     }

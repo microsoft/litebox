@@ -1302,6 +1302,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         old_name: &str,
         new_dir: DirHandle,
         new_name: &str,
+        mut may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
         if [old_name, new_name].iter().any(|name| {
             name.is_empty() || matches!(*name, "." | "..") || name.contains(['/', '\0'])
@@ -1341,12 +1342,13 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                         old_name,
                         old_handle,
                         new_name,
+                        may_move,
                     );
                 }
                 let pins = mount.live_directory_pins();
                 let old_pinned = mount.protects(&old_path);
                 let new_pinned = mount.protects(&new_path);
-                if old_pinned || new_pinned || !pins.is_empty() {
+                if may_move.is_ok() && (old_pinned || new_pinned || !pins.is_empty()) {
                     let lookup = |handle: &DirHandle, name: &str| {
                         let parent = mount
                             .backend
@@ -1361,31 +1363,32 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     };
                     let source = lookup(&old_handle, old_name)?;
                     if matches!(source, BackingEntry::Missing) {
-                        return Err(PathError::NoSuchFileOrDirectory.into());
-                    }
-                    let destination = lookup(&new_handle, new_name)?;
-                    if old_pinned
-                        || new_pinned
-                        || [source, destination]
-                            .iter()
-                            .any(|e| matches!(e, BackingEntry::Directory { pinned: true }))
-                    {
-                        // Check guest-visible entry types, but don't attempt a backing mutation
-                        // to discover host-only restrictions (e.g. ACLs or nested host mounts).
-                        return Err(match (source, destination) {
-                            (BackingEntry::File, BackingEntry::Directory { .. }) => {
-                                RenameError::IsADirectory
-                            }
-                            (BackingEntry::Directory { .. }, BackingEntry::File) => {
-                                RenameError::NotADirectory
-                            }
-                            _ => RenameError::Busy,
-                        });
+                        may_move = Err(PathError::NoSuchFileOrDirectory.into());
+                    } else {
+                        let destination = lookup(&new_handle, new_name)?;
+                        if old_pinned
+                            || new_pinned
+                            || [source, destination]
+                                .iter()
+                                .any(|e| matches!(e, BackingEntry::Directory { pinned: true }))
+                        {
+                            // Backends validate before honoring this veto; don't attempt a
+                            // mutation to discover errors enforced only by the host or server.
+                            may_move = Err(match (source, destination) {
+                                (BackingEntry::File, BackingEntry::Directory { .. }) => {
+                                    RenameError::IsADirectory
+                                }
+                                (BackingEntry::Directory { .. }, BackingEntry::File) => {
+                                    RenameError::NotADirectory
+                                }
+                                _ => RenameError::Busy,
+                            });
+                        }
                     }
                 }
                 mount
                     .backend
-                    .rename_at(old_handle, old_name, new_handle, new_name)
+                    .rename_at(old_handle, old_name, new_handle, new_name, may_move)
             }
             (ComposerDirHandleInner::Virtual { .. }, ComposerDirHandleInner::Virtual { .. }) => {
                 Err(RenameError::ReadOnlyFileSystem)

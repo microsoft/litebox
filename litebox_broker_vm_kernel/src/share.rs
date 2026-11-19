@@ -295,8 +295,10 @@ impl Backend for ShareFs {
         old_name: &str,
         new_dir: DirHandle,
         new_name: &str,
+        may_move: Result<(), RenameError>,
     ) -> Result<(), RenameError> {
-        self.0.rename_at(old_dir, old_name, new_dir, new_name)
+        self.0
+            .rename_at(old_dir, old_name, new_dir, new_name, may_move)
     }
 
     fn set_times(

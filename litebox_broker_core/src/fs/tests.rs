@@ -255,6 +255,10 @@ fn private_mount_pins_do_not_hide_earlier_rename_errors() {
     ));
     parent.rename(ROOT, "/pinned", "/pinned").unwrap();
     assert!(matches!(
+        parent.rename(ROOT, "/pinned", "/pinned/new"),
+        Err(RenameError::InvalidArgument)
+    ));
+    assert!(matches!(
         parent.rename(ROOT, "/file", "/pinned"),
         Err(RenameError::IsADirectory)
     ));
@@ -265,6 +269,34 @@ fn private_mount_pins_do_not_hide_earlier_rename_errors() {
     assert!(matches!(
         parent.unlink(ROOT, "/pinned"),
         Err(UnlinkError::IsADirectory)
+    ));
+}
+
+#[test]
+fn private_mount_keeps_overlay_rename_validation() {
+    use super::errors::{PathError, RenameError};
+    let fs = Resolver::<TestPlatform, _>::new(
+        super::composer::Composer::<TestPlatform>::builder()
+            .mount_nestable("/", |ids| {
+                Overlay::<TestPlatform>::new(
+                    InMem::<TestPlatform>::new(ids.next()),
+                    TarRo::new(TEST_TAR_FILE.into(), ids.next()),
+                    ids.next(),
+                )
+            })
+            .build()
+            .unwrap(),
+    );
+    fs.mkdir(ROOT, "/pinned", Mode::RWXU).unwrap();
+    let child = fs.copy_mount_view().unwrap();
+    child.mount_in_mem(ROOT, "/pinned").unwrap();
+    assert!(matches!(
+        fs.rename(ROOT, "/missing", "/.litebox-overlay-data"),
+        Err(RenameError::PathError(PathError::InvalidPathname))
+    ));
+    assert!(matches!(
+        fs.rename(ROOT, "/pinned", "/pinned/new"),
+        Err(RenameError::InvalidArgument)
     ));
 }
 
@@ -3474,6 +3506,10 @@ mod devices {
         let fs = devices_fs(Arc::new(TestStdioProvider::default()));
         let child = fs.copy_mount_view().unwrap();
         child.mount_in_mem(super::ROOT, "/dev/pts").unwrap();
+        assert!(matches!(
+            child.rename(USER, "/dev/pts", "/dev/moved"),
+            Err(crate::fs::errors::RenameError::Busy)
+        ));
         assert!(matches!(
             fs.rename(USER, "/dev/missing", "/dev/new"),
             Err(crate::fs::errors::RenameError::ReadOnlyFileSystem)
