@@ -2,9 +2,10 @@
 // Licensed under the MIT license.
 
 //! `AF_VSOCK` connections between the guest and `vsock_hybrid.host.py` over hybrid vsock (host
-//! Unix sockets), which has no half-close: fixed-size messages and full closes only. Listens,
-//! prints `ready`, serves the host's connections in order (see [`main`]), then connects to the
-//! host's ports, and prints `vsock-hybrid ok`.
+//! Unix sockets), which may or may not pass half-closes on (Cloud Hypervisor's does from v53):
+//! fixed-size messages and full closes only. Listens, prints `ready`, serves the host's
+//! connections in order (see [`main`]), then connects to the host's ports, and prints
+//! `vsock-hybrid ok`.
 //!
 //! A Linux program without libc, as Windows hosts have no Linux C toolchain, for x86_64 and
 //! AArch64. Built static, as nothing applies its relocations:
@@ -186,7 +187,7 @@ fn serve_guest_close(listener: i32) {
 }
 
 /// After this end's `SHUT_WR`, signalled on a second connection, the host still sends, and sees
-/// EOF only at the close.
+/// EOF only at the close (or at the `SHUT_WR`, through a bridge that passes half-closes on).
 fn serve_shutdown(listener: i32, signal_listener: i32) {
     let mut buffer = [0; MESSAGE];
     let fd = accept_host(listener);

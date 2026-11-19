@@ -7,9 +7,10 @@
 
 Hybrid vsock, over Unix sockets only: the guest's port P is reached by
 connecting to PATH and sending `CONNECT P\\n` (reply `OK <port>\\n`, or a
-close if refused), and the host's port P is the Unix socket PATH_P. No
-half-close: a message's length tells where it ends, and either side's close
-ends a connection. Once the guest prints `ready` to the run's output file OUTPUT,
+close if refused), and the host's port P is the Unix socket PATH_P. The
+bridge may or may not pass half-closes on (Cloud Hypervisor's does from v53),
+so a message's length tells where it ends, and either side's close ends a
+connection. Once the guest prints `ready` to the run's output file OUTPUT,
 connects to its listeners for vsock.c's scenarios, in order, and once to a
 port nothing listens on, which must be refused; then sends the guest two host
 ports, one listening and one refusing, and serves its connections. Exits 0 if

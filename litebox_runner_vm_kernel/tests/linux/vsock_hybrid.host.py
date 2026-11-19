@@ -9,8 +9,9 @@ Hybrid vsock, over Unix sockets only: the guest's port P is reached by
 connecting to PATH and sending `CONNECT P\\n` (reply `OK <port>\\n`, or a
 close if refused), and the host's port P is the Unix socket PATH_P. Once the
 guest prints `ready` to the run's output file OUTPUT, runs vsock_hybrid.rs's
-scenarios in order, then serves the guest's connects. No half-close. Exits 0
-if all went as expected.
+scenarios in order, then serves the guest's connects. The bridge may or may
+not pass half-closes on (Cloud Hypervisor's does from v53). Exits 0 if all went
+as expected.
 """
 
 import os
@@ -99,8 +100,9 @@ def check_eof(s):
         raise AssertionError(f"{data!r} instead of EOF")
 
 
-def check_open(s):
-    """No data and no EOF yet."""
+def check_open(s, half_closed=False):
+    """No data and no EOF yet; or, if the guest shut down sending
+    (`half_closed`), EOF, from a bridge that passes that on."""
     s.setblocking(False)
     try:
         data = s.recv(1)
@@ -108,6 +110,8 @@ def check_open(s):
         return
     finally:
         s.settimeout(STEP_TIMEOUT)
+    if not data and half_closed:
+        return
     raise AssertionError(f"{data!r} where nothing was sent" if data else "EOF before the close")
 
 
@@ -164,7 +168,7 @@ def guest_shutdown():
     check_data(read_exactly(s, MESSAGE), pattern(MESSAGE))
     # The guest shut down sending before it sent this.
     check_data(read_exactly(signal, len(SHUT)), SHUT)
-    check_open(s)
+    check_open(s, half_closed=True)
     s.sendall(pattern(MESSAGE, MESSAGE))
     check_eof(s)
     s.close()

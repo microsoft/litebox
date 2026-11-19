@@ -3,8 +3,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# Run Linux programs under QEMU with stacked runners:
-# litebox_runner_vm_kernel as the guest kernel and
+# Run Linux programs under QEMU, or Cloud Hypervisor (VMM), with stacked
+# runners: litebox_runner_vm_kernel as the guest kernel and
 # litebox_runner_linux_on_vm_userland as a ring-3 process per guest process.
 # Every litebox_runner_vm_kernel/tests/linux/<name>.c, and each of SHARED,
 # the hosted runner's tests that run here as they are, is compiled three
@@ -23,7 +23,8 @@
 # A test is litebox_runner_vm_kernel/tests/linux/<test>.json, a programs.json
 # of the host test client (dev_tools/guest_service_test_client), which runs
 # its programs through the guest service, booted as litebox.init, over hybrid
-# vsock ($VHOST_DEVICE_VSOCK), in a container whose init is /container_init.
+# vsock (under QEMU, $VHOST_DEVICE_VSOCK's; Cloud Hypervisor has its own), in
+# a container whose init is /container_init.
 # <test>.policy.txt, if any, is the payload's `policy`, an init test's too.
 # <test>.input.txt, if any, is the input of its `console_stdin` runs, sent
 # once a run prints a line `ready`. An entry with `min_reflected_syscalls` or
@@ -49,13 +50,18 @@
 # Runner processes' standard output and error go to a virtio console, backed
 # by a file.
 #
-# Their sockets reach a virtio network device on QEMU's user network,
-# isolated from the host (restrict=on) but for an echo server (cat) at
-# 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
+# Under QEMU, their sockets reach a virtio network device on QEMU's user
+# network, isolated from the host (restrict=on) but for an echo server (cat)
+# at 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host)
+# 10.0.2.1.
 #
-# A fresh host directory per boot, with greeting.txt and the symlinks link.txt
-# (to greeting.txt), self (to .), and abs.txt (to /mnt/host/greeting.txt), is
-# mounted read-only at /mnt/host over virtio-9p (its mount tag).
+# Under QEMU, a fresh host directory per boot, with greeting.txt and the
+# symlinks link.txt (to greeting.txt), self (to .), and abs.txt (to
+# /mnt/host/greeting.txt), is mounted read-only at /mnt/host over virtio-9p
+# (its mount tag).
+#
+# Cloud Hypervisor has neither a user network nor virtio-9p: there, the net
+# and share tests are skipped, and the VM has no network device.
 #
 # With QEMU_SMP above 4, the preempt test is skipped: it checks preemption
 # with 8 CPU-bound programs. With fewer than 2, the smp test is skipped: it
@@ -76,14 +82,19 @@
 #   CC            C compiler with a static and a shared glibc (default: cc)
 #   RUSTC         Rust compiler with the x86_64-unknown-none target (default:
 #                 rustc)
+#   VMM           qemu or cloud-hypervisor (default: qemu)
+#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command, which needs KVM
+#                 (default: cloud-hypervisor)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
-#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
-#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1)
+#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G); for Cloud Hypervisor
+#                 too, as an integer in MiB or suffixed M or G
+#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1); for Cloud
+#                 Hypervisor too
 #   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
-#   VHOST_DEVICE_VSOCK  the vhost-user vsock daemon (default:
+#   VHOST_DEVICE_VSOCK  QEMU's vhost-user vsock daemon (default:
 #                 vhost-device-vsock)
 #   CARGO_BUILD   command that builds the runners, the guest service and the
 #                 test client, run in their directories
@@ -116,39 +127,12 @@ while getopts "t:rvh" opt; do
     esac
 done
 
-# The CPU count in QEMU_SMP $1 (see the header); fails for another form.
-smp_cpus() {
-    local field key value cpus='' maxcpus='' product=1
-    local -a fields
-    IFS=, read -r -a fields <<<"$1"
-    for field in "${fields[@]}"; do
-        key=cpus value=$field
-        [[ $field != *=* ]] || { key=${field%%=*}; value=${field#*=}; }
-        [[ $value =~ ^[1-9][0-9]*$ ]] || return 1
-        case $key in
-            cpus) cpus=$value ;;
-            maxcpus) maxcpus=$value ;;
-            drawers | books | sockets | dies | clusters | modules | cores | threads)
-                product=$((product * value)) ;;
-            *) return 1 ;;
-        esac
-    done
-    echo "${cpus:-${maxcpus:-$product}}"
-}
 smp=$(smp_cpus "$QEMU_SMP") || {
     echo "error: no CPU count in QEMU_SMP=$QEMU_SMP (see the header)" >&2
     exit 2
 }
-
-# QEMU_MEM's size in MiB, or 0 for a form the header does not list.
-mem=${QEMU_MEM%%,*}
-mem=${mem#size=}
-if [[ $mem =~ ^([1-9][0-9]*)([MmGg]?)$ ]]; then
-    mem=${BASH_REMATCH[1]}
-    [[ ${BASH_REMATCH[2]} != [Gg] ]] || mem=$((mem * 1024))
-else
-    mem=0
-fi
+# 0 for a form the header does not list.
+mem=$(mem_mib "$QEMU_MEM")
 
 # The log level of the boots that check the processes' counts (see the header).
 counted_log=debug
@@ -158,13 +142,15 @@ counted_log=debug
 declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writable_root [egress]=/egress
     [console_flood]=/console_flood [lifecycle]=/lifecycle)
 
-# Why test $1 is skipped with these CPUs or this RAM (see the header), if it
-# is.
+# Why test $1 is skipped with these CPUs, this RAM, or this VMM (see the
+# header), if it is.
 skip_reason() {
     case $1 in
         preempt) [[ $smp -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
         smp) [[ $smp -ge 2 ]] || echo "needs threads running at once" ;;
         highmem) [[ $mem -ge 4096 ]] || echo "needs QEMU_MEM of at least 4G, as an integer in MiB or suffixed M or G" ;;
+        net) [[ $VMM == qemu ]] || echo "needs QEMU's user network" ;;
+        share) [[ $VMM == qemu ]] || echo "needs virtio-9p, which only QEMU has" ;;
     esac
 }
 
@@ -186,7 +172,7 @@ client_tests=0
 for t in "${tests[@]}"; do
     [[ -n ${INIT_TESTS[$t]:-} ]] || client_tests=1
 done
-if [[ $client_tests -ne 0 ]] && ! command -v "$VHOST_DEVICE_VSOCK" >/dev/null; then
+if [[ $VMM == qemu && $client_tests -ne 0 ]] && ! command -v "$VHOST_DEVICE_VSOCK" >/dev/null; then
     echo "error: no $VHOST_DEVICE_VSOCK, which the tests with a programs.json need" >&2
     exit 2
 fi
@@ -207,7 +193,7 @@ for f in "$KERNEL" "$USERLAND" "$GUEST_SERVICE" "$CLIENT"; do
 done
 echo "[*] kernel: $KERNEL"
 echo "[*] userland runner: $USERLAND"
-echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU, -smp $QEMU_SMP"
+describe_vm
 
 # Tests that need a dynamic linker (e.g., dlopen), not built static.
 DYNAMIC_ONLY=(dynamic)
@@ -261,19 +247,26 @@ pack_payload() {
 
 # The virtio console for boot $1, backed by a file.
 console_args() {
-    echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
-        -chardev "file,id=con0,path=$WORK/$1.console" \
-        -device virtconsole,chardev=con0,bus=vs0.0
+    case $VMM in
+        qemu)
+            echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
+                -chardev "file,id=con0,path=$WORK/$1.console" \
+                -device virtconsole,chardev=con0,bus=vs0.0
+            ;;
+        cloud-hypervisor) echo --console "file=$WORK/$1.console" ;;
+    esac
 }
 
-# The network device: see the header.
+# The network device, if any: see the header.
 network_args() {
+    [[ $VMM == qemu ]] || return 0
     echo -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.1,restrict=on,guestfwd=tcp:10.0.2.100:7-cmd:cat \
         -device virtio-net-pci,netdev=n0,disable-legacy=on
 }
 
-# The virtio-9p share for boot $1: see the header.
+# The virtio-9p share for boot $1, if any: see the header.
 share_args() {
+    [[ $VMM == qemu ]] || return 0
     mkdir "$WORK/$1.share"
     echo "hello from the host" >"$WORK/$1.share/greeting.txt"
     ln -s greeting.txt "$WORK/$1.share/link.txt"
@@ -426,12 +419,12 @@ boot() {
 # Boots test $test's programs, those of client_args, as boot $1.
 boot_client() {
     : >"$WORK/$1.stdout"
-    start_vsock_daemon "$1"
+    start_vsock "$1"
     [[ ! -f "$TESTS_DIR/$test.input.txt" ]] || client_args+=(--input "$TESTS_DIR/$test.input.txt")
     client=run_clients
     boot "$1" "$WORK/$test.tar"
     client=
-    stop_vsock_daemon
+    stop_vsock
 }
 
 for test in "${tests[@]}"; do

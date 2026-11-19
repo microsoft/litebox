@@ -35,6 +35,7 @@ RUNNER_DIR="$REPO_DIR/litebox_runner_optee_on_qemu"
 TESTS_DIR="$REPO_DIR/litebox_runner_optee_on_linux_userland/tests"
 # shellcheck source=dev_tools/qemu_test_lib.sh
 source "$SCRIPT_DIR/qemu_test_lib.sh"
+[[ $VMM == qemu ]] || { echo "error: this runner boots under QEMU only, not VMM=$VMM" >&2; exit 2; }
 
 tas=()
 profile=debug

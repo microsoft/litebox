@@ -12,6 +12,10 @@ const COM1: u16 = 0x3F8;
 
 const MAX_WAIT_ITERATIONS: u32 = 1_000_000;
 
+/// How many times [`panic_print`] tries to lock the console before it
+/// writes without the lock.
+const MAX_LOCK_ATTEMPTS: u32 = 1_000_000;
+
 struct ComPort {
     data: Port<u8>,
     interrupt_enable: Port<u8>,
@@ -125,12 +129,19 @@ pub fn print_bytes(bytes: &[u8]) {
 }
 
 /// Panic may interrupt a locked or initializing console. Never wait for it
-/// or alias its mutable handle; emergency output may interleave.
+/// for long or alias its mutable handle: waits a while for output in progress
+/// (e.g., another CPU's) to end, then writes anyway, so emergency output may
+/// interleave.
 pub fn panic_print(args: core::fmt::Arguments) {
     use core::fmt::Write;
-    if let Some(mut com) = COM_ONCE.get().and_then(Mutex::try_lock) {
-        let _ = com.write_fmt(args);
-        return;
+    if let Some(com) = COM_ONCE.get() {
+        for _ in 0..MAX_LOCK_ATTEMPTS {
+            if let Some(mut com) = com.try_lock() {
+                let _ = com.write_fmt(args);
+                return;
+            }
+            core::hint::spin_loop();
+        }
     }
     // Assume a UART is present: without one, writes go nowhere and the
     // transmit wait is bounded.

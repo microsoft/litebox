@@ -2,7 +2,7 @@
 name = "litebox_runner_vm_kernel"
 version = "0.1.0"
 edition = "2024"
-description = "LiteBox as the guest kernel of a QEMU VM, hosting ring-3 runner processes"
+description = "LiteBox as the guest kernel of a QEMU or Cloud Hypervisor VM, hosting ring-3 runner processes"
 
 [dependencies]
 arrayvec = { version = "0.7.6", default-features = false }

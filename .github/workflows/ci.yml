@@ -151,6 +151,8 @@ jobs:
     env:
       RUSTFLAGS: -Dwarnings
       VHOST_DEVICE_VSOCK_VERSION: 0.3.0
+      CLOUD_HYPERVISOR_VERSION: v54.1
+      CLOUD_HYPERVISOR_SHA256: f9ffb9646783233d1f0fb09e77db1fca66499d1041e63bc011b90683c0d49933
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -190,6 +192,15 @@ jobs:
             vhost-device-vsock --version "$VHOST_DEVICE_VSOCK_VERSION"
       - name: Put vhost-device-vsock on the PATH
         run: echo "$HOME/vhost-device-vsock/bin" >> "$GITHUB_PATH"
+      - name: Install Cloud Hypervisor
+        # Its static release binary, checked against the pinned digest.
+        run: |
+          mkdir -p ~/cloud-hypervisor
+          curl -fsSL --retry 3 -o ~/cloud-hypervisor/cloud-hypervisor \
+            "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$CLOUD_HYPERVISOR_VERSION/cloud-hypervisor-static"
+          echo "$CLOUD_HYPERVISOR_SHA256  $HOME/cloud-hypervisor/cloud-hypervisor" | sha256sum -c -
+          chmod +x ~/cloud-hypervisor/cloud-hypervisor
+          echo "$HOME/cloud-hypervisor" >> "$GITHUB_PATH"
       - name: Run OP-TEE TAs in a QEMU VM (KVM)
         # Also builds the runner.
         run: |
@@ -235,6 +246,15 @@ jobs:
         run: |
           QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
+      - name: Run static and dynamic Linux programs in a Cloud Hypervisor VM with stacked runners on 2 CPUs with RAM above 4 GiB
+        # Skips the tests of QEMU's user network and virtio-9p.
+        run: |
+          VMM=cloud-hypervisor QEMU_MEM=6G QEMU_SMP=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+            ./dev_tools/run_linux_on_vm_userland.sh
+      - name: Run OP-TEE TAs in a Cloud Hypervisor VM with stacked runners on 2 CPUs
+        run: |
+          VMM=cloud-hypervisor QEMU_SMP=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+            ./dev_tools/run_optee_on_vm_userland.sh
       - name: Save vhost-device-vsock
         if: github.event_name != 'merge_group' && steps.vhost-device-vsock.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

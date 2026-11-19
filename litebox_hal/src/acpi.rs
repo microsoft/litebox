@@ -2,12 +2,14 @@
 // Licensed under the MIT license.
 
 //! ACPI tables, from an x86 PC's firmware: the local APIC IDs of the enabled
-//! processors in the MADT, found from the RSDP (which the BIOS leaves in its
+//! processors in the MADT ([`cpus`]), and how to power off from the FADT and
+//! the DSDT ([`soft_off`]), found from the RSDP (which the BIOS leaves in its
 //! areas below 1 MiB). Lengths and checksums are checked before anything is
 //! read past a header: a bad table is an error, not a panic. As in Linux,
 //! trailing bytes too few for another entry are ignored.
 
 use crate::interrupt::{VGA_MEMORY, X2APIC_BROADCAST, XAPIC_BROADCAST};
+use crate::power::SoftOff;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -146,10 +148,10 @@ struct MadtLocalX2apic {
 }
 
 /// The local APIC IDs of the enabled processors in the MADT, the calling
-/// (boot) CPU's (`boot_apic_id`) first, then in the MADT's order. The MADT
-/// is found from the RSDP at `rsdp` (if the boot protocol gives one: PVH's 0
-/// is `None`), else where the BIOS leaves it. IDs from
-/// 0xff up (x2APIC entries') are beyond an xAPIC's IPIs (see
+/// (boot) CPU's (`boot_apic_id`) first, then in the MADT's order. `rsdp` is
+/// the RSDP's address if the boot protocol gives one (PVH's 0 is `None`);
+/// otherwise it is searched for where the BIOS leaves it. IDs from 0xff up
+/// (x2APIC entries') are beyond an xAPIC's IPIs (see
 /// [`LocalApic::send_startup_ipi`](crate::interrupt::LocalApic::send_startup_ipi)):
 /// in xAPIC mode, those CPUs cannot be started.
 pub fn cpus(
@@ -157,12 +159,32 @@ pub fn cpus(
     rsdp: Option<u64>,
     boot_apic_id: u32,
 ) -> Result<Vec<u32>, &'static str> {
+    let madt = find_table(memory, rsdp, *b"APIC", "no MADT")?;
+    let mut apic_ids = madt_apic_ids(madt)?;
+    let boot = apic_ids
+        .iter()
+        .position(|&id| id == boot_apic_id)
+        .ok_or("the boot CPU is not in the MADT")?;
+    apic_ids[..=boot].rotate_right(1);
+    Ok(apic_ids)
+}
+
+/// The first good table with `signature` that the root table lists, else
+/// the last one's error, or `missing` if it lists none. The root table is
+/// the RSDP's at `rsdp` (if the boot protocol gives one: PVH's 0 is `None`),
+/// else where the BIOS leaves it.
+fn find_table<'m>(
+    memory: &'m impl Memory,
+    rsdp: Option<u64>,
+    signature: [u8; 4],
+    missing: &'static str,
+) -> Result<&'m [u8], &'static str> {
     let rsdp = match rsdp {
         Some(rsdp) => rsdp,
         None => find_rsdp(memory)?,
     };
-    let (root, entry_len, signature) = root_table(memory, rsdp)?;
-    let madt = table(memory, root, signature)?[size_of::<SdtHeader>()..]
+    let (root, entry_len, root_signature) = root_table(memory, rsdp)?;
+    table(memory, root, root_signature)?[size_of::<SdtHeader>()..]
         .chunks_exact(entry_len)
         .map(|entry| {
             let mut address = [0; 8];
@@ -172,19 +194,11 @@ pub fn cpus(
         // Firmware may leave null entries (ACPICA skips them too).
         .filter(|&pa| pa != 0)
         .filter(|&pa| {
-            read::<SdtHeader>(memory, pa).is_ok_and(|header| header.signature == *b"APIC")
+            read::<SdtHeader>(memory, pa).is_ok_and(|header| header.signature == signature)
         })
-        .map(|pa| table(memory, pa, *b"APIC"))
-        // The first good one; else the last one's error.
+        .map(|pa| table(memory, pa, signature))
         .reduce(Result::or)
-        .unwrap_or(Err("no MADT"))?;
-    let mut apic_ids = madt_apic_ids(madt)?;
-    let boot = apic_ids
-        .iter()
-        .position(|&id| id == boot_apic_id)
-        .ok_or("the boot CPU is not in the MADT")?;
-    apic_ids[..=boot].rotate_right(1);
-    Ok(apic_ids)
+        .unwrap_or(Err(missing))
 }
 
 /// The enabled processors' local APIC IDs in `madt`, without repeats (one
@@ -232,6 +246,180 @@ fn madt_apic_ids(madt: &[u8]) -> Result<Vec<u32>, &'static str> {
         .map(|(.., id)| id)
         .filter(|&id| seen.insert(id))
         .collect())
+}
+
+/// FADT fields' offsets (ACPI 6.5, table 5.9), and its flag for
+/// hardware-reduced ACPI. Earlier revisions' FADTs end sooner.
+mod fadt {
+    pub const DSDT: usize = 40;
+    pub const PM1A_CNT_BLK: usize = 64;
+    pub const PM1B_CNT_BLK: usize = 68;
+    pub const FLAGS: usize = 112;
+    pub const X_DSDT: usize = 140;
+    pub const X_PM1A_CNT_BLK: usize = 172;
+    pub const X_PM1B_CNT_BLK: usize = 184;
+    pub const SLEEP_CONTROL_REG: usize = 244;
+
+    pub const HW_REDUCED_ACPI: u32 = 1 << 20;
+}
+
+/// A Generic Address Structure: a register's address.
+#[repr(C, packed)]
+#[derive(Clone, Copy, FromBytes)]
+struct GenericAddress {
+    space_id: u8,
+    bit_width: u8,
+    bit_offset: u8,
+    access_size: u8,
+    address: u64,
+}
+
+/// [`GenericAddress::space_id`] of I/O ports.
+const SYSTEM_IO: u8 = 1;
+
+/// The sleep control register's sleep type field and enable bit.
+const SLEEP_TYPE_SHIFT: u8 = 2;
+const SLEEP_TYPE: u8 = 0b111 << SLEEP_TYPE_SHIFT;
+const SLEEP_ENABLE: u8 = 1 << 5;
+
+/// How to enter the S5 sleep state (soft off), as ACPICA does: with
+/// hardware-reduced ACPI (e.g., Cloud Hypervisor), through the FADT's sleep
+/// control register, else (e.g., QEMU) its PM1 control registers; with the
+/// sleep types of the DSDT's `\_S5`. `rsdp` is the RSDP's address if the
+/// boot protocol gives one (PVH's 0 is `None`); otherwise it is searched for
+/// where the BIOS leaves it. Only I/O-port registers are supported.
+pub fn soft_off(memory: &impl Memory, rsdp: Option<u64>) -> Result<SoftOff, &'static str> {
+    let fadt = find_table(memory, rsdp, *b"FACP", "no FADT")?;
+    // The 64-bit address where set, as ACPICA prefers it.
+    let dsdt = field::<u64>(fadt, fadt::X_DSDT)
+        .filter(|&pa| pa != 0)
+        .or_else(|| field::<u32>(fadt, fadt::DSDT).map(u64::from))
+        .filter(|&pa| pa != 0)
+        .ok_or("no DSDT")?;
+    let (type_a, type_b) = s5_sleep_types(table(memory, dsdt, *b"DSDT")?)?;
+    let flags = field::<u32>(fadt, fadt::FLAGS).unwrap_or(0);
+    if flags & fadt::HW_REDUCED_ACPI != 0 {
+        let port = field::<GenericAddress>(fadt, fadt::SLEEP_CONTROL_REG)
+            .and_then(io_port)
+            .ok_or("no sleep control register at an I/O port")?;
+        let value = ((type_a << SLEEP_TYPE_SHIFT) & SLEEP_TYPE) | SLEEP_ENABLE;
+        return Ok(SoftOff::SleepControl { port, value });
+    }
+    let a = pm1_port(fadt, fadt::X_PM1A_CNT_BLK, fadt::PM1A_CNT_BLK)?
+        .ok_or("no PM1a control register")?;
+    let b = pm1_port(fadt, fadt::X_PM1B_CNT_BLK, fadt::PM1B_CNT_BLK)?;
+    Ok(SoftOff::Pm1 {
+        a: (a, type_a),
+        b: b.map(|b| (b, type_b)),
+    })
+}
+
+/// The I/O port of the PM1 control register at the FADT's `extended`
+/// address, where set (as ACPICA prefers it), else at its `legacy` one;
+/// `None` if neither is.
+fn pm1_port(fadt: &[u8], extended: usize, legacy: usize) -> Result<Option<u16>, &'static str> {
+    const NOT_IO: &str = "PM1 control register not at an I/O port";
+    match field::<GenericAddress>(fadt, extended) {
+        Some(register) if { register.address } != 0 => io_port(register).map(Some).ok_or(NOT_IO),
+        _ => match field::<u32>(fadt, legacy).unwrap_or(0) {
+            0 => Ok(None),
+            port => u16::try_from(port).map(Some).map_err(|_| NOT_IO),
+        },
+    }
+}
+
+/// The I/O port that `register` names, if it names one, from its first bit.
+fn io_port(register: GenericAddress) -> Option<u16> {
+    let GenericAddress {
+        space_id,
+        bit_offset,
+        address,
+        ..
+    } = register;
+    if space_id != SYSTEM_IO || bit_offset != 0 {
+        return None;
+    }
+    u16::try_from(address).ok().filter(|&port| port != 0)
+}
+
+/// The field at `offset` of `table`, if the table is long enough for it.
+fn field<T: FromBytes>(table: &[u8], offset: usize) -> Option<T> {
+    let (value, _) = T::read_from_prefix(table.get(offset..)?).ok()?;
+    Some(value)
+}
+
+/// AML opcodes, for [`s5_sleep_types`].
+mod aml {
+    pub const NAME: u8 = 0x08;
+    pub const ROOT: u8 = b'\\';
+    pub const PACKAGE: u8 = 0x12;
+    pub const ZERO: u8 = 0x00;
+    pub const ONE: u8 = 0x01;
+    pub const BYTE: u8 = 0x0a;
+    pub const WORD: u8 = 0x0b;
+    pub const DWORD: u8 = 0x0c;
+    pub const QWORD: u8 = 0x0e;
+}
+
+/// The S5 sleep types (`SLP_TYPa`, `SLP_TYPb`, 3 bits each) of the `DSDT`,
+/// without an AML interpreter, as small kernels find them: from the first
+/// `Name (_S5, Package () {...})` (maybe with a root prefix) whose first
+/// elements are integer constants. As in ACPICA, a package of one element
+/// holds both types, `SLP_TYPa` in its low byte and `SLP_TYPb` in the next.
+fn s5_sleep_types(dsdt: &[u8]) -> Result<(u8, u8), &'static str> {
+    let aml = &dsdt[size_of::<SdtHeader>()..];
+    (1..aml.len())
+        .filter(|&at| {
+            aml[at..].starts_with(b"_S5_")
+                && (aml[at - 1] == aml::NAME
+                    || at >= 2 && aml[at - 2..at] == [aml::NAME, aml::ROOT])
+        })
+        .find_map(|at| s5_package(&aml[at + 4..]))
+        .ok_or("no \\_S5 package in the DSDT")
+}
+
+/// The sleep types of the package at the start of `aml`; see
+/// [`s5_sleep_types`].
+fn s5_package(aml: &[u8]) -> Option<(u8, u8)> {
+    let (&aml::PACKAGE, rest) = aml.split_first()? else {
+        return None;
+    };
+    // `PkgLength`: bits 7:6 of its first byte count the bytes that follow.
+    let rest = rest.get(1 + usize::from(rest.first()? >> 6)..)?;
+    let (&elements, mut rest) = rest.split_first()?;
+    // As ACPICA, which rejects an empty package.
+    if elements == 0 {
+        return None;
+    }
+    let a = integer(&mut rest)?;
+    let b = if elements >= 2 {
+        integer(&mut rest)?
+    } else {
+        a >> 8
+    };
+    let sleep_type = |value: u64| value.to_le_bytes()[0] & 0b111;
+    Some((sleep_type(a), sleep_type(b)))
+}
+
+/// The integer constant at the start of `aml`, which it then skips.
+fn integer(aml: &mut &[u8]) -> Option<u64> {
+    let (&opcode, rest) = aml.split_first()?;
+    let len = match opcode {
+        aml::ZERO | aml::ONE => 0,
+        aml::BYTE => 1,
+        aml::WORD => 2,
+        aml::DWORD => 4,
+        aml::QWORD => 8,
+        _ => return None,
+    };
+    let mut bytes = [0; 8];
+    bytes[..len].copy_from_slice(rest.get(..len)?);
+    *aml = &rest[len..];
+    Some(if opcode == aml::ONE {
+        1
+    } else {
+        u64::from_le_bytes(bytes)
+    })
 }
 
 /// The root table (RSDT or XSDT) of the RSDP at `rsdp`, checked as ACPICA
@@ -674,5 +862,185 @@ mod tests {
         // Outside the memory.
         image.0.truncate(0xf_0000);
         assert_eq!(find_rsdp(&image), Err("outside the image"));
+    }
+
+    const FADT: u64 = 0x600;
+    const DSDT: u64 = 0x800;
+
+    /// A FADT `len` bytes long, with `fields` (offset, bytes) set.
+    fn fadt_table(len: usize, fields: &[(usize, &[u8])]) -> Vec<u8> {
+        let mut body = vec![0; len - size_of::<SdtHeader>()];
+        for (offset, bytes) in fields {
+            let at = offset - size_of::<SdtHeader>();
+            body[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        sdt(*b"FACP", &body)
+    }
+
+    /// A generic address of the I/O port `port`, `bits` wide.
+    fn io(port: u16, bits: u8) -> Vec<u8> {
+        let mut register = vec![SYSTEM_IO, bits, 0, bits / 8];
+        register.extend_from_slice(&u64::from(port).to_le_bytes());
+        register
+    }
+
+    /// `Name (<prefix>_S5, <package>)` in AML.
+    fn s5(prefix: &[u8], package: &[u8]) -> Vec<u8> {
+        [prefix, b"_S5_", package].concat()
+    }
+
+    /// `Package () {<elements>}` in AML, with a 1-byte `PkgLength`.
+    fn package(elements: &[&[u8]]) -> Vec<u8> {
+        let body = elements.concat();
+        let len = u8::try_from(2 + body.len()).unwrap();
+        let count = u8::try_from(elements.len()).unwrap();
+        [&[aml::PACKAGE, len, count][..], &body].concat()
+    }
+
+    /// The RSDP's XSDT listing `tables`, `fadt` at `FADT`, and a DSDT of
+    /// `body` at `DSDT`.
+    fn power_image(tables: &[u64], fadt: &[u8], body: &[u8]) -> Image {
+        let mut image = image(2, &madt(&[local_apic(0, ENABLED)]));
+        let entries: Vec<u8> = tables.iter().flat_map(|pa| pa.to_le_bytes()).collect();
+        image.put(ROOT, &sdt(*b"XSDT", &entries));
+        image.put(FADT, fadt);
+        image.put(DSDT, &sdt(*b"DSDT", body));
+        image
+    }
+
+    fn soft_off_of(fadt: &[u8], body: &[u8]) -> Result<SoftOff, &'static str> {
+        soft_off(&power_image(&[MADT, FADT], fadt, body), Some(RSDP))
+    }
+
+    #[test]
+    fn hardware_reduced_acpi_has_the_sleep_control_register() {
+        // As Cloud Hypervisor's: `Name (_S5, Package () {5, 5, 0, 0})`.
+        let five = [aml::BYTE, 5];
+        let body = s5(
+            &[aml::NAME],
+            &package(&[&five, &five, &[aml::ZERO], &[aml::ZERO]]),
+        );
+        let with = |register: &[u8]| {
+            let fadt = fadt_table(
+                276,
+                &[
+                    (fadt::FLAGS, &fadt::HW_REDUCED_ACPI.to_le_bytes()),
+                    (fadt::X_DSDT, &DSDT.to_le_bytes()),
+                    // Ignored: hardware-reduced.
+                    (fadt::X_PM1A_CNT_BLK, &io(0x610, 16)),
+                    (fadt::SLEEP_CONTROL_REG, register),
+                ],
+            );
+            soft_off_of(&fadt, &body)
+        };
+        assert_eq!(
+            with(&io(0x600, 8)),
+            Ok(SoftOff::SleepControl {
+                port: 0x600,
+                value: 0x34
+            })
+        );
+        let none = Err("no sleep control register at an I/O port");
+        assert_eq!(with(&[0; 12]), none);
+        let mut memory = io(0x600, 8);
+        memory[0] = 0;
+        assert_eq!(with(&memory), none);
+        let mut offset = io(0x600, 8);
+        offset[2] = 1;
+        assert_eq!(with(&offset), none);
+    }
+
+    #[test]
+    fn other_acpi_has_the_pm1_control_registers() {
+        // As QEMU's, in an ACPI 1.0 FADT: `Name (\_S5, Package () {0, 0, 0,
+        // 0})`.
+        let body = s5(&[aml::NAME, aml::ROOT], &package(&[&[aml::ZERO][..]; 4]));
+        let dsdt = u32::try_from(DSDT).unwrap().to_le_bytes();
+        let pm1a = 0x604u32.to_le_bytes();
+        let fadt = fadt_table(116, &[(fadt::DSDT, &dsdt), (fadt::PM1A_CNT_BLK, &pm1a)]);
+        assert_eq!(
+            soft_off_of(&fadt, &body),
+            Ok(SoftOff::Pm1 {
+                a: (0x604, 0),
+                b: None
+            })
+        );
+        // Errors.
+        let no_pm1 = fadt_table(116, &[(fadt::DSDT, &dsdt)]);
+        assert_eq!(soft_off_of(&no_pm1, &body), Err("no PM1a control register"));
+        let no_dsdt = fadt_table(116, &[(fadt::PM1A_CNT_BLK, &pm1a)]);
+        assert_eq!(soft_off_of(&no_dsdt, &body), Err("no DSDT"));
+        let no_fadt = power_image(&[MADT], &fadt, &body);
+        assert_eq!(soft_off(&no_fadt, Some(RSDP)), Err("no FADT"));
+
+        // The 64-bit addresses where set; a one-element package holds both
+        // sleep types.
+        let body = s5(&[aml::NAME], &package(&[&[aml::WORD, 5, 7]]));
+        let with = |x_pm1a: &[u8]| {
+            let fadt = fadt_table(
+                244,
+                &[
+                    // Unused: the X_DSDT is set.
+                    (fadt::DSDT, &0x900u32.to_le_bytes()),
+                    (fadt::X_DSDT, &DSDT.to_le_bytes()),
+                    (fadt::PM1A_CNT_BLK, &pm1a),
+                    (fadt::PM1B_CNT_BLK, &0x608u32.to_le_bytes()),
+                    (fadt::X_PM1A_CNT_BLK, x_pm1a),
+                ],
+            );
+            soft_off_of(&fadt, &body)
+        };
+        assert_eq!(
+            with(&io(0xb004, 16)),
+            Ok(SoftOff::Pm1 {
+                a: (0xb004, 5),
+                b: Some((0x608, 7))
+            })
+        );
+        assert_eq!(
+            with(&[0; 12]),
+            Ok(SoftOff::Pm1 {
+                a: (0x604, 5),
+                b: Some((0x608, 7))
+            })
+        );
+        let mut memory = io(0xb004, 16);
+        memory[0] = 0;
+        assert_eq!(
+            with(&memory),
+            Err("PM1 control register not at an I/O port")
+        );
+    }
+
+    #[test]
+    fn s5_sleep_types_are_the_first_s5_packages() {
+        let types = |body: &[u8]| s5_sleep_types(&sdt(*b"DSDT", body));
+        let missing = Err("no \\_S5 package in the DSDT");
+        // A 2-byte `PkgLength`, and other integer encodings; only the low 3
+        // bits count.
+        let long = [aml::PACKAGE, 0x40, 0, 2, aml::ONE, aml::DWORD, 0xb, 0, 0, 1];
+        assert_eq!(types(&s5(&[aml::NAME], &long)), Ok((1, 3)));
+        let qword = [aml::QWORD, 6, 0, 0, 0, 0, 0, 0, 1];
+        let body = s5(&[aml::NAME], &package(&[&qword, &[aml::ZERO]]));
+        assert_eq!(types(&body), Ok((6, 0)));
+        // Not a name's package of integers: skipped for a later one.
+        let later = s5(&[aml::NAME], &package(&[&[aml::BYTE, 2], &[aml::ONE]]));
+        for earlier in [
+            // A method.
+            s5(&[0x14], &package(&[&[aml::ZERO][..]; 2])),
+            s5(&[aml::NAME], &[aml::BYTE, 5]),
+            // A string.
+            s5(&[aml::NAME], &package(&[&[0x0d, b'5', 0], &[aml::ZERO]])),
+            // Truncated.
+            s5(&[aml::NAME], &[aml::PACKAGE, 4, 2, aml::WORD, 5]),
+            // Empty: what follows is not its element.
+            s5(&[aml::NAME], &[aml::PACKAGE, 2, 0, aml::BYTE, 5]),
+        ] {
+            assert_eq!(types(&[&earlier[..], &later].concat()), Ok((2, 1)));
+            assert_eq!(types(&earlier), missing);
+        }
+        // No room for a `NameOp` before it.
+        assert_eq!(types(&later[1..]), missing);
+        assert_eq!(types(&[]), missing);
     }
 }

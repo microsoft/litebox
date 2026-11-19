@@ -1,11 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! PVH front end: direct kernel boot (e.g. `qemu -kernel`) through the
-//! `XEN_ELFNOTE_PHYS32_ENTRY` note. Maps the low 4 GiB (identity and at
-//! `KERNEL_OFFSET`) and the low 1 GiB, which holds the image, at
-//! `KERNEL_IMAGE_OFFSET`; relocates the image there, and hands off (see
-//! `handoff`) on the boot stack in the scratch region.
+//! PVH front end: direct kernel boot (e.g. `qemu -kernel`, or
+//! `cloud-hypervisor --kernel`) through the `XEN_ELFNOTE_PHYS32_ENTRY` note.
+//! Maps the low 4 GiB (identity and at `KERNEL_OFFSET`) and the low 1 GiB,
+//! which holds the image, at `KERNEL_IMAGE_OFFSET`; relocates the image
+//! there, and hands off (see `handoff`) on the boot stack in the scratch
+//! region.
 //!
 //! The linker script must define `_memory_base`, `_rela_start` and
 //! `_rela_end`.

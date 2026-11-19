@@ -7,6 +7,8 @@
 //! -device vhost-vsock-pci,guest-cid=3,disable-legacy=on
 //! ```
 //!
+//! or Cloud Hypervisor's `--vsock cid=3,socket=<path>` (hybrid vsock).
+//!
 //! No features are negotiated, so only stream sockets exist. Each of the
 //! host's requests, to any guest port, waits for the user to accept or refuse
 //! it ([`VirtioVsock::take_request`]). The user connects to the host's ports

@@ -3,8 +3,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# Run OP-TEE TAs from litebox_runner_optee_on_linux_userland/tests under QEMU
-# with stacked runners: litebox_runner_vm_kernel as the guest kernel and
+# Run OP-TEE TAs from litebox_runner_optee_on_linux_userland/tests under QEMU,
+# or Cloud Hypervisor (VMM), with stacked runners: litebox_runner_vm_kernel
+# as the guest kernel and
 # litebox_runner_optee_on_vm_userland as a ring-3 process per TA instance.
 # ldelf and each TA are syscall-rewritten ahead of time (unless -u), then
 # packed with the userland runner and the test's cmds.json into a tar passed
@@ -16,7 +17,8 @@
 #
 # Runner processes' standard streams are a virtio console, backed by files:
 # TA output must reach it, and in debug builds, whose runners echo standard
-# input, so must the line fed to it.
+# input, so must the line fed to it. Cloud Hypervisor's console is a Unix
+# socket instead, which a relay connects the files to.
 #
 # Usage: dev_tools/run_optee_on_vm_userland.sh [-t <test>]... [-u] [-r] [-v]
 #   -t   test to run, e.g. ta-death or hello-ta; append @default to a TA to
@@ -27,11 +29,16 @@
 #   -v   print the full guest log and console output for passing runs too
 #
 # Environment:
+#   VMM           qemu or cloud-hypervisor (default: qemu)
+#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command, which needs KVM
+#                 (default: cloud-hypervisor)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
-#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
-#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1)
+#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G); for Cloud Hypervisor
+#                 too, as an integer in MiB or suffixed M or G
+#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1); for Cloud
+#                 Hypervisor too
 #   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runners (and the rewriter unless
@@ -87,7 +94,7 @@ for f in "${built[@]}"; do
 done
 echo "[*] kernel: $KERNEL"
 echo "[*] userland runner: $USERLAND"
-echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU, -smp $QEMU_SMP"
+describe_vm
 if [[ $rewrite -eq 1 ]]; then echo "[*] TAs: syscall-rewritten"; else echo "[*] TAs: unmodified"; fi
 
 # Copies a guest binary, syscall-rewritten unless -u. Sites the rewriter
@@ -102,22 +109,68 @@ prepare() {
 
 STDIN_LINE="hello from the host"
 
-# The virtio console's files for test $1.
+# The virtio console for test $1, with its files: $WORK/$1.stdin, its input,
+# and $WORK/$1.stdout, its output (for Cloud Hypervisor, through
+# relay_console).
 console_args() {
     printf '%s\n' "$STDIN_LINE" >"$WORK/$1.stdin"
     : >"$WORK/$1.stdout"
-    echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
-        -chardev "file,id=con0,path=$WORK/$1.stdout,input-path=$WORK/$1.stdin" \
-        -device virtconsole,chardev=con0,bus=vs0.0
+    case $VMM in
+        qemu)
+            echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
+                -chardev "file,id=con0,path=$WORK/$1.stdout,input-path=$WORK/$1.stdin" \
+                -device virtconsole,chardev=con0,bus=vs0.0
+            ;;
+        cloud-hypervisor) echo --console "socket=$WORK/$1.console" ;;
+    esac
 }
 
-# Run check: TA output, and the echoed input, on the console.
+# Connects to the Unix socket $1 once it listens (within $4 seconds), sends
+# file $2, then appends what it receives to file $3 until EOF.
+CONSOLE_RELAY='
+import socket, sys, time
+deadline = time.monotonic() + float(sys.argv[4])
+while True:
+    console = socket.socket(socket.AF_UNIX)
+    try:
+        console.connect(sys.argv[1])
+        break
+    except OSError as error:
+        console.close()
+        if time.monotonic() > deadline:
+            sys.exit(f"the console did not listen in time: {error}")
+        time.sleep(0.01)
+with open(sys.argv[2], "rb") as stdin:
+    console.sendall(stdin.read())
+with open(sys.argv[3], "ab") as stdout:
+    while data := console.recv(65536):
+        stdout.write(data)
+        stdout.flush()
+'
+
+# Cloud Hypervisor's console socket for test $1, connected to its files (see
+# console_args), until the VM ends: the test's host client. The VMM buffers
+# input until the guest takes it, and output until this connects.
+relay_console() {
+    python3 -c "$CONSOLE_RELAY" "$WORK/$1.console" "$WORK/$1.stdin" "$WORK/$1.stdout" "$TIMEOUT"
+}
+[[ $VMM != cloud-hypervisor ]] || client=relay_console
+
+# Run check: TA output, and the echoed input, on the console; under Cloud
+# Hypervisor, also the kernel's success line. The relay ends at its console's
+# EOF, which a VM reset (e.g., a triple fault, which Cloud Hypervisor turns
+# into a reboot) brings too, and run_vm counts a VM its client stopped as a
+# pass.
 check_console() {
     local out="$WORK/$1.stdout"
     if [[ ${verbose:-0} -ne 0 ]]; then
         echo "--- console ($1) ---" >&2
         cat "$out" >&2
         echo "---" >&2
+    fi
+    if [[ $VMM == cloud-hypervisor ]] && ! grep -qF "$EXIT_SUCCESS" "$WORK/$1.log"; then
+        echo "guest did not report success"
+        return 1
     fi
     grep -q "/TA:" "$out" || { echo "no TA output on the console"; return 1; }
     if [[ $profile == debug ]] && ! grep -qF "[stdin] $STDIN_LINE" "$out"; then

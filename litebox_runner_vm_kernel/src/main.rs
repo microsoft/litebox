@@ -1,18 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! QEMU guest kernel, hosting ring-3 runner processes, chosen by the payload:
+//! Guest kernel of a QEMU or Cloud Hypervisor VM, hosting ring-3 runner
+//! processes, chosen by the payload:
 //! - With [`init::RUNNER`]: [`init`], e.g., the guest service.
 //! - Otherwise, with the `optee` feature: OP-TEE TAs, one per TA instance
 //!   (`service::optee`), driven by a test client (`client::script`).
 //!
-//! QEMU exits with 33 if init exits with 0 or the OP-TEE tests pass, and 65
-//! otherwise. Runner processes' standard streams are the VM's console
-//! device, if there is one, their sockets reach the VM's network device, if
-//! there is one, as the payload's `policy` allows ([`init::POLICY`]), and
-//! their vsock sockets the host through the VM's socket device, if there is
-//! one; programs also see the host directories of virtio-9p devices,
-//! read-only, at their mount tags ([`devices`]).
+//! The VM then powers off ([`power::exit`]): QEMU, with its `isa-debug-exit`
+//! device, exits with 33 if init exits with 0 or the OP-TEE tests pass, and
+//! 65 otherwise; Cloud Hypervisor exits with 0 either way, after the serial
+//! port's [`power::EXIT_SUCCESS_LINE`] or [`power::EXIT_FAILURE_LINE`].
+//!
+//! Runner processes' standard streams are the VM's console device, if there
+//! is one, their sockets reach the VM's network device, if there is one, as
+//! the payload's `policy` allows ([`init::POLICY`]), and their vsock sockets
+//! the host through the VM's socket device, if there is one; programs also
+//! see the host directories of virtio-9p devices, read-only, at their mount
+//! tags ([`devices`]).
 //!
 //! Every CPU runs the processes ([`litebox_shim_vm_kernel::sched`],
 //! [`cpu_main`]).

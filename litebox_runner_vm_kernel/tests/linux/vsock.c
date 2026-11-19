@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 // AF_VSOCK connections between the guest and vsock.host.py, on the VM's
-// virtio-vsock device, over hybrid vsock, which has no half-close.
+// virtio-vsock device, over hybrid vsock, which may or may not pass
+// half-closes on (Cloud Hypervisor's does from v53).
 //
 //   vsock PORT   Listens on PORT, PORT + 3 and PORT + 4, prints `ready`, and
 //                serves the host's connections in order (see serve()):
@@ -415,7 +416,8 @@ static unsigned int connect_host(int fd, unsigned int port) {
 }
 
 // Writes `NAME PORT`, NAME_LEN bytes, to `fd`, and shuts it down for
-// sending, which the host does not see.
+// sending, which the host may or may not see (Cloud Hypervisor's bridge passes
+// half-closes on from v53).
 static void send_name(int fd, const char *name, unsigned int port, char *message) {
     memset(message, 0, NAME_LEN);
     int len = snprintf(message, NAME_LEN, "%s %u", name, port);

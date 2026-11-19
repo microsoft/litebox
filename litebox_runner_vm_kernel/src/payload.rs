@@ -21,7 +21,7 @@ impl Payload {
         let module = info
             .modules
             .first()
-            .ok_or("no payload module (pass -initrd)")?;
+            .ok_or("no payload module (pass QEMU's -initrd or Cloud Hypervisor's --initramfs)")?;
         let len = usize::try_from(module.end - module.start).unwrap();
         // Safety: boot modules are excluded from the heap and stay mapped at
         // `PA + KERNEL_OFFSET` for the kernel's lifetime.

@@ -10,6 +10,9 @@
 //! -device virtconsole,chardev=con0,bus=vs0.0
 //! ```
 //!
+//! or Cloud Hypervisor's `--console file=out.txt` (output only) or
+//! `--console socket=console.sock`.
+//!
 //! Without `VIRTIO_CONSOLE_F_MULTIPORT` (not negotiated), the device is a
 //! single port (port 0, where a `virtconsole` attaches) on queues 0
 //! (receive) and 1 (transmit), open without control-queue traffic.
