@@ -402,8 +402,17 @@ fn test_file_status_flags() {
 
 #[test]
 fn test_pipe2_race_with_concurrent_close() {
+    use litebox_common_linux::{Rlimit, RlimitResource};
+
     let task = init_platform();
-    task.files.borrow().set_max_fd(4);
+    task.do_prlimit(
+        RlimitResource::NOFILE,
+        Some(Rlimit {
+            rlim_cur: 4,
+            rlim_max: 4,
+        }),
+    )
+    .unwrap();
 
     let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
     let stop_closer = stop.clone();

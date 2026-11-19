@@ -142,14 +142,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // The insert, the store, and any rollback share one acquisition of the lock, so no other
         // thread can see or replace the descriptor before the store fails.
         let mut rds = files.raw_descriptor_store.write();
-        let raw_fd = match files.insert_raw_fd_locked(&mut rds, typed) {
+        let raw_fd = match self.choose_raw_fd(&rds, None) {
             Ok(raw_fd) => raw_fd,
-            Err(typed) => {
+            Err(error) => {
                 drop(rds);
                 self.remove_and_drop_descriptor(&typed);
-                return Err(Errno::EMFILE);
+                return Err(error);
             }
         };
+        assert!(rds.fd_into_specific_raw_integer(typed, raw_fd));
         if let Some(dest) = dest {
             let number = i32::try_from(raw_fd).unwrap();
             if dest.write_at_offset::<Platform>(0, number).is_none() {

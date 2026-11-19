@@ -9,14 +9,15 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessRequest, ProcessResponse,
 };
 use litebox_broker_protocol::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostName, HostNameKind,
-    HostNameSizes, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_HOST_NAME_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
-    OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
-    SetParentExitSignalRequest, SetResourceLimitRequest, StartChildProcessRequest,
-    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, CheckOpenFilesRequest, ChildExit, ChildSelector, CpuTime,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostName, HostNameKind, HostNameSizes, HostNames,
+    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
+    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, OpenProcessHandleRequest,
+    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
+    ResourceKind, ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest,
+    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
+    ThreadInfo, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
@@ -408,6 +409,18 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             limit,
         }))? {
             ProcessResponse::SetResourceLimit(previous) => Ok(previous),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Checks candidate descriptor numbers against the target's soft open-file limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn check_open_files(&self, request: CheckOpenFilesRequest) -> Result<(), Channel::Error> {
+        match self.request_process(ProcessRequest::CheckOpenFiles(request))? {
+            ProcessResponse::CheckOpenFiles => Ok(()),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    CheckOpenFilesRequest, ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
@@ -214,6 +214,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     ) -> Result<ResourceLimit, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.set_resource_limit(process_id, resource, limit)?)
+    }
+
+    /// Checks descriptor numbers against the target's soft open-file limit.
+    ///
+    /// Returns [`ProcessError::PolicyDenied`] if the minimum is outside the limit, or
+    /// [`ProcessError::ResourceExhausted`] if the highest candidate is outside the limit.
+    pub fn check_open_files(&self, request: CheckOpenFilesRequest) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.check_open_files(request)?)
     }
 
     /// Returns the host names of this process or of its pending child

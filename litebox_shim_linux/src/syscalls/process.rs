@@ -2167,6 +2167,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if self.vfork.borrow().is_some() || !self.thread.process.has_default_alarm_state() {
             return Err(Errno::EAGAIN);
         }
+        // XXX(jayb): Snapshot NOFILE and descriptors together once the broker owns both.
+        // Today a sibling can change the limit between child allocation and the table copy.
         let child = self.allocate_child_process(relation)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
@@ -2185,12 +2187,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             parent_context.regs[0] = child_pid.cast_unsigned() as usize;
         }
         let child_files = self.files.borrow().copy_for_vfork(&self.global);
-        // A sibling may have changed the parent's limits since this task's descriptor table was
-        // limited, so limit the child's to its copy of the limits.
-        let resource_limits = self.thread.process.limits.get();
-        child_files.set_max_fd(
-            resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
-        );
         let parent_files = self.files.replace(Arc::new(child_files));
         // Like Linux, the pidfd is installed after the child's descriptors are copied.
         if let Some(dest) = pidfd
@@ -2208,7 +2204,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             child_pid,
             child_own_pid,
             child_init_process,
-            resource_limits,
+            resource_limits: self.thread.process.limits.get(),
             no_new_privs: self.thread.no_new_privs.get(),
             parent_context,
             // Callers may keep values in callee-saved vector registers across the call.
@@ -2585,15 +2581,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 }
 
-const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
-pub(crate) const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+/// The system-wide descriptor ceiling, not the current process's limit.
+pub(crate) const RLIMIT_NOFILE_MAX: u64 = ResourceLimit::DEFAULT_OPEN_FILES.hard();
 /// The default soft and hard limits on queued signals, which Linux scales with memory size.
 const RLIMIT_SIGPENDING: usize = 4096;
 
 /// A process's resource limits.
 ///
-/// Every limit is kept, reported, and inherited, but only `NOFILE` and `SIGPENDING` are enforced.
-/// When LiteBox keeps the limits on `CPU` and `NPROC` instead, this copy of them goes unused.
+/// The broker owns `NOFILE`. The shim enforces `SIGPENDING` and keeps the remaining limits
+/// for reporting and inheritance, except where the broker owns `CPU` and `NPROC` as well.
 pub(crate) struct ResourceLimits<Platform: ShimPlatform> {
     limits: RwLock<Platform, ResourceLimitValues>,
 }
@@ -2607,7 +2603,8 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
             rlim_max: rlim_t::MAX,
         }; RlimitResource::RLIM_NLIMITS];
         for (resource, rlim_cur, rlim_max) in [
-            (RlimitResource::NOFILE, RLIMIT_NOFILE_CUR, RLIMIT_NOFILE_MAX),
+            // XXX(jayb): Drop the unused NOFILE slot when changing the startup payload format.
+            (RlimitResource::NOFILE, 0, 0),
             (
                 RlimitResource::STACK,
                 crate::loader::DEFAULT_STACK_SIZE,
@@ -2627,13 +2624,17 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
         limits
     }
 
-    fn new(limits: ResourceLimitValues) -> Self {
+    fn new(mut limits: ResourceLimitValues) -> Self {
+        limits[litebox_common_linux::RlimitResource::NOFILE as usize] = Rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         Self {
             limits: RwLock::new(limits),
         }
     }
 
-    /// Returns every limit.
+    /// Returns the limits carried in the shim's startup payload.
     pub(crate) fn get(&self) -> ResourceLimitValues {
         *self.limits.read()
     }
@@ -2649,6 +2650,7 @@ fn litebox_resource_kind(resource: litebox_common_linux::RlimitResource) -> Opti
     match resource {
         RlimitResource::CPU => Some(ResourceKind::CpuTime),
         RlimitResource::NPROC => Some(ResourceKind::Tasks),
+        RlimitResource::NOFILE => Some(ResourceKind::OpenFiles),
         _ => None,
     }
 }
@@ -2668,7 +2670,7 @@ fn rlim_from_litebox(value: u64) -> litebox_common_linux::rlim_t {
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    /// Returns the limit on `resource`, which a `vfork` child keeps its own copy of.
+    /// Returns a shim-owned limit, using the `vfork` child's copy if there is one.
     pub(crate) fn rlimit(&self, resource: litebox_common_linux::RlimitResource) -> Rlimit {
         match &*self.vfork.borrow() {
             Some(vfork) => vfork.resource_limits[resource as usize],
@@ -2706,8 +2708,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         rlim_max: rlim_from_litebox(old_limit.hard()),
                     });
                 }
-                // Without LiteBox's process service, this process keeps the limit itself.
-                Err(ProcessError::Unavailable) => {}
+                // CPU and NPROC retain their local fallback without a process service.
+                Err(ProcessError::Unavailable) if resource != ResourceKind::OpenFiles => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -2716,10 +2718,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         if new_limit.rlim_cur > new_limit.rlim_max {
             return Err(Errno::EINVAL);
-        }
-        let is_nofile = matches!(resource, litebox_common_linux::RlimitResource::NOFILE);
-        if is_nofile && new_limit.rlim_max > RLIMIT_NOFILE_MAX {
-            return Err(Errno::EPERM);
         }
         let mut vfork = self.vfork.borrow_mut();
         let mut process_limits;
@@ -2734,9 +2732,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // support capabilities in LiteBox, so we don't check for that here.
         if new_limit.rlim_max > old_limit.rlim_max {
             return Err(Errno::EPERM);
-        }
-        if is_nofile {
-            self.files.borrow().set_max_fd(new_limit.rlim_cur);
         }
         limits[resource as usize] = new_limit;
         Ok(old_limit)
@@ -5214,7 +5209,8 @@ mod tests {
             let barrier = barrier.clone();
             task.spawn_clone_for_test(move |task| {
                 for iteration in 0..ITERATIONS {
-                    let value = super::RLIMIT_NOFILE_MAX - (iteration * 2 + offset);
+                    let value = usize::try_from(super::RLIMIT_NOFILE_MAX).unwrap()
+                        - (iteration * 2 + offset);
                     barrier.wait();
                     let result = task.do_prlimit(
                         RlimitResource::NOFILE,
@@ -5400,22 +5396,23 @@ mod tests {
                 .unwrap();
             // LiteBox keeps the limit on CPU time, separately for the child.
             task.do_prlimit(RlimitResource::CPU, Some(core(1))).unwrap();
-            let nofile = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
+            let default_nofile = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
             let probe_fd = task.sys_dup(0, None, None).unwrap();
-            task.do_prlimit(
-                RlimitResource::NOFILE,
-                Some(Rlimit {
-                    rlim_cur: probe_fd as usize + 1,
-                    rlim_max: nofile.rlim_max,
-                }),
-            )
-            .unwrap();
+            let parent_nofile = Rlimit {
+                rlim_cur: probe_fd as usize + 1,
+                rlim_max: default_nofile.rlim_max,
+            };
+            task.do_prlimit(RlimitResource::NOFILE, Some(parent_nofile))
+                .unwrap();
 
             let mut ctx = PtRegs::default();
             assert_eq!(task.sys_vfork(&mut ctx), Ok(0));
             // The child starts with the parent's limits, including on its descriptor table.
             assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(1)));
             assert_eq!(task.sys_dup(0, None, None), Err(Errno::EMFILE));
+            task.do_prlimit(RlimitResource::NOFILE, Some(default_nofile))
+                .unwrap();
+            task.sys_dup(0, None, None).unwrap();
             assert_eq!(
                 task.do_prlimit(RlimitResource::CORE, Some(core(2))),
                 Ok(core(1))
@@ -5438,6 +5435,7 @@ mod tests {
             assert!(task.vfork.borrow().is_none());
             assert_eq!(task.do_prlimit(RlimitResource::CORE, None), Ok(core(1)));
             assert_eq!(task.do_prlimit(RlimitResource::CPU, None), Ok(core(1)));
+            assert_eq!(task.sys_dup(0, None, None), Err(Errno::EMFILE));
         });
     }
 

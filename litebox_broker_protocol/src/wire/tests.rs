@@ -34,12 +34,12 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameKind,
-    HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo, ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, CheckOpenFilesRequest, ChildExit, ChildSelector, CpuTime,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostNameKind, HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind,
+    ResourceLimit, SetHostNameRequest, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -621,8 +621,18 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::Process(ProcessRequest::SetResourceLimit(SetResourceLimitRequest {
             process_id: process_id(1),
-            resource: ResourceKind::Tasks,
+            resource: ResourceKind::OpenFiles,
             limit: ResourceLimit::new(0, 7).unwrap(),
+        })),
+        BrokerOperation::Process(ProcessRequest::CheckOpenFiles(CheckOpenFilesRequest {
+            process_id: process_id(1),
+            highest: 10,
+            minimum: None,
+        })),
+        BrokerOperation::Process(ProcessRequest::CheckOpenFiles(CheckOpenFilesRequest {
+            process_id: process_id(u32::MAX),
+            highest: u64::MAX,
+            minimum: Some(0),
         })),
         BrokerOperation::Process(ProcessRequest::GetHostNames(GetHostNamesRequest {
             process_id: process_id(u32::MAX),
@@ -1399,6 +1409,7 @@ fn response_codec_round_trips_all_variants() {
         })),
         BrokerResult::Process(ProcessResponse::SetHostName),
         BrokerResult::Process(ProcessResponse::CopyHostNames),
+        BrokerResult::Process(ProcessResponse::CheckOpenFiles),
         BrokerResult::Error(ErrorCode::PolicyDenied),
         BrokerResult::Error(ErrorCode::WouldBlock),
         BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),

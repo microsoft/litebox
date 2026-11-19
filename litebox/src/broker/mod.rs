@@ -21,7 +21,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    CheckOpenFilesRequest, ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
     MAX_PROCESS_BOOTSTRAP_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
@@ -173,6 +173,11 @@ pub(crate) trait BrokerControl: Send + Sync {
         resource: ResourceKind,
         limit: ResourceLimit,
     ) -> core::result::Result<ResourceLimit, BrokerControlError>;
+
+    fn check_open_files(
+        &self,
+        request: CheckOpenFilesRequest,
+    ) -> core::result::Result<(), BrokerControlError>;
 
     fn get_host_names(
         &self,
@@ -1154,6 +1159,13 @@ where
         limit: ResourceLimit,
     ) -> core::result::Result<ResourceLimit, BrokerControlError> {
         self.request(|local| local.set_resource_limit(process_id, resource, limit))
+    }
+
+    fn check_open_files(
+        &self,
+        request: CheckOpenFilesRequest,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.check_open_files(request))
     }
 
     fn get_host_names(

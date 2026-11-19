@@ -25,6 +25,7 @@ use litebox_broker_protocol::fs::{
     FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate, FileTimestamp,
     FileType, FileUser, SetFileTimes,
 };
+use litebox_broker_protocol::process::CheckOpenFilesRequest;
 use litebox_broker_protocol::terminal::{
     ChangeTiming, TerminalOperation, TerminalResponse, TerminalSettings,
 };
@@ -38,7 +39,6 @@ use litebox_common_linux::{
 };
 use litebox_platform::buffer::{Buffer as _, Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::time::{Instant as _, TimeProvider};
-use thiserror::Error;
 
 use super::{
     epoll::EpollFd, eventfd::EventfdFd, inet::InetSocketFd, pidfd::PidfdFd, pipe::PipeFd,
@@ -47,7 +47,7 @@ use super::{
 use crate::guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
 use crate::{GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 
 pub(crate) struct FileSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
 impl<Platform: ShimPlatform> FdEnabledSubsystem for FileSubsystem<Platform> {
@@ -427,12 +427,21 @@ pub(crate) fn status_flags_change(mask: OFlags, flags: OFlags) -> (FileOpenFlags
     (file_mask, file_flags)
 }
 
+fn find_free_raw_fd(rds: &litebox::fd::RawDescriptorStorage, start: usize) -> usize {
+    let mut raw_fd = start;
+    for occupied in rds.iter_alive().skip_while(|&fd| fd < start) {
+        if occupied != raw_fd {
+            break;
+        }
+        raw_fd += 1;
+    }
+    raw_fd
+}
+
 /// Task state shared by `CLONE_FILES`.
 pub(crate) struct FilesState<Platform: ShimPlatform> {
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
-    /// Exclusive upper bound for raw file descriptor values.
-    max_fd: AtomicUsize,
 }
 
 impl<Platform: ShimPlatform> FilesState<Platform> {
@@ -441,68 +450,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
-            max_fd: AtomicUsize::new(usize::MAX),
         }
-    }
-
-    pub(crate) fn set_max_fd(&self, max_fd: usize) {
-        self.max_fd.store(max_fd, Ordering::Relaxed);
-    }
-
-    // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
-    // Err(typed_fd)
-    pub(crate) fn insert_raw_fd<Subsystem: FdEnabledSubsystem>(
-        &self,
-        typed_fd: TypedFd<Subsystem>,
-    ) -> Result<usize, TypedFd<Subsystem>> {
-        let mut rds = self.raw_descriptor_store.write();
-        self.insert_raw_fd_locked(&mut rds, typed_fd)
-    }
-
-    pub(super) fn insert_raw_fd_locked<Subsystem: FdEnabledSubsystem>(
-        &self,
-        rds: &mut litebox::fd::RawDescriptorStorage,
-        typed_fd: TypedFd<Subsystem>,
-    ) -> Result<usize, TypedFd<Subsystem>> {
-        let max_fd = self.max_fd.load(Ordering::Relaxed);
-        self.insert_raw_fd_at_or_above_locked(rds, typed_fd, 0, max_fd)
-    }
-
-    fn insert_raw_fd_at_or_above<Subsystem: FdEnabledSubsystem>(
-        &self,
-        typed_fd: TypedFd<Subsystem>,
-        min_fd: usize,
-        max_fd: usize,
-    ) -> Result<usize, TypedFd<Subsystem>> {
-        let mut rds = self.raw_descriptor_store.write();
-        self.insert_raw_fd_at_or_above_locked(&mut rds, typed_fd, min_fd, max_fd)
-    }
-
-    fn insert_raw_fd_at_or_above_locked<Subsystem: FdEnabledSubsystem>(
-        &self,
-        rds: &mut litebox::fd::RawDescriptorStorage,
-        typed_fd: TypedFd<Subsystem>,
-        min_fd: usize,
-        max_fd: usize,
-    ) -> Result<usize, TypedFd<Subsystem>> {
-        if min_fd >= max_fd {
-            return Err(typed_fd);
-        }
-
-        // XXX: Can clean+speed this up by exposing a new method at RawDescriptorStorage
-        let mut raw_fd = min_fd;
-        for occupied_raw_fd in rds.iter_alive().skip_while(|&fd| fd < min_fd) {
-            if occupied_raw_fd != raw_fd {
-                break;
-            }
-            raw_fd += 1;
-        }
-        if raw_fd >= max_fd {
-            return Err(typed_fd);
-        }
-        let success = rds.fd_into_specific_raw_integer(typed_fd, raw_fd);
-        assert!(success);
-        Ok(raw_fd)
     }
 
     /// Installs the descriptors a program inherited across `execve`.
@@ -522,7 +470,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             let raw_fd = inherited.fd as usize;
             if raw_fd < next_fd
                 || raw_fd - next_fd > MAX_INHERITED_FD_GAP
-                || raw_fd >= crate::syscalls::process::RLIMIT_NOFILE_MAX
+                || u64::from(inherited.fd) >= crate::syscalls::process::RLIMIT_NOFILE_MAX
             {
                 return Err(crate::loader::elf::ElfLoaderError::InvalidInheritedFds);
             }
@@ -774,7 +722,6 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         }
         Self {
             raw_descriptor_store: litebox::sync::RwLock::new(copy),
-            max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
         }
     }
 }
@@ -1131,16 +1078,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         file: litebox::fs::File<Platform>,
         flags: OFlags,
     ) -> Result<u32, Errno> {
-        let max_fd = self.files.borrow().max_fd.load(Ordering::Relaxed);
-        self.insert_raw_file_fd_below(file, flags, max_fd)
-    }
-
-    fn insert_raw_file_fd_below(
-        &self,
-        file: litebox::fs::File<Platform>,
-        flags: OFlags,
-        max_fd: usize,
-    ) -> Result<u32, Errno> {
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<FileSubsystem<Platform>>(file);
         if flags.contains(OFlags::CLOEXEC) {
@@ -1148,13 +1085,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             assert!(old.is_none());
         }
         drop(dt);
-        let files = self.files.borrow();
-        let raw_fd = files
-            .insert_raw_fd_at_or_above(typed, 0, max_fd)
-            .map_err(|typed| {
-                self.remove_and_drop_descriptor(&typed);
-                Errno::EMFILE
-            })?;
+        let raw_fd = self.insert_raw_fd(typed, None)?;
         Ok(u32::try_from(raw_fd).unwrap())
     }
 
@@ -1166,7 +1097,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let path = self.resolve_path(path)?;
         let flags = OFlags::RDONLY | OFlags::NOCTTY;
         let file = self.do_open(&path, flags, Mode::empty())?;
-        self.insert_raw_file_fd_below(file, flags, usize::MAX)
+        // XXX(jayb): The loader should use the open file without a guest descriptor.
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<FileSubsystem<Platform>>(file);
+        let files = self.files.borrow();
+        let fd = files
+            .raw_descriptor_store
+            .write()
+            .fd_into_raw_integer(typed);
+        Ok(u32::try_from(fd).unwrap())
     }
 
     /// Handle syscall `umask`
@@ -1954,6 +1896,54 @@ impl<Platform: ShimPlatform> Task<Platform> {
         drop(entry);
     }
 
+    // XXX(jayb): Move allocation into the broker with the guest fd table so constructors
+    // don't hold the shim's descriptor-table write lock across this round trip.
+    fn check_raw_fd_limit(&self, highest: usize, minimum: Option<usize>) -> Result<(), Errno> {
+        self.global
+            .litebox
+            .check_open_files(CheckOpenFilesRequest {
+                process_id: ProcessId(self.own_pid_for_requests().cast_unsigned()),
+                highest: highest as u64,
+                minimum: minimum.map(|fd| fd as u64),
+            })
+            .map_err(|error| match error {
+                ProcessError::ResourceExhausted => Errno::EMFILE,
+                ProcessError::PolicyDenied => Errno::EINVAL,
+                error => error.into(),
+            })
+    }
+
+    pub(super) fn choose_raw_fd(
+        &self,
+        rds: &litebox::fd::RawDescriptorStorage,
+        minimum: Option<usize>,
+    ) -> Result<usize, Errno> {
+        let raw_fd = find_free_raw_fd(rds, minimum.unwrap_or(0));
+        self.check_raw_fd_limit(raw_fd, minimum)?;
+        Ok(raw_fd)
+    }
+
+    /// Publishes a new descriptor, closing it on failure.
+    pub(super) fn insert_raw_fd<S: FdEnabledSubsystem>(
+        &self,
+        typed: TypedFd<S>,
+        minimum: Option<usize>,
+    ) -> Result<usize, Errno> {
+        let files = self.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+        match self.choose_raw_fd(&rds, minimum) {
+            Ok(raw_fd) => {
+                assert!(rds.fd_into_specific_raw_integer(typed, raw_fd));
+                Ok(raw_fd)
+            }
+            Err(error) => {
+                drop(rds);
+                self.remove_and_drop_descriptor(&typed);
+                Err(error)
+            }
+        }
+    }
+
     /// Installs `first` and `second` at the two lowest free descriptors, in that order, and passes
     /// their numbers to `publish`.
     ///
@@ -1969,23 +1959,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // another thread could see or close a new descriptor before `publish` fails, or let its
         // slot be reused, making the rollback remove an unrelated descriptor.
         let mut rds = files.raw_descriptor_store.write();
-        let first_raw_fd = match files.insert_raw_fd_locked(&mut rds, first) {
-            Ok(raw_fd) => raw_fd,
-            Err(first) => {
-                drop(rds);
-                self.remove_and_drop_descriptor_pair(&first, &second);
-                return Err(Errno::EMFILE);
-            }
-        };
-        let second_raw_fd = match files.insert_raw_fd_locked(&mut rds, second) {
-            Ok(raw_fd) => raw_fd,
-            Err(second) => {
-                let first = rds.fd_consume_raw_integer::<S>(first_raw_fd).unwrap();
-                drop(rds);
-                self.remove_and_drop_descriptor_pair(&first, &second);
-                return Err(Errno::EMFILE);
-            }
-        };
+        let first_raw_fd = find_free_raw_fd(&rds, 0);
+        let second_raw_fd = find_free_raw_fd(&rds, first_raw_fd + 1);
+        if let Err(error) = self.check_raw_fd_limit(second_raw_fd, None) {
+            drop(rds);
+            self.remove_and_drop_descriptor_pair(&first, &second);
+            return Err(error);
+        }
+        assert!(rds.fd_into_specific_raw_integer(first, first_raw_fd));
+        assert!(rds.fd_into_specific_raw_integer(second, second_raw_fd));
         let fds = (
             u32::try_from(first_raw_fd).unwrap(),
             u32::try_from(second_raw_fd).unwrap(),
@@ -2024,6 +2006,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(), Errno> {
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
+        if let Some(fd) = &replace
+            && let Err(error) = self.check_raw_fd_limit(raw_fd, None)
+        {
+            drop(rds);
+            self.remove_and_drop_descriptor(fd);
+            return Err(if error == Errno::EMFILE {
+                Errno::EBADF
+            } else {
+                error
+            });
+        }
         let consumed: AnyTypedFd<Platform> = match rds
             .fd_consume_raw_integer::<FileSubsystem<Platform>>(raw_fd)
         {
@@ -2032,6 +2025,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 if let Some(new_fd) = replace {
                     let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
                     assert!(success, "raw_fd slot is empty, so insert must succeed");
+                    return Ok(());
                 }
                 return Err(Errno::EBADF);
             }
@@ -2931,21 +2925,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 )
             }
             FcntlArg::DUPFD { cloexec, min_fd } => {
-                let new_file = self
-                    .do_dup_inner(
-                        &fd,
-                        if cloexec {
-                            OFlags::CLOEXEC
-                        } else {
-                            OFlags::empty()
-                        },
-                        DupFdRequest::LowestAtOrAbove(min_fd as usize),
-                    )
-                    .map_err(|e| match e {
-                        DupFdError::BadFd => Errno::EBADF,
-                        DupFdError::TooManyFiles => Errno::EMFILE,
-                        DupFdError::TargetFdExceedsLimit => Errno::EINVAL,
-                    })?;
+                let new_file = self.do_dup_inner(
+                    &fd,
+                    if cloexec {
+                        OFlags::CLOEXEC
+                    } else {
+                        OFlags::empty()
+                    },
+                    DupFdRequest::LowestAtOrAbove(min_fd as usize),
+                )?;
                 Ok(new_file.try_into().unwrap())
             }
             _ => unimplemented!(),
@@ -3138,11 +3126,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             assert!(old.is_none());
         }
         drop(dt);
-        let files = self.files.borrow();
-        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-            self.remove_and_drop_descriptor(&typed);
-            Errno::EMFILE
-        })?;
+        let raw_fd = self.insert_raw_fd(typed, None)?;
         Ok(raw_fd.try_into().unwrap())
     }
 
@@ -3422,11 +3406,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             assert!(old.is_none());
         }
         drop(dt);
-        let files = self.files.borrow();
-        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-            self.remove_and_drop_descriptor(&typed);
-            Errno::EMFILE
-        })?;
+        let raw_fd = self.insert_raw_fd(typed, None)?;
         Ok(raw_fd.try_into().unwrap())
     }
 
@@ -3611,12 +3591,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         nfds: usize,
         deadline: Option<<Platform as TimeProvider>::Instant>,
     ) -> Result<usize, Errno> {
-        if nfds
-            > self
-                .rlimit(litebox_common_linux::RlimitResource::NOFILE)
-                .rlim_cur
-        {
-            return Err(Errno::EINVAL);
+        if let Some(highest) = nfds.checked_sub(1) {
+            self.check_raw_fd_limit(highest, None).map_err(|error| {
+                if error == Errno::EMFILE {
+                    Errno::EINVAL
+                } else {
+                    error
+                }
+            })?;
         }
         let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
 
@@ -3838,121 +3820,38 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(count)
     }
 
-    fn do_dup(&self, file: &AnyTypedFd<Platform>, flags: OFlags) -> Result<usize, DupFdError> {
-        self.do_dup_inner(file, flags, DupFdRequest::LowestAvailable)
-    }
-
     fn do_dup_inner(
         &self,
         file: &AnyTypedFd<Platform>,
         flags: OFlags,
         target: DupFdRequest,
-    ) -> Result<usize, DupFdError> {
+    ) -> Result<usize, Errno> {
         fn dup<Platform: ShimPlatform, S: FdEnabledSubsystem>(
             task: &Task<Platform>,
-            files: &FilesState<Platform>,
             fd: &TypedFd<S>,
             close_on_exec: bool,
             target: DupFdRequest,
-            close_typed_fd: impl FnOnce(TypedFd<S>),
-        ) -> Result<usize, DupFdError> {
-            let max_fd = files.max_fd.load(Ordering::Relaxed);
-            match target {
-                DupFdRequest::Exact(target) | DupFdRequest::LowestAtOrAbove(target)
-                    if target >= max_fd =>
-                {
-                    return Err(DupFdError::TargetFdExceedsLimit);
-                }
-                DupFdRequest::LowestAvailable if max_fd == 0 => {
-                    return Err(DupFdError::TooManyFiles);
-                }
-                _ => {}
-            }
-
+        ) -> Result<usize, Errno> {
             let mut dt = task.global.litebox.descriptor_table_mut();
-            let fd: TypedFd<_> = dt.duplicate(fd).ok_or(DupFdError::BadFd)?;
+            let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
             if close_on_exec {
                 let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
                 assert!(old.is_none());
             }
             drop(dt);
 
-            let new_fd = match target {
+            match target {
                 DupFdRequest::Exact(target) => {
-                    let _ = task.do_close_and_replace(target, Some(fd));
-                    target
+                    task.do_close_and_replace(target, Some(fd))?;
+                    Ok(target)
                 }
-                DupFdRequest::LowestAvailable => {
-                    match files.insert_raw_fd_at_or_above(fd, 0, max_fd) {
-                        Ok(fd) => fd,
-                        Err(fd) => {
-                            close_typed_fd(fd);
-                            return Err(DupFdError::TooManyFiles);
-                        }
-                    }
-                }
-                DupFdRequest::LowestAtOrAbove(min_fd) => {
-                    match files.insert_raw_fd_at_or_above(fd, min_fd, max_fd) {
-                        Ok(fd) => fd,
-                        Err(fd) => {
-                            close_typed_fd(fd);
-                            return Err(DupFdError::TooManyFiles);
-                        }
-                    }
-                }
-            };
-            Ok(new_fd)
+                DupFdRequest::LowestAvailable => task.insert_raw_fd(fd, None),
+                DupFdRequest::LowestAtOrAbove(min_fd) => task.insert_raw_fd(fd, Some(min_fd)),
+            }
         }
 
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
-        let files = self.files.borrow();
-        file.dispatch(
-            |fd| {
-                dup(self, &files, fd, close_on_exec, target, |fd| {
-                    self.remove_and_drop_descriptor(&fd);
-                })
-            },
-            |fd| {
-                dup(self, &files, fd, close_on_exec, target, |fd| {
-                    self.remove_and_drop_descriptor(&fd);
-                })
-            },
-            |fd| {
-                dup(self, &files, fd, close_on_exec, target, |fd| {
-                    self.remove_and_drop_descriptor(&fd);
-                })
-            },
-            |fd| {
-                dup(self, &files, fd, close_on_exec, target, |fd| {
-                    self.remove_and_drop_descriptor(&fd);
-                })
-            },
-            |fd| {
-                dup(self, &files, fd, close_on_exec, target, |fd| {
-                    self.remove_and_drop_descriptor(&fd);
-                })
-            },
-            |fd| {
-                dup(self, &files, fd, close_on_exec, target, |fd| {
-                    self.remove_and_drop_descriptor(&fd);
-                })
-            },
-            |fd| {
-                dup(self, &files, fd, close_on_exec, target, |fd| {
-                    self.remove_and_drop_descriptor(&fd);
-                })
-            },
-            |fd| {
-                dup(self, &files, fd, close_on_exec, target, |fd| {
-                    self.remove_and_drop_descriptor(&fd);
-                })
-            },
-            |fd| {
-                dup(self, &files, fd, close_on_exec, target, |fd| {
-                    self.remove_and_drop_descriptor(&fd);
-                })
-            },
-        )
+        on_any_fd!(file, |fd| dup(self, fd, close_on_exec, target))
     }
 
     /// Handle syscall `dup/dup2/dup3`
@@ -3992,12 +3891,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             )
         } else {
             // dup
-            self.do_dup(&typed_oldfd, flags.unwrap_or(OFlags::empty()))
+            self.do_dup_inner(
+                &typed_oldfd,
+                flags.unwrap_or(OFlags::empty()),
+                DupFdRequest::LowestAvailable,
+            )
         }
-        .map_err(|e| match e {
-            DupFdError::BadFd | DupFdError::TargetFdExceedsLimit => Errno::EBADF,
-            DupFdError::TooManyFiles => Errno::EMFILE,
-        })
         .map(|new_fd| u32::try_from(new_fd).unwrap())
     }
 }
@@ -4008,16 +3907,6 @@ enum DupFdRequest {
     LowestAtOrAbove(usize),
     /// Duplicate to the specified fd, closing it first if it's open.
     Exact(usize),
-}
-
-#[derive(Error, Debug)]
-enum DupFdError {
-    #[error("Bad file descriptor")]
-    BadFd,
-    #[error("Too many open files")]
-    TooManyFiles,
-    #[error("Target fd exceeds process limit")]
-    TargetFdExceedsLimit,
 }
 
 const DIRENT_STRUCT_BYTES_WITHOUT_NAME: usize =

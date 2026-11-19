@@ -342,18 +342,21 @@ impl SharedHostNames {
 struct ResourceLimits {
     cpu_time: ResourceLimit,
     tasks: ResourceLimit,
+    open_files: ResourceLimit,
 }
 
 impl ResourceLimits {
-    const UNLIMITED: Self = Self {
+    const DEFAULT: Self = Self {
         cpu_time: ResourceLimit::UNLIMITED,
         tasks: ResourceLimit::UNLIMITED,
+        open_files: ResourceLimit::DEFAULT_OPEN_FILES,
     };
 
     fn get(&self, resource: ResourceKind) -> ResourceLimit {
         match resource {
             ResourceKind::CpuTime => self.cpu_time,
             ResourceKind::Tasks => self.tasks,
+            ResourceKind::OpenFiles => self.open_files,
         }
     }
 
@@ -361,6 +364,7 @@ impl ResourceLimits {
         match resource {
             ResourceKind::CpuTime => &mut self.cpu_time,
             ResourceKind::Tasks => &mut self.tasks,
+            ResourceKind::OpenFiles => &mut self.open_files,
         }
     }
 }
@@ -633,7 +637,7 @@ impl BrokerProcess {
             |creator| creator.process_group(),
         );
         process_group.retain();
-        let resource_limits = creator.map_or(ResourceLimits::UNLIMITED, |creator| {
+        let resource_limits = creator.map_or(ResourceLimits::DEFAULT, |creator| {
             creator.resource_limits.lock().limits
         });
         let socket_account = Arc::new(SocketAccount::new(&core, key));
@@ -1325,6 +1329,27 @@ impl BrokerProcess {
             enforcement(resource, limit);
         }
         Ok(previous)
+    }
+
+    /// Checks the highest candidate and any requested minimum against the same soft limit.
+    /// A rejected minimum is `PolicyDenied`; a candidate at or past the limit is
+    /// `ResourceExhausted`.
+    pub fn check_open_files(
+        &self,
+        target: ProcessId,
+        highest: u64,
+        minimum: Option<u64>,
+    ) -> Result<()> {
+        let limit = self
+            .get_resource_limit(target, ResourceKind::OpenFiles)?
+            .soft();
+        if minimum.is_some_and(|minimum| minimum >= limit) {
+            return Err(BrokerError::PolicyDenied);
+        }
+        if highest >= limit {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        Ok(())
     }
 
     /// Calls `f` with the resource limits of this process or of its pending
@@ -4335,7 +4360,11 @@ mod tests {
         for resource in ResourceKind::ALL {
             assert_eq!(
                 parent.get_resource_limit(parent_id, resource),
-                Ok(ResourceLimit::UNLIMITED)
+                Ok(if resource == ResourceKind::OpenFiles {
+                    ResourceLimit::DEFAULT_OPEN_FILES
+                } else {
+                    ResourceLimit::UNLIMITED
+                })
             );
         }
         let limit = ResourceLimit::new(2, 5).unwrap();
@@ -4526,6 +4555,7 @@ mod tests {
             [
                 (ResourceKind::CpuTime, cpu_limit),
                 (ResourceKind::Tasks, ResourceLimit::UNLIMITED),
+                (ResourceKind::OpenFiles, ResourceLimit::DEFAULT_OPEN_FILES),
             ]
         );
 

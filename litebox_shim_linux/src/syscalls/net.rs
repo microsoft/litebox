@@ -36,7 +36,7 @@ use litebox_platform::time::Instant as _;
 
 use crate::guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
 use crate::syscalls::{
-    file::{AnyTypedFd, FilesState},
+    file::AnyTypedFd,
     inet::{self, InetSocket, InetSocketSubsystem},
     unix::{self, UnixSocket, UnixSocketAddr, UnixSocketSubsystem},
     vsock::{self, VsockSocket, VsockSocketSubsystem},
@@ -396,19 +396,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: SockFlags,
         protocol: u8,
     ) -> Result<u32, Errno> {
-        let files = self.files.borrow();
         let file = match domain {
             AddressFamily::INET => {
                 let socket = InetSocket::new(&self.global.litebox, ty, protocol, flags)?;
-                self.insert_socket::<InetSocketSubsystem<Platform>>(&files, socket, flags)?
+                self.insert_socket::<InetSocketSubsystem<Platform>>(socket, flags)?
             }
             AddressFamily::UNIX => {
                 let socket = UnixSocket::new(&self.global.litebox, ty, protocol, flags)?;
-                self.insert_socket::<UnixSocketSubsystem<Platform>>(&files, socket, flags)?
+                self.insert_socket::<UnixSocketSubsystem<Platform>>(socket, flags)?
             }
             AddressFamily::VSOCK => {
                 let socket = VsockSocket::new(&self.global.litebox, ty, protocol, flags)?;
-                self.insert_socket::<VsockSocketSubsystem<Platform>>(&files, socket, flags)?
+                self.insert_socket::<VsockSocketSubsystem<Platform>>(socket, flags)?
             }
             AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
             _ => unimplemented!(),
@@ -421,7 +420,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `SOCK_CLOEXEC` in `flags` sets the descriptor's close-on-exec flag.
     fn insert_socket<S: FdEnabledSubsystem>(
         &self,
-        files: &FilesState<Platform>,
         socket: S::Entry,
         flags: SockFlags,
     ) -> Result<usize, Errno> {
@@ -434,10 +432,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             typed
         };
-        files.insert_raw_fd(typed).map_err(|typed| {
-            self.remove_and_drop_descriptor(&typed);
-            Errno::EMFILE
-        })
+        self.insert_raw_fd(typed, None)
     }
 
     pub(crate) fn sys_socketpair(
@@ -621,20 +616,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     want_peer.then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
                 let accepted = socket.accept(&self.wait_cx(), flags, socket_addr.as_mut())?;
                 let raw_fd =
-                    self.insert_socket::<InetSocketSubsystem<Platform>>(&files, accepted, flags)?;
+                    self.insert_socket::<InetSocketSubsystem<Platform>>(accepted, flags)?;
                 Ok((raw_fd, socket_addr.map(SocketAddress::Inet)))
             },
             |socket| {
                 let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);
                 let accepted = socket.accept(&self.wait_cx(), flags, socket_addr.as_mut())?;
                 let raw_fd =
-                    self.insert_socket::<UnixSocketSubsystem<Platform>>(&files, accepted, flags)?;
+                    self.insert_socket::<UnixSocketSubsystem<Platform>>(accepted, flags)?;
                 Ok((raw_fd, socket_addr.map(SocketAddress::Unix)))
             },
             |socket| {
                 let (accepted, peer) = socket.accept(&self.wait_cx(), flags)?;
                 let raw_fd =
-                    self.insert_socket::<VsockSocketSubsystem<Platform>>(&files, accepted, flags)?;
+                    self.insert_socket::<VsockSocketSubsystem<Platform>>(accepted, flags)?;
                 Ok((raw_fd, want_peer.then_some(SocketAddress::Vsock(peer))))
             },
         )?;

@@ -110,11 +110,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             assert!(old.is_none());
         }
         drop(dt);
-        let files = self.files.borrow();
-        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-            self.remove_and_drop_descriptor(&typed);
-            Errno::EMFILE
-        })?;
+        let raw_fd = self.insert_raw_fd(typed, None)?;
         Ok(raw_fd.try_into().unwrap())
     }
 

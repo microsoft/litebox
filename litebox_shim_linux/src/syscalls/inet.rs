@@ -914,11 +914,21 @@ mod tests {
 
     #[test]
     fn inet_socket_returns_emfile_at_raw_fd_limit() {
+        use litebox_common_linux::{Rlimit, RlimitResource};
+
         let task = init_platform();
         let fd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .unwrap();
-        task.files.borrow().set_max_fd(fd as usize);
+        let limit = fd as usize;
+        task.do_prlimit(
+            RlimitResource::NOFILE,
+            Some(Rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            }),
+        )
+        .unwrap();
         assert_eq!(
             task.do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0),
             Err(Errno::EMFILE)

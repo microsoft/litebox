@@ -526,11 +526,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         let resource_limits = resource_limits
             .unwrap_or_else(syscalls::process::ResourceLimits::<Platform>::default_values);
 
-        let files = syscalls::file::FilesState::new();
-        files.set_max_fd(
-            resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
-        );
-        let files = Arc::new(files);
+        let files = Arc::new(syscalls::file::FilesState::new());
         let credentials = Arc::new(syscalls::process::Credentials {
             uid,
             euid,
@@ -711,9 +707,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         }
 
         let files = syscalls::file::FilesState::new();
-        files.set_max_fd(
-            resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
-        );
         files
             .install_forked_fds(&self.0, &fds)
             .map_err(ForkRestoreError::Descriptors)?;

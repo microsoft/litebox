@@ -155,19 +155,22 @@ wire_enum! {
         /// Creating a thread or process fails with `ResourceExhausted` once the
         /// creator's job has as many threads as the creator's soft limit.
         Tasks,
+        /// Exclusive upper bound on the number assigned to a new file descriptor.
+        /// Lowering it does not invalidate already-open descriptors.
+        OpenFiles,
     }
 }
 
 impl ResourceKind {
     /// Every kind.
-    pub const ALL: [Self; 2] = [Self::CpuTime, Self::Tasks];
+    pub const ALL: [Self; 3] = [Self::CpuTime, Self::Tasks, Self::OpenFiles];
 }
 
 /// Soft and hard limits on a process's use of one [`ResourceKind`].
 ///
 /// The soft limit never exceeds the hard limit. A process starts with the
-/// limits of the process that created it, or unlimited if none did, and can
-/// lower its hard limit but never raise it.
+/// limits of the process that created it, or the resource's default if none did.
+/// It can lower its hard limit but never raise it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceLimit {
     soft: u64,
@@ -182,6 +185,12 @@ impl ResourceLimit {
     pub const UNLIMITED: Self = Self {
         soft: Self::INFINITY,
         hard: Self::INFINITY,
+    };
+
+    /// Initial soft and hard descriptor number limit, matching Linux's `nr_open`.
+    pub const DEFAULT_OPEN_FILES: Self = Self {
+        soft: 1 << 20,
+        hard: 1 << 20,
     };
 
     /// Returns the limits `soft` and `hard`, or `None` if `soft` exceeds
@@ -229,6 +238,19 @@ wire_struct! {
         pub resource: ResourceKind,
         /// The new limits, whose hard limit cannot exceed the current one.
         pub limit: ResourceLimit,
+    }
+}
+
+wire_struct! {
+    /// Checks candidate descriptor numbers against the process's soft open-file limit.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CheckOpenFilesRequest {
+        /// The caller or its pending child.
+        pub process_id: ProcessId,
+        /// The highest descriptor number to check (or one less than a poll count).
+        pub highest: u64,
+        /// A user-specified minimum descriptor number, as in `F_DUPFD`.
+        pub minimum: Option<u64>,
     }
 }
 

@@ -648,6 +648,9 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::SetResourceLimit(request) => process
             .set_resource_limit(request.process_id, request.resource, request.limit)
             .map(ProcessResponse::SetResourceLimit),
+        ProcessRequest::CheckOpenFiles(request) => process
+            .check_open_files(request.process_id, request.highest, request.minimum)
+            .map(|()| ProcessResponse::CheckOpenFiles),
         ProcessRequest::GetHostNames(request) => {
             return get_host_names(process, request, shared_buffers)
                 .map(ProcessResponse::GetHostNames);

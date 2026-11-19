@@ -21,12 +21,13 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameSizes,
-    OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, CheckOpenFilesRequest, ChildExit, ChildSelector, CpuTime,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostNameSizes, OpenProcessHandleRequest, PidNamespaceOptions,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceLimit,
+    SetHostNameRequest, SetParentExitSignalRequest, SetResourceLimitRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+    WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -222,7 +223,8 @@ impl BrokerOperation {
                 | ProcessRequest::CopyHostNames(_)
                 | ProcessRequest::OpenProcessHandle(_)
                 | ProcessRequest::GetParentExitSignal(_)
-                | ProcessRequest::SetParentExitSignal(_),
+                | ProcessRequest::SetParentExitSignal(_)
+                | ProcessRequest::CheckOpenFiles(_),
             )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
@@ -516,6 +518,10 @@ wire_enum! {
         /// The broker returns `UnknownObject` if the process is neither, and
         /// `UnsupportedOperation` for a signal number above [`crate::signal::MAX_SIGNAL`].
         SetParentExitSignal(SetParentExitSignalRequest),
+        /// Check descriptor numbers of the caller or its pending child against the soft limit.
+        /// The broker returns `PolicyDenied` if the requested minimum is out of range and
+        /// `ResourceExhausted` if the highest candidate is out of range.
+        CheckOpenFiles(CheckOpenFilesRequest),
     }
 }
 
@@ -847,6 +853,8 @@ wire_enum! {
         GetParentExitSignal(u32),
         /// The parent-exit signal was set.
         SetParentExitSignal,
+        /// The descriptor numbers are within the soft limit.
+        CheckOpenFiles,
     }
 }
 
