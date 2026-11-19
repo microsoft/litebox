@@ -21,12 +21,18 @@
 //!
 //! AArch64 Mach-O syscall and thread-pointer rewriting is supported; see
 //! [`mod@macho`] for loader requirements.
+//!
+//! The rewriter builds for x86-64 and AArch64. On either architecture it can
+//! rewrite RV64 Linux guests ahead of time: the backend supports a subset of
+//! integer and compressed instructions in static ET_EXEC files with ELF mapping symbols.
+//! It redirects ECALL and virtualizes gp using [`litebox_trampoline::riscv64::GateTls`].
+//! There is not yet a corresponding RV64 Linux userland runner.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
-// Only the runtime entry points dispatch on `target_arch`; the ahead-of-time
-// ones select the architecture from the input object and build anywhere.
+// Runtime patching requires a supported host. Ahead-of-time patching selects
+// the guest architecture from the input object instead.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!(
     "litebox_syscall_rewriter's runtime patching entry points support only x86-64 and AArch64 hosts"
@@ -34,6 +40,7 @@ compile_error!(
 
 pub mod aarch64;
 pub mod macho;
+mod riscv64;
 pub use macho::{hook_syscalls_in_macho, hook_syscalls_in_macho_with_options};
 
 /// `LEA RCX, [RIP + X86_64_SYSCALL_ENTRY_JMP_LEN]`, which precedes an x86-64 ELF trampoline's
@@ -351,8 +358,11 @@ const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
 ///
-/// The `trampoline` must be an absolute address if specified; if unspecified, it will be set to
-/// zeros, and it is the caller's decision to overwrite it at loading time.
+/// On x86-64 and AArch64, `trampoline` is an absolute callback address; if omitted,
+/// the address is zero for the loader to fill in. On RV64, pass `None` or `Some(0)`:
+/// the gate reads the callback from the current thread's
+/// [`GateTls::syscall_entry`](litebox_trampoline::riscv64::GateTls::syscall_entry).
+/// A nonzero address is rejected.
 ///
 /// If rewriting emits trampoline stubs, the returned executable has trampoline code appended at a
 /// page-aligned offset after the ELF file. The file layout is:
@@ -366,7 +376,7 @@ const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 ///
 /// This layout allows loaders to read just the last 32 bytes to get the metadata.
 ///
-/// When there is nothing to patch, both architectures append only a 32-byte
+/// When there is nothing to patch in the identified code ranges, the rewriter appends only a 32-byte
 /// header carrying a `trampoline_size = 0` *sentinel* (no trampoline body), so a
 /// loader can distinguish "processed, nothing to patch" from "never processed";
 /// no instructions are rewritten in that case.
@@ -377,12 +387,15 @@ const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 /// (`SVC`) instructions. See the `aarch64` module docs.
 ///
 /// Returns the rewritten binary. Binaries that cannot or do not need to be
-/// patched (relocatable objects, non-ELF files, already-hooked binaries,
-/// binaries without executable sections) are returned unchanged.
+/// patched (relocatable objects, non-ELF files, already-hooked binaries) are returned unchanged.
+/// ELFs without executable sections pass through on x86-64 and AArch64. An RV64
+/// executable must have at least one code range identified by ELF mapping symbols;
+/// otherwise rewriting returns an error.
 ///
 /// Returns `Err` for genuinely broken inputs (corrupt ELF, unsupported
 /// executables like Bun, arithmetic overflow) and for binaries that contain
-/// patch sites that could not be redirected. An unpatchable site is replaced
+/// patch sites that could not be redirected. On RV64, an unreachable gate or
+/// unsupported instruction returns an error. On x86-64 and AArch64, an unpatchable site is replaced
 /// with a trapping instruction so it faults instead of escaping to the host
 /// kernel: `icebp; hlt` on x86-64, and `BRK` on AArch64 (where a patch site is
 /// an `SVC`, `MSR TPIDR_EL0`, `MRS TPIDR_EL0`, or enabled x18 instruction).
@@ -427,7 +440,6 @@ fn hook_syscalls_in_elf_inner(
             "big-endian AArch64 ELF".into(),
         ));
     }
-
     // Relocatable object files (.o) must not be patched: they are linker
     // input, not executable code. Rewriting instructions or appending
     // trampoline data would corrupt the object file for the linker.
@@ -444,6 +456,13 @@ fn hook_syscalls_in_elf_inner(
         if e_type == object::elf::ET_REL {
             return Ok(input_binary.to_vec());
         }
+    }
+    if input_binary.get(core::mem::offset_of!(object::elf::Ident, class))
+        == Some(&object::elf::ELFCLASS64)
+        && data == Some(&object::elf::ELFDATA2MSB)
+        && machine == Some(object::elf::EM_RISCV)
+    {
+        return Err(Error::UnsupportedExecutable("big-endian RISC-V ELF".into()));
     }
 
     // Make a single mutable, 8-byte-aligned copy of the input binary. This serves as both the
@@ -462,6 +481,22 @@ fn hook_syscalls_in_elf_inner(
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
     let (arch, text_sections, aarch64_code_sections, placement) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
+
+        if matches!(file, object::File::Elf64(_))
+            && file.architecture() == object::Architecture::Riscv64
+        {
+            if options != RewriteOptions::default() || trampoline.unwrap_or(0) != 0 {
+                return Err(Error::UnsupportedExecutable(
+                    "RV64 gates require Linux defaults and a per-thread callback".into(),
+                ));
+            }
+            if is_already_hooked(buf) {
+                return Ok(input_binary.to_vec());
+            }
+            let ranges = riscv64::code_ranges(&file)?;
+            let base = find_addr_for_trampoline_code(&file, options.target_host())?.addr();
+            return riscv64::rewrite_elf(input_binary, buf, &ranges, base);
+        }
 
         let arch = match file {
             object::File::Elf64(_) => match file.architecture() {
@@ -490,7 +525,7 @@ fn hook_syscalls_in_elf_inner(
             (sections, Vec::new())
         };
 
-        if is_already_hooked(&*buf, arch) {
+        if is_already_hooked(buf) {
             return Ok(input_binary.to_vec());
         }
 
@@ -533,15 +568,7 @@ fn hook_syscalls_in_elf_inner(
     )?;
 
     if !patch_result.found_syscall {
-        let mut out = input_binary.to_vec();
-        let header = TrampolineHeader64 {
-            magic: *TRAMPOLINE_MAGIC,
-            file_offset: 0.into(),
-            vaddr: 0.into(),
-            trampoline_size: 0.into(),
-        };
-        out.extend_from_slice(header.as_bytes());
-        return Ok(out);
+        return Ok(elf_with_empty_footer(input_binary));
     }
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
@@ -566,7 +593,7 @@ fn hook_syscalls_in_elf_inner(
 /// through a LiteBox trampoline appended as a file overlay. The Windows shim
 /// loader maps that overlay by reading the footer this function appends.
 pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
-    if is_already_hooked(input_binary, Arch::X86_64) {
+    if is_already_hooked(input_binary) {
         return Ok(input_binary.to_vec());
     }
 
@@ -1070,6 +1097,19 @@ fn patch_dense_windows_syscall_stubs_in_sections(
     Ok(patched_any)
 }
 
+/// A processed ELF without patch sites retains its original bytes.
+fn elf_with_empty_footer(input_binary: &[u8]) -> Vec<u8> {
+    let mut out = input_binary.to_vec();
+    let header = TrampolineHeader64 {
+        magic: *TRAMPOLINE_MAGIC,
+        file_offset: 0.into(),
+        vaddr: 0.into(),
+        trampoline_size: 0.into(),
+    };
+    out.extend_from_slice(header.as_bytes());
+    out
+}
+
 fn append_trampoline_footer(
     out: &mut Vec<u8>,
     trampoline_data: &mut Vec<u8>,
@@ -1187,17 +1227,7 @@ fn hook_aarch64_elf_at(
         aarch64::RewriteConfig::for_options(options)?,
     )?
     else {
-        // No patch sites: emit the original binary with a size-0 sentinel
-        // header so the loader knows there is no trampoline to map.
-        let mut out = input_binary.to_vec();
-        let header = TrampolineHeader64 {
-            magic: *TRAMPOLINE_MAGIC,
-            file_offset: 0.into(),
-            vaddr: 0.into(),
-            trampoline_size: 0.into(),
-        };
-        out.extend_from_slice(header.as_bytes());
-        return Ok(out);
+        return Ok(elf_with_empty_footer(input_binary));
     };
 
     // Build output: [patched ELF][padding to page boundary][trampoline][header].
@@ -1258,10 +1288,8 @@ fn text_sections(
 }
 
 /// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
-fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
-    let header_size = match arch {
-        Arch::X86_64 | Arch::Aarch64 => size_of::<TrampolineHeader64>(),
-    };
+fn is_already_hooked(input_binary: &[u8]) -> bool {
+    let header_size = size_of::<TrampolineHeader64>();
 
     if input_binary.len() < header_size {
         return false;

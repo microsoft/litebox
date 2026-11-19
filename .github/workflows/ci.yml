@@ -245,6 +245,35 @@ jobs:
           path: ~/vhost-device-vsock
           key: ${{ steps.vhost-device-vsock.outputs.cache-primary-key }}
 
+  build_and_test_riscv64:
+    name: Build and Test (RV64 Linux, QEMU user mode)
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: -Dwarnings
+      CARGO_BUILD_TARGET: riscv64gc-unknown-linux-gnu
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUNNER: qemu-riscv64 -L /usr/riscv64-linux-gnu
+      # Grow this list as each crate gains RV64 support.
+      RISCV64_CRATES: -p litebox_platform -p litebox_trampoline
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component clippy --target "$CARGO_BUILD_TARGET"
+      - name: Set up Nextest
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - name: Install RV64 cross toolchain and emulator
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user
+      - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $RISCV64_CRATES
+      - run: ./.github/tools/github_actions_run_cargo nextest --all-features $RISCV64_CRATES
+      - name: Execute an ahead-of-time rewritten RV64 guest
+        run: ./.github/tools/github_actions_run_cargo nextest --target x86_64-unknown-linux-gnu -p litebox_syscall_rewriter --test riscv64_tests --run-ignored only
+
   build_and_test_arm64:
     name: Build and Test (AArch64)
     runs-on: ubuntu-24.04-arm

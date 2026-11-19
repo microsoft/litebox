@@ -6,6 +6,7 @@
 extern crate alloc;
 
 pub mod aarch64;
+pub mod riscv64;
 use alloc::string::String;
 use core::ops::Range;
 use zerocopy::{
@@ -97,7 +98,7 @@ pub enum TargetHost {
 /// Callback-slot bytes the caller must populate; zero when emitted inline.
 #[cfg(target_arch = "x86_64")]
 pub const TRAMPOLINE_ENTRY_POINT_BYTES: usize = size_of::<u64>();
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub const TRAMPOLINE_ENTRY_POINT_BYTES: usize = 0;
 
 /// Alignment every write cursor into a trampoline must satisfy.
@@ -105,6 +106,8 @@ pub const TRAMPOLINE_ENTRY_POINT_BYTES: usize = 0;
 pub const TRAMPOLINE_CURSOR_ALIGN: usize = 1;
 #[cfg(target_arch = "aarch64")]
 pub const TRAMPOLINE_CURSOR_ALIGN: usize = aarch64::GATE_ALIGNMENT;
+#[cfg(target_arch = "riscv64")]
+pub const TRAMPOLINE_CURSOR_ALIGN: usize = 4;
 
 /// Furthest preferred trampoline base from the code segment.
 ///
@@ -114,6 +117,9 @@ pub const TRAMPOLINE_CURSOR_ALIGN: usize = aarch64::GATE_ALIGNMENT;
 pub const MAX_TRAMPOLINE_DISPLACEMENT: usize = 0x7FFF_0000;
 #[cfg(target_arch = "aarch64")]
 pub const MAX_TRAMPOLINE_DISPLACEMENT: usize = 0x07FF_0000;
+/// Leave a page of margin within the signed 21-bit range of `jal`.
+#[cfg(target_arch = "riscv64")]
+pub const MAX_TRAMPOLINE_DISPLACEMENT: usize = 0x000F_F000;
 
 /// Length of the `JMP [RIP + disp32]` through which an x86-64 ELF trampoline enters the syscall
 /// callback. The preceding `LEA RCX, [RIP + len]` points RCX, the callback's resume PC, just past it.
@@ -122,13 +128,20 @@ pub const X86_64_SYSCALL_ENTRY_JMP_LEN: u8 = 6;
 /// Length of the guest instruction through which a rewritten Linux syscall enters the syscall
 /// callback.
 ///
-/// The callback's resume PC immediately follows this instruction, so moving the PC back by this
-/// length, with the syscall's registers restored, reissues the syscall. On x86-64 it is the ELF
+/// On x86-64 and AArch64 the callback's resume PC immediately follows this instruction.
+/// Moving it back by this length, with the syscall's registers restored, reissues the syscall.
+/// On x86-64 it is the ELF
 /// trampoline's `JMP [RIP + disp32]`; on AArch64 it is the `B` that replaces the `SVC` in place.
 #[cfg(target_arch = "x86_64")]
 pub const SYSCALL_ENTRY_INSTRUCTION_LEN: usize = X86_64_SYSCALL_ENTRY_JMP_LEN as usize;
 #[cfg(target_arch = "aarch64")]
 pub const SYSCALL_ENTRY_INSTRUCTION_LEN: usize = aarch64::INSN_BYTES;
+/// Length of the `jal` replacing `ecall` at the guest syscall site. To restart,
+/// subtract this from the guest PC immediately after the original `ecall`.
+/// Do not subtract it from the callback's `t0`: that points to the continuation
+/// inside the gate, not to the next guest instruction.
+#[cfg(target_arch = "riscv64")]
+pub const SYSCALL_ENTRY_INSTRUCTION_LEN: usize = 4;
 
 /// Conservative address bounds reachable from the entire nonempty code span.
 ///
