@@ -873,11 +873,24 @@ pub fn map_shared(
     process: &BrokerProcess,
     handle: ObjectHandle,
 ) -> Result<FileResult<SharedFileMapping>> {
-    let file = file(
+    let file = match file(
         process,
         handle,
         HandleOperations::MAP | HandleOperations::READ,
-    )?;
+    ) {
+        Ok(file) => file,
+        // A holder allowed to query the open mode can distinguish a path-only handle.
+        // This error does not require, or grant, access to the mapping.
+        Err(BrokerError::InvalidRights)
+            if process
+                .get_status_flags(handle)?
+                .flags
+                .contains(FileOpenFlags::PATH) =>
+        {
+            return Ok(Err(FileError::PathOnly));
+        }
+        Err(error) => return Err(error),
+    };
     let handle_writable = process
         .authorized_operation(handle, HandleOperations::WRITE)
         .is_ok();

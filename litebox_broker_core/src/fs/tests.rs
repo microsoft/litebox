@@ -3,9 +3,9 @@
 
 //! Filesystem semantics for the broker-core resolver and its backends.
 //!
-//! These tests drive the resolver and the backends directly. There is deliberately no broker
-//! process, transport, or guest descriptor table involved: the semantics under test are owned by
-//! broker core.
+//! These tests drive the resolver and its backends directly, or use a broker process where the
+//! result also depends on the reference's permissions. Neither path requires a transport or a
+//! guest descriptor table.
 
 use alloc::borrow::Cow;
 
@@ -5342,6 +5342,59 @@ mod credentials {
     }
 
     #[test]
+    fn mapping_a_queryable_path_only_terminal_reports_path_only() {
+        use crate::readiness::{ReadinessSink, tests::TestReadinessSink};
+        use crate::test_support::TestBrokerBuilder;
+        use crate::{BrokerError, CallerCredential, HandleOperations, ObjectRights, PolicyEngine};
+        use litebox_broker_protocol::fs::{FileAccessMode, FileCaller, FileError, FileOpenFlags};
+
+        let carol = Credentials::new(CAROL);
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(Arc::new(with_devices(device_security())))
+        .build()
+        .unwrap();
+        let process = broker
+            .core
+            .create_process(
+                CallerCredential::Unauthenticated,
+                Arc::new(carol.authority),
+                &broker.pid_namespace,
+                &broker.fs,
+                &broker.job,
+                broker.host_names.clone(),
+                None,
+            )
+            .unwrap();
+        process.complete_start().unwrap();
+        let subject = process.create_subject(carol.subject).unwrap();
+        let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+        let path = crate::fs::open(
+            &process,
+            "/dev/tty",
+            FileCaller::Subject(subject),
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::PATH,
+            Mode::empty(),
+            &sink,
+        )
+        .unwrap()
+        .unwrap();
+        let map = |handle| crate::fs::map_shared(&process, handle).map(|result| result.map(|_| ()));
+        assert_eq!(map(path), Ok(Err(FileError::PathOnly)));
+        let wait_only = process
+            .duplicate_object_operations_to(
+                path,
+                &process,
+                ObjectRights::WAIT,
+                HandleOperations::WAIT,
+            )
+            .unwrap();
+        assert_eq!(map(wait_only), Err(BrokerError::InvalidRights));
+    }
+
+    #[test]
     fn checked_truncation_of_mapped_files_changes_all_or_nothing() {
         use crate::fs::backend::{Resolution, ResolvedTarget};
 
@@ -6160,7 +6213,16 @@ mod credentials {
             fs.read_dir_as(Some(bob.caller()), &directory),
             Err(ReadDirError::NotOpenForReading)
         ));
-        assert_eq!(read_as(&fs, Some(&carol), &file).unwrap(), b"data");
+        let mut writer = fs
+            .open(carol.caller(), "/dir/file", OFlags::RDWR, Mode::empty())
+            .unwrap();
+        assert_eq!(
+            fs.write_as(carol.caller(), &mut writer, b"copy", Some(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(read_as(&fs, Some(&carol), &writer).unwrap(), b"copy");
+        assert_eq!(read_as(&fs, Some(&carol), &file).unwrap(), b"copy");
         assert!(fs.read_dir_as(Some(carol.caller()), &directory).is_ok());
     }
 
@@ -6376,9 +6438,17 @@ mod credentials {
         fs.set_times(carol.caller(), &lower, &explicit_times(1))
             .unwrap();
         assert_eq!(accessed(&fs, &open("/dir/lower")), Some(1));
+        fs.rename(carol.caller(), "/dir/lower", "/dir/copied")
+            .unwrap();
+        create(&fs, &carol, "/dir/lower", ALL);
+        let replacement = open("/dir/lower");
+        fs.set_times(carol.caller(), &replacement, &explicit_times(7))
+            .unwrap();
         fs.set_times(carol.caller(), &lower, &explicit_times(2))
             .unwrap();
         assert_eq!(accessed(&fs, &lower), Some(2));
+        assert_eq!(accessed(&fs, &open("/dir/copied")), Some(2));
+        assert_eq!(accessed(&fs, &replacement), Some(7));
 
         // An upper file can be renamed.
         create(&fs, &carol, "/dir/upper", ALL);
@@ -6401,17 +6471,22 @@ mod credentials {
             .unwrap();
         assert_eq!(accessed(&fs, &directory), Some(4));
 
-        // A lower file that has gone, never copied up, is not recreated.
+        // An open on a lower file that was never copied up cannot recreate it or update its replacement.
         let removed = open("/dir/removed");
         fs.unlink(carol.caller(), "/dir/removed").unwrap();
         assert!(matches!(
             fs.set_times(carol.caller(), &removed, &explicit_times(5)),
             Err(SetTimesError::Io)
         ));
-        assert!(
-            fs.open(carol.caller(), "/dir/removed", OFlags::PATH, Mode::empty())
-                .is_err()
-        );
+        create(&fs, &carol, "/dir/removed", ALL);
+        let replacement = open("/dir/removed");
+        fs.set_times(carol.caller(), &replacement, &explicit_times(8))
+            .unwrap();
+        assert!(matches!(
+            fs.set_times(carol.caller(), &removed, &explicit_times(5)),
+            Err(SetTimesError::Io)
+        ));
+        assert_eq!(accessed(&fs, &replacement), Some(8));
     }
 
     #[test]
