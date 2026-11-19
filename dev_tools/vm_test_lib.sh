@@ -3,14 +3,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# Shared by the dev_tools/run_*_on_*.sh scripts; source it. Reads VMM, QEMU,
-# QEMU_ACCEL, QEMU_CPU, QEMU_MEM, QEMU_SMP, CLOUD_HYPERVISOR, TIMEOUT,
+# Shared by the dev_tools/run_*_on_*.sh scripts; source it. Reads VMM,
+# VM_CPUS, VM_MEM, QEMU, QEMU_ACCEL, QEMU_CPU, CLOUD_HYPERVISOR, TIMEOUT,
 # LITEBOX_LOG, VHOST_DEVICE_VSOCK and CARGO_BUILD (see the scripts), makes a
 # relative CARGO_TARGET_DIR absolute, and creates $WORK, removed on exit.
 
 VMM=${VMM:-qemu}
-QEMU_MEM=${QEMU_MEM:-2G}
-QEMU_SMP=${QEMU_SMP:-1}
+VM_CPUS=${VM_CPUS:-1}
+VM_MEM=${VM_MEM:-2G}
 CARGO_BUILD=${CARGO_BUILD:-cargo build}
 VHOST_DEVICE_VSOCK=${VHOST_DEVICE_VSOCK:-vhost-device-vsock}
 # Local to each boot's vsock device.
@@ -19,38 +19,12 @@ VSOCK_CID=3
 EXIT_SUCCESS='[litebox] exit: success'
 EXIT_FAILURE='[litebox] exit: failure'
 
-# QEMU_MEM $1's size in MiB, or 0 for a form the scripts' headers do not list.
-mem_mib() {
-    local mem=${1%%,*}
-    mem=${mem#size=}
-    if [[ $mem =~ ^([1-9][0-9]*)([MmGg]?)$ ]]; then
-        mem=${BASH_REMATCH[1]}
-        [[ ${BASH_REMATCH[2]} != [Gg] ]] || mem=$((mem * 1024))
-        echo "$mem"
-    else
-        echo 0
-    fi
-}
-
-# The CPU count in QEMU_SMP $1, as QEMU counts it; fails for another form.
-smp_cpus() {
-    local field key value cpus='' maxcpus='' product=1
-    local -a fields
-    IFS=, read -r -a fields <<<"$1"
-    for field in "${fields[@]}"; do
-        key=cpus value=$field
-        [[ $field != *=* ]] || { key=${field%%=*}; value=${field#*=}; }
-        [[ $value =~ ^[1-9][0-9]*$ ]] || return 1
-        case $key in
-            cpus) cpus=$value ;;
-            maxcpus) maxcpus=$value ;;
-            drawers | books | sockets | dies | clusters | modules | cores | threads)
-                product=$((product * value)) ;;
-            *) return 1 ;;
-        esac
-    done
-    echo "${cpus:-${maxcpus:-$product}}"
-}
+[[ $VM_CPUS =~ ^[1-9][0-9]*$ ]] ||
+    { echo "error: VM_CPUS=$VM_CPUS is not a CPU count" >&2; exit 2; }
+[[ $VM_MEM =~ ^([1-9][0-9]*)([MmGg]?)$ ]] ||
+    { echo "error: VM_MEM=$VM_MEM is not an integer in MiB, or suffixed M or G" >&2; exit 2; }
+VM_MIB=${BASH_REMATCH[1]}
+[[ ${BASH_REMATCH[2]} != [Gg] ]] || VM_MIB=$((VM_MIB * 1024))
 
 case $VMM in
     qemu)
@@ -73,21 +47,14 @@ case $VMM in
         [[ -r /dev/kvm && -w /dev/kvm ]] ||
             { echo "error: Cloud Hypervisor needs KVM, but /dev/kvm is not usable" >&2; exit 2; }
         TIMEOUT=${TIMEOUT:-120}
-        CH_MIB=$(mem_mib "$QEMU_MEM")
-        [[ $CH_MIB -ne 0 ]] || {
-            echo "error: for Cloud Hypervisor, QEMU_MEM=$QEMU_MEM must be an integer in MiB, or suffixed M or G" >&2
-            exit 2
-        }
-        CH_CPUS=$(smp_cpus "$QEMU_SMP") ||
-            { echo "error: no CPU count in QEMU_SMP=$QEMU_SMP" >&2; exit 2; }
         ;;
     *) echo "error: unknown VMM '$VMM' (qemu or cloud-hypervisor)" >&2; exit 2 ;;
 esac
 
 describe_vm() {
     case $VMM in
-        qemu) echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU, -smp $QEMU_SMP" ;;
-        cloud-hypervisor) echo "[*] Cloud Hypervisor: $CH_CPUS CPUs, $CH_MIB MiB" ;;
+        qemu) echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU, $VM_CPUS CPUs, $VM_MIB MiB" ;;
+        cloud-hypervisor) echo "[*] Cloud Hypervisor: $VM_CPUS CPUs, $VM_MIB MiB" ;;
     esac
 }
 
@@ -200,13 +167,8 @@ start_vsock() {
     daemon=$!
     daemons+=("$daemon")
     vsock_connect=(python3 -c "$CONNECT_VHOST_USER" "$WORK/$1.vhost")
-    # -m's size (its first field, maybe `size=`) is in MiB unless suffixed;
-    # a backend's size= is in bytes.
-    local mem=${QEMU_MEM%%,*}
-    mem=${mem#size=}
-    [[ ! $mem =~ ^[0-9]+$ ]] || mem+=M
     # shellcheck disable=SC2034 # the sourcing script passes it to QEMU
-    vsock=(-object "memory-backend-memfd,id=mem,size=$mem,share=on"
+    vsock=(-object "memory-backend-memfd,id=mem,size=${VM_MIB}M,share=on"
         -machine memory-backend=mem -chardev "socket,id=vhost-vsock,fd=4"
         -device "vhost-user-vsock-pci,chardev=vhost-vsock,disable-legacy=on")
 }
@@ -257,7 +219,7 @@ run_vm() {
             # shellcheck disable=SC2206 # QEMU is a command line
             vm+=("${vsock_connect[@]}" $QEMU
                 -machine q35 -accel "$QEMU_ACCEL" -cpu "$CPU"
-                -m "$QEMU_MEM" -smp "$QEMU_SMP" -nic none
+                -m "$VM_MIB" -smp "$VM_CPUS" -nic none
                 -kernel "$kernel" -initrd "$payload" -append "$cmdline"
                 -serial stdio -display none -no-reboot
                 -device "isa-debug-exit,iobase=0xf4,iosize=0x04")
@@ -265,7 +227,7 @@ run_vm() {
         cloud-hypervisor)
             # shellcheck disable=SC2206 # CLOUD_HYPERVISOR is a command line
             vm+=($CLOUD_HYPERVISOR
-                --cpus "boot=$CH_CPUS" --memory "size=${CH_MIB}M"
+                --cpus "boot=$VM_CPUS" --memory "size=${VM_MIB}M"
                 --kernel "$kernel" --initramfs "$payload" --cmdline "$cmdline"
                 --serial tty)
             [[ " $* " == *" --console "* ]] || vm+=(--console off)

@@ -70,7 +70,7 @@ jobs:
           # `litebox_runner_optee_on_vm_userland` and `litebox_runner_linux_on_vm_userland` are
           # ring-3 programs for them, all for
           # `x86_64-unknown-none` as set by their `.cargo/config.toml`, so they are linted from
-          # their directories and tested in the `test_qemu` job.
+          # their directories and tested in the `test_vmm` job.
           # `litebox_runner_optee_on_linux_userland` conflicts with `litebox_runner_linux_userland` due to
           # feature unification (`optee_syscall` versus `linux_syscall`). Build it separately for now.
       - run: |
@@ -145,8 +145,8 @@ jobs:
         # Fixtures are cached separately above; keep them out of rust-cache.
         run: rm -rf -- target/tmp
 
-  test_qemu:
-    name: Build and Test on QEMU (KVM)
+  test_vmm:
+    name: Build and Test on VMMs (KVM)
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -217,11 +217,11 @@ jobs:
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
       - name: Run static and dynamic Linux programs in a QEMU VM with stacked runners on 2 CPUs with RAM above 4 GiB (KVM)
         run: |
-          QEMU_MEM=6G QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          VM_MEM=6G VM_CPUS=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh
       - name: Run threaded Linux programs in a QEMU VM with stacked runners on 4 CPUs, release (KVM)
         run: |
-          QEMU_SMP=4 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          VM_CPUS=4 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh -r -t smp -t sched -t fork -t pthread
       - name: Allow unprivileged user namespaces
         # For the containerd shim's privileged tests; Ubuntu's AppArmor restricts them.
@@ -239,17 +239,16 @@ jobs:
           unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'test(/^vm::(with_mount_privilege|with_litebox_user|as_root_)/)'
       - name: Run OP-TEE TAs in a QEMU VM with stacked runners on 2 CPUs (KVM)
         run: |
-          QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          VM_CPUS=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh
       - name: Run unmodified OP-TEE TAs in a QEMU VM with stacked runners on 2 CPUs (KVM)
         run: |
-          QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          VM_CPUS=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
       - name: Smoke-test Linux programs and OP-TEE TAs in a Cloud Hypervisor VM with stacked runners on 2 CPUs
-        # Only what differs from QEMU, which runs the full suites.
         run: |
-          export VMM=cloud-hypervisor QEMU_SMP=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build"
-          QEMU_MEM=6G ./dev_tools/run_linux_on_vm_userland.sh \
+          export VMM=cloud-hypervisor VM_CPUS=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build"
+          VM_MEM=6G ./dev_tools/run_linux_on_vm_userland.sh \
             -t hello -t pid1 -t smp -t highmem -t console_flood -t net -t vsock_hybrid
           ./dev_tools/run_optee_on_vm_userland.sh -t hello-ta
       - name: Save vhost-device-vsock

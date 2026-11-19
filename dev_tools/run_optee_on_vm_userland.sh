@@ -29,15 +29,13 @@
 #
 # Environment:
 #   VMM           qemu or cloud-hypervisor (default: qemu)
-#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command (default:
-#                 cloud-hypervisor)
+#   VM_CPUS       guest CPUs (default: 1)
+#   VM_MEM        guest RAM, in MiB or suffixed M or G (default: 2G)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
-#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G), also for Cloud
-#                 Hypervisor
-#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1), also for Cloud
-#                 Hypervisor
+#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command (default:
+#                 cloud-hypervisor)
 #   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runners (and the rewriter unless
@@ -52,8 +50,8 @@ KERNEL_DIR="$REPO_DIR/litebox_runner_vm_kernel"
 USERLAND_DIR="$REPO_DIR/litebox_runner_optee_on_vm_userland"
 TESTS_DIR="$REPO_DIR/litebox_runner_optee_on_linux_userland/tests"
 VM_TESTS_DIR="$KERNEL_DIR/tests"
-# shellcheck source=dev_tools/qemu_test_lib.sh
-source "$SCRIPT_DIR/qemu_test_lib.sh"
+# shellcheck source=dev_tools/vm_test_lib.sh
+source "$SCRIPT_DIR/vm_test_lib.sh"
 
 tas=()
 profile=debug

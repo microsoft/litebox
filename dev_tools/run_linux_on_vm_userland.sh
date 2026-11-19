@@ -61,15 +61,11 @@
 # guest's gateway (10.0.2.1) and the echo server (10.0.2.100:7). It has no
 # virtio-9p, so the share test is skipped there.
 #
-# With QEMU_SMP above 4, the preempt test is skipped: it checks preemption
+# With VM_CPUS above 4, the preempt test is skipped: it checks preemption
 # with 8 CPU-bound programs. With fewer than 2, the smp test is skipped: it
-# checks threads of a program running at once. Unless QEMU_MEM's size (its
-# first field, maybe after size=) is at least 4G, as an integer in MiB or
-# suffixed M or G (e.g., 6144, 6g, or size=6G,maxmem=8G), the highmem test is
-# skipped: it needs RAM above 4 GiB. A test given with -t that would be
-# skipped is an error instead. QEMU_SMP must give the CPU count as QEMU does:
-# cpus= (or a bare count), else maxcpus=, else the product of the topology's
-# counts (e.g., sockets=2,cores=2).
+# checks threads of a program running at once. With VM_MEM below 4G, the
+# highmem test is skipped: it needs RAM above 4 GiB. A test given with -t that
+# would be skipped is an error instead.
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
@@ -81,15 +77,13 @@
 #   RUSTC         Rust compiler with the x86_64-unknown-none target (default:
 #                 rustc)
 #   VMM           qemu or cloud-hypervisor (default: qemu)
-#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command (default:
-#                 cloud-hypervisor)
+#   VM_CPUS       guest CPUs (default: 1)
+#   VM_MEM        guest RAM, in MiB or suffixed M or G (default: 2G)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
-#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G), also for Cloud
-#                 Hypervisor
-#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1), also for Cloud
-#                 Hypervisor
+#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command (default:
+#                 cloud-hypervisor)
 #   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   VHOST_DEVICE_VSOCK  the vhost-user vsock daemon (default:
@@ -109,8 +103,8 @@ TESTS_DIR="$KERNEL_DIR/tests/linux"
 HOSTED_TESTS_DIR="$REPO_DIR/litebox_runner_linux_userland/tests"
 SHARED=(fork_threads_parent.c fork_interrupt_parent.c fork_event_parent.c fork_epoll_parent.c
     fork_shared_futex_parent.c)
-# shellcheck source=dev_tools/qemu_test_lib.sh
-source "$SCRIPT_DIR/qemu_test_lib.sh"
+# shellcheck source=dev_tools/vm_test_lib.sh
+source "$SCRIPT_DIR/vm_test_lib.sh"
 
 tests=()
 profile=debug
@@ -125,12 +119,6 @@ while getopts "t:rvh" opt; do
     esac
 done
 
-smp=$(smp_cpus "$QEMU_SMP") || {
-    echo "error: no CPU count in QEMU_SMP=$QEMU_SMP (see the header)" >&2
-    exit 2
-}
-mem=$(mem_mib "$QEMU_MEM")
-
 # The log level of the boots that check the processes' counts (see the header).
 counted_log=debug
 [[ ${LITEBOX_LOG:-} != trace ]] || counted_log=trace
@@ -143,9 +131,9 @@ declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writ
 # is.
 skip_reason() {
     case $1 in
-        preempt) [[ $smp -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
-        smp) [[ $smp -ge 2 ]] || echo "needs threads running at once" ;;
-        highmem) [[ $mem -ge 4096 ]] || echo "needs QEMU_MEM of at least 4G, as an integer in MiB or suffixed M or G" ;;
+        preempt) [[ $VM_CPUS -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
+        smp) [[ $VM_CPUS -ge 2 ]] || echo "needs threads running at once" ;;
+        highmem) [[ $VM_MIB -ge 4096 ]] || echo "needs VM_MEM of at least 4G" ;;
         share) [[ $VMM == qemu ]] || echo "needs virtio-9p, which only QEMU has" ;;
     esac
 }
