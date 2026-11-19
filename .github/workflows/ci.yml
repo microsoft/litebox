@@ -121,7 +121,7 @@ jobs:
           command -v newuidmap >/dev/null || sudo apt-get install -y uidmap
           grep -q "^$(id -un):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
           chmod o+x "$HOME"
-          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only
+          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'not test(/^vm::/)'
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests
@@ -157,6 +157,10 @@ jobs:
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-linux-gnu,x86_64-unknown-none
+      - name: Set up Nextest
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
       - name: Install QEMU
         run: |
           sudo apt-get update
@@ -212,6 +216,20 @@ jobs:
         run: |
           QEMU_SMP=4 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh -r -t smp -t sched -t fork
+      - name: Allow unprivileged user namespaces
+        # For the containerd shim's privileged tests; Ubuntu's AppArmor restricts them.
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Test the containerd shim on the VM backend (KVM)
+        # The privileged ones run under `unshare`, as in the build job.
+        run: |
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'test(/^vm::/) and not test(/with_mount_privilege|with_litebox_user|as_root_/)'
+          command -v newuidmap >/dev/null || sudo apt-get install -y uidmap
+          grep -q "^$(id -un):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
+          chmod o+x "$HOME"
+          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'test(/^vm::(with_mount_privilege|with_litebox_user|as_root_)/)'
       - name: Run OP-TEE TAs in a QEMU VM with stacked runners on 2 CPUs (KVM)
         run: |
           QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
@@ -320,7 +338,7 @@ jobs:
           command -v newuidmap >/dev/null || sudo apt-get install -y uidmap
           grep -q "^$(id -un):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
           chmod o+x "$HOME"
-          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only
+          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'not test(/^vm::/)'
       - name: Test AArch64 copy-based fork
         # Forces copy-based fork; the deep fork-chain, shared-futex, and shared file mapping
         # tests need native fork.

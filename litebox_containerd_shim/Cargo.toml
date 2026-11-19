@@ -4,11 +4,17 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/microsoft/litebox"
-description = "containerd runtime v2 shim that runs each container in a LiteBox broker through the guest service"
+description = "containerd runtime v2 shims that run each container in a LiteBox broker through the guest service"
 
+# A shim per backend, as containerd finds a runtime type's shim by its name. Not one executable under
+# two names: the daemon that `start` spawns is `current_exe()`, which resolves a link.
 [[bin]]
 name = "containerd-shim-litebox-v1"
 path = "src/main.rs"
+
+[[bin]]
+name = "containerd-shim-litebox-vm-v1"
+path = "src/main_vm.rs"
 
 # Every platform's: a port adds its platform to this `any` (and to `src/lib.rs`'s `cfg`), and its own
 # dependencies in a `target` section of their own.
