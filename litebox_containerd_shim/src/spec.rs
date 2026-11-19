@@ -105,7 +105,8 @@ pub struct Ingress {
 pub struct Resources {
     /// `linux.resources.memory.limit`, in bytes, if positive.
     pub memory: Option<u64>,
-    /// `linux.resources.cpu`'s quota over its period, rounded up, if both are positive.
+    /// `linux.resources.cpu`'s quota over its period (Linux's default, 100 ms, if unset), rounded
+    /// up, if both are positive.
     pub cpus: Option<u32>,
 }
 
@@ -294,6 +295,9 @@ fn published(annotations: &HashMap<String, String>) -> Result<Vec<Publish>> {
 }
 
 /// The resources of `spec` (see [`Resources`]).
+/// Linux's CFS period, in microseconds, where a spec's quota has none.
+const DEFAULT_CPU_PERIOD: u64 = 100_000;
+
 fn resources(spec: &Spec) -> Resources {
     let Some(resources) = spec
         .linux()
@@ -311,7 +315,10 @@ fn resources(spec: &Spec) -> Resources {
     let cpus = resources
         .cpu()
         .as_ref()
-        .and_then(|cpu| Some((u64::try_from(cpu.quota()?).ok()?, cpu.period()?)))
+        .and_then(|cpu| {
+            let quota = u64::try_from(cpu.quota()?).ok()?;
+            Some((quota, cpu.period().unwrap_or(DEFAULT_CPU_PERIOD)))
+        })
         .filter(|(quota, period)| *quota > 0 && *period > 0)
         .map(|(quota, period)| u32::try_from(quota.div_ceil(period)).unwrap_or(u32::MAX));
     Resources { memory, cpus }
@@ -551,10 +558,13 @@ mod tests {
             cpus: Some(2),
         };
         assert_eq!(resources(limited), expected);
+        // Linux's default period.
+        let quota_only = serde_json::json!({"cpu": {"quota": 200_000, "cpus": "0-3"}});
+        assert_eq!(resources(quota_only).cpus, Some(2));
         for unlimited in [
             serde_json::json!({}),
             serde_json::json!({"memory": {"limit": -1}, "cpu": {"quota": -1, "period": 100_000}}),
-            serde_json::json!({"cpu": {"quota": 200_000, "cpus": "0-3"}}),
+            serde_json::json!({"cpu": {"quota": 200_000, "period": 0}}),
         ] {
             assert_eq!(resources(unlimited), Resources::default());
         }
