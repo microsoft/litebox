@@ -117,8 +117,8 @@ impl<B: Backend> Backend for ReadOnly<B> {
         self.inner.parent_dir(dir)
     }
 
-    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
-        self.inner.check_search(dir)
+    fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        self.inner.check_search_permission(dir)
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {

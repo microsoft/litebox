@@ -10,11 +10,11 @@
 //! reported as an equivalent relative target so it stays correct wherever the backend is mounted,
 //! and any other absolute target is rejected.
 //!
-//! Host namespace administration is trusted (e.g. not to move a directory out of the export
-//! concurrently with a mutation). Windows pins directory path components against deletion/rename;
-//! file operations there still assume the host does not race final-component checks.
-//! Other Unix hosts retain directory descriptors and reject changed path identities while
-//! serializing host-path operations against guest namespace changes.
+//! External host namespace changes may occur between broker operations, but must not race
+//! an operation's checks and subsequent filesystem access. Windows pins directory path
+//! components against deletion and rename, but still relies on this assumption for
+//! final-component checks. Non-Linux Unix hosts retain directory descriptors to detect
+//! changed path identities and serialize pathname operations against guest namespace changes.
 //! On Windows, std's native deletion can remain pending while an ordinary file handle is open, so the
 //! same name may not be reusable until retained handles close. Rename uses the host's atomic
 //! rename operation; in particular, replacing an empty directory may fail on Windows even though
@@ -431,8 +431,8 @@ fn readonly_for_mode(mode: Mode) -> bool {
     !mode.intersects(Mode::WUSR | Mode::WGRP | Mode::WOTH)
 }
 
-/// Opens `path` itself rather than a reparse point's target, and rejects reparse points, so
-/// that links and junctions cannot redirect a host operation outside the export.
+/// Opens the final component of `path` without following reparse points and rejects it if
+/// it is one. This does not validate any parent components.
 #[cfg(windows)]
 fn open_no_reparse(
     options: &mut OpenOptions,
@@ -495,7 +495,7 @@ fn set_permissions_file(file: &File, mode: Mode) -> std::io::Result<()> {
 impl LocalFs {
     /// Canonicalize an existing host directory as the filesystem root.
     ///
-    /// Host namespace administration must be trusted not to race later checks and operations.
+    /// External host namespace changes must not race individual filesystem operations.
     pub fn new(root: impl AsRef<Path>, allocator: InodeAllocator) -> std::io::Result<Self> {
         let root = fs::canonicalize(root)?;
         #[cfg(all(unix, not(target_os = "linux")))]
@@ -823,7 +823,7 @@ impl Backend for LocalFs {
         }))
     }
 
-    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+    fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
         guard_path_operations!(self, Err(WalkError::Io));
         let dir = dir.get_typed::<Self>();
         if !self.valid_dir(dir) {

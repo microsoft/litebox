@@ -103,8 +103,7 @@ pub trait Backend: Send + Sync + Any {
     ///
     /// Walk the directory the handle refers to, even if it has been renamed. If the backend
     /// can no longer walk that directory (for example, because a network handle is stale), fail
-    /// with [`super::errors::PathError::NoSuchFileOrDirectory`] rather than using a different
-    /// directory now at the original path; other failures report [`WalkError::Io`].
+    /// with [`super::errors::PathError::NoSuchFileOrDirectory`]; other failures report [`WalkError::Io`].
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError>;
 
     /// [`Self::walking_dir_at`] together with [`Self::dir_path`], both taken from one snapshot
@@ -118,20 +117,18 @@ pub trait Backend: Send + Sync + Any {
     }
 
     /// Current physical name, as components relative to this backend's root (empty at root).
-    /// Use the directory identity without requiring permission to search or list ancestors.
     ///
     /// A directory no longer linked into this namespace has no name and must return
-    /// [`super::errors::PathError::NoSuchFileOrDirectory`]. Returns `Ok(None)` if the backend cannot determine
-    /// the current name of a live directory; callers then fall back to a recorded name.
+    /// [`super::errors::PathError::NoSuchFileOrDirectory`]. Returns `Ok(None)` if the backend
+    /// cannot determine the current name of a live directory.
     fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError>;
 
     /// Walk up from an owned directory, returning `None` at this backend's root.
     /// Implementations must not follow `..` beyond their exported subtree.
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError>;
 
-    /// Check the caller's search permission on `dir`. Called only for directories reporting
-    /// [`PermissionCheck::ByBackend`].
-    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError>;
+    /// Check the caller's search permission on `dir`.
+    fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError>;
 
     /// Open the already-resolved file after resolver authorization, validating `flags`.
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError>;

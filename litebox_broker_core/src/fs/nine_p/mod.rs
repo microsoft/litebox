@@ -387,7 +387,7 @@ where
         })))
     }
 
-    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+    fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
         let fid = self
             .client
             .walk(&dir.get_typed::<Self>().fid.fid, &["."])?

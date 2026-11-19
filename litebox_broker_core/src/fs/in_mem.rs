@@ -513,7 +513,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             .transpose()
     }
 
-    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+    fn check_search_permission(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
         // Search permissions are enforced by the resolver.
         Ok(())
     }

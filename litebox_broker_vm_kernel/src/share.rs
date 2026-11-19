@@ -206,8 +206,8 @@ impl Backend for ShareFs {
         self.0.parent_dir(dir)
     }
 
-    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
-        self.0.check_search(dir)
+    fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        self.0.check_search_permission(dir)
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {

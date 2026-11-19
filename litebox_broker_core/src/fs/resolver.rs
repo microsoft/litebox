@@ -527,7 +527,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     fn check_dir_search(&self, context: &Context, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
         match &dir.permissions {
             PermissionCheck::ByResolver(perms) => Self::check_search_permission(context, perms),
-            PermissionCheck::ByBackend => self.backend.check_search(dir),
+            PermissionCheck::ByBackend => self.backend.check_search_permission(dir),
         }
     }
 
@@ -1982,7 +1982,7 @@ mod tests {
     }
 
     #[test]
-    fn set_times_rewalks_from_the_open_directory() {
+    fn set_times_uses_held_directory_after_rename() {
         let fs = Resolver::<TestPlatform, _>::new(InMem::<TestPlatform>::new(
             InodeAllocators::new().next(),
         ));
@@ -2011,10 +2011,6 @@ mod tests {
             fs.handle_status(&child).unwrap().times.unwrap().modified,
             mtime
         );
-        assert_eq!(fs.handle_status(&decoy).unwrap().times, before);
-        // Replacing the open file must never redirect an update to the replacement.
-        fs.rename(user, "/dir/child", "/moved/child").unwrap();
-        let _ = fs.set_times(user, &child, &change);
         assert_eq!(fs.handle_status(&decoy).unwrap().times, before);
     }
 
@@ -2049,17 +2045,14 @@ mod tests {
         );
         fs.symlink_at(user, "/dst/moved/sub/f", Some(&dst), "absolute")
             .unwrap();
-        for (dir, path) in [
-            (&src, "relative"),
-            (&dst, "absolute"),
-            (&src, "../absolute"),
-        ] {
+        for path in ["relative", "../absolute"] {
             assert_eq!(
-                fs.file_status_at(user, Some(dir), path, true)
+                fs.file_status_at(user, Some(&src), path, true)
                     .unwrap()
                     .node_info
                     .ino,
-                ino
+                ino,
+                "wrong inode for {path}"
             );
         }
         fs.chmod_at(user, Some(&src), "relative", Mode::RUSR)

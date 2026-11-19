@@ -445,7 +445,7 @@ impl Backend for Devices {
         })
     }
 
-    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+    fn check_search_permission(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
         // Device directories are searchable by everyone.
         Ok(())
     }

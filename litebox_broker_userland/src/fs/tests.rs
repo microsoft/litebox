@@ -55,7 +55,7 @@ fn dot_walk_checks_search_on_start_not_on_parent() {
     fs::set_permissions(&child, fs::Permissions::from_mode(0o000)).unwrap();
     // Privileged hosts can bypass DAC; compare against the host's actual `.` lookup.
     let host_search = fs::metadata(child.join(".")).is_ok();
-    let search = local.check_search(&walk);
+    let search = local.check_search_permission(&walk);
     let up = local.parent_dir(&held);
     fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(search.is_ok(), host_search);
@@ -116,7 +116,7 @@ fn moved_out_of_export_fails_closed_even_after_replacement() {
     fs::create_dir(root.join("child")).unwrap();
     assert!(
         local
-            .check_search(&local.walking_dir_at(&child).unwrap())
+            .check_search_permission(&local.walking_dir_at(&child).unwrap())
             .is_err()
     );
     assert!(local.parent_dir(&child).is_err());

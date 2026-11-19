@@ -210,7 +210,7 @@ impl super::backend::Backend for TarRo {
             .map(|idx| DirHandle::from_typed::<Self>(TarRoDirHandle { idx })))
     }
 
-    fn check_search(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+    fn check_search_permission(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
         // Search permissions are enforced by the resolver.
         Ok(())
     }

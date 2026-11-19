@@ -1288,7 +1288,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             .map_err(open_to_walk_error)
     }
 
-    fn check_search(&self, _dir: &ScopedDir<'_>) -> Result<(), WalkError> {
+    fn check_search_permission(&self, _dir: &ScopedDir<'_>) -> Result<(), WalkError> {
         // Merged directories report their permissions to the resolver.
         Ok(())
     }

@@ -361,7 +361,7 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
     /// [`Self::current_route`]).
     fn route(mount: &Mount, name: DirPath) -> Result<Option<Vec<String>>, WalkError> {
         // Mount paths never contain empty components. Use this marker to keep walking
-        // the held directory (including `..`) without matching mounts at its old name.
+        // the held directory (e.g., resolve `..` would pop the marker)
         const UNLINKED_ROUTE_COMPONENT: &str = "";
 
         let mut route = mount.path.clone();
@@ -846,7 +846,9 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 };
                 let mut path = mount.path.clone();
                 path.extend(suffix);
-                // An external rename can move the backing directory under a nested mount.
+                // A new mount may have been added that covers this path, which would make it inaccessible.
+                // E.g., A handle to /mnt/data/dir could become inaccessible after /mnt/data becomes a new
+                // mount point. For now, report no name rather than return the unreachable path.
                 if self.initialized_mounts().any(|(_, other)| {
                     other.path.len() > mount.path.len() && path.starts_with(&other.path)
                 }) {
@@ -902,13 +904,13 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
             .map_err(open_to_walk_error)
     }
 
-    fn check_search(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+    fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
         match &dir.get_typed::<Self>().inner {
             ComposerWalkingDirHandleInner::Mounted {
                 mount_index,
                 target: ResolvedTarget::Dir(dir),
                 ..
-            } => self.backend(*mount_index).check_search(dir),
+            } => self.backend(*mount_index).check_search_permission(dir),
             ComposerWalkingDirHandleInner::Virtual { .. } => Ok(()),
             ComposerWalkingDirHandleInner::Mounted { .. } => {
                 Err(PathError::ComponentNotADirectory.into())
