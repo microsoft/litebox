@@ -152,10 +152,19 @@ fn run_c_test(path: &str, suffix: &str, exec_or_lib: bool) {
 }
 
 macro_rules! c_test {
-    (r#mount, $path:literal) => {
-        c_test!(#[ignore = "has a dedicated test"] r#mount, $path);
+    (dedicated $stem:ident, $path:literal) => {
+        c_test!(@test #[ignore = "has a dedicated test"] $stem, $path);
     };
-    ($(#[$attribute:meta])* $stem:ident, $path:literal) => {
+    (broker $stem:ident, $path:literal) => {
+        c_test!(@test #[ignore = "needs the broker"] $stem, $path);
+    };
+    (plain r#mount, $path:literal) => {
+        c_test!(dedicated r#mount, $path);
+    };
+    (plain $stem:ident, $path:literal) => {
+        c_test!(@test $stem, $path);
+    };
+    (@test $(#[$attribute:meta])* $stem:ident, $path:literal) => {
         $(#[$attribute])*
         #[test]
         fn $stem() {
@@ -174,6 +183,89 @@ mod test_static_exec_with_rewriter {
     const SUFFIX: &str = "_exec_rewriter";
     const EXEC_OR_LIB: bool = true;
     for_each_c_test!(c_test);
+}
+
+/// Runs a C test directly on the host, with the environment the LiteBox sweeps give the guest,
+/// to check that the test's expectations hold on Linux and not only under LiteBox.
+#[cfg(target_os = "linux")]
+fn run_native_c_test(path: &str) {
+    let stem = Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .expect("failed to get file stem");
+    let unique_name = format!("{stem}_native");
+    let target = common::compile(path, &unique_name, true, false);
+    let cwd = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("cwd_{unique_name}"));
+    match std::fs::remove_dir_all(&cwd) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => panic!("failed to clear {}: {error}", cwd.display()),
+    }
+    std::fs::create_dir_all(&cwd).unwrap();
+    println!("Running `{}` natively", target.display());
+    let status = std::process::Command::new(&target)
+        .env_clear()
+        .env("HOME", "/")
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|error| panic!("failed to run {}: {error}", target.display()));
+    assert!(status.success(), "{stem} failed natively: {status}");
+    std::fs::remove_dir_all(&cwd).unwrap();
+}
+
+/// The C tests the native sweep skips, beyond those with a dedicated test, and why.
+#[cfg(target_os = "linux")]
+macro_rules! native_c_test {
+    (dedicated $stem:ident, $path:literal) => {
+        native_c_test!(@test #[ignore = "has a dedicated test"] $stem, $path);
+    };
+    ($kind:ident r#mount, $path:literal) => {
+        native_c_test!(@test #[ignore = "mounting needs root on the host"] r#mount, $path);
+    };
+    ($kind:ident r#vsock_unsupported, $path:literal) => {
+        native_c_test!(@test #[ignore = "checks LiteBox's policy; Linux supports AF_VSOCK"]
+            r#vsock_unsupported, $path);
+    };
+    ($kind:ident r#urandom_broker, $path:literal) => {
+        native_c_test!(@test #[ignore = "expects the test broker's fixed random bytes"]
+            r#urandom_broker, $path);
+    };
+    ($kind:ident r#pipe_broker, $path:literal) => {
+        native_c_test!(@test #[ignore = "Linux keeps a writer to a full pipe blocked until a \
+            reader frees a whole page; LiteBox wakes it after a 1-byte read"]
+            r#pipe_broker, $path);
+    };
+    ($kind:ident r#tcp_broker, $path:literal) => {
+        native_c_test!(@needs_arguments r#tcp_broker, $path);
+    };
+    ($kind:ident r#tcp_broker_states, $path:literal) => {
+        native_c_test!(@needs_arguments r#tcp_broker_states, $path);
+    };
+    ($kind:ident r#udp_broker, $path:literal) => {
+        native_c_test!(@needs_arguments r#udp_broker, $path);
+    };
+    ($kind:ident r#udp_broker_namespace, $path:literal) => {
+        native_c_test!(@needs_arguments r#udp_broker_namespace, $path);
+    };
+    (@needs_arguments $stem:ident, $path:literal) => {
+        native_c_test!(@test #[ignore = "needs arguments from its broker test"] $stem, $path);
+    };
+    ($kind:ident $stem:ident, $path:literal) => {
+        native_c_test!(@test $stem, $path);
+    };
+    (@test $(#[$attribute:meta])* $stem:ident, $path:literal) => {
+        $(#[$attribute])*
+        #[test]
+        fn $stem() {
+            super::run_native_c_test($path);
+        }
+    };
+}
+
+#[cfg(target_os = "linux")]
+mod test_native {
+    for_each_c_test!(native_c_test);
 }
 
 #[cfg(target_os = "linux")]

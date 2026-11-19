@@ -101,19 +101,20 @@ fn main() -> std::io::Result<()> {
                 && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
             "cannot use C test file {name:?} as a Rust test identifier"
         );
-        // Running with --run-ignored would collide with dedicated tests' outputs
-        // and fail without a broker.
-        let attributes = if DEDICATED_C_TESTS.contains(&name) {
-            "#[ignore = \"has a dedicated test\"] "
+        // Each sweep maps the kind to its own ignore policy. The LiteBox sweeps ignore dedicated
+        // and broker-only tests, which with --run-ignored would collide with dedicated tests'
+        // outputs or fail without a broker; the native sweep needs no broker.
+        let kind = if DEDICATED_C_TESTS.contains(&name) {
+            "dedicated"
         } else if BROKER_ONLY_C_TESTS.contains(&name) {
-            "#[ignore = \"needs the broker\"] "
+            "broker"
         } else {
-            ""
+            "plain"
         };
         let source = format!("./tests/{name}");
         writeln!(
             generated,
-            "        $callback!({attributes}r#{stem}, {source:?});"
+            "        $callback!({kind} r#{stem}, {source:?});"
         )
         .unwrap();
     }
