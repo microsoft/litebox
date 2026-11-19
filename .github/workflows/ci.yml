@@ -272,7 +272,7 @@ jobs:
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $RISCV64_CRATES
       - run: ./.github/tools/github_actions_run_cargo nextest --all-features $RISCV64_CRATES
       - name: Execute an ahead-of-time rewritten RV64 guest
-        run: ./.github/tools/github_actions_run_cargo nextest --target x86_64-unknown-linux-gnu -p litebox_syscall_rewriter --test rv64 --run-ignored only
+        run: ./.github/tools/github_actions_run_cargo nextest --target x86_64-unknown-linux-gnu -p litebox_syscall_rewriter --test riscv64_tests --run-ignored only
 
   build_and_test_arm64:
     name: Build and Test (AArch64)

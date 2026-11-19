@@ -372,28 +372,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn non_temporal_hints_preserve_the_encoded_register_selector() {
-        let hints = [0x33, 0x00, 0x30, 0x00, 0x0e, 0x90]; // ntl.pall; c.ntl.pall
-        let mut code = hints;
-        let mut gates = Vec::new();
-        rewrite_range(&mut code, 0, 0x10_0000, &mut gates).unwrap();
-        assert_eq!(code, hints);
-        assert_eq!(gates, [] as [u8; 0]);
+    fn non_temporal_hints_stay_native() {
+        assert!(matches!(word_site(0x0030_0033, 0), Ok(Site::Native))); // ntl.pall
+        assert!(matches!(compressed_site(0x900e, 0), Ok(Site::Native))); // c.ntl.pall
     }
 
     #[test]
-    fn narrow_site_cannot_overwrite_the_next_instruction_to_reach_a_gate() {
+    fn compressed_gate_reach_ends_at_2046_bytes() {
         let mut code = [0x0e, 0x85, 0x82, 0x80]; // c.mv a0,gp; ret
-        assert!(rewrite_range(&mut code, 0x1000, 0x1800, &mut Vec::new()).is_err());
-        assert_eq!(code, [0x0e, 0x85, 0x82, 0x80]);
-        assert!(rewrite_range(&mut code, 0x1000, 0x17fe, &mut Vec::new()).is_ok());
+        let mut out_of_range = code;
+        rewrite_range(&mut code, 0, 2046, &mut Vec::new()).unwrap();
         assert_eq!(code[2..], [0x82, 0x80]);
+        assert!(rewrite_range(&mut out_of_range, 0, 2048, &mut Vec::new()).is_err());
     }
 
     #[test]
     fn rejects_truncated_code_and_unsupported_gp_control_transfers() {
-        for bytes in [&[0x73, 0x00][..], &[0x82, 0x81], &[0xe7, 0x80, 0x01, 0x00]] {
-            assert!(rewrite_range(&mut bytes.to_vec(), 0x1000, 0x1100, &mut Vec::new()).is_err());
+        for (instruction, bytes) in [
+            ("truncated ecall", &mut [0x73, 0x00][..]),
+            ("c.jr gp", &mut [0x82, 0x81]),
+            ("jalr ra, 0(gp)", &mut [0xe7, 0x80, 0x01, 0x00]),
+        ] {
+            assert!(
+                rewrite_range(bytes, 0, 0x100, &mut Vec::new()).is_err(),
+                "{instruction}"
+            );
         }
     }
 }

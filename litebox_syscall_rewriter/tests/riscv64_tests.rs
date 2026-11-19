@@ -39,7 +39,7 @@ fn executes_rewritten_gp_tls_and_ecall() {
     let dir = tmp.path();
     let asm = "riscv64-linux-gnu-as";
     let link = "riscv64-linux-gnu-ld";
-    fs::write(dir.join("guest.s"), include_bytes!("rv64/guest.S")).unwrap();
+    fs::write(dir.join("guest.s"), include_bytes!("riscv64/guest.S")).unwrap();
     run(dir, asm, &["-march=rv64gc", "guest.s", "-o", "guest.o"]);
     // Keep the text near the end of the page, within C.J reach of the gates.
     run(
@@ -63,7 +63,7 @@ fn executes_rewritten_gp_tls_and_ecall() {
     let file = object::File::parse(&*hooked).unwrap();
     let text = file.section_by_name(".text").unwrap();
     fs::write(dir.join("text.bin"), text.data().unwrap()).unwrap();
-    fs::write(dir.join("host.s"), include_bytes!("rv64/host.S")).unwrap();
+    fs::write(dir.join("harness.s"), include_bytes!("riscv64/harness.S")).unwrap();
     run(
         dir,
         asm,
@@ -75,9 +75,9 @@ fn executes_rewritten_gp_tls_and_ecall() {
             &format!("GUEST_GP={}", offset_of!(GateTls, guest_gp)),
             "--defsym",
             &format!("BLOCK_SIZE={}", size_of::<GateTls>()),
-            "host.s",
+            "harness.s",
             "-o",
-            "host.o",
+            "harness.o",
         ],
     );
     run(
@@ -86,14 +86,14 @@ fn executes_rewritten_gp_tls_and_ecall() {
         &[
             &format!("--section-start=.guest={:#x}", text.address()),
             &format!("--section-start=.gates={:#x}", footer.vaddr.get()),
-            "host.o",
+            "harness.o",
             "-o",
-            "host",
+            "harness",
         ],
     );
     run(
         dir,
         &std::env::var("QEMU_RISCV64").unwrap_or_else(|_| "qemu-riscv64".into()),
-        &["./host"],
+        &["./harness"],
     );
 }
