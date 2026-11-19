@@ -1906,7 +1906,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let (fds, mut objects): (Vec<_>, Vec<_>) =
             self.fds_inherited_across_fork()?.into_iter().unzip();
-        let cwd = self.push_cwd_for_child(&mut objects)?;
+        let cwd = self.push_cwd_for_child(&mut objects);
         let fs = self.fs.borrow();
         let umask = u32::from(fs.umask().bits());
         drop(fs);
@@ -3888,12 +3888,10 @@ impl<P: ShimPlatform> Task<P> {
     fn push_cwd_for_child(
         &self,
         objects: &mut Vec<litebox::process::InheritableFd<P>>,
-    ) -> Result<InheritedCwd, Errno> {
-        objects.push(litebox::process::InheritableFd::File(
-            self.pinned_cwd_dir()?,
-        ));
+    ) -> InheritedCwd {
+        objects.push(litebox::process::InheritableFd::File(self.pinned_cwd_dir()));
         // Same encoded size as the child's eventual handle, for the payload size check.
-        Ok(InheritedCwd::File(litebox_broker_protocol::ObjectHandle(0)))
+        InheritedCwd::File(litebox_broker_protocol::ObjectHandle(0))
     }
 }
 
@@ -3991,7 +3989,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<usize, Errno> {
         let (inherited_fds, mut fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
             self.fds_inherited_across_exec()?.into_iter().unzip();
-        let cwd = self.push_cwd_for_child(&mut fds)?;
+        let cwd = self.push_cwd_for_child(&mut fds);
         let fs = self.fs.borrow();
         let umask = u32::from(fs.umask().bits());
         drop(fs);
@@ -6517,18 +6515,20 @@ mod fork_tests {
                 .litebox
                 .mkdir_file(&fs.context.read(), None, path, FileMode::RWXU)
                 .unwrap();
-            shim.restore_cwd(
-                &fs,
-                &task.files.borrow(),
-                &InheritedCwd::Path(path.into()),
-                core::iter::empty(),
-            )
-            .unwrap();
+            fs.set_cwd_handle(
+                shim.inherited_cwd(
+                    &fs.context.read(),
+                    &task.files.borrow(),
+                    &InheritedCwd::Path(path.into()),
+                    core::iter::empty(),
+                )
+                .unwrap(),
+            );
             shim.0
                 .litebox
                 .rename_file(&fs.context.read(), None, path, None, renamed)
                 .unwrap();
-            assert_eq!(fs.cwd_handle().unwrap().path().unwrap(), renamed);
+            assert_eq!(fs.cwd_handle().path().unwrap(), renamed);
         });
     }
 

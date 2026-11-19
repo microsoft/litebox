@@ -101,12 +101,18 @@ impl Context {
     }
 }
 
+#[derive(Clone)]
 struct WalkAnchor {
     dir: DirHandle,
     /// Name recorded when `dir` was opened, used only when the backend cannot name `dir`.
     /// It may be stale after a rename.
     hint: String,
 }
+
+/// An open entry captured as the starting point of a relative lookup (see
+/// [`ResolverEntry::anchor`]).
+#[derive(Clone)]
+pub struct DirAnchor(Option<WalkAnchor>);
 
 /// Normalized components relative to a held directory, or to root if unanchored.
 struct ResolvedPath {
@@ -223,7 +229,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     fn resolve_path(
         &self,
         context: &Context,
-        entry: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
         follow_final: bool,
         allow_missing: bool,
@@ -231,14 +237,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         if path.is_empty() {
             return Err(PathError::NoSuchFileOrDirectory.into());
         }
-        let mut anchor = match entry.filter(|_| !path.starts_with('/')) {
-            Some(entry) => match &entry.handle {
-                Handle::Dir(dir) => Some(WalkAnchor {
-                    dir: dir.clone(),
-                    hint: entry.path.clone(),
-                }),
-                Handle::File(_) => return Err(PathError::ComponentNotADirectory.into()),
-            },
+        let mut anchor = match anchor.filter(|_| !path.starts_with('/')) {
+            Some(DirAnchor(Some(anchor))) => Some(anchor),
+            Some(DirAnchor(None)) => return Err(PathError::ComponentNotADirectory.into()),
             None => None,
         };
         let mut pending: VecDeque<String> = path
@@ -376,7 +377,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     fn parent_dir_and_name(
         &self,
         context: &Context,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
     ) -> Result<Option<(ResolvedDir<'_>, String)>, WalkError> {
         if path.is_empty() {
@@ -427,16 +428,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         Ok(matches!(resolution, Resolution::Found(_)))
     }
 
-    /// Read a symbolic link's stored target, without following the final link.
-    pub fn read_link(&self, user: UserInfo, path: &str) -> Result<String, WalkError> {
-        self.read_link_at(user, None, path)
-    }
-
-    /// Read a symlink relative to a held directory. Absolute paths ignore the anchor.
-    pub fn read_link_at(
+    /// Read a symbolic link's stored target, without following the final link. A relative
+    /// `path` is resolved from `anchor`, or from the root without one.
+    pub fn read_link(
         &self,
         user: UserInfo,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
     ) -> Result<String, WalkError> {
         let context = Context::new(user);
@@ -573,7 +570,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
-    /// Opens a file
+    /// Opens a file. A relative `path` is resolved from `anchor`, or from the root without one.
     ///
     /// The `mode` is only significant when creating a file. Opening a file
     /// that refers to the opener's controlling terminal for I/O fails with
@@ -582,18 +579,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     pub fn open(
         &self,
         user: UserInfo,
-        path: &str,
-        flags: OFlags,
-        mode: Mode,
-    ) -> Result<ResolverEntry<Backend>, OpenError> {
-        self.open_at(user, None, path, flags, mode)
-    }
-
-    /// Open relative to a held directory, or from the root for absolute paths.
-    pub fn open_at(
-        &self,
-        user: UserInfo,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
         flags: OFlags,
         mode: Mode,
@@ -601,7 +587,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         self.open_with_controlling_terminal(user, anchor, path, flags, mode, &|| None)
     }
 
-    /// Opens a file like [`open_at`](Self::open_at), binding a file that refers to
+    /// Opens a file like [`open`](Self::open), binding a file that refers to
     /// the opener's controlling terminal to `controlling_terminal()`, which it
     /// holds open (see [`TerminalEndpoint::reopen`]) and through which its I/O
     /// then goes.
@@ -612,7 +598,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     pub fn open_with_controlling_terminal(
         &self,
         user: UserInfo,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
         flags: OFlags,
         mode: Mode,
@@ -638,7 +624,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     fn open_entry(
         &self,
         user: UserInfo,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
         mut flags: OFlags,
         mode: Mode,
@@ -708,8 +694,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             nonblocking,
             path_only,
             seek_behavior,
-            path: path.to_absolute(),
-            anchored_path: path.anchor.is_some().then(|| Arc::new(path)),
+            name: Arc::new(path),
             controlling_terminal: None,
         };
 
@@ -1115,16 +1100,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             .backend
             .status(entry.handle.as_ref())
             .map_err(|_| SetTimesError::Io)?;
-        let unanchored;
-        let path = if let Some(path) = entry.anchored_path.as_deref() {
-            path
-        } else {
-            unanchored = self
-                .resolve_path(context, None, entry.path(), false, false)
-                .map_err(map_walk)?;
-            &unanchored
-        };
-        let target = self.resolve_target(context, path).map_err(map_walk)?;
+        let target = self
+            .resolve_target(context, &entry.name)
+            .map_err(map_walk)?;
         let resolved = self
             .backend
             .resolved_status(&target)
@@ -1137,16 +1115,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         Ok(target)
     }
 
-    /// Change the permissions of a file
-    pub fn chmod(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), ChmodError> {
-        self.chmod_at(user, None, path, mode)
-    }
-
-    /// Change permissions relative to an optional directory handle.
-    pub fn chmod_at(
+    /// Change the permissions of a file.
+    pub fn chmod(
         &self,
         user: UserInfo,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
         mode: Mode,
     ) -> Result<(), ChmodError> {
@@ -1169,22 +1142,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         self.backend.chmod(target, mode)
     }
 
-    /// Change the owner of a file
+    /// Change the owner of a file.
     pub fn chown(
         &self,
         acting_user: UserInfo,
-        path: &str,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<(), ChownError> {
-        self.chown_at(acting_user, None, path, user, group)
-    }
-
-    /// Change ownership relative to an optional directory handle.
-    pub fn chown_at(
-        &self,
-        acting_user: UserInfo,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
         user: Option<u16>,
         group: Option<u16>,
@@ -1208,16 +1170,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         self.backend.chown(target, user, group)
     }
 
-    /// Unlink a file
-    pub fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
-        self.unlink_at(user, None, path)
-    }
-
-    /// Remove a name relative to an optional directory handle.
-    pub fn unlink_at(
+    /// Unlink a file.
+    pub fn unlink(
         &self,
         user: UserInfo,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
     ) -> Result<(), UnlinkError> {
         let context = Context::new(user);
@@ -1274,22 +1231,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         self.backend.unlink_at(parent, &name)
     }
 
-    /// Create a symbolic link without resolving its target.
+    /// Create a symbolic link at `linkpath`; `target` is stored verbatim, without resolving it.
     pub fn symlink(
         &self,
         user: UserInfo,
         target: &str,
-        linkpath: &str,
-    ) -> Result<(), SymlinkError> {
-        self.symlink_at(user, target, None, linkpath)
-    }
-
-    /// Create a link relative to an optional directory handle; `target` is stored verbatim.
-    pub fn symlink_at(
-        &self,
-        user: UserInfo,
-        target: &str,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         linkpath: &str,
     ) -> Result<(), SymlinkError> {
         if target.is_empty() {
@@ -1304,7 +1251,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             WalkError::PathError(error) => error.into(),
         };
         let Some((parent, name)) = self
-            .parent_dir_and_name(&context, anchor, linkpath)
+            .parent_dir_and_name(&context, anchor.clone(), linkpath)
             .map_err(map_walk_error)?
         else {
             return Err(SymlinkError::AlreadyExists);
@@ -1360,22 +1307,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// Atomically move an entry to a new name, replacing a compatible destination.
     ///
     /// Parent symbolic links are resolved, but final symbolic links are moved themselves.
+    /// Each path is resolved from its own anchor.
     pub fn rename(
         &self,
         user: UserInfo,
+        old_anchor: Option<DirAnchor>,
         old_path: &str,
-        new_path: &str,
-    ) -> Result<(), RenameError> {
-        self.rename_at(user, None, old_path, None, new_path)
-    }
-
-    /// Rename an entry between independently anchored parents.
-    pub fn rename_at(
-        &self,
-        user: UserInfo,
-        old_anchor: Option<&ResolverEntry<Backend>>,
-        old_path: &str,
-        new_anchor: Option<&ResolverEntry<Backend>>,
+        new_anchor: Option<DirAnchor>,
         new_path: &str,
     ) -> Result<(), RenameError> {
         let context = Context::new(user);
@@ -1470,26 +1408,21 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             .rename_at(old_dir, &old_name, new_dir, &new_name)
     }
 
-    /// Create a new directory
-    pub fn mkdir(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
-        self.mkdir_at(user, None, path, mode)
-    }
-
-    /// Create a directory relative to an optional directory handle.
-    pub fn mkdir_at(
+    /// Create a new directory.
+    pub fn mkdir(
         &self,
         user: UserInfo,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
         mode: Mode,
     ) -> Result<(), MkdirError> {
         let context = Context::new(user);
-        let Some((parent, name)) =
-            self.parent_dir_and_name(&context, anchor, path)
-                .map_err(|error| match error {
-                    WalkError::Io => MkdirError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
+        let Some((parent, name)) = self
+            .parent_dir_and_name(&context, anchor.clone(), path)
+            .map_err(|error| match error {
+                WalkError::Io => MkdirError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?
         else {
             return Err(MkdirError::AlreadyExists);
         };
@@ -1531,16 +1464,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         result
     }
 
-    /// Remove a directory
-    pub fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
-        self.rmdir_at(user, None, path)
-    }
-
-    /// Remove a directory relative to an optional directory handle.
-    pub fn rmdir_at(
+    /// Remove a directory.
+    pub fn rmdir(
         &self,
         user: UserInfo,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
     ) -> Result<(), RmdirError> {
         let context = Context::new(user);
@@ -1617,17 +1545,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     pub fn file_status(
         &self,
         user: UserInfo,
-        path: &str,
-        follow_symlinks: bool,
-    ) -> Result<super::FileStatus, FileStatusError> {
-        self.file_status_at(user, None, path, follow_symlinks)
-    }
-
-    /// Obtain status relative to an optional directory handle.
-    pub fn file_status_at(
-        &self,
-        user: UserInfo,
-        anchor: Option<&ResolverEntry<Backend>>,
+        anchor: Option<DirAnchor>,
         path: &str,
         follow_symlinks: bool,
     ) -> Result<super::FileStatus, FileStatusError> {
@@ -1664,19 +1582,16 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
     /// The name an entry was opened by, following renames of the directory it was opened from.
     fn opened_name(&self, entry: &ResolverEntry<Backend>) -> Result<String, WalkError> {
-        let Some(path) = &entry.anchored_path else {
-            return Ok(entry.path.clone());
-        };
-        let Some(anchor) = &path.anchor else {
-            return Ok(entry.path.clone());
+        let Some(anchor) = &entry.name.anchor else {
+            return Ok(entry.name.to_absolute());
         };
         match self.backend.dir_path(&anchor.dir) {
             Ok(Some(mut components)) => {
-                components.extend(path.components.iter().cloned());
+                components.extend(entry.name.components.iter().cloned());
                 Ok(ResolvedPath::join(String::new(), &components))
             }
             Ok(None) | Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
-                Ok(entry.path.clone())
+                Ok(entry.name.to_absolute())
             }
             Err(error) => Err(error),
         }
@@ -1805,15 +1720,10 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     nonblocking: bool,
     path_only: bool,
     seek_behavior: SeekBehavior,
-    /// Absolute path of the opened object, with symbolic links resolved, as recorded when it was
-    /// opened. An anchored open records its anchor's name at that time.
-    ///
-    /// Later renames or removals of the object are not reflected.
-    path: String,
-    /// Symlink-expanded, handle-relative location for backend operations requiring a rewalk.
-    /// `path` cannot identify this location after a rename of the anchor. `None` for unanchored
-    /// opens, which rewalk `path`.
-    anchored_path: Option<Arc<ResolvedPath>>,
+    /// Symlink-expanded location of the opened object, relative to the directory it was opened
+    /// from (or to the root), as resolved when it was opened. Backend operations that need a
+    /// path rewalk it; later renames or removals of the object are not reflected.
+    name: Arc<ResolvedPath>,
     /// The controlling terminal that the file referred to when it was opened,
     /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
     controlling_terminal: Option<Arc<ReopenedTerminal>>,
@@ -1832,8 +1742,7 @@ impl<Backend: super::backend::Backend> Clone for ResolverEntry<Backend> {
             nonblocking: self.nonblocking,
             path_only: self.path_only,
             seek_behavior: self.seek_behavior,
-            path: self.path.clone(),
-            anchored_path: self.anchored_path.clone(),
+            name: Arc::clone(&self.name),
             controlling_terminal: self.controlling_terminal.clone(),
         }
     }
@@ -1847,12 +1756,27 @@ struct ReopenedTerminal {
 }
 
 impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
+    /// Captures this entry as the starting point of relative lookups.
+    #[must_use]
+    pub fn anchor(&self) -> DirAnchor {
+        DirAnchor(match &self.handle {
+            Handle::Dir(dir) => Some(WalkAnchor {
+                dir: dir.clone(),
+                hint: self.name.to_absolute(),
+            }),
+            Handle::File(_) => None,
+        })
+    }
+
     pub(crate) const fn is_path_only(&self) -> bool {
         self.path_only
     }
 
-    pub(crate) fn path(&self) -> &str {
-        &self.path
+    /// Absolute name of the opened object as recorded when it was opened, naming the directory
+    /// it was opened from by that directory's recorded name.
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> String {
+        self.name.to_absolute()
     }
 
     pub(crate) const fn allows_read(&self) -> bool {
@@ -1902,25 +1826,25 @@ mod tests {
         );
         let user = UserInfo::ROOT;
         let mode = Mode::RWXU;
-        let open = |path| fs.open(user, path, OFlags::PATH, mode).unwrap();
+        let open = |path| fs.open(user, None, path, OFlags::PATH, mode).unwrap();
         for path in ["/", "/bridge", "/bridge/fs", "/bridge/fs/nested"] {
             assert_eq!(fs.handle_path(&open(path)).unwrap(), path);
         }
-        fs.mkdir(user, "/bridge/fs/old", mode).unwrap();
-        fs.mkdir(user, "/bridge/fs/old/child", mode).unwrap();
+        fs.mkdir(user, None, "/bridge/fs/old", mode).unwrap();
+        fs.mkdir(user, None, "/bridge/fs/old/child", mode).unwrap();
         let dir = open("/bridge/fs/old/child");
         let anchored = fs
-            .open_at(
+            .open(
                 user,
-                Some(&open("/bridge/fs/old")),
+                Some(open("/bridge/fs/old").anchor()),
                 "anchored",
                 OFlags::CREAT,
                 mode,
             )
             .unwrap();
-        fs.rename(user, "/bridge/fs/old", "/bridge/fs/moved")
+        fs.rename(user, None, "/bridge/fs/old", None, "/bridge/fs/moved")
             .unwrap();
-        fs.mkdir(user, "/bridge/fs/old", mode).unwrap();
+        fs.mkdir(user, None, "/bridge/fs/old", mode).unwrap();
         assert_eq!(fs.handle_path(&dir).unwrap(), "/bridge/fs/moved/child");
         // A file opened relative to a directory is named under the directory's current name.
         assert_eq!(
@@ -1928,10 +1852,16 @@ mod tests {
             "/bridge/fs/moved/anchored"
         );
 
-        fs.rename(user, "/bridge/fs/moved/child", "/bridge/fs/promoted")
-            .unwrap();
+        fs.rename(
+            user,
+            None,
+            "/bridge/fs/moved/child",
+            None,
+            "/bridge/fs/promoted",
+        )
+        .unwrap();
         let nested = fs
-            .open_at(user, Some(&dir), "../nested", OFlags::PATH, mode)
+            .open(user, Some(dir.anchor()), "../nested", OFlags::PATH, mode)
             .unwrap();
         assert_eq!(
             fs.handle_status(&nested).unwrap().node_info,
@@ -1939,12 +1869,31 @@ mod tests {
                 .unwrap()
                 .node_info
         );
-        fs.rmdir(user, "/bridge/fs/promoted").unwrap();
-        fs.mkdir(user, "/bridge/fs/promoted", mode).unwrap();
+        fs.rmdir(user, None, "/bridge/fs/promoted").unwrap();
+        fs.mkdir(user, None, "/bridge/fs/promoted", mode).unwrap();
         assert!(matches!(
             fs.handle_path(&dir),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
+    }
+
+    #[test]
+    fn directory_covered_by_a_later_mount_is_not_reported_removed() {
+        use crate::fs::composer::Composer;
+        let fs = Resolver::<TestPlatform, _>::new(
+            Composer::<TestPlatform>::builder()
+                .mount("/", InMem::<TestPlatform>::new)
+                .build()
+                .unwrap(),
+        );
+        let user = UserInfo::ROOT;
+        let mode = Mode::RWXU;
+        fs.mkdir(user, None, "/mnt", mode).unwrap();
+        fs.mkdir(user, None, "/mnt/dir", mode).unwrap();
+        let dir = fs.open(user, None, "/mnt/dir", OFlags::PATH, mode).unwrap();
+        fs.mount_in_mem(user, "/mnt").unwrap();
+        // The shadowed directory is still linked, so it must not be reported as removed.
+        assert_eq!(fs.handle_path(&dir).unwrap(), "/mnt/dir");
     }
 
     #[test]
@@ -1959,24 +1908,26 @@ mod tests {
         );
         let user = UserInfo::ROOT;
         let mode = Mode::RWXU;
-        fs.mkdir(user, "/parent", mode).unwrap();
-        fs.mkdir(user, "/parent/child", mode).unwrap();
-        let child = fs.open(user, "/parent/child", OFlags::PATH, mode).unwrap();
-        fs.rmdir(user, "/parent/child").unwrap();
-        fs.rmdir(user, "/parent").unwrap();
+        fs.mkdir(user, None, "/parent", mode).unwrap();
+        fs.mkdir(user, None, "/parent/child", mode).unwrap();
+        let child = fs
+            .open(user, None, "/parent/child", OFlags::PATH, mode)
+            .unwrap();
+        fs.rmdir(user, None, "/parent/child").unwrap();
+        fs.rmdir(user, None, "/parent").unwrap();
         let parent = fs
-            .open_at(user, Some(&child), "..", OFlags::PATH, mode)
+            .open(user, Some(child.anchor()), "..", OFlags::PATH, mode)
             .unwrap();
         assert!(matches!(
             fs.handle_path(&parent),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(
-            fs.open_at(user, Some(&parent), "nested", OFlags::PATH, mode)
+            fs.open(user, Some(parent.anchor()), "nested", OFlags::PATH, mode)
                 .is_err()
         );
         let nested = fs
-            .open_at(user, Some(&parent), "../nested", OFlags::PATH, mode)
+            .open(user, Some(parent.anchor()), "../nested", OFlags::PATH, mode)
             .unwrap();
         assert_eq!(fs.handle_path(&nested).unwrap(), "/nested");
     }
@@ -1987,15 +1938,17 @@ mod tests {
             InodeAllocators::new().next(),
         ));
         let user = UserInfo::ROOT;
-        fs.mkdir(user, "/dir", Mode::RWXU).unwrap();
-        let dir = fs.open(user, "/dir", OFlags::PATH, Mode::empty()).unwrap();
-        let child = fs
-            .open_at(user, Some(&dir), "child", OFlags::CREAT, Mode::RWXU)
+        fs.mkdir(user, None, "/dir", Mode::RWXU).unwrap();
+        let dir = fs
+            .open(user, None, "/dir", OFlags::PATH, Mode::empty())
             .unwrap();
-        fs.rename(user, "/dir", "/moved").unwrap();
-        fs.mkdir(user, "/dir", Mode::RWXU).unwrap();
+        let child = fs
+            .open(user, Some(dir.anchor()), "child", OFlags::CREAT, Mode::RWXU)
+            .unwrap();
+        fs.rename(user, None, "/dir", None, "/moved").unwrap();
+        fs.mkdir(user, None, "/dir", Mode::RWXU).unwrap();
         let decoy = fs
-            .open(user, "/dir/child", OFlags::CREAT, Mode::RWXU)
+            .open(user, None, "/dir/child", OFlags::CREAT, Mode::RWXU)
             .unwrap();
         let before = fs.handle_status(&decoy).unwrap().times;
         let mtime = crate::fs::FileTimestamp {
@@ -2022,32 +1975,32 @@ mod tests {
         let user = UserInfo::ROOT;
         let mode = Mode::RWXU;
         let open_dir = |path| {
-            fs.open(user, path, OFlags::PATH | OFlags::DIRECTORY, mode)
+            fs.open(user, None, path, OFlags::PATH | OFlags::DIRECTORY, mode)
                 .unwrap()
         };
-        fs.mkdir(user, "/old", mode).unwrap();
-        fs.mkdir(user, "/dst", mode).unwrap();
+        fs.mkdir(user, None, "/old", mode).unwrap();
+        fs.mkdir(user, None, "/dst", mode).unwrap();
         let src = open_dir("/old");
         let dst = open_dir("/dst");
-        fs.rename(user, "/old", "/dst/moved").unwrap();
-        fs.mkdir(user, "/old", mode).unwrap();
+        fs.rename(user, None, "/old", None, "/dst/moved").unwrap();
+        fs.mkdir(user, None, "/old", mode).unwrap();
 
-        fs.mkdir_at(user, Some(&src), "sub", mode).unwrap();
+        fs.mkdir(user, Some(src.anchor()), "sub", mode).unwrap();
         let file = fs
-            .open_at(user, Some(&src), "sub/f", OFlags::CREAT, mode)
+            .open(user, Some(src.anchor()), "sub/f", OFlags::CREAT, mode)
             .unwrap();
         let ino = fs.handle_status(&file).unwrap().node_info.ino;
-        fs.symlink_at(user, "sub/../sub/f", Some(&src), "relative")
+        fs.symlink(user, "sub/../sub/f", Some(src.anchor()), "relative")
             .unwrap();
         assert_eq!(
-            fs.read_link_at(user, Some(&src), "relative").unwrap(),
+            fs.read_link(user, Some(src.anchor()), "relative").unwrap(),
             "sub/../sub/f"
         );
-        fs.symlink_at(user, "/dst/moved/sub/f", Some(&dst), "absolute")
+        fs.symlink(user, "/dst/moved/sub/f", Some(dst.anchor()), "absolute")
             .unwrap();
         for path in ["relative", "../absolute"] {
             assert_eq!(
-                fs.file_status_at(user, Some(&src), path, true)
+                fs.file_status(user, Some(src.anchor()), path, true)
                     .unwrap()
                     .node_info
                     .ino,
@@ -2055,50 +2008,66 @@ mod tests {
                 "wrong inode for {path}"
             );
         }
-        fs.chmod_at(user, Some(&src), "relative", Mode::RUSR)
+        fs.chmod(user, Some(src.anchor()), "relative", Mode::RUSR)
             .unwrap();
-        fs.chown_at(user, Some(&src), "relative", Some(42), None)
+        fs.chown(user, Some(src.anchor()), "relative", Some(42), None)
             .unwrap();
-        fs.rename_at(user, Some(&src), "sub/f", Some(&dst), "received")
-            .unwrap();
+        fs.rename(
+            user,
+            Some(src.anchor()),
+            "sub/f",
+            Some(dst.anchor()),
+            "received",
+        )
+        .unwrap();
         assert_eq!(
-            fs.file_status(user, "/dst/received", true)
+            fs.file_status(user, None, "/dst/received", true)
                 .unwrap()
                 .node_info
                 .ino,
             ino
         );
-        assert!(fs.file_status(user, "/old/sub", true).is_err());
-        fs.unlink_at(user, Some(&dst), "received").unwrap();
-        fs.rmdir_at(user, Some(&src), "sub").unwrap();
+        assert!(fs.file_status(user, None, "/old/sub", true).is_err());
+        fs.unlink(user, Some(dst.anchor()), "received").unwrap();
+        fs.rmdir(user, Some(src.anchor()), "sub").unwrap();
 
         assert!(matches!(
-            fs.file_status_at(user, Some(&file), "child", true),
+            fs.file_status(user, Some(file.anchor()), "child", true),
             Err(FileStatusError::PathError(
                 PathError::ComponentNotADirectory
             ))
         ));
-        assert!(fs.file_status_at(user, Some(&file), "/dst", true).is_ok());
+        assert!(
+            fs.file_status(user, Some(file.anchor()), "/dst", true)
+                .is_ok()
+        );
         // Search checks apply to held directories as of now, not as of when they were opened.
         let owner = UserInfo {
             user: 1000,
             group: 1000,
         };
-        fs.chmod(user, "/dst", Mode::RWXU | Mode::XOTH).unwrap();
-        fs.chown(user, "/dst/moved", Some(owner.user), Some(owner.group))
+        fs.chmod(user, None, "/dst", Mode::RWXU | Mode::XOTH)
             .unwrap();
-        fs.chmod(user, "/dst/moved", Mode::WUSR).unwrap();
+        fs.chown(
+            user,
+            None,
+            "/dst/moved",
+            Some(owner.user),
+            Some(owner.group),
+        )
+        .unwrap();
+        fs.chmod(user, None, "/dst/moved", Mode::WUSR).unwrap();
         assert!(matches!(
-            fs.open_at(owner, Some(&src), "new", OFlags::CREAT, mode),
+            fs.open(owner, Some(src.anchor()), "new", OFlags::CREAT, mode),
             Err(OpenError::PathError(PathError::NoSearchPerms))
         ));
         assert!(matches!(
-            fs.mkdir_at(owner, Some(&dst), "moved/new", mode),
+            fs.mkdir(owner, Some(dst.anchor()), "moved/new", mode),
             Err(MkdirError::PathError(PathError::NoSearchPerms))
         ));
         for path in [".", "..", "relative"] {
             assert!(matches!(
-                fs.file_status_at(owner, Some(&src), path, true),
+                fs.file_status(owner, Some(src.anchor()), path, true),
                 Err(FileStatusError::PathError(PathError::NoSearchPerms))
             ));
         }
@@ -2115,25 +2084,25 @@ mod tests {
         );
         let user = UserInfo::ROOT;
         let mode = Mode::RWXU;
-        fs.mkdir(user, "/a", mode).unwrap();
-        fs.mkdir(user, "/a/b", mode).unwrap();
-        fs.mkdir(user, "/a/t", mode).unwrap();
-        let b = fs.open(user, "/a/b", OFlags::PATH, mode).unwrap();
+        fs.mkdir(user, None, "/a", mode).unwrap();
+        fs.mkdir(user, None, "/a/b", mode).unwrap();
+        fs.mkdir(user, None, "/a/t", mode).unwrap();
+        let b = fs.open(user, None, "/a/b", OFlags::PATH, mode).unwrap();
         let a = fs
-            .open_at(user, Some(&b), "..", OFlags::PATH, mode)
+            .open(user, Some(b.anchor()), "..", OFlags::PATH, mode)
             .unwrap();
         // Both handles now record locations under `/a`.
-        fs.rename(user, "/a", "/z").unwrap();
+        fs.rename(user, None, "/a", None, "/z").unwrap();
         fs.mount_in_mem(user, "/z/t").unwrap();
         let created = fs
-            .open_at(user, Some(&a), "t/x", OFlags::CREAT, mode)
+            .open(user, Some(a.anchor()), "t/x", OFlags::CREAT, mode)
             .unwrap();
-        let mounted = fs.open(user, "/z/t", OFlags::PATH, mode).unwrap();
+        let mounted = fs.open(user, None, "/z/t", OFlags::PATH, mode).unwrap();
         assert_eq!(
             fs.handle_status(&created).unwrap().node_info.dev,
             fs.handle_status(&mounted).unwrap().node_info.dev
         );
-        assert!(fs.file_status(user, "/z/t/x", true).is_ok());
+        assert!(fs.file_status(user, None, "/z/t/x", true).is_ok());
     }
 
     #[test]
@@ -2148,21 +2117,23 @@ mod tests {
         );
         let user = UserInfo::ROOT;
         let mode = Mode::RWXU;
-        fs.mkdir(user, "/outer", mode).unwrap();
-        let m = fs.open(user, "/m", OFlags::PATH, mode).unwrap();
+        fs.mkdir(user, None, "/outer", mode).unwrap();
+        let m = fs.open(user, None, "/m", OFlags::PATH, mode).unwrap();
         let up = fs
-            .open_at(user, Some(&m), "..", OFlags::PATH, mode)
+            .open(user, Some(m.anchor()), "..", OFlags::PATH, mode)
             .unwrap();
         assert_eq!(fs.handle_path(&up).unwrap(), "/");
         let outer = fs
-            .open_at(user, Some(&m), "../outer", OFlags::PATH, mode)
+            .open(user, Some(m.anchor()), "../outer", OFlags::PATH, mode)
             .unwrap();
         assert_eq!(
             fs.handle_status(&outer).unwrap().node_info,
-            fs.file_status(user, "/outer", true).unwrap().node_info
+            fs.file_status(user, None, "/outer", true)
+                .unwrap()
+                .node_info
         );
         let top = fs
-            .open_at(user, Some(&m), "../../..", OFlags::PATH, mode)
+            .open(user, Some(m.anchor()), "../../..", OFlags::PATH, mode)
             .unwrap();
         assert_eq!(fs.handle_path(&top).unwrap(), "/");
     }
@@ -2174,29 +2145,29 @@ mod tests {
         ));
         let user = UserInfo::ROOT;
         let mode = Mode::RWXU;
-        fs.mkdir(user, "/d", mode).unwrap();
-        fs.mkdir(user, "/e", mode).unwrap();
+        fs.mkdir(user, None, "/d", mode).unwrap();
+        fs.mkdir(user, None, "/e", mode).unwrap();
         let d = fs
-            .open(user, "/d", OFlags::RDONLY | OFlags::DIRECTORY, mode)
+            .open(user, None, "/d", OFlags::RDONLY | OFlags::DIRECTORY, mode)
             .unwrap();
-        fs.rmdir(user, "/d").unwrap();
+        fs.rmdir(user, None, "/d").unwrap();
         assert!(matches!(
-            fs.mkdir_at(user, Some(&d), "x", mode),
+            fs.mkdir(user, Some(d.anchor()), "x", mode),
             Err(MkdirError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(matches!(
-            fs.open_at(user, Some(&d), "x", OFlags::CREAT, mode),
+            fs.open(user, Some(d.anchor()), "x", OFlags::CREAT, mode),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(matches!(
-            fs.symlink_at(user, "target", Some(&d), "x"),
+            fs.symlink(user, "target", Some(d.anchor()), "x"),
             Err(SymlinkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(matches!(
-            fs.rename_at(user, None, "/e", Some(&d), "e"),
+            fs.rename(user, None, "/e", Some(d.anchor()), "e"),
             Err(RenameError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(matches!(fs.read_dir(&d), Err(ReadDirError::Removed)));
-        assert!(fs.file_status(user, "/e", true).is_ok());
+        assert!(fs.file_status(user, None, "/e", true).is_ok());
     }
 }

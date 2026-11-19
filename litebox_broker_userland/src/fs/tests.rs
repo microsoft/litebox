@@ -114,17 +114,24 @@ fn moved_out_of_export_fails_closed_even_after_replacement() {
     let walking = local.walking_dir_at(&child).unwrap();
     fs::rename(root.join("child"), temp.path().join("outside")).unwrap();
     fs::create_dir(root.join("child")).unwrap();
+    // Outside the export, the directory no longer exists for the guest.
+    let missing = |error: WalkError| {
+        matches!(
+            error,
+            WalkError::PathError(PathError::NoSuchFileOrDirectory)
+        )
+    };
     assert!(
         local
             .check_search_permission(&local.walking_dir_at(&child).unwrap())
-            .is_err()
+            .is_err_and(missing)
     );
-    assert!(local.parent_dir(&child).is_err());
+    assert!(local.parent_dir(&child).is_err_and(missing));
     assert!(local.list_dir_at(child).is_err());
     assert!(
         local
             .resolve(walking, &["name"], &|_| unreachable!())
-            .is_err()
+            .is_err_and(|error| missing(error.error))
     );
 }
 

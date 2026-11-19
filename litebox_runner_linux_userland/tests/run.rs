@@ -143,28 +143,27 @@ fn test_utimensat_through_broker_mount() {
 #[cfg(target_os = "linux")]
 fn run_rename_test_through_broker_mount(source: &str, name: &str, expected: &str) {
     let target = common::compile(source, name, true, false);
-    let host = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_dir"));
-    if host.exists() {
-        std::fs::remove_dir_all(&host).unwrap();
-    }
-    std::fs::create_dir(&host).unwrap();
+    // A fresh directory per run, so entries a failed run leaves behind (possibly without search
+    // permission) cannot fail later runs.
+    let host = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     // LocalFs reports host owners, so the guest runs as the mount's owner to own what it creates.
-    let host_uid = u16::try_from(std::os::unix::fs::MetadataExt::uid(
-        &std::fs::metadata(&host).unwrap(),
-    ))
-    .expect("host uid fits a guest uid");
+    let Ok(host_uid) = u16::try_from(std::os::unix::fs::MetadataExt::uid(
+        &std::fs::metadata(host.path()).unwrap(),
+    )) else {
+        eprintln!("skipping {name}: the host uid does not fit a guest uid");
+        return;
+    };
     // LocalFs does not support guest-created symlinks.
     let output = Runner::new(&target, name)
         .guest_uid(host_uid)
-        .mount(&host, "/work")
+        .mount(host.path(), "/work")
         .args(["/work", "no-symlinks"])
         .output();
     assert!(String::from_utf8_lossy(&output).contains(expected));
     assert!(
-        std::fs::read_dir(&host).unwrap().next().is_none(),
+        std::fs::read_dir(host.path()).unwrap().next().is_none(),
         "the test left entries behind on the host"
     );
-    std::fs::remove_dir(host).unwrap();
 }
 
 #[test]

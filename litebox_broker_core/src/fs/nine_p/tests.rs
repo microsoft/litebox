@@ -160,7 +160,11 @@ fn set_times_round_trips_signed_times_and_preserves_omit() {
         },
     )
     .unwrap();
-    let status = fs.file_status(USER, "/file", true).unwrap().times.unwrap();
+    let status = fs
+        .file_status(USER, None, "/file", true)
+        .unwrap()
+        .times
+        .unwrap();
     assert_eq!(status.accessed, accessed);
     assert_eq!(status.modified, modified);
     fs.set_times_at(
@@ -173,7 +177,11 @@ fn set_times_round_trips_signed_times_and_preserves_omit() {
         },
     )
     .unwrap();
-    let status = fs.file_status(USER, "/file", true).unwrap().times.unwrap();
+    let status = fs
+        .file_status(USER, None, "/file", true)
+        .unwrap()
+        .times
+        .unwrap();
     assert_eq!(status.accessed, accessed);
     assert!(status.modified.seconds > modified.seconds);
     let before = status;
@@ -188,7 +196,10 @@ fn set_times_round_trips_signed_times_and_preserves_omit() {
     )
     .unwrap();
     assert_eq!(
-        fs.file_status(USER, "/file", true).unwrap().times.unwrap(),
+        fs.file_status(USER, None, "/file", true)
+            .unwrap()
+            .times
+            .unwrap(),
         before
     );
 }
@@ -221,7 +232,7 @@ fn overlay_authorizes_logical_targets_even_with_a_self_enforcing_lower() {
     let direct = connect_9p(&server);
     drop(
         direct
-            .open(user, "/private-file", OFlags::RDONLY, Mode::empty())
+            .open(user, None, "/private-file", OFlags::RDONLY, Mode::empty())
             .unwrap(),
     );
 
@@ -244,28 +255,34 @@ fn overlay_authorizes_logical_targets_even_with_a_self_enforcing_lower() {
     let fs = Resolver::<TestPlatform, _>::new(backend);
     for flags in [OFlags::RDONLY, OFlags::WRONLY | OFlags::TRUNC] {
         assert!(matches!(
-            fs.open(user, "/private-file", flags, Mode::empty()),
+            fs.open(user, None, "/private-file", flags, Mode::empty()),
             Err(OpenError::AccessNotAllowed)
         ));
     }
     assert!(matches!(
-        fs.open(user, "/private-dir", OFlags::RDONLY, Mode::empty()),
+        fs.open(user, None, "/private-dir", OFlags::RDONLY, Mode::empty()),
         Err(OpenError::AccessNotAllowed)
     ));
     assert!(matches!(
-        fs.open(user, "/private-dir/hidden", OFlags::PATH, Mode::empty()),
+        fs.open(
+            user,
+            None,
+            "/private-dir/hidden",
+            OFlags::PATH,
+            Mode::empty()
+        ),
         Err(OpenError::PathError(PathError::NoSearchPerms))
     ));
     assert!(matches!(
-        fs.chmod(user, "/private-file", Mode::RWXU),
+        fs.chmod(user, None, "/private-file", Mode::RWXU),
         Err(ChmodError::NotTheOwner)
     ));
     assert!(matches!(
-        fs.chown(user, "/private-file", Some(user.user), None),
+        fs.chown(user, None, "/private-file", Some(user.user), None),
         Err(ChownError::NotTheOwner)
     ));
     let fd = fs
-        .open(user, "/private-file", OFlags::PATH, Mode::empty())
+        .open(user, None, "/private-file", OFlags::PATH, Mode::empty())
         .unwrap();
     assert_eq!(fs.handle_status(&fd).unwrap().size, 17);
     drop(fd);
@@ -281,6 +298,7 @@ fn test_nine_p_create_and_read_file() {
     let mut fd = fs
         .open(
             USER,
+            None,
             "/hello.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -303,7 +321,7 @@ fn test_nine_p_create_and_read_file() {
 
     // Read the file back through 9P
     let mut fd = fs
-        .open(USER, "/hello.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, None, "/hello.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading via 9P");
 
     let mut buf = alloc::vec![0u8; 256];
@@ -321,15 +339,16 @@ fn test_nine_p_mkdir_and_readdir() {
     let fs = connect_9p(&server);
 
     // Create directories
-    fs.mkdir(USER, "/subdir", Mode::RWXU)
+    fs.mkdir(USER, None, "/subdir", Mode::RWXU)
         .expect("failed to mkdir via 9P");
-    fs.mkdir(USER, "/subdir/nested", Mode::RWXU)
+    fs.mkdir(USER, None, "/subdir/nested", Mode::RWXU)
         .expect("failed to mkdir nested via 9P");
 
     // Create a file inside the subdirectory
     let mut fd = fs
         .open(
             USER,
+            None,
             "/subdir/file.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -340,7 +359,13 @@ fn test_nine_p_mkdir_and_readdir() {
 
     // Read the root directory
     let fd = fs
-        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .open(
+            USER,
+            None,
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
         .expect("failed to open root dir");
     let entries = fs.read_dir(&fd).expect("failed to readdir root");
     drop(fd);
@@ -355,6 +380,7 @@ fn test_nine_p_mkdir_and_readdir() {
     let fd = fs
         .open(
             USER,
+            None,
             "/subdir",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
@@ -383,6 +409,7 @@ fn test_nine_p_unlink_and_rmdir() {
     let fd = fs
         .open(
             USER,
+            None,
             "/to_delete.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -390,20 +417,20 @@ fn test_nine_p_unlink_and_rmdir() {
         .expect("failed to create file");
     drop(fd);
 
-    fs.unlink(USER, "/to_delete.txt")
+    fs.unlink(USER, None, "/to_delete.txt")
         .expect("failed to unlink file via 9P");
 
     // Verify the file is gone
     assert!(
-        fs.open(USER, "/to_delete.txt", OFlags::RDONLY, Mode::empty())
+        fs.open(USER, None, "/to_delete.txt", OFlags::RDONLY, Mode::empty())
             .is_err(),
         "file should no longer exist"
     );
 
     // Create a directory, then remove it
-    fs.mkdir(USER, "/to_remove", Mode::RWXU)
+    fs.mkdir(USER, None, "/to_remove", Mode::RWXU)
         .expect("failed to mkdir");
-    fs.rmdir(USER, "/to_remove")
+    fs.rmdir(USER, None, "/to_remove")
         .expect("failed to rmdir via 9P");
 
     // Verify the directory is gone on the host
@@ -422,6 +449,7 @@ fn test_nine_p_seek_and_partial_read() {
     let mut fd = fs
         .open(
             USER,
+            None,
             "/seek_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -432,7 +460,7 @@ fn test_nine_p_seek_and_partial_read() {
 
     // Open for reading and seek
     let mut fd = fs
-        .open(USER, "/seek_test.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, None, "/seek_test.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading");
 
     // Seek to offset 5
@@ -458,6 +486,7 @@ fn test_nine_p_truncate() {
     let mut fd = fs
         .open(
             USER,
+            None,
             "/trunc_test.txt",
             OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
@@ -492,7 +521,7 @@ fn test_nine_p_host_files_visible() {
 
     // Read file created on the host through 9P
     let mut fd = fs
-        .open(USER, "/host_file.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, None, "/host_file.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open host file via 9P");
     let mut buf = alloc::vec![0u8; 256];
     let n = fs.read(&mut fd, &mut buf, None).unwrap();
@@ -503,6 +532,7 @@ fn test_nine_p_host_files_visible() {
     let fd = fs
         .open(
             USER,
+            None,
             "/host_dir",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
@@ -532,7 +562,7 @@ fn test_nine_p_host_symlinks() {
     let fs = connect_9p(&server);
     let read = |path| {
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, None, path, OFlags::RDONLY, Mode::empty())
             .unwrap_or_else(|error| panic!("open {path}: {error:?}"));
         let mut buf = alloc::vec![0u8; 16];
         let n = fs.read(&mut fd, &mut buf, None).unwrap();
@@ -547,17 +577,17 @@ fn test_nine_p_host_symlinks() {
     assert_eq!(read("/abs/rel"), b"target");
     assert_eq!(read("/chain"), b"target");
 
-    assert_eq!(fs.read_link(USER, "/abs").unwrap(), "/dir");
-    assert_eq!(fs.read_link(USER, "/abs/rel").unwrap(), "file");
-    assert!(fs.read_link(USER, "/dir/file").is_err());
+    assert_eq!(fs.read_link(USER, None, "/abs").unwrap(), "/dir");
+    assert_eq!(fs.read_link(USER, None, "/abs/rel").unwrap(), "file");
+    assert!(fs.read_link(USER, None, "/dir/file").is_err());
 
-    let status = |path, follow| fs.file_status(USER, path, follow).unwrap().file_type;
+    let status = |path, follow| fs.file_status(USER, None, path, follow).unwrap().file_type;
     assert_eq!(status("/chain", false), FileType::SymbolicLink);
     assert_eq!(status("/chain", true), FileType::RegularFile);
     assert_eq!(status("/abs", true), FileType::Directory);
 
     assert!(matches!(
-        fs.open(USER, "/loop", OFlags::RDONLY, Mode::empty()),
+        fs.open(USER, None, "/loop", OFlags::RDONLY, Mode::empty()),
         Err(OpenError::PathError(
             crate::fs::errors::PathError::TooManySymlinks
         ))
@@ -566,6 +596,7 @@ fn test_nine_p_host_symlinks() {
     let fd = fs
         .open(
             USER,
+            None,
             "/dir",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
@@ -654,7 +685,7 @@ fn test_nine_p_broken_open() {
     // 2 writes: version + attach. The next write (open's walk) will fail.
     let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.open(USER, "/anything.txt", OFlags::RDONLY, Mode::empty());
+    let result = fs.open(USER, None, "/anything.txt", OFlags::RDONLY, Mode::empty());
     assert!(matches!(result, Err(OpenError::Io)));
 }
 
@@ -677,6 +708,7 @@ fn test_nine_p_broken_read() {
     let mut fd = fs
         .open(
             USER,
+            None,
             "/parent/nested/read_me.txt",
             OFlags::RDONLY,
             Mode::empty(),
@@ -702,7 +734,7 @@ fn test_nine_p_broken_read_after_progress() {
     // The second Tread fails.
     let fs = connect_9p_broken(&server, 7);
     let mut fd = fs
-        .open(USER, "/read_me.bin", OFlags::RDONLY, Mode::empty())
+        .open(USER, None, "/read_me.bin", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
 
     let mut buf = alloc::vec![0u8; data.len()];
@@ -726,7 +758,7 @@ fn test_nine_p_faulting_read_after_progress() {
 
     let fs = connect_9p(&server);
     let mut fd = fs
-        .open(USER, "/read_me.bin", OFlags::RDONLY, Mode::empty())
+        .open(USER, None, "/read_me.bin", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed");
 
     // A `Tread` carries at most 65512 bytes, so the first copy succeeds and a later one faults.
@@ -753,6 +785,7 @@ fn test_nine_p_broken_write() {
     let mut fd = fs
         .open(
             USER,
+            None,
             "/write_me.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -769,7 +802,7 @@ fn test_nine_p_broken_mkdir() {
     let server = DiodServer::start();
     let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.mkdir(USER, "/broken_dir", Mode::RWXU);
+    let result = fs.mkdir(USER, None, "/broken_dir", Mode::RWXU);
     assert!(matches!(result, Err(MkdirError::Io)));
 }
 
@@ -781,7 +814,13 @@ fn test_nine_p_broken_readdir() {
     // 4 writes: version + attach + walk + lopen for the directory.
     let fs = connect_9p_broken(&server, 4);
     let fd = fs
-        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .open(
+            USER,
+            None,
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
         .expect("open dir should succeed before break");
 
     let result = fs.read_dir(&fd);
@@ -796,7 +835,7 @@ fn test_nine_p_broken_unlink() {
     std::fs::write(server.export_path().join("to_unlink.txt"), b"").unwrap();
 
     let fs = connect_9p_broken(&server, 2);
-    let result = fs.unlink(USER, "/to_unlink.txt");
+    let result = fs.unlink(USER, None, "/to_unlink.txt");
     assert!(matches!(result, Err(UnlinkError::Io)));
 }
 
@@ -808,7 +847,7 @@ fn test_nine_p_broken_rmdir() {
     std::fs::create_dir(server.export_path().join("to_rmdir")).unwrap();
 
     let fs = connect_9p_broken(&server, 2);
-    let result = fs.rmdir(USER, "/to_rmdir");
+    let result = fs.rmdir(USER, None, "/to_rmdir");
     assert!(matches!(result, Err(RmdirError::Io)));
 }
 
@@ -818,7 +857,7 @@ fn test_nine_p_broken_file_status() {
     let server = DiodServer::start();
     let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.file_status(USER, "/", true);
+    let result = fs.file_status(USER, None, "/", true);
     assert!(matches!(result, Err(FileStatusError::Io)));
 }
 
@@ -833,7 +872,7 @@ fn test_nine_p_broken_truncate() {
     // Then truncate will fail.
     let fs = connect_9p_broken(&server, 6);
     let mut fd = fs
-        .open(USER, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
+        .open(USER, None, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
         .expect("open should succeed before break");
 
     let result = fs.truncate(&mut fd, 0, true);
@@ -851,7 +890,7 @@ fn test_nine_p_broken_seek() {
     // Then the getattr for seek will fail.
     let fs = connect_9p_broken(&server, 6);
     let mut fd = fs
-        .open(USER, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, None, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
 
     let result = fs.seek(&mut fd, -1, SeekWhence::RelativeToEnd);
@@ -870,21 +909,27 @@ fn test_nine_p_deep_path_walk() {
     for i in 0..20 {
         path.push('/');
         write!(path, "d{i}").unwrap();
-        fs.mkdir(USER, &path, Mode::RWXU)
+        fs.mkdir(USER, None, &path, Mode::RWXU)
             .expect("failed to mkdir deep path component");
     }
 
     // Create a file at the bottom
     let file_path = path.clone() + "/deep_file.txt";
     let mut fd = fs
-        .open(USER, &file_path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+        .open(
+            USER,
+            None,
+            &file_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RWXU,
+        )
         .expect("failed to create file in deep path");
     fs.write(&mut fd, b"deep content", None).unwrap();
     drop(fd);
 
     // Read it back
     let mut fd = fs
-        .open(USER, &file_path, OFlags::RDONLY, Mode::empty())
+        .open(USER, None, &file_path, OFlags::RDONLY, Mode::empty())
         .expect("failed to open file in deep path");
     let mut buf = alloc::vec![0u8; 64];
     let n = fs.read(&mut fd, &mut buf, None).unwrap();
@@ -893,7 +938,7 @@ fn test_nine_p_deep_path_walk() {
 
     // Verify file_status works through the deep path
     let status = fs
-        .file_status(USER, &file_path, true)
+        .file_status(USER, None, &file_path, true)
         .expect("failed to stat deep file");
     assert_eq!(status.file_type, FileType::RegularFile);
     assert_eq!(status.size, 12);
@@ -909,6 +954,7 @@ fn test_nine_p_chmod() {
     let fd = fs
         .open(
             USER,
+            None,
             "/chmod_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -917,7 +963,7 @@ fn test_nine_p_chmod() {
     drop(fd);
 
     // Change permissions to read-only for user
-    fs.chmod(USER, "/chmod_test.txt", Mode::RUSR)
+    fs.chmod(USER, None, "/chmod_test.txt", Mode::RUSR)
         .expect("chmod failed");
 
     // Verify via host filesystem
@@ -932,7 +978,7 @@ fn test_nine_p_chmod() {
 
     // Also verify via 9P file_status
     let status = fs
-        .file_status(USER, "/chmod_test.txt", true)
+        .file_status(USER, None, "/chmod_test.txt", true)
         .expect("file_status failed");
     assert!(status.mode.contains(Mode::RUSR), "mode should contain RUSR");
     assert!(
@@ -950,6 +996,7 @@ fn test_nine_p_chown() {
     let fd = fs
         .open(
             USER,
+            None,
             "/chown_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -959,12 +1006,13 @@ fn test_nine_p_chown() {
 
     // Get current ownership
     let status_before = fs
-        .file_status(USER, "/chown_test.txt", true)
+        .file_status(USER, None, "/chown_test.txt", true)
         .expect("file_status failed");
 
     // Change group to the same value (chown to a different uid/gid requires root)
     fs.chown(
         USER,
+        None,
         "/chown_test.txt",
         Some(status_before.owner.user),
         Some(status_before.owner.group),
@@ -973,7 +1021,7 @@ fn test_nine_p_chown() {
 
     // Verify ownership hasn't changed
     let status_after = fs
-        .file_status(USER, "/chown_test.txt", true)
+        .file_status(USER, None, "/chown_test.txt", true)
         .expect("file_status failed after chown");
     assert_eq!(status_after.owner.user, status_before.owner.user);
     assert_eq!(status_after.owner.group, status_before.owner.group);
@@ -988,6 +1036,7 @@ fn test_nine_p_handle_status() {
     let mut fd = fs
         .open(
             USER,
+            None,
             "/fd_stat_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -998,7 +1047,13 @@ fn test_nine_p_handle_status() {
 
     // Open the file and check the open-handle status
     let fd = fs
-        .open(USER, "/fd_stat_test.txt", OFlags::RDONLY, Mode::empty())
+        .open(
+            USER,
+            None,
+            "/fd_stat_test.txt",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
         .expect("failed to open file");
 
     let status = fs.handle_status(&fd).expect("handle status failed");
@@ -1009,7 +1064,13 @@ fn test_nine_p_handle_status() {
     drop(fd);
 
     let fd = fs
-        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .open(
+            USER,
+            None,
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
         .expect("failed to open root dir");
     let status = fs.handle_status(&fd).expect("handle status on dir failed");
     assert_eq!(status.file_type, FileType::Directory);
@@ -1032,6 +1093,7 @@ fn test_nine_p_large_read_write() {
     let mut fd = fs
         .open(
             USER,
+            None,
             "/large_test.bin",
             OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
@@ -1054,7 +1116,7 @@ fn test_nine_p_large_read_write() {
     // Read it all back in one call, with room to spare: the client sends as many `Tread`s as it
     // takes and stops at the end of the file.
     let mut fd = fs
-        .open(USER, "/large_test.bin", OFlags::RDONLY, Mode::empty())
+        .open(USER, None, "/large_test.bin", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading");
 
     let mut read_buf = alloc::vec![0u8; data_size + 1];
@@ -1073,6 +1135,7 @@ fn test_nine_p_explicit_offset_read_write() {
     let mut fd = fs
         .open(
             USER,
+            None,
             "/offset_test.txt",
             OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
@@ -1101,7 +1164,13 @@ fn test_nine_p_explicit_offset_read_write() {
 
     // Now test explicit offset reads
     let mut fd = fs
-        .open(USER, "/offset_test.txt", OFlags::RDONLY, Mode::empty())
+        .open(
+            USER,
+            None,
+            "/offset_test.txt",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
         .expect("failed to open for reading");
 
     // Read 5 bytes at explicit offset 5 → "BBBBB"
@@ -1133,6 +1202,7 @@ fn test_nine_p_append_mode_changes_after_open() {
     let mut fd = fs
         .open(
             USER,
+            None,
             "/append.txt",
             OFlags::WRONLY | OFlags::APPEND,
             Mode::empty(),
@@ -1154,14 +1224,17 @@ fn test_nine_p_append_mode_changes_after_open() {
 fn nine_p_held_directories_name_and_walk() {
     let server = DiodServer::start();
     let fs = connect_9p(&server);
-    fs.mkdir(USER, "/d", Mode::RWXU).unwrap();
-    fs.mkdir(USER, "/d/sub", Mode::RWXU).unwrap();
-    let root = fs.open(USER, "/", OFlags::PATH, Mode::empty()).unwrap();
+    fs.mkdir(USER, None, "/d", Mode::RWXU).unwrap();
+    fs.mkdir(USER, None, "/d/sub", Mode::RWXU).unwrap();
+    let root = fs
+        .open(USER, None, "/", OFlags::PATH, Mode::empty())
+        .unwrap();
     assert_eq!(fs.handle_path(&root).unwrap(), "/");
     // 9P cannot name other directories, so they report the name they were opened by.
     let sub = fs
         .open(
             USER,
+            None,
             "/d/sub",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
@@ -1170,9 +1243,9 @@ fn nine_p_held_directories_name_and_walk() {
     assert_eq!(fs.handle_path(&sub).unwrap(), "/d/sub");
     // A directory opened for reading still walks relative paths and lists afterwards.
     drop(
-        fs.open_at(
+        fs.open(
             USER,
-            Some(&sub),
+            Some(sub.anchor()),
             "f",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -1186,18 +1259,24 @@ fn nine_p_held_directories_name_and_walk() {
             .any(|entry| entry.name == "f")
     );
     let parent = fs
-        .open_at(USER, Some(&sub), "..", OFlags::PATH, Mode::empty())
+        .open(USER, Some(sub.anchor()), "..", OFlags::PATH, Mode::empty())
         .unwrap();
     assert_eq!(
         fs.handle_status(&parent).unwrap().node_info,
-        fs.file_status(USER, "/d", true).unwrap().node_info
+        fs.file_status(USER, None, "/d", true).unwrap().node_info
     );
     let above_root = fs
-        .open_at(USER, Some(&root), "../d", OFlags::PATH, Mode::empty())
+        .open(
+            USER,
+            Some(root.anchor()),
+            "../d",
+            OFlags::PATH,
+            Mode::empty(),
+        )
         .unwrap();
     assert_eq!(
         fs.handle_status(&above_root).unwrap().node_info,
-        fs.file_status(USER, "/d", true).unwrap().node_info
+        fs.file_status(USER, None, "/d", true).unwrap().node_info
     );
 }
 
@@ -1211,16 +1290,22 @@ fn nine_p_held_directory_search_is_checked_by_the_server() {
     let host = server.export_path().join("d");
     std::fs::create_dir(&host).unwrap();
     let d = fs
-        .open(USER, "/d", OFlags::PATH | OFlags::DIRECTORY, Mode::empty())
+        .open(
+            USER,
+            None,
+            "/d",
+            OFlags::PATH | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
         .unwrap();
-    assert!(fs.file_status_at(USER, Some(&d), ".", true).is_ok());
+    assert!(fs.file_status(USER, Some(d.anchor()), ".", true).is_ok());
 
     std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o000)).unwrap();
     // The server enforces its own credentials, so match what the host allows: an unprivileged
     // server is refused, as Linux refuses `fstatat(fd, ".")`/`openat(fd, "..")` without search.
     let host_allows_search = std::fs::metadata(host.join(".")).is_ok();
-    let status = fs.file_status_at(USER, Some(&d), ".", true);
-    let parent = fs.open_at(USER, Some(&d), "..", OFlags::PATH, Mode::empty());
+    let status = fs.file_status(USER, Some(d.anchor()), ".", true);
+    let parent = fs.open(USER, Some(d.anchor()), "..", OFlags::PATH, Mode::empty());
     std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     if host_allows_search {
@@ -1237,9 +1322,9 @@ fn nine_p_held_directory_search_is_checked_by_the_server() {
         ));
     }
     // Restoring search permission makes the held directory walkable again.
-    assert!(fs.file_status_at(USER, Some(&d), ".", true).is_ok());
+    assert!(fs.file_status(USER, Some(d.anchor()), ".", true).is_ok());
     let parent = fs
-        .open_at(USER, Some(&d), "..", OFlags::PATH, Mode::empty())
+        .open(USER, Some(d.anchor()), "..", OFlags::PATH, Mode::empty())
         .unwrap();
     assert_eq!(fs.handle_path(&parent).unwrap(), "/");
 }
@@ -1250,16 +1335,22 @@ fn nine_p_removed_held_directory_has_no_name() {
 
     let server = DiodServer::start();
     let fs = connect_9p(&server);
-    fs.mkdir(USER, "/gone", Mode::RWXU).unwrap();
+    fs.mkdir(USER, None, "/gone", Mode::RWXU).unwrap();
     let held = [OFlags::RDONLY, OFlags::PATH].map(|flags| {
-        fs.open(USER, "/gone", flags | OFlags::DIRECTORY, Mode::empty())
-            .unwrap()
+        fs.open(
+            USER,
+            None,
+            "/gone",
+            flags | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap()
     });
     for gone in &held {
         assert_eq!(fs.handle_path(gone).unwrap(), "/gone");
     }
 
-    fs.rmdir(USER, "/gone").unwrap();
+    fs.rmdir(USER, None, "/gone").unwrap();
 
     // Like Linux, an unlinked directory has no name, rather than the name it was opened by.
     for gone in &held {

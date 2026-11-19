@@ -419,7 +419,7 @@ impl From<WalkError> for OpenError {
 }
 
 /// Keeps path errors from an internal open used for walking; everything else is [`WalkError::Io`].
-pub(crate) fn open_to_walk_error(error: OpenError) -> WalkError {
+pub(super) fn open_to_walk_error(error: OpenError) -> WalkError {
     match error {
         OpenError::PathError(error) => WalkError::PathError(error),
         _ => WalkError::Io,

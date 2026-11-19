@@ -43,7 +43,7 @@ impl<
             OFlags::PATH | OFlags::NOFOLLOW
         };
         let entry = self
-            .open(user, path, flags, Mode::empty())
+            .open(user, None, path, flags, Mode::empty())
             .expect("open the target");
         self.set_times(user, &entry, times)
     }
@@ -94,7 +94,7 @@ fn runtime_mount_checks_ownership_and_sticky_ancestors() {
         Err(FileError::NotOwner)
     );
     fs.mount_in_mem(USER, "/owned").unwrap();
-    let status = fs.file_status(USER, "/owned", true).unwrap();
+    let status = fs.file_status(USER, None, "/owned", true).unwrap();
     assert_eq!(status.owner, USER);
     assert_eq!(
         status.mode,
@@ -122,12 +122,12 @@ fn read_path<Backend: super::backend::Backend + 'static>(
     path: &str,
 ) -> (alloc::string::String, alloc::vec::Vec<u8>) {
     let mut fd = fs
-        .open(USER, path, OFlags::RDONLY, Mode::empty())
+        .open(USER, None, path, OFlags::RDONLY, Mode::empty())
         .unwrap_or_else(|error| panic!("open {path:?} failed: {error:?}"));
     let mut buffer = alloc::vec![0; 1024];
     let len = fs.read(&mut fd, &mut buffer, None).unwrap();
     buffer.truncate(len);
-    (fd.path().into(), buffer)
+    (fd.path(), buffer)
 }
 
 /// One entry of an archive built by [`build_tar`].
@@ -358,7 +358,10 @@ mod timestamps {
         fs.set_times_at(ROOT, "/owned", true, &explicit).unwrap();
         fs.set_times_at(USER, "/writable", true, &both_now).unwrap();
         // In-mem has no clock, so an authorized NOW leaves times unset.
-        assert_eq!(fs.file_status(ROOT, "/writable", true).unwrap().times, None);
+        assert_eq!(
+            fs.file_status(ROOT, None, "/writable", true).unwrap().times,
+            None
+        );
         assert!(matches!(
             fs.set_times_at(USER, "/private", true, &both_now),
             Err(SetTimesError::AccessNotAllowed)
@@ -378,27 +381,33 @@ mod timestamps {
             &update(FileTimeUpdate::Omit, FileTimeUpdate::Omit),
         )
         .unwrap();
-        assert_eq!(fs.file_status(ROOT, "/private", true).unwrap().times, None);
+        assert_eq!(
+            fs.file_status(ROOT, None, "/private", true).unwrap().times,
+            None
+        );
     }
 
     #[test]
     fn set_times_signed_omit_nofollow_and_directory() {
         let fs = in_mem_fs();
-        fs.mkdir(ROOT, "/dir", Mode::RWXU).unwrap();
+        fs.mkdir(ROOT, None, "/dir", Mode::RWXU).unwrap();
         let entry = fs
             .open(
                 ROOT,
+                None,
                 "/dir/file",
                 OFlags::CREAT | OFlags::RDONLY,
                 Mode::RUSR,
             )
             .unwrap();
-        fs.symlink(ROOT, "file", "/dir/link").unwrap();
+        fs.symlink(ROOT, "file", None, "/dir/link").unwrap();
         let explicit = update(FileTimeUpdate::Set(BEFORE_EPOCH), FileTimeUpdate::Now);
         fs.set_times_at(ROOT, "/dir/link", false, &explicit)
             .unwrap();
         assert_eq!(
-            fs.file_status(ROOT, "/dir/link", false).unwrap().times,
+            fs.file_status(ROOT, None, "/dir/link", false)
+                .unwrap()
+                .times,
             Some(FileTimestamps {
                 accessed: BEFORE_EPOCH,
                 modified: UNSET,
@@ -428,7 +437,7 @@ mod timestamps {
         .unwrap();
         assert_eq!(fs.handle_status(&entry).unwrap().times, expected);
         let path_only = fs
-            .open(ROOT, "/dir/file", OFlags::PATH, Mode::empty())
+            .open(ROOT, None, "/dir/file", OFlags::PATH, Mode::empty())
             .unwrap();
         fs.set_times(ROOT, &path_only, &explicit).unwrap();
         assert_eq!(
@@ -441,7 +450,7 @@ mod timestamps {
         );
         fs.set_times_at(ROOT, "/dir", false, &explicit).unwrap();
         assert_eq!(
-            fs.file_status(ROOT, "/dir", true)
+            fs.file_status(ROOT, None, "/dir", true)
                 .unwrap()
                 .times
                 .unwrap()
@@ -466,7 +475,7 @@ mod timestamps {
                 Err(SetTimesError::ReadOnlyFileSystem)
             ));
         }
-        let old = fs.file_status(ROOT, "/foo", true).unwrap().times;
+        let old = fs.file_status(ROOT, None, "/foo", true).unwrap().times;
         fs.set_times_at(
             USER,
             "/foo",
@@ -474,36 +483,53 @@ mod timestamps {
             &update(FileTimeUpdate::Omit, FileTimeUpdate::Omit),
         )
         .unwrap();
-        assert_eq!(fs.file_status(ROOT, "/foo", true).unwrap().times, old);
+        assert_eq!(fs.file_status(ROOT, None, "/foo", true).unwrap().times, old);
         assert!(old.is_some());
-        assert!(fs.file_status(ROOT, "/", true).unwrap().times.is_none());
+        assert!(
+            fs.file_status(ROOT, None, "/", true)
+                .unwrap()
+                .times
+                .is_none()
+        );
     }
 
     #[test]
     fn set_times_rejects_renamed_unlinked_and_replaced_paths() {
         let fs = in_mem_fs();
         let entry = fs
-            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDONLY, Mode::RUSR)
+            .open(
+                ROOT,
+                None,
+                "/file",
+                OFlags::CREAT | OFlags::RDONLY,
+                Mode::RUSR,
+            )
             .unwrap();
         let times = update(
             FileTimeUpdate::Set(BEFORE_EPOCH),
             FileTimeUpdate::Set(BEFORE_EPOCH),
         );
         fs.set_times(ROOT, &entry, &times).unwrap();
-        fs.rename(ROOT, "/file", "/moved").unwrap();
+        fs.rename(ROOT, None, "/file", None, "/moved").unwrap();
         assert!(matches!(
             fs.set_times(ROOT, &entry, &times),
             Err(SetTimesError::Io)
         ));
         let replacement = fs
-            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDONLY, Mode::RUSR)
+            .open(
+                ROOT,
+                None,
+                "/file",
+                OFlags::CREAT | OFlags::RDONLY,
+                Mode::RUSR,
+            )
             .unwrap();
         assert!(matches!(
             fs.set_times(ROOT, &entry, &times),
             Err(SetTimesError::Io)
         ));
         assert_eq!(fs.handle_status(&replacement).unwrap().times, None);
-        fs.unlink(ROOT, "/file").unwrap();
+        fs.unlink(ROOT, None, "/file").unwrap();
         assert!(matches!(
             fs.set_times(ROOT, &replacement, &times),
             Err(SetTimesError::Io)
@@ -519,7 +545,10 @@ mod timestamps {
                 &[ArchiveEntry::file("bar/file", 0o644, b"")],
             ),
         );
-        assert_eq!(fs.file_status(ROOT, "/bar", true).unwrap().times, None);
+        assert_eq!(
+            fs.file_status(ROOT, None, "/bar", true).unwrap().times,
+            None
+        );
         fs.set_times_at(
             ROOT,
             "/bar",
@@ -528,7 +557,7 @@ mod timestamps {
         )
         .unwrap();
         assert_eq!(
-            fs.file_status(ROOT, "/bar", true).unwrap().times,
+            fs.file_status(ROOT, None, "/bar", true).unwrap().times,
             Some(FileTimestamps {
                 accessed: UNSET,
                 modified: LATER,
@@ -572,7 +601,7 @@ mod timestamps {
             allocators.next(),
         ));
         let entry = fs
-            .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
+            .open(ROOT, None, "/file", OFlags::RDONLY, Mode::empty())
             .unwrap();
         fs.set_times(
             ROOT,
@@ -585,7 +614,10 @@ mod timestamps {
             modified: LATER,
             changed: UNSET,
         });
-        assert_eq!(fs.file_status(ROOT, "/file", true).unwrap().times, expected);
+        assert_eq!(
+            fs.file_status(ROOT, None, "/file", true).unwrap().times,
+            expected
+        );
         assert_eq!(fs.handle_status(&entry).unwrap().times, expected);
         fs.set_times(
             ROOT,
@@ -605,10 +637,12 @@ mod timestamps {
             let allocators = InodeAllocators::new();
             let fs = Resolver::<TestPlatform, _>::new(timestamped_overlay(&allocators));
             let original = fs
-                .open(ROOT, "/dir/file", OFlags::RDONLY, Mode::empty())
+                .open(ROOT, None, "/dir/file", OFlags::RDONLY, Mode::empty())
                 .unwrap();
             let inode = fs.handle_status(&original).unwrap().node_info;
-            let writable = fs.open(ROOT, "/dir/file", flags, Mode::empty()).unwrap();
+            let writable = fs
+                .open(ROOT, None, "/dir/file", flags, Mode::empty())
+                .unwrap();
             assert_eq!(
                 fs.handle_status(&writable).unwrap().times,
                 Some(LOWER_TIMES)
@@ -626,7 +660,7 @@ mod timestamps {
             }
             for path in ["/dir", "/dir/file"] {
                 assert_eq!(
-                    fs.file_status(ROOT, path, true).unwrap().times,
+                    fs.file_status(ROOT, None, path, true).unwrap().times,
                     Some(LOWER_TIMES)
                 );
             }
@@ -638,15 +672,15 @@ mod timestamps {
         for path in ["/dir/file", "/dir"] {
             let allocators = InodeAllocators::new();
             let fs = Resolver::<TestPlatform, _>::new(timestamped_overlay(&allocators));
-            let before = fs.file_status(ROOT, path, true).unwrap();
+            let before = fs.file_status(ROOT, None, path, true).unwrap();
             let mode = Mode::RUSR | Mode::XUSR | Mode::ROTH | Mode::XOTH;
-            fs.chmod(ROOT, path, mode).unwrap();
-            let after = fs.file_status(ROOT, path, true).unwrap();
+            fs.chmod(ROOT, None, path, mode).unwrap();
+            let after = fs.file_status(ROOT, None, path, true).unwrap();
             assert_eq!(after.mode, mode);
             assert_eq!(after.node_info, before.node_info);
             for path in ["/dir", "/dir/file"] {
                 assert_eq!(
-                    fs.file_status(ROOT, path, true).unwrap().times,
+                    fs.file_status(ROOT, None, path, true).unwrap().times,
                     Some(LOWER_TIMES)
                 );
             }
@@ -674,6 +708,7 @@ mod timestamps {
         let link = fs
             .open(
                 ROOT,
+                None,
                 "/dir/link",
                 OFlags::PATH | OFlags::NOFOLLOW,
                 Mode::empty(),
@@ -692,17 +727,17 @@ mod timestamps {
         });
         for status in [
             fs.handle_status(&link).unwrap(),
-            fs.file_status(ROOT, "/dir/link", false).unwrap(),
+            fs.file_status(ROOT, None, "/dir/link", false).unwrap(),
         ] {
             assert_eq!(status.file_type, FileType::SymbolicLink);
             assert_eq!(status.times, expected);
             assert_eq!(status.node_info, inode);
         }
-        assert_eq!(fs.read_link(ROOT, "/dir/link").unwrap(), "file");
+        assert_eq!(fs.read_link(ROOT, None, "/dir/link").unwrap(), "file");
         assert_eq!(read_path(&fs, "/dir/link").1, b"lower");
         for path in ["/dir", "/dir/file"] {
             assert_eq!(
-                fs.file_status(ROOT, path, true).unwrap().times,
+                fs.file_status(ROOT, None, path, true).unwrap().times,
                 Some(LOWER_TIMES)
             );
         }
@@ -726,13 +761,13 @@ mod in_mem {
 
     /// Create `/tmp` as root, so that the unprivileged user can create entries in it.
     fn world_writable_tmp(fs: &InMemFs) {
-        fs.mkdir(ROOT, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.mkdir(ROOT, None, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to create /tmp");
     }
 
     /// Make the root directory world-writable, so tests can create entries directly in it.
     fn world_writable_root(fs: &InMemFs) {
-        fs.chmod(ROOT, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.chmod(ROOT, None, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to chmod /");
     }
 
@@ -743,7 +778,7 @@ mod in_mem {
 
         let path = "/tmp/write_only";
         let mut fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::WUSR)
+            .open(USER, None, path, OFlags::CREAT | OFlags::WRONLY, Mode::WUSR)
             .expect("Failed to create write-only file");
         fs.write(&mut fd, b"x", None).expect("Failed to write file");
 
@@ -755,7 +790,7 @@ mod in_mem {
         drop(fd);
 
         assert!(matches!(
-            fs.open(USER, path, OFlags::RDONLY, Mode::empty()),
+            fs.open(USER, None, path, OFlags::RDONLY, Mode::empty()),
             Err(OpenError::AccessNotAllowed)
         ));
     }
@@ -767,17 +802,23 @@ mod in_mem {
 
         let path = "/tmp/zero_mode";
         let mut fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::empty())
+            .open(
+                USER,
+                None,
+                path,
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::empty(),
+            )
             .expect("Failed to create zero-mode file");
         fs.write(&mut fd, b"x", None).expect("Failed to write file");
         drop(fd);
 
         let status = fs
-            .file_status(USER, path, true)
+            .file_status(USER, None, path, true)
             .expect("Failed to stat file");
         assert_eq!(status.mode, Mode::empty());
         assert!(matches!(
-            fs.open(USER, path, OFlags::WRONLY, Mode::empty()),
+            fs.open(USER, None, path, OFlags::WRONLY, Mode::empty()),
             Err(OpenError::AccessNotAllowed)
         ));
     }
@@ -790,6 +831,7 @@ mod in_mem {
         let mut fd = fs
             .open(
                 USER,
+                None,
                 path,
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RUSR | Mode::WUSR,
@@ -797,19 +839,21 @@ mod in_mem {
             .unwrap();
         fs.write(&mut fd, b"keep this data", None).unwrap();
         drop(fd);
-        fs.chmod(USER, path, Mode::RUSR).unwrap();
+        fs.chmod(USER, None, path, Mode::RUSR).unwrap();
 
         for flags in [
             OFlags::WRONLY | OFlags::TRUNC,
             OFlags::RDONLY | OFlags::TRUNC,
         ] {
             assert!(matches!(
-                fs.open(USER, path, flags, Mode::empty()),
+                fs.open(USER, None, path, flags, Mode::empty()),
                 Err(OpenError::AccessNotAllowed)
             ));
-            assert_eq!(fs.file_status(USER, path, true).unwrap().size, 14);
+            assert_eq!(fs.file_status(USER, None, path, true).unwrap().size, 14);
         }
-        let mut fd = fs.open(USER, path, OFlags::RDONLY, Mode::empty()).unwrap();
+        let mut fd = fs
+            .open(USER, None, path, OFlags::RDONLY, Mode::empty())
+            .unwrap();
         let mut data = [0; 14];
         assert_eq!(fs.read(&mut fd, &mut data, None).unwrap(), data.len());
         assert_eq!(&data, b"keep this data");
@@ -823,14 +867,15 @@ mod in_mem {
         // Test file creation
         let path = "/tmp/testfile";
         let fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(USER, None, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         drop(fd);
 
         // Test file deletion
-        fs.unlink(USER, path).expect("Failed to unlink file");
+        fs.unlink(USER, None, path).expect("Failed to unlink file");
         assert!(
-            fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(USER, None, path, OFlags::RDONLY, Mode::RWXU)
+                .is_err(),
             "File should not exist"
         );
     }
@@ -843,7 +888,7 @@ mod in_mem {
         // Create and write to a file
         let path = "/tmp/testfile";
         let mut fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(USER, None, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         let data = b"Hello, world!";
         fs.write(&mut fd, data, None)
@@ -857,7 +902,7 @@ mod in_mem {
 
         // Read from the file
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::RWXU)
+            .open(USER, None, path, OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; data.len()];
         let bytes_read = fs
@@ -879,13 +924,15 @@ mod in_mem {
 
         // Test directory creation
         let path = "/tmp/testdir";
-        fs.mkdir(USER, path, Mode::RWXU)
+        fs.mkdir(USER, None, path, Mode::RWXU)
             .expect("Failed to create directory");
 
         // Test directory removal
-        fs.rmdir(USER, path).expect("Failed to remove directory");
+        fs.rmdir(USER, None, path)
+            .expect("Failed to remove directory");
         assert!(
-            fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(USER, None, path, OFlags::RDONLY, Mode::RWXU)
+                .is_err(),
             "Directory should not exist"
         );
     }
@@ -895,11 +942,12 @@ mod in_mem {
         let fs = in_mem_fs();
 
         // Create a directory structure
-        fs.mkdir(ROOT, "/testdir", Mode::RWXU)
+        fs.mkdir(ROOT, None, "/testdir", Mode::RWXU)
             .expect("Failed to create directory");
         let fd1 = fs
             .open(
                 ROOT,
+                None,
                 "/testfile1",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
@@ -909,6 +957,7 @@ mod in_mem {
         let fd2 = fs
             .open(
                 ROOT,
+                None,
                 "/testfile2",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
@@ -918,7 +967,7 @@ mod in_mem {
 
         // Read root directory
         let fd = fs
-            .open(ROOT, "/", OFlags::RDONLY, Mode::empty())
+            .open(ROOT, None, "/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read directory");
         drop(fd);
@@ -951,7 +1000,7 @@ mod in_mem {
 
         // Read the subdirectory (should be empty)
         let fd = fs
-            .open(ROOT, "/testdir", OFlags::RDONLY, Mode::empty())
+            .open(ROOT, None, "/testdir", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open subdirectory");
         let entries = fs.read_dir(&fd).expect("Failed to read subdirectory");
         assert_eq!(
@@ -971,6 +1020,7 @@ mod in_mem {
         let fd = fs
             .open(
                 ROOT,
+                None,
                 "/testfile",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
@@ -980,7 +1030,7 @@ mod in_mem {
 
         // Try to read_dir on the file (should fail)
         let fd = fs
-            .open(ROOT, "/testfile", OFlags::RDONLY, Mode::empty())
+            .open(ROOT, None, "/testfile", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
         assert!(matches!(fs.read_dir(&fd), Err(ReadDirError::NotADirectory)));
     }
@@ -992,6 +1042,7 @@ mod in_mem {
         // A root-owned 0755 directory, holding a file and a directory to try to remove.
         fs.mkdir(
             ROOT,
+            None,
             "/rootdir",
             Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
         )
@@ -999,80 +1050,82 @@ mod in_mem {
         let fd = fs
             .open(
                 ROOT,
+                None,
                 "/rootdir/file",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
             )
             .expect("Failed to create file");
         drop(fd);
-        fs.mkdir(ROOT, "/rootdir/sub", Mode::RWXU)
+        fs.mkdir(ROOT, None, "/rootdir/sub", Mode::RWXU)
             .expect("Failed to create subdirectory");
-        fs.mkdir(ROOT, "/rootdir/sub/inner", Mode::RWXU)
+        fs.mkdir(ROOT, None, "/rootdir/sub/inner", Mode::RWXU)
             .expect("Failed to create unsearchable entry");
-        fs.symlink(ROOT, "missing", "/rootdir/dangling")
+        fs.symlink(ROOT, "missing", None, "/rootdir/dangling")
             .expect("Failed to create dangling symlink");
 
         // A world-writable directory, for the positive case.
-        fs.mkdir(ROOT, "/opendir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.mkdir(ROOT, None, "/opendir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to create directory");
 
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "/rootdir/new",
                 OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU
+                Mode::RWXU,
             ),
             Err(OpenError::NoWritePerms)
         ));
         assert!(matches!(
-            fs.mkdir(USER, "/rootdir/newdir", Mode::RWXU),
+            fs.mkdir(USER, None, "/rootdir/newdir", Mode::RWXU),
             Err(MkdirError::NoWritePerms)
         ));
         assert!(matches!(
-            fs.symlink(USER, "target", "/rootdir/newlink"),
+            fs.symlink(USER, "target", None, "/rootdir/newlink"),
             Err(SymlinkError::NoWritePerms)
         ));
         for path in ["/rootdir/sub", "/rootdir/file", "/rootdir/dangling"] {
             assert!(matches!(
-                fs.mkdir(USER, path, Mode::RWXU),
+                fs.mkdir(USER, None, path, Mode::RWXU),
                 Err(MkdirError::AlreadyExists)
             ));
             assert!(matches!(
-                fs.symlink(USER, "target", path),
+                fs.symlink(USER, "target", None, path),
                 Err(SymlinkError::AlreadyExists)
             ));
         }
         assert!(matches!(
-            fs.mkdir(USER, "/rootdir/sub/inner", Mode::RWXU),
+            fs.mkdir(USER, None, "/rootdir/sub/inner", Mode::RWXU),
             Err(MkdirError::PathError(PathError::NoSearchPerms))
         ));
         assert!(matches!(
-            fs.symlink(USER, "target", "/rootdir/sub/inner"),
+            fs.symlink(USER, "target", None, "/rootdir/sub/inner"),
             Err(SymlinkError::PathError(PathError::NoSearchPerms))
         ));
         assert!(matches!(
-            fs.unlink(USER, "/rootdir/file"),
+            fs.unlink(USER, None, "/rootdir/file"),
             Err(UnlinkError::NoWritePerms)
         ));
         assert!(matches!(
-            fs.rmdir(USER, "/rootdir/sub"),
+            fs.rmdir(USER, None, "/rootdir/sub"),
             Err(RmdirError::NoWritePerms)
         ));
         assert!(matches!(
-            fs.unlink(USER, "/rootdir/sub"),
+            fs.unlink(USER, None, "/rootdir/sub"),
             Err(UnlinkError::NoWritePerms)
         ));
         assert!(matches!(
-            fs.rmdir(USER, "/rootdir/file"),
+            fs.rmdir(USER, None, "/rootdir/file"),
             Err(RmdirError::NoWritePerms)
         ));
         assert!(matches!(
-            fs.unlink(USER, "/rootdir/missing"),
+            fs.unlink(USER, None, "/rootdir/missing"),
             Err(UnlinkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(matches!(
-            fs.rmdir(USER, "/rootdir/missing"),
+            fs.rmdir(USER, None, "/rootdir/missing"),
             Err(RmdirError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         for (old, new) in [
@@ -1080,17 +1133,18 @@ mod in_mem {
             ("/opendir/missing", "/rootdir/x"),
         ] {
             assert!(matches!(
-                fs.rename(USER, old, new),
+                fs.rename(USER, None, old, None, new),
                 Err(RenameError::PathError(PathError::NoSuchFileOrDirectory))
             ));
         }
         assert!(matches!(
-            fs.rename(USER, "/rootdir/file", "/opendir/x"),
+            fs.rename(USER, None, "/rootdir/file", None, "/opendir/x"),
             Err(RenameError::NoWritePerms)
         ));
         let fd = fs
             .open(
                 USER,
+                None,
                 "/opendir/file",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1098,11 +1152,11 @@ mod in_mem {
             .expect("Failed to create file");
         drop(fd);
         assert!(matches!(
-            fs.rename(USER, "/opendir/file", "/rootdir/x"),
+            fs.rename(USER, None, "/opendir/file", None, "/rootdir/x"),
             Err(RenameError::NoWritePerms)
         ));
         assert!(matches!(
-            fs.rename(USER, "/rootdir/file/", "/opendir/x"),
+            fs.rename(USER, None, "/rootdir/file/", None, "/opendir/x"),
             Err(RenameError::PathError(PathError::ComponentNotADirectory))
         ));
 
@@ -1110,19 +1164,20 @@ mod in_mem {
         let fd = fs
             .open(
                 USER,
+                None,
                 "/opendir/new",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
             )
             .expect("Failed to create file");
         drop(fd);
-        fs.mkdir(USER, "/opendir/newdir", Mode::RWXU)
+        fs.mkdir(USER, None, "/opendir/newdir", Mode::RWXU)
             .expect("Failed to create directory");
-        fs.symlink(USER, "target", "/opendir/newlink")
+        fs.symlink(USER, "target", None, "/opendir/newlink")
             .expect("Failed to create symlink");
-        fs.unlink(USER, "/opendir/new")
+        fs.unlink(USER, None, "/opendir/new")
             .expect("Failed to unlink file");
-        fs.rmdir(USER, "/opendir/newdir")
+        fs.rmdir(USER, None, "/opendir/newdir")
             .expect("Failed to remove directory");
     }
 
@@ -1133,16 +1188,16 @@ mod in_mem {
         // Create a test file as root
         let path = "/testfile";
         let fd = fs
-            .open(ROOT, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(ROOT, None, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         drop(fd);
 
         // First chown to 1000:1000 as root (should succeed)
-        fs.chown(ROOT, path, Some(1000), Some(1000))
+        fs.chown(ROOT, None, path, Some(1000), Some(1000))
             .expect("Failed to chown as root");
 
         // The owner may chown (should succeed)
-        fs.chown(USER, path, Some(123), Some(456))
+        fs.chown(USER, None, path, Some(123), Some(456))
             .expect("Failed to chown as owner");
 
         // A different user may not chown (should fail)
@@ -1150,7 +1205,7 @@ mod in_mem {
             user: 500,
             group: 500,
         };
-        match fs.chown(other, path, Some(789), Some(101)) {
+        match fs.chown(other, None, path, Some(789), Some(101)) {
             Err(ChownError::NotTheOwner) => {
                 // Expected behavior
             }
@@ -1159,7 +1214,7 @@ mod in_mem {
         }
 
         // Test chown on non-existent file (should fail)
-        match fs.chown(USER, "/nonexistent", Some(123), Some(456)) {
+        match fs.chown(USER, None, "/nonexistent", Some(123), Some(456)) {
             Err(ChownError::PathError(PathError::NoSuchFileOrDirectory)) => {
                 // Expected behavior
             }
@@ -1168,11 +1223,11 @@ mod in_mem {
         }
 
         // Test partial chown (change only user, leave group unchanged)
-        fs.chown(ROOT, path, Some(999), None)
+        fs.chown(ROOT, None, path, Some(999), None)
             .expect("Failed to chown user only");
 
         // Test partial chown (change only group, leave user unchanged)
-        fs.chown(ROOT, path, None, Some(888))
+        fs.chown(ROOT, None, path, None, Some(888))
             .expect("Failed to chown group only");
     }
 
@@ -1182,12 +1237,13 @@ mod in_mem {
         world_writable_root(&fs);
 
         // Create test directory and file
-        fs.mkdir(USER, "/testdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.mkdir(USER, None, "/testdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to create directory");
 
         let fd = fs
             .open(
                 USER,
+                None,
                 "/testfile",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1199,6 +1255,7 @@ mod in_mem {
         let fd = fs
             .open(
                 USER,
+                None,
                 "/testdir",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),
@@ -1210,9 +1267,10 @@ mod in_mem {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "/testfile",
                 OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
+                Mode::empty(),
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
@@ -1221,9 +1279,10 @@ mod in_mem {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "/nonexistent",
                 OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
+                Mode::empty(),
             ),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
@@ -1233,6 +1292,7 @@ mod in_mem {
         let fd = fs
             .open(
                 USER,
+                None,
                 "/newfile",
                 OFlags::CREAT | OFlags::WRONLY | OFlags::DIRECTORY,
                 Mode::RWXU,
@@ -1242,7 +1302,7 @@ mod in_mem {
 
         // Verify it created a regular file, not a directory
         let stat = fs
-            .file_status(USER, "/newfile", true)
+            .file_status(USER, None, "/newfile", true)
             .expect("Failed to get file status");
         assert_eq!(stat.file_type, FileType::RegularFile);
 
@@ -1260,6 +1320,7 @@ mod in_mem {
         let mut fd = fs
             .open(
                 USER,
+                None,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1275,6 +1336,7 @@ mod in_mem {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1286,6 +1348,7 @@ mod in_mem {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY | OFlags::TRUNC,
                 Mode::RWXU,
@@ -1297,6 +1360,7 @@ mod in_mem {
         let mut fd = fs
             .open(
                 USER,
+                None,
                 "/newfile",
                 OFlags::EXCL | OFlags::RDONLY,
                 Mode::empty(),
@@ -1313,16 +1377,23 @@ mod in_mem {
 
         // Test O_CREAT without O_EXCL on existing file (should succeed)
         let fd = fs
-            .open(USER, "/newfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                None,
+                "/newfile",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
             .expect("Failed to open existing file with O_CREAT (without O_EXCL)");
         drop(fd);
 
         // Test O_CREAT | O_EXCL on directory (should fail)
-        fs.mkdir(USER, "/testdir", Mode::RWXU)
+        fs.mkdir(USER, None, "/testdir", Mode::RWXU)
             .expect("Failed to create directory");
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "/testdir",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1339,7 +1410,7 @@ mod in_mem {
         // Create a file and write some initial content
         let path = "/testfile";
         let mut fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(USER, None, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         let initial_data = b"Hello, world! This is initial content.";
         fs.write(&mut fd, initial_data, None)
@@ -1348,7 +1419,7 @@ mod in_mem {
 
         // Verify initial content was written
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, None, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
         let mut buffer = vec![0; initial_data.len()];
         let bytes_read = fs
@@ -1360,7 +1431,13 @@ mod in_mem {
 
         // Test O_TRUNC with O_WRONLY - should truncate file
         let mut fd = fs
-            .open(USER, path, OFlags::WRONLY | OFlags::TRUNC, Mode::empty())
+            .open(
+                USER,
+                None,
+                path,
+                OFlags::WRONLY | OFlags::TRUNC,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_TRUNC | O_WRONLY");
 
         // Write new content to the truncated file
@@ -1371,7 +1448,7 @@ mod in_mem {
 
         // Verify the file was truncated and contains only new content
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, None, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for verification");
         let mut buffer = vec![0; initial_data.len()];
         let bytes_read = fs
@@ -1383,14 +1460,20 @@ mod in_mem {
 
         // Test O_TRUNC with O_RDWR - should also truncate
         let mut fd = fs
-            .open(USER, path, OFlags::WRONLY, Mode::empty())
+            .open(USER, None, path, OFlags::WRONLY, Mode::empty())
             .expect("Failed to open file for writing");
         fs.write(&mut fd, b"More content to truncate", None)
             .expect("Failed to write more content");
         drop(fd);
 
         let mut fd = fs
-            .open(USER, path, OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .open(
+                USER,
+                None,
+                path,
+                OFlags::RDWR | OFlags::TRUNC,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_TRUNC | O_RDWR");
 
         // File should be empty after truncation
@@ -1423,6 +1506,7 @@ mod in_mem {
         let mut fd = fs
             .open(
                 USER,
+                None,
                 "/posfile",
                 OFlags::CREAT | OFlags::RDWR,
                 Mode::RWXU | Mode::RWXG | Mode::RWXO,
@@ -1469,7 +1553,7 @@ mod in_mem {
     /// Create `path` holding `data`, as the unprivileged user.
     fn create_with_content(fs: &InMemFs, path: &str, data: &[u8]) {
         let mut fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(USER, None, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         fs.write(&mut fd, &data, None)
             .expect("Failed to write initial content");
@@ -1496,7 +1580,13 @@ mod in_mem {
 
         // Re-open with O_APPEND and write more data
         let mut fd = fs
-            .open(USER, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(
+                USER,
+                None,
+                path,
+                OFlags::WRONLY | OFlags::APPEND,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_APPEND");
         fs.write(&mut fd, b" World", None)
             .expect("Failed to append data");
@@ -1504,7 +1594,7 @@ mod in_mem {
 
         // Verify the file contains both pieces of data concatenated
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, None, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
         assert_eq!(read_all(&fs, &mut fd), b"Hello World");
     }
@@ -1520,7 +1610,13 @@ mod in_mem {
 
         // Re-open with O_APPEND
         let mut fd = fs
-            .open(USER, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(
+                USER,
+                None,
+                path,
+                OFlags::WRONLY | OFlags::APPEND,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_APPEND");
 
         // Seek to beginning - this should succeed but writes should still append
@@ -1534,7 +1630,7 @@ mod in_mem {
 
         // Verify the file content: original data followed by appended data
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, None, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
         assert_eq!(read_all(&fs, &mut fd), b"ABCDEF123");
     }
@@ -1550,7 +1646,13 @@ mod in_mem {
 
         // Re-open with O_RDWR | O_APPEND
         let mut fd = fs
-            .open(USER, path, OFlags::RDWR | OFlags::APPEND, Mode::empty())
+            .open(
+                USER,
+                None,
+                path,
+                OFlags::RDWR | OFlags::APPEND,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_RDWR | O_APPEND");
 
         // Read should work normally from the beginning
@@ -1581,7 +1683,13 @@ mod in_mem {
 
         // Re-open with O_APPEND
         let mut fd = fs
-            .open(USER, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(
+                USER,
+                None,
+                path,
+                OFlags::WRONLY | OFlags::APPEND,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_APPEND");
 
         // pwrite (write with explicit offset) should ignore O_APPEND per POSIX
@@ -1590,7 +1698,7 @@ mod in_mem {
 
         // Verify the file content: XX should be at position 2, not appended
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, None, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
         assert_eq!(read_all(&fs, &mut fd), b"ABXXEF");
     }
@@ -1608,6 +1716,7 @@ mod in_mem {
         let mut fd = fs
             .open(
                 USER,
+                None,
                 path,
                 OFlags::WRONLY | OFlags::TRUNC | OFlags::APPEND,
                 Mode::empty(),
@@ -1623,7 +1732,7 @@ mod in_mem {
 
         // Verify the file content
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, None, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
         assert_eq!(read_all(&fs, &mut fd), b"NewContent");
     }
@@ -1675,9 +1784,9 @@ mod in_mem {
         ));
         let path = |path: &str, flags: OFlags| -> String {
             let entry = fs
-                .open(USER, path, flags, Mode::RWXU)
+                .open(USER, None, path, flags, Mode::RWXU)
                 .unwrap_or_else(|error| panic!("open {path:?} failed: {error:?}"));
-            String::from(entry.path())
+            entry.path()
         };
 
         assert_eq!(path("/", OFlags::RDONLY), "/");
@@ -1690,7 +1799,7 @@ mod in_mem {
         );
         for path in ["/dotlink", "/blocked/../dir/file", "/blocked/./../dir/file"] {
             assert!(matches!(
-                fs.open(USER, path, OFlags::PATH, Mode::empty()),
+                fs.open(USER, None, path, OFlags::PATH, Mode::empty()),
                 Err(OpenError::PathError(PathError::NoSearchPerms))
             ));
         }
@@ -1723,7 +1832,7 @@ mod tar_ro {
     fn file_read() {
         let fs = tar_ro_fs(TEST_TAR_FILE.into());
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(USER, None, "foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1733,7 +1842,7 @@ mod tar_ro {
         drop(fd);
 
         let mut fd = fs
-            .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1749,6 +1858,7 @@ mod tar_ro {
         // Test O_DIRECTORY on a directory (should succeed)
         fs.open(
             USER,
+            None,
             "bar",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
@@ -1759,9 +1869,10 @@ mod tar_ro {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "foo",
                 OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
+                Mode::empty(),
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
@@ -1770,9 +1881,10 @@ mod tar_ro {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "nonexistent",
                 OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
+                Mode::empty(),
             ),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
@@ -1781,9 +1893,10 @@ mod tar_ro {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "bar/baz",
                 OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
+                Mode::empty(),
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
@@ -1803,39 +1916,45 @@ mod tar_ro {
             let fs = Resolver::<TestPlatform, _>::new(backend);
             for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::RDONLY | OFlags::TRUNC] {
                 assert!(matches!(
-                    fs.open(user, path, flags, Mode::empty()),
+                    fs.open(user, None, path, flags, Mode::empty()),
                     Err(OpenError::ReadOnlyFileSystem)
                 ));
             }
             assert!(matches!(
                 fs.open(
                     user,
+                    None,
                     path,
                     OFlags::WRONLY | OFlags::DIRECTORY,
-                    Mode::empty()
+                    Mode::empty(),
                 ),
                 Err(OpenError::PathError(PathError::ComponentNotADirectory))
             ));
             assert!(matches!(
                 fs.open(
                     user,
+                    None,
                     path,
                     OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
-                    Mode::empty()
+                    Mode::empty(),
                 ),
                 Err(OpenError::AlreadyExists)
             ));
-            drop(fs.open(user, path, OFlags::RDONLY, Mode::empty()).unwrap());
+            drop(
+                fs.open(user, None, path, OFlags::RDONLY, Mode::empty())
+                    .unwrap(),
+            );
             drop(
                 fs.open(
                     user,
+                    None,
                     path,
                     OFlags::PATH | OFlags::WRONLY | OFlags::TRUNC,
                     Mode::empty(),
                 )
                 .unwrap(),
             );
-            assert_eq!(fs.file_status(user, path, true).unwrap().size, 8);
+            assert_eq!(fs.file_status(user, None, path, true).unwrap().size, 8);
         }
         let user = UserInfo {
             user: 4242,
@@ -1859,7 +1978,7 @@ mod tar_ro {
 
         for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::TRUNC] {
             assert!(matches!(
-                fs.open(USER, "bar", flags, Mode::empty()),
+                fs.open(USER, None, "bar", flags, Mode::empty()),
                 Err(OpenError::ReadOnlyFileSystem)
             ));
         }
@@ -1871,7 +1990,7 @@ mod tar_ro {
 
         // Read root directory
         let fd = fs
-            .open(USER, "/", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
         drop(fd);
@@ -1902,7 +2021,7 @@ mod tar_ro {
 
         // Read `bar` directory
         let fd = fs
-            .open(USER, "bar", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar directory");
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
 
@@ -1917,7 +2036,7 @@ mod tar_ro {
         let fs = tar_ro_fs(TEST_TAR_FILE.into());
 
         let fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "foo", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open foo file");
         assert!(matches!(fs.read_dir(&fd), Err(ReadDirError::NotADirectory)));
     }
@@ -1952,31 +2071,38 @@ mod tar_ro {
             read_path(&fs, "/bin/up"),
             ("/usr/lib/libc.so".into(), b"libc".to_vec())
         );
-        assert_eq!(fs.read_link(USER, "/bin/sh").unwrap(), "/usr/bin/busybox");
-        assert_eq!(fs.read_link(USER, "/lib").unwrap(), "usr/lib");
-        assert_eq!(fs.read_link(USER, "/lib/../../bin/ash").unwrap(), "sh");
+        assert_eq!(
+            fs.read_link(USER, None, "/bin/sh").unwrap(),
+            "/usr/bin/busybox"
+        );
+        assert_eq!(fs.read_link(USER, None, "/lib").unwrap(), "usr/lib");
+        assert_eq!(
+            fs.read_link(USER, None, "/lib/../../bin/ash").unwrap(),
+            "sh"
+        );
         for path in ["/usr/bin/busybox", "/usr", "/lib/"] {
             assert!(matches!(
-                fs.read_link(USER, path),
+                fs.read_link(USER, None, path),
                 Err(WalkError::PathError(PathError::InvalidPathname))
             ));
         }
 
-        let link = fs.file_status(USER, "/bin/sh", false).unwrap();
+        let link = fs.file_status(USER, None, "/bin/sh", false).unwrap();
         assert_eq!(link.file_type, FileType::SymbolicLink);
         assert_eq!(link.size, "/usr/bin/busybox".len() as u64);
         assert_eq!(link.mode, Mode::from_bits(0o777).unwrap());
-        let target = fs.file_status(USER, "/bin/sh", true).unwrap();
+        let target = fs.file_status(USER, None, "/bin/sh", true).unwrap();
         assert_eq!(target.file_type, FileType::RegularFile);
         assert_eq!(target.mode, Mode::from_bits(0o755).unwrap());
         assert_eq!(
-            fs.file_status(USER, "/lib", true).unwrap().file_type,
+            fs.file_status(USER, None, "/lib", true).unwrap().file_type,
             FileType::Directory
         );
 
         let fd = fs
             .open(
                 USER,
+                None,
                 "/bin/sh",
                 OFlags::PATH | OFlags::NOFOLLOW,
                 Mode::empty(),
@@ -1988,31 +2114,35 @@ mod tar_ro {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "/bin/sh",
                 OFlags::RDONLY | OFlags::NOFOLLOW,
-                Mode::empty()
+                Mode::empty(),
             ),
             Err(OpenError::PathError(PathError::TooManySymlinks))
         ));
         assert!(matches!(
-            fs.open(USER, "/dangling", OFlags::RDONLY, Mode::empty()),
+            fs.open(USER, None, "/dangling", OFlags::RDONLY, Mode::empty()),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "/dangling",
                 OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU
+                Mode::RWXU,
             ),
             Err(OpenError::ReadOnlyFileSystem)
         ));
         assert!(matches!(
-            fs.open(USER, "/loop1", OFlags::RDONLY, Mode::empty()),
+            fs.open(USER, None, "/loop1", OFlags::RDONLY, Mode::empty()),
             Err(OpenError::PathError(PathError::TooManySymlinks))
         ));
 
-        let fd = fs.open(USER, "/", OFlags::RDONLY, Mode::empty()).unwrap();
+        let fd = fs
+            .open(USER, None, "/", OFlags::RDONLY, Mode::empty())
+            .unwrap();
         let entries = fs.read_dir(&fd).unwrap();
         let lib = entries.iter().find(|entry| entry.name == "lib").unwrap();
         assert_eq!(lib.file_type, FileType::SymbolicLink);
@@ -2033,8 +2163,8 @@ mod tar_ro {
             ],
         ));
         for (path, alias) in [("/a/data", "/b/alias"), ("/link", "/link-alias")] {
-            let status = fs.file_status(USER, path, false).unwrap();
-            let alias = fs.file_status(USER, alias, false).unwrap();
+            let status = fs.file_status(USER, None, path, false).unwrap();
+            let alias = fs.file_status(USER, None, alias, false).unwrap();
             assert_eq!(
                 FileStatus {
                     node_info: status.node_info,
@@ -2044,16 +2174,16 @@ mod tar_ro {
             );
         }
         assert_eq!(
-            fs.file_status(USER, "/b/alias", false).unwrap().mode,
+            fs.file_status(USER, None, "/b/alias", false).unwrap().mode,
             Mode::from_bits(0o640).unwrap()
         );
         assert_eq!(read_path(&fs, "/b/alias").1, b"shared");
-        assert_eq!(fs.read_link(USER, "/link-alias").unwrap(), "a/data");
+        assert_eq!(fs.read_link(USER, None, "/link-alias").unwrap(), "a/data");
         assert_eq!(read_path(&fs, "/link-alias").1, b"shared");
 
         for path in ["/missing", "/dir-alias"] {
             assert!(matches!(
-                fs.file_status(USER, path, false),
+                fs.file_status(USER, None, path, false),
                 Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
             ));
         }
@@ -2076,7 +2206,7 @@ mod tar_ro {
             ],
         ));
         let status = |path| {
-            let status = fs.file_status(ROOT, path, true).unwrap();
+            let status = fs.file_status(ROOT, None, path, true).unwrap();
             assert_eq!(status.file_type, FileType::Directory);
             (status.mode.bits(), status.owner.user, status.owner.group)
         };
@@ -2087,7 +2217,7 @@ mod tar_ro {
         assert_eq!(status("/implicit"), (0o777, USER.user, USER.group));
 
         assert!(matches!(
-            fs.open(USER, "/after/file", OFlags::RDONLY, Mode::empty()),
+            fs.open(USER, None, "/after/file", OFlags::RDONLY, Mode::empty()),
             Err(OpenError::PathError(PathError::NoSearchPerms))
         ));
     }
@@ -2112,7 +2242,7 @@ mod tar_ro {
                 allocators.next(),
             ));
             assert_eq!(read_path(&fs, &long_path).1, b"long");
-            assert_eq!(fs.read_link(USER, "/link").unwrap(), long_target);
+            assert_eq!(fs.read_link(USER, None, "/link").unwrap(), long_target);
             assert_eq!(
                 read_path(&fs, "/link"),
                 (long_target.clone(), b"long".to_vec())
@@ -2145,43 +2275,44 @@ mod tar_ro {
             assert!(matches!(
                 fs.open(
                     USER,
+                    None,
                     &path("new"),
                     OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU
+                    Mode::RWXU,
                 ),
                 Err(OpenError::ReadOnlyFileSystem)
             ));
             assert!(matches!(
-                fs.mkdir(USER, &path("new"), Mode::RWXU),
+                fs.mkdir(USER, None, &path("new"), Mode::RWXU),
                 Err(MkdirError::ReadOnlyFileSystem)
             ));
             assert!(matches!(
-                fs.symlink(USER, "target", &path("new")),
+                fs.symlink(USER, "target", None, &path("new")),
                 Err(SymlinkError::ReadOnlyFileSystem)
             ));
             // Creations report an existing name first.
             assert!(matches!(
-                fs.mkdir(USER, &path("file"), Mode::RWXU),
+                fs.mkdir(USER, None, &path("file"), Mode::RWXU),
                 Err(MkdirError::AlreadyExists)
             ));
             assert!(matches!(
-                fs.symlink(USER, "target", &path("sub")),
+                fs.symlink(USER, "target", None, &path("sub")),
                 Err(SymlinkError::AlreadyExists)
             ));
             // Removals and renames report the read-only filesystem before looking up the name.
             for name in ["file", "sub", "sub/", "missing"] {
                 assert!(matches!(
-                    fs.unlink(USER, &path(name)),
+                    fs.unlink(USER, None, &path(name)),
                     Err(UnlinkError::ReadOnlyFileSystem)
                 ));
             }
             for name in ["file", "sub", "missing"] {
                 assert!(matches!(
-                    fs.rmdir(USER, &path(name)),
+                    fs.rmdir(USER, None, &path(name)),
                     Err(RmdirError::ReadOnlyFileSystem)
                 ));
                 assert!(matches!(
-                    fs.rename(USER, &path(name), &path("new")),
+                    fs.rename(USER, None, &path(name), None, &path("new")),
                     Err(RenameError::ReadOnlyFileSystem)
                 ));
             }
@@ -2213,9 +2344,9 @@ mod tar_ro {
                 .build()
                 .unwrap(),
         );
-        fs.chmod(ROOT, "/tmp", Mode::from_bits(0o777).unwrap())
+        fs.chmod(ROOT, None, "/tmp", Mode::from_bits(0o777).unwrap())
             .unwrap();
-        fs.mkdir(ROOT, "/tmp/dir", Mode::RWXU).unwrap();
+        fs.mkdir(ROOT, None, "/tmp/dir", Mode::RWXU).unwrap();
         for user in [ROOT, USER] {
             for (old, new) in [
                 ("/ro/file", "/tmp/new"),
@@ -2225,7 +2356,10 @@ mod tar_ro {
                 ("/ro/file", "/mnt/new"),
             ] {
                 assert!(
-                    matches!(fs.rename(user, old, new), Err(RenameError::CrossDevice)),
+                    matches!(
+                        fs.rename(user, None, old, None, new),
+                        Err(RenameError::CrossDevice)
+                    ),
                     "{old} -> {new} as {}",
                     user.user
                 );
@@ -2237,7 +2371,7 @@ mod tar_ro {
             ] {
                 assert!(
                     matches!(
-                        fs.rename(user, old, new),
+                        fs.rename(user, None, old, None, new),
                         Err(RenameError::ReadOnlyFileSystem)
                     ),
                     "{old} -> {new} as {}",
@@ -2245,12 +2379,15 @@ mod tar_ro {
                 );
             }
         }
-        assert_eq!(fs.file_status(ROOT, "/ro/file", true).unwrap().size, 4);
-        assert!(fs.file_status(ROOT, "/tmp/dir", true).is_ok());
+        assert_eq!(
+            fs.file_status(ROOT, None, "/ro/file", true).unwrap().size,
+            4
+        );
+        assert!(fs.file_status(ROOT, None, "/tmp/dir", true).is_ok());
         for path in ["/new", "/ro/new", "/tmp/new", "/mnt/new"] {
             assert!(
                 matches!(
-                    fs.file_status(ROOT, path, true),
+                    fs.file_status(ROOT, None, path, true),
                     Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
                 ),
                 "{path}"
@@ -2295,7 +2432,7 @@ mod tar_ro {
         ));
         let fs = tar_ro_fs(archive.into());
         assert!(matches!(
-            fs.file_status(USER, "/pax_global_header", false),
+            fs.file_status(USER, None, "/pax_global_header", false),
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert_eq!(read_path(&fs, "/after").1, b"after");
@@ -2355,6 +2492,7 @@ mod tar_ro {
         let bar = fs
             .open(
                 USER,
+                None,
                 "/bar",
                 OFlags::PATH | OFlags::DIRECTORY,
                 Mode::empty(),
@@ -2362,10 +2500,19 @@ mod tar_ro {
             .unwrap();
         assert_eq!(fs.handle_path(&bar).unwrap(), "/bar");
         let up = fs
-            .open_at(USER, Some(&bar), "../..", OFlags::PATH, Mode::empty())
+            .open(
+                USER,
+                Some(bar.anchor()),
+                "../..",
+                OFlags::PATH,
+                Mode::empty(),
+            )
             .unwrap();
         assert_eq!(fs.handle_path(&up).unwrap(), "/");
-        assert!(fs.file_status_at(USER, Some(&bar), "baz", true).is_ok());
+        assert!(
+            fs.file_status(USER, Some(bar.anchor()), "baz", true)
+                .is_ok()
+        );
     }
 }
 
@@ -2417,7 +2564,7 @@ mod overlay {
     fn file_read_from_lower() {
         let fs = overlay_fs(upper([]));
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(USER, None, "foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -2430,13 +2577,13 @@ mod overlay {
         drop(fd);
 
         let stat = fs
-            .file_status(USER, "bar", true)
+            .file_status(USER, None, "bar", true)
             .expect("Failed to file stat");
         assert_eq!(stat.file_type, FileType::Directory);
         assert_eq!(stat.mode, Mode::from_bits(0o755).unwrap());
 
         let mut fd = fs
-            .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -2454,10 +2601,10 @@ mod overlay {
     fn file_read_write_copy_up() {
         let fs = overlay_fs(upper([]));
         let mut fd1 = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(USER, None, "foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut fd2 = fs
-            .open(USER, "foo", OFlags::WRONLY, Mode::RWXU)
+            .open(USER, None, "foo", OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 1024];
@@ -2484,10 +2631,10 @@ mod overlay {
     fn file_read_write_copy_up_keeps_position() {
         let fs = overlay_fs(upper([]));
         let mut fd1 = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(USER, None, "foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut fd2 = fs
-            .open(USER, "foo", OFlags::WRONLY, Mode::RWXU)
+            .open(USER, None, "foo", OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 4];
@@ -2510,7 +2657,7 @@ mod overlay {
     fn file_deletion() {
         let fs = overlay_fs(upper([]));
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(USER, None, "foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 4];
@@ -2522,7 +2669,7 @@ mod overlay {
         assert_eq!(&buffer[..bytes_read], b"test");
 
         // Then we delete it
-        fs.unlink(USER, "foo").unwrap();
+        fs.unlink(USER, None, "foo").unwrap();
 
         // This should not really impact the readability; file is fine.
         let bytes_read = fs
@@ -2533,7 +2680,7 @@ mod overlay {
         // But if we close and attempt to re-open, it should not exist
         drop(fd);
         assert!(matches!(
-            fs.open(USER, "foo", OFlags::RDONLY, Mode::empty()),
+            fs.open(USER, None, "foo", OFlags::RDONLY, Mode::empty()),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         ));
     }
@@ -2561,6 +2708,7 @@ mod overlay {
         // Test O_DIRECTORY on directory from lower layer (tar)
         fs.open(
             USER,
+            None,
             "bar",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
@@ -2570,6 +2718,7 @@ mod overlay {
         // Test O_DIRECTORY on directory from upper layer (in_mem)
         fs.open(
             USER,
+            None,
             "/upperdir",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
@@ -2580,9 +2729,10 @@ mod overlay {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "foo",
                 OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
+                Mode::empty(),
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
@@ -2591,9 +2741,10 @@ mod overlay {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "/upperfile",
                 OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
+                Mode::empty(),
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
@@ -2602,9 +2753,10 @@ mod overlay {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "bar/baz",
                 OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
+                Mode::empty(),
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
@@ -2613,9 +2765,10 @@ mod overlay {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "nonexistent",
                 OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
+                Mode::empty(),
             ),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
@@ -2627,7 +2780,7 @@ mod overlay {
     fn file_create_exist_in_lower() {
         let fs = overlay_fs(upper([]));
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .open(USER, None, "foo", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; 4];
 
@@ -2644,7 +2797,7 @@ mod overlay {
 
         // Read bar subdirectory
         let fd = fs
-            .open(USER, "bar", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar directory");
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
 
@@ -2680,7 +2833,7 @@ mod overlay {
 
         // Read root directory (should contain entries from both layers)
         let fd = fs
-            .open(USER, "/", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
         drop(fd);
@@ -2716,7 +2869,7 @@ mod overlay {
 
         // Read upperdir directory (should be from upper layer)
         let fd = fs
-            .open(USER, "/upperdir", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "/upperdir", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open upperdir");
         let entries = fs.read_dir(&fd).expect("Failed to read upperdir");
 
@@ -2733,6 +2886,7 @@ mod overlay {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "foo",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -2744,6 +2898,7 @@ mod overlay {
         let mut fd = fs
             .open(
                 USER,
+                None,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -2758,6 +2913,7 @@ mod overlay {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -2770,6 +2926,7 @@ mod overlay {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "bar",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -2779,13 +2936,14 @@ mod overlay {
 
         // Test O_CREAT | O_EXCL on file that was deleted (tombstoned) should succeed
         // First delete a file from lower layer
-        fs.unlink(USER, "foo")
+        fs.unlink(USER, None, "foo")
             .expect("Failed to unlink lower layer file");
 
         // Now try to create it with O_EXCL (should succeed since it's tombstoned)
         let mut fd = fs
             .open(
                 USER,
+                None,
                 "foo",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -2798,7 +2956,7 @@ mod overlay {
 
         // Verify the new content
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "foo", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open recreated file");
         let mut buffer = vec![0; 15];
         let bytes_read = fs
@@ -2812,6 +2970,7 @@ mod overlay {
         let mut fd = fs
             .open(
                 USER,
+                None,
                 "/upper_only_file",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
@@ -2825,6 +2984,7 @@ mod overlay {
         assert!(matches!(
             fs.open(
                 USER,
+                None,
                 "/upper_only_file",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -2838,18 +2998,23 @@ mod overlay {
         let fs = overlay_fs(upper([]));
 
         // Create the directory /bar/test (where /bar already exists inside the tar file)
-        fs.mkdir(USER, "/bar/test", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("Failed to create /bar/test directory");
+        fs.mkdir(
+            USER,
+            None,
+            "/bar/test",
+            Mode::RWXU | Mode::RWXG | Mode::RWXO,
+        )
+        .expect("Failed to create /bar/test directory");
 
         // Verify the directory was created
         let stat = fs
-            .file_status(USER, "/bar/test", true)
+            .file_status(USER, None, "/bar/test", true)
             .expect("Failed to get status of /bar/test");
         assert_eq!(stat.file_type, FileType::Directory);
 
         // Verify we can open the directory
         let fd = fs
-            .open(USER, "/bar/test", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "/bar/test", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /bar/test directory");
         let entries = fs
             .read_dir(&fd)
@@ -2869,7 +3034,13 @@ mod overlay {
         // Open bar/test for writing (where bar exists in lower layer but test doesn't exist)
         // This should create ancestor directories and allow file creation
         let mut fd = fs
-            .open(USER, "bar/test", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                None,
+                "bar/test",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
             .expect("Failed to open bar/test for writing");
 
         // Write data to the file
@@ -2880,7 +3051,7 @@ mod overlay {
 
         // Read the file back
         let mut fd = fs
-            .open(USER, "bar/test", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "bar/test", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar/test for reading");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -2891,7 +3062,7 @@ mod overlay {
 
         // Verify the file exists and has correct type
         let stat = fs
-            .file_status(USER, "bar/test", true)
+            .file_status(USER, None, "bar/test", true)
             .expect("Failed to get status of bar/test");
         assert_eq!(stat.file_type, FileType::RegularFile);
     }
@@ -2903,7 +3074,7 @@ mod overlay {
         // Open bar/baz for writing (both bar and baz exist in lower layer)
         // This copies up the ancestor directories and allows the file to be modified
         let mut fd = fs
-            .open(USER, "bar/baz", OFlags::WRONLY, Mode::RWXU)
+            .open(USER, None, "bar/baz", OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open bar/baz for writing");
 
         // Write new data to the file (overwriting existing content)
@@ -2914,7 +3085,7 @@ mod overlay {
 
         // Read the file back to verify it was modified
         let mut fd = fs
-            .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar/baz for reading");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -2926,7 +3097,7 @@ mod overlay {
 
         // Verify the file still exists and has correct type
         let stat = fs
-            .file_status(USER, "bar/baz", true)
+            .file_status(USER, None, "bar/baz", true)
             .expect("Failed to get status of bar/baz");
         assert_eq!(stat.file_type, FileType::RegularFile);
     }
@@ -2937,7 +3108,13 @@ mod overlay {
 
         // Open with O_TRUNC should copy the file up into the upper backend, empty
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .open(
+                USER,
+                None,
+                "foo",
+                OFlags::RDWR | OFlags::TRUNC,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_TRUNC");
 
         // File should be truncated (empty)
@@ -2954,7 +3131,7 @@ mod overlay {
 
         // Verify the content persists
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "foo", OFlags::RDONLY, Mode::empty())
             .expect("Failed to reopen file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -2968,22 +3145,27 @@ mod overlay {
         let fs = overlay_fs(upper([]));
 
         // Create an empty directory only in upper layer
-        fs.mkdir(USER, "/upper_empty", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("mkdir upper_empty failed");
+        fs.mkdir(
+            USER,
+            None,
+            "/upper_empty",
+            Mode::RWXU | Mode::RWXG | Mode::RWXO,
+        )
+        .expect("mkdir upper_empty failed");
 
         // Remove it
-        fs.rmdir(USER, "/upper_empty")
+        fs.rmdir(USER, None, "/upper_empty")
             .expect("rmdir upper_empty should succeed");
 
         // Verify it no longer exists
         assert!(matches!(
-            fs.file_status(USER, "/upper_empty", true),
+            fs.file_status(USER, None, "/upper_empty", true),
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
 
         // Second removal should yield NoSuchFileOrDirectory (path error)
         assert!(matches!(
-            fs.rmdir(USER, "/upper_empty"),
+            fs.rmdir(USER, None, "/upper_empty"),
             Err(RmdirError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
@@ -2992,13 +3174,19 @@ mod overlay {
     fn rmdir_upper_directory_not_empty_then_empty() {
         let fs = overlay_fs(upper([]));
 
-        fs.mkdir(USER, "/upper_dir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("mkdir upper_dir failed");
+        fs.mkdir(
+            USER,
+            None,
+            "/upper_dir",
+            Mode::RWXU | Mode::RWXG | Mode::RWXO,
+        )
+        .expect("mkdir upper_dir failed");
 
         // Create a file inside making directory non-empty
         let fd = fs
             .open(
                 USER,
+                None,
                 "/upper_dir/file",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU | Mode::RWXG,
@@ -3008,21 +3196,21 @@ mod overlay {
 
         // Attempt to remove while non-empty
         assert!(matches!(
-            fs.rmdir(USER, "/upper_dir"),
+            fs.rmdir(USER, None, "/upper_dir"),
             Err(RmdirError::NotEmpty)
         ));
 
         // Remove inner file
-        fs.unlink(USER, "/upper_dir/file")
+        fs.unlink(USER, None, "/upper_dir/file")
             .expect("unlink inner failed");
 
         // Now should succeed
-        fs.rmdir(USER, "/upper_dir")
+        fs.rmdir(USER, None, "/upper_dir")
             .expect("rmdir upper_dir should succeed");
 
         // Confirm gone
         assert!(matches!(
-            fs.file_status(USER, "/upper_dir", true),
+            fs.file_status(USER, None, "/upper_dir", true),
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
@@ -3032,7 +3220,10 @@ mod overlay {
         let fs = overlay_fs(upper([]));
 
         // "bar" exists in lower layer and contains "baz" (non-empty)
-        assert!(matches!(fs.rmdir(USER, "bar"), Err(RmdirError::NotEmpty)));
+        assert!(matches!(
+            fs.rmdir(USER, None, "bar"),
+            Err(RmdirError::NotEmpty)
+        ));
     }
 
     #[test]
@@ -3043,6 +3234,7 @@ mod overlay {
         let fd = fs
             .open(
                 USER,
+                None,
                 "/regular_file",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU | Mode::RWXG,
@@ -3052,7 +3244,7 @@ mod overlay {
 
         // rmdir should fail with NotADirectory
         assert!(matches!(
-            fs.rmdir(USER, "/regular_file"),
+            fs.rmdir(USER, None, "/regular_file"),
             Err(RmdirError::NotADirectory)
         ));
     }
@@ -3106,24 +3298,35 @@ mod overlay {
                     .build()
                     .unwrap(),
             );
-            assert_eq!(fs.file_status(USER, "/bar/baz", true).unwrap().size, 13);
             assert_eq!(
-                fs.file_status(USER, "/bar", true).unwrap().file_type,
+                fs.file_status(USER, None, "/bar/baz", true).unwrap().size,
+                13
+            );
+            assert_eq!(
+                fs.file_status(USER, None, "/bar", true).unwrap().file_type,
                 FileType::Directory
             );
             drop(
-                fs.open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
-                    .unwrap(),
+                fs.open(
+                    USER,
+                    None,
+                    "/",
+                    OFlags::RDONLY | OFlags::DIRECTORY,
+                    Mode::empty(),
+                )
+                .unwrap(),
             );
-            assert_eq!(fs.read_link(USER, "/link").unwrap(), "/bar/baz");
+            assert_eq!(fs.read_link(USER, None, "/link").unwrap(), "/bar/baz");
             drop(
-                fs.open(USER, "/link", OFlags::RDONLY, Mode::empty())
+                fs.open(USER, None, "/link", OFlags::RDONLY, Mode::empty())
                     .unwrap(),
             );
-            fs.chmod(USER, "/bar/baz", Mode::RUSR | Mode::WUSR).unwrap();
+            fs.chmod(USER, None, "/bar/baz", Mode::RUSR | Mode::WUSR)
+                .unwrap();
             drop(
                 fs.open(
                     USER,
+                    None,
                     "/bar/baz",
                     OFlags::WRONLY | OFlags::TRUNC,
                     Mode::empty(),
@@ -3133,15 +3336,16 @@ mod overlay {
             drop(
                 fs.open(
                     USER,
+                    None,
                     "/bar/new",
                     OFlags::CREAT | OFlags::WRONLY,
                     Mode::RUSR | Mode::WUSR,
                 )
                 .unwrap(),
             );
-            fs.unlink(USER, "/bar/new").unwrap();
-            fs.mkdir(USER, "/bar/sub", ALL_PERMS).unwrap();
-            fs.rmdir(USER, "/bar/sub").unwrap();
+            fs.unlink(USER, None, "/bar/new").unwrap();
+            fs.mkdir(USER, None, "/bar/sub", ALL_PERMS).unwrap();
+            fs.rmdir(USER, None, "/bar/sub").unwrap();
             tx.send(()).unwrap();
         });
         rx.recv_timeout(Duration::from_secs(5))
@@ -3163,17 +3367,18 @@ mod overlay {
                 ],
             ),
         );
-        assert_eq!(fs.read_link(USER, "/etc/link").unwrap(), "real");
+        assert_eq!(fs.read_link(USER, None, "/etc/link").unwrap(), "real");
 
-        fs.unlink(USER, "/etc/gone").unwrap();
+        fs.unlink(USER, None, "/etc/gone").unwrap();
         assert!(matches!(
-            fs.file_status(USER, "/etc/gone", false),
+            fs.file_status(USER, None, "/etc/gone", false),
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
 
         let mut fd = fs
             .open(
                 USER,
+                None,
                 "/etc/link",
                 OFlags::WRONLY | OFlags::TRUNC,
                 Mode::empty(),
@@ -3182,10 +3387,12 @@ mod overlay {
         fs.write(&mut fd, b"upper", None).unwrap();
         drop(fd);
         assert_eq!(
-            fs.file_status(USER, "/etc/link", false).unwrap().file_type,
+            fs.file_status(USER, None, "/etc/link", false)
+                .unwrap()
+                .file_type,
             FileType::SymbolicLink
         );
-        assert_eq!(fs.read_link(USER, "/etc/link").unwrap(), "real");
+        assert_eq!(fs.read_link(USER, None, "/etc/link").unwrap(), "real");
         assert_eq!(read_path(&fs, "/etc/real").1, b"upper");
     }
 
@@ -3207,7 +3414,7 @@ mod overlay {
         // an inode must hold the same.
         let check = || {
             let [a, b] = ["/a", "/b"].map(|path| {
-                let status = fs.file_status(USER, path, false).unwrap();
+                let status = fs.file_status(USER, None, path, false).unwrap();
                 let (_, data) = read_path(&fs, path);
                 assert_eq!(status.size, u64::try_from(data.len()).unwrap(), "{path}");
                 (status, data)
@@ -3218,13 +3425,18 @@ mod overlay {
             a.1
         };
 
-        let mut fd = fs.open(USER, "/a", OFlags::RDWR, Mode::empty()).unwrap();
+        let mut fd = fs
+            .open(USER, None, "/a", OFlags::RDWR, Mode::empty())
+            .unwrap();
         fs.write(&mut fd, b"new-long", None).unwrap();
         drop(fd);
         assert_eq!(check(), b"new-long");
-        drop(fs.open(USER, "/b", OFlags::WRONLY, Mode::empty()).unwrap());
+        drop(
+            fs.open(USER, None, "/b", OFlags::WRONLY, Mode::empty())
+                .unwrap(),
+        );
         assert_eq!(check(), b"new-long");
-        fs.chmod(USER, "/a", Mode::RUSR).unwrap();
+        fs.chmod(USER, None, "/a", Mode::RUSR).unwrap();
         check();
     }
 
@@ -3236,14 +3448,14 @@ mod overlay {
 
         let fs = overlay_fs(upper([]));
 
-        fs.file_status(USER, "foo", true)
+        fs.file_status(USER, None, "foo", true)
             .expect("Failed to stat foo");
 
         // Writing to the lower-layer file triggers copy-up. Run it on a worker thread.
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut fd = fs
-                .open(USER, "foo", OFlags::WRONLY, Mode::RWXU)
+                .open(USER, None, "foo", OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to open file for writing");
             fs.write(&mut fd, b"x", None)
                 .expect("Failed to write to file");
@@ -3263,57 +3475,101 @@ mod overlay {
         let bar = fs
             .open(
                 user,
+                None,
                 "/bar",
                 OFlags::PATH | OFlags::DIRECTORY,
                 Mode::empty(),
             )
             .unwrap();
-        assert!(fs.file_status_at(user, Some(&bar), "baz", true).is_ok());
+        assert!(
+            fs.file_status(user, Some(bar.anchor()), "baz", true)
+                .is_ok()
+        );
         // Creating through the held directory copies it up without hiding lower entries.
-        fs.mkdir_at(user, Some(&bar), "new", ALL_PERMS).unwrap();
-        assert!(fs.file_status(user, "/bar/new", true).is_ok());
-        assert!(fs.file_status_at(user, Some(&bar), "baz", true).is_ok());
+        fs.mkdir(user, Some(bar.anchor()), "new", ALL_PERMS)
+            .unwrap();
+        assert!(fs.file_status(user, None, "/bar/new", true).is_ok());
+        assert!(
+            fs.file_status(user, Some(bar.anchor()), "baz", true)
+                .is_ok()
+        );
         // Once removed, the held directory must not revive whited-out lower entries.
-        fs.unlink(user, "/bar/baz").unwrap();
-        fs.rmdir(user, "/bar/new").unwrap();
-        fs.rmdir(user, "/bar").unwrap();
+        fs.unlink(user, None, "/bar/baz").unwrap();
+        fs.rmdir(user, None, "/bar/new").unwrap();
+        fs.rmdir(user, None, "/bar").unwrap();
         assert!(matches!(
-            fs.file_status_at(user, Some(&bar), "baz", true),
+            fs.file_status(user, Some(bar.anchor()), "baz", true),
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
-        assert!(fs.file_status_at(user, Some(&bar), ".", true).is_ok());
+        assert!(fs.file_status(user, Some(bar.anchor()), ".", true).is_ok());
         assert!(matches!(
             fs.handle_path(&bar),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         let parent = fs
-            .open_at(user, Some(&bar), "..", OFlags::PATH, Mode::empty())
+            .open(user, Some(bar.anchor()), "..", OFlags::PATH, Mode::empty())
             .unwrap();
         assert_eq!(fs.handle_path(&parent).unwrap(), "/");
+    }
+
+    #[test]
+    fn held_lower_directories_see_changes_made_by_path() {
+        let fs = overlay_fs(upper([]));
+        let user = ACTING_USER;
+        let bar = fs
+            .open(
+                user,
+                None,
+                "/bar",
+                OFlags::PATH | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap();
+        // Resolved while it exists only in the lower layer.
+        assert!(
+            fs.file_status(user, Some(bar.anchor()), "baz", true)
+                .is_ok()
+        );
+        fs.mkdir(user, None, "/bar/new", ALL_PERMS).unwrap();
+        assert!(
+            fs.file_status(user, Some(bar.anchor()), "new", true)
+                .is_ok()
+        );
+        fs.unlink(user, None, "/bar/baz").unwrap();
+        assert!(matches!(
+            fs.file_status(user, Some(bar.anchor()), "baz", true),
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
     }
 
     #[test]
     fn held_directories_follow_rename_over_an_empty_directory() {
         let fs = overlay_fs(upper([]));
         for path in ["/a", "/a/sub", "/b"] {
-            fs.mkdir(USER, path, ALL_PERMS).unwrap();
+            fs.mkdir(USER, None, path, ALL_PERMS).unwrap();
         }
         let [a, sub, old_b] = ["/a", "/a/sub", "/b"].map(|path| {
-            fs.open(USER, path, OFlags::PATH | OFlags::DIRECTORY, Mode::empty())
-                .unwrap()
+            fs.open(
+                USER,
+                None,
+                path,
+                OFlags::PATH | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .unwrap()
         });
         let old_b_node = fs.handle_status(&old_b).unwrap().node_info;
 
-        fs.rename(USER, "/a", "/b").unwrap();
+        fs.rename(USER, None, "/a", None, "/b").unwrap();
 
         // Like Linux, held directories (and their descendants) move with the rename.
         assert_eq!(fs.handle_path(&a).unwrap(), "/b");
         assert_eq!(fs.handle_path(&sub).unwrap(), "/b/sub");
-        let b_node = fs.file_status(USER, "/b", true).unwrap().node_info;
+        let b_node = fs.file_status(USER, None, "/b", true).unwrap().node_info;
         assert_eq!(fs.handle_status(&a).unwrap().node_info, b_node);
         assert_ne!(b_node, old_b_node);
         let sub_parent = fs
-            .open_at(USER, Some(&sub), "..", OFlags::PATH, Mode::empty())
+            .open(USER, Some(sub.anchor()), "..", OFlags::PATH, Mode::empty())
             .unwrap();
         assert_eq!(fs.handle_status(&sub_parent).unwrap().node_info, b_node);
         assert_eq!(fs.handle_path(&sub_parent).unwrap(), "/b");
@@ -3325,39 +3581,51 @@ mod overlay {
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(matches!(
-            fs.file_status_at(USER, Some(&old_b), "sub", true),
+            fs.file_status(USER, Some(old_b.anchor()), "sub", true),
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         let old_b_parent = fs
-            .open_at(USER, Some(&old_b), "..", OFlags::PATH, Mode::empty())
+            .open(
+                USER,
+                Some(old_b.anchor()),
+                "..",
+                OFlags::PATH,
+                Mode::empty(),
+            )
             .unwrap();
         assert_eq!(fs.handle_path(&old_b_parent).unwrap(), "/");
         assert_eq!(
             fs.handle_status(&old_b_parent).unwrap().node_info,
-            fs.file_status(USER, "/", true).unwrap().node_info
+            fs.file_status(USER, None, "/", true).unwrap().node_info
         );
     }
 
     #[test]
     fn removed_held_directory_keeps_its_status() {
         let fs = overlay_fs(upper([]));
-        fs.mkdir(USER, "/d", ALL_PERMS).unwrap();
+        fs.mkdir(USER, None, "/d", ALL_PERMS).unwrap();
         let d = fs
-            .open(USER, "/d", OFlags::PATH | OFlags::DIRECTORY, Mode::empty())
+            .open(
+                USER,
+                None,
+                "/d",
+                OFlags::PATH | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
             .unwrap();
         let before = fs.handle_status(&d).unwrap();
         assert_eq!(before.file_type, FileType::Directory);
 
-        fs.rmdir(USER, "/d").unwrap();
+        fs.rmdir(USER, None, "/d").unwrap();
 
         // As with fstat on Linux, the held directory still describes itself once unlinked.
         let after = fs.handle_status(&d).unwrap();
         assert_eq!(after.node_info, before.node_info);
         assert_eq!(after.file_type, FileType::Directory);
         // A new directory taking the name must not be confused with the held one.
-        fs.mkdir(USER, "/d", ALL_PERMS).unwrap();
+        fs.mkdir(USER, None, "/d", ALL_PERMS).unwrap();
         assert_ne!(
-            fs.file_status(USER, "/d", true).unwrap().node_info,
+            fs.file_status(USER, None, "/d", true).unwrap().node_info,
             before.node_info
         );
         assert_eq!(fs.handle_status(&d).unwrap().node_info, before.node_info);
@@ -3398,12 +3666,12 @@ mod devices {
         let fs = devices_fs(provider.clone());
 
         let mut stdout = fs
-            .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open(USER, None, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
         assert!(matches!(fs.write(&mut stdout, b"", None), Ok(0)));
         assert!(matches!(fs.write(&mut stdout, b"out", None), Ok(3)));
         let mut stderr = fs
-            .open(USER, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .open(USER, None, "/dev/stderr", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stderr");
         assert!(matches!(fs.write(&mut stderr, b"err", None), Ok(3)));
         assert_eq!(
@@ -3416,14 +3684,14 @@ mod devices {
 
         provider.push_input(b"in");
         let mut stdin = fs
-            .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
         let mut buffer = [0; 4];
         assert!(matches!(fs.read(&mut stdin, &mut buffer, None), Ok(2)));
         assert_eq!(&buffer[..2], b"in");
 
         let mut urandom = fs
-            .open(USER, "/dev/urandom", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "/dev/urandom", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/urandom");
         assert!(matches!(fs.read(&mut urandom, &mut buffer, None), Ok(4)));
         assert_eq!(buffer, [0x5a; 4]);
@@ -3456,20 +3724,20 @@ mod devices {
             )
             .expect("Failed to open /dev/tty");
         let mut stdin = fs
-            .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
         let mut stdout = fs
-            .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open(USER, None, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
         let mut stderr = fs
-            .open(USER, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .open(USER, None, "/dev/stderr", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stderr");
         for file in [&tty, &stdin, &stdout] {
             assert!(fs.terminal(file).is_some());
         }
         assert!(fs.terminal(&stderr).is_none());
         let stdout_path = fs
-            .open(USER, "/dev/stdout", OFlags::PATH, Mode::empty())
+            .open(USER, None, "/dev/stdout", OFlags::PATH, Mode::empty())
             .expect("Failed to open /dev/stdout with O_PATH");
         assert!(fs.terminal(&stdout_path).is_none());
 
@@ -3513,7 +3781,7 @@ mod devices {
         assert!(fs.terminal(&tty).is_some());
         assert!(matches!(fs.write(&mut tty, b"tty", None), Ok(3)));
         let stdout = fs
-            .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open(USER, None, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
         assert!(fs.terminal(&stdout).is_none());
         assert_eq!(provider.terminal_writes(), vec![b"tty".to_vec()]);
@@ -3528,16 +3796,16 @@ mod devices {
         ));
 
         assert!(matches!(
-            fs.open(USER, "/dev/tty", OFlags::RDWR, Mode::empty()),
+            fs.open(USER, None, "/dev/tty", OFlags::RDWR, Mode::empty()),
             Err(OpenError::NoSuchDevice)
         ));
         let tty = fs
-            .open(USER, "/dev/tty", OFlags::PATH, Mode::empty())
+            .open(USER, None, "/dev/tty", OFlags::PATH, Mode::empty())
             .expect("Failed to open /dev/tty with O_PATH");
         assert!(fs.terminal(&tty).is_none());
 
         let status = fs
-            .file_status(USER, "/dev/tty", true)
+            .file_status(USER, None, "/dev/tty", true)
             .expect("Failed to stat /dev/tty");
         assert_eq!(status.file_type, FileType::CharacterDevice);
         assert_eq!(
@@ -3548,6 +3816,7 @@ mod devices {
         let dev = fs
             .open(
                 USER,
+                None,
                 "/dev",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),
@@ -3564,7 +3833,7 @@ mod devices {
 
         // Attempt to open a non-/dev/* path
         assert!(matches!(
-            fs.open(USER, "foo", OFlags::RDONLY, Mode::empty()),
+            fs.open(USER, None, "foo", OFlags::RDONLY, Mode::empty()),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
@@ -3573,6 +3842,7 @@ mod devices {
         let dir = fs
             .open(
                 USER,
+                None,
                 path,
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),
@@ -3588,7 +3858,7 @@ mod devices {
     fn ptmx_opens_pseudo_terminal_pairs() {
         let fs = devices_fs(Arc::new(TestStdioProvider::default()));
         let mut manager = fs
-            .open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .open(USER, None, "/dev/ptmx", OFlags::RDWR, Mode::empty())
             .expect("Failed to open /dev/ptmx");
         let endpoint = fs.terminal(&manager).expect("ptmx opens a terminal");
         assert_eq!(
@@ -3603,7 +3873,7 @@ mod devices {
         );
 
         assert!(matches!(
-            fs.open(USER, "/dev/pts/0", OFlags::RDWR, Mode::empty()),
+            fs.open(USER, None, "/dev/pts/0", OFlags::RDWR, Mode::empty()),
             Err(OpenError::Io)
         ));
         assert_eq!(
@@ -3611,7 +3881,7 @@ mod devices {
             Ok(Ok(TerminalResponse::Done))
         );
         let mut subsidiary = fs
-            .open(USER, "/dev/pts/0", OFlags::RDWR, Mode::empty())
+            .open(USER, None, "/dev/pts/0", OFlags::RDWR, Mode::empty())
             .expect("Failed to open /dev/pts/0");
         assert!(fs.terminal(&subsidiary).is_some());
         assert!(fs.readiness_source(&subsidiary).is_some());
@@ -3632,30 +3902,30 @@ mod devices {
     fn pts_names_open_pairs() {
         let fs = devices_fs(Arc::new(TestStdioProvider::default()));
         let ptmx_path = fs
-            .open(USER, "/dev/ptmx", OFlags::PATH, Mode::empty())
+            .open(USER, None, "/dev/ptmx", OFlags::PATH, Mode::empty())
             .expect("Failed to open /dev/ptmx with O_PATH");
         assert!(fs.terminal(&ptmx_path).is_none());
-        let ptmx = fs.file_status(USER, "/dev/ptmx", true).unwrap();
+        let ptmx = fs.file_status(USER, None, "/dev/ptmx", true).unwrap();
         assert_eq!(ptmx.file_type, FileType::CharacterDevice);
         assert_eq!(names(&fs, "/dev/pts"), [".", ".."]);
-        let pts = fs.file_status(USER, "/dev/pts", true).unwrap();
+        let pts = fs.file_status(USER, None, "/dev/pts", true).unwrap();
         assert_eq!(pts.file_type, FileType::Directory);
         let dev = names(&fs, "/dev");
         assert!(dev.iter().any(|name| name == "ptmx"));
         assert!(dev.iter().any(|name| name == "pts"));
 
         let first = fs
-            .open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .open(USER, None, "/dev/ptmx", OFlags::RDWR, Mode::empty())
             .unwrap();
         let second = fs
-            .open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .open(USER, None, "/dev/ptmx", OFlags::RDWR, Mode::empty())
             .unwrap();
         assert_eq!(names(&fs, "/dev/pts"), [".", "..", "0", "1"]);
-        let status = fs.file_status(USER, "/dev/pts/1", true).unwrap();
+        let status = fs.file_status(USER, None, "/dev/pts/1", true).unwrap();
         assert_eq!(status.file_type, FileType::CharacterDevice);
         assert_eq!(status.mode, Mode::RUSR | Mode::WUSR | Mode::WGRP);
         assert_eq!(status.node_info.dev, pts.node_info.dev);
-        let first_status = fs.file_status(USER, "/dev/pts/0", true).unwrap();
+        let first_status = fs.file_status(USER, None, "/dev/pts/0", true).unwrap();
         assert_ne!(status.node_info.ino, first_status.node_info.ino);
         assert_eq!(
             status.node_info.rdev.map(core::num::NonZeroU64::get),
@@ -3663,7 +3933,7 @@ mod devices {
         );
         // A path-only subsidiary describes itself without opening it.
         let path = fs
-            .open(USER, "/dev/pts/1", OFlags::PATH, Mode::empty())
+            .open(USER, None, "/dev/pts/1", OFlags::PATH, Mode::empty())
             .unwrap();
         assert!(fs.terminal(&path).is_none());
         assert_eq!(fs.handle_status(&path).unwrap().node_info, status.node_info);
@@ -3671,7 +3941,7 @@ mod devices {
         for missing in ["/dev/pts/2", "/dev/pts/01", "/dev/pts/+1", "/dev/pts/x"] {
             assert!(
                 matches!(
-                    fs.open(USER, missing, OFlags::PATH, Mode::empty()),
+                    fs.open(USER, None, missing, OFlags::PATH, Mode::empty()),
                     Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
                 ),
                 "{missing}"
@@ -3680,14 +3950,14 @@ mod devices {
         for not_directory in ["/dev/pts/0/", "/dev/pts/0/x", "/dev/ptmx/x"] {
             assert!(
                 matches!(
-                    fs.open(USER, not_directory, OFlags::PATH, Mode::empty()),
+                    fs.open(USER, None, not_directory, OFlags::PATH, Mode::empty()),
                     Err(OpenError::PathError(PathError::ComponentNotADirectory))
                 ),
                 "{not_directory}"
             );
         }
         assert!(matches!(
-            fs.open(USER, "/dev/pts/0", OFlags::DIRECTORY, Mode::empty()),
+            fs.open(USER, None, "/dev/pts/0", OFlags::DIRECTORY, Mode::empty()),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
 
@@ -3695,7 +3965,7 @@ mod devices {
         drop(first);
         assert_eq!(names(&fs, "/dev/pts"), [".", "..", "1"]);
         assert!(matches!(
-            fs.open(USER, "/dev/pts/0", OFlags::PATH, Mode::empty()),
+            fs.open(USER, None, "/dev/pts/0", OFlags::PATH, Mode::empty()),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         drop(second);
@@ -3705,16 +3975,18 @@ mod devices {
     #[test]
     fn ptmx_runs_out_of_space() {
         let fs = devices_fs(Arc::new(TestStdioProvider::default()));
-        let mut managers: Vec<_> =
-            core::iter::from_fn(|| fs.open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty()).ok())
-                .collect();
+        let mut managers: Vec<_> = core::iter::from_fn(|| {
+            fs.open(USER, None, "/dev/ptmx", OFlags::RDWR, Mode::empty())
+                .ok()
+        })
+        .collect();
         assert_eq!(managers.len(), 64);
         assert!(matches!(
-            fs.open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty()),
+            fs.open(USER, None, "/dev/ptmx", OFlags::RDWR, Mode::empty()),
             Err(OpenError::NoSpace)
         ));
         managers.pop();
-        fs.open(USER, "/dev/ptmx", OFlags::RDWR, Mode::empty())
+        fs.open(USER, None, "/dev/ptmx", OFlags::RDWR, Mode::empty())
             .expect("A closed pair frees its index");
     }
 }
@@ -3762,7 +4034,7 @@ mod composed {
         let fs = composed_fs(provider.clone());
 
         let mut fd_stdout = fs
-            .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open(USER, None, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
         assert!(matches!(fs.write(&mut fd_stdout, b"composed", None), Ok(8)));
         assert_eq!(
@@ -3772,7 +4044,7 @@ mod composed {
 
         provider.push_input(b"input");
         let mut fd_stdin = fs
-            .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
         let mut buffer = vec![0; 1024];
         assert!(matches!(fs.read(&mut fd_stdin, &mut buffer, None), Ok(5)));
@@ -3785,20 +4057,20 @@ mod composed {
 
         for path in ["/dev", "/dev/null"] {
             assert!(matches!(
-                fs.mkdir(USER, path, Mode::RWXU),
+                fs.mkdir(USER, None, path, Mode::RWXU),
                 Err(MkdirError::AlreadyExists)
             ));
             assert!(matches!(
-                fs.symlink(USER, "target", path),
+                fs.symlink(USER, "target", None, path),
                 Err(SymlinkError::AlreadyExists)
             ));
         }
         assert!(matches!(
-            fs.mkdir(USER, "/dev/new", Mode::RWXU),
+            fs.mkdir(USER, None, "/dev/new", Mode::RWXU),
             Err(MkdirError::ReadOnlyFileSystem)
         ));
         assert!(matches!(
-            fs.symlink(USER, "target", "/dev/new"),
+            fs.symlink(USER, "target", None, "/dev/new"),
             Err(SymlinkError::ReadOnlyFileSystem)
         ));
     }
@@ -3810,14 +4082,15 @@ mod composed {
         // Test file creation
         let path = "/testfile";
         let fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(USER, None, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         drop(fd);
 
         // Test file deletion
-        fs.unlink(USER, path).expect("Failed to unlink file");
+        fs.unlink(USER, None, path).expect("Failed to unlink file");
         assert!(
-            fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(USER, None, path, OFlags::RDONLY, Mode::RWXU)
+                .is_err(),
             "File should not exist"
         );
     }
@@ -3854,7 +4127,13 @@ mod shared_mapping {
         let (fs, provider) = shared_in_mem();
         let fs = Resolver::<TestPlatform, _>::new(fs);
         let mut fd = fs
-            .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .open(
+                ROOT,
+                None,
+                "/file",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RWXU,
+            )
             .unwrap();
         fs.write(&mut fd, b"hello", None).unwrap();
 
@@ -3884,6 +4163,7 @@ mod shared_mapping {
         let mut append = fs
             .open(
                 ROOT,
+                None,
                 "/file",
                 OFlags::WRONLY | OFlags::APPEND,
                 Mode::empty(),
@@ -3895,7 +4175,7 @@ mod shared_mapping {
         assert_eq!(memory.contents(), b"Je\0!!");
 
         let fd = fs
-            .open(ROOT, "/file", OFlags::RDONLY, Mode::empty())
+            .open(ROOT, None, "/file", OFlags::RDONLY, Mode::empty())
             .unwrap();
         let SharedMapping {
             file: again,
@@ -3905,7 +4185,13 @@ mod shared_mapping {
         assert!(Arc::ptr_eq(&again, &mapping));
 
         let fd = fs
-            .open(ROOT, "/file", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .open(
+                ROOT,
+                None,
+                "/file",
+                OFlags::RDWR | OFlags::TRUNC,
+                Mode::empty(),
+            )
             .unwrap();
         assert_eq!(memory.contents(), b"");
         assert_eq!(fs.handle_status(&fd).unwrap().size, 0);
@@ -3916,27 +4202,39 @@ mod shared_mapping {
     fn mapping_requires_a_readable_file() {
         let fs = Resolver::<TestPlatform, _>::new(shared_in_mem().0);
         drop(
-            fs.open(ROOT, "/file", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-                .unwrap(),
+            fs.open(
+                ROOT,
+                None,
+                "/file",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .unwrap(),
         );
         let write_only = fs
-            .open(ROOT, "/file", OFlags::WRONLY, Mode::empty())
+            .open(ROOT, None, "/file", OFlags::WRONLY, Mode::empty())
             .unwrap();
         assert!(matches!(
             fs.map_shared(&write_only),
             Err(MapSharedError::NotForReading)
         ));
-        let dir = fs.open(ROOT, "/", OFlags::RDONLY, Mode::empty()).unwrap();
+        let dir = fs
+            .open(ROOT, None, "/", OFlags::RDONLY, Mode::empty())
+            .unwrap();
         assert!(matches!(
             fs.map_shared(&dir),
             Err(MapSharedError::IsDirectory)
         ));
-        let path_only = fs.open(ROOT, "/file", OFlags::PATH, Mode::empty()).unwrap();
+        let path_only = fs
+            .open(ROOT, None, "/file", OFlags::PATH, Mode::empty())
+            .unwrap();
         assert!(matches!(
             fs.map_shared(&path_only),
             Err(MapSharedError::PathOnly)
         ));
-        let path_only_dir = fs.open(ROOT, "/", OFlags::PATH, Mode::empty()).unwrap();
+        let path_only_dir = fs
+            .open(ROOT, None, "/", OFlags::PATH, Mode::empty())
+            .unwrap();
         assert!(matches!(
             fs.map_shared(&path_only_dir),
             Err(MapSharedError::PathOnly)
@@ -3948,7 +4246,7 @@ mod shared_mapping {
         let limit = Arc::new(SharedFileLimit::new(2));
         let fs = Resolver::<TestPlatform, _>::new(shared_in_mem_with_limit(&limit).0);
         let open = |path| {
-            fs.open(ROOT, path, OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            fs.open(ROOT, None, path, OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
                 .unwrap()
         };
         let (first, second, third) = (open("/first"), open("/second"), open("/third"));
@@ -3962,7 +4260,7 @@ mod shared_mapping {
         fs.map_shared(&first).unwrap();
         assert_eq!(limit.live(), 2);
 
-        fs.unlink(ROOT, "/first").unwrap();
+        fs.unlink(ROOT, None, "/first").unwrap();
         assert!(matches!(
             fs.map_shared(&third),
             Err(MapSharedError::NoMemory)
@@ -3999,7 +4297,13 @@ mod shared_mapping {
                 .with_shared_memory(provider, Arc::clone(&limit));
             let fs = Resolver::<TestPlatform, _>::new(backend);
             let mut fd = fs
-                .open(ROOT, "/file", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+                .open(
+                    ROOT,
+                    None,
+                    "/file",
+                    OFlags::CREAT | OFlags::RDWR,
+                    Mode::RWXU,
+                )
                 .unwrap();
             fs.write(&mut fd, b"hello", None).unwrap();
             for _ in 0..2 {
@@ -4033,9 +4337,11 @@ mod shared_mapping {
         };
         let fs = super::overlay_fs(upper, Cow::Borrowed(super::TEST_TAR_FILE));
         let mut lower = fs
-            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .open(ROOT, None, "/foo", OFlags::RDONLY, Mode::empty())
             .unwrap();
-        let upper = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
+        let upper = fs
+            .open(USER, None, "/foo", OFlags::RDWR, Mode::empty())
+            .unwrap();
         let mapping = fs.map_shared(&upper).unwrap().file;
         let bytes = provider.last().contents();
         assert_eq!(bytes.len(), 8);
@@ -4052,7 +4358,7 @@ mod shared_mapping {
         assert!(Arc::ptr_eq(&followed, &mapping));
 
         let mut reopened = fs
-            .open(ROOT, "/foo", OFlags::RDONLY, Mode::empty())
+            .open(ROOT, None, "/foo", OFlags::RDONLY, Mode::empty())
             .unwrap();
         assert_eq!(fs.read(&mut reopened, &mut read, Some(0)).unwrap(), 8);
         assert_eq!(read, bytes);
@@ -4084,6 +4390,7 @@ mod shared_mapping {
         let mut fd = fs
             .open(
                 ROOT,
+                None,
                 "/shared/file",
                 OFlags::CREAT | OFlags::RDWR,
                 Mode::RWXU,
@@ -4129,7 +4436,9 @@ mod shared_mapping {
                 .build()
                 .unwrap(),
         );
-        let mut fd = fs.open(USER, "/foo", OFlags::RDWR, Mode::empty()).unwrap();
+        let mut fd = fs
+            .open(USER, None, "/foo", OFlags::RDWR, Mode::empty())
+            .unwrap();
         fs.map_shared(&fd).unwrap();
         let memory = provider.last();
         assert_eq!(memory.contents(), b"testfoo\n");
@@ -4166,7 +4475,13 @@ mod shared_mapping {
             Err(TruncateError::Busy)
         ));
         assert!(matches!(
-            fs.open(USER, "/foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty()),
+            fs.open(
+                USER,
+                None,
+                "/foo",
+                OFlags::RDWR | OFlags::TRUNC,
+                Mode::empty()
+            ),
             Err(OpenError::TruncateError(TruncateError::Busy))
         ));
         assert_eq!(memory.contents(), b"testfoo\n\0\0ab");

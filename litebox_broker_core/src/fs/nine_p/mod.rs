@@ -57,8 +57,11 @@ pub struct NineP<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read +
     /// Handed out (shared) by [`Backend::root`](super::backend::Backend::root), so it must never
     /// be `Tlopen`ed or `Tlcreate`d.
     root: Arc<OwnedFid<Platform, T>>,
-    /// Qid path of [`Self::root`], identifying the export root without a round trip.
+    /// Qid path of [`Self::root`].
     root_qid_path: u64,
+    /// Qid path of `..` walked from [`Self::root`], if the server reported one; looked up on
+    /// first use by [`Self::walk_parent`].
+    root_parent_qid_path: spin::Once<Option<u64>>,
     /// Device id reported in every [`NodeInfo`](super::NodeInfo) from this backend; inode numbers
     /// come from the server's qids instead.
     device_id: u64,
@@ -97,6 +100,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
                 client: Arc::clone(&client),
             }),
             root_qid_path: qid.path,
+            root_parent_qid_path: spin::Once::new(),
             client,
             device_id: inode_allocator.device_id(),
             unlinkat_supported: AtomicBool::new(true),
@@ -110,6 +114,42 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             fid,
             client: Arc::clone(&self.client),
         })
+    }
+
+    /// Walks `..` from the directory `dir` (whose qid path is `qid_path`), or returns `None` at
+    /// the export root.
+    ///
+    /// A matching qid path alone does not identify the root, since an export spanning several
+    /// host filesystems can repeat inode numbers; the root's `..` must match too. Some servers
+    /// (e.g., diod) walk `..` from the export root out of the export, so any doubt resolves to
+    /// the root.
+    fn walk_parent(
+        &self,
+        dir: &client::Fid<Platform>,
+        qid_path: u64,
+    ) -> Result<Option<Arc<OwnedFid<Platform, T>>>, WalkError> {
+        if qid_path != self.root_qid_path {
+            let fid = self.client.walk(dir, &[".."])?.into_complete_fid()?;
+            return Ok(Some(self.own(fid)));
+        }
+        let root_parent = *self.root_parent_qid_path.call_once(|| {
+            self.walk_dot_dot(&self.root.fid)
+                .map(|(qid_path, _)| qid_path)
+        });
+        Ok(match (root_parent, self.walk_dot_dot(dir)) {
+            (Some(root_parent), Some((parent, fid))) if parent != root_parent => Some(fid),
+            _ => None,
+        })
+    }
+
+    /// Walks `..` from `dir`, returning the qid path and fid it reached.
+    fn walk_dot_dot(
+        &self,
+        dir: &client::Fid<Platform>,
+    ) -> Option<(u64, Arc<OwnedFid<Platform, T>>)> {
+        let walk = self.client.walk(dir, &[".."]).ok()?;
+        let qid_path = walk.wqids.first()?.path;
+        Some((qid_path, self.own(walk.into_complete_fid().ok()?)))
     }
 
     /// Remove `name` from `dir`, via `Tunlinkat` where the server supports it.
@@ -354,13 +394,12 @@ where
     }
 
     fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
-        let attr = self
-            .client
-            .getattr(&dir.get_typed::<Self>().fid.fid, fcall::GetattrMask::NLINK)?;
-        if attr.valid.contains(fcall::GetattrMask::NLINK) && attr.stat.nlink == 0 {
+        let dir = &dir.get_typed::<Self>().fid.fid;
+        let attr = self.client.getattr(dir, fcall::GetattrMask::NLINK)?;
+        if is_unlinked(&attr) {
             return Err(PathError::NoSuchFileOrDirectory.into());
         }
-        if attr.qid.path == self.root_qid_path {
+        if attr.qid.path == self.root_qid_path && self.walk_parent(dir, attr.qid.path)?.is_none() {
             return Ok(Some(Vec::new()));
         }
         // 9P2000.L cannot request the current name of a fid, and enumerating ancestors would
@@ -370,21 +409,14 @@ where
 
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
         let dir = &dir.get_typed::<Self>().fid.fid;
-        if self
+        let qid_path = self
             .client
             .getattr(dir, fcall::GetattrMask::NLINK)?
             .qid
-            .path
-            == self.root_qid_path
-        {
-            return Ok(None);
-        }
-
-        let fid = self.client.walk(dir, &[".."])?.into_complete_fid()?;
-        Ok(Some(DirHandle::from_typed::<Self>(NinePDirHandle {
-            fid: self.own(fid),
-            reader: None,
-        })))
+            .path;
+        Ok(self
+            .walk_parent(dir, qid_path)?
+            .map(|fid| DirHandle::from_typed::<Self>(NinePDirHandle { fid, reader: None })))
     }
 
     fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
@@ -433,7 +465,7 @@ where
             let attr = self
                 .client
                 .getattr(&handle.fid.fid, fcall::GetattrMask::NLINK)?;
-            if attr.valid.contains(fcall::GetattrMask::NLINK) && attr.stat.nlink == 0 {
+            if is_unlinked(&attr) {
                 return Err(ReadDirError::Removed);
             }
         }
@@ -1192,4 +1224,9 @@ impl From<Rlerror> for Error {
     fn from(err: Rlerror) -> Self {
         Error::Remote(err.ecode)
     }
+}
+
+/// Whether `attr` describes a removed object; servers that omit the link count never report one.
+fn is_unlinked(attr: &fcall::Rgetattr) -> bool {
+    attr.valid.contains(fcall::GetattrMask::NLINK) && attr.stat.nlink == 0
 }

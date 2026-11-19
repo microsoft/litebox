@@ -22,7 +22,7 @@ use super::errors::{
     ReadDirError, ReadError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
     TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::resolver::{Resolver, ResolverEntry};
+use super::resolver::{DirAnchor, Resolver, ResolverEntry};
 use super::shared_storage::{SharedFileMapping, SharedMapping};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
@@ -278,7 +278,7 @@ where
 {
     // Take an independent snapshot before looking up another anchor (possibly a dup of
     // the same file). No open-description lock is held during the pathname walk.
-    fn directory_entry(&self, directory: Option<&File>) -> Result<Option<ResolverEntry<Backend>>> {
+    fn directory_anchor(&self, directory: Option<&File>) -> Result<Option<DirAnchor>> {
         directory
             .map(|file| {
                 let state = file
@@ -290,7 +290,7 @@ where
                 if !core::ptr::eq(Arc::as_ptr(&state.resolver), self) {
                     return Err(BrokerError::InvalidRights);
                 }
-                Ok(state.entry.read().clone())
+                Ok(state.entry.read().anchor())
             })
             .transpose()
     }
@@ -314,7 +314,7 @@ where
         let flags = open_flags(access, flags)?;
         let entry = match self.open_with_controlling_terminal(
             user,
-            self.directory_entry(directory)?.as_ref(),
+            self.directory_anchor(directory)?,
             path,
             flags,
             mode & FileMode::SUPPORTED,
@@ -342,10 +342,10 @@ where
         user: FileUser,
         follow_symlinks: bool,
     ) -> ServiceResult<FileStatus> {
-        let mut status = match Resolver::file_status_at(
+        let mut status = match Resolver::file_status(
             self,
             user,
-            self.directory_entry(directory)?.as_ref(),
+            self.directory_anchor(directory)?,
             path,
             follow_symlinks,
         ) {
@@ -363,7 +363,7 @@ where
         user: FileUser,
     ) -> ServiceResult<String> {
         Ok(
-            Resolver::read_link_at(self, user, self.directory_entry(directory)?.as_ref(), path)
+            Resolver::read_link(self, user, self.directory_anchor(directory)?, path)
                 .map_err(file_walk_error),
         )
     }
@@ -375,10 +375,10 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> ServiceResult<()> {
-        Ok(Resolver::chmod_at(
+        Ok(Resolver::chmod(
             self,
             user,
-            self.directory_entry(directory)?.as_ref(),
+            self.directory_anchor(directory)?,
             path,
             mode & FileMode::SUPPORTED,
         )
@@ -393,10 +393,10 @@ where
         user: Option<u16>,
         group: Option<u16>,
     ) -> ServiceResult<()> {
-        Ok(Resolver::chown_at(
+        Ok(Resolver::chown(
             self,
             acting_user,
-            self.directory_entry(directory)?.as_ref(),
+            self.directory_anchor(directory)?,
             path,
             user,
             group,
@@ -406,7 +406,7 @@ where
 
     fn unlink(&self, directory: Option<&File>, path: &str, user: FileUser) -> ServiceResult<()> {
         Ok(
-            Resolver::unlink_at(self, user, self.directory_entry(directory)?.as_ref(), path)
+            Resolver::unlink(self, user, self.directory_anchor(directory)?, path)
                 .map_err(file_unlink_error),
         )
     }
@@ -419,12 +419,12 @@ where
         new_path: &str,
         user: FileUser,
     ) -> ServiceResult<()> {
-        Ok(Resolver::rename_at(
+        Ok(Resolver::rename(
             self,
             user,
-            self.directory_entry(old_directory)?.as_ref(),
+            self.directory_anchor(old_directory)?,
             old_path,
-            self.directory_entry(new_directory)?.as_ref(),
+            self.directory_anchor(new_directory)?,
             new_path,
         )
         .map_err(file_rename_error))
@@ -437,10 +437,10 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> ServiceResult<()> {
-        Ok(Resolver::mkdir_at(
+        Ok(Resolver::mkdir(
             self,
             user,
-            self.directory_entry(directory)?.as_ref(),
+            self.directory_anchor(directory)?,
             path,
             mode & FileMode::SUPPORTED,
         )
@@ -458,11 +458,11 @@ where
         linkpath: &str,
         user: FileUser,
     ) -> ServiceResult<()> {
-        Ok(Resolver::symlink_at(
+        Ok(Resolver::symlink(
             self,
             user,
             target,
-            self.directory_entry(directory)?.as_ref(),
+            self.directory_anchor(directory)?,
             linkpath,
         )
         .map_err(file_symlink_error))
@@ -470,7 +470,7 @@ where
 
     fn rmdir(&self, directory: Option<&File>, path: &str, user: FileUser) -> ServiceResult<()> {
         Ok(
-            Resolver::rmdir_at(self, user, self.directory_entry(directory)?.as_ref(), path)
+            Resolver::rmdir(self, user, self.directory_anchor(directory)?, path)
                 .map_err(file_rmdir_error),
         )
     }
@@ -1499,6 +1499,11 @@ mod tests {
         ] {
             assert_eq!(
                 path_status(&owner, dir, path, user, true),
+                Ok(Err(FileError::InvalidPathname))
+            );
+            // Each side of a rename is checked against its own directory.
+            assert_eq!(
+                rename(&owner, Some(anchor), "new", dir, path, user),
                 Ok(Err(FileError::InvalidPathname))
             );
         }

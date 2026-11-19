@@ -820,10 +820,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             _ => false,
         };
         let replace = |old: &mut DirData<Platform>, new: Option<&mut DirData<Platform>>| {
-            if old.detached_from.is_some()
-                || new.as_ref().is_some_and(|new| new.detached_from.is_some())
-            {
-                return Err(PathError::NoSuchFileOrDirectory.into());
+            old.ensure_linked()?;
+            if let Some(new) = &new {
+                new.ensure_linked()?;
             }
             let current = old
                 .children
@@ -1212,7 +1211,7 @@ mod tests {
             OFlags::CREAT | OFlags::WRONLY,
         ] {
             assert!(matches!(
-                fs.open(OWNER, "/a", flags, ALL),
+                fs.open(OWNER, None, "/a", flags, ALL),
                 Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
             ));
         }
@@ -1221,10 +1220,10 @@ mod tests {
         };
         assert_eq!(storage.static_bytes(), Some(b"preserve".as_slice()));
         let fd = fs
-            .open(OWNER, "/link", OFlags::RDONLY, Mode::empty())
+            .open(OWNER, None, "/link", OFlags::RDONLY, Mode::empty())
             .unwrap();
         assert_eq!(fd.path(), "/target");
-        assert_eq!(fs.read_link(OWNER, "/link").unwrap(), "/target");
+        assert_eq!(fs.read_link(OWNER, None, "/link").unwrap(), "/target");
     }
 
     #[test]
@@ -1275,24 +1274,25 @@ mod tests {
             OFlags::RDWR | OFlags::TRUNC,
         ] {
             assert!(matches!(
-                fs.open(other_user, "/mnt/a/b/file", flags, Mode::empty()),
+                fs.open(other_user, None, "/mnt/a/b/file", flags, Mode::empty()),
                 Err(OpenError::AccessNotAllowed)
             ));
             assert!(upper_root.read().children.is_empty());
         }
         assert!(matches!(
-            fs.chmod(other_user, "/mnt/a/b/file", ALL),
+            fs.chmod(other_user, None, "/mnt/a/b/file", ALL),
             Err(ChmodError::NotTheOwner)
         ));
         assert!(upper_root.read().children.is_empty());
         assert!(matches!(
-            fs.chown(other_user, "/mnt/a/b/file", Some(2000), None),
+            fs.chown(other_user, None, "/mnt/a/b/file", Some(2000), None),
             Err(ChownError::NotTheOwner)
         ));
         assert!(upper_root.read().children.is_empty());
         let fd = fs
             .open(
                 other_user,
+                None,
                 "/mnt/a/b/file",
                 OFlags::PATH | OFlags::WRONLY | OFlags::TRUNC,
                 Mode::empty(),
@@ -1302,7 +1302,13 @@ mod tests {
         drop(fd);
         assert!(upper_root.read().children.is_empty());
         let mut fd = fs
-            .open(other_user, "/mnt/a/b/file", OFlags::RDONLY, Mode::empty())
+            .open(
+                other_user,
+                None,
+                "/mnt/a/b/file",
+                OFlags::RDONLY,
+                Mode::empty(),
+            )
             .unwrap();
         let mut buf = [0; 32];
         let count = fs.read(&mut fd, &mut buf, None).unwrap();
@@ -1312,6 +1318,7 @@ mod tests {
         let fd = fs
             .open(
                 OWNER,
+                None,
                 "/mnt/a/b/file",
                 OFlags::WRONLY | OFlags::TRUNC,
                 Mode::empty(),
@@ -1344,19 +1351,21 @@ mod tests {
             InodeAllocators::new().next(),
         );
         let fs = Resolver::<TestPlatform, _>::new(backend);
-        let fd = fs.open(OWNER, "/", OFlags::RDONLY, Mode::empty()).unwrap();
-        drop(fd);
-        assert!(matches!(
-            fs.open(OWNER, "/absent", OFlags::PATH, Mode::empty()),
-            Err(OpenError::PathError(PathError::NoSearchPerms))
-        ));
-        fs.chmod(OWNER, "/", Mode::RUSR | Mode::XUSR).unwrap();
         let fd = fs
-            .open(OWNER, "/dir", OFlags::RDONLY, Mode::empty())
+            .open(OWNER, None, "/", OFlags::RDONLY, Mode::empty())
             .unwrap();
         drop(fd);
         assert!(matches!(
-            fs.open(OWNER, "/dir/absent", OFlags::PATH, Mode::empty()),
+            fs.open(OWNER, None, "/absent", OFlags::PATH, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSearchPerms))
+        ));
+        fs.chmod(OWNER, None, "/", Mode::RUSR | Mode::XUSR).unwrap();
+        let fd = fs
+            .open(OWNER, None, "/dir", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        drop(fd);
+        assert!(matches!(
+            fs.open(OWNER, None, "/dir/absent", OFlags::PATH, Mode::empty()),
             Err(OpenError::PathError(PathError::NoSearchPerms))
         ));
         let other_user = UserInfo {
@@ -1364,14 +1373,14 @@ mod tests {
             group: 2000,
         };
         assert!(matches!(
-            fs.open(other_user, "/", OFlags::RDONLY, Mode::empty()),
+            fs.open(other_user, None, "/", OFlags::RDONLY, Mode::empty()),
             Err(OpenError::AccessNotAllowed)
         ));
         let fd = fs
-            .open(other_user, "/", OFlags::PATH, Mode::empty())
+            .open(other_user, None, "/", OFlags::PATH, Mode::empty())
             .unwrap();
         drop(fd);
-        fs.file_status(other_user, "/", true).unwrap();
+        fs.file_status(other_user, None, "/", true).unwrap();
     }
 
     #[test]

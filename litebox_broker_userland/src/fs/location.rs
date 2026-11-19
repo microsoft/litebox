@@ -24,8 +24,7 @@ pub(super) struct Location {
 
 // Other Unix hosts retain a directory fd as an identity witness, not a path locator. They
 // reject stale names. Serialize the checks and operations with guest renames/removals across
-// *all* LocalFs instances, even when two exports overlap. External host namespace changes
-// must not race operations on these hosts.
+// *all* LocalFs instances, even when two exports overlap.
 #[cfg(all(unix, not(target_os = "linux")))]
 #[derive(Debug)]
 struct CheckedDir {
@@ -131,7 +130,16 @@ impl Location {
         super::validate_name(name).map_err(|_| super::invalid_path())?;
         let path = self.path.join(name);
         if fs::symlink_metadata(&path)?.is_dir() {
-            Self::root(&path)
+            // Pin the host's spelling of the name: case- or normalization-insensitive volumes
+            // accept other spellings, which the canonical-name check would treat as a move.
+            let canonical = fs::canonicalize(&path)?;
+            if canonical.parent() != Some(self.path.as_path()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "directory was moved or replaced",
+                ));
+            }
+            Self::root(&canonical)
         } else {
             Ok(Self {
                 path,

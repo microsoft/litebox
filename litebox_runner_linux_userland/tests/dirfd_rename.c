@@ -36,11 +36,40 @@ static void test_search_permission(const char *tmp) {
                 rmdir("perm") == 0, "cleanup perm tree");
 }
 
+// Creating through a held directory that holds the program, which LiteBox serves from its
+// read-only lower layer, must keep the directory's existing entries visible through the fd.
+static void test_program_directory(const char *program) {
+    char dir[4096];
+    const char *slash = strrchr(program, '/');
+    TEST_ASSERT(slash != NULL && (size_t)(slash - program) < sizeof(dir),
+                "program path names its directory");
+    memcpy(dir, program, (size_t)(slash - program));
+    dir[slash - program] = '\0';
+    int fd = open(dir[0] ? dir : "/", O_PATH | O_DIRECTORY);
+    TEST_ASSERT(fd >= 0, "open program directory");
+    char sub[64];
+    snprintf(sub, sizeof(sub), "lb-dirfd-lower-%d", (int)getpid());
+    if (mkdirat(fd, sub, 0700) != 0) {
+        // Only a program directory that belongs to another user may refuse the creation.
+        TEST_ASSERT(errno == EACCES, "create in program directory");
+        TEST_ASSERT(close(fd) == 0, "close program directory");
+        return;
+    }
+    struct stat st;
+    TEST_ASSERT(fstatat(fd, sub, &st, 0) == 0 && S_ISDIR(st.st_mode),
+                "creation is visible through the fd");
+    TEST_ASSERT(fstatat(fd, slash + 1, &st, 0) == 0 && S_ISREG(st.st_mode),
+                "existing entries stay visible after creation");
+    TEST_ASSERT(unlinkat(fd, sub, AT_REMOVEDIR) == 0 && close(fd) == 0,
+                "cleanup program directory");
+}
+
 // Usage: dirfd_rename [base-directory [no-symlinks]]. The working directory is created under
 // `base-directory` (default `/tmp`); `no-symlinks` skips the steps that create symlinks, for
 // filesystems that cannot create them.
 int main(int argc, char **argv) {
     const char *base = argc > 1 ? argv[1] : "/tmp";
+    test_program_directory(argv[0]);
     int symlinks = !(argc > 2 && strcmp(argv[2], "no-symlinks") == 0);
     char tmp[64];
     TEST_ASSERT(snprintf(tmp, sizeof(tmp), "%s/lb-dirfd-XXXXXX", base) < (int)sizeof(tmp),

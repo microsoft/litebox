@@ -683,8 +683,9 @@ impl<P: ShimPlatform> Task<P> {
 
     /// `openat`. Every guest's working directory is `/`, so `AT_FDCWD` and
     /// absolute paths open like `open`; other relative paths resolve against
-    /// the directory's open path (LiteBox filesystems cannot create links or
-    /// rename at run time, so that path keeps naming the directory).
+    /// the directory's open path, since this shim emulates namei on paths.
+    // XXX: a directory renamed after it was opened is therefore looked up
+    // under its old path; anchoring to the directory's handle would follow it.
     pub(crate) fn sys_openat(
         &self,
         dirfd: i32,
@@ -1618,6 +1619,13 @@ mod tests {
         assert_eq!(stat.mode, 0o040_755);
         assert_eq!(call(nr::LSTAT64, &[ptr(c"/dirlink/data"), stat_ptr]), Ok(0));
         assert_eq!(stat.mode, 0o100_644);
+        // Relative names resolve from the working directory, `/`.
+        assert_eq!(call(nr::STAT64, &[ptr(c"link"), stat_ptr]), Ok(0));
+        assert_eq!(stat.mode, 0o100_644);
+        assert_eq!(call(nr::LSTAT64, &[ptr(c"dirlink/data"), stat_ptr]), Ok(0));
+        assert_eq!(stat.mode, 0o100_644);
+        assert_eq!(call(nr::LSTAT64, &[ptr(c"link"), stat_ptr]), Ok(0));
+        assert_eq!(stat.mode, 0o120_777);
 
         // fsctl: a dangling final link fails the lookup only when followed.
         let fsctl = |path: &str, options: u32| task.sys_fsctl(path, 0x4008_4a6a, 0, options);
@@ -1705,6 +1713,7 @@ mod tests {
 
         // access follows the final link.
         assert_eq!(call(nr::ACCESS, &[ptr(c"/link"), 4]), Ok(0));
+        assert_eq!(call(nr::ACCESS, &[ptr(c"link"), 4]), Ok(0));
         assert_eq!(
             call(nr::ACCESS, &[ptr(c"/dangling"), 0]),
             Err(Errno::ENOENT)

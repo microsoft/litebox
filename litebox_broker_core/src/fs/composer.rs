@@ -352,9 +352,16 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
     }
 
     fn has_nested_mount(&self, mount: &Mount) -> bool {
-        self.initialized_mounts().any(|(_, other)| {
-            other.path.len() > mount.path.len() && other.path.starts_with(&mount.path)
-        })
+        self.nested_mounts(mount).next().is_some()
+    }
+
+    /// Mounts strictly below `mount`'s mount point.
+    fn nested_mounts<'a>(&'a self, mount: &'a Mount) -> impl Iterator<Item = &'a Mount> {
+        self.initialized_mounts()
+            .map(|(_, other)| other)
+            .filter(|other| {
+                other.path.len() > mount.path.len() && other.path.starts_with(&mount.path)
+            })
     }
 
     /// The route of a directory inside `mount` with the backend name `name` (see
@@ -849,10 +856,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 // A new mount may have been added that covers this path, which would make it inaccessible.
                 // E.g., A handle to /mnt/data/dir could become inaccessible after /mnt/data becomes a new
                 // mount point. For now, report no name rather than return the unreachable path.
-                if self.initialized_mounts().any(|(_, other)| {
-                    other.path.len() > mount.path.len() && path.starts_with(&other.path)
-                }) {
-                    return Err(PathError::NoSuchFileOrDirectory.into());
+                if self
+                    .nested_mounts(mount)
+                    .any(|other| path.starts_with(&other.path))
+                {
+                    return Ok(None);
                 }
                 Ok(Some(path))
             }
@@ -961,9 +969,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 handle,
             } => {
                 let mount = self.initialized_mount(mount_index);
+                // The route only places nested mount points; without it, use the recorded path.
                 let path = self
                     .current_route(mount, &handle)
-                    .map_err(|_| ReadDirError::Io)?
+                    .ok()
+                    .flatten()
                     .unwrap_or(path);
                 let entries = mount.backend.list_dir_at(handle)?;
                 Ok(self.merge_mount_children(entries, &path))

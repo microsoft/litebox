@@ -1541,6 +1541,37 @@ mod tests {
             Err(LinuxProgramStartupError::InvalidExecfn)
         );
 
+        // A zero cwd length announces a handle, so a path cwd must not be empty.
+        for cwd in ["", "relative"] {
+            let invalid_cwd = LinuxProgramStartup {
+                cwd: InheritedCwd::Path(cwd.into()),
+                ..startup.clone()
+            };
+            assert_eq!(
+                invalid_cwd.encode(),
+                Err(LinuxProgramStartupError::InvalidWorkingDirectory)
+            );
+        }
+        let empty_path = LinuxProgramStartup {
+            path: String::new(),
+            ..startup.clone()
+        };
+        assert_eq!(
+            empty_path.encode(),
+            Err(LinuxProgramStartupError::InvalidPath)
+        );
+        // The child resolves a relative program path from its inherited cwd.
+        let relative_path = LinuxProgramStartup {
+            path: "./child".into(),
+            ..startup.clone()
+        };
+        assert_eq!(
+            LinuxProgramStartup::decode(&relative_path.encode().unwrap())
+                .unwrap()
+                .path,
+            "./child"
+        );
+
         let mut invalid = startup.encode().unwrap();
         let first_argument = HEADER_SIZE
             + startup.path.len()

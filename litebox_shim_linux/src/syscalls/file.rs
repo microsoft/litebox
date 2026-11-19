@@ -307,8 +307,7 @@ impl From<FileUser> for AccessUserInfo {
 pub(crate) struct FsState<Platform: ShimPlatform> {
     umask: core::sync::atomic::AtomicU32,
     // Not a guest descriptor: closing the fd passed to fchdir must not drop the cwd.
-    // Until one is installed, the task is at the root (see `Task::pinned_cwd_dir`).
-    cwd: litebox::sync::RwLock<Platform, Option<Arc<litebox::fs::File<Platform>>>>,
+    cwd: litebox::sync::RwLock<Platform, Arc<litebox::fs::File<Platform>>>,
     // XXX: the context stores credentials, might need to reconsider design when implementing
     // `setuid` and similar.
     pub(crate) context: litebox::sync::RwLock<Platform, litebox::fs::Context>,
@@ -325,8 +324,21 @@ impl<Platform: ShimPlatform> Clone for FsState<Platform> {
 }
 
 impl<Platform: ShimPlatform> FsState<Platform> {
-    /// Create the state for a task running as `credentials`.
-    pub fn new(credentials: &super::process::Credentials) -> Self {
+    /// Create the state for a task acting through `context`, with `cwd` as its working
+    /// directory.
+    pub(crate) fn new(
+        context: litebox::fs::Context,
+        cwd: Arc<litebox::fs::File<Platform>>,
+    ) -> Self {
+        Self {
+            umask: u32::from((Mode::WGRP | Mode::WOTH).bits()).into(),
+            cwd: litebox::sync::RwLock::new(cwd),
+            context: litebox::sync::RwLock::new(context),
+        }
+    }
+
+    /// The filesystem context of a task running as `credentials`.
+    pub(crate) fn context_for(credentials: &super::process::Credentials) -> litebox::fs::Context {
         let user_info = FileUser {
             // XXX: Linux ids are 32-bit, but the core litebox file system uses 16-bit ones, so we
             // may need to widen `UserInfo`.
@@ -337,25 +349,15 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         };
         let mut context = litebox::fs::Context::new();
         context.set_acting_user(user_info);
-        Self {
-            umask: u32::from((Mode::WGRP | Mode::WOTH).bits()).into(),
-            cwd: litebox::sync::RwLock::new(None),
-            context: litebox::sync::RwLock::new(context),
-        }
+        context
     }
 
-    pub(super) fn cwd_handle(&self) -> Option<Arc<litebox::fs::File<Platform>>> {
-        self.cwd.read().clone()
+    pub(super) fn cwd_handle(&self) -> Arc<litebox::fs::File<Platform>> {
+        Arc::clone(&self.cwd.read())
     }
 
     pub(crate) fn set_cwd_handle(&self, dir: Arc<litebox::fs::File<Platform>>) {
-        *self.cwd.write() = Some(dir);
-    }
-
-    /// Installs `dir` as the working directory unless one is already held, returning the
-    /// working directory.
-    fn pin_cwd(&self, dir: Arc<litebox::fs::File<Platform>>) -> Arc<litebox::fs::File<Platform>> {
-        Arc::clone(self.cwd.write().get_or_insert(dir))
+        *self.cwd.write() = dir;
     }
 
     /// The file mode creation mask.
@@ -1048,20 +1050,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.fs.borrow().umask()
     }
 
-    /// The working directory. A task that was not started with one is at the root, which the first
-    /// call opens and pins as its working directory.
-    pub(super) fn pinned_cwd_dir(&self) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
-        let fs = self.fs.borrow();
-        if let Some(dir) = fs.cwd_handle() {
-            return Ok(dir);
-        }
-        let dir = self.global.open_path_dir(&fs.context.read(), "/")?;
-        Ok(fs.pin_cwd(Arc::new(dir)))
+    pub(super) fn pinned_cwd_dir(&self) -> Arc<litebox::fs::File<Platform>> {
+        self.fs.borrow().cwd_handle()
     }
 
     /// Queries the broker for the working directory's current name.
     fn query_cwd_name(&self) -> Result<String, Errno> {
-        Ok(self.pinned_cwd_dir()?.path()?)
+        Ok(self.pinned_cwd_dir().path()?)
     }
 
     /// The file a dirfd refers to, which need not be a directory.
@@ -1071,7 +1066,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn lookup_relative(&self, fd: i32, path: String) -> Result<LookupPath<Platform>, Errno> {
         let dir = if fd == litebox_common_linux::AT_FDCWD {
-            self.pinned_cwd_dir()?
+            self.pinned_cwd_dir()
         } else {
             self.file_for_dirfd(fd)?
         };
@@ -1123,7 +1118,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Splits a path operand into the directory it is relative to (if any) and the path, without
-    /// any I/O beyond pinning the working directory (see [`Self::pinned_cwd_dir`]).
+    /// any I/O.
     ///
     /// Note that an empty path is not valid for this function, and will be rejected with `ENOENT`.
     fn lookup_path_at(&self, dirfd: i32, pathname: &str) -> Result<LookupPath<Platform>, Errno> {
@@ -1415,7 +1410,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             FsPath::Absolute { path } => LookupPath { dir: None, path },
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 let user = self.fs.borrow().context.read().acting_user();
-                return Ok(self.pinned_cwd_dir()?.set_times(user, &times)?);
+                return Ok(self.pinned_cwd_dir().set_times(user, &times)?);
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 return self.set_fd_times(fd, &times);
@@ -2481,7 +2476,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match fs_path {
             FsPath::Absolute { path } => self.do_access(None, &path, mode, caller, follow_symlink),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let status = self.pinned_cwd_dir()?.status()?;
+                let status = self.pinned_cwd_dir().status()?;
                 Self::do_access_mode(status.mode, status.owner.into(), caller, &mode)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
@@ -2729,7 +2724,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match fs_path {
             FsPath::Absolute { path } => self.do_path_stat(None, &path, follow_symlink),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                T::try_from(self.pinned_cwd_dir()?.status()?)
+                T::try_from(self.pinned_cwd_dir().status()?)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 self.with_typed_fd(fd, |fd| self.do_stat(fd))
