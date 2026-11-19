@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#include "helpers.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -13,8 +15,6 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
-
-#define SENDFILE_DST_PATH "/tmp/lb_eventfd_sendfile_dst"
 
 static ssize_t sys_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
     return (ssize_t)syscall(SYS_sendfile, out_fd, in_fd, offset, count);
@@ -243,7 +243,8 @@ static int test_sendfile_in_fd(void) {
     if (fd < 0) {
         return 1;
     }
-    int dst = open(SENDFILE_DST_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char *dst_path = test_path("lb_eventfd_sendfile_dst");
+    int dst = open(dst_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (dst < 0) {
         return 2;
     }
@@ -262,7 +263,7 @@ static int test_sendfile_in_fd(void) {
     if (expect_close(dst) != 0) {
         return 5;
     }
-    unlink(SENDFILE_DST_PATH);
+    unlink(dst_path);
     return expect_close(fd) == 0 ? 0 : 6;
 }
 

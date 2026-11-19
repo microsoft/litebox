@@ -5,6 +5,7 @@
 // file descriptions, offsets and status flags, with the parent's.
 
 #define _GNU_SOURCE
+#include "helpers.h"
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,7 +13,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define LOG_PATH "/tmp/vfork_fd_log"
 #define STDIN_ALIAS 40
 
 int main(int argc, char **argv) {
@@ -21,8 +21,9 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    int log = open(LOG_PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    int hidden = open(LOG_PATH, O_RDONLY | O_CLOEXEC);
+    char *log_path = test_path("vfork_fd_log");
+    int log = open(log_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    int hidden = open(log_path, O_RDONLY | O_CLOEXEC);
     fflush(stdout);
     int saved_stdout = fcntl(1, F_DUPFD_CLOEXEC, 0);
     if (log < 0 || hidden < 0 || saved_stdout < 0 || dup2(log, 1) != 1 ||

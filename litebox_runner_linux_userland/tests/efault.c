@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#include "helpers.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -24,7 +26,7 @@ static void expect_efault(ssize_t r, const char *operation) {
 int main() {
     expect_efault(write(STDOUT_FILENO, INVALID, 1), "write to stdout");
 
-    const char *path = "/tmp/test_efault.bin";
+    const char *path = test_path("test_efault.bin");
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) {
         perror("open");

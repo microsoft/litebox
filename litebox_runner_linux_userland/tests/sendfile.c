@@ -6,8 +6,8 @@
 
 #include <fcntl.h>
 
-#define SRC_PATH "/tmp/lb_sendfile_src"
-#define DST_PATH "/tmp/lb_sendfile_dst"
+#define SRC_NAME "lb_sendfile_src"
+#define DST_NAME "lb_sendfile_dst"
 
 // Raw syscall — the shim intercepts SYS_sendfile.
 static ssize_t sys_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
@@ -15,16 +15,16 @@ static ssize_t sys_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) 
 }
 
 static int make_src_with_data(const char *data, size_t len) {
-    int fd = open(SRC_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) die("open SRC_PATH");
+    int fd = open(test_path(SRC_NAME), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) die("open source");
     if (write(fd, data, len) != (ssize_t)len) die("write src");
     if (lseek(fd, 0, SEEK_SET) < 0) die("lseek src");
     return fd;
 }
 
 static int make_dst_empty(void) {
-    int fd = open(DST_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) die("open DST_PATH");
+    int fd = open(test_path(DST_NAME), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) die("open destination");
     return fd;
 }
 
@@ -379,8 +379,8 @@ int main(void) {
     test_unix_stream_in_fd();
     test_unix_dgram_in_fd();
 
-    unlink(SRC_PATH);
-    unlink(DST_PATH);
+    unlink(test_path(SRC_NAME));
+    unlink(test_path(DST_NAME));
 
     printf("All sendfile tests passed.\n");
     return 0;

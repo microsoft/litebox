@@ -39,6 +39,20 @@ static inline long itimer_value_us(const struct itimerval *iv) {
     return (long)iv->it_value.tv_sec * 1000000L + (long)iv->it_value.tv_usec;
 }
 
+// The directory for a test's files: `TMPDIR`, which native runs set to a directory of their own so
+// as not to share the host's /tmp, or else /tmp, as in LiteBox.
+static inline const char *test_dir(void) {
+    const char *directory = getenv("TMPDIR");
+    return directory != NULL && directory[0] != 0 ? directory : "/tmp";
+}
+
+// Returns `name` in `test_dir()`, in a new, writable buffer, which may be a `mkstemp` template.
+static inline char *test_path(const char *name) {
+    char *path = NULL;
+    TEST_ASSERT(asprintf(&path, "%s/%s", test_dir(), name) >= 0, "asprintf failed");
+    return path;
+}
+
 static inline void die(const char *msg) {
     perror(msg);
     exit(1);

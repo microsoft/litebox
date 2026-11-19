@@ -5,7 +5,7 @@
 #include <sys/vfs.h>
 
 int main(void) {
-    char path[] = "/tmp/lb_statfs_XXXXXX";
+    char *path = test_path("lb_statfs_XXXXXX");
     struct statfs st;
 
     TEST_ASSERT(mkdtemp(path) != NULL, "mkdtemp failed");
@@ -19,7 +19,7 @@ int main(void) {
     TEST_ASSERT(close(fd) == 0, "close failed");
 
     errno = 0;
-    TEST_ASSERT(statfs("/tmp/lb_statfs_missing", &st) == -1 && errno == ENOENT,
+    TEST_ASSERT(statfs(test_path("lb_statfs_missing"), &st) == -1 && errno == ENOENT,
                 "statfs missing path should fail with ENOENT");
     errno = 0;
     TEST_ASSERT(fstatfs(fd, &st) == -1 && errno == EBADF,

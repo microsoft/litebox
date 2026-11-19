@@ -25,7 +25,7 @@ static void expect_faccessat2_errno(int dirfd, const char *pathname, int mode, i
 }
 
 static void test_at_fdcwd_success(void) {
-    const char *path = "/tmp/lb_faccessat2_success";
+    const char *path = test_path("lb_faccessat2_success");
     unlink(path);
     create_test_file(path, 0600);
 
@@ -41,7 +41,7 @@ static void test_at_fdcwd_success(void) {
 }
 
 static void test_accepted_flags_regular_file(void) {
-    const char *path = "/tmp/lb_faccessat2_flags";
+    const char *path = test_path("lb_faccessat2_flags");
     unlink(path);
     create_test_file(path, 0600);
 
@@ -57,8 +57,8 @@ static void test_accepted_flags_regular_file(void) {
 }
 
 static void test_owner_bits_take_precedence(void) {
-    const char *other_read_path = "/tmp/lb_faccessat2_other_read";
-    const char *owner_read_path = "/tmp/lb_faccessat2_owner_read";
+    const char *other_read_path = test_path("lb_faccessat2_other_read");
+    const char *owner_read_path = test_path("lb_faccessat2_owner_read");
     unlink(other_read_path);
     unlink(owner_read_path);
     create_test_file(other_read_path, 0004);
@@ -76,7 +76,7 @@ static void test_owner_bits_take_precedence(void) {
 }
 
 static void test_empty_path_success(void) {
-    const char *path = "/tmp/lb_faccessat2_empty_path";
+    const char *path = test_path("lb_faccessat2_empty_path");
     unlink(path);
     create_test_file(path, 0400);
 
@@ -96,7 +96,7 @@ static void test_empty_path_success(void) {
 }
 
 static void test_missing_path_enoent(void) {
-    const char *path = "/tmp/lb_faccessat2_missing";
+    const char *path = test_path("lb_faccessat2_missing");
     unlink(path);
 
     expect_faccessat2_errno(AT_FDCWD, path, F_OK, 0, ENOENT,
@@ -104,7 +104,7 @@ static void test_missing_path_enoent(void) {
 }
 
 static void test_mode_permission_denied(void) {
-    const char *path = "/tmp/lb_faccessat2_readonly";
+    const char *path = test_path("lb_faccessat2_readonly");
     unlink(path);
     create_test_file(path, 0400);
 
@@ -120,7 +120,7 @@ static void test_mode_permission_denied(void) {
 }
 
 static void test_invalid_mode_einval(void) {
-    const char *path = "/tmp/lb_faccessat2_invalid_mode";
+    const char *path = test_path("lb_faccessat2_invalid_mode");
     unlink(path);
     create_test_file(path, 0600);
 
@@ -131,7 +131,7 @@ static void test_invalid_mode_einval(void) {
 }
 
 static void test_invalid_flags_einval(void) {
-    const char *path = "/tmp/lb_faccessat2_invalid_flags";
+    const char *path = test_path("lb_faccessat2_invalid_flags");
     unlink(path);
     create_test_file(path, 0600);
 

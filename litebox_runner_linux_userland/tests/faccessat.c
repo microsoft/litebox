@@ -20,7 +20,7 @@ static void expect_faccessat_errno(int dirfd, const char *pathname, int mode,
 }
 
 static void test_at_fdcwd_success(void) {
-    const char *path = "/tmp/lb_faccessat_success";
+    const char *path = test_path("lb_faccessat_success");
     unlink(path);
     create_test_file(path, 0600);
 
@@ -35,7 +35,7 @@ static void test_at_fdcwd_success(void) {
 }
 
 static void test_missing_path_enoent(void) {
-    const char *path = "/tmp/lb_faccessat_missing";
+    const char *path = test_path("lb_faccessat_missing");
     unlink(path);
 
     expect_faccessat_errno(AT_FDCWD, path, F_OK, ENOENT,
@@ -43,7 +43,7 @@ static void test_missing_path_enoent(void) {
 }
 
 static void test_mode_permission_denied(void) {
-    const char *path = "/tmp/lb_faccessat_readonly";
+    const char *path = test_path("lb_faccessat_readonly");
     unlink(path);
     create_test_file(path, 0400);
 
@@ -59,7 +59,7 @@ static void test_mode_permission_denied(void) {
 }
 
 static void test_invalid_mode_einval(void) {
-    const char *path = "/tmp/lb_faccessat_invalid_mode";
+    const char *path = test_path("lb_faccessat_invalid_mode");
     unlink(path);
     create_test_file(path, 0600);
 

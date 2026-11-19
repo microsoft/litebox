@@ -28,7 +28,7 @@ static int open_alphabet_file(const char *path) {
 }
 
 static void test_happy_path(void) {
-    const char *path = "/tmp/test_preadv_happy.bin";
+    const char *path = test_path("test_preadv_happy.bin");
     int fd = open_alphabet_file(path);
 
     char buf1[5];
@@ -64,7 +64,7 @@ static void test_happy_path(void) {
 }
 
 static void test_short_read_at_eof(void) {
-    const char *path = "/tmp/test_preadv_eof.bin";
+    const char *path = test_path("test_preadv_eof.bin");
     int fd = open_alphabet_file(path);
 
     char buf1[10];
@@ -94,7 +94,7 @@ static void test_short_read_at_eof(void) {
 }
 
 static void test_zero_iovcnt(void) {
-    const char *path = "/tmp/test_preadv_zero.bin";
+    const char *path = test_path("test_preadv_zero.bin");
     int fd = open_alphabet_file(path);
 
     struct iovec iov[1] = {{.iov_base = NULL, .iov_len = 0}};
@@ -114,10 +114,11 @@ static void test_bad_fd(void) {
     TEST_ASSERT(n == -1 && errno == EBADF, "preadv on fd -1 should fail with EBADF");
 
     // Open then close to get a known-invalid fd value.
-    int fd = open("/tmp/test_preadv_bad.bin", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    const char *path = test_path("test_preadv_bad.bin");
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     TEST_ASSERT(fd >= 0, "open for closed-fd test failed");
     close(fd);
-    unlink("/tmp/test_preadv_bad.bin");
+    unlink(path);
 
     errno = 0;
     n = raw_preadv(fd, iov, 1, 0);
@@ -126,7 +127,7 @@ static void test_bad_fd(void) {
 }
 
 static void test_negative_offset(void) {
-    const char *path = "/tmp/test_preadv_negoff.bin";
+    const char *path = test_path("test_preadv_negoff.bin");
     int fd = open_alphabet_file(path);
 
     char buf[4];

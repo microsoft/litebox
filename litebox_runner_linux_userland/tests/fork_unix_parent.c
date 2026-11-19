@@ -4,6 +4,7 @@
 // Checks that forked and exec'd children share Unix domain sockets with their parent.
 
 #define _GNU_SOURCE
+#include "helpers.h"
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
@@ -15,7 +16,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define SOCKET_PATH "/tmp/fork_unix_parent.sock"
 // Bounds every wait, so a failure cannot hang the test.
 #define TIMEOUT_MS 30000
 
@@ -137,9 +137,11 @@ static int datagram_pair(void) {
 // A forked child connects to its parent's listener by path, then accepts the parent's connection
 // on the listener it inherited.
 static int path_listener(void) {
+    char *path = test_path("fork_unix_parent.sock");
     struct sockaddr_un address = {.sun_family = AF_UNIX};
-    strncpy(address.sun_path, SOCKET_PATH, sizeof address.sun_path - 1);
-    unlink(SOCKET_PATH);
+    TEST_ASSERT(strlen(path) < sizeof address.sun_path, "socket path too long");
+    snprintf(address.sun_path, sizeof address.sun_path, "%s", path);
+    unlink(path);
     int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (listener < 0 || bind(listener, (struct sockaddr *)&address, sizeof address) != 0 ||
         listen(listener, 4) != 0) {
@@ -151,7 +153,7 @@ static int path_listener(void) {
         struct sockaddr_un name = {0};
         socklen_t length = sizeof name;
         ok &= getsockname(listener, (struct sockaddr *)&name, &length) == 0 &&
-              strcmp(name.sun_path, SOCKET_PATH) == 0;
+              strcmp(name.sun_path, path) == 0;
         int client = socket(AF_UNIX, SOCK_STREAM, 0);
         ok &= client >= 0 && connect(client, (struct sockaddr *)&address, sizeof address) == 0;
         ok &= send_all(client, "hello") && expect(client, "world");
@@ -161,7 +163,7 @@ static int path_listener(void) {
     }
     if (child < 0) {
         close(listener);
-        unlink(SOCKET_PATH);
+        unlink(path);
         return 1;
     }
     int accepted = accept_within(listener);
@@ -173,7 +175,7 @@ static int path_listener(void) {
     close(client);
     close(accepted);
     close(listener);
-    unlink(SOCKET_PATH);
+    unlink(path);
     return failures;
 }
 

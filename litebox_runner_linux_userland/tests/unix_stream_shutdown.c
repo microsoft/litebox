@@ -17,7 +17,9 @@ static int make_listen_socket(struct sockaddr_un *sa, const char *name) {
     }
     memset(sa, 0, sizeof(*sa));
     sa->sun_family = AF_UNIX;
-    snprintf(sa->sun_path, sizeof(sa->sun_path), "/tmp/lb_shut_%s_%d", name, getpid());
+    int length = snprintf(sa->sun_path, sizeof(sa->sun_path), "%s/lb_shut_%s_%d", test_dir(), name,
+                          getpid());
+    TEST_ASSERT(length >= 0 && (size_t)length < sizeof(sa->sun_path), "socket path too long");
     unlink(sa->sun_path);
     if (bind(fd, (struct sockaddr *)sa, sizeof(*sa)) != 0) {
         die("bind(listen)");

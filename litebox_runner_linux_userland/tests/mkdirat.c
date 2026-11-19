@@ -46,12 +46,12 @@ static void create_regular_file(const char *path) {
 
 static void test_at_fdcwd_relative_success(void) {
     const char *name = "lb_mkdirat_relative";
-    const char *path = "/tmp/lb_mkdirat_relative";
+    const char *path = test_path("lb_mkdirat_relative");
     char old_cwd[4096];
 
     rmdir(path);
     TEST_ASSERT(getcwd(old_cwd, sizeof(old_cwd)) != NULL, "getcwd failed");
-    TEST_ASSERT(chdir("/tmp") == 0, "chdir /tmp failed");
+    TEST_ASSERT(chdir(test_dir()) == 0, "chdir test directory failed");
 
     expect_mkdirat_success(AT_FDCWD, name, 0777,
                            "mkdirat AT_FDCWD relative should succeed");
@@ -63,7 +63,7 @@ static void test_at_fdcwd_relative_success(void) {
 }
 
 static void test_absolute_path_ignores_dirfd(void) {
-    const char *path = "/tmp/lb_mkdirat_absolute";
+    const char *path = test_path("lb_mkdirat_absolute");
 
     rmdir(path);
     expect_mkdirat_success(-2, path, 0700,
@@ -74,7 +74,7 @@ static void test_absolute_path_ignores_dirfd(void) {
 }
 
 static void test_existing_path_eexist(void) {
-    const char *path = "/tmp/lb_mkdirat_existing";
+    const char *path = test_path("lb_mkdirat_existing");
 
     rmdir(path);
     TEST_ASSERT(mkdir(path, 0700) == 0, "setup existing directory failed");
@@ -84,8 +84,8 @@ static void test_existing_path_eexist(void) {
 }
 
 static void test_missing_parent_enoent(void) {
-    const char *parent = "/tmp/lb_mkdirat_missing_parent";
-    const char *path = "/tmp/lb_mkdirat_missing_parent/child";
+    const char *parent = test_path("lb_mkdirat_missing_parent");
+    const char *path = test_path("lb_mkdirat_missing_parent/child");
 
     rmdir(path);
     rmdir(parent);
@@ -94,8 +94,8 @@ static void test_missing_parent_enoent(void) {
 }
 
 static void test_component_not_directory_enotdir(void) {
-    const char *file = "/tmp/lb_mkdirat_file";
-    const char *path = "/tmp/lb_mkdirat_file/child";
+    const char *file = test_path("lb_mkdirat_file");
+    const char *path = test_path("lb_mkdirat_file/child");
 
     unlink(file);
     create_regular_file(file);

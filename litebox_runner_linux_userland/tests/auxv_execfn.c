@@ -13,7 +13,6 @@
 #include <sys/auxv.h>
 
 #define CHECK_ARGUMENT "--check-execfn"
-#define SCRIPT "tmp/auxv_execfn_script"
 
 static void check_execfn(const char *expected) {
     const char *execfn = (const char *)getauxval(AT_EXECFN);
@@ -52,17 +51,19 @@ int main(int argc, char *argv[]) {
     // Relative filenames, resolved against the root.
     TEST_ASSERT(chdir("/") == 0, "chdir failed");
     char *self = argv[0] + 1;
-    FILE *script = fopen(SCRIPT, "w");
+    TEST_ASSERT(test_dir()[0] == '/', "expected an absolute test directory");
+    char *script_path = test_path("auxv_execfn_script") + 1;
+    FILE *script = fopen(script_path, "w");
     TEST_ASSERT(script != NULL, "creating the script failed");
     // Linux runs the interpreter with argv: interpreter, argument, script filename.
     fprintf(script, "#!%s %s\n", argv[0], CHECK_ARGUMENT);
     TEST_ASSERT(fclose(script) == 0, "writing the script failed");
-    TEST_ASSERT(chmod(SCRIPT, 0755) == 0, "chmod failed");
+    TEST_ASSERT(chmod(script_path, 0755) == 0, "chmod failed");
 
     vfork_exec(self, (char *[]){self, CHECK_ARGUMENT, self, NULL});
-    vfork_exec(SCRIPT, (char *[]){SCRIPT, NULL});
+    vfork_exec(script_path, (char *[]){script_path, NULL});
 
     // Replace this process, which exits with the script's check.
-    execv(SCRIPT, (char *[]){SCRIPT, NULL});
+    execv(script_path, (char *[]){script_path, NULL});
     TEST_ASSERT(0, "execv failed");
 }

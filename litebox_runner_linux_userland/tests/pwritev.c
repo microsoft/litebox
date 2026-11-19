@@ -22,7 +22,7 @@ static int open_blank_file(const char *path) {
 }
 
 static void test_happy_path(void) {
-    const char *path = "/tmp/test_pwritev_happy.bin";
+    const char *path = test_path("test_pwritev_happy.bin");
     int fd = open_blank_file(path);
 
     char a[5] = "ABCDE";
@@ -68,7 +68,7 @@ static void test_happy_path(void) {
 }
 
 static void test_extends_file(void) {
-    const char *path = "/tmp/test_pwritev_extend.bin";
+    const char *path = test_path("test_pwritev_extend.bin");
     int fd = open_blank_file(path);
 
     char buf[4] = "WXYZ";
@@ -90,7 +90,7 @@ static void test_extends_file(void) {
 }
 
 static void test_zero_iovcnt(void) {
-    const char *path = "/tmp/test_pwritev_zero.bin";
+    const char *path = test_path("test_pwritev_zero.bin");
     int fd = open_blank_file(path);
 
     struct iovec iov[1] = {{.iov_base = NULL, .iov_len = 0}};
@@ -112,10 +112,11 @@ static void test_bad_fd(void) {
     ssize_t n = raw_pwritev(-1, iov, 1, 0);
     TEST_ASSERT(n == -1 && errno == EBADF, "pwritev on fd -1 should fail with EBADF");
 
-    int fd = open("/tmp/test_pwritev_bad.bin", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    const char *path = test_path("test_pwritev_bad.bin");
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     TEST_ASSERT(fd >= 0, "open for closed-fd test failed");
     close(fd);
-    unlink("/tmp/test_pwritev_bad.bin");
+    unlink(path);
 
     errno = 0;
     n = raw_pwritev(fd, iov, 1, 0);
@@ -124,7 +125,7 @@ static void test_bad_fd(void) {
 }
 
 static void test_negative_offset(void) {
-    const char *path = "/tmp/test_pwritev_negoff.bin";
+    const char *path = test_path("test_pwritev_negoff.bin");
     int fd = open_blank_file(path);
 
     char buf[4] = "data";
@@ -156,7 +157,7 @@ static void test_socket_espipe(void) {
 }
 
 static void test_readonly_fd(void) {
-    const char *path = "/tmp/test_pwritev_ro.bin";
+    const char *path = test_path("test_pwritev_ro.bin");
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     TEST_ASSERT(fd >= 0, "open rw for setup failed");
     TEST_ASSERT(write(fd, "x", 1) == 1, "setup write failed");

@@ -12,7 +12,9 @@ static void make_dgram_pair(int sv[2]) {
 static void make_addr(struct sockaddr_un *addr, const char *name) {
     memset(addr, 0, sizeof(*addr));
     addr->sun_family = AF_UNIX;
-    snprintf(addr->sun_path, sizeof(addr->sun_path), "/tmp/lb_dgram_%s_%d", name, getpid());
+    int length = snprintf(addr->sun_path, sizeof(addr->sun_path), "%s/lb_dgram_%s_%d", test_dir(),
+                          name, getpid());
+    TEST_ASSERT(length >= 0 && (size_t)length < sizeof(addr->sun_path), "socket path too long");
     unlink(addr->sun_path);
 }
 

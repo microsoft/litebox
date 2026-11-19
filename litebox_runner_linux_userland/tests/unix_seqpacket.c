@@ -226,11 +226,13 @@ static void test_wrong_type_connect(void) {
     close(seqpacket);
     close(stream_listener);
 
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/lb_seqpacket_%d", getpid());
-    unlink(path);
     struct sockaddr_un path_address = {.sun_family = AF_UNIX};
-    strncpy(path_address.sun_path, path, sizeof(path_address.sun_path) - 1);
+    int path_length = snprintf(path_address.sun_path, sizeof(path_address.sun_path),
+                               "%s/lb_seqpacket_%d", test_dir(), getpid());
+    TEST_ASSERT(path_length >= 0 && (size_t)path_length < sizeof(path_address.sun_path),
+                "socket path too long");
+    const char *path = path_address.sun_path;
+    unlink(path);
     int path_listener = listen_on(SOCK_STREAM, &path_address, sizeof(path_address));
     seqpacket = socket(AF_UNIX, SOCK_SEQPACKET, 0);
     TEST_ASSERT(seqpacket >= 0, "socket(seqpacket)");

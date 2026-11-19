@@ -10,7 +10,6 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -103,9 +102,7 @@ static void child_checks(const char *path, int inherited, int request, int reply
 }
 
 int main(void) {
-    const char *directory = getenv("TMPDIR");
-    char path[256];
-    snprintf(path, sizeof path, "%s/fork_flock_lock", directory == NULL ? "/tmp" : directory);
+    const char *path = test_path("fork_flock_lock");
     set_handler(SIGALRM, on_timeout, 0);
     alarm(30);
     int created = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);

@@ -18,8 +18,7 @@ static void expect_times(const char *path, int nofollow,
 }
 
 int main(int argc, char **argv) {
-    char temporary[] = "/tmp/lb_utimensat_XXXXXX";
-    const char *directory = argc > 1 ? argv[1] : mkdtemp(temporary);
+    const char *directory = argc > 1 ? argv[1] : mkdtemp(test_path("lb_utimensat_XXXXXX"));
     // Only a host-backed directory has a clock; in-memory files ignore NOW.
     int now_updates = argc > 1;
     TEST_ASSERT(directory != NULL && chdir(directory) == 0, "enter test directory");

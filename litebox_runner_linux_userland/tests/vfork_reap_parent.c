@@ -6,6 +6,7 @@
 // `execve` clears `SA_NOCLDWAIT`.
 
 #define _GNU_SOURCE
+#include "helpers.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -134,24 +135,26 @@ int main(int argc, char **argv) {
     failures += !reaped;
 
     // A live child follows a later disposition change.
+    char *ignored_gate = test_path("vfork_reap_ignored");
+    char *restored_gate = test_path("vfork_reap_restored");
     set_sigchld(SIG_DFL, 0);
-    spawn_gated("/tmp/vfork_reap_ignored");
+    spawn_gated(ignored_gate);
     set_sigchld(SIG_IGN, 0);
-    open_gate("/tmp/vfork_reap_ignored");
+    open_gate(ignored_gate);
     reaped = echild(-1);
     printf("live-ignored echild=%d\n", reaped);
     failures += !reaped;
 
-    pid_t restored = spawn_gated("/tmp/vfork_reap_restored");
+    pid_t restored = spawn_gated(restored_gate);
     set_sigchld(SIG_DFL, 0);
-    open_gate("/tmp/vfork_reap_restored");
+    open_gate(restored_gate);
     status = 0;
     waited = waitpid(restored, &status, 0);
     printf("live-restored child=%d waited=%d exited=%d code=%d\n", restored, waited,
            WIFEXITED(status), WEXITSTATUS(status));
     failures += waited != restored || !WIFEXITED(status) || WEXITSTATUS(status) != 42;
-    unlink("/tmp/vfork_reap_ignored");
-    unlink("/tmp/vfork_reap_restored");
+    unlink(ignored_gate);
+    unlink(restored_gate);
 
     // A program started while SIGCHLD is ignored keeps reaping its children.
     set_sigchld(SIG_IGN, 0);
