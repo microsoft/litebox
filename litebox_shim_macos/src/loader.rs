@@ -17,6 +17,7 @@ use litebox_common_linux::PtRegs;
 use litebox_common_macos::{
     OpenFlags, PAGE_SIZE, VmProtection,
     loader::{MAX_IMAGE_SIZE, MachoParsedFile, TrampolineInfo, arm64_slice},
+    shared_cache::CacheDependency,
 };
 use litebox_syscall_rewriter::macho::{
     CodeMetadata, Rewriter, hook_syscalls_in_macho_with_options,
@@ -198,6 +199,7 @@ struct MappedImage {
     header: usize,
 }
 
+/// Load the executable and optional `dyld`; return the startup registers and dependencies.
 pub(super) fn load<P: ShimPlatform>(
     task: &Task<P>,
     path: &str,
@@ -206,7 +208,7 @@ pub(super) fn load<P: ShimPlatform>(
     random_source: bool,
     argv: &[CString],
     envp: &[CString],
-) -> Result<PtRegs, MachoLoaderError> {
+) -> Result<(PtRegs, Vec<CacheDependency>), MachoLoaderError> {
     let owned_image;
     let data = if let Some(image) = image {
         image
@@ -287,9 +289,12 @@ pub(super) fn load<P: ShimPlatform>(
         &apple,
         dyld.as_ref().map(|_| main.header),
     )?;
-    Ok(PtRegs {
-        pc: dyld.as_ref().map_or(main.entry, |dyld| dyld.entry),
-        sp,
-        ..PtRegs::default()
-    })
+    Ok((
+        PtRegs {
+            pc: dyld.as_ref().map_or(main.entry, |dyld| dyld.entry),
+            sp,
+            ..PtRegs::default()
+        },
+        image.plan.dependencies,
+    ))
 }

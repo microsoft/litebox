@@ -22,6 +22,10 @@ use litebox::platform::{ArchSpecificError, ArchSpecificRegister, RawConstPointer
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{GuestVectorState, PtRegs};
+#[cfg(feature = "shared_cache")]
+use litebox_common_macos::shared_cache::{
+    HostCache, HostCachePage, HostSharedCache, HostSharedCacheError,
+};
 use litebox_common_macos::{KernReturn, MachClock, syscall::MachTimebaseInfo};
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
@@ -73,6 +77,8 @@ pub type MacosUserland = MacosUserlandWithPageSize<HOST_PAGE_SIZE>;
 #[cfg(feature = "subpage_compat")]
 pub type MacosUserland4K = MacosUserlandWithPageSize<4096>;
 mod native;
+#[cfg(feature = "shared_cache")]
+mod shared_cache;
 #[cfg(feature = "subpage_compat")]
 mod subpage;
 /// The macOS host's Mach-O `__PAGEZERO` reserves the first 4 GiB.
@@ -85,6 +91,8 @@ pub const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000;
 pub struct MacosUserlandWithPageSize<const PAGE_SIZE: usize> {
     pages: Mutex<PageTable>,
     host_cpu_features: CpuFeatures,
+    #[cfg(feature = "shared_cache")]
+    host_shared_cache: OnceLock<Result<shared_cache::OpenedCache, HostSharedCacheError>>,
 }
 
 /// Page-management backend, chosen once from the guest page size.
@@ -188,11 +196,99 @@ impl<const PAGE_SIZE: usize> MacosUserlandWithPageSize<PAGE_SIZE> {
         Box::leak(Box::new(Self {
             pages: Mutex::new(pages),
             host_cpu_features: detect_host_cpu_features(),
+            #[cfg(feature = "shared_cache")]
+            host_shared_cache: OnceLock::new(),
         }))
     }
 }
 
 impl<const PAGE_SIZE: usize> litebox::platform::Provider for MacosUserlandWithPageSize<PAGE_SIZE> {}
+
+#[cfg(feature = "shared_cache")]
+impl<const PAGE_SIZE: usize> MacosUserlandWithPageSize<PAGE_SIZE> {
+    fn opened_shared_cache(&self) -> Result<&shared_cache::OpenedCache, HostSharedCacheError> {
+        self.host_shared_cache
+            .get_or_init(shared_cache::OpenedCache::open)
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// Replace the owned pages of `range` with a private view of `file` at `offset`; see
+    /// [`HostSharedCache::map_host_cache_range`].
+    ///
+    /// # Safety
+    ///
+    /// Nothing may access the pages of `range` during the call.
+    unsafe fn map_file_view(
+        &self,
+        range: Range<usize>,
+        file: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), PermissionUpdateError> {
+        if range.is_empty()
+            || !range.start.is_multiple_of(HOST_PAGE_SIZE)
+            || !range.end.is_multiple_of(HOST_PAGE_SIZE)
+            || !offset.is_multiple_of(HOST_PAGE_SIZE as u64)
+        {
+            return Err(PermissionUpdateError::Unaligned);
+        }
+        match &mut *self.pages.lock().unwrap() {
+            PageTable::Native(pages) => pages.map_file(&range, file, offset, permissions),
+            // A 4 KiB guest page cannot own a host page of the view.
+            #[cfg(feature = "subpage_compat")]
+            PageTable::Subpage(_) => Err(PermissionUpdateError::PermissionDenied),
+        }
+    }
+}
+
+#[cfg(feature = "shared_cache")]
+impl<const PAGE_SIZE: usize> HostSharedCache for MacosUserlandWithPageSize<PAGE_SIZE> {
+    fn host_shared_cache(&self) -> Result<HostCache<'_>, HostSharedCacheError> {
+        Ok(self.opened_shared_cache()?.view())
+    }
+
+    fn host_cache_page(
+        &self,
+        page: u64,
+        slide: u64,
+    ) -> Result<HostCachePage, HostSharedCacheError> {
+        self.opened_shared_cache()?.page(page, slide)
+    }
+
+    fn free_host_range(
+        &self,
+        from: u64,
+        length: u64,
+        limit: u64,
+    ) -> Result<Option<u64>, HostSharedCacheError> {
+        shared_cache::free_host_range(from, length, limit)
+    }
+
+    fn host_range_occupied(&self, range: Range<u64>) -> Result<bool, HostSharedCacheError> {
+        shared_cache::host_range_occupied(range)
+    }
+
+    unsafe fn map_host_cache_range(
+        &self,
+        address: u64,
+        length: u64,
+        target: usize,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), HostSharedCacheError> {
+        let (file, offset) = self.opened_shared_cache()?.file_range(address, length)?;
+        let range = usize::try_from(length)
+            .ok()
+            .and_then(|length| Some(target..target.checked_add(length)?))
+            .ok_or_else(|| HostSharedCacheError::new("cache view outside the address space"))?;
+        // SAFETY: the caller excludes users of the target pages.
+        unsafe { self.map_file_view(range, file, offset, permissions) }.map_err(|error| {
+            HostSharedCacheError::new(format_args!(
+                "mapping cache bytes {address:#x}+{length:#x} at {target:#x}: {error}"
+            ))
+        })
+    }
+}
 
 type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,
@@ -4339,5 +4435,254 @@ mod tests {
         // SAFETY: the test-owned page is idle; its old code has returned.
         unsafe { p.protect_pages(core::iter::empty, range.clone(), RW) }.unwrap();
         assert_eq!(run(44), 44);
+    }
+
+    #[cfg(feature = "shared_cache")]
+    mod file_views {
+        use super::*;
+
+        /// Unlinked file filling host page `i` with `pages[i]`; concurrent callers
+        /// pass distinct `tag`.
+        fn temp_file(pages: &[u8], tag: &str, options: &std::fs::OpenOptions) -> std::fs::File {
+            let path = std::env::temp_dir()
+                .join(format!("litebox-file-view-{}-{tag}", std::process::id()));
+            let bytes: Vec<u8> = pages
+                .iter()
+                .flat_map(|fill| [*fill; HOST_PAGE_SIZE])
+                .collect();
+            std::fs::write(&path, bytes).unwrap();
+            let file = options.open(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            file
+        }
+
+        /// Allocate `pages` RW pages near `hint`, marked with `marker`; the guard releases them.
+        fn owned_marked_pages(
+            p: &'static MacosUserland,
+            hint: usize,
+            pages: usize,
+            marker: u8,
+        ) -> (Range<usize>, impl Drop + use<>) {
+            // SAFETY: Hint allocation chooses fresh pages that this test exclusively owns.
+            let range = unsafe {
+                p.reserve_and_commit_pages(
+                    core::iter::empty,
+                    hint..hint + pages * HOST_PAGE_SIZE,
+                    RW,
+                    AllocationOptions::POPULATE,
+                    FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+                )
+            }
+            .unwrap()
+            .range();
+            let ptr =
+                <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                    range.start,
+                );
+            for offset in (0..range.len()).step_by(HOST_PAGE_SIZE) {
+                assert_eq!(ptr.write_at_offset(offset.cast_signed(), marker), Some(()));
+            }
+            let release = range.clone();
+            let release = litebox::utils::defer(move || {
+                // SAFETY: the test owns the pages and no longer accesses them.
+                unsafe { p.release_pages(release) }.unwrap();
+            });
+            (range, release)
+        }
+
+        #[test]
+        fn file_views_map_file_bytes_privately() {
+            use std::os::fd::AsFd as _;
+            use std::os::unix::fs::FileExt as _;
+
+            let p = MacosUserland::new();
+            let file = temp_file(
+                &[0x11, 0x22, 0x33],
+                "private",
+                std::fs::OpenOptions::new().read(true),
+            );
+            let (range, _release) = owned_marked_pages(p, TASK_ADDR_MIN + (4 << 40), 2, 0x5a);
+            let ptr =
+                <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                    range.start,
+                );
+            // SAFETY: the test-owned pages are idle.
+            unsafe {
+                p.map_file_view(
+                    range.clone(),
+                    file.as_fd(),
+                    HOST_PAGE_SIZE as u64,
+                    MemoryRegionPermissions::READ,
+                )
+            }
+            .unwrap();
+            assert_eq!(ptr.read_at_offset(0), Some(0x22));
+            assert_eq!(ptr.read_at_offset(HOST_PAGE_SIZE.cast_signed()), Some(0x33));
+            assert_eq!(ptr.write_at_offset(0, 0x44), None);
+            // SAFETY: the test owns the idle view.
+            unsafe { p.protect_pages(core::iter::empty, range.clone(), RW) }.unwrap();
+            // mov x0, #7; ret
+            let code = [0xd280_00e0u32, 0xd65f_03c0];
+            for (index, word) in code.iter().enumerate() {
+                assert_eq!(
+                    ptr.write_slice_at_offset((4 * index).cast_signed(), &word.to_le_bytes()),
+                    Some(())
+                );
+            }
+            let returned: usize;
+            // SAFETY: the test exclusively owns the page; its RX code is the C-ABI mov/ret stub just
+            // written. The assembly declares the call's register clobbers.
+            unsafe {
+                p.protect_pages(
+                    core::iter::empty,
+                    range.clone(),
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                )
+                .unwrap();
+                core::arch::asm!("blr {entry}", entry = in(reg) range.start,
+                    lateout("x0") returned, clobber_abi("C"));
+            }
+            assert_eq!(returned, 7);
+            assert_eq!(ptr.read_at_offset(8), Some(0x22));
+            let mut on_disk = vec![0; 3 * HOST_PAGE_SIZE];
+            file.read_exact_at(&mut on_disk, 0).unwrap();
+            assert!(
+                on_disk
+                    .chunks(HOST_PAGE_SIZE)
+                    .zip([0x11, 0x22, 0x33])
+                    .all(|(page, fill)| page.iter().all(|byte| *byte == fill)),
+                "writes never reach the file"
+            );
+        }
+
+        #[test]
+        fn file_views_replace_only_owned_pages() {
+            use std::os::fd::AsFd as _;
+
+            let p = MacosUserland::new();
+            let file = temp_file(&[0x77; 2], "owned", std::fs::OpenOptions::new().read(true));
+            // Keep these pages apart from other tests' hinted pages: the test frees two of them.
+            let (range, _release) = owned_marked_pages(p, TASK_ADDR_MIN + (5 << 40), 3, 0x10);
+            let base = range.start;
+            let ptr =
+                <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                    base,
+                );
+            let page = |index: usize| (index * HOST_PAGE_SIZE).cast_signed();
+            let span = |indices: Range<usize>| {
+                base + indices.start * HOST_PAGE_SIZE..base + indices.end * HOST_PAGE_SIZE
+            };
+            // Layout: page0 owned | page1 free | page2 host.
+            for index in [1, 2] {
+                // SAFETY: the test-owned page is idle; later probes use fallible accesses.
+                unsafe { p.release_pages(span(index..index + 1)) }.unwrap();
+            }
+            let mut host = span(2..3).start as u64;
+            // SAFETY: a FIXED allocation without OVERWRITE fails instead of replacing a mapping.
+            let result = unsafe {
+                mach_vm_allocate(
+                    mach_task_self(),
+                    &raw mut host,
+                    HOST_PAGE_SIZE as u64,
+                    MachVmFlags::FIXED,
+                )
+            };
+            assert_eq!(result, KernReturn::SUCCESS);
+            let _unmap_host = litebox::utils::defer(|| {
+                // SAFETY: the test exclusively owns the host page, which is no longer accessed.
+                unsafe { libc::munmap(host as *mut _, HOST_PAGE_SIZE) };
+            });
+            let host_marker = 0x42;
+            assert_eq!(ptr.write_at_offset(page(2), host_marker), Some(()));
+            for target in [span(0..2), span(1..3), span(2..3)] {
+                // SAFETY: the test-owned page is idle; free and host pages must be refused.
+                let result = unsafe {
+                    p.map_file_view(target, file.as_fd(), 0, MemoryRegionPermissions::READ)
+                };
+                assert!(matches!(result, Err(PermissionUpdateError::Unallocated)));
+            }
+            assert_eq!(ptr.read_at_offset(page(0)), Some(0x10));
+            assert_eq!(ptr.write_at_offset(page(0), 0x10), Some(()));
+            assert_eq!(ptr.read_at_offset(page(1)), None);
+            assert_eq!(ptr.read_at_offset(page(2)), Some(host_marker));
+            assert_eq!(ptr.write_at_offset(page(2), host_marker), Some(()));
+        }
+
+        #[test]
+        fn refused_and_failed_file_views_leave_the_pages_unchanged() {
+            use std::os::fd::AsFd as _;
+
+            let p = MacosUserland::new();
+            let readable = temp_file(
+                &[0x77; 2],
+                "refused",
+                std::fs::OpenOptions::new().read(true),
+            );
+            let write_only = temp_file(
+                &[0x77; 2],
+                "write-only",
+                std::fs::OpenOptions::new().write(true),
+            );
+            let (range, _release) = owned_marked_pages(p, TASK_ADDR_MIN + (6 << 40), 2, 0x5a);
+            let ptr =
+                <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                    range.start,
+                );
+            let read = MemoryRegionPermissions::READ;
+            for (target, file, permissions, expected) in [
+                (
+                    range.clone(),
+                    readable.as_fd(),
+                    read | MemoryRegionPermissions::EXEC,
+                    PermissionUpdateError::PermissionDenied,
+                ),
+                (
+                    range.start + 4096..range.end,
+                    readable.as_fd(),
+                    read,
+                    PermissionUpdateError::Unaligned,
+                ),
+                (
+                    range.clone(),
+                    write_only.as_fd(),
+                    read,
+                    PermissionUpdateError::PermissionDenied,
+                ),
+            ] {
+                // SAFETY: the test-owned pages are idle; a refused or failed view must leave them.
+                let result = unsafe { p.map_file_view(target.clone(), file, 0, permissions) };
+                assert_eq!(
+                    result.map_err(|error| core::mem::discriminant(&error)),
+                    Err(core::mem::discriminant(&expected)),
+                    "{target:#x?} {permissions:?}"
+                );
+                for offset in [0, HOST_PAGE_SIZE.cast_signed()] {
+                    assert_eq!(ptr.read_at_offset(offset), Some(0x5a));
+                    assert_eq!(ptr.write_at_offset(offset + 1, 0x6b), Some(()));
+                }
+            }
+        }
+
+        #[test]
+        #[cfg(feature = "subpage_compat")]
+        fn subpage_instances_refuse_file_views() {
+            use std::os::fd::AsFd as _;
+
+            let p = MacosUserland4K::new();
+            let file = temp_file(&[0x77], "subpage", std::fs::OpenOptions::new().read(true));
+            // SAFETY: a refused request has no side effects.
+            let result = unsafe {
+                p.map_file_view(
+                    TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
+                    file.as_fd(),
+                    0,
+                    MemoryRegionPermissions::READ,
+                )
+            };
+            assert!(matches!(
+                result,
+                Err(PermissionUpdateError::PermissionDenied)
+            ));
+        }
     }
 }

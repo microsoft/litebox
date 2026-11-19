@@ -7,7 +7,7 @@
 extern crate std;
 
 use super::*;
-use crate::MacosShimBuilder;
+use crate::{MacosShim, MacosShimBuilder};
 use alloc::sync::Arc;
 use litebox::{
     LiteBox,
@@ -379,21 +379,38 @@ fn dynamic_main() -> Vec<u8> {
     )
 }
 
+/// Run the loader alone, without the shared-cache instance a dyld load
+/// installs. The task keeps the mappings alive.
+fn load_with_dyld(
+    shim: MacosShim<Platform>,
+    image: &[u8],
+    dyld: &[u8],
+) -> (Task<Platform>, Result<PtRegs, MachoLoaderError>) {
+    let random_source = shim.random_source;
+    let task = crate::tests::task(shim);
+    let result = super::load(
+        &task,
+        "/bin/main",
+        Some(image),
+        Some(dyld),
+        random_source,
+        &[],
+        &[],
+    )
+    .map(|(ctx, _)| ctx);
+    (task, result)
+}
+
 /// libSystem's initializers require the entropy keys.
 #[test]
 fn dynamic_load_without_random_source_fails() {
     set_guest_abi(GuestAbi::Darwin);
     let host_dyld = std::fs::read("/usr/lib/dyld").unwrap();
-    let result = MacosShimBuilder::new(Platform::new())
-        .build()
-        .load_program_with_dyld(
-            TaskParams::default(),
-            "/bin/main",
-            &dynamic_main(),
-            arm64_slice(&host_dyld).unwrap(),
-            Vec::new(),
-            Vec::new(),
-        );
+    let (_task, result) = load_with_dyld(
+        MacosShimBuilder::new(Platform::new()).build(),
+        &dynamic_main(),
+        arm64_slice(&host_dyld).unwrap(),
+    );
     assert!(matches!(result, Err(MachoLoaderError::Entropy)));
 }
 
@@ -418,20 +435,11 @@ fn aot_rewritten_dyld_loads_like_raw_dyld() {
     // The loader rewrites raw dyld itself and uses the AOT image as supplied;
     // both must yield the same dyld entry code.
     let entry_code = |dyld: &[u8]| {
-        let program = builder_for(Platform::new(), &broker)
-            .build()
-            .load_program_with_dyld(
-                TaskParams::default(),
-                "/bin/main",
-                &main,
-                dyld,
-                Vec::new(),
-                Vec::new(),
-            )
-            .unwrap();
-        let sp = program.initial_ctx.sp;
-        let main_header = word(sp);
-        let code = read_bytes(program.initial_ctx.pc, 64);
+        let (_task, ctx) =
+            load_with_dyld(builder_for(Platform::new(), &broker).build(), &main, dyld);
+        let ctx = ctx.unwrap();
+        let main_header = word(ctx.sp);
+        let code = read_bytes(ctx.pc, 64);
         assert_eq!(read_bytes(main_header, 4), 0xfeed_facf_u32.to_le_bytes());
         code
     };

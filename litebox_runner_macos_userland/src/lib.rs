@@ -1,7 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Run static, position-independent AArch64 Mach-O programs on Apple Silicon.
+//! Run AArch64 Mach-O programs on Apple Silicon.
+//!
+//! Static, position-independent executables run directly; dynamically linked
+//! ones run under the host's dyld with a guest-private instance of its dyld
+//! shared cache, never on the runner's own libSystem.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use anyhow::{Context as _, Result, bail};
@@ -15,11 +19,11 @@ use std::path::PathBuf;
 use std::{ffi::CString, io::Read as _};
 
 #[derive(Parser, Debug)]
-#[command(about = "Run self-contained static AArch64 Mach-O programs (no dyld)")]
+#[command(about = "Run AArch64 Mach-O programs")]
 pub struct CliArgs {
     /// Host path of a thin or universal Mach-O, followed by guest arguments.
-    /// Accepts raw or AOT-rewritten static images. No host filesystem passthrough,
-    /// dynamic linking, or shared-cache support.
+    /// Accepts raw or AOT-rewritten static images, and dynamically linked ones in
+    /// `test-broker` builds. No host filesystem passthrough.
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Guest environment entry (KEY=VALUE). Host environment is not forwarded.
@@ -33,6 +37,9 @@ pub struct CliArgs {
 
 #[cfg(feature = "test-broker")]
 mod test_broker;
+
+#[cfg(feature = "test-broker")]
+const DYLD_PATH: &str = "/usr/lib/dyld";
 
 /// Mirror the allowlisted system-identity sysctls from the host, including
 /// their MIBs and read errors; nodes absent on the host stay absent.
@@ -84,6 +91,16 @@ fn host_sysctls() -> Vec<litebox_shim_macos::syscalls::HostSysctl> {
 }
 
 pub fn run(cli_args: CliArgs) -> Result<i32> {
+    // Log to stderr, filtered by `LITEBOX_LOG` (for example `LITEBOX_LOG=debug`).
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_level(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_env_var("LITEBOX_LOG")
+                .from_env_lossy(),
+        )
+        .try_init();
     set_guest_abi(GuestAbi::Darwin);
     let Some(path) = cli_args.program_and_arguments.first() else {
         bail!("missing program");
@@ -110,6 +127,22 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         .map(|s| CString::new(s.as_bytes()))
         .collect::<Result<Vec<_>, _>>()
         .context("NUL in environment entry")?;
+    let uses_dyld = litebox_common_macos::loader::arm64_slice(&data)
+        .and_then(litebox_common_macos::loader::MachoParsedFile::parse)
+        .is_ok_and(|plan| plan.uses_dyld);
+    if uses_dyld && cfg!(not(feature = "test-broker")) {
+        // libSystem's initializers need XNU's entropy apple[] strings, and
+        // only the test broker provides guest randomness.
+        bail!(
+            "dynamic executables require a guest random source; build with the `test-broker` feature: {path}"
+        );
+    }
+    #[cfg(feature = "test-broker")]
+    let dyld = if uses_dyld {
+        Some(std::fs::read(DYLD_PATH).with_context(|| format!("reading {DYLD_PATH}"))?)
+    } else {
+        None
+    };
     let platform = MacosUserland::new();
     #[cfg(not(feature = "test-broker"))]
     let builder = MacosShimBuilder::new(platform);
@@ -128,15 +161,26 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         .map_err(|error| anyhow::anyhow!("mirroring host sysctls: {error}"))?
         .build();
     #[cfg(feature = "test-broker")]
-    let program = shim.load_program(TaskParams::default(), "/executable", argv, envp);
+    let program = match &dyld {
+        Some(dyld) => shim.load_program_with_dyld(
+            TaskParams::default(),
+            test_broker::EXECUTABLE_PATH,
+            None,
+            dyld,
+            argv,
+            envp,
+        ),
+        None => shim.load_program(
+            TaskParams::default(),
+            test_broker::EXECUTABLE_PATH,
+            argv,
+            envp,
+        ),
+    };
     #[cfg(not(feature = "test-broker"))]
     let program = shim.load_program_from_bytes(TaskParams::default(), path, &data, argv, envp);
     let program = program.context("loading Mach-O")?;
-    let litebox_shim_macos::LoadedProgram {
-        entrypoints,
-        process,
-        mut initial_ctx,
-    } = program;
+    let (entrypoints, process, mut initial_ctx) = program.into_parts();
     // SAFETY: the loader owns valid mappings and has finalized Darwin gates;
     // entrypoints retain those mappings until guest execution stops.
     unsafe {
