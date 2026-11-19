@@ -57,7 +57,9 @@
 # (to greeting.txt), self (to .), and abs.txt (to /mnt/host/greeting.txt), is
 # mounted read-only at /mnt/host over virtio-9p (its mount tag).
 #
-# Cloud Hypervisor has neither, so there the net and share tests are skipped.
+# Under Cloud Hypervisor, a TAP device, made with (passwordless) sudo, has the
+# guest's gateway (10.0.2.1) and the echo server (10.0.2.100:7). It has no
+# virtio-9p, so the share test is skipped there.
 #
 # With QEMU_SMP above 4, the preempt test is skipped: it checks preemption
 # with 8 CPU-bound programs. With fewer than 2, the smp test is skipped: it
@@ -144,7 +146,6 @@ skip_reason() {
         preempt) [[ $smp -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
         smp) [[ $smp -ge 2 ]] || echo "needs threads running at once" ;;
         highmem) [[ $mem -ge 4096 ]] || echo "needs QEMU_MEM of at least 4G, as an integer in MiB or suffixed M or G" ;;
-        net) [[ $VMM == qemu ]] || echo "needs QEMU's user network" ;;
         share) [[ $VMM == qemu ]] || echo "needs virtio-9p, which only QEMU has" ;;
     esac
 }
@@ -170,6 +171,26 @@ done
 if [[ $VMM == qemu && $client_tests -ne 0 ]] && ! command -v "$VHOST_DEVICE_VSOCK" >/dev/null; then
     echo "error: no $VHOST_DEVICE_VSOCK, which the tests with a programs.json need" >&2
     exit 2
+fi
+if [[ $VMM == cloud-hypervisor ]]; then
+    TAP=litebox$$
+    sudo -n ip tuntap add dev "$TAP" mode tap user "$(id -u)" ||
+        { echo "error: Cloud Hypervisor's network needs passwordless sudo (see the header)" >&2; exit 2; }
+    trap 'cleanup; sudo -n ip link delete "$TAP"' EXIT
+    sudo -n ip addr add 10.0.2.1/24 dev "$TAP"
+    sudo -n ip addr add 10.0.2.100/32 dev "$TAP"
+    sudo -n ip link set "$TAP" up
+    sudo -n python3 -c '
+import socket, threading
+server = socket.create_server(("10.0.2.100", 7))
+def echo(connection):
+    with connection:
+        while data := connection.recv(65536):
+            connection.sendall(data)
+while True:
+    threading.Thread(target=echo, args=(server.accept()[0],), daemon=True).start()
+' </dev/null &
+    daemons+=("$!")
 fi
 
 # The VM's userland runner has its own target directory.
@@ -254,9 +275,13 @@ console_args() {
 
 # The network device: see the header.
 network_args() {
-    [[ $VMM == qemu ]] || return 0
-    echo -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.1,restrict=on,guestfwd=tcp:10.0.2.100:7-cmd:cat \
-        -device virtio-net-pci,netdev=n0,disable-legacy=on
+    case $VMM in
+        qemu)
+            echo -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.1,restrict=on,guestfwd=tcp:10.0.2.100:7-cmd:cat \
+                -device virtio-net-pci,netdev=n0,disable-legacy=on
+            ;;
+        cloud-hypervisor) echo --net "tap=$TAP" ;;
+    esac
 }
 
 # The virtio-9p share for boot $1: see the header.
