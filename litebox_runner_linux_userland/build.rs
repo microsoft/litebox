@@ -46,6 +46,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "sve_signal.c",
     "sve_syscall_abi.c",
     "sve_x18.c",
+    "tcp_broker_mirrored.c",
     "tty.c",
     "utimensat.c",
     "uts_ipc_namespace.c",

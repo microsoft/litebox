@@ -2906,6 +2906,25 @@ fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
     broker.join();
 }
 
+/// `tcp_broker_mirrored.c` on a userland broker with `--network mirrored`, which makes the
+/// guest's TCP sockets the host's.
+#[cfg(target_os = "linux")]
+#[test]
+fn tcp_sockets_are_the_host_s_on_a_mirrored_broker() {
+    let name = "tcp_broker_mirrored";
+    let target = common::compile("./tests/tcp_broker_mirrored.c", name, true, false);
+    let taken = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let output = Runner::new(&target, name)
+        .arg(taken.local_addr().unwrap().port().to_string())
+        .broker_arg("--network")
+        .broker_arg("mirrored")
+        // After the guest listener closes, the refusal must come from the host, not policy.
+        .broker_arg("--allow-tcp-destination")
+        .broker_arg("127.0.0.1/32:1-65535")
+        .output();
+    assert!(String::from_utf8_lossy(&output).contains("tcp broker mirrored ok"));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn test_runner_broker_tcp_server_with_rewriter() {
@@ -3813,6 +3832,27 @@ fn test_broker_with_curl() {
     ignore = "x18-virtualized libcrypto.so.3 fails to load (failed to map segment)"
 )]
 fn test_managed_egress_proxy_with_curl() {
+    managed_egress_proxy_with_curl("managed_egress_proxy_curl", &[]);
+}
+
+/// As [`test_managed_egress_proxy_with_curl`], where the guest reaches the proxy at the host's
+/// loopback, which it shares.
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg_attr(
+    all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"),
+    ignore = "x18-virtualized libcrypto.so.3 fails to load (failed to map segment)"
+)]
+fn test_managed_egress_proxy_with_curl_on_a_mirrored_broker() {
+    managed_egress_proxy_with_curl(
+        "managed_egress_proxy_curl_mirrored",
+        &["--network", "mirrored"],
+    );
+}
+
+/// Runs curl, named `name`, through the managed egress proxy of a broker with `broker_args`.
+#[cfg(target_os = "linux")]
+fn managed_egress_proxy_with_curl(name: &str, broker_args: &[&str]) {
     const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
     let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
@@ -3831,7 +3871,10 @@ fn test_managed_egress_proxy_with_curl() {
     );
 
     let curl_path = run_which("curl");
-    let mut runner = Runner::new(&curl_path, "managed_egress_proxy_curl");
+    let mut runner = Runner::new(&curl_path, name);
+    for arg in broker_args {
+        runner.broker_arg(arg);
+    }
     runner
         .allow_proxy_host("bing.com:443")
         .env("HTTPS_PROXY=http://wrong.example:8080")

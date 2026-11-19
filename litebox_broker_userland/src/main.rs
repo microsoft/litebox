@@ -48,7 +48,7 @@ use litebox_broker_userland::fs::LocalFs;
 use litebox_broker_userland::hybrid_vsock::{DEFAULT_GUEST_CID, HybridVsock, is_guest_cid};
 use litebox_broker_userland::mapped_file;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-use litebox_broker_userland::publish::Publishing;
+use litebox_broker_userland::publish::{Networking, Publishing};
 use litebox_broker_userland::publish::{Publish, parse_ipv4_cidr};
 use litebox_broker_userland::random::UserlandRandomProvider;
 use litebox_broker_userland::stdio::UserlandStdioProvider;
@@ -135,6 +135,14 @@ impl FromStr for MountSpec {
     }
 }
 
+/// How guest sockets reach the network, as `--network` describes.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum NetworkMode {
+    Isolated,
+    Mirrored,
+}
+
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)]
 struct CliArgs {
@@ -154,18 +162,29 @@ struct CliArgs {
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 UDP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
     allow_udp_destination: Vec<AllowedDestination>,
+    /// How guest sockets reach the network. `isolated` gives the guest a private network
+    /// (10.0.2.15, with the host at 10.0.2.1). `mirrored` uses the addresses and TCP ports
+    /// of the broker's network namespace; it does not support UDP.
+    ///
+    /// In mirrored mode, connections to this broker's guest listeners stay in memory; other
+    /// destinations require --allow-tcp-destination. After a wildcard listener closes, it stops
+    /// accepting, but its wildcard bind remains until its accepted in-memory sockets close.
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_enum, default_value_t = NetworkMode::Isolated)]
+    network: NetworkMode,
     /// Publish guest GUEST_PORT, TCP unless `/udp`, at HOST_IP:HOST_PORT (HOST_IP 0.0.0.0 by
     /// default). The broker holds the host port from its start and serves it while a guest socket
     /// listens on, or is bound to, GUEST_PORT. Clients need --allow-tcp-source or
-    /// --allow-udp-source. A UDP port at a loopback HOST_IP reaches only the host.
+    /// --allow-udp-source. A UDP port at a loopback HOST_IP reaches only the host. Not with
+    /// `--network mirrored`, whose guest listeners are at their own host ports.
     #[arg(long, value_name = "[HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]")]
     publish: Vec<Publish>,
     /// Also publish each other guest TCP listener or explicitly bound UDP socket at HOST_IP and
-    /// its own port, e.g. in a container's network namespace.
+    /// its own port, e.g. in a container's network namespace. Not with `--network mirrored`.
     #[arg(long, value_name = "HOST_IP")]
     publish_listener_ip: Option<Ipv4Addr>,
-    /// Admit clients of published TCP ports from CIDR, as the guest sees them (local ones as
-    /// 10.0.2.1).
+    /// Admit clients of published TCP ports, or with `--network mirrored` of guest TCP listeners,
+    /// from CIDR, as the guest sees them (local ones as 10.0.2.1 unless mirrored).
     #[arg(long, value_name = "CIDR", value_parser = parse_ipv4_cidr)]
     allow_tcp_source: Vec<Ipv4Cidr>,
     /// Admit senders to published UDP ports from CIDR, as the guest sees them (local ones as
@@ -297,16 +316,42 @@ fn build_broker(
         .transpose()?;
     let mut builder = BrokerCoreBuilder::new(policy)
         .with_limits(limits)
-        .with_publishing(Publishing {
-            rules: args.publish.clone(),
-            listener_ip: args.publish_listener_ip,
-            tcp_sources: args.allow_tcp_source.clone(),
-            udp_sources: args.allow_udp_source.clone(),
-        });
+        .with_networking(configured_networking(args));
     if let Some(vsock) = &vsock {
         builder = builder.with_vsock_provider(vsock.provider());
     }
     Ok((builder.build()?, vsock))
+}
+
+/// Checks that `args` publish no ports with `--network mirrored`, whose guest listeners are at
+/// their own host ports.
+#[cfg(target_os = "linux")]
+fn check_network_arguments(args: &CliArgs) -> Result<(), &'static str> {
+    if args.network == NetworkMode::Mirrored
+        && (!args.publish.is_empty() || args.publish_listener_ip.is_some())
+    {
+        return Err("--network mirrored takes neither --publish nor --publish-listener-ip");
+    }
+    Ok(())
+}
+
+/// Returns the guest networking that `args`, which [`check_network_arguments`] accepts on Linux,
+/// configure.
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+fn configured_networking(args: &CliArgs) -> Networking {
+    #[cfg(target_os = "linux")]
+    if args.network == NetworkMode::Mirrored {
+        return Networking::Mirrored {
+            tcp_sources: args.allow_tcp_source.clone(),
+            udp_sources: args.allow_udp_source.clone(),
+        };
+    }
+    Networking::Isolated(Publishing {
+        rules: args.publish.clone(),
+        listener_ip: args.publish_listener_ip,
+        tcp_sources: args.allow_tcp_source.clone(),
+        udp_sources: args.allow_udp_source.clone(),
+    })
 }
 
 /// Starts the hybrid vsock bridge at `path`, its ephemeral ports seeded at random.
@@ -770,6 +815,27 @@ mod cli_tests {
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mirrored_networking_admits_sources_but_publishes_nothing() {
+        let parse = |extra: &[&str]| {
+            let args = ["litebox-broker-userland", "--network", "mirrored"]
+                .iter()
+                .chain(extra)
+                .chain(&["--runner", "runner", "guest"]);
+            CliArgs::try_parse_from(args).unwrap()
+        };
+        let args = parse(&["--allow-tcp-source", "10.0.0.0/8"]);
+        assert_eq!(check_network_arguments(&args), Ok(()));
+        let Networking::Mirrored { tcp_sources, .. } = configured_networking(&args) else {
+            panic!("--network mirrored did not mirror");
+        };
+        assert_eq!(tcp_sources, [parse_ipv4_cidr("10.0.0.0/8").unwrap()]);
+        assert!(check_network_arguments(&parse(&["--publish", "8080:80"])).is_err());
+        let listener_ip = parse(&["--publish-listener-ip", "127.0.0.1"]);
+        assert!(check_network_arguments(&listener_ip).is_err());
     }
 
     /// Builds the process's only broker core: nextest runs each test in its own process.

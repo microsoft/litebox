@@ -33,6 +33,9 @@ use super::udp::{
     MAX_UDP_NATIVE_RECEIVE_BUFFER, MAX_UDP_QUEUE_DATAGRAMS_PER_SOURCE,
 };
 
+#[cfg(target_os = "linux")]
+mod mirrored;
+mod mirrored_transport;
 mod publish;
 mod tcp;
 mod udp;
@@ -167,6 +170,52 @@ fn run_on_thread(operation: impl FnOnce() + Send + 'static) {
         Ok(()) | Err(RecvTimeoutError::Disconnected) => worker.join().unwrap(),
         Err(RecvTimeoutError::Timeout) => panic!("the operation did not finish"),
     }
+}
+
+/// Runs the test at `path`, under `socket::tests`, again in a network
+/// namespace of its own, where it runs `child`, which may change the host's
+/// addresses and settings. Skips the test where unprivileged namespaces are unavailable,
+/// except on CI runners, which must provide them.
+#[cfg(target_os = "linux")]
+fn in_network_namespace(path: &str, child: impl FnOnce()) {
+    const CHILD_ENV: &str = "LITEBOX_TEST_NETWORK_NAMESPACE";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        child();
+        return;
+    }
+    let output = std::process::Command::new("unshare")
+        .args(["--map-root-user", "--net"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", &format!("socket::tests::{path}"), "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .output();
+    let output = match output {
+        // A test that ran exits with 0 or, failing, 101.
+        Ok(output) if matches!(output.status.code(), Some(0 | 101)) => output,
+        result => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI runner must provide unprivileged network namespaces \
+                 (see kernel.apparmor_restrict_unprivileged_userns): {result:?}"
+            );
+            eprintln!("skipped: no unprivileged network namespace: {result:?}");
+            return;
+        }
+    };
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "{output:?}"
+    );
+}
+
+/// Runs `ip` with the space-separated `args`.
+#[cfg(target_os = "linux")]
+fn ip(args: &str) {
+    let status = std::process::Command::new("ip")
+        .args(args.split(' '))
+        .status()
+        .unwrap();
+    assert!(status.success(), "ip {args}: {status}");
 }
 
 /// Waits until `condition` holds, failing after [`TEST_TIMEOUT`].
