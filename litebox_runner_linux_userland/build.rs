@@ -10,16 +10,10 @@ use std::{env, fs};
 const DEDICATED_C_TESTS: &[&str] = &[
     "aarch64_hwcaps.c",
     "async_x16.c",
-    "auxv_execfn.c",
-    "cpu_time_parent.c",
-    "ctty_parent.c",
     "fork_chain_parent.c",
     "fork_parent.c",
-    "fork_interrupt_parent.c",
     "fork_threads_parent.c",
     "fork_aarch64_state.c",
-    "fork_epoll_parent.c",
-    "fork_event_parent.c",
     "fork_flock_parent.c",
     "fork_inet_parent.c",
     "fork_shared_futex_parent.c",
@@ -27,27 +21,17 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "gate_signals.c",
     "native_tp.c",
     "inherited_ignored_signals.c",
-    "parent_death_signal.c",
     "pid_namespace.c",
-    "pidfd_parent.c",
-    "prctl_flags.c",
-    "process_group_parent.c",
-    "process_tree_parent.c",
-    "regular_file_readiness.c",
-    "rlimit_parent.c",
     "root_init.c",
     "shared_file_mapping.c",
     "sigreturn.c",
     "sigreturn_simd.c",
-    "sigtimedwait_fork_parent.c",
-    "thread_kill_process_parent.c",
     "svc_scratch_regs.c",
     "sve_async.c",
     "sve_signal.c",
     "sve_syscall_abi.c",
     "sve_x18.c",
     "tty.c",
-    "utimensat.c",
     "uts_ipc_namespace.c",
     "vfork_fault_parent.c",
     "vfork_exec_child.c",
@@ -63,6 +47,24 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "vfork_shell_parent.c",
     "vfork_signal_parent.c",
     "vfork_spawn_parent.c",
+];
+
+// Programs that create processes, which LiteBox allows only with `--allow-process-duplication`.
+const PROCESS_DUPLICATION_C_TESTS: &[&str] = &[
+    "auxv_execfn.c",
+    "cpu_time_parent.c",
+    "ctty_parent.c",
+    "fork_epoll_parent.c",
+    "fork_event_parent.c",
+    "fork_interrupt_parent.c",
+    "parent_death_signal.c",
+    "pidfd_parent.c",
+    "prctl_flags.c",
+    "process_group_parent.c",
+    "process_tree_parent.c",
+    "rlimit_parent.c",
+    "sigtimedwait_fork_parent.c",
+    "thread_kill_process_parent.c",
     "waitid_parent.c",
 ];
 
@@ -108,6 +110,8 @@ fn main() -> std::io::Result<()> {
             "dedicated"
         } else if BROKER_ONLY_C_TESTS.contains(&name) {
             "broker"
+        } else if PROCESS_DUPLICATION_C_TESTS.contains(&name) {
+            "forking"
         } else {
             "plain"
         };

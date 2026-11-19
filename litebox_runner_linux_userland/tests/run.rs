@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use common::runner::Runner;
 
 #[cfg(target_os = "linux")]
+use common::native::Native;
+#[cfg(target_os = "linux")]
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(target_os = "linux")]
@@ -129,16 +131,10 @@ fn test_mount_tmpfs() {
     assert!(String::from_utf8_lossy(&output).contains("mount tmpfs ok"));
 }
 
-#[test]
-fn test_utimensat_in_memory() {
-    let target = common::compile("./tests/utimensat.c", "utimensat_in_memory", true, false);
-    let output = Runner::new(&target, "utimensat_in_memory").output();
-    assert!(String::from_utf8_lossy(&output).contains("utimensat ok"));
-}
-
 include!(concat!(env!("OUT_DIR"), "/c_tests.rs"));
 
-fn run_c_test(path: &str, suffix: &str, exec_or_lib: bool) {
+/// Runs a C test in LiteBox, letting it create processes if `duplicate`.
+fn run_c_test(path: &str, suffix: &str, exec_or_lib: bool, duplicate: bool) {
     let stem = Path::new(path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -147,28 +143,40 @@ fn run_c_test(path: &str, suffix: &str, exec_or_lib: bool) {
     let target = common::compile(path, &unique_name, exec_or_lib, false);
     let mut runner = Runner::new(&target, &unique_name);
     #[cfg(target_os = "linux")]
-    configure_pipe_broker(Path::new(path), &mut runner);
+    {
+        configure_pipe_broker(Path::new(path), &mut runner);
+        if duplicate {
+            runner.allow_process_duplication();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert!(!duplicate, "only Linux runners create processes");
     runner.run();
 }
 
 macro_rules! c_test {
     (dedicated $stem:ident, $path:literal) => {
-        c_test!(@test #[ignore = "has a dedicated test"] $stem, $path);
+        c_test!(@test #[ignore = "has a dedicated test"] $stem, $path, false);
     };
     (broker $stem:ident, $path:literal) => {
-        c_test!(@test #[ignore = "needs the broker"] $stem, $path);
+        c_test!(@test #[ignore = "needs the broker"] $stem, $path, false);
     };
     (plain r#mount, $path:literal) => {
         c_test!(dedicated r#mount, $path);
     };
     (plain $stem:ident, $path:literal) => {
-        c_test!(@test $stem, $path);
+        c_test!(@test $stem, $path, false);
     };
-    (@test $(#[$attribute:meta])* $stem:ident, $path:literal) => {
+    (forking $stem:ident, $path:literal) => {
+        c_test!(@test
+            #[cfg_attr(not(target_os = "linux"), ignore = "only Linux runners create processes")]
+            $stem, $path, true);
+    };
+    (@test $(#[$attribute:meta])* $stem:ident, $path:literal, $duplicate:literal) => {
         $(#[$attribute])*
         #[test]
         fn $stem() {
-            super::run_c_test($path, SUFFIX, EXEC_OR_LIB);
+            super::run_c_test($path, SUFFIX, EXEC_OR_LIB, $duplicate);
         }
     };
 }
@@ -185,33 +193,18 @@ mod test_static_exec_with_rewriter {
     for_each_c_test!(c_test);
 }
 
-/// Runs a C test directly on the host, with the environment the LiteBox sweeps give the guest,
-/// to check that the test's expectations hold on Linux and not only under LiteBox.
+/// Runs a C test natively, as the LiteBox sweeps run it, to check that the test's expectations
+/// hold on Linux and not only under LiteBox.
 #[cfg(target_os = "linux")]
 fn run_native_c_test(path: &str) {
     let stem = Path::new(path)
         .file_stem()
         .and_then(|s| s.to_str())
         .expect("failed to get file stem");
-    let unique_name = format!("{stem}_native");
-    let target = common::compile(path, &unique_name, true, false);
-    let cwd = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("cwd_{unique_name}"));
-    match std::fs::remove_dir_all(&cwd) {
-        Ok(()) => (),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-        Err(error) => panic!("failed to clear {}: {error}", cwd.display()),
+    let target = common::compile(path, &format!("{stem}_native"), true, false);
+    if let Some(mut native) = Native::new(&target) {
+        native.output();
     }
-    std::fs::create_dir_all(&cwd).unwrap();
-    println!("Running `{}` natively", target.display());
-    let status = std::process::Command::new(&target)
-        .env_clear()
-        .env("HOME", "/")
-        .current_dir(&cwd)
-        .stdin(std::process::Stdio::null())
-        .status()
-        .unwrap_or_else(|error| panic!("failed to run {}: {error}", target.display()));
-    assert!(status.success(), "{stem} failed natively: {status}");
-    std::fs::remove_dir_all(&cwd).unwrap();
 }
 
 /// The C tests the native sweep skips, beyond those with a dedicated test, and why.
@@ -235,6 +228,12 @@ macro_rules! native_c_test {
         native_c_test!(@test #[ignore = "Linux keeps a writer to a full pipe blocked until a \
             reader frees a whole page; LiteBox wakes it after a 1-byte read"]
             r#pipe_broker, $path);
+    };
+    ($kind:ident r#process_tree_parent, $path:literal) => {
+        native_c_test!(@test #[ignore = "expects LiteBox's initial process to have no parent and \
+            adopt orphans, which natively only the first process of a PID namespace does, but that \
+            one also ignores signals it has no handler for"]
+            r#process_tree_parent, $path);
     };
     ($kind:ident r#tcp_broker, $path:literal) => {
         native_c_test!(@needs_arguments r#tcp_broker, $path);
@@ -266,53 +265,6 @@ macro_rules! native_c_test {
 #[cfg(target_os = "linux")]
 mod test_native {
     for_each_c_test!(native_c_test);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn regular_files_are_readable_and_writable() {
-    let target = common::compile(
-        "./tests/regular_file_readiness.c",
-        "regular_file_readiness",
-        true,
-        false,
-    );
-    let native = std::process::Command::new(&target).output().unwrap();
-    assert!(
-        native.status.success(),
-        "native regular file readiness failed: {native:?}"
-    );
-    Runner::new(&target, "regular_file_readiness").run();
-}
-
-/// `AT_EXECFN` names the file `execve` received, even a relative path or a script, for the
-/// initial program, a `vfork` child's program, and an in-process `execve`.
-#[cfg(target_os = "linux")]
-#[test]
-fn auxv_execfn_names_the_executed_file() {
-    const CHECKS: usize = 4;
-    let target = common::compile("./tests/auxv_execfn.c", "auxv_execfn", true, false);
-    let native = std::process::Command::new(&target).output().unwrap();
-    assert!(
-        native.status.success(),
-        "native AT_EXECFN checks failed: {native:?}"
-    );
-    let native = String::from_utf8(native.stdout).unwrap();
-    assert_eq!(
-        native.matches("AT_EXECFN matches").count(),
-        CHECKS,
-        "{native}"
-    );
-
-    let output = Runner::new(&target, "auxv_execfn")
-        .allow_process_duplication()
-        .output();
-    let output = String::from_utf8(output).unwrap();
-    assert_eq!(
-        output.matches("AT_EXECFN matches").count(),
-        CHECKS,
-        "{output}"
-    );
 }
 
 /// The signal `__builtin_trap` raises (`ud2` on x86-64, `brk` on AArch64).
@@ -1220,64 +1172,6 @@ fn fork_child_resumes_from_parent_snapshot() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn fork_child_can_be_interrupted_in_guest_code() {
-    let parent = common::compile(
-        "./tests/fork_interrupt_parent.c",
-        "fork_interrupt_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "fork_interrupt_parent");
-    runner.allow_process_duplication();
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output
-            .lines()
-            .any(|line| line == "forked child interrupted")
-    );
-}
-
-/// Checks that a signal one guest process sends another is pending in the receiver once its
-/// `kill` returns, whether or not the receiver has been notified of it yet.
-#[cfg(target_os = "linux")]
-#[test]
-fn signal_from_another_process_is_pending_once_sent() {
-    let parent = common::compile(
-        "./tests/sigtimedwait_fork_parent.c",
-        "sigtimedwait_fork_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "sigtimedwait_fork_parent");
-    runner.allow_process_duplication();
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "sigtimedwait-fork ok"),
-        "missing sigtimedwait-fork output in {output:?}"
-    );
-}
-
-/// Checks that `tkill` and `tgkill` reach the threads of another guest process.
-#[cfg(target_os = "linux")]
-#[test]
-fn thread_kill_reaches_another_process() {
-    let parent = common::compile(
-        "./tests/thread_kill_process_parent.c",
-        "thread_kill_process_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "thread_kill_process_parent");
-    runner.allow_process_duplication();
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "thread-kill-process ok"),
-        "missing thread-kill-process output in {output:?}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn fork_pauses_sibling_threads() {
     let parent = common::compile(
         "./tests/fork_threads_parent.c",
@@ -1437,19 +1331,13 @@ fn shared_file_mappings_are_shared_across_fork_and_processes() {
     // from its own path, for the exec check, and exits with failure, after printing which checks
     // failed, if any did. Natively, its files go in a directory of their own, which the host's
     // /tmp may not be able to execute from.
-    let native_files = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let native = std::process::Command::new(&program)
-        .arg(&program_path)
-        .env("TMPDIR", native_files.path())
-        .output()
-        .unwrap();
-    assert!(
-        native.status.success(),
-        "{}\nstdout:\n{}\nstderr:\n{}",
-        native.status,
-        String::from_utf8_lossy(&native.stdout),
-        String::from_utf8_lossy(&native.stderr)
-    );
+    if let Some(mut native) = Native::new(&program) {
+        let native_files = native.directory().to_owned();
+        native
+            .arg(&program_path)
+            .env("TMPDIR", native_files)
+            .output();
+    }
     Runner::new(&program, "shared_file_mapping")
         .allow_process_duplication()
         .arg(program_path)
@@ -1540,28 +1428,6 @@ fn forked_and_exec_children_share_inet_sockets() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn forked_children_share_eventfds_and_timerfds() {
-    let parent = common::compile(
-        "./tests/fork_event_parent.c",
-        "fork_event_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "fork_event_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = output
-        .lines()
-        .find(|line| line.starts_with("event-fork "))
-        .unwrap_or_else(|| panic!("missing event-fork output in {output:?}"));
-    for field in ["blocked=", "semaphore=", "nonblock=", "timer="] {
-        assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn forked_children_share_flock_ownership() {
     let parent = common::compile(
         "./tests/fork_flock_parent.c",
@@ -1603,36 +1469,15 @@ fn forked_children_share_futexes_in_shared_memory() {
         false,
     );
     // The checks encode Linux's behavior, so they pass natively too.
-    let native = std::process::Command::new(&parent).output().unwrap();
-    let native = String::from_utf8(native.stdout).unwrap();
-    assert!(native.lines().any(|line| line == EXPECTED), "{native:?}");
+    if let Some(mut native) = Native::new(&parent) {
+        let native = native.output();
+        assert!(native.lines().any(|line| line == EXPECTED), "{native:?}");
+    }
 
     let mut runner = Runner::new(&parent, "fork_shared_futex_parent");
     runner.allow_process_duplication();
     let output = String::from_utf8(runner.output()).unwrap();
     assert!(output.lines().any(|line| line == EXPECTED), "{output:?}");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn forked_children_share_epoll_instances() {
-    let parent = common::compile(
-        "./tests/fork_epoll_parent.c",
-        "fork_epoll_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "fork_epoll_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = output
-        .lines()
-        .find(|line| line.starts_with("epoll-fork "))
-        .unwrap_or_else(|| panic!("missing epoll-fork output in {output:?}"));
-    for field in ["shared=", "blocked=", "flags="] {
-        assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1655,41 +1500,6 @@ fn fork_requires_process_duplication() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn process_groups_and_sessions_span_processes() {
-    let parent = common::compile(
-        "./tests/process_group_parent.c",
-        "process_group_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "process_group_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output
-            .lines()
-            .any(|line| line == "process-group failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn sessions_acquire_controlling_terminals_across_processes() {
-    let parent = common::compile("./tests/ctty_parent.c", "ctty_parent", true, false);
-    let mut runner = Runner::new(&parent, "ctty_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "ctty failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn initial_program_inherits_ignored_signals() {
     let program = common::compile(
         "./tests/inherited_ignored_signals.c",
@@ -1708,25 +1518,6 @@ fn initial_program_inherits_ignored_signals() {
         output,
         "SIGHUP=ignored\nSIGINT=ignored\nSIGALRM=ignored\nSIGPIPE=default\nSIGTERM=default\n\
          survived SIGINT\n"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn orphans_are_adopted_by_subreapers_and_the_initial_process() {
-    let parent = common::compile(
-        "./tests/process_tree_parent.c",
-        "process_tree_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "process_tree_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "process-tree failures=0"),
-        "{output}"
     );
 }
 
@@ -1807,87 +1598,6 @@ fn only_root_creates_uts_and_ipc_namespaces() {
             .any(|line| line == "uts-ipc-namespace unprivileged failures=0"),
         "{output}"
     );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn dumpable_and_no_new_privs_follow_threads_and_processes() {
-    let program = common::compile("./tests/prctl_flags.c", "prctl_flags", true, false);
-    let mut runner = Runner::new(&program, "prctl_flags");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "prctl-flags failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn parent_death_signal_is_sent_when_the_parent_exits() {
-    let program = common::compile(
-        "./tests/parent_death_signal.c",
-        "parent_death_signal",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&program, "parent_death_signal");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output
-            .lines()
-            .any(|line| line == "parent-death-signal failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn cpu_time_covers_the_process_and_its_waited_descendants() {
-    let parent = common::compile("./tests/cpu_time_parent.c", "cpu_time_parent", true, false);
-    let mut runner = Runner::new(&parent, "cpu_time_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "cpu-time failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn resource_limits_are_kept_and_inherited() {
-    let parent = common::compile("./tests/rlimit_parent.c", "rlimit_parent", true, false);
-    let mut runner = Runner::new(&parent, "rlimit_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "rlimit failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn waitid_reports_and_reaps_children() {
-    let parent = common::compile("./tests/waitid_parent.c", "waitid_parent", true, false);
-    let mut runner = Runner::new(&parent, "waitid_parent");
-    runner.allow_process_duplication();
-    runner.run();
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn pidfds_follow_children() {
-    let parent = common::compile("./tests/pidfd_parent.c", "pidfd_parent", true, false);
-    let mut runner = Runner::new(&parent, "pidfd_parent");
-    runner.allow_process_duplication();
-    runner.run();
 }
 
 /// A 512 KiB host stack makes 32 generations exceed the old native fork stack-growth limit,

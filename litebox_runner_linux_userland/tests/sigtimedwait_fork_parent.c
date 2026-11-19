@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// A signal one process sends another is pending in the receiver once its `kill` returns, whether
+// or not the receiver has been notified of it yet.
+
 #include "helpers.h"
 
 #include <sched.h>
