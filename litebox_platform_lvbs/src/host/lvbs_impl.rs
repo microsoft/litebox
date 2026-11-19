@@ -353,7 +353,9 @@ impl HostInterface for HostLvbsInterface {
     }
 
     fn log(msg: &str) {
-        let _ = crate::crash_log::crash_logger().write_str(msg);
+        crate::crash_log::crash_logger()
+            .write_str(msg)
+            .expect("Failed to write log");
     }
 
     fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {

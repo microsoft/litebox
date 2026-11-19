@@ -429,7 +429,7 @@ pub unsafe extern "C" fn _start(possible_cpus: u64, mem_pa: u64, mem_size: u64) 
 
 unsafe extern "C" fn kernel_main(is_bsp: bool) -> ! {
     if is_bsp {
-        let _ = log::set_logger(crash_logger());
+        log::set_logger(crash_logger()).expect("Logger is already set");
         #[cfg(debug_assertions)]
         log::set_max_level(log::LevelFilter::Debug);
         #[cfg(not(debug_assertions))]

@@ -25,10 +25,9 @@ use x86_64::PhysAddr;
 /// Formatted [`log::Record`]s longer than this are truncated.
 const MAX_RECORD_SIZE: usize = 1024;
 
-static CRASH_LOGGER: CrashLogger = CrashLogger::new();
-
 /// Returns the platform's crash logger, e.g., to pass to [`log::set_logger`].
 pub fn crash_logger() -> &'static CrashLogger {
+    static CRASH_LOGGER: CrashLogger = CrashLogger::new();
     &CRASH_LOGGER
 }
 
@@ -54,7 +53,7 @@ impl CrashLogger {
     }
 
     /// Whether output is written to the serial port.
-    pub fn serial_enabled(&self) -> bool {
+    fn serial_enabled(&self) -> bool {
         self.serial_enabled.load(Ordering::Relaxed)
     }
 
@@ -99,7 +98,7 @@ impl log::Log for CrashLogger {
         let mut buf = arrayvec::ArrayString::<MAX_RECORD_SIZE>::new();
         let _ = litebox_util_log::format_record(&mut buf, record);
         let mut logger = self;
-        let _ = logger.write_str(&buf);
+        logger.write_str(&buf).expect("Failed to write log");
     }
 
     fn flush(&self) {}
