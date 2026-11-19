@@ -9,25 +9,19 @@
 //! guest IPC namespace; none are published in the host's System V IPC namespace.
 
 use crate::{ShimPlatform, Task, UserPtrMut};
-use litebox::segment::SegmentError;
-use litebox_broker_protocol::{ProcessId, fs::FileUser};
+use litebox::segment::{PreparedAttach, SegmentError};
+use litebox_broker_protocol::fs::FileUser;
+use litebox_broker_protocol::segment::{GetSegmentRequest, SetSegmentRequest};
 use litebox_common_linux::{
     IPC_CREAT, IPC_EXCL, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, PAGE_SIZE, SHM_DEST, SHM_EXEC,
     SHM_RDONLY, SHM_REMAP, SHM_RND, ShmidDs, errno::Errno, vmem::SharedObjectMapping,
 };
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    pub(super) fn new_segment_namespace(&self, target: ProcessId) -> Result<(), Errno> {
-        match self.global.litebox.new_segment_namespace(target) {
-            // Without the segment service, both namespaces are necessarily empty.
-            Ok(()) | Err(SegmentError::Unavailable) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn check_segment_context(&self) -> Result<(), Errno> {
-        // A vfork child has the parent's address space and service association until exec.
-        // Don't let it operate in its parent's name or modify its attachment records.
+    /// Fails with `EINVAL` in a `vfork` child, which has its parent's address space and broker
+    /// association until it execs: it must not act in its parent's name or change the parent's
+    /// attachment records.
+    fn einval_in_vfork_child(&self) -> Result<(), Errno> {
         if self.vfork.borrow().is_some() {
             log_unsupported!("SysV shared memory in a vfork child");
             Err(Errno::EINVAL)
@@ -38,17 +32,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     pub(crate) fn sys_shmget(&self, key: i32, size: usize, flags: i32) -> Result<usize, Errno> {
         const SHM_HUGETLB: i32 = 0o4000;
-        self.check_segment_context()?;
+        self.einval_in_vfork_child()?;
         if flags & SHM_HUGETLB != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
-        let id = self.global.litebox.get_segment(
+        let id = self.global.litebox.get_segment(GetSegmentRequest {
             key,
-            size as u64,
-            (flags.cast_unsigned() & 0o777) as u16,
-            flags & IPC_CREAT != 0,
-            flags & IPC_EXCL != 0,
-        )?;
+            size: size as u64,
+            mode: (flags.cast_unsigned() & 0o777) as u16,
+            create: flags & IPC_CREAT != 0,
+            exclusive: flags & IPC_EXCL != 0,
+        })?;
         Ok(id as usize)
     }
 
@@ -58,7 +52,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         addr: usize,
         flags: i32,
     ) -> Result<UserPtrMut<u8>, Errno> {
-        self.check_segment_context()?;
+        self.einval_in_vfork_child()?;
         let id = u32::try_from(shmid).map_err(|_| Errno::EINVAL)?;
         if flags & SHM_REMAP != 0 && addr == 0 {
             return Err(Errno::EINVAL);
@@ -70,55 +64,55 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let address = match addr {
             0 => None,
             addr if addr.is_multiple_of(PAGE_SIZE) => Some(addr),
-            addr if flags & SHM_RND != 0 && addr >= PAGE_SIZE => Some(addr & !(PAGE_SIZE - 1)),
+            addr if flags & SHM_RND != 0 => match addr & !(PAGE_SIZE - 1) {
+                // Linux maps the rounded address 0, below the lowest address it maps.
+                0 => return Err(Errno::EPERM),
+                rounded => Some(rounded),
+            },
             _ => return Err(Errno::EINVAL),
         };
         let readonly = flags & SHM_RDONLY != 0;
-        let segments = &self.global.litebox;
-        let (file, size, attachment) = segments
-            .attach_segment::<_, PAGE_SIZE>(self.global.platform, id, !readonly)
+        let PreparedAttach {
+            object,
+            size,
+            reservation,
+        } = self
+            .global
+            .litebox
+            .prepare_segment_attach::<_, PAGE_SIZE>(self.global.platform, id, !readonly)
             .map_err(|error| match error {
                 // `shmat` reports any lack of resources as ENOMEM; ENOSPC is `shmget`'s.
                 SegmentError::NoSpace => Errno::ENOMEM,
                 error => error.into(),
             })?;
-        let mapped = usize::try_from(size)
-            .map_err(|_| Errno::ENOMEM)
-            .and_then(|len| {
-                // SAFETY: This only creates a guest VMA at a previously unmapped range.
-                // Host code does not borrow from the new VMA: guest pointer access uses
-                // fault-aware copies, and VMA users under the MM lock cannot see it before
-                // confirmation. Other views of the backing object are independent mappings.
-                unsafe {
-                    self.global.mm.attach_sysv(
-                        address,
-                        len,
-                        readonly,
-                        SharedObjectMapping { file, offset: 0 },
-                        id,
-                        || {
-                            segments
-                                .confirm_segment_attach(attachment)
-                                .map_err(Into::into)
-                        },
-                    )
-                }
-            });
-        // A failed mapping never became an attachment. Release its reservation
-        // without reporting an attach or detach.
-        if mapped.is_err()
-            && let Err(cancel) = segments.cancel_segment_attach(attachment)
-        {
-            litebox_util_log::warn!(id, cancel:?; "failed to cancel a SysV attach");
+        let len = usize::try_from(size).map_err(|_| Errno::ENOMEM)?;
+        // SAFETY: This only creates a guest VMA at a previously unmapped range. Host code does
+        // not borrow from the new VMA: guest pointer access uses fault-aware copies, and VMA
+        // users under the MM lock cannot see it before confirmation. Other views of the backing
+        // object are independent mappings.
+        //
+        // A mapping that fails, or is never confirmed, drops the reservation, which cancels it
+        // without recording an attach or detach.
+        unsafe {
+            self.global.mm.attach_sysv(
+                address,
+                len,
+                readonly,
+                SharedObjectMapping {
+                    file: object,
+                    offset: 0,
+                },
+                id,
+                || reservation.confirm().map_err(Errno::from),
+            )
         }
-        mapped
     }
 
     pub(crate) fn sys_shmdt(&self, addr: usize) -> Result<(), Errno> {
-        self.check_segment_context()?;
-        let _pause = self.pause_other_threads()?;
-        // SAFETY: Sibling guest threads are paused, including when a native view must be split.
-        // Neither the calling task nor the host holds a borrow into the detached pages.
+        self.einval_in_vfork_child()?;
+        // SAFETY: As for `munmap`, the host reaches guest pages only through fault-aware copies
+        // and holds no borrow of them, so sibling threads that still use the detached pages fault
+        // as on Linux.
         unsafe { self.global.mm.detach_sysv(addr) }
     }
 
@@ -128,21 +122,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
         cmd: i32,
         buf: UserPtrMut<ShmidDs>,
     ) -> Result<usize, Errno> {
-        self.check_segment_context()?;
+        self.einval_in_vfork_child()?;
         let id = u32::try_from(shmid).map_err(|_| Errno::EINVAL)?;
-        let segments = &self.global.litebox;
+        let litebox = &self.global.litebox;
         match cmd {
-            IPC_RMID => segments.delete_segment(id)?,
+            IPC_RMID => litebox.remove_segment(id)?,
             IPC_SET => {
                 let ds = buf.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 let owner = FileUser {
                     user: ds.shm_perm.uid.try_into().map_err(|_| Errno::EINVAL)?,
                     group: ds.shm_perm.gid.try_into().map_err(|_| Errno::EINVAL)?,
                 };
-                segments.set_segment(id, owner, (ds.shm_perm.mode & 0o777) as u16)?;
+                litebox.set_segment(SetSegmentRequest {
+                    id,
+                    owner,
+                    mode: (ds.shm_perm.mode & 0o777) as u16,
+                })?;
             }
             IPC_STAT => {
-                let status = segments.segment_status(id)?;
+                let status = litebox.segment_status(id)?;
                 let ds = ShmidDs {
                     shm_perm: IpcPerm {
                         key: status.key,
@@ -159,9 +157,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         ..IpcPerm::default()
                     },
                     shm_segsz: status.size,
-                    shm_atime: status.attached.cast_signed(),
-                    shm_dtime: status.detached.cast_signed(),
-                    shm_ctime: status.created.cast_signed(),
+                    shm_atime: status.attach_time.cast_signed(),
+                    shm_dtime: status.detach_time.cast_signed(),
+                    shm_ctime: status.change_time.cast_signed(),
                     shm_cpid: status.creator_pid.cast_signed(),
                     shm_lpid: status.last_pid.cast_signed(),
                     shm_nattch: status.attachments,

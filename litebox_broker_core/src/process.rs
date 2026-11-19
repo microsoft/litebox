@@ -871,12 +871,11 @@ impl BrokerProcess {
     /// namespace for a pending child or while this process's children already
     /// go to another one. Returns `ResourceExhausted` if that namespace can't
     /// be created, and `PolicyDenied` for a new segment namespace unless the
-    /// segment user is root and the process may write.
+    /// segment principal is privileged and the process may write.
     pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<()> {
         if request.new_segment_namespace {
-            // Use the broker's segment principal and rights, not a guest credential.
             self.require_object_rights(ObjectRights::WAIT | ObjectRights::WRITE)?;
-            if self.core.policy.segment_user.user != 0 {
+            if !self.core.policy.segment_principal.privileged {
                 return Err(BrokerError::PolicyDenied);
             }
         }
@@ -4443,11 +4442,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_pid_namespace_reservation_keeps_host_names_shared() {
+    fn failed_pid_namespace_reservation_keeps_other_namespaces_shared() {
         let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true)
-                .with_segment_user(ROOT),
+                .with_segment_principal(crate::SegmentPrincipal {
+                    user: ROOT,
+                    privileged: true,
+                }),
         )
         .with_limits(BrokerCoreLimits {
             max_pid_namespaces_per_process: 0,
@@ -4479,6 +4481,26 @@ mod tests {
             &root.children_namespace(),
             root.pid_namespace()
         ));
+        let child = root.take_child_process(child_id).unwrap();
+        assert!(
+            root.segments
+                .lock()
+                .shares_namespace_with(&child.segments.lock())
+        );
+        // Without the PID namespace, the same request succeeds.
+        root.create_namespaces(CreateNamespacesRequest {
+            process_id: root.id(),
+            children_pid_namespace: None,
+            new_segment_namespace: true,
+            copy_host_names: true,
+        })
+        .unwrap();
+        assert!(
+            !root
+                .segments
+                .lock()
+                .shares_namespace_with(&child.segments.lock())
+        );
     }
 
     #[test]

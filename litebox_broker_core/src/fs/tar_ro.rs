@@ -794,4 +794,4 @@ const DEFAULT_DIRECTORY_OWNER: UserInfo = UserInfo {
 };
 
 /// The id that user and group ids beyond `u16` map to: Linux's default overflow id.
-pub(super) const OVERFLOW_ID: u16 = 65534;
+pub(crate) const OVERFLOW_ID: u16 = 65534;

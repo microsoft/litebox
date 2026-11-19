@@ -16,7 +16,7 @@ use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::SharedObjectDelivery;
-use super::host_file::{Exported, HostFile, create, exportable, host_len, storage_error};
+use super::host_file::{Exported, HostFile, create, export_only_object, host_len, storage_error};
 
 /// A memfd, whose size is the file's size, so Linux keeps no state of its own.
 #[derive(Default)]
@@ -103,10 +103,11 @@ impl<T: std::os::fd::AsFd + Send> HostHandle for Exported<T> {
 /// Creates memory for files in memfds, accessed only through positional I/O by the broker.
 pub struct MemfdFileMemoryProvider;
 
-fn memfd(name: &core::ffi::CStr, flags: MemfdFlags) -> Result<File, StorageError> {
+/// Creates a close-on-exec memfd named `name` with `flags`.
+fn memfd(name: &core::ffi::CStr, flags: MemfdFlags) -> IoResult<File> {
     rustix::fs::memfd_create(name, MemfdFlags::CLOEXEC | flags)
         .map(File::from)
-        .map_err(|error| storage_error::<Memfd>(&error.into()))
+        .map_err(IoError::from)
 }
 
 impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
@@ -114,7 +115,8 @@ impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
         // Ask for execution support where the host otherwise seals memfds against execution.
         // Older kernels and hosts that forbid it leave a plain memfd as the best available.
         let file = memfd(c"litebox-shared-file", MemfdFlags::EXEC)
-            .or_else(|_| memfd(c"litebox-shared-file", MemfdFlags::empty()))?;
+            .or_else(|_| memfd(c"litebox-shared-file", MemfdFlags::empty()))
+            .map_err(|error| storage_error::<Memfd>(&error))?;
         Ok(create::<Memfd>(file))
     }
 
@@ -124,24 +126,22 @@ impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
             .ok()
             .filter(|length| *length <= Memfd::size_limit())
             .ok_or(SegmentStorageError::NoSpace)?;
-        let file = rustix::fs::memfd_create(
-            c"litebox-segment",
-            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
-        )
-        .map(File::from)
-        .map_err(|error| segment_storage_error(&error.into()))?;
+        let file = memfd(c"litebox-segment", MemfdFlags::ALLOW_SEALING)
+            .map_err(|error| segment_storage_error(&error))?;
         file.set_len(length)
             .map_err(|error| segment_storage_error(&error))?;
         fcntl_add_seals(&file, SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)
             .map_err(|error| segment_storage_error(&error.into()))?;
-        Ok(exportable::<Memfd>(file))
+        Ok(export_only_object::<Memfd>(file))
     }
 }
 
 fn segment_storage_error(error: &IoError) -> SegmentStorageError {
+    if litebox_broker_transport_linux_userland::is_resource_exhaustion(error) {
+        return SegmentStorageError::OutOfMemory;
+    }
     match error.raw_os_error() {
         Some(libc::ENOSPC | libc::EFBIG | libc::EDQUOT) => SegmentStorageError::NoSpace,
-        Some(libc::ENOMEM | libc::EMFILE | libc::ENFILE) => SegmentStorageError::OutOfMemory,
         _ => SegmentStorageError::Io,
     }
 }

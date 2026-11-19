@@ -29,8 +29,8 @@ use crate::{
     errno::Errno,
     vmem::{
         self, CreatePagesFlags, LinuxReservationStore, MappingError, PageFaultError,
-        SharedObjectMapping, VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError, VmemResetError,
-        VmemUnmapError,
+        SharedObjectMapping, SysvAttachError, SysvPlacement, VmFlags, Vmem, VmemPageFaultHandler,
+        VmemProtectError, VmemResetError, VmemUnmapError,
     },
 };
 
@@ -59,30 +59,30 @@ where
     vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
 }
 
-/// Exclusive access to an address space. Publish SysV count changes under the lock so
-/// concurrent edits cannot reorder deltas or leave stale broker counts for fork to inherit.
-struct VmemWriteGuard<'a, Platform, const ALIGN: usize>
+/// Exclusive access to an address space, which publishes the SysV attachment counts the change
+/// made before unlocking it, so that a fork never inherits stale broker counts.
+struct VmemUpdateGuard<'a, Platform, const ALIGN: usize>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     vmem: RwLockWriteGuard<'a, Platform, Vmem<Platform, ALIGN>>,
 }
 
-impl<Platform, const ALIGN: usize> Drop for VmemWriteGuard<'_, Platform, ALIGN>
+impl<Platform, const ALIGN: usize> Drop for VmemUpdateGuard<'_, Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     fn drop(&mut self) {
-        let deltas = core::mem::take(&mut self.vmem.sysv_deltas);
-        if let Some(adjust) = &self.vmem.sysv_adjust {
-            for (segment, delta) in deltas.into_iter().filter(|(_, delta)| *delta != 0) {
-                adjust(segment, delta);
+        let changes = self.vmem.take_sysv_changes();
+        if let Some(publish) = &self.vmem.sysv_publish {
+            for (segment, count) in changes {
+                publish(segment, count);
             }
         }
     }
 }
 
-impl<Platform, const ALIGN: usize> core::ops::Deref for VmemWriteGuard<'_, Platform, ALIGN>
+impl<Platform, const ALIGN: usize> core::ops::Deref for VmemUpdateGuard<'_, Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
@@ -93,7 +93,7 @@ where
     }
 }
 
-impl<Platform, const ALIGN: usize> core::ops::DerefMut for VmemWriteGuard<'_, Platform, ALIGN>
+impl<Platform, const ALIGN: usize> core::ops::DerefMut for VmemUpdateGuard<'_, Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
@@ -106,9 +106,10 @@ impl<Platform, const ALIGN: usize> VmemManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
-    /// Locks the address space for a change. Use this rather than `self.vmem.write()`.
-    fn write(&self) -> VmemWriteGuard<'_, Platform, ALIGN> {
-        VmemWriteGuard {
+    /// Locks the address space for a change. Use this rather than `self.vmem.write()`, which
+    /// would not publish the change's SysV attachment counts.
+    fn lock_for_update(&self) -> VmemUpdateGuard<'_, Platform, ALIGN> {
+        VmemUpdateGuard {
             vmem: self.vmem.write(),
         }
     }
@@ -133,16 +134,17 @@ where
     /// `platform` must be able to manage every inherited mapping and reservation. The copied
     /// parent runtime must never use this manager again.
     pub unsafe fn rebind_platform_after_clone(&self, platform: &'static Platform) {
-        self.write().platform = platform;
+        self.lock_for_update().platform = platform;
     }
 
-    /// Sets the broker hook for VMA count changes in this address space. A native clone
-    /// must bind its own process's hook before changing inherited mappings.
+    /// Sets how this address space publishes `publish(segment, count)`: how many areas map a
+    /// SysV segment, after a change of them. A native clone must set its own process's before
+    /// changing inherited mappings.
     ///
-    /// The hook applies a signed, nonzero count delta synchronously, under the VMA write
-    /// lock. It must not reenter this manager, and a failure must not be silently ignored.
-    pub fn set_sysv_adjust(&self, adjust: impl Fn(u32, i64) + Send + Sync + 'static) {
-        self.write().sysv_adjust = Some(alloc::sync::Arc::new(adjust));
+    /// It runs synchronously, under the VMA write lock, and must not reenter this manager. Each
+    /// publication carries the full count, so the next one makes up for a failed one.
+    pub fn set_sysv_publisher(&self, publish: impl Fn(u32, u64) + Send + Sync + 'static) {
+        self.lock_for_update().sysv_publish = Some(alloc::sync::Arc::new(publish));
     }
 
     /// Whether this address space has any live SysV attachments.
@@ -187,7 +189,7 @@ where
         let (before_perms, after_perms) = permissions;
         // SAFETY: The caller authorizes any replacements.
         let addr = unsafe {
-            self.write().create_pages(
+            self.lock_for_update().create_pages(
                 suggested_address,
                 length,
                 flags,
@@ -201,12 +203,12 @@ where
         // Note `op` may trigger page fault handler which requires write lock to `vmem`.
         if let Err(e) = op(addr) {
             // remove the mapping if the user function fails
-            let mut vmem = self.write();
+            let mut vmem = self.lock_for_update();
             unsafe { vmem.remove_mapping(range) }.unwrap();
             return Err(e);
         }
         if before_perms != after_perms {
-            let mut vmem = self.write();
+            let mut vmem = self.lock_for_update();
             if let Err(error) = unsafe { vmem.protect_mapping(range, after_perms) } {
                 unsafe { vmem.remove_mapping(range) }
                     .expect("failed to remove mapping after permission update failure");
@@ -446,7 +448,8 @@ where
     ///
     /// The caller must ensure that the released memory regions are no longer used.
     pub unsafe fn release_memory(&self) -> Result<(), VmemUnmapError> {
-        unsafe { self.write().release_all() }.map_err(VmemUnmapError::UnmapError)
+        // SAFETY: The caller guarantees that no released memory is still in use.
+        unsafe { self.lock_for_update().release_all() }.map_err(VmemUnmapError::UnmapError)
     }
 
     /// Expands (or shrinks) an existing memory mapping
@@ -476,7 +479,7 @@ where
         new_size: usize,
         may_move: bool,
     ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
-        let mut vmem = self.write();
+        let mut vmem = self.lock_for_update();
         let old_end = old_addr
             .as_usize()
             .checked_add(old_size)
@@ -527,7 +530,7 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemUnmapError> {
-        let mut vmem = self.write();
+        let mut vmem = self.lock_for_update();
         let start = ptr.as_usize();
         let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::UnAligned)?;
         unsafe { vmem.remove_mapping(range) }
@@ -553,7 +556,7 @@ where
         len: usize,
         anonymous_only: bool,
     ) -> Result<(), VmemResetError> {
-        let mut vmem = self.write();
+        let mut vmem = self.lock_for_update();
         let start = ptr.as_usize();
         let range = PageRange::new(start, start + len).ok_or(VmemResetError::UnAligned)?;
         unsafe { vmem.reset_pages(range, anonymous_only) }
@@ -571,7 +574,7 @@ where
         len: usize,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), VmemProtectError> {
-        let mut vmem = self.write();
+        let mut vmem = self.lock_for_update();
         let start = ptr.as_usize();
         let end = start.saturating_add(len);
         let range = PageRange::new(start, end).ok_or(VmemProtectError::InvalidRange(start..end))?;
@@ -731,7 +734,7 @@ where
         let Some(memory) = issue()? else {
             return Ok(None);
         };
-        let mut vmem = self.write();
+        let mut vmem = self.lock_for_update();
         if let Some(mapping) = area(&vmem).and_then(|vma| vma.unnamed_shared_mapping()) {
             vmem.name_shared_mapping(mapping, memory);
         }
@@ -759,7 +762,7 @@ where
             let Some(memory) = issue()? else {
                 return Ok(());
             };
-            self.write().name_shared_mapping(mapping, memory);
+            self.lock_for_update().name_shared_mapping(mapping, memory);
         }
         Ok(())
     }
@@ -894,7 +897,7 @@ where
             return Err(PageFaultError::AccessError("Invalid address"));
         }
 
-        let mut vmem = self.write();
+        let mut vmem = self.lock_for_update();
         // Find the range closest to the fault address
         let (start, vma) = {
             let (r, vma) = vmem
@@ -1110,7 +1113,7 @@ where
     {
         let (flags, suggested_addr, length, permissions) =
             Self::mmap_arguments(suggested_addr, len, prot, flags, &placement)?;
-        let mut vmem = self.write();
+        let mut vmem = self.lock_for_update();
         // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the
         // mapping.
         unsafe {
@@ -1132,10 +1135,10 @@ where
         })
     }
 
-    /// Maps one broker-authorized SysV attachment. A non-null address must be available
-    /// exactly as requested. `confirm` runs under the mapping write lock, after mapping
-    /// but before registering the attachment. It must not reenter this manager. On
-    /// failure the caller retains responsibility for broker rollback.
+    /// Maps one broker-authorized SysV attachment, `len` bytes rounded up to pages, at exactly
+    /// `addr` if it is `Some` and free, and registers it once `confirm` succeeds. `confirm`
+    /// runs under the mapping write lock and must not reenter this manager. A failed
+    /// confirmation unmaps the attachment again.
     ///
     /// # Panics
     ///
@@ -1143,9 +1146,8 @@ where
     ///
     /// # Safety
     ///
-    /// If confirmation fails, the newly mapped range is unmapped. The caller must
-    /// prevent host users (including Rust borrows) that would require it to stay mapped
-    /// from accessing that range before confirmation.
+    /// The caller must keep host users that require the new mapping to stay mapped, including
+    /// Rust borrows, from it until confirmation succeeds.
     pub unsafe fn attach_sysv(
         &self,
         addr: Option<usize>,
@@ -1173,35 +1175,29 @@ where
         };
         let mut flags = MapFlags::MAP_SHARED;
         flags.set(MapFlags::MAP_FIXED_NOREPLACE, addr.is_some());
-        let (flags, addr, length, permissions) =
+        let (flags, address, length, permissions) =
             Self::mmap_arguments(addr, len, prot, flags, &MmapPlacement::GUEST)?;
-        let mut vmem = self.write();
-        if vmem.sysv_adjust.is_none() {
+        let mut vmem = self.lock_for_update();
+        if vmem.sysv_publish.is_none() {
             return Err(Errno::ENOSYS);
         }
-        // SAFETY: shmat never replaces mappings, and vmem holds its lock until the limits
-        // and attachment identity have been recorded.
-        let ptr = unsafe {
-            vmem.create_shared_object_mapping(addr, length, flags, permissions, None, mapping)
-        }
-        .map_err(|error| match error {
-            AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform
-                if addr.is_some() =>
-            {
-                Errno::EINVAL
-            }
-            AllocationError::UnsupportedByPlatform => Errno::ENOSYS,
-            error => error.into(),
-        })?;
-        let base = ptr.as_usize();
-        if let Err(error) = confirm() {
-            let range = PageRange::new(base, base + len).unwrap();
-            // SAFETY: The caller excludes host users until confirmation completes.
-            unsafe { vmem.remove_mapping(range) }.expect("failed to roll back unconfirmed shmat");
-            return Err(error);
-        }
-        vmem.register_sysv(base..base + len, id, readonly);
-        Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr))
+        let placement = SysvPlacement {
+            address,
+            length,
+            flags,
+            permissions,
+        };
+        // SAFETY: The caller excludes host users until confirmation succeeds.
+        unsafe { vmem.attach_sysv(placement, mapping, id, confirm) }
+            .map(UserPtrMut::from_platform_ptr::<Platform>)
+            .map_err(|error| match error {
+                SysvAttachError::Map(
+                    AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform,
+                ) if addr.is_some() => Errno::EINVAL,
+                SysvAttachError::Map(AllocationError::UnsupportedByPlatform) => Errno::ENOSYS,
+                SysvAttachError::Map(error) => error.into(),
+                SysvAttachError::Confirm(error) => error,
+            })
     }
 
     /// Detaches the remaining pages of a SysV attachment originally placed at `base`.
@@ -1213,7 +1209,7 @@ where
     /// Guest permission to detach and the mapping write lock do not establish this.
     pub unsafe fn detach_sysv(&self, base: usize) -> Result<(), Errno> {
         // SAFETY: The caller excludes host users of every selected fragment.
-        unsafe { self.write().detach_sysv(base) }
+        unsafe { self.lock_for_update().detach_sysv(base) }
     }
 
     /// Handle syscall `msync`.

@@ -262,7 +262,7 @@ impl SharedObjectDelivery for SectionDelivery {
         self.deliver_section(object, writable, end, true)
     }
 
-    fn deliver_sysv(
+    fn deliver_segment(
         &self,
         object: &dyn SharedFileObject,
         writable: bool,
@@ -293,7 +293,7 @@ impl SectionDelivery {
 }
 
 /// Creates a writable section of the file `file`, `size` bytes long, extending the file if it
-/// is shorter.
+/// is shorter. Only an `executable` section can back executable views.
 fn section(
     file: windows_sys::Win32::Foundation::HANDLE,
     size: u64,
@@ -421,27 +421,27 @@ mod tests {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
         #[test]
-        fn sysv_sections_are_non_executable() {
+        fn segment_sections_are_non_executable() {
             // SAFETY: The pseudo-handle names this process and is always valid.
             let process = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
             let delivery = SectionDelivery::new(process).unwrap();
             let object = TempFileMemoryProvider.create_segment(4096).unwrap();
             for writable in [false, true] {
-                let token = delivery.deliver_sysv(&*object, writable, 4096).unwrap();
+                let token = delivery.deliver_segment(&*object, writable, 4096).unwrap();
                 // SAFETY: This test exclusively owns the newly delivered handle.
                 let section = unsafe {
                     OwnedHandle::from_raw_handle(usize::try_from(token).unwrap() as HANDLE)
                 };
                 let maps = |access| {
-                    // SAFETY: Maps from the live section, unmapping any resulting view immediately.
-                    unsafe {
-                        let view = MapViewOfFile(section.as_raw_handle(), access, 0, 0, 4096);
-                        if view.Value.is_null() {
-                            return false;
-                        }
-                        assert_ne!(UnmapViewOfFile(view), 0);
-                        true
+                    // SAFETY: Maps a view of the live section, which nothing else uses.
+                    let view =
+                        unsafe { MapViewOfFile(section.as_raw_handle(), access, 0, 0, 4096) };
+                    if view.Value.is_null() {
+                        return false;
                     }
+                    // SAFETY: Unmaps the view just mapped, which nothing borrows.
+                    assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
+                    true
                 };
                 assert!(maps(FILE_MAP_READ));
                 assert_eq!(maps(FILE_MAP_READ | FILE_MAP_WRITE), writable);

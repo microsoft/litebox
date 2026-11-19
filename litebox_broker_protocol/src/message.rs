@@ -37,6 +37,10 @@ use crate::readiness_queue::{
     AddReadinessQueueEntryRequest, CreateReadinessQueueResponse, ModifyReadinessQueueEntryRequest,
     ReadinessQueueError, RemoveReadinessQueueEntryRequest, TakeReadyRequest, TakeReadyResponse,
 };
+use crate::segment::{
+    GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
+    SegmentStatus, SetSegmentAttachmentsRequest, SetSegmentRequest,
+};
 use crate::shared_buffer::SharedBufferSequence;
 use crate::shared_futex::{
     CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
@@ -122,7 +126,7 @@ wire_enum! {
         /// Vsock socket request family.
         VsockSocket(VsockSocketRequest),
         /// Keyed shared segment request family.
-        Segment(crate::segment::SegmentRequest),
+        Segment(SegmentRequest),
     }
 }
 
@@ -387,6 +391,38 @@ wire_enum! {
         Wake(FutexWakeRequest),
         /// Disarm a futex waiter, reporting whether it was woken.
         Disarm(FutexDisarmRequest),
+    }
+}
+
+wire_enum! {
+    /// Request about keyed shared segments in the caller's namespace, or about
+    /// the caller's attachments, which outlive a move to another namespace.
+    ///
+    /// Ordinary guest-visible failures are [`SegmentResponse::Failed`].
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SegmentRequest {
+        /// Look up a key, optionally creating a segment.
+        Get(GetSegmentRequest),
+        /// Read a segment's metadata.
+        Status(u32),
+        /// Change a segment's owner and permission bits.
+        Set(SetSegmentRequest),
+        /// Unpublish a segment's key; it is freed once no attachments or
+        /// reservations remain.
+        Remove(u32),
+        /// Reserve an attachment and deliver the backing object, without
+        /// changing metadata.
+        PrepareAttach(PrepareSegmentAttachRequest),
+        /// Record a reserved attachment after the caller mapped the backing object.
+        ConfirmAttach(SegmentAttachId),
+        /// Release an unused reservation without recording an attach or detach.
+        CancelAttach(SegmentAttachId),
+        /// Replace the caller's attachment count after splitting or releasing
+        /// mapped regions.
+        SetAttachments(SetSegmentAttachmentsRequest),
+        /// Copy the caller's attachments to its pending child, which inherits
+        /// its address space.
+        Inherit(ProcessId),
     }
 }
 
@@ -691,8 +727,8 @@ wire_enum! {
         VsockSocket(VsockSocketResponse),
         /// Operation failed with an ABI-neutral broker error.
         Error(ErrorCode),
-        /// Outcome of a shared segment operation.
-        Segment(crate::segment::SegmentResponse),
+        /// Keyed shared segment response family.
+        Segment(SegmentResponse),
     }
 }
 
@@ -771,6 +807,33 @@ wire_enum! {
         /// Waiting, resource, and request-validation failures use
         /// [`BrokerResult::Error`] instead.
         Failed(ReadinessQueueError),
+    }
+}
+
+wire_enum! {
+    /// Response about keyed shared segments.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SegmentResponse {
+        /// The segment's ID.
+        Get(u32),
+        /// The segment's metadata.
+        Status(SegmentStatus),
+        /// The owner and permission bits were changed.
+        Set,
+        /// The key was unpublished.
+        Remove,
+        /// The attachment was reserved and its backing object delivered.
+        PrepareAttach(PreparedSegmentAttach),
+        /// The attachment was recorded.
+        ConfirmAttach,
+        /// The reservation was released.
+        CancelAttach,
+        /// The attachment count was replaced.
+        SetAttachments,
+        /// The pending child holds copies of the caller's attachments.
+        Inherit,
+        /// Segment operation failed with a guest-visible error.
+        Failed(FileError),
     }
 }
 

@@ -310,12 +310,18 @@ fn build_broker(
         .map(|path| start_vsock_bridge(path, VsockCid(args.vsock_guest_cid)))
         .transpose()?;
     #[cfg(target_os = "linux")]
-    let policy = policy.with_segment_user(args.segment_user()?);
-    // The Windows-hosted Linux runner currently runs guests as UID/GID 1000.
+    let guest = args.segment_user()?;
+    // The Windows-hosted Linux runner always runs guests with the default credentials.
     #[cfg(windows)]
-    let policy = policy.with_segment_user(litebox_broker_protocol::fs::FileUser {
-        user: 1000,
-        group: 1000,
+    let guest = litebox_broker_protocol::fs::FileUser {
+        user: litebox_common_linux::DEFAULT_GUEST_UID,
+        group: litebox_common_linux::DEFAULT_GUEST_GID,
+    };
+    // The guest's segment requests act with its launch credentials. Linux guests have the
+    // privilege of `CAP_IPC_OWNER` and `CAP_SYS_ADMIN` as root.
+    let policy = policy.with_segment_principal(litebox_broker_core::SegmentPrincipal {
+        user: guest,
+        privileged: guest.user == 0,
     });
     let mut builder = BrokerCoreBuilder::new(policy)
         .with_limits(limits)
@@ -391,26 +397,16 @@ where
         .mount_nestable("/", |allocators| {
             let in_mem = InMem::<Platform>::new_initialized(entries, allocators.next());
             // One limit (`BrokerCoreLimits::max_shared_files`) bounds the host resources of every
-            // guest. Mapped files keep their slots until deleted, so one guest can use them all up and
-            // make other guests' mappings fail as out of memory (see `InMem::with_shared_memory`).
-            // Zero keeps every file in broker memory.
-            #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-            let in_mem = if max_shared_files == 0 {
-                in_mem
-            } else {
-                #[cfg(target_os = "linux")]
-                let provider =
-                    litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider;
-                #[cfg(all(windows, target_arch = "x86_64"))]
-                let provider =
-                    litebox_broker_userland::shared_objects::windows::TempFileMemoryProvider;
-                in_mem.with_shared_memory(
-                    Arc::new(provider),
-                    Arc::new(SharedFileLimit::new(max_shared_files)),
-                )
+            // guest's files. Mapped files keep their slots until deleted, so one guest can use them
+            // all up and make other guests' mappings fail as out of memory (see
+            // `InMem::with_shared_memory`). Zero keeps every file in broker memory.
+            let provider = litebox_broker_userland::shared_objects::host_memory_provider()
+                .filter(|_| max_shared_files != 0);
+            let in_mem = match provider {
+                Some(provider) => in_mem
+                    .with_shared_memory(provider, Arc::new(SharedFileLimit::new(max_shared_files))),
+                None => in_mem,
             };
-            #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
-            let _ = max_shared_files;
             Overlay::<Platform>::new(
                 in_mem,
                 TarRo::new(tar_data, allocators.next()),
@@ -470,9 +466,9 @@ impl CliArgs {
         } else {
             (
                 self.guest_uid
-                    .unwrap_or(litebox_runner_linux_userland::DEFAULT_GUEST_UID),
+                    .unwrap_or(litebox_common_linux::DEFAULT_GUEST_UID),
                 self.guest_gid
-                    .unwrap_or(litebox_runner_linux_userland::DEFAULT_GUEST_GID),
+                    .unwrap_or(litebox_common_linux::DEFAULT_GUEST_GID),
             )
         };
         Ok(litebox_broker_protocol::fs::FileUser { user, group })
@@ -786,7 +782,7 @@ mod cli_tests {
             args.segment_user().unwrap(),
             litebox_broker_protocol::fs::FileUser {
                 user: 0,
-                group: litebox_runner_linux_userland::DEFAULT_GUEST_GID
+                group: litebox_common_linux::DEFAULT_GUEST_GID
             }
         );
         let other = CliArgs::try_parse_from([

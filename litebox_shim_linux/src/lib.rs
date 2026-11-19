@@ -471,15 +471,16 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     /// Build the shim.
     pub fn build(self) -> LinuxShim<Platform> {
         let litebox = Arc::new(self.litebox);
-        // The child's native clone inherits the VMAs but must debit its own broker connection.
-        // The hook must not keep this LiteBox alive with the memory manager; once it is gone, the
-        // broker has released all of this process's attachments.
+        // The child's native clone inherits the VMAs but must publish to its own broker
+        // connection. The publisher must not keep this LiteBox alive with the memory manager; once
+        // it is gone, the broker has released all of this process's attachments.
         let segment_client = Arc::downgrade(&litebox);
-        self.memory_manager.set_sysv_adjust(move |id, delta| {
+        self.memory_manager.set_sysv_publisher(move |id, count| {
             if let Some(litebox) = segment_client.upgrade()
-                && let Err(error) = litebox.adjust_segment_attachments(id, delta)
+                && let Err(error) = litebox.set_segment_attachments(id, count)
             {
-                litebox_util_log::warn!(id, delta, error:?; "failed to update shared segment attachment count");
+                // The segment's next publication, with its full count, makes up for this one.
+                litebox_util_log::warn!(id, count, error:?; "failed to update shared segment attachment count");
             }
         });
         let global = Arc::new(GlobalState {
