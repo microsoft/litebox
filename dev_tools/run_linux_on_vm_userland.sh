@@ -160,7 +160,11 @@ if [[ $VMM == qemu && $client_tests -ne 0 ]] && ! command -v "$VHOST_DEVICE_VSOC
     echo "error: no $VHOST_DEVICE_VSOCK, which the tests with a programs.json need" >&2
     exit 2
 fi
+# Whether the hybrid vsock may pass the guest's half-close on (Cloud
+# Hypervisor's does from v53), for the host clients.
+half_close=0
 if [[ $VMM == cloud-hypervisor ]]; then
+    half_close=1
     TAP=litebox$$
     sudo -n ip tuntap add dev "$TAP" mode tap user "$(id -u)" ||
         { echo "error: Cloud Hypervisor's network needs passwordless sudo (see the header)" >&2; exit 2; }
@@ -290,7 +294,8 @@ run_clients() {
     local host=
     wait_vsock_started "$1" || return 1
     if [[ -f "$TESTS_DIR/$test.host.py" ]]; then
-        TIMEOUT=$TIMEOUT python3 "$TESTS_DIR/$test.host.py" "$WORK/$1.vsock" "$WORK/$1.stdout" \
+        TIMEOUT=$TIMEOUT VSOCK_HALF_CLOSE=$half_close \
+            python3 "$TESTS_DIR/$test.host.py" "$WORK/$1.vsock" "$WORK/$1.stdout" \
             >"$WORK/$1.host" 2>&1 &
         host=$!
     fi

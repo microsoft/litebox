@@ -251,7 +251,8 @@ fn find_soft_off(info: &BootInfo) {
     match acpi::soft_off(&memory, info.rsdp.map(PhysAddr::as_u64)) {
         Ok(soft_off) => {
             litebox_util_log::debug!(soft_off:? = soft_off; "ACPI soft-off");
-            litebox_hal::power::set_soft_off(soft_off);
+            // Safety: from the firmware's FADT and DSDT, which it is trusted for.
+            unsafe { litebox_hal::power::set_soft_off(soft_off) };
         }
         Err(error) => litebox_util_log::warn!(
             error:% = error;

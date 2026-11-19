@@ -36,7 +36,7 @@ impl SoftOff {
     fn enter(self) {
         use x86_64::instructions::port::Port;
         match self {
-            // Safety: the firmware's sleep register, for this write.
+            // Safety: the firmware's sleep control register (`set_soft_off`).
             Self::SleepControl { port, value } => unsafe { Port::<u8>::new(port).write(value) },
             Self::Pm1 { a, b } => {
                 let mut typed = [None; 2];
@@ -45,8 +45,9 @@ impl SoftOff {
                         continue;
                     };
                     let mut register = Port::<u16>::new(port);
-                    // Safety: the firmware's PM1 control register, of which
-                    // only the sleep type and enable bits change.
+                    // Safety: the firmware's PM1 control register
+                    // (`set_soft_off`), of which only the sleep type and
+                    // enable bits change.
                     let value = (unsafe { register.read() } & !(PM1_SLP_TYP | PM1_SLP_EN))
                         | ((u16::from(sleep_type) << PM1_SLP_TYP_SHIFT) & PM1_SLP_TYP);
                     // Safety: as above.
@@ -65,7 +66,12 @@ impl SoftOff {
 static SOFT_OFF: spin::Once<SoftOff> = spin::Once::new();
 
 /// Has [`exit`] enter S5 this way; later calls are ignored.
-pub fn set_soft_off(soft_off: SoftOff) {
+///
+/// # Safety
+///
+/// The ports must be the firmware's sleep registers, and the values its S5
+/// sleep types, e.g., from [`crate::acpi::soft_off`].
+pub unsafe fn set_soft_off(soft_off: SoftOff) {
     SOFT_OFF.call_once(|| soft_off);
 }
 

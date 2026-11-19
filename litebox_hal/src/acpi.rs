@@ -352,9 +352,9 @@ mod aml {
 }
 
 /// `SLP_TYPa` and `SLP_TYPb`, without an AML interpreter: from the first
-/// `Name (_S5, Package () {...})` whose first elements are integer constants.
-/// As in ACPICA, a one-element package holds both, `SLP_TYPa` in its low
-/// byte.
+/// `Name (_S5, Package () {...})` whose first elements are integer constants
+/// up to 7. As in ACPICA, a one-element package holds both, `SLP_TYPa` in its
+/// low byte.
 fn s5_sleep_types(dsdt: &[u8]) -> Result<(u8, u8), &'static str> {
     let aml = &dsdt[size_of::<SdtHeader>()..];
     (1..aml.len())
@@ -371,21 +371,31 @@ fn s5_package(aml: &[u8]) -> Option<(u8, u8)> {
     let (&aml::PACKAGE, rest) = aml.split_first()? else {
         return None;
     };
-    // `PkgLength`: bits 7:6 of its first byte count the bytes that follow.
-    let rest = rest.get(1 + usize::from(rest.first()? >> 6)..)?;
-    let (&elements, mut rest) = rest.split_first()?;
+    // `PkgLength` counts itself: bits 7:6 of its first byte count the bytes
+    // that follow, which hold the length above its first byte's low nibble.
+    let &lead = rest.first()?;
+    let more = usize::from(lead >> 6);
+    let len = if more == 0 {
+        usize::from(lead & 0x3f)
+    } else {
+        let high = (rest.get(1..=more)?.iter().rev())
+            .fold(0, |high, &byte| (high << 8) | usize::from(byte));
+        (high << 4) | usize::from(lead & 0xf)
+    };
+    let package = rest.get(1 + more..len)?;
+    let (&elements, mut rest) = package.split_first()?;
     // ACPICA rejects an empty package.
     if elements == 0 {
         return None;
     }
     let a = integer(&mut rest)?;
-    let b = if elements >= 2 {
-        integer(&mut rest)?
+    let (a, b) = if elements >= 2 {
+        (a, integer(&mut rest)?)
     } else {
-        a >> 8
+        (a & 0xff, (a >> 8) & 0xff)
     };
-    let sleep_type = |value: u64| value.to_le_bytes()[0] & 0b111;
-    Some((sleep_type(a), sleep_type(b)))
+    let sleep_type = |value: u64| u8::try_from(value).ok().filter(|&value| value <= 7);
+    Some((sleep_type(a)?, sleep_type(b)?))
 }
 
 fn integer(aml: &mut &[u8]) -> Option<u64> {
@@ -997,11 +1007,13 @@ mod tests {
     fn s5_sleep_types_are_the_first_s5_packages() {
         let types = |body: &[u8]| s5_sleep_types(&sdt(*b"DSDT", body));
         let missing = Err("no \\_S5 package in the DSDT");
-        // A 2-byte `PkgLength`, and other integer encodings; only the low 3
-        // bits count.
-        let long = [aml::PACKAGE, 0x40, 0, 2, aml::ONE, aml::DWORD, 0xb, 0, 0, 1];
+        // 2-byte `PkgLength`s, and other integer encodings.
+        let dword = [aml::DWORD, 3, 0, 0, 0];
+        let long = [&[aml::PACKAGE, 0x49, 0, 2, aml::ONE][..], &dword].concat();
         assert_eq!(types(&s5(&[aml::NAME], &long)), Ok((1, 3)));
-        let qword = [aml::QWORD, 6, 0, 0, 0, 0, 0, 0, 1];
+        let qword = [aml::QWORD, 6, 0, 0, 0, 0, 0, 0, 0];
+        let longer = [&[aml::PACKAGE, 0x42, 1, 4, aml::ONE][..], &dword, &qword].concat();
+        assert_eq!(types(&s5(&[aml::NAME], &longer)), Ok((1, 3)));
         let body = s5(&[aml::NAME], &package(&[&qword, &[aml::ZERO]]));
         assert_eq!(types(&body), Ok((6, 0)));
         // Not a name's package of integers: skipped for a later one.
@@ -1014,8 +1026,13 @@ mod tests {
             s5(&[aml::NAME], &package(&[&[0x0d, b'5', 0], &[aml::ZERO]])),
             // Truncated.
             s5(&[aml::NAME], &[aml::PACKAGE, 4, 2, aml::WORD, 5]),
-            // Empty: what follows is not its element.
+            // Empty, or ending before its second element: what follows is
+            // not its element.
             s5(&[aml::NAME], &[aml::PACKAGE, 2, 0, aml::BYTE, 5]),
+            s5(&[aml::NAME], &[aml::PACKAGE, 3, 2, aml::ZERO, aml::ZERO]),
+            // Sleep types above 7.
+            s5(&[aml::NAME], &package(&[&[aml::BYTE, 8], &[aml::ZERO]])),
+            s5(&[aml::NAME], &package(&[&[aml::WORD, 5, 8]])),
         ] {
             assert_eq!(types(&[&earlier[..], &later].concat()), Ok((2, 1)));
             assert_eq!(types(&earlier), missing);
