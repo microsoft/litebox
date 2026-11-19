@@ -72,6 +72,13 @@ fn socket_destinations_are_normalized_validated_and_routed() {
             Err(SocketError::InvalidArgument)
         );
     }
+    for ip in [Ipv4Addr::new(0, 0, 0, 1), Ipv4Addr::new(240, 0, 0, 1)] {
+        let address = SocketAddrV4::new(ip, port);
+        assert_eq!(
+            SocketAddressing::Host.normalize_destination(address),
+            Ok(address)
+        );
+    }
 }
 
 #[test]
@@ -864,7 +871,10 @@ impl TestPlatformSocket {
 }
 
 impl PlatformSocket for TestPlatformSocket {
-    fn bind(&self, binding: GuestSocketBinding) -> Result<SocketOutcome<SocketAddrV4>> {
+    fn bind(&self, request: SocketBindRequest) -> Result<SocketOutcome<SocketAddrV4>> {
+        let SocketBindRequest::Guest(binding) = request else {
+            return Err(BrokerError::Internal);
+        };
         let address = binding.local_address();
         *self.guest_binding.lock().unwrap() = Some(binding);
         self.state.binds.lock().unwrap().push(address);
@@ -961,6 +971,7 @@ impl PlatformSocket for TestPlatformSocket {
         &self,
         address: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
+        _egress: SocketEgress,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         self.state.connect_calls.fetch_add(1, Ordering::Relaxed);
         let connect_block = self.state.connect_block.lock().unwrap().take();
@@ -1515,6 +1526,7 @@ fn test_broker_with_policy(
         readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
         reserved_child_image_size: Arc::new(core::sync::atomic::AtomicU64::new(0)),
         random_provider: Arc::new(crate::random::TestRandomProvider),
+        socket_addressing: socket_provider.addressing(),
         socket_provider,
         vsock_provider: None,
         timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),
@@ -2519,7 +2531,7 @@ fn check_duplicate_port_binding_retires_socket(broker: &TestBroker, provider: &T
         .unwrap();
     let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
     assert_eq!(
-        attach_binding(&object, duplicate_address, duplicate_binding),
+        attach_binding(&object, duplicate_address, Some(duplicate_binding)),
         Err(BrokerError::Internal)
     );
     assert_eq!(
