@@ -194,12 +194,21 @@ impl DestinationPolicy {
     pub fn rules(&self) -> &[DestinationRule] {
         &self.destination_rules[..self.destination_rule_count]
     }
+
+    /// Whether a rule permits the caller to reach `destination`.
+    fn rules_permit(&self, caller_credential: CallerCredential, destination: SocketAddrV4) -> bool {
+        self.rules()
+            .iter()
+            .any(|rule| rule.permits(caller_credential, destination))
+    }
 }
 
 /// Socket creation and outbound destination access available to broker-owned sockets.
 ///
 /// Local bind authority is separate from egress destination rules and is
-/// enforced by the broker's guest binding namespace.
+/// enforced by the broker's guest binding namespace or, with
+/// [`SocketAddressing::Host`](crate::socket::SocketAddressing::Host), by the
+/// host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SocketPolicy {
     tcp: Option<DestinationPolicy>,
@@ -263,32 +272,40 @@ impl SocketPolicy {
         self.udp.is_some()
     }
 
-    fn permits_tcp_destination(
-        self,
+    /// Returns the destination rules of `protocol`, or `None` when it is
+    /// denied.
+    fn destination_policy(&self, protocol: IpProtocol) -> Option<&DestinationPolicy> {
+        match protocol {
+            IpProtocol::Tcp => self.tcp.as_ref(),
+            IpProtocol::Udp => self.udp.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Whether the caller may reach `destination` over `protocol`: any
+    /// destination within the guest network, and any other a rule permits.
+    fn permits_destination(
+        &self,
+        protocol: IpProtocol,
         caller_credential: CallerCredential,
         destination: SocketAddrV4,
     ) -> bool {
-        self.tcp.is_some_and(|policy| {
+        self.destination_policy(protocol).is_some_and(|policy| {
             is_internal_socket_address(destination)
-                || policy
-                    .rules()
-                    .iter()
-                    .any(|rule| rule.permits(caller_credential, destination))
+                || policy.rules_permit(caller_credential, destination)
         })
     }
 
-    fn permits_udp_destination(
-        self,
+    /// Whether a rule lets the caller reach `destination` over `protocol`,
+    /// within the guest network or not.
+    fn rules_permit_destination(
+        &self,
+        protocol: IpProtocol,
         caller_credential: CallerCredential,
         destination: SocketAddrV4,
     ) -> bool {
-        self.udp.is_some_and(|policy| {
-            is_internal_socket_address(destination)
-                || policy
-                    .rules()
-                    .iter()
-                    .any(|rule| rule.permits(caller_credential, destination))
-        })
+        self.destination_policy(protocol)
+            .is_some_and(|policy| policy.rules_permit(caller_credential, destination))
     }
 }
 
@@ -532,22 +549,40 @@ impl PolicyEngine {
         }
     }
 
+    /// Checks that the caller may connect to `destination` over `protocol`:
+    /// to any destination within the guest network, and to any other a rule
+    /// permits.
     pub(crate) fn authorize_socket_connect(
         &self,
         caller_credential: CallerCredential,
         protocol: IpProtocol,
         destination: SocketAddrV4,
     ) -> Result<(), BrokerError> {
-        let permitted = match protocol {
-            IpProtocol::Tcp => self
-                .socket_policy
-                .permits_tcp_destination(caller_credential, destination),
-            IpProtocol::Udp => self
-                .socket_policy
-                .permits_udp_destination(caller_credential, destination),
-            _ => false,
-        };
-        if permitted {
+        if self
+            .socket_policy
+            .permits_destination(protocol, caller_credential, destination)
+        {
+            Ok(())
+        } else {
+            Err(BrokerError::PolicyDenied)
+        }
+    }
+
+    /// Checks that a rule lets the caller connect to `destination` over
+    /// `protocol`, exempting no destination. With
+    /// [`SocketAddressing::Host`](crate::socket::SocketAddressing::Host),
+    /// loopback and the guest's own addresses are the host's, so only the
+    /// provider can tell which of its own listeners serve them.
+    pub(crate) fn authorize_socket_connect_by_rules(
+        &self,
+        caller_credential: CallerCredential,
+        protocol: IpProtocol,
+        destination: SocketAddrV4,
+    ) -> Result<(), BrokerError> {
+        if self
+            .socket_policy
+            .rules_permit_destination(protocol, caller_credential, destination)
+        {
             Ok(())
         } else {
             Err(BrokerError::PolicyDenied)

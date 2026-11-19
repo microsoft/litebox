@@ -75,7 +75,7 @@ pub use process::{
     ProcessLifecycleSink, ProcessShutdown, ResourceLimitEnforcement,
 };
 use random::RandomProvider;
-use socket::{BrokerSocketPorts, SocketProvider};
+use socket::{BrokerSocketPorts, SocketAddressing, SocketProvider};
 use timer::TimerProvider;
 use vsock_socket::VsockProvider;
 
@@ -374,6 +374,8 @@ pub struct BrokerCore {
     pub(crate) reserved_child_image_size: Arc<AtomicU64>,
     pub(crate) random_provider: Arc<dyn RandomProvider>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
+    /// How [`Self::socket_provider`] addresses sockets, read once at start.
+    pub(crate) socket_addressing: SocketAddressing,
     pub(crate) vsock_provider: Option<Arc<dyn VsockProvider>>,
     pub(crate) timer_provider: Arc<dyn TimerProvider>,
     pub(crate) socket_ports: BrokerSocketPorts,
@@ -418,6 +420,7 @@ impl BrokerCore {
             shared_futexes: Arc::default(),
             reserved_child_image_size: Arc::new(AtomicU64::new(0)),
             random_provider,
+            socket_addressing: socket_provider.addressing(),
             socket_provider,
             vsock_provider,
             timer_provider,
