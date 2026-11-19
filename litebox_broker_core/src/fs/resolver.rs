@@ -8,6 +8,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::marker::PhantomData;
 
 use litebox_broker_protocol::authority::{Principal, Scope, Subject};
@@ -30,6 +31,7 @@ use super::{
 };
 use super::{SeekWhence, UserInfo};
 use crate::authority::Authority;
+use crate::descriptor::handle::{HandleGrants, HandleUse};
 use crate::descriptor::mutation::{MutationContext, MutationError};
 use crate::descriptor::profile::FileSystemProfile;
 use crate::descriptor::{FileKind as DescriptorKind, RemovalDenied, Rights, SecurityDescriptor};
@@ -88,8 +90,58 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         }
     }
 
+    /// The profile of a resolver built with [`Self::with_credentials`], which bounds the
+    /// descriptors guests store and the grants of the handles it opens; `None` for one built with
+    /// [`Self::new`].
+    #[must_use]
+    pub fn profile(&self) -> Option<FileSystemProfile> {
+        self.profile
+    }
+
     fn entry_handle<'e>(&self, entry: &'e ResolverEntry<Backend>) -> Option<&'e Handle> {
         Arc::ptr_eq(&self.instance, &entry.instance).then_some(&entry.handle)
+    }
+
+    /// How `caller` may use `right` through `entry`, whose open mode allows it: without another
+    /// check (`None`) on a resolver that checks POSIX users or under a grant that the handle
+    /// cached, only if the object's current descriptor grants it to `caller`'s subject (`Some`),
+    /// or (failing with `denied`) not at all, if it is outside the handle's operation mask (see
+    /// [`HandleGrants`]).
+    ///
+    /// Fails with `refused` for a caller of the wrong kind, or for no caller where a subject must
+    /// be checked.
+    fn check_use<'c, E>(
+        &self,
+        caller: Option<Caller<'c>>,
+        entry: &ResolverEntry<Backend>,
+        right: Rights,
+        denied: E,
+        refused: E,
+    ) -> Result<Option<AtUse<'c>>, E> {
+        let context = match caller.map(|caller| self.context(caller)) {
+            None => None,
+            Some(Ok(context)) => Some(context),
+            Some(Err(_)) => return Err(refused),
+        };
+        if self.profile.is_none() {
+            return Ok(None);
+        }
+        // Every entry that a resolver authorizing subjects opens has grants.
+        let Some(grants) = entry.grants else {
+            return Err(refused);
+        };
+        match grants.decide(right) {
+            HandleUse::Denied => Err(denied),
+            HandleUse::Cached => Ok(None),
+            HandleUse::CheckAtUse => match context {
+                Some(Context::Credentialed(context)) => Ok(Some(AtUse {
+                    context,
+                    grants,
+                    right,
+                })),
+                Some(Context::Legacy(_)) | None => Err(refused),
+            },
+        }
     }
 
     /// The context for an operation by `caller`, which must be of the kind this resolver checks.
@@ -151,6 +203,45 @@ impl From<UserInfo> for Caller<'_> {
 enum Context<'a> {
     Legacy(UserInfo),
     Credentialed(MutationContext<'a>),
+}
+
+/// A use of `right` through a handle with `grants` that the object's current descriptor must
+/// grant to the subject of `context`, checked where the use happens.
+#[derive(Clone, Copy)]
+struct AtUse<'a> {
+    context: MutationContext<'a>,
+    grants: HandleGrants,
+    right: Rights,
+}
+
+impl AtUse<'_> {
+    /// Whether the object's current `descriptor` authorizes the use.
+    fn authorizes(&self, descriptor: &SecurityDescriptor) -> bool {
+        self.context.profile.honors(descriptor)
+            && self
+                .grants
+                .granted_at_use(descriptor, self.context.subject, self.right)
+                == self.right
+    }
+}
+
+/// The rights that a handle to an object of `kind` may attempt given its open mode, which lets it
+/// read or list (`read`) and write (`write`) data only if opened to, and the rights that its open
+/// requests, which are just those.
+fn handle_request(kind: DescriptorKind, read: bool, write: bool) -> (Rights, Rights) {
+    let mut requested = Rights::empty();
+    let data = match kind {
+        DescriptorKind::File => {
+            requested.set(Rights::READ, read);
+            requested.set(Rights::WRITE, write);
+            Rights::READ | Rights::WRITE
+        }
+        DescriptorKind::Directory => {
+            requested.set(Rights::LIST, read);
+            Rights::LIST
+        }
+    };
+    (kind.rights() & !(data & !requested), requested)
 }
 
 impl Context<'_> {
@@ -779,7 +870,14 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// object it creates for an admitted subject in [`Scope::Access`] (such as a pseudo-terminal
     /// subsidiary) belongs to the subject's owner and group.
     ///
+    /// A subject's open must be granted the rights that its mode requests (reading or listing,
+    /// and writing) only where the profile's [`HandleRules`] gate them at open, and also
+    /// [`Rights::WRITE`] to truncate; the entry's [`HandleGrants`] record what it may attempt and
+    /// which grants it caches. An open that creates its file is admitted without consulting the
+    /// new descriptor, and gains no other grant.
+    ///
     /// [`Backend::open_file_checked`]: super::backend::Backend::open_file_checked
+    /// [`HandleRules`]: crate::descriptor::profile::HandleRules
     fn open_entry(
         &self,
         context: Context<'_>,
@@ -830,8 +928,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             })?;
         let append_mode = flags.contains(OFlags::APPEND);
         let nonblocking = flags.contains(OFlags::NONBLOCK);
-        let entry = |handle, seek_behavior| ResolverEntry {
+        let entry = |handle, seek_behavior, grants| ResolverEntry {
             handle,
+            grants,
             instance: Arc::clone(&self.instance),
             _backend: core::marker::PhantomData,
             read_allowed,
@@ -859,19 +958,72 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             Resolution::Found(ResolvedTarget::Dir(dir)) => {
                 // XXX(jayb): non-read, non-PATH dir opens check search instead of read
                 // (#884/#888 workaround); Linux returns EISDIR for write opens.
-                if !path_only
-                    && let PermissionCheck::ByResolver(permissions) = &dir.permissions
-                    && if read_allowed {
-                        !context.can_read(permissions)
-                    } else {
-                        !context.can_execute(permissions)
+                let (handle, grants) = match &context {
+                    Context::Legacy(_) => {
+                        if !path_only
+                            && let PermissionCheck::ByResolver(permissions) = &dir.permissions
+                            && if read_allowed {
+                                !context.can_read(permissions)
+                            } else {
+                                !context.can_execute(permissions)
+                            }
+                        {
+                            return Err(OpenError::AccessNotAllowed);
+                        }
+                        (self.backend.open_dir(dir, flags)?, None)
                     }
-                {
-                    return Err(OpenError::AccessNotAllowed);
-                }
+                    Context::Credentialed(actor) => {
+                        let (eligible, requested) = handle_request(
+                            DescriptorKind::Directory,
+                            read_allowed && !path_only,
+                            false,
+                        );
+                        let admit = |descriptor: &SecurityDescriptor| {
+                            HandleGrants::admit(
+                                actor.profile.handle_rules(DescriptorKind::Directory),
+                                DescriptorKind::Directory,
+                                eligible,
+                                requested,
+                                descriptor,
+                                actor.subject,
+                            )
+                            .ok_or(OpenError::AccessNotAllowed)
+                        };
+                        if path_only {
+                            // Resolution reaches only honored broker-owned objects for a
+                            // subject. Requesting nothing, a path-only open checks no access,
+                            // so admitting the descriptor as resolved races with nothing.
+                            let PermissionCheck::ByResolver(permissions) = &dir.permissions else {
+                                return Err(OpenError::Io);
+                            };
+                            let descriptor =
+                                permissions.broker_descriptor().ok_or(OpenError::Io)?;
+                            let grants = admit(descriptor)?;
+                            (self.backend.open_dir(dir, flags)?, Some(grants))
+                        } else {
+                            // Admitted against the opened directory's current descriptor, under
+                            // the lock that changes to it take.
+                            let admitted = Cell::new(None);
+                            let handle =
+                                self.backend.open_dir_checked(dir, flags, &|descriptor| {
+                                    if !actor.profile.honors(descriptor)
+                                        || (!read_allowed
+                                            && !descriptor
+                                                .allows_file(actor.subject, Rights::TRAVERSE))
+                                    {
+                                        return Err(OpenError::AccessNotAllowed);
+                                    }
+                                    admitted.set(Some(admit(descriptor)?));
+                                    Ok(())
+                                })?;
+                            (handle, Some(admitted.get().ok_or(OpenError::Io)?))
+                        }
+                    }
+                };
                 Ok(entry(
-                    Handle::Dir(self.backend.open_dir(dir, flags)?),
+                    Handle::Dir(handle),
                     SeekBehavior::NonSeekable,
+                    grants,
                 ))
             }
             Resolution::Found(ResolvedTarget::File(file)) => {
@@ -889,30 +1041,53 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 if flags.contains(OFlags::DIRECTORY) {
                     return Err(PathError::ComponentNotADirectory.into());
                 }
-                let wants_write = write_allowed || flags.contains(OFlags::TRUNC);
+                let truncating = flags.contains(OFlags::TRUNC);
+                let wants_write = write_allowed || truncating;
+                let (eligible, requested) = handle_request(
+                    DescriptorKind::File,
+                    read_allowed && !path_only,
+                    write_allowed && !path_only,
+                );
+                // What a subject's open needs: the open-gated rights it requests, and to truncate,
+                // WRITE, which a truncating open uses at once.
+                let needed = |profile: FileSystemProfile| {
+                    let mut needed = requested
+                        & eligible
+                        & profile.handle_rules(DescriptorKind::File).open_gated;
+                    needed.set(Rights::WRITE, needed.contains(Rights::WRITE) || truncating);
+                    needed
+                };
                 if !path_only && let PermissionCheck::ByResolver(permissions) = &file.permissions {
                     if wants_write && permissions.on_read_only_fs() {
                         return Err(OpenError::ReadOnlyFileSystem);
                     }
-                    if (read_allowed && !context.can_read(permissions))
-                        || (wants_write && !context.can_write(permissions))
-                    {
+                    let denied = match &context {
+                        Context::Legacy(_) => {
+                            (read_allowed && !context.can_read(permissions))
+                                || (wants_write && !context.can_write(permissions))
+                        }
+                        Context::Credentialed(actor) => {
+                            let needed = needed(actor.profile);
+                            !permissions
+                                .broker_descriptor()
+                                .filter(|descriptor| actor.profile.honors(descriptor))
+                                .is_some_and(|descriptor| {
+                                    needed.is_empty()
+                                        || descriptor.allows_file(actor.subject, needed)
+                                })
+                        }
+                    };
+                    if denied {
                         return Err(OpenError::AccessNotAllowed);
                     }
                 }
-                let file = match &context {
-                    Context::Legacy(_) => self.backend.open_file(file, flags)?,
+                let (file, grants) = match &context {
+                    Context::Legacy(_) => (self.backend.open_file(file, flags)?, None),
                     Context::Credentialed(context) => {
-                        let rights = if path_only {
-                            Rights::empty()
-                        } else {
-                            let mut rights = Rights::empty();
-                            rights.set(Rights::READ, read_allowed);
-                            rights.set(Rights::WRITE, wants_write);
-                            rights
-                        };
                         let subject = context.subject;
-                        self.backend.open_file_checked(
+                        let rules = context.profile.handle_rules(DescriptorKind::File);
+                        let admitted = Cell::new(None);
+                        let file = self.backend.open_file_checked(
                             file,
                             flags,
                             &OpenChecks {
@@ -921,22 +1096,34 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                                     group: subject.group,
                                 },
                                 admit: &|descriptor| {
-                                    if context.profile.honors(descriptor)
-                                        && (rights.is_empty()
-                                            || descriptor.allows_file(subject, rights))
+                                    if !context.profile.honors(descriptor)
+                                        || (truncating
+                                            && !descriptor.allows_file(subject, Rights::WRITE))
                                     {
-                                        Ok(())
-                                    } else {
-                                        Err(OpenError::AccessNotAllowed)
+                                        return Err(OpenError::AccessNotAllowed);
                                     }
+                                    admitted.set(Some(
+                                        HandleGrants::admit(
+                                            rules,
+                                            DescriptorKind::File,
+                                            eligible,
+                                            requested,
+                                            descriptor,
+                                            subject,
+                                        )
+                                        .ok_or(OpenError::AccessNotAllowed)?,
+                                    ));
+                                    Ok(())
                                 },
                                 content_change: &|descriptor| context.content_change(descriptor),
                             },
-                        )?
+                        )?;
+                        // A backend that opened the file without admitting it opened nothing.
+                        (file, Some(admitted.get().ok_or(OpenError::Io)?))
                     }
                 };
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(entry(Handle::File(file), seek_behavior))
+                Ok(entry(Handle::File(file), seek_behavior, grants))
             }
             Resolution::MissingFinal { parent } if flags.contains(OFlags::CREAT) => {
                 let Some(name) = components.last() else {
@@ -949,14 +1136,25 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     OpenError::ReadOnlyFileSystem,
                     OpenError::NoWritePerms,
                 )?;
-                let file = match &context {
-                    Context::Legacy(user) => self.backend.create_file_at(
-                        parent,
-                        name,
-                        CreationMetadata::posix(FileType::RegularFile, mode, *user),
-                    )?,
+                let (file, grants) = match &context {
+                    Context::Legacy(user) => (
+                        self.backend.create_file_at(
+                            parent,
+                            name,
+                            CreationMetadata::posix(FileType::RegularFile, mode, *user),
+                        )?,
+                        None,
+                    ),
                     Context::Credentialed(context) => {
-                        self.backend.create_file_checked(parent, name, &|parent| {
+                        let (eligible, requested) =
+                            handle_request(DescriptorKind::File, read_allowed, write_allowed);
+                        let grants = HandleGrants::created(
+                            context.profile.handle_rules(DescriptorKind::File),
+                            DescriptorKind::File,
+                            eligible,
+                            requested,
+                        );
+                        let file = self.backend.create_file_checked(parent, name, &|parent| {
                             creation_descriptor(
                                 context,
                                 parent,
@@ -970,18 +1168,22 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                                     MutationError::UnsupportedForm => OpenError::Io,
                                 },
                             )
-                        })?
+                        })?;
+                        (file, Some(grants))
                     }
                 };
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(entry(Handle::File(file), seek_behavior))
+                Ok(entry(Handle::File(file), seek_behavior, grants))
             }
             Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
         }
     }
 
-    pub(crate) fn read_without_position_update(
+    /// Like [`Self::read_updating_position`], but leaves the file offset unchanged, returning the
+    /// offset read at along with the number of bytes read.
+    pub fn read_entry(
         &self,
+        caller: Option<Caller<'_>>,
         entry: &ResolverEntry<Backend>,
         buf: &mut dyn ReadBuffer,
         offset: Option<usize>,
@@ -997,7 +1199,24 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         if !entry.read_allowed {
             return Err(ReadError::NotForReading);
         }
+        let at_use = self.check_use(
+            caller,
+            entry,
+            Rights::READ,
+            ReadError::NotForReading,
+            ReadError::Io,
+        )?;
+        let authorize = |descriptor: &SecurityDescriptor| {
+            at_use.is_none_or(|at_use| at_use.authorizes(descriptor))
+        };
         if let Some(controlling) = &entry.controlling_terminal {
+            if at_use.is_some()
+                && !self
+                    .backend
+                    .authorize_handle(HandleRef::File(file), &authorize)
+            {
+                return Err(ReadError::NotForReading);
+            }
             return Ok((controlling.terminal.read(buf)?, 0));
         }
 
@@ -1005,7 +1224,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        let read = self.backend.read(file, buf, read_offset)?;
+        let read = match at_use {
+            None => self.backend.read(file, buf, read_offset)?,
+            Some(_) => self
+                .backend
+                .read_checked(file, buf, read_offset, &authorize)?,
+        };
         Ok((read, read_offset))
     }
 
@@ -1024,7 +1248,29 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         buf: &mut dyn ReadBuffer,
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let (read, read_offset) = self.read_without_position_update(entry, buf, offset)?;
+        self.read_updating_position(None, entry, buf, offset)
+    }
+
+    /// Read like [`Self::read`] for `caller`, whatever opened `entry`.
+    ///
+    /// On a resolver built with [`Self::with_credentials`], a read that the handle's grants
+    /// cache needs no caller, while any other read needs `caller`'s subject to be granted
+    /// [`Rights::READ`] by the file's current descriptor, checked with the read (see
+    /// [`HandleGrants`]). It fails with [`ReadError::NotForReading`] if not granted, or outside
+    /// the handle's operation mask, and with [`ReadError::Io`] without a subject. A caller of the
+    /// wrong kind fails with [`ReadError::Io`] on any resolver.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the updated file offset would overflow `usize`.
+    pub fn read_updating_position(
+        &self,
+        caller: Option<Caller<'_>>,
+        entry: &mut ResolverEntry<Backend>,
+        buf: &mut dyn ReadBuffer,
+        offset: Option<usize>,
+    ) -> Result<usize, ReadError> {
+        let (read, read_offset) = self.read_entry(caller, entry, buf, offset)?;
         if entry.uses_position() && offset.is_none() {
             entry.position = read_offset.checked_add(read).unwrap();
         }
@@ -1062,7 +1308,24 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         if !entry.write_allowed {
             return Err(WriteError::NotForWriting);
         }
+        let at_use = self.check_use(
+            caller,
+            entry,
+            Rights::WRITE,
+            WriteError::NotForWriting,
+            WriteError::Io,
+        )?;
+        let authorize = |descriptor: &SecurityDescriptor| {
+            at_use.is_none_or(|at_use| at_use.authorizes(descriptor))
+        };
         if let Some(controlling) = &entry.controlling_terminal {
+            if at_use.is_some()
+                && !self
+                    .backend
+                    .authorize_handle(HandleRef::File(file), &authorize)
+            {
+                return Err(WriteError::NotForWriting);
+            }
             return Ok((controlling.terminal.write(buf)?, 0));
         }
 
@@ -1081,11 +1344,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         };
         let written = match &writer {
             None => self.backend.write(file, buf, write_offset)?,
-            Some(writer) => self
-                .backend
-                .write_checked(file, buf, write_offset, &|descriptor| {
-                    writer.content_change(descriptor);
-                })?,
+            Some(writer) => {
+                self.backend
+                    .write_checked(file, buf, write_offset, &authorize, &|descriptor| {
+                        writer.content_change(descriptor);
+                    })?
+            }
         };
         Ok((written, write_offset))
     }
@@ -1117,7 +1381,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// For a subject, a write of at least one byte is a content change (see
     /// [`MutationContext::content_change`]): with it, and under the same lock, the file loses
     /// the elevation grants that the subject may not preserve. Failed and empty writes change
-    /// nothing.
+    /// nothing. Unless the handle caches its grant of [`Rights::WRITE`] (see [`HandleGrants`]),
+    /// the file's current descriptor must also grant it to the subject, checked under that lock;
+    /// otherwise, or if it is outside the handle's operation mask, the write fails with
+    /// [`WriteError::NotForWriting`].
     ///
     /// # Panics
     ///
@@ -1237,7 +1504,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// For a subject, a successful truncation is a content change (see
     /// [`MutationContext::content_change`]) even if it keeps the length, as on Linux: with it,
     /// and under the same lock, the file loses the elevation grants that the subject may not
-    /// preserve. Failed truncations change nothing.
+    /// preserve. Failed truncations change nothing. As for [`Self::write_as`], it needs
+    /// [`Rights::WRITE`] cached or granted at use, failing with [`TruncateError::NotForWriting`]
+    /// otherwise.
     pub fn truncate_as<'c>(
         &self,
         caller: impl Into<Caller<'c>>,
@@ -1289,12 +1558,22 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         if !entry.write_allowed {
             return Err(TruncateError::NotForWriting);
         }
+        let at_use = self.check_use(
+            caller,
+            entry,
+            Rights::WRITE,
+            TruncateError::NotForWriting,
+            TruncateError::Io,
+        )?;
 
         match &writer {
             None => self.backend.truncate(file, length)?,
-            Some(writer) => self.backend.truncate_checked(file, length, &|descriptor| {
-                writer.content_change(descriptor);
-            })?,
+            Some(writer) => self.backend.truncate_checked(
+                file,
+                length,
+                &|descriptor| at_use.is_none_or(|at_use| at_use.authorizes(descriptor)),
+                &|descriptor| writer.content_change(descriptor),
+            )?,
         }
         Ok(())
     }
@@ -1344,11 +1623,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         Err(SetTimesError::NotTheOwner)
     }
 
-    /// Whether `subject` may make the timestamp update `times` to an object with `descriptor`:
-    /// setting both to the current time needs [`Rights::TOUCH`], and others
-    /// [`Rights::WRITE_ATTRIBUTES`].
+    /// Whether `subject` may make the timestamp update `times` through a handle with `grants` to
+    /// an object with `descriptor`: setting both to the current time needs [`Rights::TOUCH`], and
+    /// others [`Rights::WRITE_ATTRIBUTES`], each within the handle's operation mask.
     fn authorize_subject_set_times(
         subject: &Subject,
+        grants: HandleGrants,
         descriptor: &SecurityDescriptor,
         times: &SetFileTimes,
     ) -> Result<(), SetTimesError> {
@@ -1356,8 +1636,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             (times.access, times.modify),
             (FileTimeUpdate::Now, FileTimeUpdate::Now)
         );
-        let granted =
-            descriptor.granted_file_rights(subject, Rights::TOUCH | Rights::WRITE_ATTRIBUTES);
+        let granted = grants.granted_at_use(
+            descriptor,
+            subject,
+            Rights::TOUCH | Rights::WRITE_ATTRIBUTES,
+        );
         if granted.contains(Rights::WRITE_ATTRIBUTES)
             || (both_now && granted.contains(Rights::TOUCH))
         {
@@ -1370,16 +1653,40 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 
     /// Change timestamps of the object identified by an open entry.
+    ///
+    /// For a resolver authorizing subjects, this changes and authorizes against the opened object
+    /// itself, through its handle, whatever its name now.
     pub fn set_times<'c>(
         &self,
         caller: impl Into<Caller<'c>>,
         entry: &ResolverEntry<Backend>,
         times: &SetFileTimes,
     ) -> Result<(), SetTimesError> {
-        // XXX: set_times re-resolves the open path as the caller;
+        let context = self.context(caller)?;
+        let omitted = matches!(
+            (times.access, times.modify),
+            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
+        );
+        if let Context::Credentialed(context) = context {
+            // Every entry that a resolver authorizing subjects opens has grants.
+            let grants = entry.grants.ok_or(SetTimesError::Io)?;
+            let handle = self.entry_handle(entry).ok_or(SetTimesError::Io)?;
+            if omitted {
+                return Ok(());
+            }
+            // Backends on read-only file systems refuse before authorizing.
+            return self
+                .backend
+                .set_handle_times_checked(handle.as_ref(), times, &|descriptor| {
+                    if !context.profile.honors(descriptor) {
+                        return Err(SetTimesError::AccessNotAllowed);
+                    }
+                    Self::authorize_subject_set_times(context.subject, grants, descriptor, times)
+                });
+        }
+        // XXX: legacy set_times re-resolves the open path as the caller;
         // renamed/unlinked/replaced open files fail with EIO, and losing search permission on an
         // ancestor fails with EACCES, where Linux updates the open inode.
-        let context = self.context(caller)?;
         let map_walk = |error| match error {
             WalkError::Io
             | WalkError::PathError(
@@ -1403,32 +1710,14 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         {
             return Err(SetTimesError::Io);
         }
-        if matches!(
-            (times.access, times.modify),
-            (FileTimeUpdate::Omit, FileTimeUpdate::Omit)
-        ) {
+        if omitted {
             return Ok(());
         }
-        match context {
-            Context::Legacy(user) => {
-                Self::authorize_set_times(user, &target, times)?;
-                self.backend.set_times(target, times)
-            }
-            Context::Credentialed(context) => {
-                if let PermissionCheck::ByResolver(permissions) = target.permissions()
-                    && permissions.on_read_only_fs()
-                {
-                    return Err(SetTimesError::ReadOnlyFileSystem);
-                }
-                self.backend
-                    .set_times_checked(target, times, &|descriptor| {
-                        if !context.profile.honors(descriptor) {
-                            return Err(SetTimesError::AccessNotAllowed);
-                        }
-                        Self::authorize_subject_set_times(context.subject, descriptor, times)
-                    })
-            }
-        }
+        let Context::Legacy(user) = context else {
+            unreachable!("credentialed contexts returned above")
+        };
+        Self::authorize_set_times(user, &target, times)?;
+        self.backend.set_times(target, times)
     }
 
     /// Replace the descriptor of the object at `path`, following symbolic links, with `requested`
@@ -2013,12 +2302,40 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         &self,
         entry: &ResolverEntry<Backend>,
     ) -> Result<Vec<super::DirEntry>, ReadDirError> {
+        self.read_dir_as(None, entry)
+    }
+
+    /// List a directory like [`Self::read_dir`] for `caller`, whatever opened `entry`.
+    ///
+    /// On a resolver built with [`Self::with_credentials`], a listing that the handle's grants
+    /// cache needs no caller, while any other listing needs `caller`'s subject to be granted
+    /// [`Rights::LIST`] by the directory's current descriptor, checked with the listing (see
+    /// [`HandleGrants`]). It fails with [`ReadDirError::NotOpenForReading`] if not granted, or
+    /// outside the handle's operation mask, and with [`ReadDirError::Io`] without a subject. A
+    /// caller of the wrong kind fails with [`ReadDirError::Io`] on any resolver.
+    pub fn read_dir_as(
+        &self,
+        caller: Option<Caller<'_>>,
+        entry: &ResolverEntry<Backend>,
+    ) -> Result<Vec<super::DirEntry>, ReadDirError> {
         if entry.path_only || !entry.read_allowed {
             return Err(ReadDirError::NotOpenForReading);
         }
         let dir = match self.entry_handle(entry).ok_or(ReadDirError::Io)? {
             Handle::File(_) => return Err(ReadDirError::NotADirectory),
             Handle::Dir(dir) => dir,
+        };
+        let listed = match self.check_use(
+            caller,
+            entry,
+            Rights::LIST,
+            ReadDirError::NotOpenForReading,
+            ReadDirError::Io,
+        )? {
+            None => self.backend.list_dir_at(dir.clone())?,
+            Some(at_use) => self
+                .backend
+                .list_dir_checked(dir.clone(), &|descriptor| at_use.authorizes(descriptor))?,
         };
 
         let mut entries = Vec::new();
@@ -2033,7 +2350,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             file_type: FileType::Directory,
             ino_info: None,
         });
-        entries.extend(self.backend.list_dir_at(dir.clone())?);
+        entries.extend(listed);
         Ok(entries)
     }
 
@@ -2124,6 +2441,36 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         }
     }
 
+    /// Whether `caller` may now read the terminal that `entry` refers to (see [`Self::terminal`]),
+    /// as reading through `entry` would check: only if `entry` is open for reading, and, where
+    /// the handle does not cache [`Rights::READ`], only if the file's current descriptor grants
+    /// it to `caller`'s subject. Without a subject, that check fails closed.
+    ///
+    /// The file service uses this wherever access to a terminal's data, rather than control of
+    /// it, depends on the handle being readable, such as when acquiring it as a controlling
+    /// terminal, so that eligibility to read never stands in for a grant.
+    pub(super) fn terminal_readable(
+        &self,
+        caller: Option<Caller<'_>>,
+        entry: &ResolverEntry<Backend>,
+    ) -> bool {
+        if !entry.read_allowed || self.terminal(entry).is_none() {
+            return false;
+        }
+        let Some(Handle::File(file)) = self.entry_handle(entry) else {
+            return false;
+        };
+        match self.check_use(caller, entry, Rights::READ, (), ()) {
+            Err(()) => false,
+            Ok(None) => true,
+            Ok(Some(at_use)) => self
+                .backend
+                .authorize_handle(HandleRef::File(file), &|descriptor| {
+                    at_use.authorizes(descriptor)
+                }),
+        }
+    }
+
     /// Readiness of an open entry whose reads or writes can fail with `WouldBlock`, or `None` if
     /// they always make progress. Path-only entries never read or write.
     pub fn readiness_source(
@@ -2145,8 +2492,15 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// This method returns the (entire) underlying static byte slice if the file's contents are
     /// backed by borrowed static data (e.g., set up via [`super::in_mem::InitialNode::File`]).
     ///
-    /// Returns `None` if the entry is not open for reading or has no static backing data.
+    /// Returns `None` if the entry is not open for reading or has no static backing data, or on a
+    /// resolver built with [`Self::with_credentials`], unless the entry caches its grant of
+    /// [`Rights::READ`]: the data outlives any later check.
     pub fn get_static_backing_data(&self, entry: &ResolverEntry<Backend>) -> Option<&'static [u8]> {
+        if self.profile.is_some()
+            && entry.grants.map(|grants| grants.decide(Rights::READ)) != Some(HandleUse::Cached)
+        {
+            return None;
+        }
         match self.entry_handle(entry)? {
             Handle::File(file) if !entry.path_only && entry.read_allowed => {
                 self.backend.get_static_backing_data(file)
@@ -2201,6 +2555,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 /// entry may operate on it, even if another resolver uses the same backend type or policy.
 pub struct ResolverEntry<Backend: super::backend::Backend> {
     handle: Handle,
+    /// What the handle may do with its object's descriptor rights, for an entry that a resolver
+    /// built with [`Resolver::with_credentials`] opened.
+    grants: Option<HandleGrants>,
     instance: Arc<()>,
     _backend: core::marker::PhantomData<Backend>,
     read_allowed: bool,
@@ -2230,6 +2587,19 @@ struct ReopenedTerminal {
 impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
     pub(crate) const fn is_path_only(&self) -> bool {
         self.path_only
+    }
+
+    /// Whether the entry refers to a directory.
+    pub(crate) fn is_directory(&self) -> bool {
+        matches!(self.handle, Handle::Dir(_))
+    }
+
+    /// What the handle may do with its object's descriptor rights: its operation mask, the rights
+    /// its open admitted, and the grants it caches; `None` if a resolver built with
+    /// [`Resolver::new`] opened it.
+    #[must_use]
+    pub fn handle_grants(&self) -> Option<HandleGrants> {
+        self.grants
     }
 
     /// Absolute path of the opened object, with symbolic links resolved, as of when it was opened.

@@ -11,9 +11,13 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::authority::Authority;
+use crate::descriptor::profile::FileSystemProfile;
 use crate::fs::FileService;
 use crate::job::Job;
-use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights, StatusFlags};
+use crate::object::{
+    self, HandleOperations, ObjectEntry, ObjectReference, ObjectRights, ReferenceAccess,
+    StatusFlags,
+};
 use crate::pid_namespace::PidNamespace;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::signal::ProcessSignals;
@@ -482,6 +486,24 @@ impl ExitReadiness {
 /// it keeps neither the process, nor its IDs, nor its registration in its PID
 /// namespace from going away. Its readiness is its process's
 /// [`ExitReadiness`].
+///
+/// Its operations are of two sorts. Native ones come from the handle's own
+/// contract and need no descriptor: observing the exit, the shared status
+/// flags, and selecting the process's exit when it is the holder's child.
+/// Signaling is the descriptor-backed SIGNAL right on the target process, and
+/// each file-system profile involved restricts it separately: the target's
+/// (the object's) when the handle is opened, and each holder's when a
+/// reference is installed, starting with the opener's.
+///
+/// A process with no profile has no descriptor to check, so between two such
+/// processes [`HandleOperations::SIGNAL`] signals as the holder could by ID.
+/// Where either end has a profile, a reference could signal only under a grant
+/// its open admitted or after a check of the target's descriptor and
+/// confinement at use. An open names neither rights nor a subject, and no such
+/// check exists yet, so such a reference carries only native operations and
+/// fails closed. Since a reference only ever keeps operations of the one it
+/// came from, signaling withheld once is never restored, even by passing
+/// through a holder without a profile.
 pub(crate) struct ProcessObject {
     /// The process, held weakly so that only its allocation is kept, whose
     /// address identifies it even once its ID is reused.
@@ -490,9 +512,42 @@ pub(crate) struct ProcessObject {
     /// so that the process's last reference never drops under an object lock.
     exit: Arc<ExitReadiness>,
     status: StatusFlags,
+    /// The operations every reference may attempt at most, fixed at open.
+    /// Every reference descends from the opener's.
+    operations: HandleOperations,
 }
 
 impl ProcessObject {
+    /// Operations of the handle's own contract, which need no descriptor.
+    const NATIVE_OPERATIONS: HandleOperations = HandleOperations::WAIT
+        .union(HandleOperations::QUERY)
+        .union(HandleOperations::SET_FLAGS)
+        .union(HandleOperations::WAIT_CHILD);
+
+    /// `operations` as restricted by one end, target or holder, whose file
+    /// service has `profile`.
+    fn within_profile(
+        operations: HandleOperations,
+        profile: Option<FileSystemProfile>,
+    ) -> HandleOperations {
+        if profile.is_some() {
+            operations & Self::NATIVE_OPERATIONS
+        } else {
+            operations
+        }
+    }
+
+    /// The operations references to this handle may attempt at most.
+    pub(crate) fn operations(&self) -> HandleOperations {
+        self.operations
+    }
+
+    /// The operations a reference installed in a process whose file service
+    /// has `holder` may attempt at most.
+    pub(crate) fn operations_for(&self, holder: Option<FileSystemProfile>) -> HandleOperations {
+        Self::within_profile(self.operations, holder)
+    }
+
     pub(crate) fn readiness(&self) -> ReadinessFlags {
         self.exit.readiness()
     }
@@ -1244,7 +1299,7 @@ impl BrokerProcess {
         // taken under it.
         let handle_target = match selector {
             ChildSelector::ProcessHandle(handle) => {
-                let object = self.authorized_object(handle, ObjectRights::WAIT)?;
+                let object = self.authorized_operation(handle, HandleOperations::WAIT_CHILD)?;
                 Some(Weak::clone(&object.read().as_process()?.target))
             }
             _ => None,
@@ -1432,6 +1487,9 @@ impl BrokerProcess {
     /// `UnknownObject` if no such process exists or it was released, and
     /// `PolicyDenied` if this process may not wait on objects, since every use
     /// of the handle needs that right.
+    ///
+    /// Only if neither this process nor the target has a file-system profile
+    /// can the handle signal; see [`ProcessObject`].
     pub fn open_process_handle(
         &self,
         process_id: ProcessId,
@@ -1441,6 +1499,13 @@ impl BrokerProcess {
         let status = StatusFlags::new(flags)?;
         let target = self.pid_namespace().registered_process(process_id)?;
         let rights = self.require_object_rights(ObjectRights::WAIT)?;
+        let operations = ProcessObject::within_profile(
+            ProcessObject::within_profile(
+                ProcessObject::NATIVE_OPERATIONS | HandleOperations::SIGNAL,
+                target.fs.handle_profile(),
+            ),
+            self.fs.handle_profile(),
+        );
         let reference = self.reserve_object_reference(rights)?;
         let registration =
             ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
@@ -1450,6 +1515,7 @@ impl BrokerProcess {
                 target: Arc::downgrade(&target),
                 exit: Arc::clone(&target.exit),
                 status,
+                operations,
             }),
             Some(registration),
         )
@@ -1458,14 +1524,14 @@ impl BrokerProcess {
     /// Returns the process that `handle`, a process handle of this process,
     /// refers to, for sending it a signal.
     ///
-    /// Returns `InvalidRights` if `handle` is of another kind, `PeerClosed` if
-    /// the process was released or torn down, and `UnknownObject` if this
-    /// process's PID namespace doesn't see it.
+    /// Returns `InvalidRights` if `handle` is of another kind or may not
+    /// signal, `PeerClosed` if the process was released or torn down, and
+    /// `UnknownObject` if this process's PID namespace doesn't see it.
     pub(crate) fn process_handle_signal_target(
         &self,
         handle: ObjectHandle,
     ) -> Result<Arc<BrokerProcess>> {
-        let object = self.authorized_object(handle, ObjectRights::WAIT)?;
+        let object = self.authorized_operation(handle, HandleOperations::SIGNAL)?;
         let target = {
             let object = object.read();
             let process_handle = object.as_process()?;
@@ -2432,34 +2498,47 @@ impl BrokerProcess {
 
     /// Duplicates object references into another process.
     ///
-    /// Each duplicate retains its source reference's rights. Returned handles
-    /// follow the requested source order. If duplication fails, references
-    /// already created by this call are removed from the target before the
-    /// error is returned.
+    /// Returned handles follow the requested source order. No handle becomes visible to the
+    /// recipient unless every reference can be installed.
     pub fn duplicate_object_references_to(
         &self,
         handles: &[ObjectHandle],
         target: &BrokerProcess,
     ) -> Result<Vec<ObjectHandle>> {
+        if handles.len() > target.core.limits.max_references_per_process {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        let mut transfers = Vec::new();
+        transfers
+            .try_reserve_exact(handles.len())
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        for &handle in handles {
+            transfers.push(self.reference_for_install(handle, target, None, None)?);
+        }
         let mut duplicates = Vec::new();
         duplicates
             .try_reserve_exact(handles.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
-        for handle in handles {
-            let duplicate = self
-                .object_reference_rights(*handle)
-                .and_then(|rights| self.duplicate_object_reference_to(*handle, target, rights));
-            match duplicate {
-                Ok(duplicate) => duplicates.push(duplicate),
-                Err(error) => {
-                    for duplicate in duplicates.drain(..).rev() {
-                        if target.close_object_reference(duplicate).is_err() {
-                            return Err(BrokerError::Internal);
-                        }
-                    }
-                    return Err(error);
-                }
+        let mut process_references = target.references.lock();
+        target.prepare_process_references(&mut process_references, transfers.len())?;
+        let mut references = target.core.references.write();
+        target.reserve_reference_slots(&mut references, transfers.len())?;
+        for _ in &transfers {
+            let handle = target.core.allocate_reference_handle()?;
+            if references.contains_key(&handle) {
+                return Err(BrokerError::Internal);
             }
+            duplicates.push(handle);
+        }
+        for (&handle, (object, access)) in duplicates.iter().zip(transfers) {
+            target.insert_object_reference(
+                &mut references,
+                &mut process_references.handles,
+                handle,
+                object,
+                access,
+                None,
+            );
         }
         Ok(duplicates)
     }
@@ -2611,34 +2690,21 @@ impl BrokerProcess {
             .core
             .policy
             .principal_object_rights(self.caller_credential)?;
+        let access = ReferenceAccess::issue(&object, rights);
         let object = Arc::new(RwLock::new(object));
-        self.create_object_reference_with_rights(object, rights)
+        self.create_object_reference_with_access(object, access)
     }
 
-    fn create_object_reference_with_rights(
+    fn create_object_reference_with_access(
         &self,
         object: Arc<RwLock<ObjectEntry>>,
-        rights: ObjectRights,
+        access: ReferenceAccess,
     ) -> Result<ObjectHandle> {
         let mut process_references = self.references.lock();
         self.prepare_process_references(&mut process_references, 1)?;
         let mut references = self.core.references.write();
         let preparation = (|| {
-            let pending = self.core.pending_references.load(Ordering::Relaxed);
-            if references
-                .len()
-                .checked_add(pending)
-                .is_none_or(|count| count >= self.core.limits.max_references)
-            {
-                return Err(BrokerError::ResourceExhausted);
-            }
-            references
-                .try_reserve(
-                    pending
-                        .checked_add(1)
-                        .ok_or(BrokerError::ResourceExhausted)?,
-                )
-                .map_err(|_| BrokerError::OutOfMemory)?;
+            self.reserve_reference_slots(&mut references, 1)?;
             let handle = self.core.allocate_reference_handle()?;
             if references.contains_key(&handle) {
                 return Err(BrokerError::Internal);
@@ -2658,7 +2724,7 @@ impl BrokerProcess {
             &mut process_references.handles,
             handle,
             object,
-            rights,
+            access,
             None,
         );
 
@@ -2684,43 +2750,71 @@ impl BrokerProcess {
         target: &BrokerProcess,
         rights: ObjectRights,
     ) -> Result<ObjectHandle> {
-        if rights.is_empty() {
-            return Err(BrokerError::InvalidRights);
-        }
+        self.duplicate_reference(handle, target, rights, None)
+    }
 
-        let object = {
+    /// Like [`Self::duplicate_object_reference_to`], but retains only the specified operations.
+    /// The request must be nonempty and wholly within the source and deployment masks.
+    pub fn duplicate_object_operations_to(
+        &self,
+        handle: ObjectHandle,
+        target: &BrokerProcess,
+        rights: ObjectRights,
+        operations: HandleOperations,
+    ) -> Result<ObjectHandle> {
+        self.duplicate_reference(handle, target, rights, Some(operations))
+    }
+
+    fn duplicate_reference(
+        &self,
+        handle: ObjectHandle,
+        target: &BrokerProcess,
+        rights: ObjectRights,
+        operations: Option<HandleOperations>,
+    ) -> Result<ObjectHandle> {
+        let (object, access) =
+            self.reference_for_install(handle, target, Some(rights), operations)?;
+        target.create_object_reference_with_access(object, access)
+    }
+
+    fn reference_for_install(
+        &self,
+        handle: ObjectHandle,
+        target: &BrokerProcess,
+        rights: Option<ObjectRights>,
+        operations: Option<HandleOperations>,
+    ) -> Result<(Arc<RwLock<ObjectEntry>>, ReferenceAccess)> {
+        if !Arc::ptr_eq(&self.core, &target.core) {
+            return Err(BrokerError::PolicyDenied);
+        }
+        let (object, mut access) = {
             let references = self.core.references.read();
             let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
             if reference.owner != self.key {
                 return Err(BrokerError::UnknownObject);
             }
-            if !reference.rights.contains(rights) {
-                return Err(BrokerError::InvalidRights);
-            }
-            Arc::clone(&reference.object)
+            let rights = rights.unwrap_or(reference.access.classes);
+            (
+                Arc::clone(&reference.object),
+                reference.access.restrict(rights, operations)?,
+            )
         };
 
-        if !object.read().is_duplicable() {
-            return Err(BrokerError::UnsupportedOperation);
+        access.operations &= object
+            .read()
+            .check_install(target.fs.handle_profile(), operations)?;
+        if access.operations.is_empty() {
+            return Err(BrokerError::InvalidRights);
         }
 
         let target_rights = target
             .core
             .policy
             .principal_object_rights(target.caller_credential)?;
-        if !target_rights.contains(rights) {
+        if !target_rights.contains(access.classes) {
             return Err(BrokerError::PolicyDenied);
         }
-        target.create_object_reference_with_rights(object, rights)
-    }
-
-    fn object_reference_rights(&self, handle: ObjectHandle) -> Result<ObjectRights> {
-        let references = self.core.references.read();
-        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != self.key {
-            return Err(BrokerError::UnknownObject);
-        }
-        Ok(reference.rights)
+        Ok((object, access))
     }
 
     /// Publishes readiness of all of this process's references through
@@ -2742,7 +2836,9 @@ impl BrokerProcess {
                 .get_mut(&handle)
                 .filter(|reference| reference.owner == self.key)
                 .ok_or(BrokerError::UnknownObject)?;
-            if reference.readiness.is_none() {
+            if reference.readiness.is_none()
+                && reference.access.operations.contains(HandleOperations::WAIT)
+            {
                 reference.readiness = reference.object.read().watch(handle, readiness_sink)?;
             }
         }
@@ -2758,28 +2854,15 @@ impl BrokerProcess {
             .core
             .policy
             .principal_object_rights(self.caller_credential)?;
+        let first_access = ReferenceAccess::issue(&first, rights);
+        let second_access = ReferenceAccess::issue(&second, rights);
         let first = Arc::new(RwLock::new(first));
         let second = Arc::new(RwLock::new(second));
         let mut process_references = self.references.lock();
         self.prepare_process_references(&mut process_references, 2)?;
         let mut references = self.core.references.write();
         let preparation = (|| {
-            let pending = self.core.pending_references.load(Ordering::Relaxed);
-            if references
-                .len()
-                .checked_add(pending)
-                .and_then(|count| count.checked_add(2))
-                .is_none_or(|count| count > self.core.limits.max_references)
-            {
-                return Err(BrokerError::ResourceExhausted);
-            }
-            references
-                .try_reserve(
-                    pending
-                        .checked_add(2)
-                        .ok_or(BrokerError::ResourceExhausted)?,
-                )
-                .map_err(|_| BrokerError::OutOfMemory)?;
+            self.reserve_reference_slots(&mut references, 2)?;
             let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
             if first_handle == second_handle
                 || references.contains_key(&first_handle)
@@ -2797,13 +2880,16 @@ impl BrokerProcess {
                 return Err(error);
             }
         };
-        for (handle, object) in [(first_handle, first), (second_handle, second)] {
+        for (handle, object, access) in [
+            (first_handle, first, first_access),
+            (second_handle, second, second_access),
+        ] {
             self.insert_object_reference(
                 &mut references,
                 &mut process_references.handles,
                 handle,
                 object,
-                rights,
+                access,
                 None,
             );
         }
@@ -2875,13 +2961,36 @@ impl BrokerProcess {
         Ok(pending_and_additional)
     }
 
+    fn reserve_reference_slots(
+        &self,
+        references: &mut HashMap<ObjectHandle, ObjectReference>,
+        additional: usize,
+    ) -> Result<()> {
+        let reserve = self
+            .core
+            .pending_references
+            .load(Ordering::Relaxed)
+            .checked_add(additional)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        if references
+            .len()
+            .checked_add(reserve)
+            .is_none_or(|n| n > self.core.limits.max_references)
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        references
+            .try_reserve(reserve)
+            .map_err(|_| BrokerError::OutOfMemory)
+    }
+
     fn insert_object_reference(
         &self,
         references: &mut HashMap<ObjectHandle, ObjectReference>,
         reference_handles: &mut Vec<ObjectHandle>,
         handle: ObjectHandle,
         object: Arc<RwLock<ObjectEntry>>,
-        rights: ObjectRights,
+        access: ReferenceAccess,
         readiness: Option<ReadinessRegistration>,
     ) {
         let process_reference_index = reference_handles.len();
@@ -2890,7 +2999,7 @@ impl BrokerProcess {
             ObjectReference {
                 object,
                 owner: self.key,
-                rights,
+                access,
                 process_reference_index,
                 readiness,
             },
@@ -2904,34 +3013,18 @@ impl BrokerProcess {
     /// that control to release all broker locks before calling an external
     /// platform implementation, then reacquire only the object lock if they need
     /// to update broker-owned state.
-    pub(crate) fn authorized_object(
+    pub(crate) fn authorized_operation(
         &self,
         handle: ObjectHandle,
-        required_rights: ObjectRights,
+        required: HandleOperations,
     ) -> Result<Arc<RwLock<ObjectEntry>>> {
+        debug_assert!(!required.is_empty());
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
         if reference.owner != self.key {
             return Err(BrokerError::UnknownObject);
         }
-        if !reference.rights.contains(required_rights) {
-            return Err(BrokerError::InvalidRights);
-        }
-        Ok(Arc::clone(&reference.object))
-    }
-
-    pub(crate) fn authorized_object_with_any_rights(
-        &self,
-        handle: ObjectHandle,
-        allowed_rights: ObjectRights,
-    ) -> Result<Arc<RwLock<ObjectEntry>>> {
-        debug_assert!(!allowed_rights.is_empty());
-        let references = self.core.references.read();
-        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != self.key {
-            return Err(BrokerError::UnknownObject);
-        }
-        if !reference.rights.intersects(allowed_rights) {
+        if !reference.access.operations.contains(required) {
             return Err(BrokerError::InvalidRights);
         }
         Ok(Arc::clone(&reference.object))
@@ -2939,15 +3032,14 @@ impl BrokerProcess {
 
     /// Returns the current readiness of a broker-owned object.
     pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags> {
-        let object = self.authorized_object(handle, ObjectRights::WAIT)?;
+        let object = self.authorized_operation(handle, HandleOperations::WAIT)?;
         crate::socket::refresh_readiness(&object);
         object::readiness(&object)
     }
 
     /// Returns the access mode and status flags of a broker-owned object.
     pub fn get_status_flags(&self, handle: ObjectHandle) -> Result<FileStatusFlags> {
-        let object = self
-            .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+        let object = self.authorized_operation(handle, HandleOperations::QUERY)?;
         object::get_status_flags(&object)
     }
 
@@ -2960,10 +3052,7 @@ impl BrokerProcess {
         if !FileOpenFlags::STATUS.contains(request.mask) {
             return Err(BrokerError::UnsupportedOperation);
         }
-        let object = self.authorized_object_with_any_rights(
-            request.handle,
-            ObjectRights::WAIT | ObjectRights::WRITE,
-        )?;
+        let object = self.authorized_operation(request.handle, HandleOperations::SET_FLAGS)?;
         object::set_status_flags(&object, request.mask, request.flags)
     }
 
@@ -3220,6 +3309,20 @@ impl PendingObjectReference<'_> {
         self.handle
     }
 
+    /// Registers the initial holder for publications only when it may observe readiness.
+    pub(crate) fn watch_readiness(
+        &self,
+        sink: Arc<dyn ReadinessSink>,
+        watch: impl FnOnce(&ReadinessRegistration) -> Result<()>,
+    ) -> Result<Option<ReadinessRegistration>> {
+        if !self.rights.contains(ObjectRights::WAIT) {
+            return Ok(None);
+        }
+        let registration = ReadinessRegistration::new(self.handle, sink);
+        watch(&registration)?;
+        Ok(Some(registration))
+    }
+
     pub(crate) fn commit(self, object: ObjectEntry) -> Result<ObjectHandle> {
         self.commit_with_readiness(object, None)
     }
@@ -3231,6 +3334,7 @@ impl PendingObjectReference<'_> {
         object: ObjectEntry,
         readiness: Option<ReadinessRegistration>,
     ) -> Result<ObjectHandle> {
+        let access = ReferenceAccess::issue(&object, self.rights);
         let mut process_references = self.process.references.lock();
         let mut references = self.process.core.references.write();
         if references.contains_key(&self.handle) {
@@ -3253,7 +3357,7 @@ impl PendingObjectReference<'_> {
             &mut process_references.handles,
             self.handle,
             Arc::new(RwLock::new(object)),
-            self.rights,
+            access,
             readiness,
         );
         Ok(self.handle)
@@ -5808,6 +5912,126 @@ mod tests {
         );
     }
 
+    #[test]
+    fn waiting_on_a_pipe_does_not_lend_its_data_even_after_inheritance() {
+        use crate::HandleOperations as Op;
+
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let sender = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let holder = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        holder.complete_start().unwrap();
+        let (reader, writer) = crate::pipe::create(&sender, 4, 1, FileOpenFlags::NONE).unwrap();
+        crate::pipe::write(&sender, writer, b"x").unwrap();
+        assert_eq!(
+            sender.duplicate_object_operations_to(reader, &holder, ObjectRights::all(), Op::WRITE),
+            Err(BrokerError::InvalidRights)
+        );
+        let wait = sender
+            .duplicate_object_operations_to(reader, &holder, ObjectRights::WAIT, Op::WAIT)
+            .unwrap();
+        let child_id = holder
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        let sink: Arc<dyn ReadinessSink> = readiness_sink();
+        let handles = holder
+            .duplicate_object_references_to_child(child_id, &[wait], &sink)
+            .unwrap();
+        let child = holder.take_child_process(child_id).unwrap();
+        for (process, handle) in [(&holder, wait), (&child, handles[0])] {
+            assert!(
+                process
+                    .check_readiness(handle)
+                    .unwrap()
+                    .contains(ReadinessFlags::READ)
+            );
+            assert_eq!(
+                read_pipe(process, handle, 1),
+                Err(BrokerError::InvalidRights)
+            );
+            assert_eq!(
+                process.duplicate_object_operations_to(
+                    handle,
+                    &sender,
+                    ObjectRights::WAIT,
+                    Op::READ
+                ),
+                Err(BrokerError::InvalidRights)
+            );
+        }
+        assert_eq!(read_pipe(&sender, reader, 1).unwrap(), b"x");
+    }
+
+    #[test]
+    fn transfer_uses_the_receiving_file_profile_before_installing_any_handles() {
+        use crate::descriptor::profile::{FileSystemProfile, StorableForms};
+        use crate::fs::{in_mem::InMem, inode_allocator::InodeAllocators, resolver::Resolver};
+
+        let memory = || InMem::<TestPlatform>::new(InodeAllocators::new().next());
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(memory())))
+        .build()
+        .unwrap();
+        let sender = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let receiver = TestBroker {
+            fs: Arc::new(Resolver::<TestPlatform, _>::with_credentials(
+                memory(),
+                FileSystemProfile::new(StorableForms::MODE).unwrap(),
+            )),
+            ..broker.clone()
+        }
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+        let sink: Arc<dyn ReadinessSink> = readiness_sink();
+        let file = crate::fs::open(
+            &sender,
+            "/",
+            ROOT,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::PATH,
+            FileMode::empty(),
+            &sink,
+        )
+        .unwrap()
+        .unwrap();
+        let event = crate::event::create(&sender, 1, FileOpenFlags::NONE).unwrap();
+        assert_eq!(
+            sender.duplicate_object_reference_to(file, &receiver, ObjectRights::WAIT),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert_eq!(
+            sender.duplicate_object_references_to(&[event, file], &receiver),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert_eq!(
+            receiver.references.lock().handles,
+            Vec::<ObjectHandle>::new()
+        );
+        // A native event has no filesystem descriptor or object profile.
+        let event = sender
+            .duplicate_object_reference_to(event, &receiver, ObjectRights::WAIT)
+            .unwrap();
+        assert_eq!(
+            crate::event::consume(&receiver, event, EventConsumeMode::One)
+                .unwrap()
+                .value,
+            1
+        );
+    }
+
     fn check_shared_file_mapping_follows_reference_rights(broker: &TestBroker) {
         let source = broker
             .create_process(CallerCredential::Unauthenticated)
@@ -6543,7 +6767,7 @@ mod tests {
         )
         .unwrap();
         let object = process
-            .authorized_object(reader, ObjectRights::WAIT)
+            .authorized_operation(reader, crate::HandleOperations::READ)
             .unwrap();
         let process_capacity = Arc::clone(&process.reserved_pipe_capacity);
 
@@ -6907,6 +7131,214 @@ mod tests {
         assert_eq!(
             root.collect_child_exit(ChildSelector::ProcessHandle(event)),
             Err(BrokerError::InvalidRights)
+        );
+    }
+
+    /// Creates and starts a root process of `broker` whose file service has a
+    /// profile.
+    fn started_profiled_root(broker: &TestBroker) -> Arc<BrokerProcess> {
+        use crate::descriptor::profile::{FileSystemProfile, StorableForms};
+        use crate::fs::{in_mem::InMem, inode_allocator::InodeAllocators, resolver::Resolver};
+
+        let root = TestBroker {
+            fs: Arc::new(Resolver::<TestPlatform, _>::with_credentials(
+                InMem::<TestPlatform>::new(InodeAllocators::new().next()),
+                FileSystemProfile::new(StorableForms::MODE).unwrap(),
+            )),
+            ..broker.clone()
+        }
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+        root.complete_start().unwrap();
+        root
+    }
+
+    /// Asserts that `process` can neither signal nor probe through `handle`.
+    fn assert_cannot_signal(process: &BrokerProcess, handle: ObjectHandle) {
+        for signal in [0, 15] {
+            assert_eq!(
+                crate::signal::send(process, SignalTarget::ProcessHandle(handle), signal),
+                Err(BrokerError::InvalidRights)
+            );
+        }
+    }
+
+    #[test]
+    fn a_process_handle_with_a_profile_at_either_end_waits_but_cannot_signal() {
+        let broker = process_handle_broker();
+        let legacy = started_root(&broker);
+        let profiled = started_profiled_root(&broker);
+        let legacy_child = child_of(&legacy);
+        let profiled_child = child_of(&profiled);
+        let legacy_signals = crate::signal::open(&legacy_child, readiness_sink()).unwrap();
+        let profiled_signals = crate::signal::open(&profiled_child, readiness_sink()).unwrap();
+        // The target, the opener, or both have a profile.
+        let (from_legacy, _) = open_process_handle(&legacy, &profiled_child);
+        let (to_legacy, _) = open_process_handle(&profiled, &legacy_child);
+        let (to_child, _) = open_process_handle(&profiled, &profiled_child);
+
+        for (process, handle) in [
+            (&legacy, from_legacy),
+            (&profiled, to_legacy),
+            (&profiled, to_child),
+        ] {
+            assert_cannot_signal(process, handle);
+            process
+                .set_status_flags(SetStatusFlagsRequest {
+                    handle,
+                    mask: FileOpenFlags::NONBLOCKING,
+                    flags: FileOpenFlags::NONBLOCKING,
+                })
+                .unwrap();
+            assert_eq!(
+                process.get_status_flags(handle).map(|status| status.flags),
+                Ok(FileOpenFlags::NONBLOCKING)
+            );
+            assert_eq!(
+                process.check_readiness(handle),
+                Ok(ReadinessFlags::default())
+            );
+        }
+        for (child, signals) in [
+            (&legacy_child, legacy_signals),
+            (&profiled_child, profiled_signals),
+        ] {
+            assert_eq!(
+                crate::signal::take(child, signals),
+                Err(BrokerError::WouldBlock)
+            );
+        }
+
+        // Observing an exit and selecting a child need no descriptor.
+        run_to_exit(&profiled_child, EXITED);
+        assert_eq!(legacy.check_readiness(from_legacy), Ok(HANDLE_EXITED));
+        assert_eq!(
+            profiled
+                .collect_child_exit(ChildSelector::ProcessHandle(to_child))
+                .map(|exit| exit.process_id),
+            Ok(profiled_child.id())
+        );
+        assert_eq!(legacy.check_readiness(from_legacy), Ok(HANDLE_RELEASED));
+        run_to_exit(&legacy_child, EXITED);
+        assert_eq!(profiled.check_readiness(to_legacy), Ok(HANDLE_EXITED));
+    }
+
+    #[test]
+    fn signaling_withheld_from_a_process_handle_is_never_restored() {
+        use crate::HandleOperations as Op;
+
+        let broker = process_handle_broker();
+        let opener = started_root(&broker);
+        let target = child_of(&opener);
+        target.complete_start().unwrap();
+        let signals = crate::signal::open(&target, readiness_sink()).unwrap();
+        let (handle, _) = open_process_handle(&opener, &target);
+        let legacy = started_root(&broker);
+        let profiled = started_profiled_root(&broker);
+        let after_profiled = started_root(&broker);
+
+        // Between processes without profiles, a transfer keeps signaling.
+        let direct = opener
+            .duplicate_object_reference_to(handle, &legacy, ObjectRights::WAIT)
+            .unwrap();
+        crate::signal::send(&legacy, SignalTarget::ProcessHandle(direct), 15).unwrap();
+        assert_eq!(
+            crate::signal::take(&target, signals),
+            Ok(SignalEvent::Signal(PendingSignal {
+                thread: None,
+                signal: 15,
+                sender: legacy.id(),
+            }))
+        );
+
+        // A recipient with a profile refuses a request to signal, installing
+        // nothing, and otherwise receives only the native operations.
+        assert_eq!(
+            opener.duplicate_object_operations_to(
+                handle,
+                &profiled,
+                ObjectRights::WAIT,
+                Op::WAIT | Op::SIGNAL,
+            ),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(
+            profiled.references.lock().handles,
+            Vec::<ObjectHandle>::new()
+        );
+        let held = opener
+            .duplicate_object_references_to(&[handle], &profiled)
+            .unwrap()[0];
+        assert_cannot_signal(&profiled, held);
+
+        // Passing on to holders without profiles, by request, duplication, or
+        // inheritance, restores nothing.
+        assert_eq!(
+            profiled.duplicate_object_operations_to(
+                held,
+                &after_profiled,
+                ObjectRights::WAIT,
+                Op::SIGNAL,
+            ),
+            Err(BrokerError::InvalidRights)
+        );
+        let returned = profiled
+            .duplicate_object_reference_to(held, &after_profiled, ObjectRights::WAIT)
+            .unwrap();
+        let child_id = after_profiled
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        let inherited = after_profiled
+            .duplicate_object_references_to_child(
+                child_id,
+                &[returned],
+                &(readiness_sink() as Arc<dyn ReadinessSink>),
+            )
+            .unwrap()[0];
+        let inheritor = after_profiled.take_child_process(child_id).unwrap();
+        // Nor does an attenuation between holders without profiles.
+        let waiting = opener
+            .duplicate_object_operations_to(handle, &legacy, ObjectRights::WAIT, Op::WAIT)
+            .unwrap();
+        let passed_on = legacy
+            .duplicate_object_reference_to(waiting, &after_profiled, ObjectRights::WAIT)
+            .unwrap();
+        for (process, handle) in [
+            (&after_profiled, returned),
+            (&inheritor, inherited),
+            (&after_profiled, passed_on),
+        ] {
+            assert_cannot_signal(process, handle);
+        }
+        assert_eq!(
+            crate::signal::take(&target, signals),
+            Err(BrokerError::WouldBlock)
+        );
+
+        // Every reference still follows the one process.
+        let holders = [
+            (&legacy, direct),
+            (&profiled, held),
+            (&after_profiled, returned),
+            (&inheritor, inherited),
+        ];
+        run_to_exit(&target, EXITED);
+        for (process, handle) in holders {
+            assert_eq!(process.check_readiness(handle), Ok(HANDLE_EXITED));
+        }
+        assert_eq!(
+            opener
+                .collect_child_exit(ChildSelector::ProcessHandle(handle))
+                .map(|exit| exit.process_id),
+            Ok(target.id())
+        );
+        for (process, handle) in holders {
+            assert_eq!(process.check_readiness(handle), Ok(HANDLE_RELEASED));
+        }
+        assert_eq!(
+            crate::signal::send(&legacy, SignalTarget::ProcessHandle(direct), 0),
+            Err(BrokerError::PeerClosed)
         );
     }
 

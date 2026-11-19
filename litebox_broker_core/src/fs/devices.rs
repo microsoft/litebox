@@ -22,10 +22,10 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
-    AuthorizeRemoval, AuthorizeRename, Backend, BackendHandles, CreationMetadata, DirHandle,
-    FileHandle, FileTerminal, HandleRef, OpenChecks, Opener, PermissionCheck, PermissionInfo,
-    Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior, mode_descriptor,
-    status_mode,
+    AuthorizeRemoval, AuthorizeRename, AuthorizeUse, Backend, BackendHandles, ContentChange,
+    CreationMetadata, DirHandle, FileHandle, FileTerminal, HandleRef, OpenChecks, Opener,
+    PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
+    SeekBehavior, mode_descriptor, status_mode,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -494,6 +494,28 @@ impl Devices {
             },
             ResolvedTarget::Dir(_) => self.security.directories.clone(),
         }
+    }
+
+    /// The descriptor of an open device that is not a subsidiary, which never changes.
+    fn fixed_descriptor(&self, file: &DeviceFile) -> Option<&SecurityDescriptor> {
+        match file {
+            DeviceFile::Device(device) => Some(device.descriptor(self)),
+            // A manager is what opening `ptmx` yields.
+            DeviceFile::Manager(_) => Some(Device::Ptmx.descriptor(self)),
+            DeviceFile::Subsidiary { .. } => None,
+        }
+    }
+
+    /// Whether `authorize` allows the current descriptor of the open device `file`. A
+    /// subsidiary's descriptor may change right after, so I/O must check it under its lock.
+    fn authorize_file(&self, file: &DeviceFile, authorize: AuthorizeUse<'_>) -> bool {
+        if !self.secured {
+            return false;
+        }
+        if let DeviceFile::Subsidiary { metadata, .. } = file {
+            return authorize(&metadata.descriptor());
+        }
+        self.fixed_descriptor(file).is_some_and(authorize)
     }
 
     /// Terminal endpoint behind `device`, through which its I/O goes.
@@ -1046,9 +1068,24 @@ impl Backend for Devices {
         h: &FileHandle,
         buf: &dyn WriteBuffer,
         offset: usize,
-        _content_change: &dyn Fn(&mut SecurityDescriptor),
+        authorize: AuthorizeUse<'_>,
+        _content_change: ContentChange<'_>,
     ) -> Result<usize, WriteError> {
         // Writing to a device changes no file's contents, so its descriptor stays.
+        let file = &h.get_typed::<Self>().0;
+        if !self.secured {
+            return Err(WriteError::Io);
+        }
+        if let DeviceFile::Subsidiary { file, .. } = file {
+            return file
+                .as_ref()
+                .ok_or(WriteError::Io)?
+                .endpoint()
+                .subsidiary_write_checked(buf, authorize);
+        }
+        if !self.authorize_file(file, authorize) {
+            return Err(WriteError::NotForWriting);
+        }
         self.write(h, buf, offset)
     }
 
@@ -1056,8 +1093,93 @@ impl Backend for Devices {
         &self,
         h: &FileHandle,
         length: usize,
-        _content_change: &dyn Fn(&mut SecurityDescriptor),
+        authorize: AuthorizeUse<'_>,
+        _content_change: ContentChange<'_>,
     ) -> Result<(), TruncateError> {
+        // Devices are never truncated, so a racing descriptor change makes no difference.
+        if !self.authorize_file(&h.get_typed::<Self>().0, authorize) {
+            return Err(TruncateError::NotForWriting);
+        }
         self.truncate(h, length)
+    }
+
+    fn read_checked(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+        authorize: AuthorizeUse<'_>,
+    ) -> Result<usize, ReadError> {
+        let file = &h.get_typed::<Self>().0;
+        if !self.secured {
+            return Err(ReadError::Io);
+        }
+        if let DeviceFile::Subsidiary { file, .. } = file {
+            return file
+                .as_ref()
+                .ok_or(ReadError::Io)?
+                .endpoint()
+                .subsidiary_read_checked(buf, authorize);
+        }
+        if !self.authorize_file(file, authorize) {
+            return Err(ReadError::NotForReading);
+        }
+        self.read(h, buf, offset)
+    }
+
+    fn open_dir_checked(
+        &self,
+        dir: ResolvedDir<'_>,
+        flags: OFlags,
+        admit: &dyn Fn(&SecurityDescriptor) -> Result<(), OpenError>,
+    ) -> Result<DirHandle, OpenError> {
+        if !self.secured {
+            return Err(OpenError::Io);
+        }
+        // The directories' descriptor never changes.
+        admit(&self.security.directories)?;
+        self.open_dir(dir, flags)
+    }
+
+    fn set_handle_times_checked(
+        &self,
+        h: HandleRef<'_>,
+        _times: &SetFileTimes,
+        authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), SetTimesError>,
+    ) -> Result<(), SetTimesError> {
+        if !self.secured {
+            return Err(SetTimesError::Io);
+        }
+        match h {
+            // Devices keep no times, so once authorized, the change is done.
+            HandleRef::File(h) => match &h.get_typed::<Self>().0 {
+                DeviceFile::Subsidiary { metadata, .. } => authorize(&metadata.descriptor()),
+                file => authorize(self.fixed_descriptor(file).ok_or(SetTimesError::Io)?),
+            },
+            // As their permissions say, the directories are on a read-only file system.
+            HandleRef::Dir(_) => Err(SetTimesError::ReadOnlyFileSystem),
+        }
+    }
+
+    fn list_dir_checked(
+        &self,
+        handle: DirHandle,
+        authorize: AuthorizeUse<'_>,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
+        if !self.secured {
+            return Err(ReadDirError::Io);
+        }
+        // The directories' descriptor never changes.
+        if !authorize(&self.security.directories) {
+            return Err(ReadDirError::NotOpenForReading);
+        }
+        self.list_dir_at(handle)
+    }
+
+    fn authorize_handle(&self, h: HandleRef<'_>, authorize: AuthorizeUse<'_>) -> bool {
+        match h {
+            HandleRef::File(h) => self.authorize_file(&h.get_typed::<Self>().0, authorize),
+            HandleRef::Dir(_) => self.secured && authorize(&self.security.directories),
+        }
     }
 }

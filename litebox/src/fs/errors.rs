@@ -38,6 +38,8 @@ pub enum OpenError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadError {
+    #[error("filesystem subject is no longer admissible")]
+    StaleSubject,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("file descriptor does not point to a file")]
@@ -334,6 +336,8 @@ pub enum RmdirError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
+    #[error("filesystem subject is no longer admissible")]
+    StaleSubject,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("fd does not point to a directory")]

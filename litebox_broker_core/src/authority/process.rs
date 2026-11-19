@@ -8,7 +8,7 @@ use litebox_broker_protocol::authority::{Scope, Subject, Term};
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 
 use super::{Authority, AuthorityError};
-use crate::object::{ObjectEntry, ObjectRights};
+use crate::object::{HandleOperations, ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// A process-private subject. The weak pointer identifies the last authority
@@ -91,7 +91,7 @@ impl BrokerProcess {
         scope: Option<Scope>,
         operation: impl FnOnce(&Subject, &Authority) -> R,
     ) -> Result<R> {
-        let object = self.authorized_object(handle, ObjectRights::empty())?;
+        let object = self.authorized_operation(handle, HandleOperations::USE_SUBJECT)?;
         let (subject, authority) = {
             let mut object = object.write();
             let ObjectEntry::Subject(registered) = &mut *object else {

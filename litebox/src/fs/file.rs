@@ -466,6 +466,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     /// [`FileOpenFlags::NONBLOCKING`]. A failure after partial progress returns the bytes read.
     pub fn read(
         &self,
+        buf: impl ReadBuffer,
+        offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<usize, ReadError> {
+        self.read_inner(None, buf, offset, wait)
+    }
+
+    /// Reads as the current caller when the handle requires a fresh access check.
+    pub fn read_as(
+        &self,
+        caller: &Caller,
+        buf: impl ReadBuffer,
+        offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
+    ) -> Result<usize, ReadError> {
+        self.read_inner(caller.content_subject(&self.broker)?, buf, offset, wait)
+    }
+
+    fn read_inner(
+        &self,
+        subject: Option<ObjectHandle>,
         mut buf: impl ReadBuffer,
         offset: Option<usize>,
         wait: Option<&WaitContext<'_, Platform>>,
@@ -483,6 +504,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
                 self.broker
                     .read_file(
                         self.handle,
+                        subject,
                         &mut (&mut buf).sub_buffer(read, length),
                         offset,
                     )?
@@ -646,7 +668,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
     /// Reads the entries of the directory this file opens.
     pub fn read_directory(&self) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         self.broker
-            .read_directory(self.handle)?
+            .read_directory(self.handle, None)?
+            .map_err(ReadDirError::from)
+    }
+
+    /// Enumerates as the current caller when the handle requires a fresh access check.
+    pub fn read_directory_as(
+        &self,
+        caller: &Caller,
+    ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+        self.broker
+            .read_directory(self.handle, caller.content_subject(&self.broker)?)?
             .map_err(ReadDirError::from)
     }
 
@@ -998,6 +1030,7 @@ impl From<FileError> for OpenError {
 impl From<FileError> for ReadError {
     fn from(error: FileError) -> Self {
         match error {
+            FileError::StaleSubject => Self::StaleSubject,
             FileError::NotFile => Self::NotAFile,
             FileError::AccessNotAllowed | FileError::NotForReading => Self::NotForReading,
             _ => Self::Io,
@@ -1171,6 +1204,7 @@ impl From<FileError> for RmdirError {
 impl From<FileError> for ReadDirError {
     fn from(error: FileError) -> Self {
         match error {
+            FileError::StaleSubject => Self::StaleSubject,
             FileError::NotDirectory => Self::NotADirectory,
             FileError::PathOnly => Self::NotOpenForReading,
             FileError::AccessNotAllowed | FileError::NotForReading => Self::NotForReading,

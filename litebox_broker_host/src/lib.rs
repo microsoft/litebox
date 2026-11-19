@@ -857,11 +857,12 @@ fn handle_file_request<Memory: SharedMemory>(
         }
         FileRequest::Read(ReadFileRequest {
             handle,
+            subject,
             buffer,
             offset,
         }) => {
             let mut output = shared_buffer(shared_buffers, buffer, MAX_FILE_TRANSFER_SIZE)?;
-            match litebox_broker_core::fs::read(process, handle, &mut output, offset)
+            match litebox_broker_core::fs::read_as(process, handle, subject, &mut output, offset)
                 .map_err(RequestFailure::from)?
             {
                 Ok(read) => Ok(FileResponse::Read(ReadFileResponse {
@@ -920,11 +921,12 @@ fn handle_file_request<Memory: SharedMemory>(
         }
         FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle,
+            subject,
             buffer,
             start_index,
         }) => {
             validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
-            let entries = match litebox_broker_core::fs::read_directory(process, handle)
+            let entries = match litebox_broker_core::fs::read_directory_as(process, handle, subject)
                 .map_err(RequestFailure::from)?
             {
                 Ok(entries) => entries,
@@ -2995,6 +2997,7 @@ mod tests {
                 &process,
                 BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                     handle: opened.handle,
+                    subject: None,
                     buffer: sequence([2], 3),
                     offset: None,
                 })),
@@ -3029,6 +3032,7 @@ mod tests {
             &process,
             BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
                 handle: directory.handle,
+                subject: None,
                 buffer: single_slot_sequence(4, 64),
                 start_index: 0,
             })),

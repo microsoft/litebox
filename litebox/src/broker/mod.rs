@@ -513,6 +513,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn read_file(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
         data: &mut dyn ReadBuffer,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError>;
@@ -555,6 +556,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn read_directory(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
     ) -> core::result::Result<
         core::result::Result<Vec<FileDirectoryEntry>, FileError>,
         BrokerControlError,
@@ -1732,13 +1734,14 @@ where
     fn read_file(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
         data: &mut dyn ReadBuffer,
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
         let length = data.len().min(MAX_FILE_TRANSFER_SIZE as usize);
         let data = &mut data.sub_buffer(0, length);
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.read_file(handle, lease.sequence(), data, offset))
+        self.request(|local| local.read_file(handle, subject, lease.sequence(), data, offset))
     }
 
     fn write_file(
@@ -1793,6 +1796,7 @@ where
     fn read_directory(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
     ) -> core::result::Result<
         core::result::Result<Vec<FileDirectoryEntry>, FileError>,
         BrokerControlError,
@@ -1801,8 +1805,9 @@ where
         let mut start_index = 0;
         loop {
             let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
-            let response =
-                self.request(|local| local.read_directory(handle, lease.sequence(), start_index))?;
+            let response = self.request(|local| {
+                local.read_directory(handle, subject, lease.sequence(), start_index)
+            })?;
             let (mut chunk, next_index) = match response {
                 Ok(response) => response,
                 Err(error) => return Ok(Err(error)),

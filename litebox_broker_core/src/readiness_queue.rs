@@ -27,7 +27,7 @@ use litebox_broker_protocol::readiness_queue::{
 use spin::Mutex;
 use spin::rwlock::RwLock;
 
-use crate::object::{self, ObjectEntry, ObjectRights, StatusFlags};
+use crate::object::{self, HandleOperations, ObjectEntry, StatusFlags};
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::{BrokerError, BrokerProcess, Result};
@@ -47,12 +47,13 @@ pub fn create(
         .policy
         .principal_object_rights(process.caller_credential)?;
     let reference = process.reserve_object_reference(rights)?;
-    let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
     let queue = Queue::new();
-    queue.watchers.lock().watch(&registration)?;
+    let registration = reference.watch_readiness(Arc::clone(readiness_sink), |r| {
+        queue.watchers.lock().watch(r)
+    })?;
     reference.commit_with_readiness(
         ObjectEntry::ReadinessQueue(ReadinessQueueObject { queue, status }),
-        Some(registration),
+        registration,
     )
 }
 
@@ -68,8 +69,8 @@ pub fn add(
     key: u64,
     interest: ReadinessQueueInterest,
 ) -> Result<ReadinessQueueResult<()>> {
-    let queue = authorized_queue(process, queue, ObjectRights::WRITE)?;
-    let target = process.authorized_object(target, ObjectRights::WAIT)?;
+    let queue = authorized_queue(process, queue, HandleOperations::WATCH_SET)?;
+    let target = process.authorized_operation(target, HandleOperations::WAIT)?;
     queue.add(process, &target, key, interest)
 }
 
@@ -83,8 +84,8 @@ pub fn modify(
     key: u64,
     interest: ReadinessQueueInterest,
 ) -> Result<ReadinessQueueResult<()>> {
-    let queue = authorized_queue(process, queue, ObjectRights::WRITE)?;
-    let target = process.authorized_object(target, ObjectRights::WAIT)?;
+    let queue = authorized_queue(process, queue, HandleOperations::WATCH_SET)?;
+    let target = process.authorized_operation(target, HandleOperations::WAIT)?;
     Ok(queue.modify(&target, key, interest))
 }
 
@@ -95,8 +96,8 @@ pub fn remove(
     target: ObjectHandle,
     key: u64,
 ) -> Result<ReadinessQueueResult<()>> {
-    let queue = authorized_queue(process, queue, ObjectRights::WRITE)?;
-    let target = process.authorized_object(target, ObjectRights::WAIT)?;
+    let queue = authorized_queue(process, queue, HandleOperations::WATCH_SET)?;
+    let target = process.authorized_operation(target, HandleOperations::WAIT)?;
     Ok(queue.remove(&target, key))
 }
 
@@ -111,16 +112,16 @@ pub fn take_ready(
     queue: ObjectHandle,
     max_events: usize,
 ) -> Result<Vec<ReadyEvent>> {
-    let queue = authorized_queue(process, queue, ObjectRights::WAIT)?;
+    let queue = authorized_queue(process, queue, HandleOperations::READ)?;
     queue.take_ready(max_events)
 }
 
 fn authorized_queue(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    rights: ObjectRights,
+    operation: HandleOperations,
 ) -> Result<Arc<Queue>> {
-    let object = process.authorized_object(handle, rights)?;
+    let object = process.authorized_operation(handle, operation)?;
     let queue = match &*object.read() {
         ObjectEntry::ReadinessQueue(queue) => Arc::clone(&queue.queue),
         _ => return Err(BrokerError::InvalidRights),

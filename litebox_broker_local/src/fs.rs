@@ -67,6 +67,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn read_file(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
         buffer: SharedBufferSequence,
         destination: &mut dyn ReadBuffer,
         offset: Option<u64>,
@@ -74,6 +75,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         self.validate_file_buffer(buffer, destination.len(), MAX_FILE_TRANSFER_SIZE)?;
         match self.request_file(FileRequest::Read(ReadFileRequest {
             handle,
+            subject,
             buffer,
             offset,
         }))? {
@@ -215,12 +217,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn read_directory(
         &self,
         handle: ObjectHandle,
+        subject: Option<ObjectHandle>,
         buffer: SharedBufferSequence,
         start_index: u64,
     ) -> Result<DirectoryReadResult, Channel::Error> {
         self.validate_file_buffer(buffer, buffer.length() as usize, SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle,
+            subject,
             buffer,
             start_index,
         }))? {
@@ -745,6 +749,7 @@ mod tests {
     #[test]
     fn file_calls_stage_shared_data_and_preserve_file_errors() {
         let handle = ObjectHandle(7);
+        let subject = Some(ObjectHandle(11));
         let status = FileStatus {
             file_type: FileType::RegularFile,
             mode: FileMode::from_bits(0o600).unwrap(),
@@ -820,7 +825,7 @@ mod tests {
         let mut output = [0; 2];
         assert_eq!(
             local
-                .read_file(handle, sequence([2], 2), &mut output, Some(1))
+                .read_file(handle, subject, sequence([2], 2), &mut output, Some(1))
                 .unwrap(),
             Ok(2)
         );
@@ -841,6 +846,7 @@ mod tests {
             local
                 .read_directory(
                     handle,
+                    subject,
                     sequence([4], u32::try_from(directory_payload.len()).unwrap()),
                     0,
                 )
@@ -858,15 +864,15 @@ mod tests {
             [
                 BrokerOperation::File(FileRequest::Open(_)),
                 BrokerOperation::File(FileRequest::Write(_)),
-                BrokerOperation::File(FileRequest::Read(_)),
+                BrokerOperation::File(FileRequest::Read(ReadFileRequest { subject: read_subject, .. })),
                 BrokerOperation::File(FileRequest::Seek(_)),
                 BrokerOperation::File(FileRequest::PathStatus(_)),
-                BrokerOperation::File(FileRequest::ReadDirectory(_)),
+                BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest { subject: list_subject, .. })),
                 BrokerOperation::File(FileRequest::HandleStatus(_)),
                 BrokerOperation::File(FileRequest::IsTerminal(IsTerminalFileRequest {
                     handle: sent_handle,
                 })),
-            ] if *sent_handle == handle
+            ] if *sent_handle == handle && *read_subject == subject && *list_subject == subject
         ));
     }
 
@@ -994,7 +1000,7 @@ mod tests {
         let oversized = sequence([0], MAX_FILE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
-            local.read_file(ObjectHandle(1), oversized, &mut [], None),
+            local.read_file(ObjectHandle(1), None, oversized, &mut [], None),
             Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))
         ));
         assert!(matches!(
@@ -1056,6 +1062,7 @@ mod tests {
             local
                 .read_file(
                     ObjectHandle(1),
+                    None,
                     sequence([4, 7], u32::try_from(length).unwrap()),
                     &mut output,
                     None,

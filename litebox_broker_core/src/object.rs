@@ -11,6 +11,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
 use crate::authority::SubjectObject;
+use crate::descriptor::profile::FileSystemProfile;
 use crate::event::EventObject;
 use crate::fs::File;
 use crate::pipe::PipeObject;
@@ -25,8 +26,12 @@ use crate::unix_socket::UnixSocketObject;
 use crate::vsock_socket::VsockSocketObject;
 use crate::{BrokerError, ProcessKey, Result};
 
+mod access;
+pub use access::HandleOperations;
+pub(crate) use access::ReferenceAccess;
+
 bitflags::bitflags! {
-    /// Broker rights attached to an object reference.
+    /// Deployment policy classes limiting which operations a reference can receive.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct ObjectRights: u32 {
         /// Right to observe or consume object state, including readiness and file reads.
@@ -40,7 +45,7 @@ bitflags::bitflags! {
 pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,
     pub(crate) owner: ProcessKey,
-    pub(crate) rights: ObjectRights,
+    pub(crate) access: ReferenceAccess,
     /// Position of this reference's handle in the owner's handle list.
     pub(crate) process_reference_index: usize,
     /// Readiness publication for kinds whose state changes outside this
@@ -69,24 +74,45 @@ pub(crate) enum ObjectEntry {
 // block, so adding a kind does not touch other kinds' operations. Only
 // operations that depend on every kind match exhaustively here.
 impl ObjectEntry {
-    /// Returns whether references to this object may be duplicated into
-    /// another process.
+    /// Checks the kind's transfer contract in the receiving process, returning the operations a
+    /// reference installed there may keep at most. An open file keeps using the issuing service
+    /// (including for future descriptor checks); changing its profile is unsafe even if the
+    /// transfer drops every cached data grant. A process handle may reach a process of any
+    /// profile, keeping only what that profile allows (see
+    /// [`ProcessObject`](crate::process::ProcessObject)).
+    ///
+    /// An explicit `requested` set must lie within the result, or this fails with
+    /// `InvalidRights`; otherwise the installed reference silently loses what lies outside it.
     ///
     /// A duplicable kind whose waiters need wake-ups for changes made by
     /// other processes must also implement [`Self::watch`].
-    pub(crate) fn is_duplicable(&self) -> bool {
-        match self {
-            Self::Event(_)
-            | Self::File(_)
+    pub(crate) fn check_install(
+        &self,
+        receiver_profile: Option<FileSystemProfile>,
+        requested: Option<HandleOperations>,
+    ) -> Result<HandleOperations> {
+        let bound = match self {
+            Self::File(file) if file.profile != receiver_profile => {
+                return Err(BrokerError::PolicyDenied);
+            }
+            Self::File(file) if requested.is_some() => file.operations,
+            Self::Process(process) => process.operations_for(receiver_profile),
+            Self::File(_)
+            | Self::Event(_)
             | Self::UnixSocket(_)
             | Self::Pipe(_)
             | Self::Socket(_)
             | Self::VsockSocket(_)
             | Self::Timer(_)
-            | Self::ReadinessQueue(_)
-            | Self::Process(_) => true,
-            Self::Subject(_) | Self::Signals(_) | Self::FutexWaiter(_) => false,
+            | Self::ReadinessQueue(_) => HandleOperations::all(),
+            Self::Subject(_) | Self::Signals(_) | Self::FutexWaiter(_) => {
+                return Err(BrokerError::UnsupportedOperation);
+            }
+        };
+        if requested.is_some_and(|ops| !bound.contains(ops)) {
+            return Err(BrokerError::InvalidRights);
         }
+        Ok(bound)
     }
 
     /// Returns a registration that publishes readiness changes to this

@@ -300,12 +300,31 @@ impl<B: Backend> Backend for ReadOnly<B> {
         Err(SetTimesError::ReadOnlyFileSystem)
     }
 
+    fn set_handle_times_checked(
+        &self,
+        _h: HandleRef<'_>,
+        _times: &super::SetFileTimes,
+        _authorize: &dyn Fn(&SecurityDescriptor) -> Result<(), SetTimesError>,
+    ) -> Result<(), SetTimesError> {
+        Err(SetTimesError::ReadOnlyFileSystem)
+    }
+
     fn update_security(
         &self,
         _target: ResolvedTarget<'_>,
         _update: &dyn Fn(&SecurityDescriptor) -> Result<SecurityDescriptor, SetSecurityError>,
     ) -> Result<(), SetSecurityError> {
         Err(SetSecurityError::ReadOnlyFileSystem)
+    }
+
+    fn open_dir_checked(
+        &self,
+        dir: ResolvedDir<'_>,
+        flags: OFlags,
+        admit: &dyn Fn(&SecurityDescriptor) -> Result<(), OpenError>,
+    ) -> Result<DirHandle, OpenError> {
+        self.inner
+            .open_dir_checked(dir, read_only_flags(flags)?, admit)
     }
 
     // Truncating opens fail (see `read_only_flags`), so opens change no contents.
@@ -324,6 +343,7 @@ impl<B: Backend> Backend for ReadOnly<B> {
         _h: &FileHandle,
         _buf: &dyn WriteBuffer,
         _offset: usize,
+        _authorize: &dyn Fn(&SecurityDescriptor) -> bool,
         _content_change: &dyn Fn(&mut SecurityDescriptor),
     ) -> Result<usize, WriteError> {
         Err(WriteError::NotForWriting)
@@ -333,8 +353,35 @@ impl<B: Backend> Backend for ReadOnly<B> {
         &self,
         _h: &FileHandle,
         _length: usize,
+        _authorize: &dyn Fn(&SecurityDescriptor) -> bool,
         _content_change: &dyn Fn(&mut SecurityDescriptor),
     ) -> Result<(), TruncateError> {
         Err(TruncateError::NotForWriting)
+    }
+
+    fn read_checked(
+        &self,
+        h: &FileHandle,
+        buf: &mut dyn ReadBuffer,
+        offset: usize,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
+    ) -> Result<usize, ReadError> {
+        self.inner.read_checked(h, buf, offset, authorize)
+    }
+
+    fn list_dir_checked(
+        &self,
+        handle: DirHandle,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
+        self.inner.list_dir_checked(handle, authorize)
+    }
+
+    fn authorize_handle(
+        &self,
+        h: HandleRef<'_>,
+        authorize: &dyn Fn(&SecurityDescriptor) -> bool,
+    ) -> bool {
+        self.inner.authorize_handle(h, authorize)
     }
 }

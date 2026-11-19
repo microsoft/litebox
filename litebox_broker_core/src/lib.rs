@@ -66,7 +66,7 @@ pub use error::BrokerError;
 use fs::FileService;
 use job::Job;
 use object::ObjectReference;
-pub use object::ObjectRights;
+pub use object::{HandleOperations, ObjectRights};
 use pid_namespace::{PerNamespaceIds, PidNamespace};
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,

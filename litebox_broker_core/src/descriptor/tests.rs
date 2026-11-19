@@ -8,8 +8,9 @@ use litebox_broker_protocol::authority::{DomainId, sorted_set::SortedSet};
 use litebox_broker_protocol::signal::MAX_SIGNAL;
 
 use super::acl::{AceKind, AllOf, MAX_ALL_OF};
+use super::handle::{HandleGrants, HandleUse};
 use super::process::{ProcessAce, ProcessDescriptor, ProcessRights, SignalMask, SignalRequest};
-use super::profile::{FileSystemProfile, StorableForms};
+use super::profile::{FileSystemProfile, HandleRules, StorableForms};
 use super::*;
 
 mod mutation;
@@ -557,6 +558,393 @@ fn profile_bounds_guest_descriptor_forms() {
     assert_eq!(
         FileSystemProfile::new(StorableForms::from_bits_retain(1 << 5)),
         Err(DescriptorError::InvalidForms)
+    );
+}
+
+const fn rules(open_gated: Rights, cacheable: Rights) -> HandleRules {
+    HandleRules {
+        open_gated,
+        cacheable,
+    }
+}
+
+#[test]
+fn profiles_accept_only_valid_handle_rules() {
+    let linux = FileSystemProfile::new(StorableForms::MODE).unwrap();
+    assert_eq!(linux.handle_rules(FileKind::File), HandleRules::LINUX_FILE);
+    assert_eq!(
+        linux.handle_rules(FileKind::Directory),
+        HandleRules::LINUX_DIRECTORY
+    );
+    let with = |file, directory| {
+        FileSystemProfile::with_handle_rules(StorableForms::MODE, file, directory)
+    };
+    assert_eq!(
+        with(HandleRules::LINUX_FILE, HandleRules::LINUX_DIRECTORY),
+        Ok(linux)
+    );
+
+    let checked = rules(Rights::READ | Rights::WRITE, Rights::empty());
+    let profile = with(
+        checked,
+        rules(Rights::LIST | Rights::TRAVERSE, Rights::TRAVERSE),
+    )
+    .unwrap();
+    assert_eq!(profile.handle_rules(FileKind::File), checked);
+    assert_ne!(profile, linux);
+
+    let invalid = [
+        // Caching a right that the open does not admit.
+        (
+            rules(Rights::READ, Rights::READ | Rights::WRITE),
+            HandleRules::LINUX_DIRECTORY,
+        ),
+        // Caching a decision about who may access the object.
+        (
+            rules(Rights::WRITE_SECURITY, Rights::WRITE_SECURITY),
+            HandleRules::LINUX_DIRECTORY,
+        ),
+        (
+            HandleRules::LINUX_FILE,
+            rules(Rights::LIST | Rights::WRITE_OWNER, Rights::WRITE_OWNER),
+        ),
+        // Rights of the other kind.
+        (
+            rules(Rights::LIST, Rights::empty()),
+            HandleRules::LINUX_DIRECTORY,
+        ),
+        (HandleRules::LINUX_FILE, rules(Rights::READ, Rights::READ)),
+        (HandleRules::LINUX_DIRECTORY, HandleRules::LINUX_FILE),
+    ];
+    for (file, directory) in invalid {
+        assert_eq!(
+            with(file, directory),
+            Err(DescriptorError::InvalidHandleRules),
+            "{file:?} {directory:?}"
+        );
+    }
+    // A gated right need not be cached.
+    with(
+        rules(Rights::WRITE_SECURITY, Rights::empty()),
+        HandleRules::LINUX_DIRECTORY,
+    )
+    .unwrap();
+}
+
+#[test]
+fn handle_grants_separate_the_mask_admission_and_cache() {
+    let opener = subject(user(1), group(1));
+    let reader = subject(user(2), group(1));
+    let gated = rules(Rights::READ | Rights::WRITE, Rights::READ);
+    let all = FileKind::File.rights();
+    let read_only = all - Rights::WRITE;
+
+    // A read-write open by the owner caches only the cacheable grant.
+    let grants = HandleGrants::admit(
+        gated,
+        FileKind::File,
+        all,
+        Rights::READ | Rights::WRITE,
+        &file(0o640),
+        &opener,
+    )
+    .unwrap();
+    assert_eq!(grants.kind(), FileKind::File);
+    assert_eq!(grants.mask(), all);
+    assert_eq!(grants.admitted(), Rights::READ | Rights::WRITE);
+    assert_eq!(grants.cached(), Rights::READ);
+    assert_eq!(grants.decide(Rights::READ), HandleUse::Cached);
+    assert_eq!(grants.decide(Rights::WRITE), HandleUse::CheckAtUse);
+    assert_eq!(
+        grants.decide(Rights::READ | Rights::WRITE),
+        HandleUse::CheckAtUse
+    );
+    assert_eq!(grants.decide(Rights::TOUCH), HandleUse::CheckAtUse);
+    assert_eq!(grants.decide(Rights::empty()), HandleUse::Denied);
+    assert_eq!(grants.decide(Rights::LIST), HandleUse::Denied);
+
+    // Gated rights that the open does not request leave the mask, ungated ones do not.
+    let grants = HandleGrants::admit(
+        gated,
+        FileKind::File,
+        read_only,
+        Rights::READ,
+        &file(0o640),
+        &reader,
+    )
+    .unwrap();
+    assert_eq!(grants.mask(), read_only);
+    assert_eq!(grants.decide(Rights::WRITE), HandleUse::Denied);
+    assert_eq!(grants.decide(Rights::EXECUTE), HandleUse::CheckAtUse);
+    let ungated = HandleGrants::admit(
+        rules(Rights::WRITE, Rights::WRITE),
+        FileKind::File,
+        read_only,
+        Rights::READ,
+        &file(0o600),
+        &reader,
+    )
+    .unwrap();
+    assert_eq!(ungated.admitted(), Rights::empty());
+    assert_eq!(ungated.decide(Rights::READ), HandleUse::CheckAtUse);
+
+    // The open needs every requested gated right, of a descriptor of its kind.
+    assert!(
+        HandleGrants::admit(
+            gated,
+            FileKind::File,
+            all,
+            Rights::READ | Rights::WRITE,
+            &file(0o640),
+            &reader,
+        )
+        .is_none()
+    );
+    assert!(
+        HandleGrants::admit(
+            gated,
+            FileKind::File,
+            all,
+            Rights::READ,
+            &dir(0o777),
+            &opener
+        )
+        .is_none()
+    );
+    assert!(
+        HandleGrants::admit(
+            HandleRules::LINUX_DIRECTORY,
+            FileKind::Directory,
+            FileKind::Directory.rights(),
+            Rights::LIST,
+            &file(0o777),
+            &opener,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn handles_use_only_masked_rights_that_are_cached_or_granted_now() {
+    let opener = subject(user(1), group(1));
+    let other = subject(user(2), group(2));
+    let writer = with_privileges(other.clone(), Privileges::WRITE_ANY | Privileges::READ_ANY);
+    let all = FileKind::File.rights();
+    let grants = HandleGrants::admit(
+        rules(Rights::READ | Rights::WRITE, Rights::READ),
+        FileKind::File,
+        all,
+        Rights::READ | Rights::WRITE,
+        &file(0o600),
+        &opener,
+    )
+    .unwrap();
+    let data = Rights::READ | Rights::WRITE;
+    // A cached grant outlives revocation; others follow the current descriptor and subject.
+    assert_eq!(
+        grants.granted_at_use(&file(0o000), &opener, data),
+        Rights::READ
+    );
+    assert_eq!(grants.granted_at_use(&file(0o600), &opener, data), data);
+    assert_eq!(
+        grants.granted_at_use(&file(0o600), &other, data),
+        Rights::READ
+    );
+    assert_eq!(grants.granted_at_use(&file(0o606), &other, data), data);
+    assert_eq!(
+        grants.granted_at_use(&file(0o777), &other, data | Rights::EXECUTE),
+        data | Rights::EXECUTE
+    );
+    // A descriptor of another kind grants nothing uncached.
+    assert_eq!(
+        grants.granted_at_use(&dir(0o777), &opener, data),
+        Rights::READ
+    );
+
+    // Nothing outside the mask, whatever the descriptor grants.
+    let reader = grants.restrict(all - Rights::WRITE);
+    assert_eq!(
+        reader.granted_at_use(&file(0o777), &writer, data),
+        Rights::READ
+    );
+    assert_eq!(
+        reader.granted_at_use(&file(0o777), &writer, Rights::WRITE),
+        Rights::empty()
+    );
+
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let privileges = [
+        Privileges::empty(),
+        Privileges::READ_ANY | Privileges::WRITE_ANY,
+        Privileges::ACT_AS_OWNER,
+    ];
+    let rights: Vec<Rights> = single_rights(FileKind::File).collect();
+    for _ in 0..500 {
+        let at_open = file_acl(random_entries(&mut rng, FileKind::File, &rights));
+        let at_use = file_acl(random_entries(&mut rng, FileKind::File, &rights));
+        let actor = |rng: &mut Rng| {
+            with_privileges(
+                subject(rng.pick(&UNIVERSE), rng.pick(&UNIVERSE)),
+                rng.pick(&privileges),
+            )
+        };
+        let (opener, user) = (actor(&mut rng), actor(&mut rng));
+        let pick = |rng: &mut Rng| {
+            Rights::from_bits_truncate(u32::try_from(rng.next() >> 32).unwrap()) & all
+        };
+        let open_gated = pick(&mut rng);
+        let handle_rules = rules(
+            open_gated,
+            open_gated & pick(&mut rng) & !Rights::NEVER_CACHEABLE,
+        );
+        let (eligible, requested) = (pick(&mut rng), pick(&mut rng));
+        let Some(grants) = HandleGrants::admit(
+            handle_rules,
+            FileKind::File,
+            eligible,
+            requested,
+            &at_open,
+            &opener,
+        ) else {
+            continue;
+        };
+        let grants = grants.restrict(pick(&mut rng));
+        assert!(grants.mask().contains(grants.admitted()));
+        assert!(grants.admitted().contains(grants.cached()));
+        let asked = pick(&mut rng);
+        let granted = grants.granted_at_use(&at_use, &user, asked);
+        assert!((asked & grants.mask()).contains(granted));
+        assert!(granted.contains(asked & grants.cached()));
+        assert!(
+            (granted & !grants.cached())
+                .difference(at_use.granted_file_rights(&user, asked & !grants.cached()))
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn restricting_handle_grants_only_removes_rights() {
+    let all = FileKind::File.rights();
+    let grants = HandleGrants::admit(
+        HandleRules::LINUX_FILE,
+        FileKind::File,
+        all,
+        Rights::READ | Rights::WRITE,
+        &file(0o600),
+        &subject(user(1), group(1)),
+    )
+    .unwrap();
+    assert_eq!(grants.cached(), Rights::READ | Rights::WRITE);
+
+    let reader = grants.restrict(Rights::READ | Rights::TOUCH);
+    assert_eq!(reader.mask(), Rights::READ | Rights::TOUCH);
+    assert_eq!(reader.admitted(), Rights::READ);
+    assert_eq!(reader.cached(), Rights::READ);
+    assert_eq!(reader.decide(Rights::WRITE), HandleUse::Denied);
+    // Restricting again cannot restore a right.
+    assert_eq!(reader.restrict(all), reader);
+    assert_eq!(reader.restrict(Rights::WRITE).mask(), Rights::empty());
+
+    // Under rules that cache less, cached grants are checked at use; under rules gating more,
+    // rights that the open did not admit leave the mask.
+    let stricter = grants.restrict_to_rules(rules(
+        Rights::READ | Rights::WRITE | Rights::TOUCH,
+        Rights::READ,
+    ));
+    assert_eq!(stricter.mask(), all - Rights::TOUCH);
+    assert_eq!(stricter.admitted(), Rights::READ | Rights::WRITE);
+    assert_eq!(stricter.cached(), Rights::READ);
+    assert_eq!(stricter.decide(Rights::WRITE), HandleUse::CheckAtUse);
+    assert_eq!(stricter.decide(Rights::TOUCH), HandleUse::Denied);
+    let unchecked = grants.restrict_to_rules(rules(Rights::empty(), Rights::empty()));
+    assert_eq!(unchecked.mask(), all);
+    assert_eq!(unchecked.cached(), Rights::empty());
+    assert_eq!(
+        unchecked.restrict_to_rules(HandleRules::LINUX_FILE),
+        unchecked
+    );
+}
+
+#[test]
+fn handles_never_cache_a_search_only_lookup_any_granted() {
+    let directory_rules = rules(
+        Rights::LIST | Rights::TRAVERSE,
+        Rights::LIST | Rights::TRAVERSE,
+    );
+    let private = dir(0o700);
+    let admit = |subject: &Subject| {
+        HandleGrants::admit(
+            directory_rules,
+            FileKind::Directory,
+            FileKind::Directory.rights(),
+            Rights::TRAVERSE,
+            &private,
+            subject,
+        )
+    };
+    let lookup = with_privileges(subject(user(3), group(3)), Privileges::LOOKUP_ANY);
+    let grants = admit(&lookup).unwrap();
+    assert_eq!(grants.admitted(), Rights::TRAVERSE);
+    assert_eq!(grants.cached(), Rights::empty());
+    assert_eq!(grants.decide(Rights::TRAVERSE), HandleUse::CheckAtUse);
+    assert_eq!(grants.decide(Rights::LIST), HandleUse::Denied);
+
+    let traverse = with_privileges(lookup, Privileges::TRAVERSE_ANY);
+    assert_eq!(admit(&traverse).unwrap().cached(), Rights::TRAVERSE);
+    assert_eq!(
+        admit(&subject(user(1), group(1))).unwrap().cached(),
+        Rights::TRAVERSE
+    );
+}
+
+#[test]
+fn cached_directory_modification_still_requires_a_modifying_search() {
+    let subject_at_open = subject(user(1), group(1));
+    let lookup = with_privileges(subject(user(3), group(3)), Privileges::LOOKUP_ANY);
+    let private = dir(0o700);
+    let requested = Rights::ADD_ENTRY | Rights::TRAVERSE;
+    let grants = HandleGrants::admit(
+        rules(Rights::ADD_ENTRY, Rights::ADD_ENTRY),
+        FileKind::Directory,
+        FileKind::Directory.rights(),
+        requested,
+        &private,
+        &subject_at_open,
+    )
+    .unwrap();
+    assert_eq!(grants.admitted(), requested);
+    assert_eq!(grants.cached(), Rights::ADD_ENTRY);
+    assert_eq!(
+        grants.granted_at_use(&private, &lookup, Rights::TRAVERSE),
+        Rights::TRAVERSE
+    );
+    assert_eq!(
+        grants.granted_at_use(&private, &lookup, requested),
+        Rights::ADD_ENTRY
+    );
+    // A receiving profile can require admission for previously ungated traversal, but cannot cache it.
+    let recipient = grants.restrict_to_rules(rules(requested, requested));
+    assert_eq!(recipient.decide(Rights::TRAVERSE), HandleUse::CheckAtUse);
+}
+
+#[test]
+fn created_handles_gain_only_the_gated_rights_they_request() {
+    let all = FileKind::File.rights();
+    let gated = rules(Rights::READ | Rights::WRITE | Rights::TOUCH, Rights::WRITE);
+    let writer = HandleGrants::created(gated, FileKind::File, all - Rights::READ, Rights::WRITE);
+    assert_eq!(writer.mask(), all - Rights::READ - Rights::TOUCH);
+    assert_eq!(writer.admitted(), Rights::WRITE);
+    assert_eq!(writer.cached(), Rights::WRITE);
+    let both = HandleGrants::created(gated, FileKind::File, all, Rights::READ | Rights::WRITE);
+    assert_eq!(both.admitted(), Rights::READ | Rights::WRITE);
+    assert_eq!(both.cached(), Rights::WRITE);
+    assert_eq!(both.decide(Rights::READ), HandleUse::CheckAtUse);
+    let path = HandleGrants::created(gated, FileKind::File, all, Rights::empty());
+    assert_eq!(path.admitted(), Rights::empty());
+    assert_eq!(
+        path.mask(),
+        all - Rights::READ - Rights::WRITE - Rights::TOUCH
     );
 }
 

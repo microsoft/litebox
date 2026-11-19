@@ -40,6 +40,7 @@ use litebox_broker_protocol::fs::FileMode;
 use thiserror::Error;
 
 pub mod acl;
+pub mod handle;
 mod mode;
 pub mod mutation;
 pub mod process;
@@ -87,6 +88,10 @@ impl Rights {
     pub const MODIFYING: Self = Self::ADD_ENTRY
         .union(Self::DELETE_CHILD)
         .union(Self::REPARENT);
+
+    /// Rights that decide who may access the object, which a handle never
+    /// caches: a cached copy would outlive a change of owner.
+    pub const NEVER_CACHEABLE: Self = Self::WRITE_SECURITY.union(Self::WRITE_OWNER);
 
     const COMMON: Self = Self::TOUCH
         .union(Self::WRITE_ATTRIBUTES)
@@ -196,6 +201,10 @@ pub enum DescriptorError {
     /// A profile names unknown descriptor forms.
     #[error("unknown descriptor forms")]
     InvalidForms,
+    /// A profile's handle rules name rights of another kind of object, cache
+    /// a right that is not open-gated, or cache a never-cacheable right.
+    #[error("invalid handle rules")]
+    InvalidHandleRules,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -406,6 +415,29 @@ impl SecurityDescriptor {
     /// grant the other rights.
     #[must_use]
     pub fn granted_file_rights(&self, subject: &Subject, requested: Rights) -> Rights {
+        self.granted_with_privileges(subject, subject.privileges, requested)
+    }
+
+    /// The subset of `requested` that `subject` is granted and that a handle
+    /// may cache (see [`handle::HandleGrants`]): as
+    /// [`Self::granted_file_rights`], but without a [`Rights::TRAVERSE`] that
+    /// only [`Privileges::LOOKUP_ANY`] supplies, since a cached search could
+    /// later serve as a modifying search.
+    #[must_use]
+    pub fn cacheable_file_rights(&self, subject: &Subject, requested: Rights) -> Rights {
+        self.granted_with_privileges(
+            subject,
+            subject.privileges.difference(Privileges::LOOKUP_ANY),
+            requested,
+        ) & !Rights::NEVER_CACHEABLE
+    }
+
+    fn granted_with_privileges(
+        &self,
+        subject: &Subject,
+        privileges: Privileges,
+        requested: Rights,
+    ) -> Rights {
         if subject.scope != Scope::Access || !self.kind.rights().contains(requested) {
             return Rights::empty();
         }
@@ -423,7 +455,7 @@ impl SecurityDescriptor {
             ),
             Access::Acl { entries, .. } => walk(entries, &context, requested),
         };
-        walked | (self.privileged_rights(subject.privileges, requested) & requested)
+        walked | (self.privileged_rights(privileges, requested) & requested)
     }
 
     /// Whether `subject` is granted every right in `requested`, which must be

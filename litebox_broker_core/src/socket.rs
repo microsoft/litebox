@@ -23,7 +23,7 @@ use litebox_broker_protocol::socket::{
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, RwLock};
 
-use crate::object::{ObjectEntry, ObjectRights, ProvidedReadiness, StatusFlags};
+use crate::object::{HandleOperations, ObjectEntry, ProvidedReadiness, StatusFlags};
 use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
@@ -770,7 +770,7 @@ pub fn create(
     });
     let socket = SocketObject::new(resource, request, status);
     socket.sync_readiness();
-    reference.commit_with_readiness(ObjectEntry::Socket(socket), Some(registration))
+    reference.commit_with_readiness(ObjectEntry::Socket(socket), registration)
 }
 
 /// Starts a nonblocking connection attempt, or reports one already started.
@@ -791,7 +791,7 @@ pub fn connect(
     handle: ObjectHandle,
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
-    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::CONNECT)?;
     let result = if read_socket(&object, |socket| is_udp(socket.create_request))? {
         connect_datagram(process, &object, address)
     } else {
@@ -882,7 +882,7 @@ pub fn check_connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
-    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::CONNECT)?;
     let result = if read_socket(&object, |socket| is_udp(socket.create_request))? {
         refresh(&object, true);
         read_socket(&object, |socket| match socket.view() {
@@ -924,8 +924,7 @@ pub fn get_name(
     handle: ObjectHandle,
     peer: bool,
 ) -> Result<Option<SocketAddrV4>> {
-    let object = process
-        .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::QUERY)?;
     read_socket(&object, |_| ())?;
     refresh(&object, !peer);
     let address = read_socket(&object, |socket| {
@@ -943,8 +942,7 @@ pub fn get_name(
 
 /// Takes a socket's oldest pending error.
 pub fn take_error(process: &BrokerProcess, handle: ObjectHandle) -> Result<Option<SocketError>> {
-    let object = process
-        .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::SOCKET_ERROR)?;
     read_socket(&object, |_| ())?;
     refresh(&object, true);
     let error = take_pending_error(&object);
@@ -956,8 +954,7 @@ pub fn take_error(process: &BrokerProcess, handle: ObjectHandle) -> Result<Optio
 ///
 /// A socket keeps at most two pending errors, so this may discard the newest.
 pub fn set_error(process: &BrokerProcess, handle: ObjectHandle, error: SocketError) -> Result<()> {
-    let object = process
-        .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::SOCKET_ERROR)?;
     write_socket(&object, |socket| socket.errors.prepend(error))?;
     sync_readiness(&object);
     Ok(())
@@ -1100,7 +1097,7 @@ pub fn bind(
     handle: ObjectHandle,
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketAddrV4>> {
-    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::BIND)?;
     let result = transport_bind(process, &object, address);
     sync_readiness(&object);
     result
@@ -1163,7 +1160,7 @@ pub fn listen(
     if backlog > MAX_TCP_LISTEN_BACKLOG {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::LISTEN)?;
     let result = transport_listen(process, &object, backlog);
     sync_readiness(&object);
     result
@@ -1266,7 +1263,7 @@ pub fn accept(
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<SocketOutcome<AcceptedBrokerSocket>> {
     let status = StatusFlags::new(flags)?;
-    let listener = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let listener = process.authorized_operation(handle, HandleOperations::ACCEPT)?;
     let (listener_resource, create_request, nonblocking) = {
         let listener = listener.read();
         let ObjectEntry::Socket(socket) = &*listener else {
@@ -1332,8 +1329,8 @@ pub fn accept(
         remote_address,
     );
     accepted_socket.sync_readiness();
-    let handle = reference
-        .commit_with_readiness(ObjectEntry::Socket(accepted_socket), Some(registration))?;
+    let handle =
+        reference.commit_with_readiness(ObjectEntry::Socket(accepted_socket), registration)?;
     Ok(SocketOutcome::Completed(AcceptedBrokerSocket {
         handle,
         local_address,
@@ -1357,7 +1354,7 @@ pub fn send(
     if flags.has_unsupported_bits() || data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::WRITE)?;
     let result = send_stream(&object, data, flags);
     sync_readiness(&object);
     result
@@ -1455,7 +1452,7 @@ pub fn send_to(
     if flags.has_unsupported_bits() || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::WRITE)?;
     let result = send_datagram(process, &object, data, flags, destination);
     sync_readiness(&object);
     result
@@ -1653,7 +1650,7 @@ pub fn receive(
     {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let object = process.authorized_operation(handle, HandleOperations::READ)?;
     let result = receive_stream(&object, handle, output, flags, peek_offset, peek_length);
     sync_readiness(&object);
     result
@@ -1769,7 +1766,7 @@ pub fn receive_from(
     if flags.has_unsupported_bits() || output.len() > MAX_UDP_DATAGRAM_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let object = process.authorized_operation(handle, HandleOperations::READ)?;
     let result = receive_datagram(&object, output, flags);
     sync_readiness(&object);
     result
@@ -1834,7 +1831,7 @@ pub fn set_option(
     handle: ObjectHandle,
     value: SocketOptionValue,
 ) -> Result<()> {
-    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::SET_OPTION)?;
     let mut object = object.write();
     let ObjectEntry::Socket(socket) = &mut *object else {
         return Err(BrokerError::InvalidRights);
@@ -1856,8 +1853,7 @@ pub fn get_option(
     handle: ObjectHandle,
     name: SocketOptionName,
 ) -> Result<SocketOptionValue> {
-    let object = process
-        .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::QUERY)?;
     let object = object.read();
     let ObjectEntry::Socket(socket) = &*object else {
         return Err(BrokerError::InvalidRights);
@@ -1909,7 +1905,7 @@ pub fn shutdown(
     handle: ObjectHandle,
     mode: ShutdownMode,
 ) -> Result<SocketOutcome<()>> {
-    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_operation(handle, HandleOperations::SHUTDOWN)?;
     let result = if read_socket(&object, |socket| is_udp(socket.create_request))? {
         shutdown_datagram(&object, mode)
     } else {
@@ -2080,7 +2076,7 @@ fn transport_status(
 /// error without queuing it.
 #[cfg(any(test, feature = "test-support"))]
 pub fn status(process: &BrokerProcess, handle: ObjectHandle) -> Result<PlatformSocketStatus> {
-    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
+    let object = process.authorized_operation(handle, HandleOperations::READ_STATE)?;
     let result = transport_status(&object, false).map(|(status, _)| status);
     sync_readiness(&object);
     result
@@ -2392,9 +2388,9 @@ fn datagram_status(
 fn socket_resource(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    required_rights: ObjectRights,
+    required: HandleOperations,
 ) -> Result<Arc<SocketResource>> {
-    let object = process.authorized_object(handle, required_rights)?;
+    let object = process.authorized_operation(handle, required)?;
     let object = object.read();
     let ObjectEntry::Socket(socket) = &*object else {
         return Err(BrokerError::InvalidRights);
@@ -3259,13 +3255,13 @@ fn socket_readiness(
     readiness_sink: Arc<dyn ReadinessSink>,
     quota: Arc<QuotaReservation>,
 ) -> Result<(
-    ReadinessRegistration,
+    Option<ReadinessRegistration>,
     Arc<SocketReadinessSink>,
     ReadinessRegistration,
 )> {
-    let registration = ReadinessRegistration::new(reference.handle(), readiness_sink);
     let socket_sink = Arc::new(SocketReadinessSink::default());
-    socket_sink.watchers.watch(&registration)?;
+    let registration =
+        reference.watch_readiness(readiness_sink, |r| socket_sink.watchers.watch(r))?;
     let readiness = ReadinessRegistration::new_with_retirement_guard(
         reference.handle(),
         socket_sink.clone(),

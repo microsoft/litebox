@@ -475,6 +475,8 @@ wire_struct! {
     pub struct ReadFileRequest {
         /// Broker-owned file handle.
         pub handle: ObjectHandle,
+        /// Current Access subject for a read that was not cached at open.
+        pub subject: Option<ObjectHandle>,
         /// Shared-buffer destination sequence.
         pub buffer: SharedBufferSequence,
         /// Explicit offset, or `None` to use and update the shared position.
@@ -608,6 +610,8 @@ wire_struct! {
     pub struct ReadDirectoryRequest {
         /// Broker-owned directory handle.
         pub handle: ObjectHandle,
+        /// Current Access subject for an enumeration that was not cached at open.
+        pub subject: Option<ObjectHandle>,
         /// Shared-buffer destination for encoded entries.
         pub buffer: SharedBufferSequence,
         /// Entry index at which this response should begin.

@@ -45,7 +45,7 @@ use litebox_broker_protocol::vsock_socket::{
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::Mutex;
 
-use crate::object::{ObjectEntry, ObjectRights, ProvidedReadiness, StatusFlags};
+use crate::object::{HandleOperations, ObjectEntry, ProvidedReadiness, StatusFlags};
 use crate::process::PendingObjectReference;
 use crate::quota::QuotaReservation;
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
@@ -244,7 +244,7 @@ pub fn create(
     };
     reference.commit_with_readiness(
         ObjectEntry::VsockSocket(VsockSocketObject::new(resource, status)),
-        Some(registration),
+        registration,
     )
 }
 
@@ -254,7 +254,7 @@ pub fn bind(
     handle: ObjectHandle,
     address: VsockAddress,
 ) -> Result<SocketOutcome<()>> {
-    let (socket, _) = lease(process, handle, ObjectRights::WRITE)?;
+    let (socket, _) = lease(process, handle, HandleOperations::BIND)?;
     let _binding = socket.binding.lock();
     socket.socket.bind(address)
 }
@@ -271,7 +271,7 @@ pub fn listen(
     if backlog > MAX_VSOCK_LISTEN_BACKLOG {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (socket, _) = lease(process, handle, ObjectRights::WRITE)?;
+    let (socket, _) = lease(process, handle, HandleOperations::LISTEN)?;
     let _binding = socket.binding.lock();
     // The provider fails the listen of an unbound socket.
     if let Some(address) = socket.socket.local_address() {
@@ -296,7 +296,7 @@ pub fn accept(
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<SocketOutcome<AcceptedBrokerVsockSocket>> {
     let status = StatusFlags::new(flags)?;
-    let (listener, nonblocking) = lease(process, handle, ObjectRights::WAIT)?;
+    let (listener, nonblocking) = lease(process, handle, HandleOperations::ACCEPT)?;
     let rights = process
         .core
         .policy
@@ -324,7 +324,7 @@ pub fn accept(
     };
     let handle = reference.commit_with_readiness(
         ObjectEntry::VsockSocket(VsockSocketObject::new(resource, status)),
-        Some(registration),
+        registration,
     )?;
     Ok(SocketOutcome::Completed(AcceptedBrokerVsockSocket {
         handle,
@@ -343,7 +343,7 @@ pub fn connect(
     handle: ObjectHandle,
     address: VsockAddress,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
-    let (socket, _) = lease(process, handle, ObjectRights::WRITE)?;
+    let (socket, _) = lease(process, handle, HandleOperations::CONNECT)?;
     let to_host = address.cid == VsockCid::HOST;
     if to_host {
         match process.core.policy.authorize_vsock_connect(address) {
@@ -372,7 +372,7 @@ pub fn check_connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
-    let (socket, _) = lease(process, handle, ObjectRights::WRITE)?;
+    let (socket, _) = lease(process, handle, HandleOperations::CONNECT)?;
     match socket.socket.check_connect()? {
         SocketOutcome::Completed(SocketConnectionStatus::Failed(_)) => Err(BrokerError::Internal),
         outcome => Ok(outcome),
@@ -381,13 +381,13 @@ pub fn check_connect(
 
 /// Cancels a connect in progress; see [`PlatformVsockSocket::cancel_connect`].
 pub fn cancel_connect(process: &BrokerProcess, handle: ObjectHandle) -> Result<SocketOutcome<()>> {
-    let (socket, _) = lease(process, handle, ObjectRights::WRITE)?;
+    let (socket, _) = lease(process, handle, HandleOperations::CONNECT)?;
     socket.socket.cancel_connect()
 }
 
 /// Takes a socket's pending error.
 pub fn take_error(process: &BrokerProcess, handle: ObjectHandle) -> Result<Option<SocketError>> {
-    let (socket, _) = lease(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let (socket, _) = lease(process, handle, HandleOperations::SOCKET_ERROR)?;
     Ok(socket.socket.take_error())
 }
 
@@ -403,7 +403,7 @@ pub fn send(
     if flags != SendFlags::NONE || length > MAX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (socket, nonblocking) = lease(process, handle, ObjectRights::WRITE)?;
+    let (socket, nonblocking) = lease(process, handle, HandleOperations::WRITE)?;
     let outcome = socket
         .socket
         .send(data)
@@ -427,7 +427,7 @@ pub fn receive(
     if length > MAX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (socket, nonblocking) = lease(process, handle, ObjectRights::WAIT)?;
+    let (socket, nonblocking) = lease(process, handle, HandleOperations::READ)?;
     let outcome = socket
         .socket
         .receive(output)
@@ -453,7 +453,7 @@ pub fn shutdown(
     ) {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let (socket, _) = lease(process, handle, ObjectRights::WRITE)?;
+    let (socket, _) = lease(process, handle, HandleOperations::SHUTDOWN)?;
     socket.socket.shutdown(mode)
 }
 
@@ -463,7 +463,7 @@ pub fn get_name(
     handle: ObjectHandle,
     peer: bool,
 ) -> Result<Option<VsockAddress>> {
-    let (socket, _) = lease(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    let (socket, _) = lease(process, handle, HandleOperations::QUERY)?;
     Ok(if peer {
         socket.socket.peer_address()
     } else {
@@ -476,9 +476,9 @@ pub fn get_name(
 fn lease(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    rights: ObjectRights,
+    rights: HandleOperations,
 ) -> Result<(Arc<VsockSocketResource>, bool)> {
-    let object = process.authorized_object_with_any_rights(handle, rights)?;
+    let object = process.authorized_operation(handle, rights)?;
     let object = object.read();
     let ObjectEntry::VsockSocket(socket) = &*object else {
         return Err(BrokerError::InvalidRights);
@@ -502,13 +502,12 @@ fn socket_readiness(
     readiness_sink: Arc<dyn ReadinessSink>,
     quota: Arc<QuotaReservation>,
 ) -> Result<(
-    ReadinessRegistration,
+    Option<ReadinessRegistration>,
     Arc<WatchersSink>,
     ReadinessRegistration,
 )> {
-    let registration = ReadinessRegistration::new(reference.handle(), readiness_sink);
     let watchers = Arc::new(WatchersSink::default());
-    watchers.0.watch(&registration)?;
+    let registration = reference.watch_readiness(readiness_sink, |r| watchers.0.watch(r))?;
     let readiness = ReadinessRegistration::new_with_retirement_guard(
         reference.handle(),
         watchers.clone(),
@@ -614,7 +613,9 @@ mod tests {
     use super::*;
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::{TestBroker, TestBrokerBuilder};
-    use crate::{BrokerCoreLimits, CallerCredential, PolicyEngine, VsockPolicy, VsockPortRange};
+    use crate::{
+        BrokerCoreLimits, CallerCredential, ObjectRights, PolicyEngine, VsockPolicy, VsockPortRange,
+    };
 
     const HOST: VsockAddress = VsockAddress {
         cid: VsockCid::HOST,
