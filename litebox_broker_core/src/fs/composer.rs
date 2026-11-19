@@ -1356,6 +1356,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                         may_move,
                     );
                 }
+                let mut directory_cycle = false;
                 let may_move = may_move.and_then(|()| {
                     let pins = mount.live_directory_pins();
                     let path_pinned = mount.protects(&old_path) || mount.protects(&new_path);
@@ -1378,9 +1379,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     if matches!(source, BackingEntry::Missing) {
                         return Err(PathError::NoSuchFileOrDirectory.into());
                     }
-                    if !path_pinned
+                    directory_cycle = matches!(source, BackingEntry::Directory { .. })
+                        && new_path.starts_with(&old_path);
+                    if directory_cycle
+                        && !path_pinned
                         && matches!(source, BackingEntry::Directory { pinned: false })
-                        && new_path.starts_with(&old_path)
                     {
                         // Backends must reject directory cycles. No protected source or
                         // descendant can move; leave destination validation to the backend.
@@ -1397,9 +1400,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     // Describe only a move the view actually vetoes. Otherwise the
                     // backend decides, including servers that do not support rename.
                     Err(match (source, destination) {
-                        (BackingEntry::Directory { .. }, _) if new_path.starts_with(&old_path) => {
-                            RenameError::InvalidArgument
-                        }
+                        _ if directory_cycle => RenameError::InvalidArgument,
                         (_, BackingEntry::Directory { .. }) if old_path.starts_with(&new_path) => {
                             RenameError::NotEmpty
                         }
@@ -1412,11 +1413,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                         _ => RenameError::Busy,
                     })
                 });
-                // A failed search is authoritative; don't inspect the protected name further.
-                if matches!(
-                    may_move,
-                    Err(RenameError::PathError(PathError::NoSearchPerms))
-                ) {
+                // A backend can reject a known directory cycle without searching the destination.
+                // Otherwise report a denied search before inspecting the protected name further.
+                if !directory_cycle
+                    && matches!(
+                        may_move,
+                        Err(RenameError::PathError(PathError::NoSearchPerms))
+                    )
+                {
                     return may_move;
                 }
                 mount

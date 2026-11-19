@@ -85,19 +85,21 @@ fn private_mount_does_not_hide_invalid_subtree_rename() {
         fs::create_dir(temp.path().join(dir)).unwrap();
     }
     let parent = host_service(temp.path());
-    let child = parent.copy_mount_view().unwrap();
-    child.mount_in_mem("/other", ROOT).unwrap().unwrap();
-    let destination = format!("/p/{}", "x".repeat(256));
-    assert_eq!(
-        parent.rename("/p", &destination, ROOT).unwrap(),
-        Err(FileError::InvalidArgument)
-    );
-    // LocalFs rejects the cycle without looking up the leaf, even if /p is not searchable.
     let p = temp.path().join("p");
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
-    let rename = parent.rename("/p", "/p/new", ROOT).unwrap();
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(rename, Err(FileError::InvalidArgument));
+    let destination = format!("/p/{}", "x".repeat(256));
+    for mountpoint in ["/other", "/p"] {
+        let child = parent.copy_mount_view().unwrap();
+        child.mount_in_mem(mountpoint, ROOT).unwrap().unwrap();
+        assert_eq!(
+            parent.rename("/p", &destination, ROOT).unwrap(),
+            Err(FileError::InvalidArgument)
+        );
+        // LocalFs rejects the cycle without looking up the leaf, even if /p is not searchable.
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        let rename = parent.rename("/p", "/p/new", ROOT).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(rename, Err(FileError::InvalidArgument));
+    }
 }
 
 #[test]
