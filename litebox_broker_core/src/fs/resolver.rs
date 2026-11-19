@@ -1300,6 +1300,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
     /// Create a new directory
     pub fn mkdir(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
+        // A failed mkdir may roll back a temporarily visible directory. A related view
+        // must not mount it between creation and rollback.
+        let _paths = self.composer().map(|c| c.mount_paths.lock());
         let context = Context::new(user);
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, path)

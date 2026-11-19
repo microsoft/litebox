@@ -101,6 +101,13 @@ type DirectoryId = (u64, u128);
 #[derive(Default)]
 pub(super) struct MountPins(Vec<(usize, Vec<DirectoryId>)>);
 
+#[derive(Clone, Copy)]
+enum BackingEntry {
+    Missing,
+    File,
+    Directory { pinned: bool },
+}
+
 impl Mount {
     fn pin(&self, path: &Arc<[String]>) {
         let mut points = self.points.lock();
@@ -124,27 +131,31 @@ impl Mount {
             .collect()
     }
 
-    /// `None` for a missing final name; only an existing directory can have a pinned identity.
-    fn lookup_entry_pin<'a>(
+    fn lookup_entry<'a>(
         &'a self,
         parent: ResolvedDir<'a>,
         name: &str,
         pins: &[Arc<[DirectoryId]>],
-    ) -> Result<Option<bool>, WalkError> {
+    ) -> Result<BackingEntry, WalkError> {
         match self
             .backend
             .resolve(parent, &[name], &|_| Ok(()))
             .map_err(|e| e.error)?
         {
-            Resolution::MissingFinal { .. } => Ok(None),
-            Resolution::Found(target @ ResolvedTarget::Dir(_)) if !pins.is_empty() => {
+            Resolution::MissingFinal { .. } => Ok(BackingEntry::Missing),
+            Resolution::Found(ResolvedTarget::File(_)) => Ok(BackingEntry::File),
+            Resolution::Found(target @ ResolvedTarget::Dir(_)) => {
+                if pins.is_empty() {
+                    return Ok(BackingEntry::Directory { pinned: false });
+                }
                 let id = self
                     .backend
                     .mount_directory_id(&target)
                     .map_err(|_| WalkError::Io)?;
-                Ok(Some(pins.iter().any(|ids| ids.contains(&id))))
+                Ok(BackingEntry::Directory {
+                    pinned: pins.iter().any(|ids| ids.contains(&id)),
+                })
             }
-            Resolution::Found(_) => Ok(Some(false)),
         }
     }
 }
@@ -584,10 +595,13 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         else {
             unreachable!()
         };
-        match mount.lookup_entry_pin(handle, name, &pins) {
-            Ok(None) => Err(PathError::NoSuchFileOrDirectory.into()),
-            Ok(Some(pinned)) if path_pinned || pinned => Err(RmdirError::Busy),
-            Ok(Some(_)) => Ok(None),
+        match mount.lookup_entry(handle, name, &pins) {
+            Ok(BackingEntry::Missing) => Err(PathError::NoSuchFileOrDirectory.into()),
+            Ok(BackingEntry::File) => Err(RmdirError::NotADirectory),
+            Ok(BackingEntry::Directory { pinned }) if path_pinned || pinned => {
+                Err(RmdirError::Busy)
+            }
+            Ok(BackingEntry::Directory { .. }) => Ok(None),
             Err(WalkError::PathError(e)) => Err(RmdirError::PathError(e)),
             Err(WalkError::Io) => Err(RmdirError::Io),
         }
@@ -1339,20 +1353,34 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                             .walking_dir_at(handle)
                             .ok_or(RenameError::Io)?;
                         mount
-                            .lookup_entry_pin(parent, name, &pins)
+                            .lookup_entry(parent, name, &pins)
                             .map_err(|e| match e {
                                 WalkError::PathError(e) => RenameError::PathError(e),
                                 WalkError::Io => RenameError::Io,
                             })
                     };
-                    // Across views, a pin only prevents an otherwise possible rename. In
-                    // particular, it cannot turn EXDEV or a missing source into EBUSY.
-                    let source_pinned =
-                        lookup(&old_handle, old_name)?.ok_or(PathError::NoSuchFileOrDirectory)?;
-                    // Both lookups must pass the backend's search checks before reporting a pin.
-                    let destination_pinned = lookup(&new_handle, new_name)? == Some(true);
-                    if old_pinned || source_pinned || new_pinned || destination_pinned {
-                        return Err(RenameError::Busy);
+                    let source = lookup(&old_handle, old_name)?;
+                    if matches!(source, BackingEntry::Missing) {
+                        return Err(PathError::NoSuchFileOrDirectory.into());
+                    }
+                    let destination = lookup(&new_handle, new_name)?;
+                    if old_pinned
+                        || new_pinned
+                        || [source, destination]
+                            .iter()
+                            .any(|e| matches!(e, BackingEntry::Directory { pinned: true }))
+                    {
+                        // Check guest-visible entry types, but don't attempt a backing mutation
+                        // to discover host-only restrictions (e.g. ACLs or nested host mounts).
+                        return Err(match (source, destination) {
+                            (BackingEntry::File, BackingEntry::Directory { .. }) => {
+                                RenameError::IsADirectory
+                            }
+                            (BackingEntry::Directory { .. }, BackingEntry::File) => {
+                                RenameError::NotADirectory
+                            }
+                            _ => RenameError::Busy,
+                        });
                     }
                 }
                 mount

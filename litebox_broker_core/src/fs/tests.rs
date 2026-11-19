@@ -237,6 +237,9 @@ fn private_mount_pins_do_not_hide_earlier_rename_errors() {
     );
     parent.mkdir(ROOT, "/pinned", Mode::RWXU).unwrap();
     parent.mkdir(ROOT, "/other/source", Mode::RWXU).unwrap();
+    parent
+        .open(ROOT, "/file", OFlags::CREAT, Mode::RWXU)
+        .unwrap();
     let child = parent.copy_mount_view().unwrap();
     child.mount_in_mem(ROOT, "/pinned").unwrap();
 
@@ -251,6 +254,14 @@ fn private_mount_pins_do_not_hide_earlier_rename_errors() {
         Err(RenameError::PathError(PathError::NoSuchFileOrDirectory))
     ));
     parent.rename(ROOT, "/pinned", "/pinned").unwrap();
+    assert!(matches!(
+        parent.rename(ROOT, "/file", "/pinned"),
+        Err(RenameError::IsADirectory)
+    ));
+    assert!(matches!(
+        parent.rename(ROOT, "/pinned", "/file"),
+        Err(RenameError::NotADirectory)
+    ));
     assert!(matches!(
         parent.unlink(ROOT, "/pinned"),
         Err(UnlinkError::IsADirectory)

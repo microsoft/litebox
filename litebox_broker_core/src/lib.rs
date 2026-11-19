@@ -459,10 +459,10 @@ impl BrokerCore {
 
     /// Creates a root process, one with no parent, and its initial thread. The
     /// process is in `pid_namespace` and `job`, opens files through `fs`, and
-    /// starts with the host names `host_names`, which no other root shares; its
-    /// descendants share `job`, `fs` and those host names (until one takes a
-    /// copy, see [`BrokerProcess::copy_host_names`]), and are in
-    /// `pid_namespace` or in namespaces nested in it.
+    /// starts with the host names `host_names`, which no other root shares.
+    /// Descendants share `job` and live in `pid_namespace` or a nested namespace.
+    /// A child shares its creator's mount view unless created with a private copy.
+    /// Host names are shared independently until [`BrokerProcess::copy_host_names`].
     ///
     /// If `pid_namespace` has no first process yet, this process becomes it
     /// once its creation succeeds (see [`BrokerProcess::is_first_process`]);
