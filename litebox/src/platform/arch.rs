@@ -2,14 +2,15 @@
 // Licensed under the MIT license.
 
 //! Architecture-specific platform interfaces.
-//!
-//! As it currently stands, the interfaces here are only considered for x86-64 and aarch64, in
-//! the future other architectures might be supported.
 
 use thiserror::Error;
 
 /// A provider of architecture-specific functionality.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+))]
 pub trait ArchSpecificProvider {
     /// Get the architecture-specific `reg`, for the current guest context.
     ///
@@ -62,6 +63,16 @@ pub enum ArchSpecificRegister {
     /// The read-only thread pointer register; Darwin keeps the thread's TSD
     /// base here.
     TpidrroEl0,
+}
+
+/// Guest-visible RISC-V register values, independent of how the platform stores them.
+#[cfg(target_arch = "riscv64")]
+#[non_exhaustive]
+pub enum ArchSpecificRegister {
+    /// Global pointer (x3), not the runner's per-thread anchor.
+    Gp,
+    /// Thread pointer (x4).
+    Tp,
 }
 
 /// Errors that can be produced by a [`ArchSpecificProvider`] operation.

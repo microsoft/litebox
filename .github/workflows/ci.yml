@@ -287,8 +287,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user
-      - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $RISCV64_CRATES
+      - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $RISCV64_CRATES -p litebox
       - run: ./.github/tools/github_actions_run_cargo nextest --all-features $RISCV64_CRATES
+      # Core FD tests use ordinary drop semantics, not the panic_on_unclosed_fd_drop diagnostic.
+      - run: ./.github/tools/github_actions_run_cargo nextest -p litebox
       - name: Execute an ahead-of-time rewritten RV64 guest
         run: ./.github/tools/github_actions_run_cargo nextest --target x86_64-unknown-linux-gnu -p litebox_syscall_rewriter --test riscv64_tests --run-ignored only
 

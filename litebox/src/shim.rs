@@ -141,6 +141,26 @@ pub struct ExceptionInfo {
     pub bus_error: bool,
 }
 
+/// Information about a synchronous RV64 exception.
+#[cfg(target_arch = "riscv64")]
+#[derive(Copy, Clone, Debug)]
+pub struct ExceptionInfo {
+    /// Synchronous exception code (the code field of `scause`).
+    pub exception: Exception,
+    /// Faulting virtual address for a memory exception, when available.
+    pub fault_address: usize,
+    /// Whether the fault occurred in the runtime rather than in guest code.
+    pub kernel_mode: bool,
+    /// Whether the backing memory object could not service the access.
+    pub bus_error: bool,
+}
+
+/// A RISC-V synchronous exception code (no interrupt bit).
+#[cfg(target_arch = "riscv64")]
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Exception(pub usize);
+
 /// An x86 exception type.
 #[cfg(target_arch = "x86_64")]
 #[repr(transparent)]
