@@ -650,9 +650,10 @@ impl<P: ShimPlatform> Task<P> {
             FcntlArg::GetPath(buffer) => {
                 // Only vnodes have a path; XNU fails others with EBADF, as
                 // this fails inherited descriptors, which have no path in the
-                // guest's namespace. For a vnode XNU returns its path
-                // (vn_getpath_ext): a directory's current path, or the
-                // name a file was opened by, with symbolic links resolved.
+                // guest's namespace. For a vnode XNU returns its current path
+                // (vn_getpath_ext), with symbolic links resolved. LiteBox
+                // matches this for a directory but reports a file by the
+                // name it was opened by, under its directory's current path.
                 if !self.files.opened_by_path(&typed)? {
                     return Err(Errno::EBADF);
                 }

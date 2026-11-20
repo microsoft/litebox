@@ -22,10 +22,9 @@ use litebox_broker_core::fs::errors::SetTimesError;
 use litebox_broker_protocol::fs::{FileTimeUpdate, FileTimestamp, SetFileTimes};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_IO_PENDING};
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES, ReadFile,
-    WriteFile,
-};
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+
+use super::win_flags::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::core::BOOL;
 
@@ -195,10 +194,11 @@ pub(super) fn set_times(
             updates.set_modified(time)
         };
     }
-    OpenOptions::new()
-        .access_mode(FILE_WRITE_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .and_then(|file| file.set_times(updates))
-        .map_err(super::io_errors::set_times_error)
+    super::open_no_reparse(
+        OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES),
+        FILE_FLAG_BACKUP_SEMANTICS,
+        path,
+    )
+    .and_then(|(file, _)| file.set_times(updates))
+    .map_err(super::io_errors::set_times_error)
 }

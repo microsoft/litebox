@@ -138,7 +138,7 @@ impl<Platform: ShimPlatform> File<Platform> {
     }
 
     /// The current name of a directory, or the name a file was opened by.
-    pub(crate) fn path(&self) -> Result<String, Errno> {
+    fn path(&self) -> Result<String, Errno> {
         Ok(self.file.path()?)
     }
 
@@ -1117,6 +1117,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(path)
     }
 
+    /// A copy of the filesystem context, so no borrow or lock is held across broker calls.
+    fn fs_context(&self) -> litebox::fs::Context {
+        self.fs.borrow().context.read().clone()
+    }
+
     /// Splits a path operand into the directory it is relative to (if any) and the path, without
     /// any I/O.
     ///
@@ -1130,7 +1135,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
-    pub(crate) fn do_open(
+    pub(super) fn do_open(
         &self,
         path: &str,
         flags: OFlags,
@@ -1147,8 +1152,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mode: Mode,
     ) -> Result<litebox::fs::File<Platform>, Errno> {
         let mode = mode & !self.get_umask();
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         // The broker opens on behalf of a `vfork` child's parent, so the open must not give the
         // parent's session a controlling terminal. The child can still acquire one with
         // `TIOCSCTTY`.
@@ -1262,8 +1266,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENAMETOOLONG);
         }
         let linkpath = self.lookup_path_at(dirfd, linkpath)?;
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         self.global
             .litebox
             .symlink_file(target, &context, linkpath.dir.as_deref(), &linkpath.path)
@@ -1273,8 +1276,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle path-based `chmod` and `fchmodat`.
     pub(crate) fn sys_fchmodat(&self, dirfd: i32, pathname: &str, mode: u32) -> Result<(), Errno> {
         let path = self.lookup_path_at(dirfd, pathname)?;
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         self.global
             .litebox
             .chmod_file(
@@ -1409,7 +1411,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let path = match FsPath::new(dirfd, path)? {
             FsPath::Absolute { path } => LookupPath { dir: None, path },
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let user = self.fs.borrow().context.read().acting_user();
+                let user = self.fs_context().acting_user();
                 return Ok(self.cwd_handle().set_times(user, &times)?);
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
@@ -1418,7 +1420,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
             FsPath::FdRelative { fd, path } => self.lookup_relative(fd, path)?,
         };
-        let user = self.fs.borrow().context.read().acting_user();
+        let user = self.fs_context().acting_user();
         // The broker only sets times by handle, so path forms first open an `O_PATH` handle.
         let flags = if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
             OFlags::PATH | OFlags::NOFOLLOW
@@ -1430,7 +1432,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     fn set_fd_times(&self, fd: i32, times: &SetFileTimes) -> Result<(), Errno> {
-        let user = self.fs.borrow().context.read().acting_user();
+        let user = self.fs_context().acting_user();
         // XXX: the NULL-path form does not reject O_PATH fds (Linux: EBADF).
         self.with_typed_fd(fd, |fd| match fd.as_file() {
             Some(fd) => self
@@ -1468,8 +1470,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let owner = to_id(owner)?;
         let group = to_id(group)?;
         let path = self.lookup_path_at(dirfd, pathname)?;
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         self.global
             .litebox
             .chown_file(&context, path.dir.as_deref(), &path.path, owner, group)
@@ -1550,8 +1551,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let oldpath = self.lookup_path_at(olddirfd, oldpath)?;
         let newpath = self.lookup_path_at(newdirfd, newpath)?;
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         self.global
             .litebox
             .rename_file(
@@ -1576,8 +1576,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let path = self.lookup_path_at(dirfd, pathname)?;
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         if flags.contains(AtFlags::AT_REMOVEDIR) {
             self.global
                 .litebox
@@ -1949,8 +1948,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn do_mkdir(&self, lookup: LookupPath<Platform>, mode: Mode) -> Result<(), Errno> {
         let mode = mode & !self.get_umask();
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         self.global
             .litebox
             .mkdir_file(&context, lookup.dir.as_deref(), &lookup.path, mode)
@@ -1989,8 +1987,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         // Mounting is name-based, so a relative target is named from the cwd handle's current path.
         let target = self.absolute_name(target)?;
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         self.global
             .litebox
             .mount_in_mem(&context, &target)
@@ -2444,13 +2441,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         caller: AccessUserInfo,
         follow_symlink: bool,
     ) -> Result<(), Errno> {
-        let status = {
-            let fs = self.fs.borrow();
-            let context = fs.context.read();
-            self.global
-                .litebox
-                .path_file_status(&context, dir, pathname, follow_symlink)?
-        };
+        let status = self.global.litebox.path_file_status(
+            &self.fs_context(),
+            dir,
+            pathname,
+            follow_symlink,
+        )?;
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
     }
@@ -2480,13 +2476,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Self::do_access_mode(status.mode, status.owner.into(), caller, &mode)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let files = self.files.borrow();
-                let typed_fd = files.typed_fd(fd)?;
+                let typed_fd = self.typed_fd(fd)?;
                 if let Some(file) = typed_fd.as_file() {
                     let status = self.global.with_file(file, File::status)?;
                     return Self::do_access_mode(status.mode, status.owner.into(), caller, &mode);
                 }
-                drop(files);
                 let stat: FileStat = self.do_stat(&typed_fd)?;
                 let owner = AccessUserInfo {
                     user: stat.st_uid,
@@ -2551,8 +2545,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             );
         }
 
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         Ok(self.global.litebox.read_link_file(&context, dir, path)?)
     }
 
@@ -2671,13 +2664,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if follow_symlink && let Some(fd) = self.proc_self_fd(pathname) {
             return self.do_stat(&fd?);
         }
-        let status = {
-            let fs = self.fs.borrow();
-            let context = fs.context.read();
-            self.global
-                .litebox
-                .path_file_status(&context, dir, pathname, follow_symlink)?
-        };
+        let status = self.global.litebox.path_file_status(
+            &self.fs_context(),
+            dir,
+            pathname,
+            follow_symlink,
+        )?;
         T::try_from(status)
     }
 

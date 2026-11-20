@@ -123,7 +123,10 @@ fn moved_out_of_export_fails_closed_even_after_replacement() {
     };
     assert!(local.walking_dir_at(&child).is_err_and(missing));
     assert!(local.parent_dir(&child).is_err_and(missing));
-    assert!(local.list_dir_at(child).is_err());
+    assert!(matches!(
+        local.list_dir_at(child),
+        Err(ReadDirError::Removed)
+    ));
 }
 
 #[test]
@@ -188,8 +191,8 @@ fn legacy_timestamps_only_update_pinned_non_links() {
     use std::os::unix::fs::MetadataExt;
     let temp = tempfile::tempdir().unwrap();
     let root = Location::pin_dir(temp.path()).unwrap();
-    fs::create_dir(root.join("dir")).unwrap();
-    fs::write(root.join("file"), b"").unwrap();
+    fs::create_dir(temp.path().join("dir")).unwrap();
+    fs::write(temp.path().join("file"), b"").unwrap();
     let times = Timestamps {
         last_access: Timespec {
             tv_sec: 1,
@@ -202,9 +205,9 @@ fn legacy_timestamps_only_update_pinned_non_links() {
     };
     for name in ["file", "dir"] {
         let pinned = root.pin_child(name).unwrap();
-        let moved = root.join(format!("{name}.moved"));
-        fs::rename(root.join(name), &moved).unwrap();
-        symlink("untouched", root.join(name)).unwrap();
+        let moved = temp.path().join(format!("{name}.moved"));
+        fs::rename(temp.path().join(name), &moved).unwrap();
+        symlink("untouched", temp.path().join(name)).unwrap();
         linux::set_times_legacy(&pinned, &times).unwrap();
         assert_eq!(fs::metadata(moved).unwrap().mtime(), 2);
         // The fallback refuses a pinned symlink rather than following it.

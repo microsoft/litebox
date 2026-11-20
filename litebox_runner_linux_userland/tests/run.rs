@@ -186,6 +186,31 @@ fn test_cwd_rename_through_broker_mount() {
     );
 }
 
+/// A held directory from the read-only lower layer, once its entry and then itself are removed,
+/// must not bring back the entry the lower layer still holds.
+#[test]
+#[cfg(target_os = "linux")]
+fn test_held_lower_directory_removal() {
+    let target = common::compile("./tests/held_lower_dir.c", "held_lower_dir", true, false);
+    // The rootfs tar records host owners, so the guest runs as the host user to own `/held`.
+    let Ok(host_uid) = u16::try_from(std::os::unix::fs::MetadataExt::uid(
+        &std::fs::metadata(env!("CARGO_TARGET_TMPDIR")).unwrap(),
+    )) else {
+        eprintln!("skipping held_lower_dir: the host uid does not fit a guest uid");
+        return;
+    };
+    let output = Runner::new(&target, "held_lower_dir")
+        .guest_uid(host_uid)
+        .arg("/held/lower")
+        .with_fs_path(|root| {
+            // Under a staged parent, since the guest does not own `/`.
+            std::fs::create_dir_all(root.join("held/lower")).unwrap();
+            std::fs::write(root.join("held/lower/entry"), b"").unwrap();
+        })
+        .output();
+    assert!(String::from_utf8_lossy(&output).contains("held lower directory ok"));
+}
+
 #[test]
 fn test_mount_tmpfs() {
     let target = common::compile("./tests/mount.c", "mount_tmpfs", true, false);

@@ -11,9 +11,7 @@ static void *enter_parent(void *unused) {
     return NULL;
 }
 
-// Usage: cwd_rename [base-directory [no-symlinks]]. The working directory is created under
-// `base-directory` (default `test_dir()`); `no-symlinks` skips the steps that create symlinks, for
-// filesystems that cannot create them.
+// Usage: cwd_rename [base-directory [no-symlinks]], like `enter_test_dir`.
 int main(int argc, char **argv) {
     char tmp[4096];
     int symlinks = enter_test_dir(argc, argv, "lb-cwd", tmp, sizeof(tmp));

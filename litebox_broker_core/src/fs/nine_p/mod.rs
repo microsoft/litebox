@@ -190,12 +190,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
     }
 
-    /// Walks `..` from `dir`, returning the qid path and fid it reached.
+    /// Walks `..` from `dir`.
     fn walk_dot_dot(&self, dir: &client::Fid<Platform>) -> Result<WalkedDir<Platform, T>, Error> {
         self.walk_one(dir, "..")
     }
 
-    /// Walks the single component `name` from `dir`, returning the qid path and fid it reached.
+    /// Walks the single component `name` from `dir`.
     fn walk_one(
         &self,
         dir: &client::Fid<Platform>,

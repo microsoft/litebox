@@ -3,7 +3,7 @@
 
 //! Windows-shim file access with registry namespace isolation.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -13,7 +13,7 @@ use litebox::fs::errors::ChmodError;
 use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, RmdirError, UnlinkError,
 };
-use litebox::fs::{Context, File, ResolvedPath};
+use litebox::fs::{Context, File};
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags, FileStatus,
 };
@@ -27,9 +27,33 @@ enum Namespace {
     Registry,
 }
 
+/// Normalizes `path` from the root without consulting the filesystem: empty and `.` components
+/// are dropped, and `..` removes the previous component (never above the root).
+fn normalize(path: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+    if components.is_empty() {
+        return String::from("/");
+    }
+    let mut normalized = String::with_capacity(path.len());
+    for component in components {
+        normalized.push('/');
+        normalized.push_str(component);
+    }
+    normalized
+}
+
 impl Namespace {
     fn resolve_path(self, path: &str) -> Result<String, PathError> {
-        let path = ResolvedPath::new(path).to_string();
+        let path = normalize(path);
         match (self, is_registry_path(&path)) {
             (Self::Regular, false) | (Self::Registry, true) => Ok(path),
             (Self::Regular, true) => Err(PathError::MissingComponent),
@@ -38,7 +62,7 @@ impl Namespace {
     }
 
     fn hides_registry_entry(self, directory_path: &str) -> bool {
-        self == Self::Regular && ResolvedPath::new(directory_path).to_string() == "/"
+        self == Self::Regular && normalize(directory_path) == "/"
     }
 }
 

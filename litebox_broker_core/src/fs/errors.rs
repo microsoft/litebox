@@ -415,6 +415,18 @@ impl From<WalkError> for OpenError {
     }
 }
 
+/// Error mapping for rewalking an open handle to update its times: a handle whose name no longer
+/// leads anywhere is stale, so it fails with `Io` rather than a lookup error.
+pub(super) fn set_times_walk_error(error: WalkError) -> SetTimesError {
+    match error {
+        WalkError::Io
+        | WalkError::PathError(PathError::NoSuchFileOrDirectory | PathError::MissingComponent) => {
+            SetTimesError::Io
+        }
+        WalkError::PathError(error) => SetTimesError::PathError(error),
+    }
+}
+
 /// Error mapping for an internal open performed as part of a walk.
 pub(super) fn open_to_walk_error(error: OpenError) -> WalkError {
     match error {

@@ -118,9 +118,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         Ok(File::new(self, broker, handle))
     }
 
-    /// Change the permissions of a file. A relative `path` resolves from `dir`; an absolute path
-    /// ignores `dir`.
-    /// See [`Self::open_file`] for the rules on `dir`.
+    /// Change the permissions of a file. See [`Self::open_file`] for the rules on `dir`.
     pub fn chmod_file(
         &self,
         context: &Context,
@@ -136,9 +134,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(ChmodError::from)
     }
 
-    /// Change the owner of a file. A relative `path` resolves from `dir`; an absolute path
-    /// ignores `dir`.
-    /// See [`Self::open_file`] for the rules on `dir`.
+    /// Change the owner of a file. See [`Self::open_file`] for the rules on `dir`.
     pub fn chown_file(
         &self,
         context: &Context,
@@ -176,8 +172,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(SymlinkError::from)
     }
 
-    /// Unlink a file. A relative `path` resolves from `dir`; an absolute path ignores `dir`.
-    /// See [`Self::open_file`] for the rules on `dir`.
+    /// Unlink a file. See [`Self::open_file`] for the rules on `dir`.
     pub fn unlink_file(
         &self,
         context: &Context,
@@ -213,9 +208,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(RenameError::from)
     }
 
-    /// Create a new directory. A relative `path` resolves from `dir`; an absolute path
-    /// ignores `dir`.
-    /// See [`Self::open_file`] for the rules on `dir`.
+    /// Create a new directory. See [`Self::open_file`] for the rules on `dir`.
     pub fn mkdir_file(
         &self,
         context: &Context,
@@ -244,8 +237,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(|_| FileError::Io)?
     }
 
-    /// Remove a directory. A relative `path` resolves from `dir`; an absolute path ignores `dir`.
-    /// See [`Self::open_file`] for the rules on `dir`.
+    /// Remove a directory. See [`Self::open_file`] for the rules on `dir`.
     pub fn rmdir_file(
         &self,
         context: &Context,
@@ -260,11 +252,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(RmdirError::from)
     }
 
-    /// Obtain the status of a path. A relative `path` resolves from `dir`; an absolute path
-    /// ignores `dir`.
-    /// See [`Self::open_file`] for the rules on `dir`.
+    /// Obtain the status of a path. See [`Self::open_file`] for the rules on `dir`.
     ///
-    /// If `follow_symlinks` is false, a final symbolic link is described itself.
+    /// If `follow_symlinks` is false, a final symbolic link is described itself unless the path
+    /// ends in a slash.
     pub fn path_file_status(
         &self,
         context: &Context,
@@ -280,8 +271,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .map_err(FileStatusError::from)
     }
 
-    /// Read a symbolic link's stored target, without following the final link. A relative `path`
-    /// resolves from `dir`; an absolute path ignores `dir`.
+    /// Read a symbolic link's stored target, without following the final link.
     /// See [`Self::open_file`] for the rules on `dir`.
     pub fn read_link_file(
         &self,
@@ -331,43 +321,6 @@ impl Context {
 impl Default for Context {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Absolute, lexically normalized path.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedPath {
-    components: Vec<String>,
-}
-
-impl ResolvedPath {
-    /// Normalizes `path` from the root without consulting the filesystem: empty and `.`
-    /// components are dropped, and `..` removes the previous component (never above the root).
-    #[must_use]
-    pub fn new(path: &str) -> Self {
-        let mut components: Vec<String> = Vec::new();
-        for component in path.split('/') {
-            match component {
-                "" | "." => {}
-                ".." => {
-                    let _ = components.pop();
-                }
-                _ => components.push(component.into()),
-            }
-        }
-        Self { components }
-    }
-}
-
-impl core::fmt::Display for ResolvedPath {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        for component in &self.components {
-            write!(formatter, "/{component}")?;
-        }
-        if self.components.is_empty() {
-            formatter.write_str("/")?;
-        }
-        Ok(())
     }
 }
 
@@ -1093,5 +1046,86 @@ impl From<FileError> for TerminalControlError {
 impl From<FileError> for WalkError {
     fn from(error: FileError) -> Self {
         path_error(error).map_or(Self::Io, Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use litebox_broker_local::test_support::test_broker_local;
+    use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, OpenFileResponse};
+    use litebox_broker_protocol::message::{
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, FileRequest, FileResponse,
+    };
+    use litebox_broker_transport::channel::LocalCallChannel;
+    use litebox_broker_transport::shared_memory::HeapSharedMemory;
+
+    use super::Context;
+    use crate::LiteBox;
+    use crate::platform::mock::MockPlatform;
+
+    /// Serves only absolute opens, so any other request reaching it fails the test.
+    struct OpenOnlyChannel {
+        next_handle: AtomicU64,
+    }
+
+    impl LocalCallChannel for OpenOnlyChannel {
+        type Error = ();
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            let result = match request.operation {
+                BrokerOperation::File(FileRequest::Open(open)) if open.dir.is_none() => {
+                    BrokerResult::File(FileResponse::Open(OpenFileResponse {
+                        handle: ObjectHandle(self.next_handle.fetch_add(1, Ordering::SeqCst)),
+                    }))
+                }
+                BrokerOperation::CloseObject(_) => BrokerResult::ObjectClosed,
+                request => panic!("unexpected broker request: {request:?}"),
+            };
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result,
+            })
+        }
+    }
+
+    fn litebox() -> LiteBox<MockPlatform> {
+        let local = test_broker_local(
+            OpenOnlyChannel {
+                next_handle: AtomicU64::new(1),
+            },
+            Arc::new(HeapSharedMemory::new(
+                litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
+            )),
+        );
+        LiteBox::new_with_broker_local(MockPlatform::new(), local)
+    }
+
+    /// Handle numbers are scoped to a broker connection, so a directory from another connection,
+    /// whose number may name an unrelated object here, is refused without sending the request.
+    #[test]
+    fn relative_paths_refuse_a_directory_from_another_connection() {
+        let (first, second) = (litebox(), litebox());
+        let context = Context::new();
+        let foreign = first
+            .open_file(
+                &context,
+                None,
+                "/",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+                FileMode::empty(),
+            )
+            .unwrap();
+        assert!(
+            second
+                .mkdir_file(&context, Some(&foreign), "dir", FileMode::RWXU)
+                .is_err()
+        );
     }
 }

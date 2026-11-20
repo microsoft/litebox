@@ -17,7 +17,8 @@ use litebox_platform::sync::RawSyncPrimitivesProvider;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SeekError, SetTimesError,
-    SymlinkError, TruncateError, UnlinkError, WalkError, WriteError, walk_error_or,
+    SymlinkError, TruncateError, UnlinkError, WalkError, WriteError, set_times_walk_error,
+    walk_error_or,
 };
 use super::{
     FileTimeUpdate, FileType, Mode, OFlags, SetFileTimes,
@@ -110,7 +111,8 @@ struct WalkAnchor {
 }
 
 /// An open entry captured as the starting point of a relative lookup (see
-/// [`ResolverEntry::anchor`]).
+/// `ResolverEntry::anchor`). Path operations resolve a relative path from their anchor, or from the
+/// root without one.
 ///
 /// The inner `None` anchors a non-directory, from which relative lookups fail. It is unrelated to
 /// an absent `Option<DirAnchor>`, which resolves from the root.
@@ -467,8 +469,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         Ok(matches!(resolution, Resolution::Found(_)))
     }
 
-    /// Read a symbolic link's stored target, without following the final link. A relative
-    /// `path` is resolved from `anchor`, or from the root without one.
+    /// Read a symbolic link's stored target, without following the final link.
     pub fn read_link(
         &self,
         user: UserInfo,
@@ -1095,10 +1096,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         let context = Context::new(user);
         let target = match &entry.handle {
             // A directory handle is walkable by its identity, which renames cannot redirect.
+            // XXX: a removed directory fails with EIO, like a stale file below, where Linux
+            // updates the open inode.
             Handle::Dir(dir) => ResolvedTarget::Dir(
                 self.backend
                     .walking_dir_at(dir)
-                    .map_err(walk_error_or(SetTimesError::Io))?,
+                    .map_err(set_times_walk_error)?,
             ),
             Handle::File(_) => self.rewalk_open_file(&context, entry)?,
         };
@@ -1122,13 +1125,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         context: &Context,
         entry: &ResolverEntry<Backend>,
     ) -> Result<ResolvedTarget<'_>, SetTimesError> {
-        let map_walk = |error| match error {
-            WalkError::Io
-            | WalkError::PathError(
-                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-            ) => SetTimesError::Io,
-            WalkError::PathError(error) => SetTimesError::PathError(error),
-        };
         // Before resolving: the resolved target can hold a backend lock (e.g. the overlay's
         // namespace) that querying the open handle would take again.
         let opened = self
@@ -1137,7 +1133,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             .map_err(|_| SetTimesError::Io)?;
         let target = self
             .resolve_target(context, &entry.name, None)
-            .map_err(map_walk)?;
+            .map_err(set_times_walk_error)?;
         let resolved = self
             .backend
             .resolved_status(&target)
@@ -1150,7 +1146,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         Ok(target)
     }
 
-    /// Change the permissions of a file. A relative path is resolved from `anchor`, or from the root without one.
+    /// Change the permissions of a file.
     pub fn chmod(
         &self,
         user: UserInfo,
@@ -1171,7 +1167,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         self.backend.chmod(target, mode)
     }
 
-    /// Change the owner of a file. A relative path is resolved from `anchor`, or from the root without one.
+    /// Change the owner of a file.
     pub fn chown(
         &self,
         acting_user: UserInfo,
@@ -1193,7 +1189,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         self.backend.chown(target, user, group)
     }
 
-    /// Unlink a file. A relative path is resolved from `anchor`, or from the root without one.
+    /// Unlink a file.
     pub fn unlink(
         &self,
         user: UserInfo,
@@ -1419,7 +1415,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             .rename_at(old_dir, &old_name, new_dir, &new_name)
     }
 
-    /// Create a new directory. A relative path is resolved from `anchor`, or from the root without one.
+    /// Create a new directory.
     pub fn mkdir(
         &self,
         user: UserInfo,
@@ -1472,7 +1468,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         result
     }
 
-    /// Remove a directory. A relative path is resolved from `anchor`, or from the root without one.
+    /// Remove a directory.
     pub fn rmdir(
         &self,
         user: UserInfo,
@@ -1544,7 +1540,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         Ok(entries)
     }
 
-    /// Obtain the status of a file/directory/... on the file-system. A relative path is resolved from `anchor`, or from the root without one.
+    /// Obtain the status of a file/directory/... on the file-system.
     ///
     /// If `follow_symlinks` is false, a final symbolic link is described itself.
     pub fn file_status(
@@ -1745,7 +1741,7 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
     // TODO: this formats the recorded name on every relative lookup although the hint is only
     // read as a fallback. Store it once (e.g. as `Arc<str>` with a length) when the entry opens.
     #[must_use]
-    pub fn anchor(&self) -> DirAnchor {
+    pub(crate) fn anchor(&self) -> DirAnchor {
         DirAnchor(match &self.handle {
             Handle::Dir(dir) => Some(WalkAnchor {
                 dir: dir.clone(),

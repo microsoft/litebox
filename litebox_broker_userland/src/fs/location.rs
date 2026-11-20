@@ -6,7 +6,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// A name usable with std filesystem operations for the lifetime of the retained handle.
+/// A host location for std filesystem operations. Linux names it through the retained
+/// descriptor, which stays usable for the handle's lifetime; other hosts name it by a path that is
+/// checked or locked against renames.
 #[derive(Clone, Debug)]
 pub(super) struct Location {
     path: PathBuf,
@@ -37,6 +39,9 @@ pub(super) fn namespace_guard(root: &Path) -> io::Result<Vec<File>> {
     // on each ancestor and an exclusive one at the export root serialize overlapping
     // exports (including independently created instances), but not unrelated mounts.
     // All callers acquire in the same root-to-leaf order.
+    // TODO: every guarded backend call reopens and locks each ancestor of the root (O(depth)
+    // opens) and the exclusive root lock serializes all path operations across threads; reuse
+    // one guard across a composed operation or move to a per-instance lock.
     let mut ancestors: Vec<_> = root.ancestors().collect();
     ancestors.reverse();
     ancestors
@@ -117,7 +122,7 @@ impl Location {
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
-        fs::metadata(self.join(".")).map(drop)
+        fs::metadata(self.path.join(".")).map(drop)
     }
 
     /// Fails with `NotFound` once the pinned directory has been removed.
@@ -293,13 +298,6 @@ impl AsRef<Path> for Location {
     }
 }
 
-impl std::ops::Deref for Location {
-    type Target = Path;
-    fn deref(&self) -> &Path {
-        &self.path
-    }
-}
-
 #[cfg(target_os = "linux")]
 impl Location {
     // TODO: format the procfs name lazily. Each walked component pays for this allocation
@@ -454,7 +452,15 @@ fn directory_identity_witness_rejects_replaced_ancestor() {
     assert!(pinned.metadata().is_ok());
     fs::rename(root.join("ancestor"), root.join("renamed")).unwrap();
     fs::create_dir_all(root.join("ancestor/sub")).unwrap();
-    assert!(pinned.host_path().is_err());
+    // The pin must never name the replacement; following the rename would also be sound.
+    let host_path = pinned.host_path();
+    assert!(
+        match &host_path {
+            Ok(path) => *path == root.join("renamed/sub"),
+            Err(_) => true,
+        },
+        "{host_path:?}"
+    );
 }
 
 #[cfg(all(test, windows, target_arch = "x86_64"))]

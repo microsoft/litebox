@@ -50,7 +50,13 @@ static void test_program_directory(const char *program) {
     TEST_ASSERT(fd >= 0, "open program directory");
     char sub[64];
     snprintf(sub, sizeof(sub), "lb-dirfd-lower-%d", (int)getpid());
-    if (mkdirat(fd, sub, 0700) != 0) {
+    // The name repeats across runs with the same pid, so clear an empty one a failed run left.
+    int made = mkdirat(fd, sub, 0700);
+    if (made != 0 && errno == EEXIST) {
+        TEST_ASSERT(unlinkat(fd, sub, AT_REMOVEDIR) == 0, "remove stale program directory entry");
+        made = mkdirat(fd, sub, 0700);
+    }
+    if (made != 0) {
         // Only a program directory that belongs to another user may refuse the creation.
         TEST_ASSERT(errno == EACCES, "create in program directory");
         fprintf(stderr, "skipping program directory checks: %s is not writable\n",
@@ -67,9 +73,7 @@ static void test_program_directory(const char *program) {
                 "cleanup program directory");
 }
 
-// Usage: dirfd_rename [base-directory [no-symlinks]]. The working directory is created under
-// `base-directory` (default `test_dir()`); `no-symlinks` skips the steps that create symlinks, for
-// filesystems that cannot create them.
+// Usage: dirfd_rename [base-directory [no-symlinks]], like `enter_test_dir`.
 int main(int argc, char **argv) {
     test_program_directory(argv[0]);
     char tmp[4096];

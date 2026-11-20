@@ -48,7 +48,7 @@ use location::Location;
 macro_rules! guard_path_operations {
     ($this:expr, $failure:expr) => {
         #[cfg(all(unix, not(target_os = "linux")))]
-        let _namespace = match location::namespace_guard(&$this.root) {
+        let _namespace = match location::namespace_guard($this.root.as_ref()) {
             Ok(namespace) => namespace,
             Err(error) => {
                 litebox_util_log::debug!(error:? = error; "LocalFs namespace guard failed");
@@ -100,8 +100,8 @@ fn check_offset(offset: u64) -> std::io::Result<()> {
 #[cfg(unix)]
 use io_errors::chown_error;
 use io_errors::{
-    chmod_error, invalid_path, mkdir_error, open_error, rename_error, rmdir_error, unlink_error,
-    unsupported_object, walk_error,
+    chmod_error, invalid_path, mkdir_error, open_error, rename_error, rmdir_error,
+    stale_handle_error, unlink_error, unsupported_object, walk_error,
 };
 
 use litebox_broker_core::fs::backend::{
@@ -235,16 +235,6 @@ fn validate_name(name: &str) -> Result<(), PathError> {
         return Err(PathError::InvalidPathname);
     }
     Ok(())
-}
-
-/// Maps a failed check that a held directory or resolved file is still usable to a path error,
-/// else `io`.
-fn usable_dir_error<E: From<PathError>>(error: &std::io::Error, io: E) -> E {
-    match error.kind() {
-        std::io::ErrorKind::NotFound => PathError::NoSuchFileOrDirectory.into(),
-        std::io::ErrorKind::PermissionDenied => PathError::NoSearchPerms.into(),
-        _ => io,
-    }
 }
 
 /// The components of the host name `name` below `root`; a name outside it was moved out.
@@ -487,14 +477,15 @@ fn set_permissions_path(path: &Path, mode: Mode) -> std::io::Result<()> {
     }
 }
 
-/// Opens the regular file at `path` for I/O. Callers have checked its type; Windows checks it
-/// again, since it opens by path.
+/// Opens the regular file at `path` for I/O. Callers have checked its type. Hosts other than
+/// Linux open it by path: other Unix hosts rely on the namespace guard to keep it in place, while
+/// Windows checks the type again and refuses reparse points.
 fn open_for_io(path: &Location, readable: bool, writable: bool) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(readable).write(writable);
     #[cfg(windows)]
     {
-        let (file, metadata) = open_no_reparse(&mut options, 0, path)?;
+        let (file, metadata) = open_no_reparse(&mut options, 0, path.as_ref())?;
         if !metadata.is_file() {
             return Err(invalid_path());
         }
@@ -535,16 +526,25 @@ impl LocalFs {
     }
 
     /// [`Self::check_dir`], with its failures mapped to path errors (else `io`).
-    fn check_usable_dir<E: From<PathError>>(&self, dir: &LocalDir, io: E) -> Result<(), E> {
+    fn check_usable_dir<E: From<PathError> + core::fmt::Debug>(
+        &self,
+        dir: &LocalDir,
+        io: E,
+    ) -> Result<(), E> {
         self.check_dir(dir)
-            .map_err(|error| usable_dir_error(&error, io))
+            .map_err(|error| stale_handle_error(&error, io))
     }
 
     /// Checks a directory reached within the current operation. On Linux, such a directory was
-    /// pinned from the root, or from a held directory that `walking_dir_at` checked, through
-    /// non-following lookups of validated names, so it is inside the root by construction. Other
-    /// hosts name directories by path and check them every time.
-    fn check_walked_dir<E: From<PathError>>(&self, dir: &LocalDir, io: E) -> Result<(), E> {
+    /// pinned from the root, or from a held directory that `walking_dir_at` or
+    /// `walking_dir_with_path` checked, through non-following lookups of validated names, so it is
+    /// inside the root by construction. Other hosts name directories by path and check them every
+    /// time.
+    fn check_walked_dir<E: From<PathError> + core::fmt::Debug>(
+        &self,
+        dir: &LocalDir,
+        io: E,
+    ) -> Result<(), E> {
         #[cfg(target_os = "linux")]
         return if self.valid_dir(dir) { Ok(()) } else { Err(io) };
         #[cfg(not(target_os = "linux"))]
@@ -628,7 +628,7 @@ impl LocalFs {
         if actual != expected {
             return Err(unsupported_object());
         }
-        status_from_metadata(&metadata, self.node(&metadata, location))
+        status_from_metadata(&metadata, self.node(&metadata, location.as_ref()))
     }
 
     fn status_file(&self, file: &File, identity_path: &Path) -> std::io::Result<FileStatus> {
@@ -882,7 +882,7 @@ impl Backend for LocalFs {
             let (root, name) = dir
                 .location
                 .checked_names_under(&self.root)
-                .map_err(|error| usable_dir_error(&error, WalkError::Io))?;
+                .map_err(|error| stale_handle_error(&error, WalkError::Io))?;
             self.root
                 .ensure_linked()
                 .and_then(|()| dir.location.ensure_linked())
@@ -1143,7 +1143,7 @@ impl Backend for LocalFs {
                     return Err(FileStatusError::Io);
                 }
                 if let Some(open) = &file.file {
-                    self.status_file(open, &file.location)
+                    self.status_file(open, file.location.as_ref())
                         .map_err(|_| FileStatusError::Io)
                 } else {
                     self.status_location_of_type(&file.location, file.file_type)
@@ -1244,7 +1244,7 @@ impl Backend for LocalFs {
             .create_dir_at(name, metadata.mode)
             .map_err(mkdir_error)?;
         #[cfg(windows)]
-        if let Err(error) = set_permissions_path(&dir.location.join(name), metadata.mode) {
+        if let Err(error) = set_permissions_path(&dir.location.as_ref().join(name), metadata.mode) {
             if let Err(cleanup) = dir.location.remove_dir_at(name) {
                 litebox_util_log::warn!(
                     name = name, error:? = cleanup;
@@ -1339,8 +1339,8 @@ impl Backend for LocalFs {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let old_path = old_dir.location.join(old_name);
-            let new_path = new_dir.location.join(new_name);
+            let old_path = old_dir.location.as_ref().join(old_name);
+            let new_path = new_dir.location.as_ref().join(new_name);
             let source = fs::symlink_metadata(&old_path).map_err(rename_error)?;
             let source_is_dir = source.is_dir() && !source.file_type().is_symlink();
             if old_path == new_path {
@@ -1383,7 +1383,7 @@ impl Backend for LocalFs {
             ResolvedTarget::File(file) => {
                 let file = file.get_typed::<Self>();
                 self.check_resolved_file(file)
-                    .map_err(|error| usable_dir_error(&error, SetTimesError::Io))?;
+                    .map_err(|error| stale_handle_error(&error, SetTimesError::Io))?;
                 &file.location
             }
         };
@@ -1393,7 +1393,7 @@ impl Backend for LocalFs {
         }
         #[cfg(all(windows, target_arch = "x86_64"))]
         {
-            windows::set_times(path, times)
+            windows::set_times(path.as_ref(), times)
         }
         #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
         {
@@ -1420,7 +1420,7 @@ impl Backend for LocalFs {
                 {
                     return Err(ChmodError::Io);
                 }
-                set_permissions_path(&dir.location, mode)
+                set_permissions_path(dir.location.as_ref(), mode)
             }
             ResolvedTarget::File(file) => {
                 let file = file.get_typed::<Self>();
@@ -1437,7 +1437,7 @@ impl Backend for LocalFs {
                 {
                     return Err(ChmodError::Io);
                 }
-                set_permissions_path(&file.location, mode)
+                set_permissions_path(file.location.as_ref(), mode)
             }
         };
         result.map_err(chmod_error)

@@ -6,7 +6,7 @@
 
 // Paths reach the filesystem as spelled: trailing slashes are enforced, and `..` applies after
 // following a symlink, for both cwd- and dirfd-relative names and Unix socket addresses.
-// Usage: exact_paths [base-directory [no-symlinks]], like `enter_test_dir`; needs symlinks.
+// Usage: exact_paths [base-directory], like `enter_test_dir`; needs symlinks.
 int main(int argc, char **argv) {
     char tmp[4096];
     enter_test_dir(argc, argv, "lb-exact", tmp, sizeof(tmp));

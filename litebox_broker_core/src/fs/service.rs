@@ -715,7 +715,7 @@ pub fn open(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<FileResult<ObjectHandle>> {
     let rights = process.require_object_rights(open_required_rights(access, flags)?)?;
-    with_validated_directory(process, directory, path, |directory| {
+    with_path_anchor(process, directory, path, |directory| {
         let reference = process.reserve_object_reference(rights)?;
         let file = match Arc::clone(&process.fs).open(
             directory,
@@ -960,7 +960,7 @@ pub fn path_status(
     follow_symlinks: bool,
 ) -> Result<FileResult<FileStatus>> {
     process.require_object_rights(ObjectRights::WAIT)?;
-    with_validated_directory(process, directory, path, |dir| {
+    with_path_anchor(process, directory, path, |dir| {
         process.fs.path_status(dir, path, user, follow_symlinks)
     })
 }
@@ -974,7 +974,7 @@ pub fn read_link(
     user: FileUser,
 ) -> Result<FileResult<String>> {
     process.require_object_rights(ObjectRights::WAIT)?;
-    with_validated_directory(process, directory, path, |dir| {
+    with_path_anchor(process, directory, path, |dir| {
         process.fs.read_link(dir, path, user)
     })
 }
@@ -1001,7 +1001,7 @@ pub fn chmod(
     mode: FileMode,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_validated_directory(process, directory, path, |dir| {
+    with_path_anchor(process, directory, path, |dir| {
         process.fs.chmod(dir, path, user, mode)
     })
 }
@@ -1017,7 +1017,7 @@ pub fn chown(
     group: Option<u16>,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_validated_directory(process, directory, path, |dir| {
+    with_path_anchor(process, directory, path, |dir| {
         process.fs.chown(dir, path, acting_user, user, group)
     })
 }
@@ -1031,7 +1031,7 @@ pub fn unlink(
     user: FileUser,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_validated_directory(process, directory, path, |dir| {
+    with_path_anchor(process, directory, path, |dir| {
         process.fs.unlink(dir, path, user)
     })
 }
@@ -1047,8 +1047,8 @@ pub fn rename(
     user: FileUser,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_validated_directory(process, old_directory, old_path, |old_dir| {
-        with_validated_directory(process, new_directory, new_path, |new_dir| {
+    with_path_anchor(process, old_directory, old_path, |old_dir| {
+        with_path_anchor(process, new_directory, new_path, |new_dir| {
             process
                 .fs
                 .rename(old_dir, old_path, new_dir, new_path, user)
@@ -1066,7 +1066,7 @@ pub fn mkdir(
     mode: FileMode,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_validated_directory(process, directory, path, |dir| {
+    with_path_anchor(process, directory, path, |dir| {
         process.fs.mkdir(dir, path, user, mode)
     })
 }
@@ -1090,7 +1090,7 @@ pub fn symlink(
     user: FileUser,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_validated_directory(process, directory, linkpath, |dir| {
+    with_path_anchor(process, directory, linkpath, |dir| {
         process.fs.symlink(target, dir, linkpath, user)
     })
 }
@@ -1104,7 +1104,7 @@ pub fn rmdir(
     user: FileUser,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_validated_directory(process, directory, path, |dir| {
+    with_path_anchor(process, directory, path, |dir| {
         process.fs.rmdir(dir, path, user)
     })
 }
@@ -1136,7 +1136,8 @@ fn validate_path(directory: Option<ObjectHandle>, path: &str) -> FileResult<()> 
     }
 }
 
-fn with_validated_directory<T>(
+/// Runs `operation` with the open directory a validated `path` is resolved from, if any.
+fn with_path_anchor<T>(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
     path: &str,

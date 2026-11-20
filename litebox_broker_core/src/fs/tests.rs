@@ -2398,6 +2398,8 @@ mod tar_ro {
     /// Lookups from a held directory on a read-only mount stay read-only, whether or not a nested
     /// mount makes the composer walk from the handle with its path: the read-only mount is
     /// reported before the caller's lack of write permission on the directory.
+    // Linux: do_unlinkat(), do_rmdir() and do_renameat2() call mnt_want_write() after resolving
+    // the parent but before looking up or permission-checking the last component, so EROFS wins.
     #[test]
     fn read_only_held_directories_stay_read_only() {
         use super::InMem;
