@@ -14,17 +14,16 @@
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result};
 use std::os::fd::AsRawFd;
-use std::path::Path;
 
 use litebox_broker_core::fs::errors::{PathError, SetTimesError};
 use litebox_broker_protocol::fs::{FileTimeUpdate, SetFileTimes};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 pub(super) fn set_times(
-    path: &Path,
+    location: &super::Location,
     times: &SetFileTimes,
 ) -> core::result::Result<(), SetTimesError> {
-    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_NOW, UTIME_OMIT, utimensat};
+    use rustix::fs::{AtFlags, Timespec, Timestamps, UTIME_NOW, UTIME_OMIT, utimensat};
     use rustix::io::Errno;
 
     let timestamp = |update: &FileTimeUpdate| match update {
@@ -47,7 +46,19 @@ pub(super) fn set_times(
         last_modification: timestamp(&times.modify),
     };
     // The resolver already followed guest links. Following one here could escape the host root.
-    utimensat(CWD, path, &times, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| match error {
+    utimensat(
+        &*location.pin,
+        "",
+        &times,
+        AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .or_else(|error| {
+        if error != Errno::INVAL {
+            return Err(error);
+        }
+        set_times_legacy(location, &times)
+    })
+    .map_err(|error| match error {
         Errno::PERM => SetTimesError::NotTheOwner,
         Errno::ACCESS => SetTimesError::AccessNotAllowed,
         Errno::ROFS => SetTimesError::ReadOnlyFileSystem,
@@ -58,6 +69,20 @@ pub(super) fn set_times(
         Errno::NAMETOOLONG => SetTimesError::PathError(PathError::InvalidPathname),
         _ => SetTimesError::Io,
     })
+}
+
+// Linux before 5.8 lacks AT_EMPTY_PATH for utimensat. Follow only the retained
+// procfd magic link to a pinned non-link object, never an original host pathname.
+pub(super) fn set_times_legacy(
+    location: &super::Location,
+    times: &rustix::fs::Timestamps,
+) -> rustix::io::Result<()> {
+    use rustix::fs::{AtFlags, CWD, FileType, fstat, utimensat};
+    let ty = FileType::from_raw_mode(fstat(&*location.pin)?.st_mode);
+    if !matches!(ty, FileType::RegularFile | FileType::Directory) {
+        return Err(rustix::io::Errno::NOTSUP);
+    }
+    utimensat(CWD, location.as_ref(), times, AtFlags::empty())
 }
 
 /// Reads from `file` at `offset` directly into `buf`, from `start` to its end,

@@ -41,8 +41,7 @@ pub(crate) use service::{File, handle_terminal, handle_terminal_access, open_wit
 pub use service::{
     FileResult, FileService, UnsupportedFileService, chmod, chown, handle_path, handle_status,
     is_terminal, lock, map_shared, mkdir, mount_in_mem, open, path_status, read, read_directory,
-    read_link, rename, resolve_path, rmdir, seek, set_times, symlink, terminal_control, truncate,
-    unlink, write,
+    read_link, rename, rmdir, seek, set_times, symlink, terminal_control, truncate, unlink, write,
 };
 
 bitflags! {

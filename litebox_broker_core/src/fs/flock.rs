@@ -98,6 +98,7 @@ mod tests {
         let readiness: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
         fs::open(
             process,
+            None,
             path,
             FileUser::ROOT,
             access,
@@ -227,7 +228,7 @@ mod tests {
         );
 
         assert_eq!(
-            fs::rename(&first, "/file", "/renamed", FileUser::ROOT),
+            fs::rename(&first, None, "/file", None, "/renamed", FileUser::ROOT),
             Ok(Ok(()))
         );
         let renamed = open(

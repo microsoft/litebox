@@ -33,6 +33,59 @@ const HEADER_SIZE: usize = size_of::<u8>()
     } else {
         0
     };
+/// A fresh process inherits the open working directory, even if it no longer has a path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InheritedCwd {
+    /// Absolute startup path, for launchers without an open working directory.
+    Path(String),
+    /// File reference in the child's broker object table. It may equal an inherited
+    /// descriptor's handle, in which case both share that one reference.
+    File(ObjectHandle),
+}
+
+impl InheritedCwd {
+    // A zero pathname length indicates a fixed-size broker handle in place of the pathname bytes.
+    fn path_len(&self) -> usize {
+        match self {
+            Self::Path(path) => path.len(),
+            Self::File(_) => 0,
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Path(path) => path.len(),
+            Self::File(_) => size_of::<u64>(),
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Path(path) => out.extend_from_slice(path.as_bytes()),
+            Self::File(handle) => push_u64(out, handle.0),
+        }
+    }
+
+    fn decode(input: &mut &[u8], len: usize) -> Result<Self, LinuxProgramStartupError> {
+        if len == 0 {
+            Ok(Self::File(ObjectHandle(read_u64(input)?)))
+        } else {
+            let path = core::str::from_utf8(take_bytes(input, len)?)
+                .map_err(|_| LinuxProgramStartupError::InvalidWorkingDirectory)?;
+            Ok(Self::Path(path.into()))
+        }
+    }
+
+    fn validate(&self) -> Result<(), LinuxProgramStartupError> {
+        if let Self::Path(path) = self
+            && (!path.starts_with('/') || path.as_bytes().contains(&0))
+        {
+            return Err(LinuxProgramStartupError::InvalidWorkingDirectory);
+        }
+        Ok(())
+    }
+}
+
 /// Size of an inherited descriptor's number, handle, and kind tag, which precede its kind's fields.
 const INHERITED_FD_HEADER_SIZE: usize = size_of::<u32>() + size_of::<u64>() + size_of::<u8>();
 /// Size of a memory region's start, end, and flags.
@@ -101,15 +154,14 @@ pub struct LinuxProgramStartup {
     /// Whether the thread calling `execve` has `PR_SVE_VL_INHERIT` set, which the program keeps.
     #[cfg(target_arch = "aarch64")]
     pub sve_vl_inherit: bool,
-    /// Absolute executable path.
+    /// Executable path, resolved from the inherited working directory if relative.
     pub path: String,
     /// The filename the program was executed with, which Linux exposes as `AT_EXECFN`.
     ///
-    /// Unlike `path`, it is as `execve` received it: possibly relative, and naming a script
-    /// rather than its interpreter.
+    /// It is as `execve` received it, possibly naming a script rather than its interpreter.
     pub execfn: String,
-    /// Absolute working directory.
-    pub cwd: String,
+    /// Inherited working directory.
+    pub cwd: InheritedCwd,
     /// Program arguments.
     pub argv: Vec<CString>,
     /// Program environment.
@@ -206,8 +258,8 @@ pub struct LinuxForkStartup {
     pub dumpable: bool,
     /// Whether the thread calling `fork` has `no_new_privs` set, which the child copies.
     pub no_new_privs: bool,
-    /// Absolute working directory.
-    pub cwd: String,
+    /// Inherited working directory.
+    pub cwd: InheritedCwd,
     /// Command name.
     pub comm: [u8; TASK_COMM_LEN],
     /// Blocked signals.
@@ -281,7 +333,7 @@ pub enum LinuxProgramStartupError {
     /// The startup payload is malformed.
     #[error("malformed Linux program startup")]
     Malformed,
-    /// The executable path is not an absolute UTF-8 path.
+    /// The executable path is empty or not a UTF-8 path without NUL.
     #[error("invalid Linux program path")]
     InvalidPath,
     /// The execution filename is not a UTF-8 string without NUL.
@@ -332,7 +384,7 @@ impl LinuxProgramStartup {
         );
         push_u32(
             &mut output,
-            u32::try_from(self.cwd.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
+            u32::try_from(self.cwd.path_len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
         );
         push_u32(
             &mut output,
@@ -355,7 +407,7 @@ impl LinuxProgramStartup {
         }
         output.extend_from_slice(self.path.as_bytes());
         output.extend_from_slice(self.execfn.as_bytes());
-        output.extend_from_slice(self.cwd.as_bytes());
+        self.cwd.encode(&mut output);
         for value in self.argv.iter().chain(&self.envp) {
             let value = value.as_bytes();
             push_u32(
@@ -422,10 +474,7 @@ impl LinuxProgramStartup {
         let execfn = core::str::from_utf8(take_bytes(&mut input, execfn_length)?)
             .map_err(|_| LinuxProgramStartupError::InvalidExecfn)?
             .into();
-        let cwd_bytes = take_bytes(&mut input, cwd_length)?;
-        let cwd = core::str::from_utf8(cwd_bytes)
-            .map_err(|_| LinuxProgramStartupError::InvalidWorkingDirectory)?
-            .into();
+        let cwd = InheritedCwd::decode(&mut input, cwd_length)?;
         let value_count = argv_count
             .checked_add(envp_count)
             .ok_or(LinuxProgramStartupError::Malformed)?;
@@ -520,13 +569,13 @@ impl LinuxForkStartup {
         output.extend_from_slice(self.resource_limits.as_bytes());
         output.push(u8::from(self.dumpable));
         output.push(u8::from(self.no_new_privs));
-        for count in [self.cwd.len(), self.regions.len(), self.fds.len()] {
+        for count in [self.cwd.path_len(), self.regions.len(), self.fds.len()] {
             push_u32(
                 &mut output,
                 u32::try_from(count).map_err(|_| LinuxProgramStartupError::TooLarge)?,
             );
         }
-        output.extend_from_slice(self.cwd.as_bytes());
+        self.cwd.encode(&mut output);
         for region in &self.regions {
             push_u64(&mut output, region.range.start as u64);
             push_u64(&mut output, region.range.end as u64);
@@ -586,9 +635,7 @@ impl LinuxForkStartup {
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let fd_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
-        let cwd = core::str::from_utf8(take_bytes(&mut input, cwd_length)?)
-            .map_err(|_| LinuxProgramStartupError::InvalidWorkingDirectory)?
-            .into();
+        let cwd = InheritedCwd::decode(&mut input, cwd_length)?;
         if region_count > input.len() / FORK_REGION_SIZE {
             return Err(LinuxProgramStartupError::Malformed);
         }
@@ -745,15 +792,13 @@ impl InheritedFd {
 }
 
 fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupError> {
-    if !startup.path.starts_with('/') || startup.path.as_bytes().contains(&0) {
+    if startup.path.is_empty() || startup.path.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidPath);
     }
     if startup.execfn.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidExecfn);
     }
-    if !startup.cwd.starts_with('/') || startup.cwd.as_bytes().contains(&0) {
-        return Err(LinuxProgramStartupError::InvalidWorkingDirectory);
-    }
+    startup.cwd.validate()?;
     if startup.umask & !0o777 != 0 {
         return Err(LinuxProgramStartupError::InvalidUmask);
     }
@@ -775,9 +820,7 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
 }
 
 fn validate_fork(startup: &LinuxForkStartup) -> Result<(), LinuxProgramStartupError> {
-    if !startup.cwd.starts_with('/') || startup.cwd.as_bytes().contains(&0) {
-        return Err(LinuxProgramStartupError::InvalidWorkingDirectory);
-    }
+    startup.cwd.validate()?;
     if startup.umask & !0o777 != 0 {
         return Err(LinuxProgramStartupError::InvalidUmask);
     }
@@ -810,7 +853,7 @@ fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStart
     let mut length = HEADER_SIZE
         .checked_add(startup.path.len())
         .and_then(|length| length.checked_add(startup.execfn.len()))
-        .and_then(|length| length.checked_add(startup.cwd.len()))
+        .and_then(|length| length.checked_add(startup.cwd.encoded_len()))
         .ok_or(LinuxProgramStartupError::TooLarge)?;
     if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
         return Err(LinuxProgramStartupError::TooLarge);
@@ -1024,7 +1067,7 @@ mod tests {
             sve_vl_inherit: false,
             path: "/child".into(),
             execfn: "/child".into(),
-            cwd: "/".into(),
+            cwd: InheritedCwd::Path("/".into()),
             argv: vec![CString::new("child").unwrap()],
             envp: Vec::new(),
             inherited_fds: Vec::new(),
@@ -1039,7 +1082,7 @@ mod tests {
         startup.pending_signals.process = vec![siginfo(realtime, 7), siginfo(realtime, 8)];
         let encoded = startup.encode().unwrap();
         let first_signal =
-            HEADER_SIZE + startup.path.len() + startup.execfn.len() + startup.cwd.len();
+            HEADER_SIZE + startup.path.len() + startup.execfn.len() + startup.cwd.encoded_len();
         for invalid_signal in [0_i32, 65] {
             let mut invalid = encoded.clone();
             invalid[first_signal..first_signal + size_of::<i32>()]
@@ -1096,7 +1139,7 @@ mod tests {
             sve_vl_inherit: true,
             path: "/bin/child".into(),
             execfn: "./script".into(),
-            cwd: "/home/user".into(),
+            cwd: InheritedCwd::File(ObjectHandle(u64::MAX)),
             argv: vec![
                 CString::new("child").unwrap(),
                 CString::new("argument").unwrap(),
@@ -1199,7 +1242,7 @@ mod tests {
             sve_vl_inherit: false,
             path: "/child".into(),
             execfn: "/child".into(),
-            cwd: "/".into(),
+            cwd: InheritedCwd::Path("/".into()),
             argv: vec![CString::new("").unwrap(); 1025],
             envp: Vec::new(),
             inherited_fds: Vec::new(),
@@ -1259,7 +1302,7 @@ mod tests {
             resource_limits: resource_limits(),
             dumpable: false,
             no_new_privs: true,
-            cwd: "/home/user".into(),
+            cwd: InheritedCwd::File(ObjectHandle(7)),
             comm: *b"python3\0\0\0\0\0\0\0\0\0",
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
             signal_actions,
@@ -1380,6 +1423,7 @@ mod tests {
             panic!("fork startup must decode as a fork");
         };
         assert_eq!(decoded.regions, startup.regions);
+        assert_eq!(decoded.cwd, startup.cwd);
         assert_eq!(decoded.fds, startup.fds);
         assert_eq!(decoded.comm, startup.comm);
         assert_eq!(decoded.signal_actions[0].restorer, 0x5678);
@@ -1497,11 +1541,43 @@ mod tests {
             Err(LinuxProgramStartupError::InvalidExecfn)
         );
 
+        // A path cwd must be absolute; in particular it cannot be empty, since a zero length
+        // announces a handle.
+        for cwd in ["", "relative"] {
+            let invalid_cwd = LinuxProgramStartup {
+                cwd: InheritedCwd::Path(cwd.into()),
+                ..startup.clone()
+            };
+            assert_eq!(
+                invalid_cwd.encode(),
+                Err(LinuxProgramStartupError::InvalidWorkingDirectory)
+            );
+        }
+        let empty_path = LinuxProgramStartup {
+            path: String::new(),
+            ..startup.clone()
+        };
+        assert_eq!(
+            empty_path.encode(),
+            Err(LinuxProgramStartupError::InvalidPath)
+        );
+        // The child resolves a relative program path from its inherited cwd.
+        let relative_path = LinuxProgramStartup {
+            path: "./child".into(),
+            ..startup.clone()
+        };
+        assert_eq!(
+            LinuxProgramStartup::decode(&relative_path.encode().unwrap())
+                .unwrap()
+                .path,
+            "./child"
+        );
+
         let mut invalid = startup.encode().unwrap();
         let first_argument = HEADER_SIZE
             + startup.path.len()
             + startup.execfn.len()
-            + startup.cwd.len()
+            + startup.cwd.encoded_len()
             + size_of::<u32>();
         invalid[first_argument] = 0;
         assert_eq!(

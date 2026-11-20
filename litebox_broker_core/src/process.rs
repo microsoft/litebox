@@ -5662,6 +5662,7 @@ mod tests {
         let readiness: Arc<dyn ReadinessSink> = readiness_sink();
         let file = crate::fs::open(
             &source,
+            None,
             "/mapped",
             ROOT,
             FileAccessMode::ReadWrite,
@@ -5694,7 +5695,10 @@ mod tests {
         for (process, handle) in [(&source, file), (&target, reader), (&target, writer)] {
             assert_eq!(process.close_object_reference(handle), Ok(()));
         }
-        assert_eq!(crate::fs::unlink(&source, "/mapped", ROOT), Ok(Ok(())));
+        assert_eq!(
+            crate::fs::unlink(&source, None, "/mapped", ROOT),
+            Ok(Ok(()))
+        );
     }
 
     fn check_file_reference_lifecycle(broker: &TestBroker, stdio_provider: &TestStdioProvider) {
@@ -5709,6 +5713,7 @@ mod tests {
         let readiness: Arc<dyn ReadinessSink> = sink.clone();
         let file = crate::fs::open(
             &source,
+            None,
             "/file",
             ROOT,
             FileAccessMode::ReadWrite,
@@ -5742,6 +5747,7 @@ mod tests {
         assert_eq!(
             crate::fs::open(
                 &source,
+                None,
                 "/uncommitted",
                 ROOT,
                 FileAccessMode::ReadWrite,
@@ -5753,7 +5759,7 @@ mod tests {
         );
         assert_eq!(source.close_object_reference(event), Ok(()));
         assert_eq!(
-            crate::fs::path_status(&source, "/uncommitted", ROOT, true),
+            crate::fs::path_status(&source, None, "/uncommitted", ROOT, true),
             Ok(Err(FileError::NoSuchFileOrDirectory))
         );
 
@@ -5800,10 +5806,11 @@ mod tests {
         );
         assert_eq!(&byte, b"a");
         assert_eq!(target.close_object_reference(duplicate), Ok(()));
-        assert_eq!(crate::fs::unlink(&source, "/file", ROOT), Ok(Ok(())));
+        assert_eq!(crate::fs::unlink(&source, None, "/file", ROOT), Ok(Ok(())));
 
         let directory = crate::fs::open(
             &source,
+            None,
             "/",
             ROOT,
             FileAccessMode::ReadOnly,
@@ -5822,6 +5829,7 @@ mod tests {
 
         let write_only_directory = crate::fs::open(
             &source,
+            None,
             "/",
             ROOT,
             FileAccessMode::WriteOnly,
@@ -5839,6 +5847,7 @@ mod tests {
 
         let random = crate::fs::open(
             &source,
+            None,
             "/dev/urandom",
             ROOT,
             FileAccessMode::ReadOnly,
@@ -5859,6 +5868,7 @@ mod tests {
 
         let write_only_random = Arc::clone(&broker.fs)
             .open(
+                None,
                 "/dev/urandom",
                 ROOT,
                 FileAccessMode::WriteOnly,
@@ -5875,6 +5885,7 @@ mod tests {
 
         let read_only_null = Arc::clone(&broker.fs)
             .open(
+                None,
                 "/dev/null",
                 ROOT,
                 FileAccessMode::ReadOnly,
@@ -5891,6 +5902,7 @@ mod tests {
 
         let stdout = crate::fs::open(
             &source,
+            None,
             "/dev/stdout",
             ROOT,
             FileAccessMode::WriteOnly,
@@ -5923,6 +5935,7 @@ mod tests {
 
         let stdin = crate::fs::open(
             &source,
+            None,
             "/dev/stdin",
             ROOT,
             FileAccessMode::ReadOnly,

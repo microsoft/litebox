@@ -2083,7 +2083,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         ];
         for entry in self
             .fs
-            .read_file_directory(&self.fs_context, &file.path, fd)
+            .read_file_directory(&file.path, fd)
             .map_err(map_read_dir_error)?
         {
             if entry.name == "." || entry.name == ".." {
@@ -2848,11 +2848,12 @@ fn map_file_status_error(error: FileStatusError) -> NtStatus {
     }
 }
 
-fn map_read_dir_error(error: ReadDirError) -> NtStatus {
+pub(super) fn map_read_dir_error(error: ReadDirError) -> NtStatus {
     match error {
         ReadDirError::ClosedFd => NtStatus::INVALID_HANDLE,
         ReadDirError::NotADirectory => NtStatus::NOT_A_DIRECTORY,
         ReadDirError::NotForReading => NtStatus::ACCESS_DENIED,
+        ReadDirError::Removed => NtStatus::DELETE_PENDING,
         _ => NtStatus::UNSUCCESSFUL,
     }
 }

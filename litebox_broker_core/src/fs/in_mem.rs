@@ -5,7 +5,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
@@ -58,6 +58,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     pub fn new(inode_allocator: InodeAllocator) -> Self {
         let root = Arc::new(sync::RwLock::new(DirData {
             instance: Arc::new(()),
+            parent: None,
+            detached_from: None,
             perms: Permissions {
                 mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                 userinfo: UserInfo::ROOT,
@@ -158,6 +160,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             name = next;
         }
 
+        let parent = Arc::downgrade(&dir);
         let mut dir = dir.write();
         match (dir.children.get(name), node) {
             (Some(Node::Dir(existing)), InitialNode::Directory { mode, owner }) => {
@@ -203,6 +206,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             (None, InitialNode::Directory { mode, owner }) => {
                 let child = Arc::new(sync::RwLock::new(DirData {
                     instance: dir.instance.clone(),
+                    parent: Some(parent),
+                    detached_from: None,
                     perms: Permissions {
                         mode,
                         userinfo: owner,
@@ -453,11 +458,63 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         ))
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &super::backend::DirHandle) -> Option<ResolvedDir<'a>> {
-        Some(Self::resolved_dir(InMemDirHandle {
+    fn walking_dir_at<'a>(
+        &'a self,
+        dir: &super::backend::DirHandle,
+    ) -> Result<ResolvedDir<'a>, WalkError> {
+        Ok(Self::resolved_dir(InMemDirHandle {
             dir: dir.get_typed::<Self>().dir.clone(),
             flags: super::OFlags::PATH,
         }))
+    }
+
+    fn dir_path(&self, dir: &super::backend::DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+        let _rename = self.rename_lock.lock();
+        super::backend::name_by_walking_up(dir.get_typed::<Self>().dir.clone(), |child| {
+            if Arc::ptr_eq(child, &self.root) {
+                return Ok(None);
+            }
+            let parent = child
+                .read()
+                .parent
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .ok_or(PathError::NoSuchFileOrDirectory)?;
+            let name = parent
+                .read()
+                .children
+                .iter()
+                .find_map(|(name, node)| {
+                    matches!(node, Node::Dir(dir) if Arc::ptr_eq(dir, child)).then(|| name.clone())
+                })
+                .ok_or(PathError::NoSuchFileOrDirectory)?;
+            Ok(Some((parent, name)))
+        })
+        .map(Some)
+    }
+
+    fn parent_dir(
+        &self,
+        dir: &super::backend::DirHandle,
+    ) -> Result<Option<super::backend::DirHandle>, WalkError> {
+        let dir = dir.get_typed::<Self>().dir.read();
+        dir.parent
+            .as_ref()
+            .map(|parent| {
+                let dir = parent.upgrade().ok_or(PathError::NoSuchFileOrDirectory)?;
+                Ok(super::backend::DirHandle::from_typed::<Self>(
+                    InMemDirHandle {
+                        dir,
+                        flags: super::OFlags::PATH,
+                    },
+                ))
+            })
+            .transpose()
+    }
+
+    fn check_search_permission(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        // Search permissions are enforced by the resolver.
+        Ok(())
     }
 
     fn open_file(
@@ -483,10 +540,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         &self,
         handle: super::backend::DirHandle,
     ) -> Result<Vec<DirEntry>, ReadDirError> {
-        Ok(handle
-            .into_typed::<Self>()
-            .dir
-            .read()
+        let handle = handle.into_typed::<Self>();
+        let dir = handle.dir.read();
+        if dir.detached_from.is_some() {
+            return Err(ReadDirError::Removed);
+        }
+        Ok(dir
             .children
             .iter()
             .map(|(name, child)| child.dir_entry(name))
@@ -597,6 +656,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         // the resolver should do so before calling this.
         let parent = dir.into_typed::<Self>();
         let mut parent = parent.dir.write();
+        parent.ensure_linked()?;
         if parent.children.contains_key(name) {
             return Err(OpenError::AlreadyExists);
         }
@@ -627,6 +687,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     ) -> Result<(), SymlinkError> {
         let parent = dir.into_typed::<Self>();
         let mut parent = parent.dir.write();
+        parent.ensure_linked()?;
         if parent.children.contains_key(name) {
             return Err(SymlinkError::AlreadyExists);
         }
@@ -652,12 +713,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         // TODO(jayb): Nothing checks write permission on the parent directory before creating;
         // the resolver should do so before calling this.
         let parent = dir.into_typed::<Self>();
+        let parent_node = Arc::downgrade(&parent.dir);
         let mut parent = parent.dir.write();
+        parent.ensure_linked()?;
         if parent.children.contains_key(name) {
             return Err(MkdirError::AlreadyExists);
         }
         let child = Arc::new(sync::RwLock::new(DirData {
             instance: parent.instance.clone(),
+            parent: Some(parent_node),
+            detached_from: None,
             perms: Permissions {
                 mode: metadata.mode,
                 userinfo: metadata.owner,
@@ -697,14 +762,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         // TODO(jayb): Nothing checks write permission on the parent directory before removing;
         // the resolver should do so before calling this.
         let parent = dir.into_typed::<Self>();
+        let parent_node = parent.dir.clone();
         let mut parent = parent.dir.write();
         match parent.children.get(name) {
             None => Err(PathError::NoSuchFileOrDirectory.into()),
             Some(Node::File(_)) => Err(RmdirError::NotADirectory),
-            Some(Node::Dir(child)) if !child.read().children.is_empty() => {
-                Err(RmdirError::NotEmpty)
-            }
-            Some(Node::Dir(_)) => {
+            Some(Node::Dir(child)) => {
+                if !child.write().detach_if_empty(parent_node) {
+                    return Err(RmdirError::NotEmpty);
+                }
                 parent.children.remove(name);
                 Ok(())
             }
@@ -723,8 +789,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 return Err(PathError::InvalidPathname.into());
             }
         }
-        // XXX(jayb): racing rmdir can detach a resolved parent, as for create and mkdir; fix all
-        // three together as part of broader atomicity fixups.
         let old_dir = old_dir.into_typed::<Self>().dir;
         let new_dir = new_dir.into_typed::<Self>().dir;
         let _rename = self.rename_lock.lock();
@@ -752,6 +816,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             _ => false,
         };
         let replace = |old: &mut DirData<Platform>, new: Option<&mut DirData<Platform>>| {
+            old.ensure_linked()?;
+            if let Some(new) = &new {
+                new.ensure_linked()?;
+            }
             let current = old
                 .children
                 .get(old_name)
@@ -780,8 +848,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             match (current, target) {
                 (Node::Dir(_), Some(Node::File(_))) => return Err(RenameError::NotADirectory),
                 (Node::File(_), Some(Node::Dir(_))) => return Err(RenameError::IsADirectory),
-                (Node::Dir(_), Some(Node::Dir(dir))) if !dir.read().children.is_empty() => {
-                    return Err(RenameError::NotEmpty);
+                (Node::Dir(_), Some(Node::Dir(dir))) => {
+                    let detached = dir.write().detach_if_empty(new_dir.clone());
+                    if !detached {
+                        return Err(RenameError::NotEmpty);
+                    }
                 }
                 _ => {}
             }
@@ -789,6 +860,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 .children
                 .remove(old_name)
                 .expect("source was checked under lock");
+            if !same_parent && let Node::Dir(dir) = &moved {
+                dir.write().parent = Some(Arc::downgrade(&new_dir));
+            }
             match new {
                 Some(new) => new.children.insert(new_name.into(), moved),
                 None => old.children.insert(new_name.into(), moved),
@@ -987,10 +1061,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Node<Platform> {
 type DirNode<Platform> = Arc<sync::RwLock<Platform, DirData<Platform>>>;
 struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
     instance: Arc<()>,
+    parent: Option<Weak<sync::RwLock<Platform, DirData<Platform>>>>,
+    // Set when this dir is unlinked (rmdir/rename-over). Holds a strong ref to the
+    // former parent so `parent` (Weak) stays upgradable for `..`; safe because the
+    // parent no longer owns us, so no cycle. Also marks the dir as deleted.
+    detached_from: Option<DirNode<Platform>>,
     perms: Permissions,
     children: HashMap<String, Node<Platform>>,
     node_info: NodeInfo,
     times: Option<FileTimestamps>,
+}
+
+impl<Platform: sync::RawSyncPrimitivesProvider> DirData<Platform> {
+    /// Marks this directory as removed from `parent` unless it has entries; returns whether it
+    /// was empty. The caller unlinks it while still holding `parent`'s lock.
+    fn detach_if_empty(&mut self, parent: DirNode<Platform>) -> bool {
+        if !self.children.is_empty() {
+            return false;
+        }
+        self.detached_from = Some(parent);
+        true
+    }
+
+    /// Fails once the directory has been removed, so that no entry is created unreachable.
+    fn ensure_linked(&self) -> Result<(), PathError> {
+        if self.detached_from.is_some() {
+            return Err(PathError::NoSuchFileOrDirectory);
+        }
+        Ok(())
+    }
 }
 
 type FileNode<Platform> = Arc<sync::RwLock<Platform, FileData>>;
@@ -1117,7 +1216,7 @@ mod tests {
             OFlags::CREAT | OFlags::WRONLY,
         ] {
             assert!(matches!(
-                fs.open(OWNER, "/a", flags, ALL),
+                fs.open(OWNER, None, "/a", flags, ALL),
                 Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
             ));
         }
@@ -1126,10 +1225,10 @@ mod tests {
         };
         assert_eq!(storage.static_bytes(), Some(b"preserve".as_slice()));
         let fd = fs
-            .open(OWNER, "/link", OFlags::RDONLY, Mode::empty())
+            .open(OWNER, None, "/link", OFlags::RDONLY, Mode::empty())
             .unwrap();
-        assert_eq!(fd.path(), "/target");
-        assert_eq!(fs.read_link(OWNER, "/link").unwrap(), "/target");
+        assert_eq!(fd.recorded_name(), "/target");
+        assert_eq!(fs.read_link(OWNER, None, "/link").unwrap(), "/target");
     }
 
     #[test]
@@ -1180,24 +1279,25 @@ mod tests {
             OFlags::RDWR | OFlags::TRUNC,
         ] {
             assert!(matches!(
-                fs.open(other_user, "/mnt/a/b/file", flags, Mode::empty()),
+                fs.open(other_user, None, "/mnt/a/b/file", flags, Mode::empty()),
                 Err(OpenError::AccessNotAllowed)
             ));
             assert!(upper_root.read().children.is_empty());
         }
         assert!(matches!(
-            fs.chmod(other_user, "/mnt/a/b/file", ALL),
+            fs.chmod(other_user, None, "/mnt/a/b/file", ALL),
             Err(ChmodError::NotTheOwner)
         ));
         assert!(upper_root.read().children.is_empty());
         assert!(matches!(
-            fs.chown(other_user, "/mnt/a/b/file", Some(2000), None),
+            fs.chown(other_user, None, "/mnt/a/b/file", Some(2000), None),
             Err(ChownError::NotTheOwner)
         ));
         assert!(upper_root.read().children.is_empty());
         let fd = fs
             .open(
                 other_user,
+                None,
                 "/mnt/a/b/file",
                 OFlags::PATH | OFlags::WRONLY | OFlags::TRUNC,
                 Mode::empty(),
@@ -1207,7 +1307,13 @@ mod tests {
         drop(fd);
         assert!(upper_root.read().children.is_empty());
         let mut fd = fs
-            .open(other_user, "/mnt/a/b/file", OFlags::RDONLY, Mode::empty())
+            .open(
+                other_user,
+                None,
+                "/mnt/a/b/file",
+                OFlags::RDONLY,
+                Mode::empty(),
+            )
             .unwrap();
         let mut buf = [0; 32];
         let count = fs.read(&mut fd, &mut buf, None).unwrap();
@@ -1217,6 +1323,7 @@ mod tests {
         let fd = fs
             .open(
                 OWNER,
+                None,
                 "/mnt/a/b/file",
                 OFlags::WRONLY | OFlags::TRUNC,
                 Mode::empty(),
@@ -1249,19 +1356,21 @@ mod tests {
             InodeAllocators::new().next(),
         );
         let fs = Resolver::<TestPlatform, _>::new(backend);
-        let fd = fs.open(OWNER, "/", OFlags::RDONLY, Mode::empty()).unwrap();
-        drop(fd);
-        assert!(matches!(
-            fs.open(OWNER, "/absent", OFlags::PATH, Mode::empty()),
-            Err(OpenError::PathError(PathError::NoSearchPerms))
-        ));
-        fs.chmod(OWNER, "/", Mode::RUSR | Mode::XUSR).unwrap();
         let fd = fs
-            .open(OWNER, "/dir", OFlags::RDONLY, Mode::empty())
+            .open(OWNER, None, "/", OFlags::RDONLY, Mode::empty())
             .unwrap();
         drop(fd);
         assert!(matches!(
-            fs.open(OWNER, "/dir/absent", OFlags::PATH, Mode::empty()),
+            fs.open(OWNER, None, "/absent", OFlags::PATH, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSearchPerms))
+        ));
+        fs.chmod(OWNER, None, "/", Mode::RUSR | Mode::XUSR).unwrap();
+        let fd = fs
+            .open(OWNER, None, "/dir", OFlags::RDONLY, Mode::empty())
+            .unwrap();
+        drop(fd);
+        assert!(matches!(
+            fs.open(OWNER, None, "/dir/absent", OFlags::PATH, Mode::empty()),
             Err(OpenError::PathError(PathError::NoSearchPerms))
         ));
         let other_user = UserInfo {
@@ -1269,14 +1378,14 @@ mod tests {
             group: 2000,
         };
         assert!(matches!(
-            fs.open(other_user, "/", OFlags::RDONLY, Mode::empty()),
+            fs.open(other_user, None, "/", OFlags::RDONLY, Mode::empty()),
             Err(OpenError::AccessNotAllowed)
         ));
         let fd = fs
-            .open(other_user, "/", OFlags::PATH, Mode::empty())
+            .open(other_user, None, "/", OFlags::PATH, Mode::empty())
             .unwrap();
         drop(fd);
-        fs.file_status(other_user, "/", true).unwrap();
+        fs.file_status(other_user, None, "/", true).unwrap();
     }
 
     #[test]

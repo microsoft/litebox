@@ -55,6 +55,18 @@ static inline char *test_path(const char *name) {
     return path;
 }
 
+// For tests taking `[base-directory [no-symlinks]]`: creates a directory named from `prefix` under
+// `base-directory` (default `test_dir()`) into `dir`, enters it, and returns whether the test may
+// create symlinks, which `no-symlinks` rules out for filesystems that cannot create them.
+static inline int enter_test_dir(int argc, char **argv, const char *prefix, char *dir,
+                                 size_t size) {
+    const char *base = argc > 1 ? argv[1] : test_dir();
+    int length = snprintf(dir, size, "%s/%s-XXXXXX", base, prefix);
+    TEST_ASSERT(length >= 0 && (size_t)length < size, "base directory name is short");
+    TEST_ASSERT(mkdtemp(dir) != NULL && chdir(dir) == 0, "create working directory");
+    return !(argc > 2 && strcmp(argv[2], "no-symlinks") == 0);
+}
+
 // Sets `address` to the Unix socket path `name` in `test_dir()`, removing any file there, or, if
 // `abstract`, to the abstract name made of that path, which is as unique to the run as the
 // directory is. Returns the address's length.

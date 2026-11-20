@@ -146,6 +146,7 @@ pub fn serve(info: &StartupInfo) -> ! {
     // TA and ldelf output goes to the broker's standard output.
     match builder.litebox().open_file(
         &litebox::fs::Context::new(),
+        None,
         "/dev/stdout",
         FileAccessMode::WriteOnly,
         FileOpenFlags::NONE,
@@ -784,6 +785,7 @@ fn check_stdin(
         litebox
             .open_file(
                 &context,
+                None,
                 path,
                 access,
                 FileOpenFlags::NONBLOCKING,

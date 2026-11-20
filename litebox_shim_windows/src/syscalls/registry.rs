@@ -39,8 +39,7 @@ use litebox::event::{
 };
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::fs::errors::{
-    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, TruncateError,
-    WriteError,
+    FileStatusError, MkdirError, OpenError, PathError, ReadError, TruncateError, WriteError,
 };
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::sync::Mutex;
@@ -51,6 +50,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::fs::{Fs, REGISTRY_ROOT};
 use crate::syscalls::Handle;
+use crate::syscalls::file::map_read_dir_error;
 use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value, raw_handle_entry};
 
 use crate::nt_types::{
@@ -809,7 +809,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let mut summary = KeySummary::default();
         for entry in self
             .fs()
-            .read_file_directory(&self.fs_context, &key.path, &key.fd)
+            .read_file_directory(&key.path, &key.fd)
             .map_err(map_read_dir_error)?
         {
             if entry.file_type == FileType::Directory
@@ -829,7 +829,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         };
         let values = self
             .fs()
-            .read_file_directory(&self.fs_context, &values_path, &values_fd)
+            .read_file_directory(&values_path, &values_fd)
             .map_err(map_read_dir_error);
         drop(values_fd);
         for entry in values? {
@@ -890,7 +890,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let mut names = Vec::new();
         for entry in self
             .fs()
-            .read_file_directory(&self.fs_context, &key.path, &key.fd)
+            .read_file_directory(&key.path, &key.fd)
             .map_err(map_read_dir_error)?
         {
             if entry.file_type == FileType::Directory
@@ -942,7 +942,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         };
         let entries = self
             .fs()
-            .read_file_directory(&self.fs_context, &values_path, &values_fd)
+            .read_file_directory(&values_path, &values_fd)
             .map_err(map_read_dir_error);
         drop(values_fd);
         let mut names = Vec::new();
@@ -2078,7 +2078,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         )?;
         let value_name = crate::nt_types::read_unicode_string::<Platform>(value_name)?;
         let value = key.with_entry(|key| {
-            // TODO: Open the value relative to `key.fd` once the FS has an openat-style API.
+            // TODO: Open the value relative to `key.fd` once `Fs::open_file` takes a directory
+            // (keeping its namespace check) instead of rooting every name.
             self.global
                 .registry
                 .read_value_at_path(&key.path, &value_name)
@@ -2556,14 +2557,6 @@ fn map_read_error(error: ReadError) -> NtStatus {
     match error {
         ReadError::NotForReading => NtStatus::ACCESS_DENIED,
         ReadError::NotAFile => NtStatus::OBJECT_TYPE_MISMATCH,
-        _ => NtStatus::UNSUCCESSFUL,
-    }
-}
-
-fn map_read_dir_error(error: ReadDirError) -> NtStatus {
-    match error {
-        ReadDirError::NotADirectory => NtStatus::NOT_A_DIRECTORY,
-        ReadDirError::NotForReading => NtStatus::ACCESS_DENIED,
         _ => NtStatus::UNSUCCESSFUL,
     }
 }
@@ -3280,7 +3273,12 @@ mod tests {
         let broker_fs = litebox;
         assert_eq!(
             broker_fs
-                .path_file_status(&litebox::fs::Context::new(), value_path.as_str(), true)
+                .path_file_status(
+                    &litebox::fs::Context::new(),
+                    None,
+                    value_path.as_str(),
+                    true
+                )
                 .unwrap()
                 .file_type,
             FileType::RegularFile

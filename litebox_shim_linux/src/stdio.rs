@@ -18,6 +18,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             .litebox
             .open_file(
                 context,
+                None,
                 "/dev/stdin",
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::NONE,
@@ -28,6 +29,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             .litebox
             .open_file(
                 context,
+                None,
                 "/dev/stdout",
                 FileAccessMode::WriteOnly,
                 FileOpenFlags::NONE,
@@ -38,6 +40,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             .litebox
             .open_file(
                 context,
+                None,
                 "/dev/stderr",
                 FileAccessMode::WriteOnly,
                 FileOpenFlags::NONE,

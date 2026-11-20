@@ -12,8 +12,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::fs::backend::{
-    Backend, CreationMetadata, DirHandle, FileHandle, FileTerminal, HandleRef, PermissionInfo,
-    Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+    Backend, CreationMetadata, DirHandle, DirPathResult, FileHandle, FileTerminal, HandleRef,
+    PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, ReadDirError,
@@ -187,8 +187,27 @@ impl Backend for ShareFs {
         self.0.open_dir(dir, flags)
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError> {
         self.0.walking_dir_at(dir)
+    }
+
+    fn walking_dir_with_path<'a>(
+        &'a self,
+        dir: &DirHandle,
+    ) -> Result<(ResolvedDir<'a>, DirPathResult), WalkError> {
+        self.0.walking_dir_with_path(dir)
+    }
+
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+        self.0.dir_path(dir)
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        self.0.parent_dir(dir)
+    }
+
+    fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        self.0.check_search_permission(dir)
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {

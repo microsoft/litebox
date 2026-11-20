@@ -322,6 +322,8 @@ pub enum RmdirError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
+    #[error("directory has been removed")]
+    Removed,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("fd does not point to a directory")]
@@ -346,8 +348,7 @@ pub enum FileStatusError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`crate::LiteBox::read_link_file`] and
-/// [`crate::LiteBox::resolve_file_path`].
+/// Possible errors from [`crate::LiteBox::read_link_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum WalkError {
@@ -361,6 +362,8 @@ pub enum WalkError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum FilePathError {
+    #[error("directory has no name in this namespace")]
+    NoSuchFileOrDirectory,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("I/O error")]

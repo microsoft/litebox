@@ -293,6 +293,8 @@ pub enum RmdirError {
 /// Possible errors from [`super::resolver::Resolver::read_dir`]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
+    #[error("directory has been removed")]
+    Removed,
     #[error("fd has been closed already")]
     ClosedFd,
     #[error("fd does not point to a directory")]
@@ -404,5 +406,39 @@ impl From<StorageError> for TruncateError {
 impl From<StorageError> for FileStatusError {
     fn from(_: StorageError) -> Self {
         Self::Io
+    }
+}
+
+impl From<WalkError> for OpenError {
+    fn from(error: WalkError) -> Self {
+        walk_error_or(Self::Io)(error)
+    }
+}
+
+/// Error mapping for rewalking an open handle to update its times: a handle whose name no longer
+/// leads anywhere is stale, so it fails with `Io` rather than a lookup error.
+pub(super) fn set_times_walk_error(error: WalkError) -> SetTimesError {
+    match error {
+        WalkError::Io
+        | WalkError::PathError(PathError::NoSuchFileOrDirectory | PathError::MissingComponent) => {
+            SetTimesError::Io
+        }
+        WalkError::PathError(error) => SetTimesError::PathError(error),
+    }
+}
+
+/// Error mapping for an internal open performed as part of a walk.
+pub(super) fn open_to_walk_error(error: OpenError) -> WalkError {
+    match error {
+        OpenError::PathError(error) => WalkError::PathError(error),
+        _ => WalkError::Io,
+    }
+}
+
+/// Keeps a walk's path error, reporting any other failure as `io`.
+pub(super) fn walk_error_or<E: From<PathError>>(io: E) -> impl FnOnce(WalkError) -> E {
+    move |error| match error {
+        WalkError::PathError(error) => error.into(),
+        WalkError::Io => io,
     }
 }

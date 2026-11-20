@@ -138,6 +138,79 @@ fn test_utimensat_through_broker_mount() {
     std::fs::remove_dir_all(host).unwrap();
 }
 
+/// Runs a directory rename test with its working directory on a host mount, so held directories
+/// and the cwd follow renames and removals of host directories.
+#[cfg(target_os = "linux")]
+fn run_rename_test_through_broker_mount(source: &str, name: &str, expected: &str) {
+    let target = common::compile(source, name, true, false);
+    // A fresh directory per run, so entries a failed run leaves behind (possibly without search
+    // permission) cannot fail later runs.
+    let host = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    // LocalFs reports host owners, so the guest runs as the mount's owner to own what it creates.
+    let Ok(host_uid) = u16::try_from(std::os::unix::fs::MetadataExt::uid(
+        &std::fs::metadata(host.path()).unwrap(),
+    )) else {
+        eprintln!("skipping {name}: the host uid does not fit a guest uid");
+        return;
+    };
+    // LocalFs does not support guest-created symlinks.
+    let output = Runner::new(&target, name)
+        .guest_uid(host_uid)
+        .mount(host.path(), "/work")
+        .args(["/work", "no-symlinks"])
+        .output();
+    assert!(String::from_utf8_lossy(&output).contains(expected));
+    assert!(
+        std::fs::read_dir(host.path()).unwrap().next().is_none(),
+        "the test left entries behind on the host"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_dirfd_rename_through_broker_mount() {
+    run_rename_test_through_broker_mount(
+        "./tests/dirfd_rename.c",
+        "dirfd_rename_broker_mount",
+        "All directory fd rename tests passed.",
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_cwd_rename_through_broker_mount() {
+    run_rename_test_through_broker_mount(
+        "./tests/cwd_rename.c",
+        "cwd_rename_broker_mount",
+        "All cwd rename tests passed.",
+    );
+}
+
+/// A held directory from the read-only lower layer, once its entry and then itself are removed,
+/// must not bring back the entry the lower layer still holds.
+#[test]
+#[cfg(target_os = "linux")]
+fn test_held_lower_directory_removal() {
+    let target = common::compile("./tests/held_lower_dir.c", "held_lower_dir", true, false);
+    // The rootfs tar records host owners, so the guest runs as the host user to own `/held`.
+    let Ok(host_uid) = u16::try_from(std::os::unix::fs::MetadataExt::uid(
+        &std::fs::metadata(env!("CARGO_TARGET_TMPDIR")).unwrap(),
+    )) else {
+        eprintln!("skipping held_lower_dir: the host uid does not fit a guest uid");
+        return;
+    };
+    let output = Runner::new(&target, "held_lower_dir")
+        .guest_uid(host_uid)
+        .arg("/held/lower")
+        .with_fs_path(|root| {
+            // Under a staged parent, since the guest does not own `/`.
+            std::fs::create_dir_all(root.join("held/lower")).unwrap();
+            std::fs::write(root.join("held/lower/entry"), b"").unwrap();
+        })
+        .output();
+    assert!(String::from_utf8_lossy(&output).contains("held lower directory ok"));
+}
+
 #[test]
 fn test_mount_tmpfs() {
     let target = common::compile("./tests/mount.c", "mount_tmpfs", true, false);

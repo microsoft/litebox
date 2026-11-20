@@ -136,8 +136,10 @@ impl UnixSocketAddr {
         match self {
             UnixSocketAddr::Unnamed => Err(Errno::EINVAL),
             UnixSocketAddr::Abstract(name) => Ok(UnixSocketAddress::Abstract(name.clone())),
+            // Sent unnormalized: the broker resolves `..` after following symlinks and enforces
+            // trailing slashes.
             UnixSocketAddr::Path(path) => Ok(UnixSocketAddress::Path {
-                path: task.resolve_path(path)?.into(),
+                path: task.absolute_name(path.as_str())?,
                 name: path.as_bytes().to_vec(),
             }),
         }

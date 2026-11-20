@@ -63,6 +63,24 @@ pub enum SeekBehavior {
     PositionBased,
 }
 
+/// The result of [`Backend::dir_path`].
+pub type DirPathResult = Result<Option<Vec<String>>, WalkError>;
+
+/// Names `dir` relative to its backend's root by walking up. `step` returns a directory's parent
+/// and its name there, or `None` at the root.
+pub(super) fn name_by_walking_up<D>(
+    mut dir: D,
+    mut step: impl FnMut(&D) -> Result<Option<(D, String)>, WalkError>,
+) -> Result<Vec<String>, WalkError> {
+    let mut path = Vec::new();
+    while let Some((parent, name)) = step(&dir)? {
+        path.push(name);
+        dir = parent;
+    }
+    path.reverse();
+    Ok(path)
+}
+
 /// A backend that can be used to support a (full or subset of) a LiteBox filesystem.
 pub trait Backend: Send + Sync + Any {
     /// Resolve the root directory.
@@ -98,12 +116,39 @@ pub trait Backend: Send + Sync + Any {
 
     /// Obtain a resolved directory from an existing owned directory handle, without opening it.
     ///
-    /// This operation always succeeds and returns a `Some` _unless_ on a networked backend where
-    /// owned handles can go stale.
+    /// Walk the directory the handle refers to, even if it has been renamed. If the backend
+    /// can no longer walk that directory (for example, because a network handle is stale), fail
+    /// with [`super::errors::PathError::NoSuchFileOrDirectory`]. Other failures report
+    /// [`WalkError::Io`] or a more specific [`super::errors::PathError`] (such as missing search
+    /// permission), which the resolver passes on.
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError>;
+
+    /// [`Self::walking_dir_at`] together with [`Self::dir_path`], both taken from one snapshot
+    /// of the directory's location where the backend can provide that.
+    fn walking_dir_with_path<'a>(
+        &'a self,
+        dir: &DirHandle,
+    ) -> Result<(ResolvedDir<'a>, DirPathResult), WalkError> {
+        let path = self.dir_path(dir);
+        Ok((self.walking_dir_at(dir)?, path))
+    }
+
+    /// Current physical name, as components relative to this backend's root (empty at root).
     ///
-    /// XXX(jayb): We will likely migrate away from `Option` here when we do a bit of an overhaul of
-    /// the `errors` module in order to more consistently support stale errors everywhere.
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>>;
+    /// A directory no longer linked into this namespace has no name and must return
+    /// [`super::errors::PathError::NoSuchFileOrDirectory`]. So must a directory the backend can no
+    /// longer walk (see [`Self::walking_dir_at`]), such as a moved directory on a backend that
+    /// reaches directories by path. Returns `Ok(None)` if the backend cannot determine the current
+    /// name of a live directory.
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError>;
+
+    /// Walk up from an owned directory, returning `None` at this backend's root.
+    /// Implementations must not follow `..` beyond their exported subtree.
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError>;
+
+    /// Check search permission on `dir` with the backend's own credentials. The resolver calls
+    /// this only for directories reporting [`PermissionCheck::ByBackend`].
+    fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError>;
 
     /// Open the already-resolved file after resolver authorization, validating `flags`.
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError>;
@@ -237,7 +282,8 @@ pub trait Backend: Send + Sync + Any {
 
     /// Atomically move an entry, replacing a compatible destination without following final
     /// symbolic links. Backends must reject directory cycles and preserve open file contents.
-    /// Directory handles retain the backend's documented object or path-locator semantics.
+    /// Directory handles keep referring to the same directories across the rename (see
+    /// [`Self::walking_dir_at`]).
     fn rename_at(
         &self,
         old_dir: DirHandle,

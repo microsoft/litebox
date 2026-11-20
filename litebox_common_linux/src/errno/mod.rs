@@ -486,6 +486,7 @@ impl From<litebox::fs::errors::FilePathError> for Errno {
     fn from(value: litebox::fs::errors::FilePathError) -> Self {
         match value {
             litebox::fs::errors::FilePathError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::FilePathError::NoSuchFileOrDirectory => Errno::ENOENT,
             litebox::fs::errors::FilePathError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
@@ -803,7 +804,11 @@ impl From<litebox::fs::errors::ReadDirError> for Errno {
     fn from(value: litebox::fs::errors::ReadDirError) -> Self {
         match value {
             litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
-            litebox::fs::errors::ReadDirError::NotOpenForReading => Errno::EBADF,
+            litebox::fs::errors::ReadDirError::Removed => Errno::ENOENT,
+            litebox::fs::errors::ReadDirError::ClosedFd
+            | litebox::fs::errors::ReadDirError::NotForReading
+            | litebox::fs::errors::ReadDirError::NotOpenForReading => Errno::EBADF,
+            litebox::fs::errors::ReadDirError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
     }

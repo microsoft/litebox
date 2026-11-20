@@ -310,7 +310,7 @@ fn path_names_stay_taken_until_unlinked() {
         fixture.bind(other, &address),
         Err(UnixSocketError::AddressInUse)
     );
-    crate::fs::unlink(&fixture.process, "/server", USER)
+    crate::fs::unlink(&fixture.process, None, "/server", USER)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -375,6 +375,7 @@ fn path_connections_require_write_permission() {
     );
     crate::fs::chmod(
         &fixture.process,
+        None,
         "/server",
         USER,
         FileMode::RWXU | FileMode::WOTH,

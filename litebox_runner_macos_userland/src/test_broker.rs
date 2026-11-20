@@ -119,6 +119,7 @@ pub(crate) fn setup(
             .litebox()
             .open_file(
                 &context,
+                None,
                 path,
                 access,
                 FileOpenFlags::NONE,

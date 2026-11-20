@@ -44,6 +44,20 @@ fn path_error(error: &std::io::Error) -> PathError {
     }
 }
 
+/// Maps a failed check that a held directory or resolved file is still usable: a missing or
+/// unsearchable object keeps its path error, and anything else becomes `io`.
+pub(super) fn stale_handle_error<E: From<PathError> + core::fmt::Debug>(
+    error: &std::io::Error,
+    io: E,
+) -> E {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            path_error(error).into()
+        }
+        _ => unmapped(error, io),
+    }
+}
+
 pub(super) fn walk_error(error: std::io::Error) -> WalkError {
     match error.kind() {
         std::io::ErrorKind::NotFound

@@ -182,8 +182,37 @@ impl super::backend::Backend for TarRo {
         Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
-        Some(self.resolved_dir(dir.get_typed::<Self>().clone()))
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError> {
+        Ok(self.resolved_dir(dir.get_typed::<Self>().clone()))
+    }
+
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+        let dirs = &self.tar_index.dirs;
+        super::backend::name_by_walking_up(dir.get_typed::<Self>().idx, |&child| {
+            let Some(parent) = dirs[child].parent else {
+                return Ok(None);
+            };
+            let name = dirs[parent]
+                .children
+                .iter()
+                .find_map(|(name, node)| {
+                    matches!(node, IndexedChild::Dir(idx) if *idx == child).then(|| name.clone())
+                })
+                .ok_or(WalkError::Io)?;
+            Ok(Some((parent, name)))
+        })
+        .map(Some)
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        Ok(self.tar_index.dirs[dir.get_typed::<Self>().idx]
+            .parent
+            .map(|idx| DirHandle::from_typed::<Self>(TarRoDirHandle { idx })))
+    }
+
+    fn check_search_permission(&self, _dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        // Search permissions are enforced by the resolver.
+        Ok(())
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
@@ -394,6 +423,7 @@ impl IndexedFile {
 }
 
 struct IndexedDir {
+    parent: Option<usize>,
     times: Option<super::FileTimestamps>,
     mode: Mode,
     /// Set by the directory's own archive entry, or else by the first entry beneath it.
@@ -403,8 +433,13 @@ struct IndexedDir {
 }
 
 impl IndexedDir {
-    fn new(owner: Option<UserInfo>, inode_allocator: &InodeAllocator) -> Self {
+    fn new(
+        parent: Option<usize>,
+        owner: Option<UserInfo>,
+        inode_allocator: &InodeAllocator,
+    ) -> Self {
         Self {
+            parent,
             times: None,
             mode: DEFAULT_DIR_MODE,
             owner,
@@ -433,7 +468,7 @@ impl TarIndex {
         let mut index = Self {
             tar_data: alloc::borrow::Cow::Borrowed(&[]),
             files: Vec::new(),
-            dirs: alloc::vec![IndexedDir::new(None, &inode_allocator)],
+            dirs: alloc::vec![IndexedDir::new(None, None, &inode_allocator)],
         };
         for entry in archive_entries(&tar_data) {
             let (entry, data_range) = entry.unwrap_or_else(|error| panic!("{error}"));
@@ -575,7 +610,7 @@ impl TarIndex {
                 None => {
                     let child = self.dirs.len();
                     self.dirs
-                        .push(IndexedDir::new(Some(owner), inode_allocator));
+                        .push(IndexedDir::new(Some(dir), Some(owner), inode_allocator));
                     self.dirs[dir]
                         .children
                         .insert((*component).into(), IndexedChild::Dir(child));

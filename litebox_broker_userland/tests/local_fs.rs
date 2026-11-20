@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 use litebox_broker_core::fs::SeekWhence;
 use litebox_broker_core::fs::backend::{
-    Backend, HandleRef, Resolution, ResolvedFile, ResolvedTarget,
+    Backend, DirHandle, HandleRef, Resolution, ResolvedFile, ResolvedTarget,
 };
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::errors::{
@@ -61,6 +61,19 @@ fn resolved_file<'a>(local: &'a LocalFs, name: &str) -> ResolvedFile<'a> {
         Resolution::Found(ResolvedTarget::File(file)) => file,
         _ => panic!("expected a resolved file"),
     }
+}
+
+/// Opens the directory at `components` with `O_PATH`.
+fn open_path_dir(local: &LocalFs, components: &[&str]) -> DirHandle {
+    let Resolution::Found(ResolvedTarget::Dir(dir)) = local
+        .resolve(local.root().unwrap(), components, &|_| {
+            panic!("LocalFs must enforce host permissions itself")
+        })
+        .unwrap()
+    else {
+        panic!("expected a directory");
+    };
+    local.open_dir(dir, OFlags::PATH).unwrap()
 }
 
 fn host_timestamps(metadata: &fs::Metadata) -> FileTimestamps {
@@ -708,7 +721,7 @@ fn read_only_backend_reads_live_and_refuses_every_host_mutation() {
             .build()
             .unwrap(),
     );
-    let open = |path, flags| resolver.open(USER, path, flags, Mode::RWXU);
+    let open = |path, flags| resolver.open(USER, None, path, flags, Mode::RWXU);
 
     for (path, flags) in [
         ("/ro/file", OFlags::WRONLY),
@@ -728,36 +741,42 @@ fn read_only_backend_reads_live_and_refuses_every_host_mutation() {
         OpenError::AlreadyExists
     );
     assert_err!(
-        resolver.mkdir(USER, "/ro/new", Mode::RWXU),
+        resolver.mkdir(USER, None, "/ro/new", Mode::RWXU),
         MkdirError::ReadOnlyFileSystem
     );
     assert_err!(
-        resolver.mkdir(USER, "/ro/dir", Mode::RWXU),
+        resolver.mkdir(USER, None, "/ro/dir", Mode::RWXU),
         MkdirError::AlreadyExists
     );
     assert_err!(
-        resolver.symlink(USER, "file", "/ro/new"),
+        resolver.symlink(USER, "file", None, "/ro/new"),
         SymlinkError::ReadOnlyFileSystem
     );
     assert_err!(
-        resolver.symlink(USER, "file", "/ro/file"),
+        resolver.symlink(USER, "file", None, "/ro/file"),
         SymlinkError::AlreadyExists
     );
     // Like Linux, the read-only check precedes the final-name lookup.
     for (file, dir) in [("/ro/file", "/ro/empty"), ("/ro/missing", "/ro/missing")] {
-        assert_err!(resolver.unlink(USER, file), UnlinkError::ReadOnlyFileSystem);
-        assert_err!(resolver.rmdir(USER, dir), RmdirError::ReadOnlyFileSystem);
         assert_err!(
-            resolver.rename(USER, file, "/ro/moved"),
+            resolver.unlink(USER, None, file),
+            UnlinkError::ReadOnlyFileSystem
+        );
+        assert_err!(
+            resolver.rmdir(USER, None, dir),
+            RmdirError::ReadOnlyFileSystem
+        );
+        assert_err!(
+            resolver.rename(USER, None, file, None, "/ro/moved"),
             RenameError::ReadOnlyFileSystem
         );
     }
     assert_err!(
-        resolver.chmod(USER, "/ro/file", Mode::RUSR),
+        resolver.chmod(USER, None, "/ro/file", Mode::RUSR),
         ChmodError::ReadOnlyFileSystem
     );
     assert_err!(
-        resolver.chown(USER, "/ro/file", None, None),
+        resolver.chown(USER, None, "/ro/file", None, None),
         ChownError::ReadOnlyFileSystem
     );
     let explicit = FileTimeUpdate::Set(FileTimestamp {
@@ -814,15 +833,9 @@ fn direct_backend_mutations_and_flags() {
     );
     assert_eq!(fs::metadata(temp.path().join("new")).unwrap().len(), 4097);
     fs::create_dir(temp.path().join("dir")).unwrap();
-    let Resolution::Found(ResolvedTarget::Dir(dir)) = local
-        .resolve(local.root().unwrap(), &["dir"], &|_| unreachable!())
-        .unwrap()
-    else {
-        panic!("expected directory");
-    };
-    let dir = local.open_dir(dir, OFlags::PATH).unwrap();
+    let dir = open_path_dir(&local, &["dir"]);
     assert!(local.status(HandleRef::Dir(&dir)).is_ok());
-    assert!(local.walking_dir_at(&dir).is_some());
+    assert!(local.walking_dir_at(&dir).is_ok());
     local.unlink_at(local.root().unwrap(), "new").unwrap();
     local.rmdir_at(local.root().unwrap(), "dir").unwrap();
     assert!(!temp.path().join("new").exists());
@@ -837,6 +850,7 @@ fn competing_creators_never_overwrite() {
         let left = scope.spawn(|| {
             local.open(
                 USER,
+                None,
                 "/only_one",
                 OFlags::CREAT | OFlags::EXCL | OFlags::RDWR,
                 Mode::RWXU,
@@ -845,6 +859,7 @@ fn competing_creators_never_overwrite() {
         let right = scope.spawn(|| {
             local.open(
                 USER,
+                None,
                 "/only_one",
                 OFlags::CREAT | OFlags::EXCL | OFlags::RDWR,
                 Mode::RWXU,
@@ -894,9 +909,10 @@ fn dangling_symlink_cannot_be_replaced_by_creation() {
         local
             .open(
                 USER,
+                None,
                 "/dangling",
                 OFlags::CREAT | OFlags::WRONLY,
-                Mode::RUSR
+                Mode::RUSR,
             )
             .is_err()
     );
@@ -933,7 +949,7 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
     let listed = local
         .read_dir(
             &local
-                .open(USER, "/", OFlags::RDONLY, Mode::empty())
+                .open(USER, None, "/", OFlags::RDONLY, Mode::empty())
                 .unwrap(),
         )
         .unwrap();
@@ -946,11 +962,14 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
             "{name}"
         );
     }
-    assert_eq!(local.read_link(USER, "/absolute").unwrap(), "target");
-    assert_eq!(local.read_link(USER, "/sub/relative").unwrap(), "../target");
+    assert_eq!(local.read_link(USER, None, "/absolute").unwrap(), "target");
+    assert_eq!(
+        local.read_link(USER, None, "/sub/relative").unwrap(),
+        "../target"
+    );
     assert_eq!(
         local
-            .file_status(USER, "/absolute", false)
+            .file_status(USER, None, "/absolute", false)
             .unwrap()
             .file_type,
         FileType::SymbolicLink
@@ -962,7 +981,7 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
         "/dir_link/relative",
     ] {
         let mut file = local
-            .open(USER, name, OFlags::RDONLY, Mode::empty())
+            .open(USER, None, name, OFlags::RDONLY, Mode::empty())
             .unwrap();
         let mut buf = [0; 6];
         assert_eq!(
@@ -975,7 +994,7 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
     for name in ["/escape", "/sub/climb", "/cycle_a", "/socket"] {
         assert!(
             local
-                .open(USER, name, OFlags::RDONLY, Mode::empty())
+                .open(USER, None, name, OFlags::RDONLY, Mode::empty())
                 .is_err(),
             "{name}"
         );
@@ -988,11 +1007,11 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
         ),
     ] {
         assert!(
-            local.open(USER, name, flags, Mode::empty()).is_err(),
+            local.open(USER, None, name, flags, Mode::empty()).is_err(),
             "{name}"
         );
     }
-    assert!(local.unlink(USER, "/socket").is_err());
+    assert!(local.unlink(USER, None, "/socket").is_err());
     assert!(root.join("socket").exists());
     assert_eq!(fs::read(&outside).unwrap(), b"outside");
     drop(socket);
@@ -1048,7 +1067,7 @@ fn resolver_and_composer_use_host_permissions_and_live_positions() {
         .unwrap();
     let resolver: Resolver<TestPlatform, _> = Resolver::new(composer);
     let mut file = resolver
-        .open(USER, "/host/file", OFlags::RDWR, Mode::empty())
+        .open(USER, None, "/host/file", OFlags::RDWR, Mode::empty())
         .unwrap();
     assert!(resolver.get_static_backing_data(&file).is_none());
     let mut buf = [0; 3];
@@ -1063,6 +1082,7 @@ fn resolver_and_composer_use_host_permissions_and_live_positions() {
     let mut appended = resolver
         .open(
             USER,
+            None,
             "/host/file",
             OFlags::WRONLY | OFlags::APPEND,
             Mode::empty(),
@@ -1070,16 +1090,21 @@ fn resolver_and_composer_use_host_permissions_and_live_positions() {
         .unwrap();
     resolver.write(&mut appended, b"+", None).unwrap();
     assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"Zb!+");
-    let status = resolver.file_status(USER, "/host/file", true).unwrap();
+    let status = resolver
+        .file_status(USER, None, "/host/file", true)
+        .unwrap();
     assert_eq!(status.size, 4);
     resolver.truncate(&mut file, 2, false).unwrap();
     assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"Zb");
-    resolver.mkdir(USER, "/host/folder", Mode::RWXU).unwrap();
-    resolver.rmdir(USER, "/host/folder").unwrap();
+    resolver
+        .mkdir(USER, None, "/host/folder", Mode::RWXU)
+        .unwrap();
+    resolver.rmdir(USER, None, "/host/folder").unwrap();
     // Existing resolver behavior creates a regular file on CREAT|DIRECTORY.
     let created = resolver
         .open(
             USER,
+            None,
             "/host/creat_dir",
             OFlags::CREAT | OFlags::DIRECTORY | OFlags::RDWR,
             Mode::RUSR | Mode::SUID | Mode::SGID,
@@ -1093,8 +1118,8 @@ fn resolver_and_composer_use_host_permissions_and_live_positions() {
         resolver.handle_status(&created).unwrap().mode & (Mode::SUID | Mode::SGID),
         Mode::empty()
     );
-    resolver.unlink(USER, "/host/creat_dir").unwrap();
-    resolver.unlink(USER, "/host/file").unwrap();
+    resolver.unlink(USER, None, "/host/creat_dir").unwrap();
+    resolver.unlink(USER, None, "/host/file").unwrap();
 }
 
 #[cfg(unix)]
@@ -1113,7 +1138,7 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
     );
     let foreign = first.open_dir(first.root().unwrap(), OFlags::PATH).unwrap();
     assert!(second.list_dir_at(foreign.clone()).is_err());
-    assert!(second.walking_dir_at(&foreign).is_none());
+    assert!(second.walking_dir_at(&foreign).is_err());
     assert!(second.unlink_at(first.root().unwrap(), "f").is_err());
     assert_eq!(fs::read(a.path().join("f")).unwrap(), b"one");
     let file = first
@@ -1210,7 +1235,7 @@ fn live_io_creation_listing_and_removal() {
     let local: Resolver<TestPlatform, _> = Resolver::new(backend(temp.path()));
 
     let mut file = local
-        .open(USER, "/existing", OFlags::RDWR, Mode::empty())
+        .open(USER, None, "/existing", OFlags::RDWR, Mode::empty())
         .unwrap();
     let mut data = [0; 3];
     assert_eq!(local.read(&mut file, &mut data, Some(0)).unwrap(), 3);
@@ -1218,10 +1243,11 @@ fn live_io_creation_listing_and_removal() {
     assert_eq!(local.write(&mut file, b"Z", Some(1)).unwrap(), 1);
     assert_eq!(fs::read(temp.path().join("existing")).unwrap(), b"aZc");
 
-    local.mkdir(USER, "/directory", Mode::RWXU).unwrap();
+    local.mkdir(USER, None, "/directory", Mode::RWXU).unwrap();
     let created = local
         .open(
             USER,
+            None,
             "/created",
             OFlags::CREAT | OFlags::EXCL | OFlags::RDWR,
             Mode::RUSR | Mode::WUSR,
@@ -1229,39 +1255,40 @@ fn live_io_creation_listing_and_removal() {
         .unwrap();
     assert_eq!(local.handle_status(&created).unwrap().size, 0);
     let root = local
-        .open(USER, "/", OFlags::RDONLY, Mode::empty())
+        .open(USER, None, "/", OFlags::RDONLY, Mode::empty())
         .unwrap();
     let entries = local.read_dir(&root).unwrap();
     assert!(entries.iter().any(|entry| entry.name == "existing"));
     assert!(entries.iter().any(|entry| entry.name == "created"));
     assert!(entries.iter().any(|entry| entry.name == "directory"));
 
-    local.chmod(USER, "/created", Mode::RUSR).unwrap();
+    local.chmod(USER, None, "/created", Mode::RUSR).unwrap();
     assert!(
         fs::metadata(temp.path().join("created"))
             .unwrap()
             .permissions()
             .readonly()
     );
-    assert!(local.unlink(USER, "/created").is_err());
+    assert!(local.unlink(USER, None, "/created").is_err());
     local
-        .chmod(USER, "/created", Mode::RUSR | Mode::WUSR)
+        .chmod(USER, None, "/created", Mode::RUSR | Mode::WUSR)
         .unwrap();
     // std's Windows deletion can remain pending while an existing handle is open.
     drop(created);
-    local.unlink(USER, "/created").unwrap();
+    local.unlink(USER, None, "/created").unwrap();
     let replacement = local
         .open(
             USER,
+            None,
             "/created",
             OFlags::CREAT | OFlags::EXCL | OFlags::RDWR,
             Mode::RUSR | Mode::WUSR,
         )
         .unwrap();
     drop(replacement);
-    local.unlink(USER, "/created").unwrap();
-    local.rmdir(USER, "/directory").unwrap();
-    local.unlink(USER, "/existing").unwrap();
+    local.unlink(USER, None, "/created").unwrap();
+    local.rmdir(USER, None, "/directory").unwrap();
+    local.unlink(USER, None, "/existing").unwrap();
     assert!(!temp.path().join("created").exists());
     assert!(!temp.path().join("directory").exists());
     assert!(!temp.path().join("existing").exists());
@@ -1287,34 +1314,56 @@ fn symlinks_are_bounded_when_windows_allows_test_symlink_creation() {
     let local: Resolver<TestPlatform, _> = Resolver::new(backend(&root));
     for name in ["/inside_link", "/absolute_link"] {
         let mut inside = local
-            .open(USER, name, OFlags::RDONLY, Mode::empty())
+            .open(USER, None, name, OFlags::RDONLY, Mode::empty())
             .unwrap();
         let mut data = [0; 6];
         assert_eq!(local.read(&mut inside, &mut data, Some(0)).unwrap(), 6);
         assert_eq!(&data, b"inside");
     }
-    assert_eq!(local.read_link(USER, "/absolute_link").unwrap(), "target");
+    assert_eq!(
+        local.read_link(USER, None, "/absolute_link").unwrap(),
+        "target"
+    );
     assert!(
         local
-            .open(USER, "/escape_link", OFlags::RDONLY, Mode::empty())
+            .open(USER, None, "/escape_link", OFlags::RDONLY, Mode::empty())
             .is_err()
     );
     assert!(
         local
             .open(
                 USER,
+                None,
                 "/inside_link",
                 OFlags::RDONLY | OFlags::NOFOLLOW,
-                Mode::empty()
+                Mode::empty(),
             )
             .is_err()
     );
 
     assert!(matches!(
-        local.rmdir(USER, "/dir_link"),
+        local.rmdir(USER, None, "/dir_link"),
         Err(RmdirError::NotADirectory)
     ));
-    local.unlink(USER, "/inside_link").unwrap();
+    local.unlink(USER, None, "/inside_link").unwrap();
     assert!(fs::symlink_metadata(root.join("inside_link")).is_err());
     assert_eq!(fs::read(root.join("target")).unwrap(), b"inside");
+}
+
+#[test]
+fn held_directories_name_themselves_and_walk_up_to_the_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("export");
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    let local = backend(&root);
+    let mut dir = open_path_dir(&local, &["a", "b"]);
+    for expected in [&["a", "b"][..], &["a"], &[]] {
+        assert_eq!(local.dir_path(&dir).unwrap().unwrap(), expected);
+        let Some(parent) = local.parent_dir(&dir).unwrap() else {
+            assert!(expected.is_empty(), "only the root has no parent");
+            break;
+        };
+        dir = parent;
+    }
+    assert!(local.parent_dir(&dir).unwrap().is_none());
 }

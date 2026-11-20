@@ -48,26 +48,52 @@ pub struct SharedFileObject<Object> {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    /// Opens a file.
+    /// The handle a relative `path` resolves from. Rejects an empty path, a relative path without
+    /// `dir`, and a `dir` from another broker connection.
+    fn checked_path_anchor(
+        broker: &Arc<dyn BrokerControl>,
+        dir: Option<&File<Platform>>,
+        path: &str,
+    ) -> Result<Option<ObjectHandle>, FileError> {
+        if path.is_empty() {
+            return Err(FileError::NoSuchFileOrDirectory);
+        }
+        if path.starts_with('/') {
+            return Ok(None);
+        }
+        let dir = dir.ok_or(FileError::InvalidPathname)?;
+        // Handle numbers are scoped to a broker connection.
+        if !Arc::ptr_eq(broker, &dir.broker) {
+            return Err(FileError::Io);
+        }
+        Ok(Some(dir.handle()))
+    }
+
+    /// Opens a file. A relative `path` resolves from `dir`; an absolute path ignores `dir`.
+    ///
+    /// A relative `path` requires `dir`, which must be a directory opened through this same
+    /// `LiteBox`; otherwise the call fails. The other path-taking methods share these rules.
     ///
     /// `access` and `flags` use the architecture-independent broker contract.
     /// The `mode` is only significant when creating a file.
     pub fn open_file(
         &self,
         context: &Context,
-        path: impl PathArg,
+        dir: Option<&File<Platform>>,
+        path: &str,
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: Mode,
     ) -> Result<File<Platform>, OpenError> {
-        let path = path.broker_path(context)?;
         if FileOpenFlags::from_bits(flags.bits()).is_none() {
             return Err(OpenError::AccessNotAllowed);
         }
         let broker = self.broker_control().ok_or(OpenError::Io)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
         let handle = broker
             .open_file(
-                &path,
+                dir,
+                path,
                 context.acting_user(),
                 access,
                 flags,
@@ -92,168 +118,179 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         Ok(File::new(self, broker, handle))
     }
 
-    /// Change the permissions of a file.
+    /// Change the permissions of a file. See [`Self::open_file`] for the rules on `dir`.
     pub fn chmod_file(
         &self,
         context: &Context,
-        path: impl PathArg,
+        dir: Option<&File<Platform>>,
+        path: &str,
         mode: Mode,
     ) -> Result<(), ChmodError> {
-        let path = path.broker_path(context)?;
-        self.broker_control()
-            .ok_or(ChmodError::Io)?
-            .chmod_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
+        let broker = self.broker_control().ok_or(ChmodError::Io)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
+        broker
+            .chmod_file(dir, path, context.acting_user(), mode & Mode::SUPPORTED)
             .map_err(|_| ChmodError::Io)?
             .map_err(ChmodError::from)
     }
 
-    /// Change the owner of a file.
+    /// Change the owner of a file. See [`Self::open_file`] for the rules on `dir`.
     pub fn chown_file(
         &self,
         context: &Context,
-        path: impl PathArg,
+        dir: Option<&File<Platform>>,
+        path: &str,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let path = path.broker_path(context)?;
-        self.broker_control()
-            .ok_or(ChownError::Io)?
-            .chown_file(&path, context.acting_user(), user, group)
+        let broker = self.broker_control().ok_or(ChownError::Io)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
+        broker
+            .chown_file(dir, path, context.acting_user(), user, group)
             .map_err(|_| ChownError::Io)?
             .map_err(ChownError::from)
     }
 
-    /// Create a symbolic link at `linkpath`, storing `target` verbatim.
+    /// Create a symbolic link at `linkpath`, storing `target` verbatim. A relative `linkpath`
+    /// resolves from `dir`; an absolute one ignores `dir`.
+    /// See [`Self::open_file`] for the rules on `dir`.
     ///
-    /// Only `linkpath` is resolved against the context's working directory. A relative target is
-    /// interpreted relative to the link's parent when the link is subsequently followed.
+    /// A relative target is interpreted relative to the link's parent when the link is
+    /// subsequently followed.
     pub fn symlink_file(
         &self,
         target: &str,
         context: &Context,
-        linkpath: impl PathArg,
+        dir: Option<&File<Platform>>,
+        linkpath: &str,
     ) -> Result<(), SymlinkError> {
-        let linkpath = linkpath.broker_path(context)?;
-        self.broker_control()
-            .ok_or(SymlinkError::Io)?
-            .symlink_file(target, &linkpath, context.acting_user())
+        let broker = self.broker_control().ok_or(SymlinkError::Io)?;
+        let dir = Self::checked_path_anchor(&broker, dir, linkpath)?;
+        broker
+            .symlink_file(target, dir, linkpath, context.acting_user())
             .map_err(|_| SymlinkError::Io)?
             .map_err(SymlinkError::from)
     }
 
-    /// Unlink a file.
-    pub fn unlink_file(&self, context: &Context, path: impl PathArg) -> Result<(), UnlinkError> {
-        let path = path.broker_path(context)?;
-        self.broker_control()
-            .ok_or(UnlinkError::Io)?
-            .unlink_file(&path, context.acting_user())
+    /// Unlink a file. See [`Self::open_file`] for the rules on `dir`.
+    pub fn unlink_file(
+        &self,
+        context: &Context,
+        dir: Option<&File<Platform>>,
+        path: &str,
+    ) -> Result<(), UnlinkError> {
+        let broker = self.broker_control().ok_or(UnlinkError::Io)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
+        broker
+            .unlink_file(dir, path, context.acting_user())
             .map_err(|_| UnlinkError::Io)?
             .map_err(UnlinkError::from)
     }
 
-    /// Rename a file or directory, replacing an existing destination when permitted.
+    /// Rename a file or directory, replacing an existing destination when permitted. Relative
+    /// source and destination paths resolve from `old_dir` and `new_dir` respectively; absolute
+    /// paths ignore them.
+    /// See [`Self::open_file`] for the rules on `dir`.
     pub fn rename_file(
         &self,
         context: &Context,
-        old_path: impl PathArg,
-        new_path: impl PathArg,
+        old_dir: Option<&File<Platform>>,
+        old_path: &str,
+        new_dir: Option<&File<Platform>>,
+        new_path: &str,
     ) -> Result<(), RenameError> {
-        let old_path = old_path.broker_path(context)?;
-        let new_path = new_path.broker_path(context)?;
-        self.broker_control()
-            .ok_or(RenameError::Io)?
-            .rename_file(&old_path, &new_path, context.acting_user())
+        let broker = self.broker_control().ok_or(RenameError::Io)?;
+        let old_dir = Self::checked_path_anchor(&broker, old_dir, old_path)?;
+        let new_dir = Self::checked_path_anchor(&broker, new_dir, new_path)?;
+        broker
+            .rename_file(old_dir, old_path, new_dir, new_path, context.acting_user())
             .map_err(|_| RenameError::Io)?
             .map_err(RenameError::from)
     }
 
-    /// Create a new directory.
+    /// Create a new directory. See [`Self::open_file`] for the rules on `dir`.
     pub fn mkdir_file(
         &self,
         context: &Context,
-        path: impl PathArg,
+        dir: Option<&File<Platform>>,
+        path: &str,
         mode: Mode,
     ) -> Result<(), MkdirError> {
-        let path = path.broker_path(context)?;
-        self.broker_control()
-            .ok_or(MkdirError::Io)?
-            .mkdir_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
+        let broker = self.broker_control().ok_or(MkdirError::Io)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
+        broker
+            .mkdir_file(dir, path, context.acting_user(), mode & Mode::SUPPORTED)
             .map_err(|_| MkdirError::Io)?
             .map_err(MkdirError::from)
     }
 
-    /// Mount a fresh in-memory filesystem at a directory path.
-    pub fn mount_in_mem(&self, context: &Context, path: impl PathArg) -> Result<(), FileError> {
-        let path = path.broker_path(context)?;
-        self.broker_control()
-            .ok_or(FileError::Io)?
-            .mount_in_mem(&path, context.acting_user())
+    /// Mount a fresh in-memory filesystem at an absolute directory path.
+    // TODO: take a `dir` anchor like the other path methods. Callers name a relative target from
+    // their cwd's current path, so a concurrent rename of that directory can mount at a stale
+    // location. Needs a protocol change, since the broker's mount table is name-based.
+    pub fn mount_in_mem(&self, context: &Context, path: &str) -> Result<(), FileError> {
+        let broker = self.broker_control().ok_or(FileError::Io)?;
+        // Validation only.
+        Self::checked_path_anchor(&broker, None, path)?;
+        broker
+            .mount_in_mem(path, context.acting_user())
             .map_err(|_| FileError::Io)?
     }
 
-    /// Remove a directory.
-    pub fn rmdir_file(&self, context: &Context, path: impl PathArg) -> Result<(), RmdirError> {
-        let path = path.broker_path(context)?;
-        self.broker_control()
-            .ok_or(RmdirError::Io)?
-            .rmdir_file(&path, context.acting_user())
+    /// Remove a directory. See [`Self::open_file`] for the rules on `dir`.
+    pub fn rmdir_file(
+        &self,
+        context: &Context,
+        dir: Option<&File<Platform>>,
+        path: &str,
+    ) -> Result<(), RmdirError> {
+        let broker = self.broker_control().ok_or(RmdirError::Io)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
+        broker
+            .rmdir_file(dir, path, context.acting_user())
             .map_err(|_| RmdirError::Io)?
             .map_err(RmdirError::from)
     }
 
-    /// Obtain the status of a path.
+    /// Obtain the status of a path. See [`Self::open_file`] for the rules on `dir`.
     ///
     /// If `follow_symlinks` is false, a final symbolic link is described itself unless the path
     /// ends in a slash.
     pub fn path_file_status(
         &self,
         context: &Context,
-        path: impl PathArg,
+        dir: Option<&File<Platform>>,
+        path: &str,
         follow_symlinks: bool,
     ) -> Result<FileStatus, FileStatusError> {
-        let path = path.broker_path(context)?;
-        self.broker_control()
-            .ok_or(FileStatusError::Io)?
-            .path_file_status(&path, context.acting_user(), follow_symlinks)
+        let broker = self.broker_control().ok_or(FileStatusError::Io)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
+        broker
+            .path_file_status(dir, path, context.acting_user(), follow_symlinks)
             .map_err(|_| FileStatusError::Io)?
             .map_err(FileStatusError::from)
     }
 
     /// Read a symbolic link's stored target, without following the final link.
+    /// See [`Self::open_file`] for the rules on `dir`.
     pub fn read_link_file(
         &self,
         context: &Context,
-        path: impl PathArg,
+        dir: Option<&File<Platform>>,
+        path: &str,
     ) -> Result<String, WalkError> {
-        let path = path.broker_path(context)?;
-        self.broker_control()
-            .ok_or(WalkError::Io)?
-            .read_link_file(&path, context.acting_user())
+        let broker = self.broker_control().ok_or(WalkError::Io)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
+        broker
+            .read_link_file(dir, path, context.acting_user())
             .map_err(|_| WalkError::Io)?
             .map_err(WalkError::from)
     }
-
-    /// Resolve a path to its physical location, following symbolic links.
-    pub fn resolve_file_path(
-        &self,
-        context: &Context,
-        path: impl PathArg,
-    ) -> Result<ResolvedPath, WalkError> {
-        let path = path.broker_path(context)?;
-        let resolved = self
-            .broker_control()
-            .ok_or(WalkError::Io)?
-            .resolve_file_path(&path, context.acting_user())
-            .map_err(|_| WalkError::Io)?
-            .map_err(WalkError::from)?;
-        Ok(ResolvedPath::from_absolute(resolved))
-    }
 }
 
-/// Caller-owned filesystem context containing a working directory and acting user.
+/// Caller-owned filesystem context holding the acting user.
 #[derive(Clone, Debug)]
 pub struct Context {
-    cwd: Arc<ResolvedPath>,
     user_info: UserInfo,
 }
 
@@ -269,136 +306,21 @@ impl Context {
         self.user_info = user;
     }
 
-    /// The current working directory.
-    #[must_use]
-    pub fn cwd(&self) -> &ResolvedPath {
-        &self.cwd
-    }
-
-    /// Set the current working directory.
-    pub fn set_cwd(&mut self, cwd: ResolvedPath) {
-        self.cwd = Arc::new(cwd);
-    }
-
-    /// A new default context, anchored at `/` for a non-root user.
+    /// A new default context for a non-root user.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cwd: Arc::new(ResolvedPath(String::from("/"))),
             user_info: UserInfo {
                 user: 1000,
                 group: 1000,
             },
         }
     }
-
-    /// Join a relative path to the working directory without removing dots or trailing slashes.
-    /// An absolute path is copied unchanged; an empty path returns the working directory itself.
-    #[must_use]
-    pub fn joined(&self, path: &str) -> BrokerPath {
-        if path.starts_with('/') {
-            return BrokerPath(String::from(path));
-        }
-        // XXX(jayb): cwd is a path snapshot and goes stale if an ancestor is renamed.
-        let mut absolute = self.cwd.0.clone();
-        if !path.is_empty() {
-            if !absolute.ends_with('/') {
-                absolute.push('/');
-            }
-            absolute.push_str(path);
-        }
-        BrokerPath(absolute)
-    }
 }
 
 impl Default for Context {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// An owned absolute path ready to send to the broker without normalization.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BrokerPath(String);
-
-impl BrokerPath {
-    /// Keep the exact spelling of an absolute path.
-    ///
-    /// # Panics
-    /// Panics if `path` does not start with `/`.
-    #[must_use]
-    pub fn verbatim(path: String) -> Self {
-        assert!(path.starts_with('/'), "broker path must be absolute");
-        Self(path)
-    }
-
-    /// Borrow the exact path to be sent to the broker.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for BrokerPath {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl From<BrokerPath> for String {
-    fn from(path: BrokerPath) -> Self {
-        path.0
-    }
-}
-
-/// A string to join to the working directory, or a prepared [`BrokerPath`] to use verbatim.
-/// Shared references to either are also accepted. This trait is sealed.
-pub trait PathArg: sealed::Sealed {}
-
-impl<T: sealed::Sealed + ?Sized> PathArg for T {}
-
-mod sealed {
-    use super::{BrokerPath, Context, FileError, String};
-    use alloc::borrow::Cow;
-
-    pub trait Sealed: AsRef<str> {
-        fn broker_path(&self, context: &Context) -> Result<Cow<'_, str>, FileError> {
-            let path = self.as_ref();
-            if path.is_empty() {
-                Err(FileError::NoSuchFileOrDirectory)
-            } else if path.starts_with('/') {
-                Ok(Cow::Borrowed(path))
-            } else {
-                Ok(Cow::Owned(context.joined(path).0))
-            }
-        }
-    }
-
-    impl Sealed for str {}
-    impl Sealed for String {}
-    impl Sealed for BrokerPath {}
-    impl<T: Sealed + ?Sized> Sealed for &T {}
-}
-
-/// An absolute physical path obtained from the broker.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedPath(String);
-
-impl ResolvedPath {
-    /// Restore a physical path previously obtained from the broker, e.g. an inherited cwd.
-    ///
-    /// # Panics
-    /// Panics if `path` does not start with `/`.
-    #[must_use]
-    pub fn from_absolute(path: String) -> Self {
-        assert!(path.starts_with('/'), "resolved path must be absolute");
-        Self(path)
-    }
-}
-
-impl core::fmt::Display for ResolvedPath {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str(&self.0)
     }
 }
 
@@ -595,14 +517,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
             .map_err(SetTimesError::from)
     }
 
-    /// Returns the absolute path of the file, with symbolic links resolved, as of when it was
-    /// opened.
+    /// Returns the absolute path of the file, with symbolic links resolved.
     ///
-    /// Later renames or removals of the file are not reflected.
+    /// A directory reports its current path where the backend can determine it, and fails with
+    /// [`FilePathError::NoSuchFileOrDirectory`] once removed. Any other file keeps the name it was
+    /// opened by, under the current path of the directory it was opened relative to; its own
+    /// later renames or removals are not reflected.
     pub fn path(&self) -> Result<String, FilePathError> {
         self.broker
             .handle_file_path(self.handle)?
-            .map_err(|_| FilePathError::Io)
+            .map_err(|error| match error {
+                FileError::NoSuchFileOrDirectory => FilePathError::NoSuchFileOrDirectory,
+                _ => FilePathError::Io,
+            })
     }
 
     /// Determines whether the file is connected to a terminal.
@@ -1090,6 +1017,7 @@ impl From<FileError> for RmdirError {
 impl From<FileError> for ReadDirError {
     fn from(error: FileError) -> Self {
         match error {
+            FileError::NoSuchFileOrDirectory => Self::Removed,
             FileError::NotDirectory => Self::NotADirectory,
             FileError::PathOnly => Self::NotOpenForReading,
             FileError::AccessNotAllowed | FileError::NotForReading => Self::NotForReading,
@@ -1118,5 +1046,86 @@ impl From<FileError> for TerminalControlError {
 impl From<FileError> for WalkError {
     fn from(error: FileError) -> Self {
         path_error(error).map_or(Self::Io, Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use litebox_broker_local::test_support::test_broker_local;
+    use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, OpenFileResponse};
+    use litebox_broker_protocol::message::{
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, FileRequest, FileResponse,
+    };
+    use litebox_broker_transport::channel::LocalCallChannel;
+    use litebox_broker_transport::shared_memory::HeapSharedMemory;
+
+    use super::Context;
+    use crate::LiteBox;
+    use crate::platform::mock::MockPlatform;
+
+    /// Serves only absolute opens, so any other request reaching it fails the test.
+    struct OpenOnlyChannel {
+        next_handle: AtomicU64,
+    }
+
+    impl LocalCallChannel for OpenOnlyChannel {
+        type Error = ();
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            let result = match request.operation {
+                BrokerOperation::File(FileRequest::Open(open)) if open.dir.is_none() => {
+                    BrokerResult::File(FileResponse::Open(OpenFileResponse {
+                        handle: ObjectHandle(self.next_handle.fetch_add(1, Ordering::SeqCst)),
+                    }))
+                }
+                BrokerOperation::CloseObject(_) => BrokerResult::ObjectClosed,
+                request => panic!("unexpected broker request: {request:?}"),
+            };
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result,
+            })
+        }
+    }
+
+    fn litebox() -> LiteBox<MockPlatform> {
+        let local = test_broker_local(
+            OpenOnlyChannel {
+                next_handle: AtomicU64::new(1),
+            },
+            Arc::new(HeapSharedMemory::new(
+                litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
+            )),
+        );
+        LiteBox::new_with_broker_local(MockPlatform::new(), local)
+    }
+
+    /// Handle numbers are scoped to a broker connection, so a directory from another connection,
+    /// whose number may name an unrelated object here, is refused without sending the request.
+    #[test]
+    fn relative_paths_refuse_a_directory_from_another_connection() {
+        let (first, second) = (litebox(), litebox());
+        let context = Context::new();
+        let foreign = first
+            .open_file(
+                &context,
+                None,
+                "/",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+                FileMode::empty(),
+            )
+            .unwrap();
+        assert!(
+            second
+                .mkdir_file(&context, Some(&foreign), "dir", FileMode::RWXU)
+                .is_err()
+        );
     }
 }

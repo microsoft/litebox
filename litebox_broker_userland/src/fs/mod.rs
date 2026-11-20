@@ -3,30 +3,60 @@
 
 //! Live host filesystem access rooted at a canonical host directory.
 //!
-//! This backend assumes the host namespace is trusted not to race its checks. Guest-supplied path
-//! components are validated, every resolved object is canonicalized, and the result must remain
-//! below the configured root. Regular files, directories, and symlinks are exposed live and host
+//! Guest-supplied components are validated and walked one at a time. Linux pins the root and
+//! each resolved object with a non-following descriptor. Regular files, directories, and symlinks are exposed live and host
 //! access checks use the broker process's own credentials. Walks stop at host symlinks so the
 //! resolver follows their targets inside the guest namespace; an absolute target below the root is
 //! reported as an equivalent relative target so it stays correct wherever the backend is mounted,
 //! and any other absolute target is rejected.
 //!
-//! The root is intentionally path-based rather than pinned by a directory handle. A concurrent
-//! host rename, replacement, or symlink swap can therefore invalidate a check or redirect a later
-//! operation. Directory and `O_PATH` handles are pathname locators: deleting and recreating their
-//! path retargets them. This tradeoff keeps the implementation portable and mostly
-//! platform-neutral; it is suitable only when host namespace administration is trusted. On
-//! Windows, std's native deletion can remain pending while an ordinary file handle is open, so the
+//! External host namespace changes may occur between broker operations, but must not race
+//! an operation's checks and subsequent filesystem access. Windows pins directory path
+//! components against deletion and rename, but still relies on this assumption for
+//! final-component checks. Non-Linux Unix hosts retain directory descriptors to detect
+//! changed path identities and serialize pathname operations against guest namespace changes.
+//! On Windows, std's native deletion can remain pending while an ordinary file handle is open, so the
 //! same name may not be reusable until retained handles close. Rename uses the host's atomic
 //! rename operation; in particular, replacing an empty directory may fail on Windows even though
 //! the backend's type checks pass.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 mod io_errors;
+mod location;
+// Win32 ABI values used with std OpenOptionsExt, also on targets without windows-sys.
+#[cfg(windows)]
+mod win_flags {
+    pub(super) const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    pub(super) const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    pub(super) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    pub(super) const FILE_SHARE_READ: u32 = 1;
+    pub(super) const FILE_SHARE_WRITE: u32 = 2;
+    pub(super) const FILE_TRAVERSE: u32 = 0x20;
+    pub(super) const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    pub(super) const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+}
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
+use location::Location;
+
+macro_rules! guard_path_operations {
+    ($this:expr, $failure:expr) => {
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let _namespace = match location::namespace_guard($this.root.as_ref()) {
+            Ok(namespace) => namespace,
+            Err(error) => {
+                litebox_util_log::debug!(error:? = error; "LocalFs namespace guard failed");
+                return $failure;
+            }
+        };
+    };
+}
 // On Linux and x86-64 Windows hosts, file reads and writes transfer directly between the host file
 // and a buffer that is one contiguous part of raw bytes, such as a run of a runner's shared memory.
 // Other buffers, and all buffers on other hosts, are staged through a bounce buffer.
@@ -70,8 +100,8 @@ fn check_offset(offset: u64) -> std::io::Result<()> {
 #[cfg(unix)]
 use io_errors::chown_error;
 use io_errors::{
-    chmod_error, invalid_path, mkdir_error, open_error, rename_error, rmdir_error, unlink_error,
-    unsupported_object, walk_error,
+    chmod_error, invalid_path, mkdir_error, open_error, rename_error, rmdir_error,
+    stale_handle_error, unlink_error, unsupported_object, walk_error,
 };
 
 use litebox_broker_core::fs::backend::{
@@ -91,7 +121,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 /// A live host filesystem rooted at a canonical directory path.
 pub struct LocalFs {
-    root: PathBuf,
+    root: Location,
     instance_tag: BackendInstanceTag,
     allocator: InodeAllocator,
     identities: Mutex<HashMap<HostIdentity, NodeInfo>>,
@@ -101,14 +131,14 @@ pub struct LocalFs {
 #[derive(Clone)]
 pub struct LocalDir {
     instance_tag: BackendInstanceTag,
-    canonical_path: PathBuf,
+    location: Location,
 }
 
 /// Regular-file or (`O_PATH`) symlink handle owned by [`LocalFs`].
 #[derive(Clone)]
 pub struct LocalFile {
     instance_tag: BackendInstanceTag,
-    canonical_path: PathBuf,
+    location: Location,
     /// Currently always [`FileType::RegularFile`] or (for `O_PATH` opens) [`FileType::SymbolicLink`].
     file_type: FileType,
     file: Option<Arc<File>>,
@@ -132,9 +162,9 @@ impl LocalFile {
 
 /// Identifies the [`LocalFs`] instance that created a handle.
 ///
-/// Erased backend handles are only checked by backend type, and these handles carry absolute host
-/// paths, so a handle passed to a different `LocalFs` instance must be rejected rather than used
-/// outside that instance's root.
+/// Erased backend handles are only checked by backend type, and these handles carry host locations
+/// (pinned descriptors on Linux, host paths elsewhere), so a handle passed to a different `LocalFs`
+/// instance must be rejected rather than used outside that instance's root.
 #[derive(Clone)]
 struct BackendInstanceTag(Arc<()>);
 
@@ -159,12 +189,11 @@ struct HostIdentity {
 }
 
 struct Located {
-    canonical_path: PathBuf,
+    location: Location,
     file_type: FileType,
 }
 
 impl BackendHandles for LocalFs {
-    // XXX(jayb): LocalFs handles are path-based and can go stale on host rename.
     type ResolvedDir<'a> = LocalDir;
     type ResolvedFile<'a> = LocalFile;
     type FileHandle = LocalFile;
@@ -208,6 +237,15 @@ fn validate_name(name: &str) -> Result<(), PathError> {
     Ok(())
 }
 
+/// The components of the host name `name` below `root`; a name outside it was moved out.
+fn components_under(root: &Path, name: &Path) -> Result<Vec<String>, WalkError> {
+    name.strip_prefix(root)
+        .map_err(|_| PathError::NoSuchFileOrDirectory)?
+        .iter()
+        .map(|part| part.to_str().map(String::from).ok_or(WalkError::Io))
+        .collect()
+}
+
 fn check_flags(flags: OFlags) -> Result<(), OpenError> {
     const ALLOWED: OFlags = OFlags::CREAT
         .union(OFlags::WRONLY)
@@ -239,14 +277,12 @@ fn host_mode(mode: Mode) -> u32 {
 
 /// The broker's host umask still filters creation modes, unlike later `chmod`s.
 #[cfg(unix)]
-fn log_umask_filtered_mode(path: &Path, metadata: std::io::Result<fs::Metadata>, mode: Mode) {
+fn log_umask_filtered_mode(name: &str, metadata: &fs::Metadata, mode: Mode) {
     use std::os::unix::fs::MetadataExt as _;
     let requested = host_mode(mode);
-    if let Ok(metadata) = metadata
-        && metadata.mode() & 0o7777 != requested
-    {
+    if metadata.mode() & 0o7777 != requested {
         litebox_util_log::debug!(
-            path:? = path, requested = requested, actual = metadata.mode() & 0o7777;
+            name = name, requested = requested, actual = metadata.mode() & 0o7777;
             "host umask changed the created mode"
         );
     }
@@ -402,13 +438,61 @@ fn readonly_for_mode(mode: Mode) -> bool {
     !mode.intersects(Mode::WUSR | Mode::WGRP | Mode::WOTH)
 }
 
+/// Opens the final component of `path` without following reparse points and rejects it if
+/// it is one. This does not validate any parent components.
+#[cfg(windows)]
+fn open_no_reparse(
+    options: &mut OpenOptions,
+    flags: u32,
+    path: &Path,
+) -> std::io::Result<(File, fs::Metadata)> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let file = options
+        .custom_flags(flags | win_flags::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & win_flags::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(invalid_path());
+    }
+    Ok((file, metadata))
+}
+
 fn set_permissions_path(path: &Path, mode: Mode) -> std::io::Result<()> {
-    let mut permissions = fs::metadata(path)?.permissions();
-    #[cfg(unix)]
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, host_mode(mode));
     #[cfg(windows)]
-    permissions.set_readonly(readonly_for_mode(mode));
-    fs::set_permissions(path, permissions)
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use win_flags::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES};
+        let (file, _) = open_no_reparse(
+            OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES),
+            FILE_FLAG_BACKUP_SEMANTICS,
+            path,
+        )?;
+        set_permissions_file(&file, mode)
+    }
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, host_mode(mode));
+        fs::set_permissions(path, permissions)
+    }
+}
+
+/// Opens the regular file at `path` for I/O. Callers have checked its type. Hosts other than
+/// Linux open it by path: other Unix hosts rely on the namespace guard to keep it in place, while
+/// Windows checks the type again and refuses reparse points.
+fn open_for_io(path: &Location, readable: bool, writable: bool) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(readable).write(writable);
+    #[cfg(windows)]
+    {
+        let (file, metadata) = open_no_reparse(&mut options, 0, path.as_ref())?;
+        if !metadata.is_file() {
+            return Err(invalid_path());
+        }
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    options.open(path)
 }
 
 #[cfg(windows)]
@@ -421,10 +505,13 @@ fn set_permissions_file(file: &File, mode: Mode) -> std::io::Result<()> {
 impl LocalFs {
     /// Canonicalize an existing host directory as the filesystem root.
     ///
-    /// Host namespace administration must be trusted not to race later checks and operations.
+    /// External host namespace changes must not race individual filesystem operations.
     pub fn new(root: impl AsRef<Path>, allocator: InodeAllocator) -> std::io::Result<Self> {
         let root = fs::canonicalize(root)?;
-        if !fs::metadata(&root)?.is_dir() {
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let _namespace = location::namespace_guard(&root)?;
+        let root = Location::pin_dir(&root)?;
+        if !root.metadata()?.is_dir() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotADirectory,
                 "LocalFs root is not a directory",
@@ -438,6 +525,48 @@ impl LocalFs {
         })
     }
 
+    /// [`Self::check_dir`], with its failures mapped to path errors (else `io`).
+    fn check_usable_dir<E: From<PathError> + core::fmt::Debug>(
+        &self,
+        dir: &LocalDir,
+        io: E,
+    ) -> Result<(), E> {
+        self.check_dir(dir)
+            .map_err(|error| stale_handle_error(&error, io))
+    }
+
+    /// Checks a directory reached within the current operation. On Linux, such a directory was
+    /// pinned from the root, or from a held directory that `walking_dir_at` or
+    /// `walking_dir_with_path` checked, through non-following lookups of validated names, so it is
+    /// inside the root by construction. Other hosts name directories by path and check them every
+    /// time.
+    fn check_walked_dir<E: From<PathError> + core::fmt::Debug>(
+        &self,
+        dir: &LocalDir,
+        io: E,
+    ) -> Result<(), E> {
+        #[cfg(target_os = "linux")]
+        return if self.valid_dir(dir) { Ok(()) } else { Err(io) };
+        #[cfg(not(target_os = "linux"))]
+        self.check_usable_dir(dir, io)
+    }
+
+    /// Fails unless `dir` belongs to this instance and is still inside the root. A directory
+    /// moved outside the root, or (on non-Linux Unix hosts) moved or replaced at all, fails with
+    /// `NotFound`. On Linux, a removed directory passes; see [`Location::linked_path`].
+    fn check_dir(&self, dir: &LocalDir) -> std::io::Result<()> {
+        if !self.valid_dir(dir) {
+            return Err(invalid_path());
+        }
+        // Every absolute lookup starts from a clone of the root, which is trivially inside itself;
+        // skip the two procfs readlinks.
+        #[cfg(target_os = "linux")]
+        if Arc::ptr_eq(&dir.location.pin, &self.root.pin) {
+            return Ok(());
+        }
+        dir.location.checked_names_under(&self.root).map(drop)
+    }
+
     fn valid_dir(&self, dir: &LocalDir) -> bool {
         self.instance_tag.same_instance(&dir.instance_tag)
     }
@@ -446,19 +575,33 @@ impl LocalFs {
         self.instance_tag.same_instance(&file.instance_tag)
     }
 
+    /// Fails unless `file` belongs to this instance and still names an object of its resolved
+    /// type. A Linux location pins its inode, whose type cannot change.
+    fn check_resolved_file(&self, file: &LocalFile) -> std::io::Result<()> {
+        let stale = || std::io::Error::other("file is from another instance or was replaced");
+        if !self.valid_file(file) {
+            return Err(stale());
+        }
+        #[cfg(not(target_os = "linux"))]
+        if !host_file_type(&file.location.metadata()?).is_ok_and(|ty| ty == file.file_type) {
+            return Err(stale());
+        }
+        Ok(())
+    }
+
     fn root_dir(&self) -> LocalDir {
         LocalDir {
             instance_tag: self.instance_tag.clone(),
-            canonical_path: self.root.clone(),
+            location: self.root.clone(),
         }
     }
 
     fn locate(parent: &LocalDir, name: &str) -> std::io::Result<Located> {
-        validate_name(name).map_err(|_| invalid_path())?;
-        let canonical_path = parent.canonical_path.join(name);
-        let file_type = host_file_type(&fs::symlink_metadata(&canonical_path)?)?;
+        // `pin_child` validates `name`.
+        let location = parent.location.pin_child(name)?;
+        let file_type = host_file_type(&location.metadata()?)?;
         Ok(Located {
-            canonical_path,
+            location,
             file_type,
         })
     }
@@ -474,14 +617,18 @@ impl LocalFs {
             .or_insert_with(|| self.allocator.next())
     }
 
-    fn status_path_of_type(&self, path: &Path, expected: FileType) -> std::io::Result<FileStatus> {
-        let metadata = fs::symlink_metadata(path)?;
+    fn status_location_of_type(
+        &self,
+        location: &Location,
+        expected: FileType,
+    ) -> std::io::Result<FileStatus> {
+        let metadata = location.metadata()?;
         let actual = host_file_type(&metadata)?;
         // Check before `node` so a replaced object is not assigned a guest inode ID.
         if actual != expected {
             return Err(unsupported_object());
         }
-        status_from_metadata(&metadata, self.node(&metadata, path))
+        status_from_metadata(&metadata, self.node(&metadata, location.as_ref()))
     }
 
     fn status_file(&self, file: &File, identity_path: &Path) -> std::io::Result<FileStatus> {
@@ -504,16 +651,47 @@ impl Backend for LocalFs {
         components: &[&str],
         _authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError> {
-        let mut dir = from.into_typed::<Self>();
-        if !self.valid_dir(&dir) {
-            return Err(ResolutionError {
+        guard_path_operations!(
+            self,
+            Err(ResolutionError {
                 component: None,
-                error: WalkError::Io,
-            });
-        }
+                error: WalkError::Io
+            })
+        );
+        let mut dir = from.into_typed::<Self>();
+        self.check_walked_dir(&dir, WalkError::Io)
+            .map_err(|error| ResolutionError {
+                component: None,
+                error,
+            })?;
         for (index, &name) in components.iter().enumerate() {
+            // An intermediate component must be a directory, which the open itself can check.
+            #[cfg(target_os = "linux")]
+            if index + 1 != components.len() {
+                match dir.location.pin_child_dir(name) {
+                    Ok(location) => {
+                        dir = LocalDir {
+                            instance_tag: self.instance_tag.clone(),
+                            location,
+                        };
+                        continue;
+                    }
+                    // Anything else is classified below, which reports the precise error.
+                    Err(error)
+                        if error.raw_os_error().is_some_and(|errno| {
+                            errno == rustix::io::Errno::NOTDIR.raw_os_error()
+                                || errno == rustix::io::Errno::LOOP.raw_os_error()
+                        }) => {}
+                    Err(error) => {
+                        return Err(ResolutionError {
+                            component: Some(index),
+                            error: walk_error(error),
+                        });
+                    }
+                }
+            }
             let Located {
-                canonical_path,
+                location,
                 file_type,
             } = match Self::locate(&dir, name) {
                 Ok(located) => located,
@@ -535,9 +713,8 @@ impl Backend for LocalFs {
             if file_type == FileType::Directory {
                 dir = LocalDir {
                     instance_tag: self.instance_tag.clone(),
-                    canonical_path,
+                    location,
                 };
-                // XXX: search on a dir followed by `..` goes unchecked (e.g. `blocked/../target`).
             } else if index + 1 != components.len() {
                 return Err(ResolutionError {
                     component: Some(index + 1),
@@ -548,7 +725,7 @@ impl Backend for LocalFs {
                     ResolvedFile::from_typed::<Self>(
                         LocalFile {
                             instance_tag: self.instance_tag.clone(),
-                            canonical_path,
+                            location,
                             file_type,
                             file: None,
                             readable: false,
@@ -566,12 +743,11 @@ impl Backend for LocalFs {
     }
 
     fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+        guard_path_operations!(self, Err(WalkError::Io));
         validate_name(name)?;
         let dir = dir.get_typed::<Self>();
-        if !self.valid_dir(dir) {
-            return Err(WalkError::Io);
-        }
-        let target = fs::read_link(dir.canonical_path.join(name)).map_err(walk_error)?;
+        self.check_walked_dir(dir, WalkError::Io)?;
+        let target = dir.location.read_link_at(name).map_err(walk_error)?;
         // The guest root is wherever this backend is mounted, so an absolute target below the host
         // root becomes the equivalent path relative to the link's directory. Any other rooted
         // target (including Windows drive- or root-relative forms) names a host location outside
@@ -580,7 +756,11 @@ impl Backend for LocalFs {
             target.components().next(),
             Some(std::path::Component::Prefix(_) | std::path::Component::RootDir)
         ) {
-            let inside = target.strip_prefix(&self.root);
+            let (root, dir_name) = dir
+                .location
+                .checked_names_under(&self.root)
+                .map_err(walk_error)?;
+            let inside = target.strip_prefix(&root);
             // The root is canonical, but targets may spell it differently (Windows verbatim or 8.3
             // short prefixes, case, host symlinks in ancestors). Canonicalize the parent only, so
             // the final component stays a name the resolver will itself follow.
@@ -596,16 +776,21 @@ impl Backend for LocalFs {
             let inside = inside.or_else(|error| {
                 canonical_target
                     .as_deref()
-                    .map_or(Err(error), |target| target.strip_prefix(&self.root))
+                    .map_or(Err(error), |target| target.strip_prefix(&root))
             });
-            let (Ok(inside), Ok(depth)) = (inside, dir.canonical_path.strip_prefix(&self.root))
-            else {
+            let (Ok(inside), Ok(depth)) = (inside, dir_name.strip_prefix(&root)) else {
                 litebox_util_log::debug!(
                     target:? = target;
                     "rejecting host symlink with an absolute target outside the root"
                 );
                 return Err(PathError::InvalidPathname.into());
             };
+            if inside
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(PathError::InvalidPathname.into());
+            }
             let parts = depth
                 .components()
                 .map(|_| Some(".."))
@@ -626,18 +811,10 @@ impl Backend for LocalFs {
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
+        guard_path_operations!(self, Err(OpenError::Io));
         check_flags(flags)?;
         let dir = dir.into_typed::<Self>();
-        if !self.valid_dir(&dir) {
-            return Err(OpenError::Io);
-        }
-        if !fs::metadata(&dir.canonical_path).is_ok_and(|metadata| metadata.is_dir()) {
-            litebox_util_log::debug!(
-                path:? = dir.canonical_path;
-                "directory vanished or was replaced before open; reporting Io"
-            );
-            return Err(OpenError::Io);
-        }
+        self.check_walked_dir(&dir, OpenError::Io)?;
         if flags.contains(OFlags::CREAT | OFlags::EXCL) {
             return Err(OpenError::AlreadyExists);
         }
@@ -649,44 +826,121 @@ impl Backend for LocalFs {
                 // Linux would return EISDIR, but `OpenError` cannot express it; the in-memory
                 // backend likewise accepts writable directory opens.
                 litebox_util_log::debug!(
-                    path:? = dir.canonical_path, flags:? = flags;
+                    path:? = dir.location, flags:? = flags;
                     "accepting writable directory open without host permission check"
                 );
             } else {
                 // std has no portable open-directory-for-reading call, so a listing probes the
                 // host's read permission.
-                let _ = fs::read_dir(&dir.canonical_path).map_err(open_error)?;
+                let _ = fs::read_dir(&dir.location).map_err(open_error)?;
             }
         }
         Ok(DirHandle::from_typed::<Self>(dir))
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError> {
         let dir = dir.get_typed::<Self>();
+        // On Linux, operations trust directories walked from the result (see
+        // `check_walked_dir`), so check containment once here. Other hosts check every
+        // directory they use.
+        #[cfg(target_os = "linux")]
+        self.check_usable_dir(dir, WalkError::Io)?;
+        #[cfg(not(target_os = "linux"))]
         if !self.valid_dir(dir) {
-            return None;
+            return Err(WalkError::Io);
         }
-        if !fs::metadata(&dir.canonical_path).is_ok_and(|metadata| metadata.is_dir()) {
-            litebox_util_log::debug!(
-                path:? = dir.canonical_path;
-                "directory handle no longer names a host directory"
-            );
-            return None;
-        }
-        Some(ResolvedDir::from_typed::<Self>(
+        Ok(ResolvedDir::from_typed::<Self>(
             dir.clone(),
             PermissionCheck::ByBackend,
         ))
     }
 
+    #[cfg(target_os = "linux")]
+    fn walking_dir_with_path<'a>(
+        &'a self,
+        dir: &DirHandle,
+    ) -> Result<
+        (
+            ResolvedDir<'a>,
+            litebox_broker_core::fs::backend::DirPathResult,
+        ),
+        WalkError,
+    > {
+        let dir = dir.get_typed::<Self>();
+        if !self.valid_dir(dir) {
+            return Err(WalkError::Io);
+        }
+        let path = if Arc::ptr_eq(&dir.location.pin, &self.root.pin) {
+            // The root is trivially inside itself (see `check_dir`).
+            self.root
+                .ensure_linked()
+                .map_err(walk_error)
+                .map(|()| Some(Vec::new()))
+        } else {
+            // One pair of procfs readlinks serves both the containment check of
+            // `walking_dir_at` and the name of `dir_path`.
+            let (root, name) = dir
+                .location
+                .checked_names_under(&self.root)
+                .map_err(|error| stale_handle_error(&error, WalkError::Io))?;
+            self.root
+                .ensure_linked()
+                .and_then(|()| dir.location.ensure_linked())
+                .map_err(walk_error)
+                .and_then(|()| components_under(&root, &name))
+                .map(Some)
+        };
+        Ok((
+            ResolvedDir::from_typed::<Self>(dir.clone(), PermissionCheck::ByBackend),
+            path,
+        ))
+    }
+
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+        guard_path_operations!(self, Err(WalkError::Io));
+        let dir = dir.get_typed::<Self>();
+        if !self.valid_dir(dir) {
+            return Err(WalkError::Io);
+        }
+        let root = self.root.linked_path().map_err(walk_error)?;
+        let name = dir.location.linked_path().map_err(walk_error)?;
+        components_under(&root, &name).map(Some)
+    }
+
+    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+        guard_path_operations!(self, Err(WalkError::Io));
+        let dir = dir.get_typed::<Self>();
+        // On Linux, `parent_under` checks containment itself; checking here too would repeat its
+        // procfs readlinks.
+        #[cfg(target_os = "linux")]
+        if !self.valid_dir(dir) {
+            return Err(WalkError::Io);
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.check_usable_dir(dir, WalkError::Io)?;
+        let parent = dir.location.parent_under(&self.root).map_err(walk_error)?;
+        Ok(parent.map(|location| {
+            DirHandle::from_typed::<Self>(LocalDir {
+                instance_tag: self.instance_tag.clone(),
+                location,
+            })
+        }))
+    }
+
+    fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
+        guard_path_operations!(self, Err(WalkError::Io));
+        let dir = dir.get_typed::<Self>();
+        self.check_walked_dir(dir, WalkError::Io)?;
+        dir.location.check_search().map_err(walk_error)
+    }
+
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
+        guard_path_operations!(self, Err(OpenError::Io));
         check_flags(flags)?;
         let file = file.into_typed::<Self>();
-        if !self.valid_file(&file) {
-            return Err(OpenError::Io);
-        }
+        self.check_resolved_file(&file).map_err(open_error)?;
         let LocalFile {
-            canonical_path,
+            location,
             file_type,
             ..
         } = file;
@@ -704,7 +958,7 @@ impl Backend for LocalFs {
         if !(file_type == FileType::RegularFile || symlink) || flags.contains(OFlags::DIRECTORY) {
             if file_type == FileType::Directory {
                 litebox_util_log::debug!(
-                    path:? = canonical_path;
+                    path:? = location;
                     "rejecting directory file open as ComponentNotADirectory where Linux would return EISDIR"
                 );
             }
@@ -716,35 +970,34 @@ impl Backend for LocalFs {
         let file = if path_only {
             if flags.contains(OFlags::TRUNC) {
                 litebox_util_log::debug!(
-                    path:? = canonical_path;
+                    path:? = location;
                     "ignoring O_TRUNC on O_PATH file open"
                 );
             }
             None
         } else {
-            let opened = OpenOptions::new()
-                .read(readable)
-                .write(writable)
-                .open(&canonical_path)
-                .map_err(open_error)?;
+            let opened = open_for_io(&location, readable, writable).map_err(open_error)?;
             if flags.contains(OFlags::TRUNC) {
                 if writable {
                     opened.set_len(0).map_err(open_error)?;
                 } else {
                     // Linux truncates on O_RDONLY | O_TRUNC when the caller may write, so use a
                     // temporary write handle to get the host's write-permission check.
-                    OpenOptions::new()
-                        .write(true)
-                        .open(&canonical_path)
+                    open_for_io(&location, false, true)
                         .and_then(|file| file.set_len(0))
                         .map_err(open_error)?;
                 }
             }
             Some(Arc::new(opened))
         };
+        // On Linux the opened file names itself, so its O_PATH pin can go.
+        #[cfg(target_os = "linux")]
+        let location = file
+            .as_ref()
+            .map_or(location, |file| Location::opened(Arc::clone(file)));
         Ok(FileHandle::from_typed::<Self>(LocalFile {
             instance_tag: self.instance_tag.clone(),
-            canonical_path,
+            location,
             file_type,
             file,
             readable,
@@ -753,14 +1006,18 @@ impl Backend for LocalFs {
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+        guard_path_operations!(self, Err(ReadDirError::Io));
         let dir = handle.into_typed::<Self>();
-        if !self.valid_dir(&dir) {
-            return Err(ReadDirError::Io);
-        }
-        let entries = fs::read_dir(&dir.canonical_path).map_err(|_| ReadDirError::Io)?;
+        // Like Linux, listing a removed directory fails with ENOENT.
+        let removed = |error: std::io::Error| match error.kind() {
+            std::io::ErrorKind::NotFound => ReadDirError::Removed,
+            _ => ReadDirError::Io,
+        };
+        self.check_dir(&dir).map_err(removed)?;
+        let entries = fs::read_dir(&dir.location).map_err(removed)?;
         let mut result = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|_| ReadDirError::Io)?;
+            let entry = entry.map_err(removed)?;
             let name = entry.file_name();
             let Some(text) = name.to_str() else {
                 continue;
@@ -780,6 +1037,11 @@ impl Backend for LocalFs {
                 file_type,
                 ino_info: Some(self.node(&metadata, &entry.path())),
             });
+        }
+        // std's listing (glibc's readdir) reports a removed directory as empty instead of failing,
+        // and only an empty directory can be removed.
+        if result.is_empty() {
+            dir.location.linked_path().map_err(removed)?;
         }
         Ok(result)
     }
@@ -867,13 +1129,12 @@ impl Backend for LocalFs {
     }
 
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+        guard_path_operations!(self, Err(FileStatusError::Io));
         match h {
             HandleRef::Dir(dir) => {
                 let dir = dir.get_typed::<Self>();
-                if !self.valid_dir(dir) {
-                    return Err(FileStatusError::Io);
-                }
-                self.status_path_of_type(&dir.canonical_path, FileType::Directory)
+                self.check_usable_dir(dir, FileStatusError::Io)?;
+                self.status_location_of_type(&dir.location, FileType::Directory)
                     .map_err(|_| FileStatusError::Io)
             }
             HandleRef::File(file) => {
@@ -882,10 +1143,10 @@ impl Backend for LocalFs {
                     return Err(FileStatusError::Io);
                 }
                 if let Some(open) = &file.file {
-                    self.status_file(open, &file.canonical_path)
+                    self.status_file(open, file.location.as_ref())
                         .map_err(|_| FileStatusError::Io)
                 } else {
-                    self.status_path_of_type(&file.canonical_path, file.file_type)
+                    self.status_location_of_type(&file.location, file.file_type)
                         .map_err(|_| FileStatusError::Io)
                 }
             }
@@ -893,23 +1154,22 @@ impl Backend for LocalFs {
     }
 
     fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
-        let (path, file_type) = match target {
+        guard_path_operations!(self, Err(FileStatusError::Io));
+        let (location, file_type) = match target {
             ResolvedTarget::Dir(dir) => {
                 let dir = dir.get_typed::<Self>();
-                if !self.valid_dir(dir) {
-                    return Err(FileStatusError::Io);
-                }
-                (&dir.canonical_path, FileType::Directory)
+                self.check_walked_dir(dir, FileStatusError::Io)?;
+                (&dir.location, FileType::Directory)
             }
             ResolvedTarget::File(file) => {
                 let file = file.get_typed::<Self>();
                 if !self.valid_file(file) {
                     return Err(FileStatusError::Io);
                 }
-                (&file.canonical_path, file.file_type)
+                (&file.location, file.file_type)
             }
         };
-        self.status_path_of_type(path, file_type)
+        self.status_location_of_type(location, file_type)
             .map_err(|_| FileStatusError::Io)
     }
 
@@ -919,35 +1179,39 @@ impl Backend for LocalFs {
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
+        guard_path_operations!(self, Err(OpenError::Io));
         validate_name(name)?;
         let dir = dir.into_typed::<Self>();
-        if !self.valid_dir(&dir) {
-            return Err(OpenError::Io);
+        self.check_walked_dir(&dir, OpenError::Io)?;
+        let opened = dir
+            .location
+            .create_file_at(name, metadata.mode)
+            .map_err(open_error)?;
+        #[cfg(unix)]
+        if let Ok(host) = opened.metadata() {
+            log_umask_filtered_mode(name, &host, metadata.mode);
         }
-        let canonical_path = dir.canonical_path.join(name);
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, host_mode(metadata.mode));
-        let opened = options.open(&canonical_path).map_err(open_error)?;
-        #[cfg(unix)]
-        log_umask_filtered_mode(&canonical_path, opened.metadata(), metadata.mode);
         #[cfg(windows)]
         if let Err(error) = set_permissions_file(&opened, metadata.mode) {
             drop(opened);
-            if let Err(cleanup) = fs::remove_file(&canonical_path) {
+            if let Err(cleanup) = dir.location.remove_file_at(name) {
                 litebox_util_log::warn!(
-                    path:? = canonical_path, error:? = cleanup;
+                    name = name, error:? = cleanup;
                     "failed to remove file after its creation failed"
                 );
             }
             return Err(open_error(error));
         }
+        let opened = Arc::new(opened);
+        #[cfg(target_os = "linux")]
+        let location = Location::opened(opened.clone());
+        #[cfg(not(target_os = "linux"))]
+        let location = dir.location.pin_child(name).map_err(open_error)?;
         Ok(FileHandle::from_typed::<Self>(LocalFile {
             instance_tag: self.instance_tag.clone(),
-            canonical_path,
+            location,
             file_type: FileType::RegularFile,
-            file: Some(Arc::new(opened)),
+            file: Some(opened),
             readable: true,
             writable: true,
         }))
@@ -961,8 +1225,8 @@ impl Backend for LocalFs {
         _metadata: CreationMetadata,
     ) -> Result<(), SymlinkError> {
         // Guest-created host symlinks would let the guest race path checks against later opens
-        // to escape the root. Validating the target alone cannot make this path-based backend
-        // safe; supporting this requires confining host access atomically.
+        // to escape the root. Validating the target alone cannot make the path-based non-Linux
+        // variants safe; supporting this requires confining host access atomically on every host.
         unimplemented!()
     }
 
@@ -972,74 +1236,61 @@ impl Backend for LocalFs {
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
+        guard_path_operations!(self, Err(MkdirError::Io));
         validate_name(name)?;
         let dir = dir.into_typed::<Self>();
-        if !self.valid_dir(&dir) {
-            return Err(MkdirError::Io);
-        }
-        let canonical_path = dir.canonical_path.join(name);
-        let builder = {
-            #[cfg(unix)]
-            {
-                let mut builder = fs::DirBuilder::new();
-                std::os::unix::fs::DirBuilderExt::mode(&mut builder, host_mode(metadata.mode));
-                builder
-            }
-            #[cfg(windows)]
-            {
-                fs::DirBuilder::new()
-            }
-        };
-        builder.create(&canonical_path).map_err(mkdir_error)?;
-        #[cfg(unix)]
-        log_umask_filtered_mode(
-            &canonical_path,
-            fs::metadata(&canonical_path),
-            metadata.mode,
-        );
+        self.check_walked_dir(&dir, MkdirError::Io)?;
+        dir.location
+            .create_dir_at(name, metadata.mode)
+            .map_err(mkdir_error)?;
         #[cfg(windows)]
-        if let Err(error) = set_permissions_path(&canonical_path, metadata.mode) {
-            if let Err(cleanup) = fs::remove_dir(&canonical_path) {
+        if let Err(error) = set_permissions_path(&dir.location.as_ref().join(name), metadata.mode) {
+            if let Err(cleanup) = dir.location.remove_dir_at(name) {
                 litebox_util_log::warn!(
-                    path:? = canonical_path, error:? = cleanup;
+                    name = name, error:? = cleanup;
                     "failed to remove directory after its creation failed"
                 );
             }
             return Err(mkdir_error(error));
         }
+        let location = dir.location.pin_child(name).map_err(mkdir_error)?;
+        let host = location.metadata().map_err(mkdir_error)?;
+        if !host.is_dir() {
+            return Err(MkdirError::Io);
+        }
+        #[cfg(unix)]
+        log_umask_filtered_mode(name, &host, metadata.mode);
         Ok(DirHandle::from_typed::<Self>(LocalDir {
             instance_tag: self.instance_tag.clone(),
-            canonical_path,
+            location,
         }))
     }
 
     fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
+        guard_path_operations!(self, Err(UnlinkError::Io));
         validate_name(name)?;
         let dir = dir.into_typed::<Self>();
-        if !self.valid_dir(&dir) {
-            return Err(UnlinkError::Io);
-        }
-        let path = dir.canonical_path.join(name);
-        let metadata = fs::symlink_metadata(&path).map_err(unlink_error)?;
-        let is_symlink = metadata.file_type().is_symlink();
-        if metadata.is_dir() && !is_symlink {
-            return Err(UnlinkError::IsADirectory);
-        }
-        if !metadata.is_file() && !is_symlink {
-            return Err(UnlinkError::Io);
+        self.check_walked_dir(&dir, UnlinkError::Io)?;
+        let entry = dir.location.entry_at(name).map_err(unlink_error)?;
+        match entry.kind {
+            Some(FileType::Directory) => return Err(UnlinkError::IsADirectory),
+            Some(FileType::RegularFile | FileType::SymbolicLink) => {}
+            _ => return Err(UnlinkError::Io),
         }
         #[cfg(windows)]
-        if !is_symlink && metadata.permissions().readonly() {
+        let is_symlink = entry.kind == Some(FileType::SymbolicLink);
+        #[cfg(windows)]
+        if !is_symlink && entry.readonly {
             // Rust's Windows remove_file implementation can override the readonly attribute.
             // Preserve host-native readonly protection; callers can clear it with chmod first.
             return Err(UnlinkError::NoWritePerms);
         }
-        match fs::remove_file(&path) {
+        match dir.location.remove_file_at(name) {
             Ok(()) => Ok(()),
             #[cfg(windows)]
-            Err(error) if is_symlink => fs::remove_dir(&path).map_err(|fallback| {
+            Err(error) if is_symlink => dir.location.remove_dir_at(name).map_err(|fallback| {
                 litebox_util_log::debug!(
-                    path:? = path, error:? = error, fallback:? = fallback;
+                    name = name, error:? = error, fallback:? = fallback;
                     "symlink removal failed as file and directory; reporting the file error"
                 );
                 unlink_error(error)
@@ -1049,17 +1300,14 @@ impl Backend for LocalFs {
     }
 
     fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
+        guard_path_operations!(self, Err(RmdirError::Io));
         validate_name(name)?;
         let dir = dir.into_typed::<Self>();
-        if !self.valid_dir(&dir) {
-            return Err(RmdirError::Io);
-        }
-        let path = dir.canonical_path.join(name);
-        let metadata = fs::symlink_metadata(&path).map_err(rmdir_error)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        self.check_walked_dir(&dir, RmdirError::Io)?;
+        if dir.location.entry_at(name).map_err(rmdir_error)?.kind != Some(FileType::Directory) {
             return Err(RmdirError::NotADirectory);
         }
-        fs::remove_dir(path).map_err(rmdir_error)
+        dir.location.remove_dir_at(name).map_err(rmdir_error)
     }
 
     fn rename_at(
@@ -1069,39 +1317,55 @@ impl Backend for LocalFs {
         new_dir: DirHandle,
         new_name: &str,
     ) -> Result<(), RenameError> {
+        guard_path_operations!(self, Err(RenameError::Io));
         validate_name(old_name)?;
         validate_name(new_name)?;
         let old_dir = old_dir.into_typed::<Self>();
         let new_dir = new_dir.into_typed::<Self>();
-        if !self.valid_dir(&old_dir) || !self.valid_dir(&new_dir) {
-            return Err(RenameError::Io);
+        self.check_usable_dir(&old_dir, RenameError::Io)?;
+        self.check_usable_dir(&new_dir, RenameError::Io)?;
+        // Each pinned directory has its own procfs name, so path comparisons cannot detect a
+        // move into the source's own subtree. The kernel checks that (EINVAL) before the
+        // destination's type, as Linux guests expect.
+        #[cfg(target_os = "linux")]
+        {
+            rustix::fs::renameat(
+                &*old_dir.location.pin,
+                old_name,
+                &*new_dir.location.pin,
+                new_name,
+            )
+            .map_err(|error| rename_error(error.into()))
         }
-        let old_path = old_dir.canonical_path.join(old_name);
-        let new_path = new_dir.canonical_path.join(new_name);
-        let source = fs::symlink_metadata(&old_path).map_err(rename_error)?;
-        let source_is_dir = source.is_dir() && !source.file_type().is_symlink();
-        if old_path == new_path {
-            return Ok(());
-        }
-        if source_is_dir && new_path.starts_with(&old_path) {
-            return Err(RenameError::InvalidArgument);
-        }
-
-        match fs::symlink_metadata(&new_path) {
-            Ok(destination) => {
-                let destination_is_dir =
-                    destination.is_dir() && !destination.file_type().is_symlink();
-                if !source_is_dir && destination_is_dir {
-                    return Err(RenameError::IsADirectory);
-                }
-                if source_is_dir && !destination_is_dir {
-                    return Err(RenameError::NotADirectory);
-                }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let old_path = old_dir.location.as_ref().join(old_name);
+            let new_path = new_dir.location.as_ref().join(new_name);
+            let source = fs::symlink_metadata(&old_path).map_err(rename_error)?;
+            let source_is_dir = source.is_dir() && !source.file_type().is_symlink();
+            if old_path == new_path {
+                return Ok(());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(rename_error(error)),
+            if source_is_dir && new_path.starts_with(&old_path) {
+                return Err(RenameError::InvalidArgument);
+            }
+
+            match fs::symlink_metadata(&new_path) {
+                Ok(destination) => {
+                    let destination_is_dir =
+                        destination.is_dir() && !destination.file_type().is_symlink();
+                    if !source_is_dir && destination_is_dir {
+                        return Err(RenameError::IsADirectory);
+                    }
+                    if source_is_dir && !destination_is_dir {
+                        return Err(RenameError::NotADirectory);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(rename_error(error)),
+            }
+            fs::rename(old_path, new_path).map_err(rename_error)
         }
-        fs::rename(old_path, new_path).map_err(rename_error)
     }
 
     fn set_times(
@@ -1109,20 +1373,18 @@ impl Backend for LocalFs {
         target: ResolvedTarget<'_>,
         times: &SetFileTimes,
     ) -> Result<(), SetTimesError> {
+        guard_path_operations!(self, Err(SetTimesError::Io));
         let path = match &target {
             ResolvedTarget::Dir(dir) => {
                 let dir = dir.get_typed::<Self>();
-                if !self.valid_dir(dir) {
-                    return Err(SetTimesError::Io);
-                }
-                &dir.canonical_path
+                self.check_walked_dir(dir, SetTimesError::Io)?;
+                &dir.location
             }
             ResolvedTarget::File(file) => {
                 let file = file.get_typed::<Self>();
-                if !self.valid_file(file) {
-                    return Err(SetTimesError::Io);
-                }
-                &file.canonical_path
+                self.check_resolved_file(file)
+                    .map_err(|error| stale_handle_error(&error, SetTimesError::Io))?;
+                &file.location
             }
         };
         #[cfg(target_os = "linux")]
@@ -1131,7 +1393,7 @@ impl Backend for LocalFs {
         }
         #[cfg(all(windows, target_arch = "x86_64"))]
         {
-            windows::set_times(path, times)
+            windows::set_times(path.as_ref(), times)
         }
         #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
         {
@@ -1141,6 +1403,7 @@ impl Backend for LocalFs {
     }
 
     fn chmod(&self, h: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
+        guard_path_operations!(self, Err(ChmodError::Io));
         #[cfg(windows)]
         litebox_util_log::debug!(
             mode:? = mode;
@@ -1149,12 +1412,15 @@ impl Backend for LocalFs {
         let result = match h {
             ResolvedTarget::Dir(dir) => {
                 let dir = dir.get_typed::<Self>();
-                if !self.valid_dir(dir)
-                    || !fs::metadata(&dir.canonical_path).is_ok_and(|metadata| metadata.is_dir())
+                self.check_walked_dir(dir, ChmodError::Io)?;
+                if !dir
+                    .location
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.is_dir())
                 {
                     return Err(ChmodError::Io);
                 }
-                set_permissions_path(&dir.canonical_path, mode)
+                set_permissions_path(dir.location.as_ref(), mode)
             }
             ResolvedTarget::File(file) => {
                 let file = file.get_typed::<Self>();
@@ -1164,10 +1430,14 @@ impl Backend for LocalFs {
                 if file.is_symlink() {
                     return Err(ChmodError::IsSymlink);
                 }
-                if !fs::metadata(&file.canonical_path).is_ok_and(|metadata| metadata.is_file()) {
+                if !file
+                    .location
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.is_file())
+                {
                     return Err(ChmodError::Io);
                 }
-                set_permissions_path(&file.canonical_path, mode)
+                set_permissions_path(file.location.as_ref(), mode)
             }
         };
         result.map_err(chmod_error)
@@ -1179,13 +1449,12 @@ impl Backend for LocalFs {
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
+        guard_path_operations!(self, Err(ChownError::Io));
         let (path, file_type) = match &h {
             ResolvedTarget::Dir(dir) => {
                 let dir = dir.get_typed::<Self>();
-                if !self.valid_dir(dir) {
-                    return Err(ChownError::Io);
-                }
-                (&dir.canonical_path, FileType::Directory)
+                self.check_walked_dir(dir, ChownError::Io)?;
+                (&dir.location, FileType::Directory)
             }
             ResolvedTarget::File(file) => {
                 let file = file.get_typed::<Self>();
@@ -1195,10 +1464,10 @@ impl Backend for LocalFs {
                 if file.is_symlink() {
                     return Err(ChownError::IsSymlink);
                 }
-                (&file.canonical_path, FileType::RegularFile)
+                (&file.location, FileType::RegularFile)
             }
         };
-        let metadata = fs::metadata(path).map_err(|_| ChownError::Io)?;
+        let metadata = path.metadata().map_err(|_| ChownError::Io)?;
         if file_type == FileType::Directory && !metadata.is_dir()
             || file_type == FileType::RegularFile && !metadata.is_file()
         {

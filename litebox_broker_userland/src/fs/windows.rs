@@ -22,9 +22,10 @@ use litebox_broker_core::fs::errors::SetTimesError;
 use litebox_broker_protocol::fs::{FileTimeUpdate, FileTimestamp, SetFileTimes};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_IO_PENDING};
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES, ReadFile,
-    WriteFile,
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+
+use super::win_flags::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::core::BOOL;
@@ -195,6 +196,8 @@ pub(super) fn set_times(
             updates.set_modified(time)
         };
     }
+    // Not `open_no_reparse`: a final symbolic link gets its own timestamps, as with Linux
+    // `AT_SYMLINK_NOFOLLOW`, rather than being refused.
     OpenOptions::new()
         .access_mode(FILE_WRITE_ATTRIBUTES)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)

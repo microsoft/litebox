@@ -27,9 +27,33 @@ enum Namespace {
     Registry,
 }
 
+/// Normalizes `path` from the root without consulting the filesystem: empty and `.` components
+/// are dropped, and `..` removes the previous component (never above the root).
+fn normalize(path: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(component),
+        }
+    }
+    if components.is_empty() {
+        return String::from("/");
+    }
+    let mut normalized = String::with_capacity(path.len());
+    for component in components {
+        normalized.push('/');
+        normalized.push_str(component);
+    }
+    normalized
+}
+
 impl Namespace {
-    fn resolve_path(self, context: &Context, path: &str) -> Result<String, PathError> {
-        let path = namespace_path(context, path);
+    fn resolve_path(self, path: &str) -> Result<String, PathError> {
+        let path = normalize(path);
         match (self, is_registry_path(&path)) {
             (Self::Regular, false) | (Self::Registry, true) => Ok(path),
             (Self::Regular, true) => Err(PathError::MissingComponent),
@@ -37,8 +61,8 @@ impl Namespace {
         }
     }
 
-    fn hides_registry_entry(self, context: &Context, directory_path: &str) -> bool {
-        self == Self::Regular && namespace_path(context, directory_path) == "/"
+    fn hides_registry_entry(self, directory_path: &str) -> bool {
+        self == Self::Regular && normalize(directory_path) == "/"
     }
 }
 
@@ -63,8 +87,8 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         }
     }
 
-    fn resolve_path(&self, context: &Context, path: &str) -> Result<String, PathError> {
-        self.namespace.resolve_path(context, path)
+    fn resolve_path(&self, path: &str) -> Result<String, PathError> {
+        self.namespace.resolve_path(path)
     }
 
     pub(crate) fn open_file(
@@ -75,19 +99,18 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         flags: FileOpenFlags,
         mode: FileMode,
     ) -> Result<File<Platform>, OpenError> {
-        let path = self.resolve_path(context, path)?;
+        let path = self.resolve_path(path)?;
         self.litebox
-            .open_file(context, path.as_str(), access, flags, mode)
+            .open_file(context, None, path.as_str(), access, flags, mode)
     }
 
     pub(crate) fn read_file_directory(
         &self,
-        context: &Context,
         directory_path: &str,
         file: &File<Platform>,
     ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         let mut entries = file.read_directory()?;
-        if self.namespace.hides_registry_entry(context, directory_path) {
+        if self.namespace.hides_registry_entry(directory_path) {
             entries.retain(|entry| !is_registry_root_name(&entry.name));
         }
         Ok(entries)
@@ -98,8 +121,9 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         context: &Context,
         path: &str,
     ) -> Result<FileStatus, FileStatusError> {
-        let path = self.resolve_path(context, path)?;
-        self.litebox.path_file_status(context, path.as_str(), true)
+        let path = self.resolve_path(path)?;
+        self.litebox
+            .path_file_status(context, None, path.as_str(), true)
     }
 
     #[cfg(test)]
@@ -109,13 +133,13 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         path: &str,
         mode: FileMode,
     ) -> Result<(), ChmodError> {
-        let path = self.resolve_path(context, path)?;
-        self.litebox.chmod_file(context, path.as_str(), mode)
+        let path = self.resolve_path(path)?;
+        self.litebox.chmod_file(context, None, path.as_str(), mode)
     }
 
     pub(crate) fn unlink_file(&self, context: &Context, path: &str) -> Result<(), UnlinkError> {
-        let path = self.resolve_path(context, path)?;
-        self.litebox.unlink_file(context, path.as_str())
+        let path = self.resolve_path(path)?;
+        self.litebox.unlink_file(context, None, path.as_str())
     }
 
     pub(crate) fn mkdir_file(
@@ -124,30 +148,14 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         path: &str,
         mode: FileMode,
     ) -> Result<(), MkdirError> {
-        let path = self.resolve_path(context, path)?;
-        self.litebox.mkdir_file(context, path.as_str(), mode)
+        let path = self.resolve_path(path)?;
+        self.litebox.mkdir_file(context, None, path.as_str(), mode)
     }
 
     pub(crate) fn rmdir_file(&self, context: &Context, path: &str) -> Result<(), RmdirError> {
-        let path = self.resolve_path(context, path)?;
-        self.litebox.rmdir_file(context, path.as_str())
+        let path = self.resolve_path(path)?;
+        self.litebox.rmdir_file(context, None, path.as_str())
     }
-}
-
-// Classify and send the same Windows namespace path, even when the caller uses dot components.
-fn namespace_path(context: &Context, path: &str) -> String {
-    let path = context.joined(path);
-    let mut components = Vec::new();
-    for component in path.as_str().split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                components.pop();
-            }
-            _ => components.push(component),
-        }
-    }
-    String::from("/") + &components.join("/")
 }
 
 fn is_registry_path(path: &str) -> bool {
@@ -166,38 +174,32 @@ mod tests {
 
     #[test]
     fn namespace_path_resolution_is_symmetric() {
-        let context = Context::new();
-
         assert_eq!(
-            Namespace::Regular
-                .resolve_path(&context, "/tmp/../file")
-                .unwrap(),
+            Namespace::Regular.resolve_path("/tmp/../file").unwrap(),
             "/file"
         );
         assert!(matches!(
-            Namespace::Regular.resolve_path(&context, "/tmp/../Registry/machine"),
+            Namespace::Regular.resolve_path("/tmp/../Registry/machine"),
             Err(PathError::MissingComponent)
         ));
         assert_eq!(
             Namespace::Registry
-                .resolve_path(&context, "/tmp/../Registry/machine")
+                .resolve_path("/tmp/../Registry/machine")
                 .unwrap(),
             "/Registry/machine"
         );
         assert!(matches!(
-            Namespace::Registry.resolve_path(&context, "/tmp"),
+            Namespace::Registry.resolve_path("/tmp"),
             Err(PathError::InvalidPathname)
         ));
     }
 
     #[test]
     fn regular_namespace_hides_registry_for_root_aliases() {
-        let context = Context::new();
-
         for path in ["/", "/.", "//", "/tmp/..", "."] {
-            assert!(Namespace::Regular.hides_registry_entry(&context, path));
+            assert!(Namespace::Regular.hides_registry_entry(path));
         }
-        assert!(!Namespace::Regular.hides_registry_entry(&context, "/tmp"));
-        assert!(!Namespace::Registry.hides_registry_entry(&context, "/registry"));
+        assert!(!Namespace::Regular.hides_registry_entry("/tmp"));
+        assert!(!Namespace::Registry.hides_registry_entry("/registry"));
     }
 }
