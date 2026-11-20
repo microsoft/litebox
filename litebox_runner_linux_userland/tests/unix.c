@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 #define _GNU_SOURCE
+#include "helpers.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -11,7 +12,6 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#define TEST_SOCKET_PATH "/tmp/test_unix_socket.sock"
 #define BUFFER_SIZE 1024
 
 // Shared data between threads
@@ -274,13 +274,10 @@ int main() {
         test_failed = 1;
     }
 
-    // Clean up any existing socket file
-    unlink(TEST_SOCKET_PATH);
-
     // Initialize context
     memset(&ctx, 0, sizeof(ctx));
-    ctx.addr.sun_family = AF_UNIX;
-    strncpy(ctx.addr.sun_path, TEST_SOCKET_PATH, sizeof(ctx.addr.sun_path) - 1);
+    test_socket_address(&ctx.addr, "test_unix_socket.sock", 0);
+    const char *socket_path = ctx.addr.sun_path;
     ctx.ready = 0;
     pthread_mutex_init(&ctx.mutex, NULL);
     pthread_cond_init(&ctx.cond, NULL);
@@ -307,7 +304,7 @@ int main() {
     // Cleanup
     pthread_mutex_destroy(&ctx.mutex);
     pthread_cond_destroy(&ctx.cond);
-    unlink(TEST_SOCKET_PATH);
+    unlink(socket_path);
 
     printf("\n===== All Tests Complete =====\n");
 

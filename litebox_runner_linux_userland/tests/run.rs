@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use common::runner::Runner;
 
 #[cfg(target_os = "linux")]
+use common::native::Native;
+#[cfg(target_os = "linux")]
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(target_os = "linux")]
@@ -85,10 +87,21 @@ fn gateway_udp_policy() -> litebox_broker_core::SocketPolicy {
         .unwrap()
 }
 
+/// The variable that has `sendfile.c` check pipes, which in LiteBox need the userland broker.
+#[cfg(target_os = "linux")]
+const PIPE_BROKER_VARIABLE: &str = "LITEBOX_PIPE_BROKER";
+
+#[cfg(target_os = "linux")]
+fn checks_broker_pipes(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("sendfile.c")
+}
+
 #[cfg(target_os = "linux")]
 fn configure_pipe_broker(path: &Path, runner: &mut Runner) {
-    if path.file_name().and_then(|name| name.to_str()) == Some("sendfile.c") {
-        runner.use_userland_broker().env("LITEBOX_PIPE_BROKER=1");
+    if checks_broker_pipes(path) {
+        runner
+            .use_userland_broker()
+            .env(format!("{PIPE_BROKER_VARIABLE}=1"));
     }
 }
 
@@ -129,37 +142,89 @@ fn test_mount_tmpfs() {
     assert!(String::from_utf8_lossy(&output).contains("mount tmpfs ok"));
 }
 
-#[test]
-fn test_utimensat_in_memory() {
-    let target = common::compile("./tests/utimensat.c", "utimensat_in_memory", true, false);
-    let output = Runner::new(&target, "utimensat_in_memory").output();
-    assert!(String::from_utf8_lossy(&output).contains("utimensat ok"));
-}
-
 include!(concat!(env!("OUT_DIR"), "/c_tests.rs"));
 
-fn run_c_test(path: &str, suffix: &str, exec_or_lib: bool) {
-    let stem = Path::new(path)
+/// The program that C tests of the `with_exec_child` kind execute.
+const EXEC_CHILD: &str = "./tests/vfork_exec_child.c";
+
+fn c_test_stem(path: &str) -> &str {
+    Path::new(path)
         .file_stem()
         .and_then(|s| s.to_str())
-        .expect("failed to get file stem");
-    let unique_name = format!("{stem}{suffix}");
-    let target = common::compile(path, &unique_name, exec_or_lib, false);
-    let mut runner = Runner::new(&target, &unique_name);
+        .expect("failed to get file stem")
+}
+
+/// Builds the C program at `path`, as a static executable if `exec_or_lib`, under a name that every
+/// test building it the same way shares.
+fn build_c_program(path: &str, exec_or_lib: bool) -> PathBuf {
+    let linkage = if exec_or_lib { "static" } else { "dynamic" };
+    let name = format!("{}.{linkage}", c_test_stem(path));
+    common::compile(path, &name, exec_or_lib, false)
+}
+
+/// Runs a C test in LiteBox, letting it create processes if `allow_duplication`, and passing it
+/// the path of `vfork_exec_child.c`, built like it, if `with_exec_child`.
+fn run_c_test(
+    path: &str,
+    suffix: &str,
+    exec_or_lib: bool,
+    allow_duplication: bool,
+    with_exec_child: bool,
+) {
+    let target = build_c_program(path, exec_or_lib);
+    let mut runner = Runner::new(&target, &format!("{}{suffix}", c_test_stem(path)));
     #[cfg(target_os = "linux")]
-    configure_pipe_broker(Path::new(path), &mut runner);
+    {
+        configure_pipe_broker(Path::new(path), &mut runner);
+        if allow_duplication {
+            runner.allow_process_duplication();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert!(!allow_duplication, "only Linux runners create processes");
+    if with_exec_child {
+        let child = build_c_program(EXEC_CHILD, exec_or_lib);
+        // The guest finds the child where the host keeps it.
+        let child_guest_path = std::path::absolute(&child).unwrap();
+        runner.arg(&child_guest_path).with_fs_path(|root| {
+            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
+            assert!(common::rewrite_with_cache(&child, &destination, &[]));
+        });
+    }
     runner.run();
 }
 
+/// Generates a LiteBox sweep test for a C test of the kind `build.rs` gives it.
 macro_rules! c_test {
-    (r#mount, $path:literal) => {
-        c_test!(#[ignore = "has a dedicated test"] r#mount, $path);
+    ($kind:ident $stem:ident, $path:literal, ignore_natively = $reason:literal) => {
+        c_test!($kind $stem, $path);
     };
-    ($(#[$attribute:meta])* $stem:ident, $path:literal) => {
+    (dedicated $stem:ident, $path:literal) => {
+        c_test!(@test #[ignore = "has a dedicated test"] $stem, $path, false, false);
+    };
+    // With `--run-ignored`, these would fail without a broker.
+    (broker $stem:ident, $path:literal) => {
+        c_test!(@test #[ignore = "needs the broker"] $stem, $path, false, false);
+    };
+    (plain $stem:ident, $path:literal) => {
+        c_test!(@test $stem, $path, false, false);
+    };
+    (duplicating $stem:ident, $path:literal) => {
+        c_test!(@test
+            #[cfg_attr(not(target_os = "linux"), ignore = "only Linux runners create processes")]
+            $stem, $path, true, false);
+    };
+    (with_exec_child $stem:ident, $path:literal) => {
+        c_test!(@test
+            #[cfg_attr(not(target_os = "linux"), ignore = "only Linux runners create processes")]
+            $stem, $path, true, true);
+    };
+    (@test $(#[$attribute:meta])* $stem:ident, $path:literal, $allow_duplication:literal,
+        $with_exec_child:literal) => {
         $(#[$attribute])*
         #[test]
         fn $stem() {
-            super::run_c_test($path, SUFFIX, EXEC_OR_LIB);
+            super::run_c_test($path, SUFFIX, EXEC_OR_LIB, $allow_duplication, $with_exec_child);
         }
     };
 }
@@ -176,58 +241,51 @@ mod test_static_exec_with_rewriter {
     for_each_c_test!(c_test);
 }
 
+/// Runs a C test natively, as the LiteBox sweeps run it, to check that the test's expectations
+/// hold on Linux and not only under LiteBox.
 #[cfg(target_os = "linux")]
-#[test]
-fn regular_files_are_readable_and_writable() {
-    let target = common::compile(
-        "./tests/regular_file_readiness.c",
-        "regular_file_readiness",
-        true,
-        false,
-    );
-    let native = std::process::Command::new(&target).output().unwrap();
-    assert!(
-        native.status.success(),
-        "native regular file readiness failed: {native:?}"
-    );
-    Runner::new(&target, "regular_file_readiness").run();
+fn run_native_c_test(path: &str, with_exec_child: bool) {
+    let target = build_c_program(path, true);
+    let Some(mut native) = Native::new(&target) else {
+        return;
+    };
+    if checks_broker_pipes(Path::new(path)) {
+        native.env(PIPE_BROKER_VARIABLE, "1");
+    }
+    if with_exec_child {
+        let child = build_c_program(EXEC_CHILD, true);
+        native.arg(std::path::absolute(child).unwrap());
+    }
+    native.output();
 }
 
-/// `AT_EXECFN` names the file `execve` received, even a relative path or a script, for the
-/// initial program, a `vfork` child's program, and an in-process `execve`.
+/// Generates a native sweep test for a C test of the kind `build.rs` gives it, which, if it has a
+/// dedicated test or `build.rs` says to skip it natively, runs only when asked to, e.g. with
+/// `--run-ignored`.
 #[cfg(target_os = "linux")]
-#[test]
-fn auxv_execfn_names_the_executed_file() {
-    const CHECKS: usize = 4;
-    let target = common::compile("./tests/auxv_execfn.c", "auxv_execfn", true, false);
-    let native = std::process::Command::new(&target).output().unwrap();
-    assert!(
-        native.status.success(),
-        "native AT_EXECFN checks failed: {native:?}"
-    );
-    let native = String::from_utf8(native.stdout).unwrap();
-    assert_eq!(
-        native.matches("AT_EXECFN matches").count(),
-        CHECKS,
-        "{native}"
-    );
-
-    let output = Runner::new(&target, "auxv_execfn")
-        .allow_process_duplication()
-        .output();
-    let output = String::from_utf8(output).unwrap();
-    assert_eq!(
-        output.matches("AT_EXECFN matches").count(),
-        CHECKS,
-        "{output}"
-    );
+macro_rules! native_c_test {
+    (dedicated $stem:ident, $path:literal) => {
+        native_c_test!(@test #[ignore = "has a dedicated test"] $stem, $path, false);
+    };
+    (with_exec_child $stem:ident, $path:literal $(, ignore_natively = $reason:literal)?) => {
+        native_c_test!(@test $(#[ignore = $reason])? $stem, $path, true);
+    };
+    ($kind:ident $stem:ident, $path:literal $(, ignore_natively = $reason:literal)?) => {
+        native_c_test!(@test $(#[ignore = $reason])? $stem, $path, false);
+    };
+    (@test $(#[$attribute:meta])* $stem:ident, $path:literal, $with_exec_child:literal) => {
+        $(#[$attribute])*
+        #[test]
+        fn $stem() {
+            super::run_native_c_test($path, $with_exec_child);
+        }
+    };
 }
 
-/// The signal `__builtin_trap` raises (`ud2` on x86-64, `brk` on AArch64).
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-const TRAP_SIGNAL: i32 = libc::SIGILL;
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-const TRAP_SIGNAL: i32 = libc::SIGTRAP;
+#[cfg(target_os = "linux")]
+mod test_native {
+    for_each_c_test!(native_c_test);
+}
 
 #[cfg(target_os = "linux")]
 fn numeric_field(line: &str, name: &str) -> i32 {
@@ -238,753 +296,6 @@ fn numeric_field(line: &str, name: &str) -> i32 {
                 .and_then(|value| value.parse().ok())
         })
         .unwrap_or_else(|| panic!("missing {name} in {line:?}"))
-}
-
-/// Runs `vfork_exec_parent.c`, which execs `vfork_exec_child.c` with
-/// `child_args`, and returns the combined output.
-#[cfg(target_os = "linux")]
-fn run_vfork_exec(name: &str, child_args: &[&str]) -> String {
-    let parent_name = format!("{name}_parent");
-    let child_name = format!("{name}_child");
-    let parent = common::compile("./tests/vfork_exec_parent.c", &parent_name, true, false);
-    let child = common::compile("./tests/vfork_exec_child.c", &child_name, true, false);
-    let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, &parent_name);
-    runner
-        .allow_process_duplication()
-        .arg(&child_guest_path)
-        .args(child_args)
-        .with_fs_path(|root| {
-            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&child, &destination, &[]));
-        });
-    String::from_utf8(runner.output()).unwrap()
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn vfork_exec_starts_fresh_runner_and_resumes_parent() {
-    let output = run_vfork_exec("vfork_exec", &[]);
-    let parent_line = output
-        .lines()
-        .find(|line| line.starts_with("parent "))
-        .unwrap_or_else(|| panic!("missing parent output in {output:?}"));
-    let child_line = output
-        .lines()
-        .find(|line| line.starts_with("child "))
-        .unwrap_or_else(|| panic!("missing child output in {output:?}"));
-
-    let parent_before = numeric_field(parent_line, "before=");
-    let parent_after = numeric_field(parent_line, "after=");
-    let reported_child = numeric_field(parent_line, "child=");
-    assert_eq!(parent_after, parent_before);
-    assert_ne!(reported_child, parent_before);
-    assert_eq!(numeric_field(parent_line, "waited="), reported_child);
-    assert_eq!(numeric_field(parent_line, "exited="), 1);
-    assert_eq!(numeric_field(parent_line, "code="), 42);
-    assert_eq!(numeric_field(parent_line, "again="), -1);
-    assert_eq!(numeric_field(parent_line, "echild="), 1);
-    assert_eq!(numeric_field(child_line, "pid="), reported_child);
-    assert_eq!(numeric_field(child_line, "ppid="), parent_before);
-    assert_eq!(numeric_field(child_line, "tid="), reported_child);
-    assert!(child_line.contains("marker=from-vfork"));
-    assert!(child_line.contains("env=1"));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn vfork_exec_child_inherits_descriptors_not_marked_close_on_exec() {
-    let parent = common::compile("./tests/vfork_fd_parent.c", "vfork_fd_parent", true, false);
-    let child = common::compile("./tests/vfork_exec_child.c", "vfork_fd_child", true, false);
-    let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, "vfork_fd_parent");
-    runner
-        .allow_process_duplication()
-        .arg(&child_guest_path)
-        .with_fs_path(|root| {
-            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&child, &destination, &[]));
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let mut lines = output
-        .lines()
-        .skip_while(|line| !line.starts_with("parent "));
-    let parent_line = lines
-        .next()
-        .unwrap_or_else(|| panic!("missing parent output in {output:?}"));
-    assert_eq!(
-        numeric_field(parent_line, "waited="),
-        numeric_field(parent_line, "child=")
-    );
-    assert_eq!(numeric_field(parent_line, "exited="), 1);
-    assert_eq!(numeric_field(parent_line, "code="), 42);
-    // The child's `F_SETFL` changed the open file description the parent's stdin shares.
-    assert_eq!(numeric_field(parent_line, "stdin_nonblock="), 1);
-    // The parent's stdout and `log` share the offset the child advanced through both.
-    let log: Vec<_> = lines.collect();
-    assert_eq!(
-        log,
-        [
-            "child-fds via-stdout",
-            "child-fds via-log",
-            "child-fds stdin_setfl=1 hidden_closed=1",
-        ]
-    );
-    let length = numeric_field(parent_line, "length=");
-    assert_eq!(numeric_field(parent_line, "offset="), length);
-    assert_eq!(usize::try_from(length).unwrap(), log.join("\n").len() + 1);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn vfork_children_change_their_own_descriptors() {
-    let parent = common::compile(
-        "./tests/vfork_fd_ops_parent.c",
-        "vfork_fd_ops_parent",
-        true,
-        false,
-    );
-    let child = common::compile(
-        "./tests/vfork_exec_child.c",
-        "vfork_fd_ops_child",
-        true,
-        false,
-    );
-    let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, "vfork_fd_ops_parent");
-    runner
-        .allow_process_duplication()
-        .arg(&child_guest_path)
-        .with_fs_path(|root| {
-            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&child, &destination, &[]));
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = |prefix: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
-    };
-
-    // `posix_spawn` file actions change only the child's table, which then transfers through
-    // `execve`.
-    let spawn_line = line("spawn ");
-    assert_eq!(numeric_field(spawn_line, "ret="), 0);
-    assert_eq!(numeric_field(spawn_line, "exited="), 1);
-    assert_eq!(numeric_field(spawn_line, "code="), 42);
-    assert_eq!(numeric_field(spawn_line, "log_cloexec="), 1);
-    assert_eq!(numeric_field(spawn_line, "pipe_open="), 1);
-    assert_eq!(numeric_field(spawn_line, "opened_closed="), 1);
-    let child_line = "child-open-fds 0 1 2 3 10";
-    assert_eq!(line("child-open-fds"), child_line);
-    // The parent's `log` shares the offset the child advanced through its stdout.
-    let length = numeric_field(spawn_line, "length=");
-    assert_eq!(numeric_field(spawn_line, "offset="), length);
-    assert_eq!(usize::try_from(length).unwrap(), child_line.len() + 1);
-
-    // A child that exits without `execve` changes only its own table and working directory, and
-    // its descriptors are closed when the parent resumes.
-    let vfork_line = line("vfork ");
-    assert_eq!(numeric_field(vfork_line, "exited="), 1);
-    assert_eq!(numeric_field(vfork_line, "code="), 0);
-    assert_eq!(numeric_field(vfork_line, "log_cloexec="), 1);
-    assert_eq!(numeric_field(vfork_line, "pipe_open="), 1);
-    assert_eq!(numeric_field(vfork_line, "first="), 1);
-    assert!(vfork_line.contains(" byte=x "));
-    assert_eq!(numeric_field(vfork_line, "second="), 0);
-    assert_eq!(numeric_field(vfork_line, "child_cwd="), 1);
-    assert_eq!(numeric_field(vfork_line, "cwd_kept="), 1);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn vfork_exec_children_share_pipes_with_their_parent() {
-    let parent = common::compile(
-        "./tests/vfork_pipe_parent.c",
-        "vfork_pipe_parent",
-        true,
-        false,
-    );
-    let child = common::compile(
-        "./tests/vfork_exec_child.c",
-        "vfork_pipe_child",
-        true,
-        false,
-    );
-    let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, "vfork_pipe_parent");
-    runner
-        .allow_process_duplication()
-        .arg(&child_guest_path)
-        .with_fs_path(|root| {
-            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&child, &destination, &[]));
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = |prefix: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
-    };
-
-    // The parent reads the child's stdout from a pipe until the child's exit closes it.
-    let stdout_line = line("stdout-pipe ");
-    assert_eq!(numeric_field(stdout_line, "code="), 42);
-    assert_eq!(numeric_field(stdout_line, "eof="), 1);
-    assert_eq!(line("child-stdout "), "child-stdout wronly=1");
-    assert_eq!(line("child-open-fds"), "child-open-fds 0 1 2");
-
-    // Each process waits for the other to drain or fill the pipe, and the child's nonblocking
-    // read end sees end-of-file once the parent closes its write end. Both processes share the
-    // read end's status flags, so the parent sees the child clear O_NONBLOCK.
-    let cat_line = line("child-cat ");
-    assert_eq!(numeric_field(cat_line, "bytes="), 256 * 1024);
-    assert_eq!(numeric_field(cat_line, "ok="), 1);
-    assert_eq!(numeric_field(cat_line, "rdonly="), 1);
-    assert_eq!(numeric_field(cat_line, "nonblock="), 1);
-    let stdin_line = line("stdin-pipe ");
-    assert_eq!(numeric_field(stdin_line, "code="), 42);
-    assert_eq!(numeric_field(stdin_line, "written="), 256 * 1024);
-    assert_eq!(numeric_field(stdin_line, "shared_setfl="), 1);
-
-    // The child's exit wakes the parent blocked writing a full pipe.
-    assert_eq!(line("child-read-byte "), "child-read-byte n=1 byte=a");
-    let early_line = line("early-reader ");
-    assert_eq!(numeric_field(early_line, "code="), 42);
-    assert_eq!(numeric_field(early_line, "partial="), 1);
-    assert_eq!(numeric_field(early_line, "second="), -1);
-    assert_eq!(numeric_field(early_line, "epipe="), 1);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn vfork_exec_child_signal_death_is_reported_to_parent() {
-    let output = run_vfork_exec("vfork_exec_abort", &["abort"]);
-    let parent_line = output
-        .lines()
-        .find(|line| line.starts_with("parent "))
-        .unwrap_or_else(|| panic!("missing parent output in {output:?}"));
-
-    assert_eq!(
-        numeric_field(parent_line, "waited="),
-        numeric_field(parent_line, "child=")
-    );
-    assert_eq!(numeric_field(parent_line, "exited="), 0);
-    assert_eq!(numeric_field(parent_line, "signaled="), 1);
-    assert_eq!(numeric_field(parent_line, "signal="), libc::SIGABRT);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn vfork_child_exit_resumes_parent_with_waitable_child() {
-    let parent = common::compile(
-        "./tests/vfork_exit_parent.c",
-        "vfork_exit_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "vfork_exit_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = |prefix: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
-    };
-    let parent_line = line("parent ");
-    let parent_pid = numeric_field(parent_line, "before=");
-    assert_eq!(numeric_field(parent_line, "after="), parent_pid);
-    assert_eq!(numeric_field(parent_line, "echild="), 1);
-    assert_eq!(numeric_field(line("armed "), "eagain="), 1);
-    for (prefix, code) in [
-        ("exit_group ", 37),
-        ("exit ", 38),
-        ("bad_args ", libc::EINVAL),
-        ("disarmed ", 39),
-    ] {
-        let child_line = line(prefix);
-        let child = numeric_field(child_line, "child=");
-        assert_ne!(child, parent_pid);
-        assert_eq!(numeric_field(child_line, "waited="), child);
-        assert_eq!(numeric_field(child_line, "exited="), 1);
-        assert_eq!(numeric_field(child_line, "code="), code);
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn vfork_exec_failure_returns_error_to_child() {
-    let parent = common::compile(
-        "./tests/vfork_exec_parent.c",
-        "vfork_exec_failure_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "vfork_exec_failure_parent");
-    runner
-        .allow_process_duplication()
-        .arg("/missing-vfork-executable");
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let parent_line = output
-        .lines()
-        .find(|line| line.starts_with("parent "))
-        .unwrap_or_else(|| panic!("missing parent output in {output:?}"));
-    let reported_child = numeric_field(parent_line, "child=");
-    assert_eq!(
-        numeric_field(parent_line, "after="),
-        numeric_field(parent_line, "before=")
-    );
-    assert_eq!(numeric_field(parent_line, "waited="), reported_child);
-    assert_eq!(numeric_field(parent_line, "exited="), 1);
-    assert_eq!(numeric_field(parent_line, "code="), 111);
-    assert_eq!(numeric_field(parent_line, "echild="), 1);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn vfork_child_fault_resumes_parent_with_signaled_child() {
-    let parent = common::compile(
-        "./tests/vfork_fault_parent.c",
-        "vfork_fault_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "vfork_fault_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let parent_line = output
-        .lines()
-        .find(|line| line.starts_with("parent "))
-        .unwrap_or_else(|| panic!("missing parent output in {output:?}"));
-    let parent_pid = numeric_field(parent_line, "before=");
-    let child = numeric_field(parent_line, "child=");
-    assert_eq!(numeric_field(parent_line, "after="), parent_pid);
-    assert_ne!(child, parent_pid);
-    assert_eq!(numeric_field(parent_line, "waited="), child);
-    assert_eq!(numeric_field(parent_line, "signaled="), 1);
-    assert_eq!(numeric_field(parent_line, "signal="), TRAP_SIGNAL);
-    assert_eq!(numeric_field(parent_line, "echild="), 1);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn vfork_child_has_its_own_signal_state() {
-    let parent = common::compile(
-        "./tests/vfork_signal_parent.c",
-        "vfork_signal_parent",
-        true,
-        false,
-    );
-    let child = common::compile(
-        "./tests/vfork_exec_child.c",
-        "vfork_signal_child",
-        true,
-        false,
-    );
-    let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, "vfork_signal_parent");
-    runner
-        .allow_process_duplication()
-        .arg(&child_guest_path)
-        .with_fs_path(|root| {
-            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&child, &destination, &[]));
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = |prefix: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
-    };
-    let parent_line = line("parent ");
-    let parent_pid = numeric_field(parent_line, "pid=");
-    // The parent's dispositions, pending SIGUSR2, blocked mask, and alternate stack survive its
-    // children's changes.
-    assert_eq!(numeric_field(parent_line, "hup_default="), 1);
-    assert_eq!(numeric_field(parent_line, "term_blocked="), 1);
-    assert_eq!(numeric_field(parent_line, "altstack_disabled="), 1);
-    assert_eq!(numeric_field(parent_line, "usr2_before_unblock="), 0);
-    assert_eq!(numeric_field(parent_line, "usr2_pid="), parent_pid);
-
-    let fault_line = line("fault ");
-    let fault_child = numeric_field(fault_line, "child=");
-    assert_ne!(fault_child, parent_pid);
-    assert_eq!(numeric_field(fault_line, "waited="), fault_child);
-    assert_eq!(numeric_field(fault_line, "exited="), 1);
-    assert_eq!(numeric_field(fault_line, "code="), 55);
-    assert_eq!(numeric_field(fault_line, "handler_pid="), fault_child);
-
-    let ignore_line = line("ignore ");
-    let ignore_child = numeric_field(ignore_line, "child=");
-    assert_eq!(numeric_field(ignore_line, "waited="), ignore_child);
-    assert_eq!(numeric_field(ignore_line, "exited="), 1);
-    assert_eq!(numeric_field(ignore_line, "code="), 60);
-    assert_eq!(numeric_field(ignore_line, "usr2_pending="), 1);
-    assert_eq!(numeric_field(ignore_line, "term_pending="), 1);
-
-    let sigpipe_line = line("sigpipe ");
-    let sigpipe_child = numeric_field(sigpipe_line, "child=");
-    assert_eq!(numeric_field(sigpipe_line, "waited="), sigpipe_child);
-    assert_eq!(numeric_field(sigpipe_line, "code="), 70);
-    assert_eq!(numeric_field(sigpipe_line, "sender="), sigpipe_child);
-
-    let kill_self_line = line("kill-self ");
-    let kill_self_child = numeric_field(kill_self_line, "child=");
-    assert_eq!(numeric_field(kill_self_line, "waited="), kill_self_child);
-    assert_eq!(numeric_field(kill_self_line, "signaled="), 1);
-    assert_eq!(numeric_field(kill_self_line, "signal="), libc::SIGKILL);
-
-    // A documented difference: Linux would signal the parent, and the child would exit with 82.
-    let kill_other_line = line("kill-other ");
-    let kill_other_child = numeric_field(kill_other_line, "child=");
-    assert_eq!(numeric_field(kill_other_line, "waited="), kill_other_child);
-    assert_eq!(numeric_field(kill_other_line, "exited="), 1);
-    assert_eq!(numeric_field(kill_other_line, "code="), 81);
-
-    let exec_line = line("exec ");
-    let exec_child = numeric_field(exec_line, "child=");
-    assert_eq!(numeric_field(exec_line, "waited="), exec_child);
-    assert_eq!(numeric_field(exec_line, "exited="), 1);
-    assert_eq!(numeric_field(exec_line, "code="), 42);
-
-    // Like Linux `execve`, ignored dispositions and the blocked mask survive while handlers
-    // reset to the default.
-    let child_line = line("child-signals ");
-    assert_eq!(numeric_field(child_line, "pipe_ignored="), 1);
-    assert_eq!(numeric_field(child_line, "hup_ignored="), 1);
-    assert_eq!(numeric_field(child_line, "usr2_default="), 1);
-    assert_eq!(numeric_field(child_line, "ill_default="), 1);
-    assert_eq!(numeric_field(child_line, "term_blocked="), 1);
-    assert_eq!(numeric_field(child_line, "usr2_blocked="), 0);
-    // Like Linux, the signals pending for the child, but not the parent's, survive `execve`, each
-    // for the process or the thread it was pending for, and with its sender, if it had one.
-    assert_eq!(numeric_field(child_line, "usr1_pending="), 1);
-    assert_eq!(numeric_field(child_line, "term_pending="), 0);
-    assert_eq!(numeric_field(child_line, "usr1_from_self="), 1);
-    assert_eq!(numeric_field(child_line, "pipe_from_worker="), 0);
-    assert_eq!(numeric_field(child_line, "pipe_from_main="), 1);
-    assert_eq!(numeric_field(child_line, "rt_without_sender="), 1);
-    assert_eq!(numeric_field(child_line, "rt_from_self="), 2);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn vfork_children_are_reaped_automatically_when_sigchld_says_so() {
-    let parent = common::compile(
-        "./tests/vfork_reap_parent.c",
-        "vfork_reap_parent",
-        true,
-        false,
-    );
-    let child = common::compile(
-        "./tests/vfork_exec_child.c",
-        "vfork_reap_child",
-        true,
-        false,
-    );
-    let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, "vfork_reap_parent");
-    runner
-        .allow_process_duplication()
-        .arg(&child_guest_path)
-        .with_fs_path(|root| {
-            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&child, &destination, &[]));
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = |prefix: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
-    };
-    let zombie_line = line("zombie ");
-    assert_eq!(
-        numeric_field(zombie_line, "waited="),
-        numeric_field(zombie_line, "child=")
-    );
-    assert_eq!(numeric_field(zombie_line, "exited="), 1);
-    assert_eq!(numeric_field(zombie_line, "code="), 21);
-    assert_eq!(numeric_field(line("ignored "), "echild="), 1);
-    assert_eq!(numeric_field(line("nocldwait "), "echild="), 1);
-    assert_eq!(numeric_field(line("live-ignored "), "echild="), 1);
-    let restored_line = line("live-restored ");
-    assert_eq!(
-        numeric_field(restored_line, "waited="),
-        numeric_field(restored_line, "child=")
-    );
-    assert_eq!(numeric_field(restored_line, "exited="), 1);
-    assert_eq!(numeric_field(restored_line, "code="), 42);
-    assert_eq!(numeric_field(line("reap-inherited "), "reaped="), 1);
-    assert_eq!(numeric_field(line("reap-reset "), "reaped="), 0);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn kill_signals_other_processes() {
-    let parent = common::compile(
-        "./tests/vfork_kill_parent.c",
-        "vfork_kill_parent",
-        true,
-        false,
-    );
-    let child = common::compile(
-        "./tests/vfork_exec_child.c",
-        "vfork_kill_child",
-        true,
-        false,
-    );
-    let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, "vfork_kill_parent");
-    runner
-        .allow_process_duplication()
-        .arg(&child_guest_path)
-        .with_fs_path(|root| {
-            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&child, &destination, &[]));
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = |prefix: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
-    };
-    // Each signal reports its sender's process ID and the receiver's user.
-    let handshake = line("handshake ");
-    assert_eq!(numeric_field(handshake, "count="), 1, "{handshake}");
-    assert_eq!(
-        numeric_field(handshake, "pid="),
-        numeric_field(handshake, "child="),
-        "{handshake}"
-    );
-    assert_eq!(
-        numeric_field(handshake, "code="),
-        libc::SI_USER,
-        "{handshake}"
-    );
-    assert_eq!(numeric_field(handshake, "uid="), 1, "{handshake}");
-    assert_eq!(numeric_field(handshake, "alive="), 1, "{handshake}");
-    assert_eq!(numeric_field(handshake, "sent="), 1, "{handshake}");
-    assert_eq!(
-        numeric_field(handshake, "waited="),
-        numeric_field(handshake, "child="),
-        "{handshake}"
-    );
-    assert_eq!(numeric_field(handshake, "exit="), 42, "{handshake}");
-    let child_kill = line("child-kill ");
-    assert_eq!(numeric_field(child_kill, "count="), 1, "{child_kill}");
-    assert_eq!(
-        numeric_field(child_kill, "pid="),
-        numeric_field(child_kill, "ppid="),
-        "{child_kill}"
-    );
-    assert_eq!(
-        numeric_field(child_kill, "code="),
-        libc::SI_USER,
-        "{child_kill}"
-    );
-    assert_eq!(numeric_field(child_kill, "uid="), 1, "{child_kill}");
-
-    let killed = line("killed ");
-    assert_eq!(
-        numeric_field(killed, "waited="),
-        numeric_field(killed, "child="),
-        "{killed}"
-    );
-    assert_eq!(numeric_field(killed, "sent="), 1, "{killed}");
-    assert_eq!(numeric_field(killed, "signaled="), 1, "{killed}");
-    assert_eq!(numeric_field(killed, "signal="), libc::SIGKILL, "{killed}");
-
-    let missing = line("missing ");
-    assert_eq!(numeric_field(missing, "esrch="), 1, "{missing}");
-    assert_eq!(numeric_field(missing, "check_esrch="), 1, "{missing}");
-    assert_eq!(numeric_field(missing, "self_check="), 1, "{missing}");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn vfork_children_signal_parent_on_termination() {
-    let parent = common::compile(
-        "./tests/vfork_sigchld_parent.c",
-        "vfork_sigchld_parent",
-        true,
-        false,
-    );
-    let child = common::compile(
-        "./tests/vfork_exec_child.c",
-        "vfork_sigchld_child",
-        true,
-        false,
-    );
-    let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, "vfork_sigchld_parent");
-    runner
-        .allow_process_duplication()
-        .arg(&child_guest_path)
-        .with_fs_path(|root| {
-            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&child, &destination, &[]));
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = |prefix: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
-    };
-    // Each handler run reports its child's process ID, termination, and user.
-    let assert_handled = |line: &str, code: i32, status: i32| {
-        assert_eq!(numeric_field(line, "count="), 1, "{line}");
-        assert_eq!(
-            numeric_field(line, "pid="),
-            numeric_field(line, "child="),
-            "{line}"
-        );
-        assert_eq!(numeric_field(line, "code="), code, "{line}");
-        assert_eq!(numeric_field(line, "status="), status, "{line}");
-        assert_eq!(numeric_field(line, "uid="), 1, "{line}");
-    };
-    let reaped = |line: &str| {
-        assert_eq!(
-            numeric_field(line, "waited="),
-            numeric_field(line, "child="),
-            "{line}"
-        );
-    };
-    let exited = line("exited ");
-    reaped(exited);
-    assert_handled(exited, libc::CLD_EXITED, 7);
-    assert_eq!(numeric_field(exited, "early="), 1);
-    let killed = line("killed ");
-    reaped(killed);
-    assert_handled(killed, libc::CLD_KILLED, TRAP_SIGNAL);
-    assert_eq!(numeric_field(killed, "early="), 1);
-    let paused = line("paused ");
-    reaped(paused);
-    assert_handled(paused, libc::CLD_EXITED, 42);
-    assert_eq!(numeric_field(paused, "early="), 0);
-    assert_eq!(numeric_field(paused, "eintr="), 1);
-    let waited = line("waited ");
-    reaped(waited);
-    assert_handled(waited, libc::CLD_EXITED, 42);
-    assert_eq!(numeric_field(waited, "exited="), 1);
-    assert_eq!(numeric_field(waited, "exit="), 42);
-    let nocldwait = line("nocldwait ");
-    assert_handled(nocldwait, libc::CLD_EXITED, 9);
-    assert_eq!(numeric_field(nocldwait, "early="), 1);
-    assert_eq!(numeric_field(nocldwait, "echild="), 1);
-    let ignored = line("ignored-blocked ");
-    assert_eq!(numeric_field(ignored, "waited="), -1);
-    assert_eq!(numeric_field(ignored, "count="), 0);
-    let default = line("default ");
-    reaped(default);
-    assert_eq!(numeric_field(default, "alarmed="), 1);
-    assert_eq!(numeric_field(default, "eintr="), 1);
-    assert_eq!(numeric_field(default, "exit="), 42);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn clone_vfork_children_start_like_vfork_children() {
-    let parent = common::compile(
-        "./tests/vfork_spawn_parent.c",
-        "vfork_spawn_parent",
-        true,
-        false,
-    );
-    let child = common::compile(
-        "./tests/vfork_exec_child.c",
-        "vfork_spawn_child",
-        true,
-        false,
-    );
-    let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, "vfork_spawn_parent");
-    runner
-        .allow_process_duplication()
-        .arg(&child_guest_path)
-        .with_fs_path(|root| {
-            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&child, &destination, &[]));
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = |prefix: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
-    };
-    let parent_pid = numeric_field(line("parent "), "pid=");
-    // `posix_spawn` uses `clone3` and glibc's `clone` wrapper uses `clone`, both with a separate
-    // child stack.
-    for (label, marker) in [("spawn", "from-spawn"), ("clone", "from-clone")] {
-        let parent_line = line(&format!("{label} "));
-        let child_pid = numeric_field(parent_line, "child=");
-        assert_ne!(child_pid, parent_pid);
-        assert_eq!(numeric_field(parent_line, "waited="), child_pid);
-        assert_eq!(numeric_field(parent_line, "exited="), 1);
-        assert_eq!(numeric_field(parent_line, "code="), 42);
-        let child_line = line(&format!("child pid={child_pid} "));
-        assert_eq!(numeric_field(child_line, "ppid="), parent_pid);
-        assert!(child_line.ends_with(&format!("marker={marker} env={label}")));
-    }
-
-    // Spawn attributes reset SIGHUP and replace the blocked mask before exec.
-    let signals_line = line("signals ");
-    assert_eq!(numeric_field(signals_line, "exited="), 1);
-    assert_eq!(numeric_field(signals_line, "code="), 42);
-    let child_line = line("child-signals ");
-    assert_eq!(numeric_field(child_line, "pipe_ignored="), 1);
-    assert_eq!(numeric_field(child_line, "hup_ignored="), 0);
-    assert_eq!(numeric_field(child_line, "usr2_default="), 1);
-    assert_eq!(numeric_field(child_line, "term_blocked="), 1);
-    assert_eq!(numeric_field(child_line, "usr2_blocked="), 0);
-    // The spawned child has no pending signals.
-    for field in [
-        "usr1_pending=",
-        "term_pending=",
-        "usr1_from_self=",
-        "pipe_from_worker=",
-        "pipe_from_main=",
-        "rt_without_sender=",
-        "rt_from_self=",
-    ] {
-        assert_eq!(numeric_field(child_line, field), 0, "{field}");
-    }
-
-    let missing_line = line("missing ");
-    assert_eq!(numeric_field(missing_line, "ret="), libc::ENOENT);
-    assert_eq!(numeric_field(missing_line, "echild="), 1);
-
-    // With `CLONE_CLEAR_SIGHAND`, the parent's SIGILL handler does not catch the child's fault.
-    let clear_line = line("clear-sighand ");
-    assert_eq!(
-        numeric_field(clear_line, "waited="),
-        numeric_field(clear_line, "child=")
-    );
-    assert_eq!(numeric_field(clear_line, "signaled="), 1);
-    assert_eq!(numeric_field(clear_line, "signal="), libc::SIGILL);
-
-    let parent_line = line("parent-signals ");
-    assert_eq!(numeric_field(parent_line, "hup_ignored="), 1);
-    assert_eq!(numeric_field(parent_line, "usr2_handled="), 1);
-    assert_eq!(numeric_field(parent_line, "ill_handled="), 1);
 }
 
 /// Stages the host's `dash`, with its libraries, as the guest's `/bin/sh`, and a `/tmp` directory.
@@ -1069,142 +380,6 @@ fn interactive_shell_runs_commands_in_foreground_groups() {
             "missing {expected:?} in {output:?}"
         );
     }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn fork_child_resumes_from_parent_snapshot() {
-    let parent = common::compile("./tests/fork_parent.c", "fork_parent", true, false);
-    let mut runner = Runner::new(&parent, "fork_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = |prefix: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
-    };
-    let parent_line = line("parent ");
-    let parent_pid = numeric_field(parent_line, "pid=");
-    assert_eq!(numeric_field(parent_line, "global="), 2);
-    assert_eq!(numeric_field(parent_line, "intact="), 1);
-    assert_eq!(numeric_field(parent_line, "usr1="), 0);
-    assert_eq!(numeric_field(parent_line, "sigchld="), 1);
-    assert_eq!(numeric_field(parent_line, "echild="), 1);
-    assert_eq!(numeric_field(parent_line, "alarm="), 1);
-
-    let fork_line = line("fork ");
-    let child = numeric_field(fork_line, "child=");
-    assert_ne!(child, parent_pid);
-    assert_eq!(numeric_field(fork_line, "waited="), child);
-    assert_eq!(numeric_field(fork_line, "exited="), 1);
-    assert_eq!(numeric_field(fork_line, "code="), 7);
-    let pipe_line = line("pipe ");
-    assert_eq!(numeric_field(pipe_line, "pid="), child);
-    assert_eq!(numeric_field(pipe_line, "failures="), 0);
-    assert_eq!(numeric_field(line("child-stdout "), "pid="), child);
-
-    let raw_line = line("raw-fork ");
-    let raw_child = numeric_field(raw_line, "child=");
-    assert!(raw_child != parent_pid && raw_child != child);
-    assert_eq!(numeric_field(raw_line, "waited="), raw_child);
-    assert_eq!(numeric_field(raw_line, "exited="), 1);
-    assert_eq!(numeric_field(raw_line, "code="), 9);
-    for form in [
-        "clone",
-        "clone3-v0",
-        "clone3-zero-tail",
-        "clone3-too-small",
-        "clone3-too-big",
-        "clone3-nonzero-tail",
-        "clone3-fault",
-    ] {
-        let clone_line = line(&format!("clone-form {form} "));
-        assert_eq!(numeric_field(clone_line, "ok="), 1, "{clone_line}");
-    }
-    assert_eq!(numeric_field(line("clone-forms "), "failures="), 0);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn fork_child_can_be_interrupted_in_guest_code() {
-    let parent = common::compile(
-        "./tests/fork_interrupt_parent.c",
-        "fork_interrupt_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "fork_interrupt_parent");
-    runner.allow_process_duplication();
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output
-            .lines()
-            .any(|line| line == "forked child interrupted")
-    );
-}
-
-/// Checks that a signal one guest process sends another is pending in the receiver once its
-/// `kill` returns, whether or not the receiver has been notified of it yet.
-#[cfg(target_os = "linux")]
-#[test]
-fn signal_from_another_process_is_pending_once_sent() {
-    let parent = common::compile(
-        "./tests/sigtimedwait_fork_parent.c",
-        "sigtimedwait_fork_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "sigtimedwait_fork_parent");
-    runner.allow_process_duplication();
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "sigtimedwait-fork ok"),
-        "missing sigtimedwait-fork output in {output:?}"
-    );
-}
-
-/// Checks that `tkill` and `tgkill` reach the threads of another guest process.
-#[cfg(target_os = "linux")]
-#[test]
-fn thread_kill_reaches_another_process() {
-    let parent = common::compile(
-        "./tests/thread_kill_process_parent.c",
-        "thread_kill_process_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "thread_kill_process_parent");
-    runner.allow_process_duplication();
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "thread-kill-process ok"),
-        "missing thread-kill-process output in {output:?}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn fork_pauses_sibling_threads() {
-    let parent = common::compile(
-        "./tests/fork_threads_parent.c",
-        "fork_threads_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "fork_threads_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = output
-        .lines()
-        .find(|line| line.starts_with("threads-fork "))
-        .unwrap_or_else(|| panic!("missing threads-fork output in {output:?}"));
-    assert_eq!(numeric_field(line, "code="), 7);
-    assert_eq!(numeric_field(line, "failures="), 0);
-    assert_eq!(numeric_field(line, "read="), 1);
-    assert_eq!(numeric_field(line, "slept="), 1);
 }
 
 /// Checks vector state and pointer authentication across `fork` and `vfork`.
@@ -1328,173 +503,6 @@ fn aarch64_hwcaps_expose_only_supported_host_features() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn shared_file_mappings_are_shared_across_fork_and_processes() {
-    // Copy-based fork cannot share pages, so it refuses to fork with shared mappings.
-    assert!(
-        std::env::var_os("LITEBOX_DISABLE_NATIVE_FORK").is_none(),
-        "shared file mappings across fork require native fork support"
-    );
-    let program = common::compile(
-        "./tests/shared_file_mapping.c",
-        "shared_file_mapping",
-        true,
-        false,
-    );
-    let program_path = std::path::absolute(&program).unwrap();
-    // The checks encode Linux's behavior, so they pass natively too. The program reruns itself,
-    // from its own path, for the exec check, and exits with failure, after printing which checks
-    // failed, if any did. Natively, its files go in a directory of their own, which the host's
-    // /tmp may not be able to execute from.
-    let native_files = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let native = std::process::Command::new(&program)
-        .arg(&program_path)
-        .env("TMPDIR", native_files.path())
-        .output()
-        .unwrap();
-    assert!(
-        native.status.success(),
-        "{}\nstdout:\n{}\nstderr:\n{}",
-        native.status,
-        String::from_utf8_lossy(&native.stdout),
-        String::from_utf8_lossy(&native.stderr)
-    );
-    Runner::new(&program, "shared_file_mapping")
-        .allow_process_duplication()
-        .arg(program_path)
-        .run();
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn forked_and_exec_children_share_unix_sockets() {
-    let parent = common::compile(
-        "./tests/fork_unix_parent.c",
-        "fork_unix_parent",
-        true,
-        false,
-    );
-    let child = common::compile("./tests/vfork_exec_child.c", "fork_unix_child", true, false);
-    let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, "fork_unix_parent");
-    runner
-        .allow_process_duplication()
-        .arg(&child_guest_path)
-        .with_fs_path(|root| {
-            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&child, &destination, &[]));
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = |prefix: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
-    };
-    let parent_line = line("unix-fork ");
-    for field in ["stream=", "dgram=", "path=", "exec=", "seqpacket="] {
-        assert_eq!(
-            numeric_field(parent_line, field),
-            0,
-            "{field} in {output:?}"
-        );
-    }
-    let child_line = line("child-unix ");
-    for field in ["stream=", "sent=", "replied=", "hidden_closed="] {
-        assert_eq!(numeric_field(child_line, field), 1, "{field} in {output:?}");
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn forked_and_exec_children_share_inet_sockets() {
-    let parent = common::compile(
-        "./tests/fork_inet_parent.c",
-        "fork_inet_parent",
-        true,
-        false,
-    );
-    let child = common::compile("./tests/vfork_exec_child.c", "fork_inet_child", true, false);
-    let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, "fork_inet_parent");
-    runner
-        .allow_process_duplication()
-        .arg(&child_guest_path)
-        .with_fs_path(|root| {
-            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
-            assert!(common::rewrite_with_cache(&child, &destination, &[]));
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = |prefix: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
-    };
-    let parent_line = line("inet-fork ");
-    for field in ["tcp=", "udp=", "orphan=", "exec="] {
-        assert_eq!(
-            numeric_field(parent_line, field),
-            0,
-            "{field} in {output:?}"
-        );
-    }
-    let child_line = line("child-inet ");
-    for field in ["stream=", "sent=", "replied=", "hidden_closed="] {
-        assert_eq!(numeric_field(child_line, field), 1, "{field} in {output:?}");
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn forked_children_share_eventfds_and_timerfds() {
-    let parent = common::compile(
-        "./tests/fork_event_parent.c",
-        "fork_event_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "fork_event_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = output
-        .lines()
-        .find(|line| line.starts_with("event-fork "))
-        .unwrap_or_else(|| panic!("missing event-fork output in {output:?}"));
-    for field in ["blocked=", "semaphore=", "nonblock=", "timer="] {
-        assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn forked_children_share_flock_ownership() {
-    let parent = common::compile(
-        "./tests/fork_flock_parent.c",
-        "fork_flock_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "fork_flock_parent");
-    runner
-        .allow_process_duplication()
-        .arg("/out/flock-lock")
-        .with_fs_path(|root| {
-            std::fs::write(root.join("out/flock-lock"), []).unwrap();
-        });
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line
-            == "flock-fork inherited=1 conflict=1 shared=1 blocked=1 close=1 interrupted=1 exit=1"),
-        "{output:?}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn forked_children_share_futexes_in_shared_memory() {
     const EXPECTED: &str = "shared-futex memory=1 wake=1 timeout=1 interrupted=1 private=1 \
                             mutex=1 semaphore=1 bitset=1 misaligned=1 count=1 inaccessible=1 \
@@ -1511,36 +519,15 @@ fn forked_children_share_futexes_in_shared_memory() {
         false,
     );
     // The checks encode Linux's behavior, so they pass natively too.
-    let native = std::process::Command::new(&parent).output().unwrap();
-    let native = String::from_utf8(native.stdout).unwrap();
-    assert!(native.lines().any(|line| line == EXPECTED), "{native:?}");
+    if let Some(mut native) = Native::new(&parent) {
+        let native = native.output();
+        assert!(native.lines().any(|line| line == EXPECTED), "{native:?}");
+    }
 
     let mut runner = Runner::new(&parent, "fork_shared_futex_parent");
     runner.allow_process_duplication();
     let output = String::from_utf8(runner.output()).unwrap();
     assert!(output.lines().any(|line| line == EXPECTED), "{output:?}");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn forked_children_share_epoll_instances() {
-    let parent = common::compile(
-        "./tests/fork_epoll_parent.c",
-        "fork_epoll_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "fork_epoll_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    let line = output
-        .lines()
-        .find(|line| line.starts_with("epoll-fork "))
-        .unwrap_or_else(|| panic!("missing epoll-fork output in {output:?}"));
-    for field in ["shared=", "blocked=", "flags="] {
-        assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1563,41 +550,6 @@ fn fork_requires_process_duplication() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn process_groups_and_sessions_span_processes() {
-    let parent = common::compile(
-        "./tests/process_group_parent.c",
-        "process_group_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "process_group_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output
-            .lines()
-            .any(|line| line == "process-group failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn sessions_acquire_controlling_terminals_across_processes() {
-    let parent = common::compile("./tests/ctty_parent.c", "ctty_parent", true, false);
-    let mut runner = Runner::new(&parent, "ctty_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "ctty failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn initial_program_inherits_ignored_signals() {
     let program = common::compile(
         "./tests/inherited_ignored_signals.c",
@@ -1616,25 +568,6 @@ fn initial_program_inherits_ignored_signals() {
         output,
         "SIGHUP=ignored\nSIGINT=ignored\nSIGALRM=ignored\nSIGPIPE=default\nSIGTERM=default\n\
          survived SIGINT\n"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn orphans_are_adopted_by_subreapers_and_the_initial_process() {
-    let parent = common::compile(
-        "./tests/process_tree_parent.c",
-        "process_tree_parent",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&parent, "process_tree_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "process-tree failures=0"),
-        "{output}"
     );
 }
 
@@ -1715,87 +648,6 @@ fn only_root_creates_uts_and_ipc_namespaces() {
             .any(|line| line == "uts-ipc-namespace unprivileged failures=0"),
         "{output}"
     );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn dumpable_and_no_new_privs_follow_threads_and_processes() {
-    let program = common::compile("./tests/prctl_flags.c", "prctl_flags", true, false);
-    let mut runner = Runner::new(&program, "prctl_flags");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "prctl-flags failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn parent_death_signal_is_sent_when_the_parent_exits() {
-    let program = common::compile(
-        "./tests/parent_death_signal.c",
-        "parent_death_signal",
-        true,
-        false,
-    );
-    let mut runner = Runner::new(&program, "parent_death_signal");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output
-            .lines()
-            .any(|line| line == "parent-death-signal failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn cpu_time_covers_the_process_and_its_waited_descendants() {
-    let parent = common::compile("./tests/cpu_time_parent.c", "cpu_time_parent", true, false);
-    let mut runner = Runner::new(&parent, "cpu_time_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "cpu-time failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn resource_limits_are_kept_and_inherited() {
-    let parent = common::compile("./tests/rlimit_parent.c", "rlimit_parent", true, false);
-    let mut runner = Runner::new(&parent, "rlimit_parent");
-    runner.allow_process_duplication();
-
-    let output = String::from_utf8(runner.output()).unwrap();
-    assert!(
-        output.lines().any(|line| line == "rlimit failures=0"),
-        "{output}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn waitid_reports_and_reaps_children() {
-    let parent = common::compile("./tests/waitid_parent.c", "waitid_parent", true, false);
-    let mut runner = Runner::new(&parent, "waitid_parent");
-    runner.allow_process_duplication();
-    runner.run();
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn pidfds_follow_children() {
-    let parent = common::compile("./tests/pidfd_parent.c", "pidfd_parent", true, false);
-    let mut runner = Runner::new(&parent, "pidfd_parent");
-    runner.allow_process_duplication();
-    runner.run();
 }
 
 /// A 512 KiB host stack makes 32 generations exceed the old native fork stack-growth limit,

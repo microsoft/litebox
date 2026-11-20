@@ -1,14 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// A vfork child's `execve` keeps the descriptors not marked close-on-exec, which share their open
+// file descriptions, offsets and status flags, with the parent's.
+
 #define _GNU_SOURCE
+#include "helpers.h"
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define LOG_PATH "/tmp/vfork_fd_log"
 #define STDIN_ALIAS 40
 
 int main(int argc, char **argv) {
@@ -17,8 +21,9 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    int log = open(LOG_PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    int hidden = open(LOG_PATH, O_RDONLY | O_CLOEXEC);
+    char *log_path = test_path("vfork_fd_log");
+    int log = open(log_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    int hidden = open(log_path, O_RDONLY | O_CLOEXEC);
     fflush(stdout);
     int saved_stdout = fcntl(1, F_DUPFD_CLOEXEC, 0);
     if (log < 0 || hidden < 0 || saved_stdout < 0 || dup2(log, 1) != 1 ||
@@ -60,5 +65,15 @@ int main(int argc, char **argv) {
     if (length > 0) {
         fwrite(contents, 1, length, stdout);
     }
-    return 0;
+    // The child wrote, in order, through both descriptors that share the log's offset.
+    static const char expected[] = "child-fds via-stdout\n"
+                                   "child-fds via-log\n"
+                                   "child-fds stdin_setfl=1 hidden_closed=1\n";
+    int logged = length == (ssize_t)(sizeof expected - 1) &&
+                 memcmp(contents, expected, sizeof expected - 1) == 0;
+    // The child's `F_SETFL` changed the open file description the parent's stdin shares.
+    return waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 42 && logged &&
+                   offset == length && stdin_nonblock == 1
+               ? 0
+               : 1;
 }

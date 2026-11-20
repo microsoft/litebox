@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// `kill` signals other processes, naming its sender and the receiver's user, terminates a child
+// that has only just started, and reports processes that don't exist.
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <limits.h>
@@ -64,6 +67,11 @@ int main(int argc, char **argv) {
            "exit=%d\n",
            child, waited, usr2_count, usr2_pid, usr2_code, usr2_uid_matches, alive, sent,
            WEXITSTATUS(status));
+    // Each signal reports its sender's process ID and the receiver's user; the child checks the
+    // one it takes.
+    int failures = usr2_count != 1 || usr2_pid != child || usr2_code != SI_USER ||
+                   !usr2_uid_matches || !alive || !sent || waited != child ||
+                   !WIFEXITED(status) || WEXITSTATUS(status) != 42;
 
     // A signal sent as soon as the child starts terminates it, even before it can take signals.
     child = spawn("kill-wait");
@@ -72,12 +80,15 @@ int main(int argc, char **argv) {
     waited = waitpid(child, &status, 0);
     printf("killed child=%d waited=%d sent=%d signaled=%d signal=%d\n", child, waited, sent,
            WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    failures += waited != child || !sent || !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL;
 
     errno = 0;
     int missing = kill(INT_MAX, SIGTERM) == -1 && errno == ESRCH;
     errno = 0;
     int missing_check = kill(INT_MAX, 0) == -1 && errno == ESRCH;
-    printf("missing esrch=%d check_esrch=%d self_check=%d\n", missing, missing_check,
-           kill(getpid(), 0) == 0);
-    return 0;
+    int self_check = kill(getpid(), 0) == 0;
+    printf("missing esrch=%d check_esrch=%d self_check=%d\n", missing, missing_check, self_check);
+    failures += !missing || !missing_check || !self_check;
+    printf("vfork-kill failures=%d\n", failures);
+    return failures != 0;
 }

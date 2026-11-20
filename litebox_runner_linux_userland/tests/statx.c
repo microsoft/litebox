@@ -17,9 +17,10 @@
 #define STATX__RESERVED 0x80000000U
 #endif
 
-#define TEST_PATH "/tmp/statx_test_file"
 #define TEST_CONTENT "hello statx"
 #define TEST_CONTENT_LEN ((size_t)(sizeof(TEST_CONTENT) - 1))
+
+static char *test_file_path;
 
 static int raw_statx(int dirfd, const char *pathname, int flags,
                      unsigned int mask, struct statx *buf) {
@@ -45,7 +46,7 @@ static void expect_statx_errno(int dirfd, const char *pathname, int flags,
 }
 
 static void seed_test_file(void) {
-    int fd = openat(AT_FDCWD, TEST_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = openat(AT_FDCWD, test_file_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     TEST_ASSERT(fd >= 0, "openat create test file");
     ssize_t n = write(fd, TEST_CONTENT, TEST_CONTENT_LEN);
     TEST_ASSERT(n == (ssize_t)TEST_CONTENT_LEN, "write test content");
@@ -53,12 +54,12 @@ static void seed_test_file(void) {
 }
 
 static void cleanup_test_file(void) {
-    (void)unlink(TEST_PATH);
+    (void)unlink(test_file_path);
 }
 
 static void test_absolute_happy_path(void) {
     struct statx sx;
-    expect_statx(AT_FDCWD, TEST_PATH, 0, STATX_BASIC_STATS, &sx,
+    expect_statx(AT_FDCWD, test_file_path, 0, STATX_BASIC_STATS, &sx,
                  "statx absolute happy path");
     TEST_ASSERT((sx.stx_mask & STATX_TYPE) != 0, "stx_mask STATX_TYPE set");
     TEST_ASSERT((sx.stx_mask & STATX_SIZE) != 0, "stx_mask STATX_SIZE set");
@@ -67,7 +68,7 @@ static void test_absolute_happy_path(void) {
 }
 
 static void test_at_empty_path_fd(void) {
-    int fd = openat(AT_FDCWD, TEST_PATH, O_RDONLY);
+    int fd = openat(AT_FDCWD, test_file_path, O_RDONLY);
     TEST_ASSERT(fd >= 0, "openat for AT_EMPTY_PATH");
     struct statx sx;
     memset(&sx, 0, sizeof(sx));
@@ -89,7 +90,7 @@ static void test_at_empty_path_cwd(void) {
 }
 
 static void test_enoent(void) {
-    expect_statx_errno(AT_FDCWD, "/tmp/statx_does_not_exist_xyzzy", 0,
+    expect_statx_errno(AT_FDCWD, test_path("statx_does_not_exist_xyzzy"), 0,
                        STATX_BASIC_STATS, ENOENT, "statx ENOENT on missing path");
 }
 
@@ -107,19 +108,20 @@ static void test_ebadf(void) {
 }
 
 static void test_einval_reserved_mask(void) {
-    expect_statx_errno(AT_FDCWD, TEST_PATH, 0, STATX__RESERVED, EINVAL,
+    expect_statx_errno(AT_FDCWD, test_file_path, 0, STATX__RESERVED, EINVAL,
                        "statx EINVAL on STATX__RESERVED mask bit");
 }
 
 static void test_einval_bad_flag(void) {
     // Pick a bit that is not in any documented AT_* / AT_STATX_* flag.
     const int bogus_flag = 0x40000000;
-    expect_statx_errno(AT_FDCWD, TEST_PATH, bogus_flag, STATX_BASIC_STATS, EINVAL,
+    expect_statx_errno(AT_FDCWD, test_file_path, bogus_flag, STATX_BASIC_STATS, EINVAL,
                        "statx EINVAL on bogus flag bit");
 }
 
 int main(void) {
     printf("statx tests starting...\n");
+    test_file_path = test_path("statx_test_file");
     seed_test_file();
     test_absolute_happy_path();
     test_at_empty_path_fd();

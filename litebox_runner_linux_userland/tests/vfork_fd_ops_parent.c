@@ -1,7 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// `posix_spawn` file actions change only the child's descriptor table, which then transfers through
+// `execve`. A vfork child that exits without `execve` changes only its own descriptors and working
+// directory, and its descriptors close when the parent resumes.
+
 #define _GNU_SOURCE
+#include "helpers.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <spawn.h>
@@ -11,8 +16,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define LOG_PATH "/tmp/vfork_fd_ops_log"
-#define CWD_DIR "/tmp"
 #define CWD_FILE "vfork_fd_ops_cwd"
 #define OPENED_FD 10
 
@@ -28,7 +31,8 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    int log = open(LOG_PATH, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    char *log_path = test_path("vfork_fd_ops_log");
+    int log = open(log_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     // A close-on-exec descriptor far above the others, which the children also get.
     int high[300];
     for (int i = 0; i < 300; i++) {
@@ -51,7 +55,7 @@ int main(int argc, char **argv) {
     posix_spawn_file_actions_addclose(&actions, p[1]);
     posix_spawn_file_actions_adddup2(&actions, log, 1);
     posix_spawn_file_actions_adddup2(&actions, log, log);
-    posix_spawn_file_actions_addopen(&actions, OPENED_FD, LOG_PATH, O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, OPENED_FD, log_path, O_RDONLY, 0);
     char *child_argv[] = {argv[1], "open-fds", NULL};
     fflush(stdout);
     pid_t child;
@@ -62,18 +66,30 @@ int main(int argc, char **argv) {
     off_t offset = lseek(log, 0, SEEK_CUR);
     char contents[512];
     ssize_t length = pread(log, contents, sizeof contents, 0);
+    int exited = waited == child && WIFEXITED(status);
+    int pipe_open = is_open(p[0]) && is_open(p[1]);
     printf("spawn ret=%d exited=%d code=%d log_cloexec=%d pipe_open=%d opened_closed=%d "
            "offset=%lld length=%zd\n",
-           ret, waited == child && WIFEXITED(status), WEXITSTATUS(status), is_cloexec(log),
-           is_open(p[0]) && is_open(p[1]), opened_closed, (long long)offset, length);
+           ret, exited, WEXITSTATUS(status), is_cloexec(log), pipe_open, opened_closed,
+           (long long)offset, length);
     if (length > 0) {
         fwrite(contents, 1, length, stdout);
     }
+    // The child had only the standard streams, `log`, and the descriptor its file action opened,
+    // and wrote through its stdout at the offset the parent's `log` shares.
+    char expected[64];
+    int expected_length =
+        snprintf(expected, sizeof expected, "child-open-fds 0 1 2 %d %d\n", log, OPENED_FD);
+    int failures = ret != 0 || !exited || WEXITSTATUS(status) != 42 || !is_cloexec(log) ||
+                   !pipe_open || !opened_closed;
+    failures += length != expected_length || memcmp(contents, expected, expected_length) != 0 ||
+                offset != length;
 
     // The child changes its own descriptors and working directory, and exits without `execve`.
     char parent_cwd[256];
-    unlink(CWD_DIR "/" CWD_FILE);
-    int dir = open(CWD_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    char *cwd_path = test_path(CWD_FILE);
+    unlink(cwd_path);
+    int dir = open(test_dir(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dir < 0 || chdir("/") != 0 || getcwd(parent_cwd, sizeof parent_cwd) == NULL) {
         perror("cwd setup");
         return 4;
@@ -92,18 +108,21 @@ int main(int argc, char **argv) {
         _exit(0);
     }
     waited = child < 0 ? -1 : waitpid(child, &status, 0);
-    int pipe_open = is_open(p[0]) && is_open(p[1]);
+    pipe_open = is_open(p[0]) && is_open(p[1]);
     char cwd[256];
     int cwd_kept = getcwd(cwd, sizeof cwd) != NULL && strcmp(cwd, parent_cwd) == 0;
-    int child_cwd = access(CWD_DIR "/" CWD_FILE, F_OK) == 0;
+    int child_cwd = access(cwd_path, F_OK) == 0;
     close(p[1]);
     // The pipe reaches end-of-file only once the child's copies of its write end are closed too.
     char byte = 0;
     ssize_t first = read(p[0], &byte, 1);
     ssize_t second = read(p[0], &byte, 1);
+    exited = waited == child && WIFEXITED(status);
     printf("vfork exited=%d code=%d log_cloexec=%d pipe_open=%d first=%zd byte=%c second=%zd "
            "child_cwd=%d cwd_kept=%d\n",
-           waited == child && WIFEXITED(status), WEXITSTATUS(status), is_cloexec(log), pipe_open,
-           first, byte, second, child_cwd, cwd_kept);
-    return 0;
+           exited, WEXITSTATUS(status), is_cloexec(log), pipe_open, first, byte, second, child_cwd,
+           cwd_kept);
+    failures += !exited || WEXITSTATUS(status) != 0 || !is_cloexec(log) || !pipe_open ||
+                first != 1 || byte != 'x' || second != 0 || !child_cwd || !cwd_kept;
+    return failures != 0;
 }

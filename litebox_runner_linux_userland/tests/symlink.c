@@ -4,7 +4,7 @@
 #include "helpers.h"
 
 int main(void) {
-    char path[] = "/tmp/lb_symlink_XXXXXX";
+    char *path = test_path("lb_symlink_XXXXXX");
     char absolute[4096], target[64];
     struct stat file_st, link_st;
 

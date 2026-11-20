@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// A forked child shares its parent's `flock` ownership through the open file description they
+// share, while a fresh open of the file conflicts with it, on both a writable filesystem and
+// LiteBox's read-only program image.
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -98,11 +102,9 @@ static void child_checks(const char *path, int inherited, int request, int reply
     _exit(0);
 }
 
-int main(int argc, char **argv) {
-    TEST_ASSERT(argc == 2, "expected lock file path");
-    set_handler(SIGALRM, on_timeout, 0);
+static void check_fork_locks(const char *path) {
     alarm(30);
-    int fd = open(argv[1], O_RDONLY);
+    int fd = open(path, O_RDONLY);
     TEST_ASSERT(fd >= 0, "parent open");
     TEST_ASSERT(flock(fd, LOCK_EX | LOCK_NB) == 0, "parent exclusive lock");
     int request[2], reply[2];
@@ -112,7 +114,7 @@ int main(int argc, char **argv) {
     if (child == 0) {
         close(request[1]);
         close(reply[0]);
-        child_checks(argv[1], fd, request[0], reply[1]);
+        child_checks(path, fd, request[0], reply[1]);
     }
     close(request[0]);
     close(reply[1]);
@@ -150,6 +152,17 @@ int main(int argc, char **argv) {
     close(request[1]);
     close(reply[0]);
     alarm(0);
+}
+
+int main(int argc, char **argv) {
+    TEST_ASSERT(argc > 0 && argv[0][0] == '/', "program path must be absolute");
+    set_handler(SIGALRM, on_timeout, 0);
+    check_fork_locks(argv[0]);
+    const char *path = test_path("fork_flock_lock");
+    int created = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    TEST_ASSERT(created >= 0 && close(created) == 0, "create lock file");
+    check_fork_locks(path);
+    TEST_ASSERT(unlink(path) == 0, "remove lock file");
     puts("flock-fork inherited=1 conflict=1 shared=1 blocked=1 close=1 interrupted=1 exit=1");
     return 0;
 }

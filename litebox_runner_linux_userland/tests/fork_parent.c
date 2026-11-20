@@ -176,8 +176,9 @@ static unsigned long checksum(const unsigned char *buffer, size_t size) {
     return sum;
 }
 
-// Reaps `child`, polling if `options` has `WNOHANG`, which reaps it as soon as it exits.
-static int wait_for(pid_t child, const char *name, int options) {
+// Reaps `child`, polling if `options` has `WNOHANG`, which reaps it as soon as it exits, and
+// returns whether it failed to exit with `code`.
+static int wait_for(pid_t child, const char *name, int options, int code) {
     int status = 0;
     pid_t waited;
     do {
@@ -187,7 +188,7 @@ static int wait_for(pid_t child, const char *name, int options) {
     sigchld_before_reap &= sigchld_count >= ++reaped_count;
     printf("%s child=%d waited=%d exited=%d code=%d\n", name, child, waited, WIFEXITED(status),
            WEXITSTATUS(status));
-    return waited == child ? 0 : 1;
+    return waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != code;
 }
 
 // Runs in the child returned by glibc's `fork`.
@@ -306,7 +307,12 @@ int main(void) {
         }
     }
     printf("pipe %s", message);
-    int failures = wait_for(child, "fork", 0);
+    // The child reports its ID, which is the one `fork` returned here, and no failures.
+    int reported_pid = 0;
+    int child_failures = -1;
+    int failures = sscanf(message, "child pid=%d failures=%d", &reported_pid, &child_failures) != 2 ||
+                   reported_pid != child || child == parent || child_failures != 0;
+    failures += wait_for(child, "fork", 0, 7);
 
     pid_t raw_child = raw_fork();
     if (raw_child == 0) {
@@ -316,18 +322,22 @@ int main(void) {
         perror("raw fork");
         return 5;
     }
-    failures += wait_for(raw_child, "raw-fork", WNOHANG);
+    failures += raw_child == parent || raw_child == child;
+    failures += wait_for(raw_child, "raw-fork", WNOHANG, 9);
     failures += check_clone_forms();
 
     pid_t again = waitpid(-1, NULL, WNOHANG);
     int again_errno = errno;
     // The parent keeps its alarm.
     unsigned int alarm_left = alarm(0);
+    int intact =
+        checksum(buffer, BUFFER_SIZE) == expected_sum && exec_only() == 42 && hidden_is_intact();
+    int echild = again == -1 && again_errno == ECHILD;
+    int alarm_kept = alarm_left > 0 && alarm_left <= ALARM_SECONDS;
     printf("parent pid=%d global=%d intact=%d usr1=%d sigchld=%d echild=%d alarm=%d\n", getpid(),
-           global_value,
-           checksum(buffer, BUFFER_SIZE) == expected_sum && exec_only() == 42 &&
-               hidden_is_intact(),
-           usr1_count, sigchld_before_reap, again == -1 && again_errno == ECHILD,
-           alarm_left > 0 && alarm_left <= ALARM_SECONDS);
+           global_value, intact, usr1_count, sigchld_before_reap, echild, alarm_kept);
+    // The child's writes and signal stay in the child.
+    failures += global_value != 2 || !intact || usr1_count != 0;
+    failures += !sigchld_before_reap || !echild || !alarm_kept;
     return failures;
 }

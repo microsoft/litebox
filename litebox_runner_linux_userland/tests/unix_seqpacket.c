@@ -31,11 +31,9 @@ static void send_record(int fd, const char *record, const char *op) {
 }
 
 static socklen_t abstract_address(struct sockaddr_un *address, const char *name) {
-    memset(address, 0, sizeof(*address));
-    address->sun_family = AF_UNIX;
-    int len = snprintf(address->sun_path + 1, sizeof(address->sun_path) - 1, "lb_seqpacket_%s_%d",
-                       name, getpid());
-    return offsetof(struct sockaddr_un, sun_path) + 1 + len;
+    char file[64];
+    snprintf(file, sizeof(file), "lb_seqpacket_%s", name);
+    return test_socket_address(address, file, 1);
 }
 
 static int listen_on(int type, const struct sockaddr_un *address, socklen_t length) {
@@ -226,11 +224,9 @@ static void test_wrong_type_connect(void) {
     close(seqpacket);
     close(stream_listener);
 
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/lb_seqpacket_%d", getpid());
-    unlink(path);
-    struct sockaddr_un path_address = {.sun_family = AF_UNIX};
-    strncpy(path_address.sun_path, path, sizeof(path_address.sun_path) - 1);
+    struct sockaddr_un path_address;
+    test_socket_address(&path_address, "lb_seqpacket", 0);
+    const char *path = path_address.sun_path;
     int path_listener = listen_on(SOCK_STREAM, &path_address, sizeof(path_address));
     seqpacket = socket(AF_UNIX, SOCK_SEQPACKET, 0);
     TEST_ASSERT(seqpacket >= 0, "socket(seqpacket)");

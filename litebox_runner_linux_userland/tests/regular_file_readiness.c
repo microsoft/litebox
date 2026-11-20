@@ -26,7 +26,7 @@ static void check_readiness(int fd) {
 }
 
 int main(void) {
-    char path[] = "/tmp/regular_file_readiness.XXXXXX";
+    char *path = test_path("regular_file_readiness.XXXXXX");
     int fd = mkstemp(path);
     TEST_ASSERT(fd >= 0, "mkstemp");
     int reader = open(path, O_RDONLY);

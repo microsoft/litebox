@@ -9,7 +9,7 @@
 #error SYS_getdents64 is not defined on this build host
 #endif
 
-#define TEST_DIR "/tmp/lb_dup_directory_position"
+#define TEST_DIR_NAME "lb_dup_directory_position"
 #define GETDENTS_BUFFER_SIZE 48
 #define MAX_CHUNK_ENTRIES 2
 #define NAME_CAPACITY 32
@@ -92,25 +92,25 @@ static int chunks_have_same_names(const struct name_chunk *left,
 }
 
 static void create_entries(void) {
-    TEST_ASSERT(mkdir(TEST_DIR, 0700) == 0, "create test directory failed");
-    create_test_file(TEST_DIR "/a", 0600);
-    create_test_file(TEST_DIR "/b", 0600);
-    create_test_file(TEST_DIR "/c", 0600);
-    create_test_file(TEST_DIR "/d", 0600);
+    TEST_ASSERT(mkdir(test_path(TEST_DIR_NAME), 0700) == 0, "create test directory failed");
+    create_test_file(test_path(TEST_DIR_NAME "/a"), 0600);
+    create_test_file(test_path(TEST_DIR_NAME "/b"), 0600);
+    create_test_file(test_path(TEST_DIR_NAME "/c"), 0600);
+    create_test_file(test_path(TEST_DIR_NAME "/d"), 0600);
 }
 
 static void cleanup(void) {
-    TEST_ASSERT(unlink(TEST_DIR "/a") == 0, "remove a failed");
-    TEST_ASSERT(unlink(TEST_DIR "/b") == 0, "remove b failed");
-    TEST_ASSERT(unlink(TEST_DIR "/c") == 0, "remove c failed");
-    TEST_ASSERT(unlink(TEST_DIR "/d") == 0, "remove d failed");
-    TEST_ASSERT(rmdir(TEST_DIR) == 0, "remove test directory failed");
+    TEST_ASSERT(unlink(test_path(TEST_DIR_NAME "/a")) == 0, "remove a failed");
+    TEST_ASSERT(unlink(test_path(TEST_DIR_NAME "/b")) == 0, "remove b failed");
+    TEST_ASSERT(unlink(test_path(TEST_DIR_NAME "/c")) == 0, "remove c failed");
+    TEST_ASSERT(unlink(test_path(TEST_DIR_NAME "/d")) == 0, "remove d failed");
+    TEST_ASSERT(rmdir(test_path(TEST_DIR_NAME)) == 0, "remove test directory failed");
 }
 
 int main(void) {
     create_entries();
 
-    int dir_fd = open(TEST_DIR, O_RDONLY | O_DIRECTORY);
+    int dir_fd = open(test_path(TEST_DIR_NAME), O_RDONLY | O_DIRECTORY);
     TEST_ASSERT(dir_fd >= 0, "open test directory failed");
     int dup_fd = dup(dir_fd);
     TEST_ASSERT(dup_fd >= 0, "duplicate directory descriptor failed");

@@ -14,35 +14,9 @@
 //   - Verify the non‑CLOEXEC fd is still open.
 // Exit status 0 on success; nonzero on failure.
 
-#define _GNU_SOURCE
-#include <errno.h>
-#include <fcntl.h>
+#include "helpers.h"
 #include <pthread.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 #include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-
-#define CLO_PATH "/tmp/execve_clo"
-#define KEEP_PATH "/tmp/execve_keep"
-
-static void die(const char *msg) {
-    perror(msg);
-    exit(2);
-}
-
-// Keep this copy in sync with helpers.h; including it would redefine die().
-#if defined(__x86_64__) || defined(__i386__)
-#define SPIN_HINT() __asm__ __volatile__("pause")
-#elif defined(__aarch64__)
-#define SPIN_HINT() __asm__ __volatile__("yield")
-#else
-#define SPIN_HINT() __asm__ __volatile__("")
-#endif
 
 void* spin_thread(void* arg) {
     for (;;) {
@@ -83,12 +57,14 @@ void* exec_thread(void* arg) {
 
 int main(int argc, char *argv[], char *envp[]) {
     const char *phase = getenv("PHASE");
+    char *clo_path = test_path("execve_clo");
+    char *keep_path = test_path("execve_keep");
 
     if (!phase) {
         // Phase 1: set up descriptors and exec self.
-        int fd_clo = open(CLO_PATH, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        int fd_clo = open(clo_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
         if (fd_clo < 0) die("open cloexec");
-        int fd_keep = open(KEEP_PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        int fd_keep = open(keep_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
         if (fd_keep < 0) die("open keep");
 
         char clo_buf[32], keep_buf[32];
@@ -107,9 +83,17 @@ int main(int argc, char *argv[], char *envp[]) {
         new_argv[3] = exec_args.tid_buf;
         new_argv[4] = NULL;
 
-        char *new_envp[2];
-        new_envp[0] = "PHASE=after_exec";
-        new_envp[1] = NULL;
+        // Pass on TMPDIR, if set, so that phase 2 resolves the same paths.
+        char *new_envp[3];
+        int envc = 0;
+        new_envp[envc++] = "PHASE=after_exec";
+        const char *tmpdir = getenv("TMPDIR");
+        char *tmpdir_env = NULL;
+        if (tmpdir != NULL && tmpdir[0] != 0) {
+            if (asprintf(&tmpdir_env, "TMPDIR=%s", tmpdir) < 0) die("asprintf");
+            new_envp[envc++] = tmpdir_env;
+        }
+        new_envp[envc] = NULL;
         exec_args.argv = new_argv;
         exec_args.envp = new_envp;
 
@@ -191,8 +175,8 @@ int main(int argc, char *argv[], char *envp[]) {
     if (keep_flags != -1) {
         close(fd_keep);
     }
-    unlink(CLO_PATH);
-    unlink(KEEP_PATH);
+    unlink(clo_path);
+    unlink(keep_path);
 
     if (ok) {
         printf("[OK] exec caller became leader; cloexec fd %d closed; keep fd %d open\n",

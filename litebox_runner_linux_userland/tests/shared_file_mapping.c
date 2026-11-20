@@ -28,10 +28,7 @@ static char SHORT_PATH[4096];
 static char CODE_PATH[4096];
 
 static void name_files(pid_t main_process) {
-    const char *directory = getenv("TMPDIR");
-    if (directory == NULL || directory[0] == 0) {
-        directory = "/tmp";
-    }
+    const char *directory = test_dir();
     int id = (int)main_process;
     snprintf(PATH, sizeof(PATH), "%s/shared-file-mapping-%d", directory, id);
     snprintf(SHORT_PATH, sizeof(SHORT_PATH), "%s/shared-file-mapping-%d-short", directory, id);
@@ -273,7 +270,9 @@ int main(int argc, char **argv) {
         return exec_child();
     }
     name_files(getpid());
-    const char *self = argc >= 2 ? argv[1] : NULL;
+    // The program reruns itself, from its own path, for the exec check.
+    const char *self = argv[0][0] == '/' ? argv[0] : NULL;
+    CHECK(self != NULL);
     long page = sysconf(_SC_PAGESIZE);
     // Ends the test, as failed, if anything hangs, well before the harness gives up on it.
     signal(SIGALRM, on_watchdog);
@@ -360,7 +359,7 @@ int main(int argc, char **argv) {
     close(write_only);
 
     // A directory has no contents to map, and is never open for writing.
-    int directory = open("/tmp", O_RDONLY | O_DIRECTORY);
+    int directory = open(test_dir(), O_RDONLY | O_DIRECTORY);
     CHECK(directory >= 0);
     errno = 0;
     CHECK(mmap(NULL, page, PROT_READ, MAP_SHARED, directory, 0) == MAP_FAILED);

@@ -10,16 +10,21 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static int wait_for(pid_t child_pid, const char *name) {
+static pid_t parent_before;
+
+// Reaps `child_pid`, reporting it as `name`, and returns whether it failed to exit with `code`.
+static int wait_for(pid_t child_pid, const char *name, int code) {
     int status = 0;
     pid_t waited = waitpid(child_pid, &status, 0);
     printf("%s child=%d waited=%d exited=%d code=%d\n", name, child_pid, waited,
            WIFEXITED(status), WEXITSTATUS(status));
-    return waited == child_pid ? 0 : 1;
+    return waited != child_pid || child_pid == parent_before || !WIFEXITED(status) ||
+           WEXITSTATUS(status) != code;
 }
 
+// A vfork child that exits, by any route, resumes its parent, which can wait for it.
 int main(void) {
-    pid_t parent_before = getpid();
+    parent_before = getpid();
     printf("vfork-started\n");
     fflush(stdout);
 
@@ -31,7 +36,7 @@ int main(void) {
         perror("vfork");
         return 2;
     }
-    int failures = wait_for(exit_group_child, "exit_group");
+    int failures = wait_for(exit_group_child, "exit_group", 37);
 
     pid_t exit_child = vfork();
     if (exit_child == 0) {
@@ -43,7 +48,7 @@ int main(void) {
         perror("vfork");
         return 3;
     }
-    failures += wait_for(exit_child, "exit");
+    failures += wait_for(exit_child, "exit", 38);
 
     // An allowed syscall with invalid arguments fails in the child; its errno is the exit code.
     pid_t bad_args_child = vfork();
@@ -56,20 +61,11 @@ int main(void) {
         perror("vfork");
         return 5;
     }
-    failures += wait_for(bad_args_child, "bad_args");
+    failures += wait_for(bad_args_child, "bad_args", EINVAL);
 
-    // A vfork child cannot run while an alarm is armed, but one disarmed with `alarm(0)` (as
-    // busybox httpd does before running a CGI program) no longer counts.
+    // An alarm disarmed with `alarm(0)`, as busybox httpd does before running a CGI program, leaves
+    // vfork working.
     alarm(60);
-    pid_t armed_child = vfork();
-    if (armed_child == 0) {
-        _exit(112);
-    }
-    int armed_errno = errno;
-    if (armed_child > 0) {
-        failures += wait_for(armed_child, "armed");
-    }
-    printf("armed eagain=%d\n", armed_child == -1 && armed_errno == EAGAIN);
     alarm(0);
     pid_t disarmed_child = vfork();
     if (disarmed_child == 0) {
@@ -79,11 +75,11 @@ int main(void) {
         perror("vfork after alarm(0)");
         return 4;
     }
-    failures += wait_for(disarmed_child, "disarmed");
+    failures += wait_for(disarmed_child, "disarmed", 39);
 
     pid_t again = waitpid(-1, NULL, WNOHANG);
     int again_errno = errno;
-    printf("parent before=%d after=%d echild=%d\n", parent_before, getpid(),
-           again == -1 && again_errno == ECHILD);
-    return failures;
+    int echild = again == -1 && again_errno == ECHILD;
+    printf("parent before=%d after=%d echild=%d\n", parent_before, getpid(), echild);
+    return failures + (getpid() != parent_before) + !echild;
 }

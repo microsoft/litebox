@@ -15,10 +15,9 @@ static int make_listen_socket(struct sockaddr_un *sa, const char *name) {
     if (fd < 0) {
         die("socket(listen)");
     }
-    memset(sa, 0, sizeof(*sa));
-    sa->sun_family = AF_UNIX;
-    snprintf(sa->sun_path, sizeof(sa->sun_path), "/tmp/lb_shut_%s_%d", name, getpid());
-    unlink(sa->sun_path);
+    char file[64];
+    snprintf(file, sizeof(file), "lb_shut_%s", name);
+    test_socket_address(sa, file, 0);
     if (bind(fd, (struct sockaddr *)sa, sizeof(*sa)) != 0) {
         die("bind(listen)");
     }

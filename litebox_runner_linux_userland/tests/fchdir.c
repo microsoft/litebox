@@ -8,7 +8,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
-#define TEST_DIR "/tmp/lb_fchdir"
+#define TEST_DIR_NAME "lb_fchdir"
 
 static char test_dir_cwd[4096];
 
@@ -30,7 +30,7 @@ static void test_at_syscalls(int dirfd) {
 
     // The CWD is `/`, so only `dirfd` can resolve these paths.
     create_file(dirfd, "file");
-    TEST_ASSERT(stat(TEST_DIR "/file", &st) == 0 && S_ISREG(st.st_mode),
+    TEST_ASSERT(stat(test_path(TEST_DIR_NAME "/file"), &st) == 0 && S_ISREG(st.st_mode),
                 "openat should create the file in dirfd");
     TEST_ASSERT(fstatat(dirfd, "file", &st, 0) == 0 && S_ISREG(st.st_mode),
                 "fstatat relative to dirfd failed");
@@ -38,11 +38,11 @@ static void test_at_syscalls(int dirfd) {
                 "faccessat relative to dirfd failed");
     TEST_ASSERT(fchmodat(dirfd, "file", 0640, 0) == 0,
                 "fchmodat relative to dirfd failed");
-    TEST_ASSERT(stat(TEST_DIR "/file", &st) == 0 && (st.st_mode & 0777) == 0640,
+    TEST_ASSERT(stat(test_path(TEST_DIR_NAME "/file"), &st) == 0 && (st.st_mode & 0777) == 0640,
                 "fchmodat should change the file in dirfd");
 
     TEST_ASSERT(mkdirat(dirfd, "sub", 0700) == 0, "mkdirat relative to dirfd failed");
-    TEST_ASSERT(stat(TEST_DIR "/sub", &st) == 0 && S_ISDIR(st.st_mode),
+    TEST_ASSERT(stat(test_path(TEST_DIR_NAME "/sub"), &st) == 0 && S_ISDIR(st.st_mode),
                 "mkdirat should create the directory in dirfd");
     TEST_ASSERT(symlinkat("file", dirfd, "sub/../link") == 0,
                 "symlinkat relative to dirfd failed");
@@ -50,12 +50,13 @@ static void test_at_syscalls(int dirfd) {
     TEST_ASSERT(len == 4 && memcmp(buf, "file", 4) == 0, "readlinkat relative to dirfd failed");
     TEST_ASSERT(renameat(dirfd, "link", dirfd, "sub/link") == 0,
                 "renameat relative to dirfd failed");
-    TEST_ASSERT(lstat(TEST_DIR "/sub/link", &st) == 0 && S_ISLNK(st.st_mode),
+    TEST_ASSERT(lstat(test_path(TEST_DIR_NAME "/sub/link"), &st) == 0 && S_ISLNK(st.st_mode),
                 "renameat should move the link within dirfd");
     TEST_ASSERT(unlinkat(dirfd, "sub/link", 0) == 0, "unlinkat relative to dirfd failed");
     TEST_ASSERT(unlinkat(dirfd, "sub", AT_REMOVEDIR) == 0,
                 "unlinkat AT_REMOVEDIR relative to dirfd failed");
-    expect_errno(stat(TEST_DIR "/sub", &st), ENOENT, "unlinkat should remove the directory");
+    expect_errno(stat(test_path(TEST_DIR_NAME "/sub"), &st), ENOENT,
+                 "unlinkat should remove the directory");
 }
 
 static void test_at_syscall_errors(int dirfd) {
@@ -76,7 +77,7 @@ static void test_at_syscall_errors(int dirfd) {
     expect_errno(mkdirat(closed_fd, "x", 0700), EBADF, "mkdirat relative to a closed fd");
 
     // An absolute path ignores `dirfd` entirely.
-    TEST_ASSERT(fstatat(file_fd, TEST_DIR "/file", &st, 0) == 0,
+    TEST_ASSERT(fstatat(file_fd, test_path(TEST_DIR_NAME "/file"), &st, 0) == 0,
                 "fstatat with an absolute path should ignore dirfd");
 
     close(pipe_fds[0]);
@@ -116,7 +117,7 @@ static void test_fchdir(int dirfd) {
 
 // `fchdir` needs search permission on the directory as of the call, not as of the open.
 static void test_fchdir_search_permission(int dirfd) {
-    const char *path = TEST_DIR "/noexec";
+    const char *path = test_path(TEST_DIR_NAME "/noexec");
     char cwd[4096];
 
     // Root can search any directory.
@@ -141,19 +142,19 @@ static void test_fchdir_search_permission(int dirfd) {
 }
 
 int main(void) {
-    unlink(TEST_DIR "/file");
-    unlink(TEST_DIR "/sub/link");
-    rmdir(TEST_DIR "/sub");
-    rmdir(TEST_DIR "/noexec");
-    rmdir(TEST_DIR);
-    TEST_ASSERT(mkdir(TEST_DIR, 0700) == 0, "mkdir test directory failed");
+    unlink(test_path(TEST_DIR_NAME "/file"));
+    unlink(test_path(TEST_DIR_NAME "/sub/link"));
+    rmdir(test_path(TEST_DIR_NAME "/sub"));
+    rmdir(test_path(TEST_DIR_NAME "/noexec"));
+    rmdir(test_path(TEST_DIR_NAME));
+    TEST_ASSERT(mkdir(test_path(TEST_DIR_NAME), 0700) == 0, "mkdir test directory failed");
 
     // The CWD `chdir` reports for the test directory, which `fchdir` must match.
-    TEST_ASSERT(chdir(TEST_DIR) == 0, "chdir test directory failed");
+    TEST_ASSERT(chdir(test_path(TEST_DIR_NAME)) == 0, "chdir test directory failed");
     TEST_ASSERT(getcwd(test_dir_cwd, sizeof(test_dir_cwd)) != NULL, "getcwd failed");
     TEST_ASSERT(chdir("/") == 0, "chdir / failed");
 
-    int dirfd = open(TEST_DIR, O_RDONLY | O_DIRECTORY);
+    int dirfd = open(test_path(TEST_DIR_NAME), O_RDONLY | O_DIRECTORY);
     TEST_ASSERT(dirfd >= 0, "open test directory failed");
 
     printf("===== fchdir and dirfd tests =====\n");
@@ -163,8 +164,8 @@ int main(void) {
     test_fchdir_search_permission(dirfd);
 
     close(dirfd);
-    TEST_ASSERT(unlink(TEST_DIR "/file") == 0, "cleanup file failed");
-    TEST_ASSERT(rmdir(TEST_DIR) == 0, "cleanup test directory failed");
+    TEST_ASSERT(unlink(test_path(TEST_DIR_NAME "/file")) == 0, "cleanup file failed");
+    TEST_ASSERT(rmdir(test_path(TEST_DIR_NAME)) == 0, "cleanup test directory failed");
     printf("All fchdir and dirfd tests passed.\n");
     return 0;
 }

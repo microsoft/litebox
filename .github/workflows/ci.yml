@@ -369,18 +369,21 @@ jobs:
           chmod o+x "$HOME"
           unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'not test(/^vm::/)'
       - name: Test AArch64 copy-based fork
-        # Forces copy-based fork; the deep fork-chain, shared-futex, and shared file mapping
-        # tests need native fork.
+        # Forces copy-based fork, which refuses to fork a process with shared mappings: the deep
+        # fork-chain test and the tests that share memory across fork (shared futexes,
+        # sigtimedwait_fork_parent) need native fork, as do shared_file_mapping and
+        # thread_kill_process_parent, which the filter doesn't select. Native runs don't use
+        # LiteBox's fork.
         env:
           LITEBOX_DISABLE_NATIVE_FORK: "1"
         run: |
-          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_copy_based_fork -E '(binary(run) and test(/fork|hwcaps/) and not test(/^deep_fork|^forked_children_share_futexes|^shared_file_mappings_are_shared_across_fork/)) or (binary(rewritten_guests) and test(sve))'
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_copy_based_fork -E '(binary(run) and test(/fork|hwcaps/) and not test(/^deep_fork|^forked_children_share_futexes|^test_native::|::sigtimedwait_fork_parent$/)) or (binary(rewritten_guests) and test(sve))'
       - name: Test AArch64 native TP (PACGA)
         run: |
           ./.github/tools/github_actions_run_cargo nextest -p litebox_syscall_rewriter -p litebox_trampoline -p litebox_platform_linux_userland -p litebox_shim_linux --features litebox_platform_linux_userland/aarch64_pacga,litebox_shim_linux/aarch64_pacga
           # In-process runner tests need a matching native-TP broker.
           ./.github/tools/github_actions_run_cargo build -p litebox_broker_userland --features litebox_broker_userland/aarch64_pacga
-          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_pacga -E 'binary(run) or binary(rewritten_guests)'
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_pacga -E '(binary(run) and not test(/^test_native::/)) or binary(rewritten_guests)'
       # Nextest does not run doctests.
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc $AARCH64_CRATES

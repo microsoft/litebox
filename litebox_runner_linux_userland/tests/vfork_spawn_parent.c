@@ -1,7 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#define _GNU_SOURCE
+// Children created by `posix_spawn`, which uses `clone3`, and by glibc's `clone` wrapper, each with
+// a separate child stack, start like vfork children, as the processes the parent got for them;
+// spawn attributes change their signal state, and `CLONE_CLEAR_SIGHAND` drops the parent's
+// handlers.
+
+#include "helpers.h"
 #include <errno.h>
 #include <linux/sched.h>
 #include <sched.h>
@@ -10,11 +15,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 static char *child_path;
+static char parent_variable[32];
+static struct pid_report clone_report;
 static char child_stack[64 * 1024] __attribute__((aligned(16)));
 
 static void on_signal(int signal) { (void)signal; }
@@ -24,18 +32,27 @@ static void on_ill(int signal) {
     _exit(57);
 }
 
-static void report(const char *label, pid_t child) {
+// Reaps `child`, reporting it as `label`, and returns its wait status, or -1 if `child` isn't
+// another process this one reaped.
+static int report(const char *label, pid_t child) {
     int status = 0;
     pid_t waited = waitpid(child, &status, 0);
     printf("%s child=%d waited=%d exited=%d code=%d signaled=%d signal=%d\n", label, child,
            waited, WIFEXITED(status), WEXITSTATUS(status), WIFSIGNALED(status),
            WTERMSIG(status));
     fflush(stdout);
+    return child != getpid() && waited == child ? status : -1;
+}
+
+// Returns whether wait status `status` is an exit with `code`.
+static int exited_with(int status, int code) {
+    return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == code;
 }
 
 static int clone_child(void *marker) {
     char *argv[] = {child_path, marker, NULL};
-    char *envp[] = {"VFORK_EXEC_TEST=clone", NULL};
+    // The child checks that it is this process's child, with the marker `from-clone`.
+    char *envp[] = {"VFORK_EXEC_TEST=clone", parent_variable, clone_report.variable, NULL};
     execve(child_path, argv, envp);
     return 111;
 }
@@ -103,6 +120,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     child_path = argv[1];
+    snprintf(parent_variable, sizeof parent_variable, "VFORK_EXEC_PARENT=%d", getpid());
 
     struct sigaction handled = {.sa_handler = on_signal};
     struct sigaction ill = {.sa_handler = on_ill};
@@ -118,13 +136,19 @@ int main(int argc, char **argv) {
     // separate child stack.
     pid_t child;
     char *spawn_argv[] = {child_path, "from-spawn", NULL};
-    char *spawn_envp[] = {"VFORK_EXEC_TEST=spawn", NULL};
-    int ret = posix_spawn(&child, child_path, NULL, NULL, spawn_argv, spawn_envp);
+    // The child checks that it is this process's child, with the marker `from-spawn`.
+    char *spawn_envp[] = {"VFORK_EXEC_TEST=spawn", parent_variable, NULL};
+    struct pid_report spawn_report;
+    open_pid_report(&spawn_report);
+    char *reporting_envp[] = {"VFORK_EXEC_TEST=spawn", parent_variable, spawn_report.variable,
+                              NULL};
+    int ret = posix_spawn(&child, child_path, NULL, NULL, spawn_argv, reporting_envp);
     if (ret != 0) {
         printf("spawn-error ret=%d\n", ret);
         return 4;
     }
-    report("spawn", child);
+    int failures = !exited_with(report("spawn", child), 42);
+    failures += !pid_reported(&spawn_report, child);
 
     // Spawn attributes change the child's signal state before it execs.
     posix_spawnattr_t attr;
@@ -134,7 +158,9 @@ int main(int argc, char **argv) {
     sigaddset(&defaults, SIGHUP);
     sigemptyset(&mask);
     sigaddset(&mask, SIGTERM);
-    char *signals_argv[] = {child_path, "signals", NULL};
+    // In the order `vfork_exec_child.c` reports them: SIGPIPE still ignored but SIGHUP reset, SIGUSR2
+    // default, SIGTERM but not SIGUSR2 blocked, and no signals pending.
+    char *signals_argv[] = {child_path, "signals", "101.100000000", NULL};
     if (posix_spawnattr_init(&attr) != 0 || posix_spawnattr_setsigdefault(&attr, &defaults) != 0 ||
         posix_spawnattr_setsigmask(&attr, &mask) != 0 ||
         posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK) != 0) {
@@ -146,33 +172,42 @@ int main(int argc, char **argv) {
         printf("spawn-error ret=%d\n", ret);
         return 6;
     }
-    report("signals", child);
+    failures += !exited_with(report("signals", child), 42);
 
     // The child reports a failed exec to `posix_spawn`, which reaps it.
     ret = posix_spawn(&child, "/missing-spawn-executable", NULL, NULL, spawn_argv, spawn_envp);
     pid_t again = waitpid(-1, NULL, WNOHANG);
-    printf("missing ret=%d echild=%d\n", ret, again == -1 && errno == ECHILD);
+    int echild = again == -1 && errno == ECHILD;
+    printf("missing ret=%d echild=%d\n", ret, echild);
     fflush(stdout);
+    failures += ret != ENOENT || !echild;
 
     // glibc's `clone` wrapper uses the `clone` syscall with a separate child stack.
+    open_pid_report(&clone_report);
     child = clone(clone_child, child_stack + sizeof(child_stack),
                   CLONE_VM | CLONE_VFORK | SIGCHLD, "from-clone");
     if (child < 0) {
         perror("clone");
         return 7;
     }
-    report("clone", child);
+    failures += !exited_with(report("clone", child), 42);
+    failures += !pid_reported(&clone_report, child);
 
     child = clone3_clear_sighand();
     if (child < 0) {
         printf("clone3-error ret=%d\n", child);
         return 8;
     }
-    report("clear-sighand", child);
+    int status = report("clear-sighand", child);
+    failures += status == -1 || !WIFSIGNALED(status) || WTERMSIG(status) != SIGILL;
 
     // The children's handler resets do not reach the parent.
-    printf("parent-signals hup_ignored=%d usr2_handled=%d ill_handled=%d\n",
-           handler_is(SIGHUP, SIG_IGN), handler_is(SIGUSR2, on_signal),
-           handler_is(SIGILL, on_ill));
-    return 0;
+    int hup_ignored = handler_is(SIGHUP, SIG_IGN);
+    int usr2_handled = handler_is(SIGUSR2, on_signal);
+    int ill_handled = handler_is(SIGILL, on_ill);
+    printf("parent-signals hup_ignored=%d usr2_handled=%d ill_handled=%d\n", hup_ignored,
+           usr2_handled, ill_handled);
+    failures += !hup_ignored || !usr2_handled || !ill_handled;
+    printf("vfork-spawn failures=%d\n", failures);
+    return failures != 0;
 }

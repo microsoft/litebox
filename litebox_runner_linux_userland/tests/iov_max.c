@@ -59,7 +59,7 @@ static int open_seeded(const char *path) {
 }
 
 static void test_readv(void) {
-    const char *path = "/tmp/test_iov_max_readv.bin";
+    const char *path = test_path("test_iov_max_readv.bin");
     int fd = open_seeded(path);
 
     errno = 0;
@@ -79,7 +79,7 @@ static void test_readv(void) {
 }
 
 static void test_writev(void) {
-    const char *path = "/tmp/test_iov_max_writev.bin";
+    const char *path = test_path("test_iov_max_writev.bin");
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     TEST_ASSERT(fd >= 0, "open writev test file failed");
 
@@ -99,7 +99,7 @@ static void test_writev(void) {
 }
 
 static void test_preadv(void) {
-    const char *path = "/tmp/test_iov_max_preadv.bin";
+    const char *path = test_path("test_iov_max_preadv.bin");
     int fd = open_seeded(path);
 
     errno = 0;
@@ -118,7 +118,7 @@ static void test_preadv(void) {
 }
 
 static void test_pwritev(void) {
-    const char *path = "/tmp/test_iov_max_pwritev.bin";
+    const char *path = test_path("test_iov_max_pwritev.bin");
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     TEST_ASSERT(fd >= 0, "open pwritev test file failed");
 

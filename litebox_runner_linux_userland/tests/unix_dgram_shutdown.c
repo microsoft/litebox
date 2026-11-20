@@ -10,10 +10,9 @@ static void make_dgram_pair(int sv[2]) {
 }
 
 static void make_addr(struct sockaddr_un *addr, const char *name) {
-    memset(addr, 0, sizeof(*addr));
-    addr->sun_family = AF_UNIX;
-    snprintf(addr->sun_path, sizeof(addr->sun_path), "/tmp/lb_dgram_%s_%d", name, getpid());
-    unlink(addr->sun_path);
+    char file[64];
+    snprintf(file, sizeof(file), "lb_dgram_%s", name);
+    test_socket_address(addr, file, 0);
 }
 
 static int bind_dgram_addr(const struct sockaddr_un *addr, const char *op) {

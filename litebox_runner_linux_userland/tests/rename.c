@@ -4,7 +4,7 @@
 #include "helpers.h"
 
 int main(void) {
-    char path[] = "/tmp/lb_rename_XXXXXX";
+    char *path = test_path("lb_rename_XXXXXX");
     char buffer[5];
     struct stat st;
 

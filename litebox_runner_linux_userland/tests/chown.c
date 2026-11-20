@@ -4,7 +4,7 @@
 #include "helpers.h"
 
 int main(void) {
-    char path[] = "/tmp/lb_chown_XXXXXX";
+    char *path = test_path("lb_chown_XXXXXX");
     struct stat before, after;
 
     TEST_ASSERT(mkdtemp(path) != NULL, "mkdtemp failed");
