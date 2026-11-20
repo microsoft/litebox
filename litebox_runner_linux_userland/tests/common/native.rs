@@ -39,7 +39,9 @@ impl Native {
         }
         println!("Running `{}` natively", program.display());
         let mut command = isolated(program);
-        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        // Use a short absolute path even in deep worktrees or when the host's TMPDIR is long:
+        // Unix socket fixtures include TMPDIR in sockaddr_un.sun_path.
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
         command
             .env_clear()
             .env("HOME", "/")
