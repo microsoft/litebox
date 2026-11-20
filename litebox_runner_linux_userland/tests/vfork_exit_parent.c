@@ -63,10 +63,11 @@ int main(void) {
     }
     failures += wait_for(bad_args_child, "bad_args", EINVAL);
 
-    // An alarm disarmed with `alarm(0)`, as busybox httpd does before running a CGI program, leaves
-    // vfork working.
+    // Cancel an alarm before vfork, as busybox httpd does before running a CGI program.
     alarm(60);
-    alarm(0);
+    if (alarm(0) == 0) {
+        return 6;
+    }
     pid_t disarmed_child = vfork();
     if (disarmed_child == 0) {
         _exit(39);

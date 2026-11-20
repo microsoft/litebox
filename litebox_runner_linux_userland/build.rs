@@ -118,10 +118,6 @@ const NATIVE_SKIPPED_C_TESTS: &[(&str, &str)] = &[
         "needs arguments from its broker test",
     ),
     (
-        "urandom_broker.c",
-        "expects the test broker's fixed random bytes",
-    ),
-    (
         "vsock_unsupported.c",
         "checks LiteBox's policy; Linux supports AF_VSOCK",
     ),
