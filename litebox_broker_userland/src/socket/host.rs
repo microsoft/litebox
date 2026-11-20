@@ -95,6 +95,8 @@ pub(crate) trait HostErrno:
     const HOSTUNREACH: Self;
     const TIMEDOUT: Self;
     const INVAL: Self;
+    /// The host withholds what the call asks for from the broker's privileges.
+    const ACCES: Self;
 
     /// Maps an error that reports the host out of a resource to the broker's.
     fn broker_resource_error(self) -> Option<BrokerError>;
@@ -128,7 +130,7 @@ pub(crate) trait HostErrno:
 /// stays until a call or [`Self::take_error`] takes it, and
 /// [`Self::error_pending`] reports it until then.
 pub(crate) trait HostSocket: Sized + Send {
-    type Errno;
+    type Errno: HostErrno;
 
     /// Opens a TCP socket.
     fn tcp() -> Result<Self, Self::Errno>;
@@ -140,7 +142,9 @@ pub(crate) trait HostSocket: Sized + Send {
     /// which keeps every other socket off the port.
     fn tcp_listening(address: SocketAddrV4) -> Result<Self, Self::Errno>;
 
-    /// Listens with room for `backlog` connections; a listener keeps those pending.
+    /// Listens with room for `backlog` connections; a listener keeps those pending. A TCP socket
+    /// that the poller watches stays watched under its token, and reports a connection to accept
+    /// as [`SocketEvents::READABLE`].
     fn listen(&self, backlog: u32) -> Result<(), Self::Errno>;
 
     /// Accepts a listener's connection and its peer, or fails with [`HostErrno::AGAIN`].
@@ -150,6 +154,43 @@ pub(crate) trait HostSocket: Sized + Send {
 
     /// Binds the socket so that no other shares its port, whichever address either binds.
     fn bind_exclusively(&self, address: SocketAddrV4) -> Result<(), Self::Errno>;
+
+    /// Binds a TCP socket at `address` for a mirrored guest socket. With `reuse_address`, it
+    /// shares the address as far as the host's `SO_REUSEADDR` lets sockets that do not listen
+    /// share one; a host on which that would let other sockets take the port binds exclusively
+    /// whatever `reuse_address` says.
+    ///
+    /// Fails with [`HostErrno::ADDRINUSE`] if another socket holds the address, and with
+    /// [`HostErrno::ACCES`] only if the host withholds the address from the broker's
+    /// privileges, as Linux does a privileged port.
+    fn bind_as_guest(&self, address: SocketAddrV4, reuse_address: bool) -> Result<(), Self::Errno>;
+
+    /// Gets a preferred source address without sending traffic. This is a hint, not an
+    /// ownership check: policy routing can allow TCP while denying the UDP route used here.
+    fn preferred_source_for(destination: SocketAddrV4) -> Result<Option<Ipv4Addr>, Self::Errno> {
+        let hint = || {
+            let socket = Self::udp()?;
+            loop {
+                match socket.connect(destination) {
+                    Err(error) if error == <Self::Errno as HostErrno>::INTR => continue,
+                    result => result?,
+                }
+                return socket.local_address();
+            }
+        };
+        match hint() {
+            Ok(source) => Ok(Some(*source.ip())),
+            Err(error) if error.broker_resource_error().is_some() => Err(error),
+            Err(error) => {
+                // This probe chooses only a source for an already-authorized in-memory stream.
+                litebox_util_log::debug!("No UDP source hint for {destination}: {error}");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Whether this namespace owns the unicast address, independent of flow routing.
+    fn owns_address(address: Ipv4Addr) -> Result<bool, Self::Errno>;
 
     /// Connects to `address`, or starts connecting a TCP socket, which fails
     /// with [`HostErrno::INPROGRESS`].
@@ -166,6 +207,15 @@ pub(crate) trait HostSocket: Sized + Send {
     /// shutdown discards no queued data: receives return it before they end
     /// the stream.
     fn shutdown(&self, how: Shutdown) -> Result<(), Self::Errno>;
+
+    /// Disconnects a TCP socket in place, whatever its state, as Linux's `connect` to
+    /// `AF_UNSPEC` does: a listener stops listening and resets the connections it did not
+    /// accept, and a connect in progress stops, without a reset. The socket stays bound at a
+    /// port it was bound at explicitly, rather than one the host chose, but not at its address
+    /// if that was the wildcard and a connect chose another.
+    ///
+    /// Fails on a host that cannot disconnect a socket in place.
+    fn disconnect(&self) -> Result<(), Self::Errno>;
 
     /// Sends `data` with one system call, to `destination` if set, and
     /// returns how many bytes it sent.
@@ -278,6 +328,16 @@ pub(crate) trait HostSocket: Sized + Send {
     /// Makes closing the socket reset its connection instead of finishing
     /// it.
     fn set_linger_zero(&self) -> Result<(), Self::Errno>;
+
+    /// Changes whether a bound TCP socket shares its address, as
+    /// [`Self::bind_as_guest`] binds it, for the binds and listens that follow. A host that
+    /// binds a guest's socket exclusively whatever it asks ignores the change.
+    fn set_reuse_address(&self, value: bool) -> Result<(), Self::Errno>;
+
+    /// Reports whether a TCP socket shares its address, as [`Self::set_reuse_address`] last
+    /// set it, or as a connection a listener accepted took it from the listener when the host
+    /// connected it.
+    fn reuse_address(&self) -> Result<bool, Self::Errno>;
 
     fn set_receive_buffer_size(&self, size: usize) -> Result<(), Self::Errno>;
 

@@ -33,6 +33,16 @@
 //! lock are innermost: a thread may take them under any other lock, but takes
 //! nothing while holding them, and wakers run only after the stream's lock is
 //! released.
+//!
+//! With [`Networking::Mirrored`], each guest TCP socket binds a host socket of
+//! its own at the address the guest names, and a guest listener listens on
+//! it. A connect to a destination such a listener serves still makes an
+//! in-memory stream; any other connect is the host socket's own. The ports
+//! that in-memory streams name stay bound on the host while any end of them is
+//! open: the connector's bound host socket holds its port, and a listener's,
+//! once it stops listening, holds its port at the address it listened at, at
+//! every host address for the wildcard. A socket bound at a port the guest
+//! named keeps it, as on Linux, until it closes.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -50,10 +60,9 @@ use std::time::Duration;
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::stream::StreamWaker;
 use litebox_broker_core::socket::{
-    AcceptedPlatformSocket, GuestSocketBinding, GuestSourceLease, HOST_GATEWAY_IPV4_ADDRESS,
-    PlatformConnectError, PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus,
-    PlatformStreamReceive, SocketBindRequest, SocketEgress, SocketProvider,
-    is_internal_socket_address,
+    AcceptedPlatformSocket, GuestSourceLease, HOST_GATEWAY_IPV4_ADDRESS, PlatformConnectError,
+    PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
+    SocketAddressing, SocketBindRequest, SocketEgress, SocketProvider, is_internal_socket_address,
 };
 use litebox_broker_core::{BrokerError, Ipv4Cidr, ProcessKey, Result as BrokerResult};
 use litebox_broker_protocol::ObjectHandle;
@@ -65,7 +74,7 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-use crate::publish::{Protocol, Publish, Publishing};
+use crate::publish::{Networking, Protocol, Publish, Publishing};
 
 mod direct;
 mod host;
@@ -78,9 +87,9 @@ use host::{
     HostWaiter as _, Interest, Poller, Socket, SocketEvents, WAKE_TOKEN, Waiter,
 };
 use tcp::{
-    AcceptedEndpoints, PUBLISHED_EVENT_TOKEN_FLAG, ReceiveOutcome, TcpSocketState, TcpTopology,
-    create_tcp_transport, handle_socket_event, listen_published, status_tcp_socket,
-    tcp_peek_buffer,
+    AcceptedEndpoints, LISTENER_EVENT_TOKEN_FLAG, PUBLISHED_EVENT_TOKEN_FLAG, ReceiveOutcome,
+    TcpSocketState, TcpTopology, create_tcp_transport, handle_socket_event, listen_published,
+    status_tcp_socket, tcp_peek_buffer,
 };
 use udp::{
     ProcessCounters, QueueCounter, UDP_EVENT_TOKEN_FLAG, UdpInbox, UdpPeer, UdpPorts,
@@ -129,12 +138,35 @@ impl UserlandSocketProvider {
         max_sockets_per_process: usize,
         publishing: Publishing,
     ) -> IoResult<Self> {
-        if let Some(twice) = crate::publish::duplicate(&publishing.rules) {
+        Self::with_networking(
+            max_sockets,
+            max_sockets_per_process,
+            Networking::Isolated(publishing),
+        )
+    }
+
+    /// Starts a provider that connects guest sockets to the host's network as `networking`
+    /// says; fails if a published port is taken or published twice.
+    pub fn with_networking(
+        max_sockets: usize,
+        max_sockets_per_process: usize,
+        networking: Networking,
+    ) -> IoResult<Self> {
+        if let Networking::Isolated(publishing) = &networking
+            && let Some(twice) = crate::publish::duplicate(&publishing.rules)
+        {
             let error = format!("a host endpoint or guest port overlaps an earlier one: {twice}");
             return Err(Error::new(ErrorKind::InvalidInput, error));
         }
+        // Mirrored sockets keep their ports by stopping host sockets in place, as only Linux can.
+        if cfg!(not(target_os = "linux")) && matches!(networking, Networking::Mirrored { .. }) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "mirrored networking needs a Linux host",
+            ));
+        }
         Ok(Self {
-            core: ProviderCore::start(max_sockets, max_sockets_per_process, publishing)?,
+            core: ProviderCore::start(max_sockets, max_sockets_per_process, networking)?,
         })
     }
 }
@@ -147,6 +179,11 @@ impl SocketProvider for UserlandSocketProvider {
         readiness: ReadinessRegistration,
     ) -> BrokerResult<Arc<dyn PlatformSocket>> {
         let kind = socket_kind(request).ok_or(BrokerError::UnsupportedOperation)?;
+        if kind == SocketKind::Udp && self.core.mirrored() {
+            // Mirrored UDP is not supported yet. Of the errors a create reports, a denial is the
+            // guest's closest to an unsupported protocol.
+            return Err(BrokerError::PolicyDenied);
+        }
         let socket = UserlandSocket::new(&self.core, process_key, kind, readiness)?;
         let mut state = lock(&socket.state);
         self.core.charge_socket(process_key)?;
@@ -165,6 +202,10 @@ impl SocketProvider for UserlandSocketProvider {
     fn close_process(&self, process_key: ProcessKey) {
         self.core.close_process(process_key);
     }
+
+    fn addressing(&self) -> SocketAddressing {
+        self.core.addressing
+    }
 }
 
 /// Provider-wide state shared by every socket and the event thread.
@@ -177,11 +218,15 @@ struct ProviderCore {
     next_udp_event_token: AtomicU64,
     max_sockets: usize,
     max_sockets_per_process: usize,
+    /// How guest sockets are addressed: [`SocketAddressing::Host`] when they are mirrored, each
+    /// a host socket at the guest's own host address and port.
+    addressing: SocketAddressing,
     /// Each published port's rule, and its host socket while no guest socket holds it.
     published: Mutex<Vec<(Publish, Option<Socket>)>>,
     /// Where other guest servers are mirrored, at their own ports, while they serve them.
     published_listener_ip: Option<Ipv4Addr>,
-    /// The networks whose clients published and mirrored TCP ports admit, as the guest sees them.
+    /// The networks whose clients published and mirrored TCP ports admit, as the guest sees them;
+    /// with mirrored sockets, those whose clients the guest's TCP listeners admit.
     tcp_sources: Vec<Ipv4Cidr>,
     /// The networks whose senders published and mirrored UDP ports admit, as the guest sees them.
     udp_sources: Vec<Ipv4Cidr>,
@@ -369,11 +414,40 @@ fn token_set(capacity: usize) -> IoResult<HashSet<u64>> {
 }
 
 impl ProviderCore {
+    /// Whether each guest TCP socket is a host socket at the guest's own host address and port.
+    fn mirrored(&self) -> bool {
+        self.addressing == SocketAddressing::Host
+    }
+
+    /// A host socket's client as the guest sees it: itself with mirrored sockets, and otherwise
+    /// as [`guest_visible_client`] translates it.
+    fn guest_client(&self, client: SocketAddrV4) -> SocketAddrV4 {
+        if self.mirrored() {
+            client
+        } else {
+            guest_visible_client(client)
+        }
+    }
+
     fn start(
         max_sockets: usize,
         max_sockets_per_process: usize,
-        publishing: Publishing,
+        networking: Networking,
     ) -> IoResult<Arc<Self>> {
+        let (addressing, publishing) = match networking {
+            Networking::Isolated(publishing) => (SocketAddressing::Isolated, publishing),
+            Networking::Mirrored {
+                tcp_sources,
+                udp_sources,
+            } => (
+                SocketAddressing::Host,
+                Publishing {
+                    tcp_sources,
+                    udp_sources,
+                    ..Publishing::default()
+                },
+            ),
+        };
         let (poller, waiter) = Poller::new()?;
         let published = listen_published(&poller, publishing.rules)?;
         let poller = Arc::new(poller);
@@ -398,6 +472,7 @@ impl ProviderCore {
             next_udp_event_token: AtomicU64::new(1),
             max_sockets,
             max_sockets_per_process,
+            addressing,
             published: Mutex::new(published),
             published_listener_ip: publishing.listener_ip,
             tcp_sources: publishing.tcp_sources,
@@ -465,7 +540,7 @@ impl ProviderCore {
     fn allocate_socket_id(&self) -> BrokerResult<u64> {
         self.next_socket_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-                (id < PUBLISHED_EVENT_TOKEN_FLAG - 1).then_some(id + 1)
+                (id < LISTENER_EVENT_TOKEN_FLAG - 1).then_some(id + 1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)
     }
@@ -637,7 +712,7 @@ impl ProviderCore {
         let socket = {
             let registry = read_lock(&self.registry);
             let id = if token & UDP_EVENT_TOKEN_FLAG == 0 {
-                Some(token)
+                Some(token & !LISTENER_EVENT_TOKEN_FLAG)
             } else {
                 registry.udp_tokens.get(&token).copied()
             };
@@ -879,7 +954,7 @@ impl UserlandSocket {
             flags.remove(SocketEvents::ERROR);
         }
         if token & UDP_EVENT_TOKEN_FLAG == 0 {
-            if handle_socket_event(&mut socket, flags)? {
+            if handle_socket_event(&mut socket, token, flags)? {
                 return Ok(Dispatch::Polled);
             }
         } else {
@@ -904,10 +979,11 @@ impl UserlandSocket {
 
 impl PlatformSocket for UserlandSocket {
     fn bind(&self, request: SocketBindRequest) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
-        let SocketBindRequest::Guest(binding) = request else {
-            return Err(BrokerError::Internal);
-        };
-        self.call(|socket| socket.bind_socket(binding))
+        self.call(|socket| socket.bind_socket(request))
+    }
+
+    fn release_connect_bind(&self, address: SocketAddrV4) -> BrokerResult<()> {
+        self.call(|socket| socket.release_mirrored_connect_bind(address))
     }
 
     fn listen(&self, backlog: u32) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
@@ -938,12 +1014,14 @@ impl PlatformSocket for UserlandSocket {
         &self,
         address: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
-        _egress: SocketEgress,
+        egress: SocketEgress,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         self.call(|socket| {
             Ok(match socket.kind() {
                 SocketKind::Udp => socket.connect_udp_socket(address),
-                SocketKind::Tcp => socket.connect_tcp_destination(address, guest_source_lease),
+                SocketKind::Tcp => {
+                    socket.connect_tcp_destination(address, guest_source_lease, egress)
+                }
             })
         })
         .map_err(PlatformConnectError::PeerIndeterminate)?
@@ -1198,7 +1276,13 @@ impl<'a> SocketEntry<'a> {
     /// The host socket an event `token` of this socket refers to.
     fn event_descriptor(&self, token: u64) -> Option<&Socket> {
         match &self.transport {
-            SocketTransportState::Tcp(tcp) => tcp.descriptor.socket().ok(),
+            // A listener's token refers to no connection's host socket, though the socket may have
+            // connected its host socket since a listen failed.
+            SocketTransportState::Tcp(tcp) => tcp
+                .descriptor
+                .socket()
+                .ok()
+                .filter(|_| token & LISTENER_EVENT_TOKEN_FLAG == 0),
             SocketTransportState::Udp(udp) => udp
                 .native_endpoint
                 .as_ref()
@@ -1220,12 +1304,23 @@ impl<'a> SocketEntry<'a> {
         }
     }
 
+    /// Binds the socket as `request` asks: at the address that core reserved for it, or, with
+    /// mirrored sockets, wherever the host binds its host socket.
     fn bind_socket(
         &mut self,
-        binding: GuestSocketBinding,
+        request: SocketBindRequest,
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
         let kind = self.kind();
         let already_bound = self.guest_local_address.is_some();
+        let binding = match request {
+            SocketBindRequest::Guest(binding) if !self.core().mirrored() => binding,
+            SocketBindRequest::Host(request)
+                if self.core().mirrored() && kind == SocketKind::Tcp =>
+            {
+                return self.bind_mirrored_tcp(request);
+            }
+            _ => return Err(BrokerError::Internal),
+        };
         let binding_kind = if binding.is_tcp() {
             SocketKind::Tcp
         } else {
@@ -1504,7 +1599,12 @@ fn guest_visible_client(client: SocketAddrV4) -> SocketAddrV4 {
 /// Whether a published port admits `client`: whether one of `sources` contains it, as the guest
 /// sees it.
 fn admits(sources: &[Ipv4Cidr], client: SocketAddrV4) -> bool {
-    let client = u32::from(*guest_visible_client(client).ip());
+    sources_contain(sources, guest_visible_client(client))
+}
+
+/// Whether one of `sources` contains `client`'s IP.
+fn sources_contain(sources: &[Ipv4Cidr], client: SocketAddrV4) -> bool {
+    let client = u32::from(*client.ip());
     sources.iter().any(|source| {
         let host_bits = u32::MAX.checked_shr(source.prefix_length().into());
         client & !host_bits.unwrap_or(0) == u32::from_be_bytes(source.network().0)
