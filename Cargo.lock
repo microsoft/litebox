@@ -2043,6 +2043,7 @@ version = "0.1.0"
 dependencies = [
  "containerd-shim",
  "libc",
+ "litebox_broker_core",
  "litebox_guest_service_protocol",
  "log",
  "oci-spec 0.9.0",

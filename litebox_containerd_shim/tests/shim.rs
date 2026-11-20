@@ -11,7 +11,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -172,6 +172,7 @@ on_both_backends! {
     vm only: a_dead_vsock_device_stops_the_broker, qemu_takes_the_cpu_quota_and_prefers_kvm,
         a_vm_that_boots_late_starts;
     vm only as root: with_litebox_user_the_vm_runs_as_that_user,
+        as_root_a_vm_takes_back_a_state_directory_another_user_owns,
 }
 
 /// Polls `done` until it holds, failing with `what` after [`TIMEOUT`].
@@ -722,15 +723,12 @@ fn a_container_runs_and_reports_its_exit(backend: Backend) {
     std::fs::create_dir(&first).unwrap();
     std::fs::write(first.join("sh"), "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(first.join("sh"), std::fs::Permissions::from_mode(0o641)).unwrap();
-    // The VM has no network yet.
-    if backend == Backend::Userland {
-        shim.configure(|spec| {
-            spec["annotations"] = serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80-81"});
-        });
-    }
+    shim.configure(|spec| {
+        spec["annotations"] = serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80-81"});
+    });
     let pid = shim.create().unwrap();
-    // The init's pid is the broker's, which allows the annotation's egress; or QEMU's, which has
-    // no network device.
+    // The init's pid is the broker's, which allows the annotation's egress; or QEMU's, whose
+    // payload does.
     let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap();
     match backend {
         Backend::Userland => {
@@ -742,7 +740,18 @@ fn a_container_runs_and_reports_its_exit(backend: Backend) {
         }
         Backend::Vm => {
             assert!(cmdline.contains("qemu-system-x86_64"), "{cmdline}");
-            assert!(!cmdline.contains("virtio-net"), "{cmdline}");
+            assert!(cmdline.contains("virtio-net-pci"), "{cmdline}");
+            let payload = shim.state_dir().join("payload.tar");
+            let policy = Command::new("tar")
+                .arg("-xOf")
+                .arg(payload)
+                .arg("policy")
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&policy.stdout),
+                "egress tcp 10.1.0.0/16:80-81\n"
+            );
         }
     }
     assert_eq!(shim.start("").unwrap(), pid);
@@ -1236,6 +1245,26 @@ fn with_litebox_user_the_guardian_broker_and_runners_run_as_that_user() {
     }
 }
 
+/// QEMU, here the daemon's user's, opens the payload in the state directory by path: an earlier
+/// container's broker user, who may own the directory, loses it.
+fn as_root_a_vm_takes_back_a_state_directory_another_user_owns() {
+    let mut shim = Shim::launch(Backend::Vm, &process(&["guest", "exit", "0"]));
+    let state = shim.state_dir();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&state)
+        .unwrap();
+    std::os::unix::fs::chown(&state, Some(4242), Some(4243)).unwrap();
+    let qemu = shim.create().unwrap();
+    let daemon = std::fs::metadata(shim.dir.path()).unwrap().uid();
+    let metadata = std::fs::metadata(&state).unwrap();
+    assert_eq!((metadata.uid(), metadata.mode() & 0o7777), (daemon, 0o700));
+    shim.start("").unwrap();
+    assert_eq!(shim.wait(""), 0);
+    shim.finish(qemu);
+}
+
 /// The VM's guardian, device daemon and QEMU have `/dev/kvm`'s group as their only supplementary
 /// group, unless it is root's or the overflow group (one the user namespace does not map).
 fn with_litebox_user_the_vm_runs_as_that_user() {
@@ -1245,6 +1274,13 @@ fn with_litebox_user_the_vm_runs_as_that_user() {
     // The user traverses it to the VM's programs and the state root.
     std::fs::set_permissions(shim.dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
     let qemu = shim.create().unwrap();
+    // The state directory, with the payload, is the daemon's: the user only traverses it.
+    let daemon = std::fs::metadata(shim.dir.path()).unwrap().uid();
+    let state = std::fs::metadata(shim.state_dir()).unwrap();
+    assert_eq!(
+        (state.uid(), state.gid(), state.mode() & 0o7777),
+        (daemon, 4243, 0o710)
+    );
     shim.start("").unwrap();
     shim.wait_output("c.out", "child\n");
     let guardian = stat_fields(qemu).unwrap()[1].parse().unwrap();
@@ -1838,6 +1874,8 @@ fn qemu_takes_the_cpu_quota_and_prefers_kvm() {
     assert_eq!(option(b"-smp").as_deref(), Some(&*2.min(host).to_string()));
     let accel: &[&[u8]] = &[b"-accel", b"kvm", b"-accel", b"tcg"];
     assert!(args.windows(4).any(|window| window == accel), "{args:?}");
+    // Without egress rules, no network device.
+    assert_eq!(option(b"-netdev"), None, "{args:?}");
     assert_eq!(shim.start("").unwrap(), qemu);
     assert_eq!(shim.wait(""), 0);
     shim.finish(qemu);
@@ -1896,12 +1934,7 @@ fn refused_or_unsupported_specs_and_annotations_fail_create(backend: Backend) {
         ),
     ];
     if backend == Backend::Vm {
-        // The VM has no network yet.
-        cases.push((
-            "annotations",
-            serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80"}),
-            Code::UNIMPLEMENTED,
-        ));
+        // The VM publishes no ports yet.
         cases.push((
             "annotations",
             serde_json::json!({"io.litebox.publish.tcp": "127.0.0.1:20881:80"}),

@@ -7,7 +7,9 @@
 //! socket would not take (from other than its peer, after its read
 //! shutdown, or beyond its queue's bounds) is dropped. Beyond the guest, a
 //! bound socket whose binding can reach it (not to a loopback address) has
-//! a smoltcp socket on the Ethernet interface.
+//! a smoltcp socket on the Ethernet interface; unconnected, it takes
+//! datagrams from there only from the destinations it sent to, as the
+//! userland broker's.
 //!
 //! ICMP errors about datagrams to the peer (e.g., port unreachable) become
 //! the socket's pending error, as on Linux.
@@ -54,6 +56,11 @@ const MAX_RECEIVED_BYTES: usize = 4 * MAX_UDP_DATAGRAM_SIZE as usize;
 const MAX_RECEIVED_FROM_PROCESS: usize = 16;
 const MAX_RECEIVED_BYTES_FROM_PROCESS: usize = 2 * MAX_UDP_DATAGRAM_SIZE as usize;
 
+/// An unconnected socket takes datagrams from beyond the guest from at most
+/// this many destinations it sent to, as the userland broker's unconnected
+/// sockets' peers; a send to more fails.
+pub(super) const MAX_UDP_CONTACTED: usize = 64;
+
 struct Datagram {
     data: Vec<u8>,
     source: SocketAddrV4,
@@ -78,6 +85,9 @@ pub(super) struct Udp {
     pending_error: Option<SocketError>,
     read_shutdown: bool,
     write_shutdown: bool,
+    /// While unconnected, the destinations beyond the guest it sent to, whose
+    /// datagrams it takes; at most [`MAX_UDP_CONTACTED`].
+    contacted: Vec<SocketAddrV4>,
 }
 
 /// Whether `socket` surely takes a datagram of `size`: a free packet slot,
@@ -113,6 +123,7 @@ impl Udp {
             pending_error: None,
             read_shutdown: false,
             write_shutdown: false,
+            contacted: Vec::new(),
         }
     }
 
@@ -233,7 +244,9 @@ impl Udp {
             let source = socket_address(meta.endpoint);
             let wanted = !self.read_shutdown
                 && normalize_socket_destination(source) == Ok(source)
-                && self.peer.is_none_or(|peer| peer == source);
+                && self
+                    .peer
+                    .map_or(self.contacted.contains(&source), |peer| peer == source);
             if wanted {
                 if !self.has_room(payload.len(), None) || payload.len() > *room {
                     break;
@@ -527,6 +540,7 @@ impl Stack {
             return Ok(SocketConnectionStatus::Failed(error));
         }
         udp.peer = Some(destination);
+        udp.contacted.clear();
         Ok(SocketConnectionStatus::Connected)
     }
 
@@ -564,7 +578,22 @@ impl Stack {
             else {
                 return Err(BrokerError::Internal);
             };
-            return udp.send_external(&mut self.sockets, data, source, destination);
+            // An unconnected socket takes the replies of those it sends to.
+            let contacted = udp.peer.is_none() && !udp.contacted.contains(&destination);
+            if contacted {
+                if udp.contacted.len() >= MAX_UDP_CONTACTED {
+                    return Err(BrokerError::ResourceExhausted);
+                }
+                udp.contacted
+                    .try_reserve(1)
+                    .map_err(|_| BrokerError::OutOfMemory)?;
+                udp.contacted.push(destination);
+            }
+            let sent = udp.send_external(&mut self.sockets, data, source, destination);
+            if contacted && !matches!(sent, Ok(SocketOutcome::Completed(_))) {
+                udp.contacted.pop();
+            }
+            return sent;
         }
         let Some(receiver) = self.udp_bound_to(destination) else {
             return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));

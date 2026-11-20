@@ -15,8 +15,9 @@
 //! Timers are on the kernel clock. IPv4 TCP and UDP
 //! sockets are `litebox_broker_smoltcp`'s, which mediates their traffic:
 //! between runner processes directly, and, with the runner's [`Network`]
-//! device ([`Config::network`]), to the outside on smoltcp. With the runner's
-//! socket device ([`Config::vsock`]), vsock sockets are
+//! device ([`Config::network`]), to the outside on smoltcp, as
+//! [`Config::socket_policy`] allows.
+//! With the runner's socket device ([`Config::vsock`]), vsock sockets are
 //! [`litebox_broker_core::vsock_socket::transport`]'s; without it, they
 //! cannot be created. Readiness (e.g., of standard input, a timer's expiry,
 //! or sockets) goes to the association's notification ring.
@@ -44,6 +45,21 @@
 //!
 //! A process the kernel starts on its own (a root) has no parent, as in the
 //! userland broker.
+//!
+//! # `policy`
+//!
+//! The socket policy ([`policy::parse`]), a rule a line:
+//!
+//! ```text
+//! egress tcp 10.0.2.100/32:7
+//! egress udp 10.0.2.3/32:53
+//! ```
+//!
+//! `egress tcp|udp CIDR:PORT[-PORT]`, as the userland broker's
+//! `--allow-tcp-destination` and `--allow-udp-destination`, allows a
+//! destination beyond the guest network; at most
+//! [`litebox_broker_core::MAX_DESTINATION_RULES`] a protocol. Empty lines are
+//! ignored; others are rejected.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -52,6 +68,7 @@
 extern crate alloc;
 
 mod memory;
+pub mod policy;
 mod providers;
 mod readiness;
 mod serving;
@@ -68,7 +85,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
-    fs::FileService, job::Job, pid_namespace::PidNamespace,
+    SocketPolicy, fs::FileService, job::Job, pid_namespace::PidNamespace,
 };
 use litebox_broker_host::{
     BrokerHostAssociation, ProcessLauncher, default_host_names, handle_process_operation,
@@ -131,6 +148,9 @@ pub struct Config {
     pub shares: Vec<share::Share>,
     /// The network sockets reach beyond the guest, if any.
     pub network: Option<&'static dyn Network>,
+    /// What sockets may reach: the guest network, and the destinations it
+    /// allows beyond, through [`Self::network`] (see [`policy`]).
+    pub socket_policy: SocketPolicy,
     /// The socket device vsock sockets connect with the host on, if any.
     pub vsock: Option<Arc<dyn VsockTransport>>,
     /// Whether processes may start child processes (process duplication), as
@@ -190,7 +210,7 @@ impl Broker {
             stdio.clone(),
             timers.clone(),
             sockets.clone(),
-            config.network.is_some(),
+            &config.socket_policy,
             vsock
                 .clone()
                 .map(|vsock| vsock as Arc<dyn litebox_broker_core::vsock_socket::VsockProvider>),

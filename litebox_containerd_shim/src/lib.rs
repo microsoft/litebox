@@ -33,8 +33,8 @@
 //!
 //! The VM backend runs LiteBox's VM kernel in QEMU in place of the broker (see
 //! `sandbox::linux::vm`), as `LITEBOX_USER` with `/dev/kvm`'s group, whatever
-//! `LITEBOX_ROOT_BROKER`. It has no network yet: it refuses the egress and publish annotations,
-//! and serves no guest listener.
+//! `LITEBOX_ROOT_BROKER`. Its guest reaches QEMU's user network, which NATs it, as far as the
+//! egress annotations allow; it refuses the publish annotations, and serves no guest listener.
 
 #![cfg(target_os = "linux")]
 

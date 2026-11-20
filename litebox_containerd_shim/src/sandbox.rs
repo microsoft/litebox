@@ -142,7 +142,7 @@ impl StateDir {
         if temp != self.sockets {
             create_dir(&temp).map_err(failed)?;
         }
-        grant_access(self).map_err(failed)
+        grant_access(self, backend).map_err(failed)
     }
 
     /// Locks the state directory unless it is missing or locked (by its live daemon).

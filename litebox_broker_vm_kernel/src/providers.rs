@@ -10,8 +10,7 @@ use crate::share::{Share, ShareFs};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
-    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy,
+    BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy,
     fs::{
         FileService, Mode, UserInfo,
         composer::Composer,
@@ -29,7 +28,6 @@ use litebox_broker_core::{
     vsock_socket::VsockProvider,
 };
 use litebox_broker_protocol::process::PidNamespaceOptions;
-use litebox_broker_protocol::socket::{Ipv4Address, Port};
 use litebox_platform_vm_kernel::VmKernel;
 
 /// The HAL's hardware CSPRNG as the broker's randomness.
@@ -78,24 +76,6 @@ fn file_service(
     Arc::new(Resolver::<VmKernel, _>::new(devices))
 }
 
-/// Sockets may reach the guest network, and, if `external`, any address:
-/// what is reachable is up to the network the runner's link is on.
-fn socket_policy(external: bool) -> SocketPolicy {
-    let policy = SocketPolicy::guest_network();
-    if !external {
-        return policy;
-    }
-    let anywhere = [DestinationRule::new(
-        CallerCredential::HostGuaranteed,
-        Ipv4Cidr::new(Ipv4Address([0, 0, 0, 0]), 0).expect("a canonical network"),
-        DestinationPortRange::new(Port(1), Port(u16::MAX)).expect("an ordered range"),
-    )];
-    policy
-        .with_tcp_destination_rules(&anywhere)
-        .and_then(|policy| policy.with_udp_destination_rules(&anywhere))
-        .expect("one rule fits")
-}
-
 /// The broker core's limits, which the network stack also applies.
 pub(crate) const LIMITS: BrokerCoreLimits = BrokerCoreLimits::DEFAULT;
 
@@ -116,9 +96,9 @@ pub(crate) fn seed() -> u64 {
 /// the processes the kernel starts.
 ///
 /// Runner processes, which the kernel vouches for, may open and use files: the
-/// devices, `root`'s, if any, and the shares' (read-only); sockets (see
-/// [`socket_policy`]); with a `vsock` provider, vsock sockets, to and on any
-/// port; and, if `allow_process_duplication`, start child processes.
+/// devices, `root`'s, if any, and the shares' (read-only); sockets, to
+/// `socket_policy`'s destinations; with a `vsock` provider, vsock sockets, to
+/// and on any port; and, if `allow_process_duplication`, start child processes.
 ///
 /// # Panics
 ///
@@ -131,7 +111,7 @@ pub(crate) fn core(
     stdio: Arc<dyn StdioProvider>,
     timers: Arc<dyn TimerProvider>,
     sockets: Arc<dyn SocketProvider>,
-    external: bool,
+    socket_policy: &SocketPolicy,
     vsock: Option<Arc<dyn VsockProvider>>,
     allow_process_duplication: bool,
     pid_namespace: PidNamespaceOptions,
@@ -139,7 +119,7 @@ pub(crate) fn core(
     let random: Arc<dyn RandomProvider> = Arc::new(HardwareRandom(litebox_hal::rng::hardware()));
     let core = BrokerCore::new(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::WAIT | ObjectRights::WRITE)
-            .with_socket_policy(socket_policy(external))
+            .with_socket_policy(*socket_policy)
             .with_vsock_policy(if vsock.is_some() {
                 VsockPolicy::any()
             } else {

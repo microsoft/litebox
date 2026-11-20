@@ -24,6 +24,7 @@
 # of the host test client (dev_tools/guest_service_test_client), which runs
 # its programs through the guest service, booted as litebox.init, over hybrid
 # vsock ($VHOST_DEVICE_VSOCK), in a container whose init is /container_init.
+# <test>.policy.txt, if any, is the payload's `policy`, an init test's too.
 # <test>.input.txt, if any, is the input of its `console_stdin` runs, sent
 # once a run prints a line `ready`. An entry with `min_reflected_syscalls` or
 # `replay` runs in a boot of its own, checked from the kernel's log. The
@@ -42,6 +43,7 @@
 #   init_exit: init's exit kills the other processes.
 #   lifecycle: processes end in each way the other tests end theirs.
 #   writable_root: the root is writable.
+#   egress: sockets reach only the policy's destinations.
 #   console_flood: the console keeps 4 writers' records (check_records).
 #
 # Runner processes' standard output and error go to a virtio console, backed
@@ -153,7 +155,7 @@ counted_log=debug
 [[ ${LITEBOX_LOG:-} != trace ]] || counted_log=trace
 
 # Init tests (see the header): their init's path in the root.
-declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writable_root
+declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writable_root [egress]=/egress
     [console_flood]=/console_flood [lifecycle]=/lifecycle)
 
 # Why test $1 is skipped with these CPUs or this RAM (see the header), if it
@@ -244,12 +246,17 @@ cp "$GUEST_SERVICE" "$WORK/rootfs/.litebox/guest-service"
     tar --format=ustar --owner=0 --group=0 -cf "$WORK/rootfs.tar" -T -)
 
 # Packs test $1's payload, with the root $2, as $WORK/$1.tar: the userland
-# runner and the root.
+# runner, the root, and the test's policy, if any.
 pack_payload() {
     mkdir -p "$WORK/$1"
     cp "$USERLAND" "$WORK/$1/linux-runner.elf"
     [[ $2 == "$WORK/$1/rootfs.tar" ]] || cp "$2" "$WORK/$1/rootfs.tar"
-    tar --format=ustar -cf "$WORK/$1.tar" -C "$WORK/$1" linux-runner.elf rootfs.tar
+    local payload=(linux-runner.elf rootfs.tar)
+    if [[ -f "$TESTS_DIR/$1.policy.txt" ]]; then
+        cp "$TESTS_DIR/$1.policy.txt" "$WORK/$1/policy"
+        payload+=(policy)
+    fi
+    tar --format=ustar -cf "$WORK/$1.tar" -C "$WORK/$1" "${payload[@]}"
 }
 
 # The virtio console for boot $1, backed by a file.

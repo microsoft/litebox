@@ -5,32 +5,38 @@
 //! The guardian runs QEMU, whose pid is the broker's, and `vhost-device-vsock`, whose hybrid vsock
 //! bridge reaches the guest service.
 //!
-//! The payload, QEMU's initrd, holds the VM's Linux runner and the root archive. The VM serves one
-//! directory bind at most for now, as a read-only virtio-9p device whose mount tag is its guest
-//! path. The VM has no network device. QEMU's stdout is the
-//! kernel's log, and its stderr the processes' output.
+//! The payload, QEMU's initrd, holds the VM's Linux runner, the root archive and the `policy`, the
+//! egress rules (see `litebox_broker_vm_kernel`'s docs). The VM serves one directory bind at most
+//! for now, as a read-only virtio-9p device whose mount tag is its guest path. With egress rules,
+//! guest sockets reach QEMU's user network, which NATs them, as far as the rules let them (see
+//! [`Egress`]); without, the VM has no network device. The VM publishes no ports yet. QEMU's NAT
+//! keeps one destination per guest UDP port, the last: an unconnected UDP socket that sends to
+//! 10.0.2.1 or 10.0.2.3 and to other destinations may lose the replies of those it sent to earlier.
+//! QEMU's stdout is the kernel's log, and its stderr the processes' output.
 //!
 //! The kernel, the runner and the daemon are next to this executable unless `LITEBOX_VM_KERNEL`,
-//! `LITEBOX_VM_RUNNER` or `LITEBOX_VHOST_DEVICE_VSOCK` name them; QEMU is `qemu-system-x86_64`
-//! unless `LITEBOX_QEMU` names it.
+//! `LITEBOX_VM_RUNNER` or `LITEBOX_VHOST_DEVICE_VSOCK` name them; the kernel and the runner must be
+//! of this executable's build. QEMU is `qemu-system-x86_64` unless `LITEBOX_QEMU` names it.
 
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek as _, SeekFrom};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 use std::process::Command;
 
+use litebox_broker_core::MAX_DESTINATION_RULES;
 use tar_core::EntryType;
 use tar_core::builder::EntryBuilder;
 
 use super::super::{StateDir, program};
 use super::guardian::DEVICE_FD;
 use crate::rootfs::{append, finish};
-use crate::spec::{Bind, Plan, Resources};
-use crate::{Result, internal, unsupported};
+use crate::spec::{Bind, Egress, Plan};
+use crate::{Result, internal, invalid, unsupported};
 
 /// The kernel's line once its vsock device runs, which connections wait for (see
 /// `litebox_runner_vm_kernel`'s `devices::VSOCK_STARTED`).
@@ -50,15 +56,25 @@ const OVERHEAD_MEMORY_MIB: u64 = 128;
 /// The most guest RAM the kernel uses: its direct map's 512 GiB, less q35's hole below 4 GiB.
 const MAX_MEMORY_MIB: u64 = (512 - 2) << 10;
 
-/// Fails if the VM cannot run `plan`: on hosts other than x86-64, or with egress rules or published
-/// ports, as it has no network yet (see the crate's docs).
+/// Fails if the VM cannot run `plan`: on hosts other than x86-64, with more egress destinations of
+/// a protocol than its kernel's broker takes, or with published ports, which it does not serve yet
+/// (see the crate's docs).
 pub fn check(plan: &Plan) -> Result<()> {
     if cfg!(not(target_arch = "x86_64")) {
         return Err(unsupported("the VM backend runs on x86-64 hosts only"));
     }
-    if !plan.egress.tcp.is_empty() || !plan.egress.udp.is_empty() || !plan.publish.is_empty() {
+    for (protocol, destinations) in [("tcp", &plan.egress.tcp), ("udp", &plan.egress.udp)] {
+        if destinations.len() > MAX_DESTINATION_RULES {
+            return Err(invalid(format!(
+                "io.litebox.egress.{protocol} names {} destinations, more than the broker's \
+                 {MAX_DESTINATION_RULES}",
+                destinations.len()
+            )));
+        }
+    }
+    if !plan.publish.is_empty() {
         return Err(unsupported(
-            "the VM backend has no network yet (io.litebox.egress.*, io.litebox.publish.*)",
+            "the VM backend publishes no ports yet (io.litebox.publish.*)",
         ));
     }
     Ok(())
@@ -100,7 +116,7 @@ pub fn guardian_arguments(
     state: &StateDir,
     archive: File,
     binds: &[Bind],
-    resources: &Resources,
+    plan: &Plan,
 ) -> Result<()> {
     // TODO: serve any number of directory and file binds, nested ones too, live, through one
     // device for the sandbox exporting a tree the host composes: a device per bind takes a PCI
@@ -130,11 +146,12 @@ pub fn guardian_arguments(
         )));
     }
     let runner = program("LITEBOX_VM_RUNNER", RUNNER);
-    let payload_size = pack_payload(state, archive, &runner)?;
-    let memory_mib = memory_mib(resources.memory, payload_size);
+    let policy = policy(&plan.egress);
+    let payload_size = pack_payload(state, archive, &runner, policy.as_bytes())?;
+    let memory_mib = memory_mib(plan.resources.memory, payload_size);
     let memory = format!("{memory_mib}M");
     let host_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let cpus = cpus(resources.cpus, host_cpus);
+    let cpus = cpus(plan.resources.cpus, host_cpus);
     let socket = state.sockets.join("vhost-user");
     command
         .arg(&socket)
@@ -161,6 +178,15 @@ pub fn guardian_arguments(
         .args(["-device", "virtio-serial-pci,id=vs0,disable-legacy=on"])
         .args(["-chardev", "file,id=con0,path=/proc/self/fd/2"])
         .args(["-device", "virtconsole,chardev=con0,bus=vs0.0"]);
+    // TODO: a NAT that keeps each UDP flow (passt, or a TAP device) (see the module's docs).
+    if !policy.is_empty() {
+        command
+            .args([
+                "-netdev",
+                "user,id=n0,net=10.0.2.0/24,host=10.0.2.1,ipv6=off",
+            ])
+            .args(["-device", "virtio-net-pci,netdev=n0,disable-legacy=on"]);
+    }
     // Only read-only ones reach here (see `RootFs::bind`).
     for (index, bind) in binds.iter().enumerate() {
         let mut fsdev = OsString::from(format!("local,id=fs{index},path="));
@@ -185,6 +211,17 @@ pub fn guardian_arguments(
             "vhost-user-vsock-pci,chardev=vhost-vsock,disable-legacy=on",
         ]);
     Ok(())
+}
+
+/// The payload's `policy` (see `litebox_broker_vm_kernel`'s docs): `egress`'s rules, a line each.
+fn policy(egress: &Egress) -> String {
+    let mut policy = String::new();
+    for (protocol, destinations) in [("tcp", &egress.tcp), ("udp", &egress.udp)] {
+        for destination in destinations {
+            writeln!(policy, "egress {protocol} {destination}").expect("a `String` takes it");
+        }
+    }
+    policy
 }
 
 /// `value` as a value of a QEMU option list, its commas doubled.
@@ -216,9 +253,9 @@ fn memory_mib(limit: Option<u64>, payload: u64) -> u64 {
     memory.min(MAX_MEMORY_MIB)
 }
 
-/// Packs the payload of `state` and removes the root archive, read from `archive` as written: the
-/// broker's user, owning the directory, may have replaced its path. Returns the payload's size.
-fn pack_payload(state: &StateDir, mut archive: File, runner: &Path) -> Result<u64> {
+/// Packs the payload of `state`, with `policy`, and removes the root archive, read from `archive`.
+/// Returns the payload's size.
+fn pack_payload(state: &StateDir, mut archive: File, runner: &Path, policy: &[u8]) -> Result<u64> {
     let path = state.payload();
     let failed = |error: io::Error| internal(format!("cannot write {}: {error}", path.display()));
     let unreadable = |source: &Path, error: io::Error| {
@@ -228,8 +265,14 @@ fn pack_payload(state: &StateDir, mut archive: File, runner: &Path) -> Result<u6
     archive
         .seek(SeekFrom::Start(0))
         .map_err(|error| unreadable(&state.archive(), error))?;
-    // Never through a symlink: the broker's user may own the directory.
-    let payload = File::create_new(&path).map_err(failed)?;
+    // Never through a symlink (an earlier container's broker user may have owned the directory),
+    // and the daemon's alone, whatever the umask, until `grant_read`.
+    let payload = File::options()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(failed)?;
     // QEMU opens it by path.
     super::grant_read(state, &payload).map_err(failed)?;
     let mut writer = BufWriter::new(payload);
@@ -243,6 +286,8 @@ fn pack_payload(state: &StateDir, mut archive: File, runner: &Path) -> Result<u6
             .len();
         append_file(&mut writer, name, Box::new(file), size).map_err(failed)?;
     }
+    let size = u64::try_from(policy.len()).expect("small");
+    append_file(&mut writer, "policy", Box::new(policy), size).map_err(failed)?;
     let file = finish(writer).map_err(failed)?;
     if let Err(error) = std::fs::remove_file(state.archive()) {
         log::warn!("cannot remove the packed root archive: {error}");
@@ -267,9 +312,12 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs::File;
     use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::Path;
 
-    use super::{MAX_CPUS, MAX_MEMORY_MIB, StateDir, cpus, memory_mib, option_value, pack_payload};
+    use super::{
+        MAX_CPUS, MAX_MEMORY_MIB, StateDir, cpus, memory_mib, option_value, pack_payload, policy,
+    };
 
     /// A state directory below `root`, the runner, and an archive written there, open.
     fn packing(root: &Path) -> (StateDir, std::path::PathBuf, File) {
@@ -297,10 +345,12 @@ mod tests {
         std::fs::write(&secret, "secret").unwrap();
         std::fs::remove_file(state.archive()).unwrap();
         std::os::unix::fs::symlink(&secret, state.archive()).unwrap();
-        pack_payload(&state, archive, &runner).unwrap();
+        pack_payload(&state, archive, &runner, b"").unwrap();
         let payload = std::fs::read(state.payload()).unwrap();
         let holds = |bytes: &[u8]| payload.windows(bytes.len()).any(|window| window == bytes);
         assert!(holds(b"archive") && holds(b"RUNNER") && !holds(b"secret"));
+        let mode = std::fs::metadata(state.payload()).unwrap().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     /// Nor may root's packing write through a link at the payload's path.
@@ -311,7 +361,7 @@ mod tests {
         let victim = dir.path().join("victim");
         std::fs::write(&victim, "victim").unwrap();
         std::os::unix::fs::symlink(&victim, state.payload()).unwrap();
-        assert!(pack_payload(&state, archive, &runner).is_err());
+        assert!(pack_payload(&state, archive, &runner, b"").is_err());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "victim");
     }
 
@@ -331,6 +381,45 @@ mod tests {
         assert_eq!(cpus(Some(2), 8), 2);
         assert_eq!(cpus(Some(16), 8), 8);
         assert_eq!(cpus(Some(u32::MAX), 128), MAX_CPUS);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn more_egress_destinations_than_the_broker_takes_are_refused() {
+        let destinations: Vec<String> = (1..=super::MAX_DESTINATION_RULES + 1)
+            .map(|port| format!("10.1.0.0/16:{port}"))
+            .collect();
+        let spec: oci_spec::runtime::Spec = serde_json::from_value(serde_json::json!({
+            "ociVersion": "1.2.0",
+            "root": {"path": "rootfs"},
+            "process": {"args": ["sh"], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+            "annotations": {"io.litebox.egress.udp": destinations.join(",")},
+        }))
+        .unwrap();
+        let error = super::check(&crate::spec::plan(&spec).unwrap()).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("io.litebox.egress.udp"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn egress_rules_are_the_kernels_policy() {
+        let spec: oci_spec::runtime::Spec = serde_json::from_value(serde_json::json!({
+            "ociVersion": "1.2.0",
+            "root": {"path": "rootfs"},
+            "process": {"args": ["sh"], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+            "annotations": {
+                "io.litebox.egress.tcp": "10.1.0.0/16:80-81,0.0.0.0/0:443",
+                "io.litebox.egress.udp": "10.0.2.3/32:53",
+            },
+        }))
+        .unwrap();
+        let plan = crate::spec::plan(&spec).unwrap();
+        assert_eq!(
+            policy(&plan.egress),
+            "egress tcp 10.1.0.0/16:80-81\negress tcp 0.0.0.0/0:443\negress udp 10.0.2.3/32:53\n"
+        );
     }
 
     #[test]
