@@ -35,7 +35,7 @@ use super::host::{
 use super::{
     PlatformSocketStatus, ProviderCore, ReceiveFromOutcome, SocketEntry, SocketInbox, Topology,
     admits, broker_error_from_errno, guest_visible_client, local_socket_address, lock, read_lock,
-    republish_own_readiness, set_own_readiness, socket_error_from_errno,
+    republish_own_readiness, retry_intr, set_own_readiness, socket_error_from_errno,
     socket_operation_error_from_errno, write_lock, zeroed_vec,
 };
 use crate::publish::Protocol;
@@ -1208,15 +1208,8 @@ impl SocketEntry<'_> {
                 // every port a broker endpoint is bound to is in `udp_ports`
                 // before any send checks it.
                 let mut ports = write_lock(&core.udp_ports);
-                loop {
-                    match socket.bind(wildcard) {
-                        Ok(()) => break,
-                        Err(Errno::INTR) => {}
-                        Err(error) => {
-                            return socket_operation_error_from_errno(error)
-                                .map(SocketOutcome::Failed);
-                        }
-                    }
+                if let Err(error) = retry_intr(|| socket.bind(wildcard)) {
+                    return socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
                 }
                 let port = match local_socket_address(&socket) {
                     Ok(address) => address.port(),
@@ -1273,16 +1266,11 @@ impl SocketEntry<'_> {
         event_token: u64,
         connected_external_destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<()>> {
-        if let Some(external_destination) = connected_external_destination {
-            loop {
-                match socket.connect(host_socket_destination(external_destination)) {
-                    Ok(()) => break,
-                    Err(Errno::INTR) => {}
-                    Err(error) => {
-                        return socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
-                    }
-                }
-            }
+        if let Some(external_destination) = connected_external_destination
+            && let Err(error) =
+                retry_intr(|| socket.connect(host_socket_destination(external_destination)))
+        {
+            return socket_operation_error_from_errno(error).map(SocketOutcome::Failed);
         }
         let core = self.core();
         {
@@ -1460,20 +1448,15 @@ impl SocketEntry<'_> {
     ) -> core::result::Result<SocketOutcome<()>, PlatformConnectError> {
         let indeterminate = PlatformConnectError::PeerIndeterminate;
         let endpoint = self.udp_endpoint().map_err(indeterminate)?;
-        loop {
-            match endpoint
+        if let Err(error) = retry_intr(|| {
+            endpoint
                 .socket
                 .connect(host_socket_destination(external_destination))
-            {
-                Ok(()) => break,
-                Err(Errno::INTR) => {}
-                Err(error) => {
-                    return match socket_operation_error_from_errno(error) {
-                        Ok(error) => Ok(SocketOutcome::Failed(error)),
-                        Err(error) => Err(PlatformConnectError::PeerUnchanged(error)),
-                    };
-                }
-            }
+        }) {
+            return match socket_operation_error_from_errno(error) {
+                Ok(error) => Ok(SocketOutcome::Failed(error)),
+                Err(error) => Err(PlatformConnectError::PeerUnchanged(error)),
+            };
         }
         let _ = endpoint
             .socket
@@ -2143,13 +2126,7 @@ fn udp_reconnect_changes_source(socket: &Socket, host_destination: SocketAddrV4)
 /// selects.
 fn udp_route_source(host_destination: SocketAddrV4) -> Option<Ipv4Addr> {
     let socket = Socket::udp().ok()?;
-    loop {
-        match socket.connect(host_destination) {
-            Ok(()) => break,
-            Err(Errno::INTR) => {}
-            Err(_) => return None,
-        }
-    }
+    retry_intr(|| socket.connect(host_destination)).ok()?;
     Some(*socket.local_address().ok()?.ip())
 }
 
@@ -2213,12 +2190,10 @@ pub(super) fn is_local_ipv4_address(address: Ipv4Addr) -> bool {
     }
     // Any nonzero port; connecting a UDP socket sends nothing.
     let probe = SocketAddrV4::new(address, 9);
-    loop {
-        match socket.connect(probe) {
-            Err(Errno::INTR) => {}
-            result => return !matches!(result, Err(Errno::NETUNREACH | Errno::HOSTUNREACH)),
-        }
-    }
+    !matches!(
+        retry_intr(|| socket.connect(probe)),
+        Err(Errno::NETUNREACH | Errno::HOSTUNREACH)
+    )
 }
 
 #[cfg(test)]

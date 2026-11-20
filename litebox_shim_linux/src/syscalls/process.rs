@@ -1471,10 +1471,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 Ok(0)
             }
-            PrctlArg::GetKeepCaps => Ok(usize::from(match self.vfork.borrow().as_ref() {
-                Some(vfork) => vfork.keep_caps,
-                None => self.thread.keep_caps.get(),
-            })),
+            PrctlArg::GetKeepCaps => Ok(usize::from(self.keep_caps())),
             #[cfg(target_arch = "aarch64")]
             PrctlArg::SveGetVl => {
                 let flags = if self.thread.sve_vl_inherit.get() {
@@ -1508,6 +1505,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match &*self.vfork.borrow() {
             Some(vfork) => vfork.no_new_privs,
             None => self.thread.no_new_privs.get(),
+        }
+    }
+
+    /// Returns whether this thread keeps its capabilities across a change of user IDs
+    /// (`PR_SET_KEEPCAPS`), which a `vfork` child keeps its own copy of.
+    fn keep_caps(&self) -> bool {
+        match &*self.vfork.borrow() {
+            Some(vfork) => vfork.keep_caps,
+            None => self.thread.keep_caps.get(),
         }
     }
 

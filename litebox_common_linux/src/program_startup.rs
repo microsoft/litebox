@@ -174,7 +174,7 @@ pub enum InheritedFdKind {
     Epoll,
     /// An IPv4 socket.
     InetSocket {
-        /// TCP, UDP, or ICMP echo.
+        /// The socket's IPv4 protocol.
         protocol: IpProtocol,
     },
     /// A vsock stream socket.
@@ -521,7 +521,8 @@ impl LinuxForkStartup {
         }
         output.extend_from_slice(self.resource_limits.as_bytes());
         output.push(u8::from(self.dumpable));
-        output.push(u8::from(self.no_new_privs) | (u8::from(self.keep_caps) << 1));
+        output.push(u8::from(self.no_new_privs));
+        output.push(u8::from(self.keep_caps));
         for count in [self.cwd.len(), self.regions.len(), self.fds.len()] {
             push_u32(
                 &mut output,
@@ -581,10 +582,8 @@ impl LinuxForkStartup {
         let program_break = read_usize(&mut input)?;
         let resource_limits = read_value(&mut input)?;
         let dumpable = read_bool(&mut input)?;
-        let flags = read_u8(&mut input)?;
-        if flags & !3 != 0 {
-            return Err(LinuxProgramStartupError::Malformed);
-        }
+        let no_new_privs = read_bool(&mut input)?;
+        let keep_caps = read_bool(&mut input)?;
         let cwd_length = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let region_count = usize::try_from(read_u32(&mut input)?)
@@ -631,8 +630,8 @@ impl LinuxForkStartup {
             umask,
             resource_limits,
             dumpable,
-            no_new_privs: flags & 1 != 0,
-            keep_caps: flags & 2 != 0,
+            no_new_privs,
+            keep_caps,
             cwd,
             comm,
             blocked_signals,

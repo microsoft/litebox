@@ -20,7 +20,7 @@ use litebox_broker_core::{
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::socket::{
-    Ipv4Address, MAX_SOCKET_TRANSFER_SIZE, Port, ReceiveSocketResponse,
+    Ipv4Address, MAX_SOCKET_TRANSFER_SIZE, Port, ReceiveSocketResponse, SocketType,
 };
 use litebox_platform::buffer::{Fault, RawBytes};
 
@@ -581,38 +581,37 @@ fn non_loopback_local_ipv4() -> Option<Ipv4Addr> {
         .then_some(*address.ip())
 }
 
-fn create_socket(
+fn create_inet_socket(
     process: &litebox_broker_core::BrokerProcess,
+    protocol: IpProtocol,
+    flags: FileOpenFlags,
     readiness: Arc<dyn ReadinessSink>,
 ) -> ObjectHandle {
     litebox_broker_core::socket::create(
         process,
         CreateSocketRequest {
             address_family: AddressFamily::Ipv4,
-            socket_type: SocketType::Stream,
-            protocol: IpProtocol::Tcp,
-            flags: FileOpenFlags::NONE,
+            socket_type: protocol.socket_type(),
+            protocol,
+            flags,
         },
         readiness,
     )
     .unwrap()
 }
 
+fn create_socket(
+    process: &litebox_broker_core::BrokerProcess,
+    readiness: Arc<dyn ReadinessSink>,
+) -> ObjectHandle {
+    create_inet_socket(process, IpProtocol::Tcp, FileOpenFlags::NONE, readiness)
+}
+
 fn create_udp_socket(
     process: &litebox_broker_core::BrokerProcess,
     readiness: Arc<dyn ReadinessSink>,
 ) -> ObjectHandle {
-    litebox_broker_core::socket::create(
-        process,
-        CreateSocketRequest {
-            address_family: AddressFamily::Ipv4,
-            socket_type: SocketType::Datagram,
-            protocol: IpProtocol::Udp,
-            flags: FileOpenFlags::NONE,
-        },
-        readiness,
-    )
-    .unwrap()
+    create_inet_socket(process, IpProtocol::Udp, FileOpenFlags::NONE, readiness)
 }
 
 fn wait_until_connected(

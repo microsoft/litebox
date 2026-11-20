@@ -6,12 +6,12 @@ use core::net::SocketAddrV4;
 use crate::socket::is_internal_socket_address;
 use crate::{BrokerError, CallerCredential, ObjectRights};
 use litebox_broker_protocol::socket::{
-    AddressFamily, CreateSocketRequest, IpProtocol, Ipv4Address, Port, SocketType,
+    AddressFamily, CreateSocketRequest, IpProtocol, Ipv4Address, Port,
 };
 use litebox_broker_protocol::vsock_socket::{VsockAddress, VsockPort};
 use thiserror::Error;
 
-/// Maximum number of destination rules in one transport policy.
+/// Maximum number of destination rules in one protocol's policy.
 pub const MAX_DESTINATION_RULES: usize = 64;
 
 /// An IPv4 network in canonical CIDR form.
@@ -145,13 +145,25 @@ trait PermitsDestination: Copy {
     fn permits(self, caller_credential: CallerCredential, destination: SocketAddrV4) -> bool;
 }
 
+/// Whether a rule for `rule_caller` and `network` covers `caller_credential`
+/// reaching the IP of `destination`.
+fn rule_covers_host(
+    rule_caller: CallerCredential,
+    network: Ipv4Cidr,
+    caller_credential: CallerCredential,
+    destination: SocketAddrV4,
+) -> bool {
+    rule_caller == caller_credential && network.contains(Ipv4Address(destination.ip().octets()))
+}
+
 impl PermitsDestination for DestinationRule {
     fn permits(self, caller_credential: CallerCredential, destination: SocketAddrV4) -> bool {
-        self.caller_credential == caller_credential
-            && self
-                .destination
-                .contains(Ipv4Address(destination.ip().octets()))
-            && self.ports.contains(Port(destination.port()))
+        rule_covers_host(
+            self.caller_credential,
+            self.destination,
+            caller_credential,
+            destination,
+        ) && self.ports.contains(Port(destination.port()))
     }
 }
 
@@ -202,10 +214,12 @@ impl IcmpEchoDestinationRule {
 
 impl PermitsDestination for IcmpEchoDestinationRule {
     fn permits(self, caller_credential: CallerCredential, destination: SocketAddrV4) -> bool {
-        self.caller_credential == caller_credential
-            && self
-                .destination
-                .contains(Ipv4Address(destination.ip().octets()))
+        rule_covers_host(
+            self.caller_credential,
+            self.destination,
+            caller_credential,
+            destination,
+        )
     }
 }
 
@@ -228,7 +242,7 @@ pub enum SocketPolicyError {
     },
 }
 
-/// Bounded static IPv4 destination rules for one transport protocol.
+/// Bounded static IPv4 destination rules for one IP protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DestinationPolicy<T> {
     destination_rules: [T; MAX_DESTINATION_RULES],
@@ -245,23 +259,26 @@ impl<T: Copy> DestinationPolicy<T> {
 
     /// Returns the configured destination rules.
     #[must_use]
-    pub fn rules(&self) -> &[T] {
+    fn rules(&self) -> &[T] {
         &self.destination_rules[..self.destination_rule_count]
     }
 }
 
 impl<T: PermitsDestination> DestinationPolicy<T> {
+    /// Whether `policy` enables the protocol and permits the destination.
     /// Guest-network destinations need no rule.
     fn permits_destination(
-        &self,
+        policy: Option<&Self>,
         caller_credential: CallerCredential,
         destination: SocketAddrV4,
     ) -> bool {
-        is_internal_socket_address(destination)
-            || self
-                .rules()
-                .iter()
-                .any(|rule| rule.permits(caller_credential, destination))
+        policy.is_some_and(|policy| {
+            is_internal_socket_address(destination)
+                || policy
+                    .rules()
+                    .iter()
+                    .any(|rule| rule.permits(caller_credential, destination))
+        })
     }
 }
 
@@ -359,18 +376,21 @@ impl SocketPolicy {
         destination: SocketAddrV4,
     ) -> bool {
         match protocol {
-            IpProtocol::Tcp => self
-                .tcp
-                .as_ref()
-                .is_some_and(|policy| policy.permits_destination(caller_credential, destination)),
-            IpProtocol::Udp => self
-                .udp
-                .as_ref()
-                .is_some_and(|policy| policy.permits_destination(caller_credential, destination)),
-            IpProtocol::IcmpEcho => self
-                .icmp_echo
-                .as_ref()
-                .is_some_and(|policy| policy.permits_destination(caller_credential, destination)),
+            IpProtocol::Tcp => DestinationPolicy::permits_destination(
+                self.tcp.as_ref(),
+                caller_credential,
+                destination,
+            ),
+            IpProtocol::Udp => DestinationPolicy::permits_destination(
+                self.udp.as_ref(),
+                caller_credential,
+                destination,
+            ),
+            IpProtocol::IcmpEcho => DestinationPolicy::permits_destination(
+                self.icmp_echo.as_ref(),
+                caller_credential,
+                destination,
+            ),
             _ => false,
         }
     }
@@ -605,11 +625,8 @@ impl PolicyEngine {
         request: CreateSocketRequest,
     ) -> Result<ObjectRights, BrokerError> {
         let rights = self.principal_object_rights(caller_credential)?;
-        let permitted = matches!(
-            (request.socket_type, request.protocol),
-            (SocketType::Stream, IpProtocol::Tcp)
-                | (SocketType::Datagram, IpProtocol::Udp | IpProtocol::IcmpEcho)
-        ) && self.socket_policy.permits_socket(request.protocol);
+        let permitted = request.socket_type == request.protocol.socket_type()
+            && self.socket_policy.permits_socket(request.protocol);
         if request.address_family == AddressFamily::Ipv4 && permitted {
             Ok(rights)
         } else {
@@ -676,6 +693,7 @@ impl Default for PolicyEngine {
 mod tests {
     use super::*;
     use litebox_broker_protocol::fs::FileOpenFlags;
+    use litebox_broker_protocol::socket::SocketType;
     use litebox_broker_protocol::vsock_socket::VsockCid;
 
     const IPV4_TCP: CreateSocketRequest = CreateSocketRequest {
@@ -1078,10 +1096,14 @@ mod tests {
     }
 
     #[test]
-    fn guest_network_policy_allows_tcp_and_udp_only_within_the_guest_network() {
+    fn guest_network_policy_allows_only_guest_network_destinations() {
         let socket_policy = SocketPolicy::guest_network();
         assert_eq!(socket_policy.tcp_destination_rules(), Some([].as_slice()));
         assert_eq!(socket_policy.udp_destination_rules(), Some([].as_slice()));
+        assert_eq!(
+            socket_policy.icmp_echo_destination_rules(),
+            Some([].as_slice())
+        );
         let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(socket_policy);
         assert_eq!(

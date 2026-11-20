@@ -129,17 +129,18 @@ static int vfork_child_sets_flags(void *arg) {
     if (syscall(SYS_setuid, *(uid_t *)arg) != 0 || syscall(SYS_capset, &caps, empty) != 0) {
         _exit(3);
     }
-    if (dumpable() != 0 || no_new_privs() != 0) {
+    if (dumpable() != 0 || no_new_privs() != 0 || pr(PR_GET_KEEPCAPS, 0, 0, 0, 0) != 0) {
         _exit(1);
     }
-    if (!set_dumpable(1) || !set_no_new_privs() || no_new_privs() != 1) {
+    if (!set_dumpable(1) || !set_no_new_privs() || no_new_privs() != 1 ||
+        pr(PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0 || pr(PR_GET_KEEPCAPS, 0, 0, 0, 0) != 1) {
         _exit(2);
     }
     _exit(0);
 }
 
 // A vfork child shares its parent's dumpable flag, as they share memory, but has its own
-// no_new_privs.
+// no_new_privs and keepcaps.
 static void vfork_child_shares_only_dumpable(void) {
     CHECK(set_dumpable(0));
     uid_t uid = getuid();
@@ -149,6 +150,7 @@ static void vfork_child_shares_only_dumpable(void) {
     CHECK(child > 0 && exited_with(child, 0));
     CHECK(dumpable() == 1);
     CHECK(no_new_privs() == 0);
+    CHECK(pr(PR_GET_KEEPCAPS, 0, 0, 0, 0) == 0);
 }
 
 static int vfork_child_sets_no_new_privs_and_execs(void *arg) {
@@ -248,7 +250,9 @@ static void fork_and_execve_carry_the_flags(void) {
     char *const argv[] = {self_path, "exec-child", "1", NULL};
     CHECK(posix_spawn(&child, self_path, NULL, NULL, argv, environ) == 0);
     CHECK(exited_with(child, 0));
+    // The spawned program's exec clears only its own keepcaps.
     CHECK(dumpable() == 0);
+    CHECK(pr(PR_GET_KEEPCAPS, 0, 0, 0, 0) == 1);
 }
 
 int main(int argc, char **argv) {

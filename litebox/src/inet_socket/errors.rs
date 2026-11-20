@@ -148,7 +148,7 @@ pub enum SocketWriteError {
     BufferFull,
     /// The transmit buffer is full, and the socket is nonblocking.
     NonBlocking,
-    /// The datagram exceeds the protocol maximum.
+    /// The datagram exceeds the protocol limit or the path MTU.
     MessageTooLong,
     /// A destination address is required but was not provided.
     DestinationAddressRequired,

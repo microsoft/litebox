@@ -70,8 +70,7 @@ pub struct InetSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Creates an unbound, unconnected IPv4 socket for `protocol`, on the
-    /// socket type that carries it. An ICMP echo socket is echo-only, not a
-    /// raw ICMP socket.
+    /// socket type that carries it.
     ///
     /// `flags` must be within [`FileOpenFlags::STATUS`].
     pub fn create_inet_socket(
@@ -84,11 +83,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
             .ok_or(SocketError::BrokerUnavailable)?;
         let handle = broker
             .create_inet_socket(protocol, flags)
-            .map_err(|error| match BrokerObjectError::from(error) {
-                // The broker's providers need not offer every protocol.
-                BrokerObjectError::UnsupportedOperation => SocketError::UnsupportedProtocol,
-                error => error.into(),
-            })?;
+            .map_err(BrokerObjectError::from)?;
         Ok(InetSocket::new(
             broker,
             self.broker_pollable_registry(),
@@ -145,11 +140,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
 
     /// The socket's type.
     pub fn socket_type(&self) -> SocketType {
-        if self.is_stream() {
-            SocketType::Stream
-        } else {
-            SocketType::Datagram
-        }
+        self.protocol.socket_type()
     }
 
     /// The socket's IPv4 protocol.
@@ -375,7 +366,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
             ));
         }
         if let Some(addr) = destination
-            && self.protocol != IpProtocol::IcmpEcho
+            && self.protocol.has_ports()
             && (addr.port() == 0 || addr.ip().is_unspecified())
         {
             return Err(SocketWriteError::Unaddressable);
@@ -507,11 +498,12 @@ impl From<BrokerObjectError> for SocketError {
                 Self::ResourceExhausted
             }
             BrokerObjectError::PermissionDenied => Self::PermissionDenied,
+            // The broker's providers need not offer every protocol.
+            BrokerObjectError::UnsupportedOperation => Self::UnsupportedProtocol,
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::WouldBlock
             | BrokerObjectError::PeerClosed
-            | BrokerObjectError::UnsupportedOperation
             | BrokerObjectError::Fault => Self::BackendFailure,
         }
     }

@@ -1626,9 +1626,17 @@ fn test_runner_icmp_echo() {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires iputils ping installed"]
 fn test_runner_iputils_ping() {
-    let ping = run_which("ping");
+    let Some(ping) = std::process::Command::new("which")
+        .arg("ping")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+    else {
+        eprintln!("skipped: iputils ping is not installed");
+        return;
+    };
     let _ = Runner::new(&ping, "iputils_ping_rewriter")
         .arg("-4")
         .arg("-n")

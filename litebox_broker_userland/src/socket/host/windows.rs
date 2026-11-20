@@ -27,12 +27,12 @@ use windows_sys::Win32::Networking::WinSock::{
     LPFN_WSARECVMSG, MSG_BCAST, MSG_MCAST, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
     SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME,
     SO_EXCLUSIVEADDRUSE, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSA_NOT_ENOUGH_MEMORY,
-    WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED,
-    WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR, WSAEINVAL,
-    WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN,
-    WSAEPROTONOSUPPORT, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError,
-    WSAID_WSARECVMSG, WSAIoctl, WSAMSG, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend,
-    WSASendMsg, WSASendTo, getsockopt, ioctlsocket, setsockopt,
+    WSABUF, WSAEACCES, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY,
+    WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR,
+    WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS,
+    WSAENOTCONN, WSAEOPNOTSUPP, WSAEPROTONOSUPPORT, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK,
+    WSAGetLastError, WSAID_WSARECVMSG, WSAIoctl, WSAMSG, WSAPOLL_EVENT_FLAGS, WSAPOLLFD, WSAPoll,
+    WSARecv, WSARecvFrom, WSASend, WSASendMsg, WSASendTo, getsockopt, ioctlsocket, setsockopt,
 };
 use windows_sys::core::GUID;
 
@@ -94,6 +94,8 @@ impl HostErrno for Errno {
     const MSGSIZE: Self = Self(WSAEMSGSIZE);
     const TIMEDOUT: Self = Self(WSAETIMEDOUT);
     const INVAL: Self = Self(WSAEINVAL);
+    const ACCES: Self = Self(WSAEACCES);
+    const OPNOTSUPP: Self = Self(WSAEOPNOTSUPP);
 
     fn broker_resource_error(self) -> Option<BrokerError> {
         match self {
@@ -265,12 +267,12 @@ impl Socket {
         Ok(received)
     }
 
-    /// Reports whether Winsock reports a TCP connection failed.
-    fn error_polled(&self) -> Result<bool, Errno> {
-        // Winsock reports a failed connect only to a poll for data.
+    /// Polls the socket for `events`, which Winsock reports with errors and
+    /// hang-ups, without waiting, and returns the events it reports.
+    fn polled_events(&self, events: WSAPOLL_EVENT_FLAGS) -> Result<WSAPOLL_EVENT_FLAGS, Errno> {
         let mut sockets = [WSAPOLLFD {
             fd: self.raw(),
-            events: POLLRDNORM | POLLWRNORM,
+            events,
             revents: 0,
         }];
         // SAFETY: `sockets` outlives the call, which polls without waiting
@@ -278,7 +280,13 @@ impl Socket {
         if unsafe { WSAPoll(sockets.as_mut_ptr(), 1, 0) } == SOCKET_ERROR {
             return Err(Errno::last());
         }
-        Ok(sockets[0].revents & POLLERR != 0)
+        Ok(sockets[0].revents)
+    }
+
+    /// Reports whether Winsock reports a TCP connection failed.
+    fn error_polled(&self) -> Result<bool, Errno> {
+        // Winsock reports a failed connect only to a poll for data.
+        Ok(self.polled_events(POLLRDNORM | POLLWRNORM)? & POLLERR != 0)
     }
 
     /// Returns the error of a failed TCP connection.
@@ -645,17 +653,7 @@ impl HostSocket for Socket {
     }
 
     fn stream_readable(&self) -> Result<bool, Errno> {
-        let mut sockets = [WSAPOLLFD {
-            fd: self.raw(),
-            events: POLLRDNORM,
-            revents: 0,
-        }];
-        // SAFETY: `sockets` outlives the call, which polls without waiting
-        // and writes only the entries' `revents`.
-        if unsafe { WSAPoll(sockets.as_mut_ptr(), 1, 0) } == SOCKET_ERROR {
-            return Err(Errno::last());
-        }
-        Ok(sockets[0].revents & POLLRDNORM != 0)
+        Ok(self.polled_events(POLLRDNORM)? & POLLRDNORM != 0)
     }
 
     #[cfg(test)]
@@ -718,24 +716,15 @@ impl HostSocket for Socket {
         Ok(seconds == u32::MAX)
     }
 
-    fn events(&self) -> Result<SocketEvents, Errno> {
-        let mut sockets = [WSAPOLLFD {
-            fd: self.raw(),
-            events: POLLRDNORM | POLLWRNORM,
-            revents: 0,
-        }];
-        // SAFETY: `sockets` outlives the call, which polls without waiting
-        // and writes only the entries' `revents`.
-        if unsafe { WSAPoll(sockets.as_mut_ptr(), 1, 0) } == SOCKET_ERROR {
-            return Err(Errno::last());
-        }
+    fn poll_events(&self) -> Result<SocketEvents, Errno> {
+        let polled = self.polled_events(POLLRDNORM | POLLWRNORM)?;
         let mut events = SocketEvents::empty();
         for (flag, event) in [
             (POLLRDNORM, SocketEvents::READABLE),
             (POLLWRNORM, SocketEvents::WRITABLE),
             (POLLERR, SocketEvents::ERROR),
         ] {
-            if sockets[0].revents & flag != 0 {
+            if polled & flag != 0 {
                 events |= event;
             }
         }

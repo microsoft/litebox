@@ -96,6 +96,8 @@ pub(crate) trait HostErrno:
     const MSGSIZE: Self;
     const TIMEDOUT: Self;
     const INVAL: Self;
+    const ACCES: Self;
+    const OPNOTSUPP: Self;
 
     /// Maps an error that reports the host out of a resource to the broker's.
     fn broker_resource_error(self) -> Option<BrokerError>;
@@ -137,10 +139,7 @@ pub(crate) trait HostErrno:
 ///
 /// A ping socket sends and receives ICMP echo messages without an IP
 /// header. The host assigns its echo identifier and checksum, and grants no
-/// raw socket access. Unlike a UDP socket's, its
-/// [`Self::receive_datagram`] may return only the length it copied, and the
-/// provider watches it with [`Interest::Stream`] and samples it with
-/// [`Self::events`].
+/// raw socket access.
 pub(crate) trait HostSocket: Sized + Send {
     type Errno;
 
@@ -229,9 +228,9 @@ pub(crate) trait HostSocket: Sized + Send {
     /// leaving it queued with `peek`.
     ///
     /// Returns the datagram's full length, even if `output` is shorter, and
-    /// its source, if IPv4. May fail with [`HostErrno::AGAIN`] while
-    /// datagrams are still queued, which the poller then reports; see
-    /// [`Interest::Oneshot`].
+    /// its source, if IPv4; a ping socket may return only the length it
+    /// copied. May fail with [`HostErrno::AGAIN`] while datagrams are still
+    /// queued, which the poller then reports; see [`Interest::Oneshot`].
     fn receive_datagram(
         &self,
         output: RawParts<'_>,
@@ -274,9 +273,10 @@ pub(crate) trait HostSocket: Sized + Send {
     /// Reports whether a TCP connect is still in progress.
     fn connect_pending(&self) -> Result<bool, Self::Errno>;
 
-    /// Reports which of [`SocketEvents::READABLE`], [`SocketEvents::WRITABLE`],
-    /// and [`SocketEvents::ERROR`] a ping socket raises now, without waiting.
-    fn events(&self) -> Result<SocketEvents, Self::Errno>;
+    /// Polls, without waiting, which of [`SocketEvents::READABLE`],
+    /// [`SocketEvents::WRITABLE`], and [`SocketEvents::ERROR`] a ping socket
+    /// raises now.
+    fn poll_events(&self) -> Result<SocketEvents, Self::Errno>;
 
     /// Sets whether a TCP socket sends small segments without delay.
     ///

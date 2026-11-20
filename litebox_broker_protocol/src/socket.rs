@@ -26,15 +26,15 @@ pub const MAX_SOCKET_TRANSFER_SIZE: u32 = 32 * 1024;
 const _: () = assert!(MAX_SOCKET_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
 
 /// Maximum bytes carried by one IPv4 UDP datagram.
-///
-/// A complete datagram fits in one association shared-buffer slot, preserving
-/// datagram atomicity across the broker boundary.
 pub const MAX_UDP_DATAGRAM_SIZE: u32 = 65_507;
 
 /// Largest IPv4 echo message, including the ICMP header but not the IPv4 header.
 pub const MAX_ICMP_ECHO_MESSAGE_SIZE: u32 = 65_515;
 
-/// Largest atomic message the shared datagram transport must accommodate.
+/// Largest message of any datagram protocol.
+///
+/// A complete datagram fits in one association shared-buffer slot, preserving
+/// datagram atomicity across the broker boundary.
 pub const MAX_DATAGRAM_TRANSFER_SIZE: u32 = MAX_ICMP_ECHO_MESSAGE_SIZE;
 
 const _: () = assert!(MAX_UDP_DATAGRAM_SIZE <= MAX_DATAGRAM_TRANSFER_SIZE);
@@ -101,6 +101,15 @@ impl IpProtocol {
             Self::Tcp => None,
         }
     }
+
+    /// Whether addresses of this protocol carry a port. An echo peer is
+    /// named by its IP alone, so its port is ignored.
+    pub const fn has_ports(self) -> bool {
+        match self {
+            Self::Tcp | Self::Udp => true,
+            Self::IcmpEcho => false,
+        }
+    }
 }
 
 wire_enum! {
@@ -142,8 +151,8 @@ wire_enum! {
         Broadcast,
         /// Whether Nagle's algorithm is disabled, which only TCP sockets support.
         NoDelay,
-        /// Whether a datagram socket requested extended error reporting. The
-        /// broker records the request; it supplies no extended error queue.
+        /// Whether extended error reporting was requested. The broker records
+        /// the request; it supplies no extended error queue.
         ReceiveExtendedErrors,
     }
 }

@@ -169,7 +169,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             (SockType::Stream, IPProtocol::Default | IPProtocol::TCP) => IpProtocol::Tcp,
             (SockType::Datagram, IPProtocol::Default | IPProtocol::UDP) => IpProtocol::Udp,
             (SockType::Datagram, IPProtocol::ICMP) => IpProtocol::IcmpEcho,
-            (SockType::Stream | SockType::Datagram, _) => return Err(Errno::EINVAL),
+            (SockType::Stream | SockType::Datagram, _) => return Err(Errno::EPROTONOSUPPORT),
             (SockType::Raw, _) => return Err(Errno::EPERM),
             _ => return Err(Errno::ESOCKTNOSUPPORT),
         };

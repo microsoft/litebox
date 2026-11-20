@@ -32,10 +32,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         if flags.contains(ReceiveFlags::PEEK) {
             broker_flags.0 |= BrokerReceiveFromFlags::PEEK.0;
         }
-        let maximum = self
-            .protocol
-            .max_datagram_size()
-            .expect("datagram protocol");
+        let Some(maximum) = self.protocol.max_datagram_size() else {
+            return Err(SocketReadError::Socket(SocketAsyncError::BackendFailure));
+        };
         let length = if flags.contains(ReceiveFlags::DISCARD) {
             0
         } else {
@@ -72,12 +71,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         buffer: impl WriteBuffer,
         destination: Option<SocketAddr>,
     ) -> Result<usize, SocketWriteError> {
-        if buffer.len()
-            > self
-                .protocol
-                .max_datagram_size()
-                .expect("datagram protocol") as usize
-        {
+        let Some(maximum) = self.protocol.max_datagram_size() else {
+            return Err(SocketWriteError::Socket(SocketAsyncError::BackendFailure));
+        };
+        if buffer.len() > maximum as usize {
             return Err(SocketWriteError::MessageTooLong);
         }
         let destination = match destination {

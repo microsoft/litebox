@@ -60,7 +60,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, MAX_UDP_DATAGRAM_SIZE, ReceiveFlags,
     ReceiveFromFlags, SendFlags, ShutdownMode, SocketConnectionStatus, SocketError,
-    SocketOptionName, SocketOptionValue, SocketOutcome, SocketType,
+    SocketOptionName, SocketOptionValue, SocketOutcome,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
@@ -197,6 +197,11 @@ struct ProviderCore {
     udp_ports: RwLock<UdpPorts>,
     /// Datagrams and bytes queued between guest UDP sockets broker-wide.
     udp_queued: Arc<QueueCounter>,
+    /// Receives host echo replies for any socket, which keeps only the
+    /// reply it matches.
+    echo_scratch: Mutex<Vec<u8>>,
+    /// Whether the host's lack of ping sockets has been reported.
+    ping_unavailable_reported: AtomicBool,
     /// Set under the `registry` write lock once the event thread fails.
     failed: AtomicBool,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -409,6 +414,8 @@ impl ProviderCore {
             registry: RwLock::new(registry),
             udp_ports: RwLock::new(UdpPorts::default()),
             udp_queued: Arc::new(QueueCounter::default()),
+            echo_scratch: Mutex::new(Vec::new()),
+            ping_unavailable_reported: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             thread: Mutex::new(None),
             #[cfg(test)]
@@ -810,7 +817,7 @@ impl UserlandSocket {
         let transport = match kind {
             SocketKind::Tcp => create_tcp_transport(),
             SocketKind::Udp => SocketTransportState::Udp(UdpSocketState::default()),
-            SocketKind::Echo => SocketTransportState::Echo(echo::EchoSocket::default()),
+            SocketKind::Echo => SocketTransportState::Echo(echo::EchoSocketState::default()),
         };
         Ok(Arc::new(Self {
             id,
@@ -1091,7 +1098,8 @@ enum ReceiveFromOutcome {
 }
 
 impl ReceiveFromOutcome {
-    /// Copies as much of `datagram` from `source` as fits into `output`.
+    /// Copies as much of `datagram` as fits into `output`, recording
+    /// `source_address` as its sender.
     fn copy_out(output: RawParts<'_>, datagram: &[u8], source_address: SocketAddrV4) -> Self {
         let received = output.len().min(datagram.len());
         output.copy_from_slice(&datagram[..received]);
@@ -1115,7 +1123,7 @@ impl ReceiveFromOutcome {
 enum SocketTransportState {
     Tcp(TcpSocketState),
     Udp(UdpSocketState),
-    Echo(echo::EchoSocket),
+    Echo(echo::EchoSocketState),
 }
 
 /// Socket state guarded by the socket's `state` lock.
@@ -1158,6 +1166,41 @@ enum SocketKind {
     Tcp,
     Udp,
     Echo,
+}
+
+impl SocketKind {
+    const fn for_protocol(protocol: IpProtocol) -> Option<Self> {
+        match protocol {
+            IpProtocol::Tcp => Some(Self::Tcp),
+            IpProtocol::Udp => Some(Self::Udp),
+            IpProtocol::IcmpEcho => Some(Self::Echo),
+            _ => None,
+        }
+    }
+}
+
+/// The directions a datagram socket's shutdown `mode` stops reading and
+/// writing in; TCP lifecycle modes fail with `InvalidArgument`.
+fn datagram_shutdown_directions(mode: ShutdownMode) -> BrokerResult<SocketOutcome<(bool, bool)>> {
+    Ok(SocketOutcome::Completed(match mode {
+        ShutdownMode::Read => (true, false),
+        ShutdownMode::Write => (false, true),
+        ShutdownMode::Both => (true, true),
+        ShutdownMode::Abort | ShutdownMode::StopListening => {
+            return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+        }
+        _ => return Err(BrokerError::UnsupportedOperation),
+    }))
+}
+
+/// Retries `call` until a host call is not interrupted.
+fn retry_intr<T>(mut call: impl FnMut() -> Result<T, Errno>) -> Result<T, Errno> {
+    loop {
+        match call() {
+            Err(Errno::INTR) => {}
+            result => return result,
+        }
+    }
 }
 
 /// A socket whose `state` lock is held.
@@ -1246,23 +1289,14 @@ impl<'a> SocketEntry<'a> {
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
         let kind = self.kind();
         let already_bound = self.guest_local_address.is_some();
-        let binding_kind = if binding.is_tcp() {
-            SocketKind::Tcp
-        } else if binding.is_icmp_echo() {
-            SocketKind::Echo
-        } else {
-            SocketKind::Udp
-        };
-        if !binding.is_valid() || binding_kind != kind {
+        if !binding.is_valid() || SocketKind::for_protocol(binding.protocol()) != Some(kind) {
             return Err(BrokerError::Internal);
         }
-        if kind == SocketKind::Echo {
-            return self.bind_echo(binding);
+        match kind {
+            SocketKind::Tcp => self.bind_tcp_socket(binding, already_bound),
+            SocketKind::Udp => self.bind_udp_socket(binding, already_bound),
+            SocketKind::Echo => self.bind_echo(binding),
         }
-        if kind == SocketKind::Udp {
-            return self.bind_udp_socket(binding, already_bound);
-        }
-        self.bind_tcp_socket(binding, already_bound)
     }
 
     fn send_to_socket(
@@ -1270,10 +1304,19 @@ impl<'a> SocketEntry<'a> {
         data: RawParts<'_>,
         destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        if self.kind() == SocketKind::Echo {
-            return self.send_echo(data, destination);
+        match self.kind() {
+            SocketKind::Tcp => Ok(SocketOutcome::Failed(SocketError::InvalidArgument)),
+            SocketKind::Udp => self.send_to_udp_socket(data, destination),
+            SocketKind::Echo => self.send_echo(data, destination),
         }
-        if self.kind() != SocketKind::Udp || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+    }
+
+    fn send_to_udp_socket(
+        &mut self,
+        data: RawParts<'_>,
+        destination: Option<SocketAddrV4>,
+    ) -> BrokerResult<SocketOutcome<usize>> {
+        if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         if let Some(error) = self.take_udp_cached_error() {
@@ -1302,20 +1345,17 @@ impl<'a> SocketEntry<'a> {
     }
 
     fn shutdown_socket(&mut self, mode: ShutdownMode) -> BrokerResult<SocketOutcome<()>> {
-        if self.kind() == SocketKind::Tcp {
-            return self.shutdown_tcp_socket(mode);
+        match self.kind() {
+            SocketKind::Tcp => self.shutdown_tcp_socket(mode),
+            SocketKind::Udp => self.shutdown_udp_socket(mode),
+            SocketKind::Echo => self.shutdown_echo(mode),
         }
-        if self.kind() == SocketKind::Echo {
-            return self.shutdown_echo(mode);
-        }
-        let (shut_read, shut_write) = match mode {
-            ShutdownMode::Read => (true, false),
-            ShutdownMode::Write => (false, true),
-            ShutdownMode::Both => (true, true),
-            ShutdownMode::Abort | ShutdownMode::StopListening => {
-                return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
-            }
-            _ => return Err(BrokerError::UnsupportedOperation),
+    }
+
+    fn shutdown_udp_socket(&mut self, mode: ShutdownMode) -> BrokerResult<SocketOutcome<()>> {
+        let (shut_read, shut_write) = match datagram_shutdown_directions(mode)? {
+            SocketOutcome::Completed(directions) => directions,
+            SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
         };
         if shut_read {
             let peer = self.udp_state()?.peer;
@@ -1341,9 +1381,18 @@ impl<'a> SocketEntry<'a> {
         output: RawParts<'_>,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<ReceiveFromOutcome> {
-        if self.kind() == SocketKind::Echo {
-            return self.receive_echo(output, flags);
+        match self.kind() {
+            SocketKind::Tcp => Err(BrokerError::Internal),
+            SocketKind::Udp => self.receive_from_udp_socket(output, flags),
+            SocketKind::Echo => self.receive_echo(output, flags),
         }
+    }
+
+    fn receive_from_udp_socket(
+        &mut self,
+        output: RawParts<'_>,
+        flags: ReceiveFromFlags,
+    ) -> BrokerResult<ReceiveFromOutcome> {
         if let Some(error) = self.take_udp_cached_error() {
             return Ok(ReceiveFromOutcome::Failed(error));
         }
@@ -1557,17 +1606,13 @@ fn local_socket_address(socket: &Socket) -> BrokerResult<SocketAddrV4> {
     socket.local_address().map_err(broker_error_from_errno)
 }
 
-const fn socket_kind(request: CreateSocketRequest) -> Option<SocketKind> {
-    match (
-        request.address_family,
-        request.socket_type,
-        request.protocol,
-    ) {
-        (AddressFamily::Ipv4, SocketType::Stream, IpProtocol::Tcp) => Some(SocketKind::Tcp),
-        (AddressFamily::Ipv4, SocketType::Datagram, IpProtocol::Udp) => Some(SocketKind::Udp),
-        (AddressFamily::Ipv4, SocketType::Datagram, IpProtocol::IcmpEcho) => Some(SocketKind::Echo),
-        _ => None,
+fn socket_kind(request: CreateSocketRequest) -> Option<SocketKind> {
+    if request.address_family != AddressFamily::Ipv4
+        || request.socket_type != request.protocol.socket_type()
+    {
+        return None;
     }
+    SocketKind::for_protocol(request.protocol)
 }
 
 fn status_socket(socket: &mut SocketEntry<'_>) -> BrokerResult<PlatformSocketStatus> {
@@ -1607,6 +1652,10 @@ const fn socket_error_from_errno(error: Errno) -> SocketError {
         Errno::ADDRNOTAVAIL => SocketError::AddressNotAvailable,
         Errno::NOTCONN | Errno::PIPE => SocketError::NotConnected,
         Errno::INVAL => SocketError::InvalidArgument,
+        // As an ICMP administratively-prohibited error reports.
+        Errno::ACCES => SocketError::PolicyDenied,
+        // As an ICMP source-route-failed error reports.
+        Errno::OPNOTSUPP => SocketError::UnsupportedOperation,
         _ => SocketError::Other,
     }
 }

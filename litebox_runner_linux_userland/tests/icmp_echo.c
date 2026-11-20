@@ -40,9 +40,29 @@ static void protocol_numbers_are_checked_in_full(void) {
     assert(socket(AF_INET, SOCK_DGRAM, 257) == -1 && errno == EPROTONOSUPPORT);
     errno = 0;
     assert(socket(AF_UNIX, SOCK_STREAM, -1) == -1 && errno == EPROTONOSUPPORT);
+    // A known protocol that the socket type does not carry is as unsupported.
+    errno = 0;
+    assert(socket(AF_INET, SOCK_STREAM, IPPROTO_UDP) == -1 && errno == EPROTONOSUPPORT);
+    errno = 0;
+    assert(socket(AF_INET, SOCK_DGRAM, IPPROTO_TCP) == -1 && errno == EPROTONOSUPPORT);
+    errno = 0;
+    assert(socket(AF_INET, SOCK_STREAM, IPPROTO_ICMP) == -1 && errno == EPROTONOSUPPORT);
 }
 
-static void malformed_requests_are_rejected(int fd, const struct sockaddr_in *dst) {
+// A receive into a buffer shorter than the reply takes the whole reply.
+static void truncated_receive_discards_the_rest(int fd, const struct sockaddr_in *dst) {
+    unsigned char request[] = {8, 0, 0, 0, 0, 0, 0, 7, 'x', 'y', 'z'};
+    assert(sendto(fd, request, sizeof(request), 0, (const struct sockaddr *)dst, sizeof(*dst)) ==
+           sizeof(request));
+    assert(wait_readable(fd));
+    unsigned char header[8];
+    assert(recv(fd, header, sizeof(header), 0) == sizeof(header));
+    assert(header[0] == 0 && header[7] == 7);
+    errno = 0;
+    assert(recv(fd, header, sizeof(header), 0) == -1 && errno == EAGAIN);
+}
+
+static void requests_are_validated_up_to_the_largest(int fd, const struct sockaddr_in *dst) {
     unsigned char request[] = {8, 0, 0, 0, 0, 0, 0, 1};
     const struct sockaddr *to = (const struct sockaddr *)dst;
     // Shorter than an ICMP header.
@@ -159,7 +179,8 @@ int main(void) {
     assert(checksum_valid(reply, sizeof(request)));
     assert(memcmp(reply + 6, request + 6, sizeof(request) - 6) == 0);
     assert(recv(fd, reply, sizeof(reply), 0) == -1 && errno == EAGAIN);
-    malformed_requests_are_rejected(fd, &dst);
+    truncated_receive_discards_the_rest(fd, &dst);
+    requests_are_validated_up_to_the_largest(fd, &dst);
     assert(close(fd) == 0);
     connected_socket_accepts_any_reply();
 }

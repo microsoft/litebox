@@ -26,8 +26,7 @@ use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned IPv4 socket for `protocol`, on the socket type
-    /// that carries it, with the status flags `flags`. An ICMP echo socket is
-    /// echo-only, not a raw ICMP socket.
+    /// that carries it, with the status flags `flags`.
     ///
     /// # Panics
     ///

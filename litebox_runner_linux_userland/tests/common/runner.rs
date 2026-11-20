@@ -437,22 +437,27 @@ impl Runner {
             let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
             // SAFETY: waitid writes to a valid siginfo_t. WNOWAIT keeps the group
             // leader's PID reserved until the group has been cleaned up below.
-            if unsafe {
+            let waited = unsafe {
                 libc::waitid(
                     libc::P_PID,
                     pid,
                     info.as_mut_ptr(),
                     libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
                 )
-            } < 0
-            {
+            };
+            if waited < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
                     break Err(error);
                 }
-            // SAFETY: waitid succeeded; si_pid is zero if there was no exit.
-            } else if unsafe { info.assume_init().si_pid() } != 0 {
-                break Ok(());
+            } else {
+                // SAFETY: `info` started zeroed, a valid siginfo_t, and waitid
+                // succeeded.
+                let info = unsafe { info.assume_init_ref() };
+                // SAFETY: waitid set `si_pid`, which stays zero if there was no exit.
+                if unsafe { info.si_pid() } != 0 {
+                    break Ok(());
+                }
             }
             if Instant::now() >= deadline {
                 break Err(std::io::Error::new(

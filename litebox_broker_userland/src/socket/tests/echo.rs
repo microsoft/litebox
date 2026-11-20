@@ -34,18 +34,62 @@ fn with_echo_provider(
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
-    let handle = core_socket::create(
+    let handle = create_inet_socket(
         &process,
-        CreateSocketRequest {
-            address_family: AddressFamily::Ipv4,
-            socket_type: SocketType::Datagram,
-            protocol: IpProtocol::IcmpEcho,
-            flags: FileOpenFlags::NONBLOCKING,
-        },
+        IpProtocol::IcmpEcho,
+        FileOpenFlags::NONBLOCKING,
         Arc::new(TestReadinessSink { published, retired }),
-    )
-    .unwrap();
+    );
     run(&process, handle, &publications);
+}
+
+/// The registered socket of a provider that holds one.
+#[cfg(target_os = "linux")]
+fn only_socket(provider: &UserlandSocketProvider) -> Arc<UserlandSocket> {
+    read_lock(&provider.core.registry)
+        .sockets
+        .values()
+        .next()
+        .unwrap()
+        .upgrade()
+        .unwrap()
+}
+
+/// Bytes queued for the loopback UDP socket bound to `port`, as Linux
+/// accounts them in `/proc/net/udp`, or `None` if the read missed it, as one
+/// can while other sockets open or close.
+#[cfg(target_os = "linux")]
+fn udp_receive_queue_bytes(port: u16) -> Option<usize> {
+    let table = std::fs::read_to_string("/proc/net/udp").unwrap();
+    table.lines().skip(1).find_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let (_, local_port) = fields.get(1)?.split_once(':')?;
+        if u16::from_str_radix(local_port, 16).ok()? != port {
+            return None;
+        }
+        let (_, queued) = fields.get(4)?.split_once(':')?;
+        usize::from_str_radix(queued, 16).ok()
+    })
+}
+
+/// Waits until the loopback UDP socket bound to `port` queues at least
+/// `bytes`, and returns how many it queues.
+#[cfg(target_os = "linux")]
+fn wait_for_udp_receive_queue(port: u16, bytes: usize) -> usize {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        let queued = udp_receive_queue_bytes(port);
+        if let Some(queued) = queued
+            && queued >= bytes
+        {
+            return queued;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{queued:?} bytes queued, expected {bytes}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -71,24 +115,25 @@ fn echo_filtered_batch_posts_continuation_without_publishing_read() {
                 .unwrap();
             let address = host.local_address().unwrap();
             let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            // A reply to the awaited request from another host is as unmatched
+            // as one to a request never sent.
+            let spoofer = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
+            spoofer.send_to(&REPLY, address).unwrap();
+            let datagram_bytes = wait_for_udp_receive_queue(address.port(), 1);
             let mut unsolicited = REPLY;
             unsolicited[7] = 9;
-            for _ in 0..HOST_SCAN_BUDGET {
+            for _ in 1..HOST_SCAN_BUDGET {
                 sender.send_to(&unsolicited, address).unwrap();
             }
             sender.send_to(&REPLY, address).unwrap();
+            // The scan must find every datagram already queued.
+            let all = (HOST_SCAN_BUDGET + 1) * datagram_bytes;
+            assert_eq!(wait_for_udp_receive_queue(address.port(), all), all);
 
             let peer = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 0);
-            let socket = read_lock(&provider.core.registry)
-                .sockets
-                .values()
-                .next()
-                .unwrap()
-                .upgrade()
-                .unwrap();
-            socket
+            only_socket(&provider)
                 .call(|entry| {
-                    entry.install_echo_test_host(host, peer, [0, 1]);
+                    entry.install_awaiting_echo_test_host(host, peer, [0, 1]);
                     entry.refresh_echo().unwrap();
                     assert_eq!(entry.inbox().own, ReadinessFlags::WRITE);
                     Ok(())
@@ -222,9 +267,58 @@ fn echo_drops_loopback_replies_beyond_its_queue_but_not_requests() {
     });
 }
 
+#[test]
+fn echo_bounds_the_bytes_of_its_queued_loopback_replies() {
+    use crate::socket::echo::MAX_REPLY_BYTES;
+    use litebox_broker_protocol::socket::MAX_ICMP_ECHO_MESSAGE_SIZE;
+
+    with_echo(&SocketPolicy::guest_network(), |process, handle, _| {
+        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        let mut request = vec![0; MAX_ICMP_ECHO_MESSAGE_SIZE as usize];
+        request[0] = 8;
+        let fitting = MAX_REPLY_BYTES / request.len();
+        for sequence in 0..=fitting {
+            request[7] = u8::try_from(sequence).unwrap();
+            assert_eq!(
+                send_datagram(process, handle, &request, SendFlags::NONE, Some(peer)),
+                Ok(SocketOutcome::Completed(request.len()))
+            );
+        }
+        let mut reply = vec![0; request.len()];
+        for sequence in 0..fitting {
+            assert_eq!(
+                receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
+                Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                    received: request.len(),
+                    datagram_length: request.len(),
+                    source_address: peer,
+                }))
+            );
+            assert_eq!(usize::from(reply[7]), sequence);
+        }
+        assert_eq!(
+            receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
+            Err(BrokerError::NonBlockingWouldBlock)
+        );
+    });
+}
+
 #[cfg(target_os = "linux")]
 #[test]
-fn echo_reports_a_host_error_once() {
+fn echo_reports_a_host_error_once_to_a_receive() {
+    echo_reports_a_host_error_once(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn echo_reports_a_host_error_once_to_a_status_query() {
+    echo_reports_a_host_error_once(true);
+}
+
+/// Like a UDP socket's, an echo socket reports a host error once, whether a
+/// receive or a status query takes it.
+#[cfg(target_os = "linux")]
+fn echo_reports_a_host_error_once(taken_by_status: bool) {
     let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
     with_echo_provider(
         &SocketPolicy::guest_network(),
@@ -250,40 +344,42 @@ fn echo_reports_a_host_error_once() {
                 probe.as_mut_slice(),
             )];
             host.send(RawParts::from(&parts), None).unwrap();
-            let deadline = std::time::Instant::now() + TEST_TIMEOUT;
-            while !host.events().unwrap().contains(SocketEvents::ERROR) {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "no ICMP error arrived"
-                );
+            let deadline = Instant::now() + TEST_TIMEOUT;
+            while !host.poll_events().unwrap().contains(SocketEvents::ERROR) {
+                assert!(Instant::now() < deadline, "no ICMP error arrived");
                 std::thread::sleep(Duration::from_millis(1));
             }
 
             let peer = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 0);
-            let socket = read_lock(&provider.core.registry)
-                .sockets
-                .values()
-                .next()
-                .unwrap()
-                .upgrade()
-                .unwrap();
-            socket
+            only_socket(&provider)
                 .call(|entry| {
-                    entry.install_echo_test_host(host, peer, [0, 1]);
+                    entry.install_awaiting_echo_test_host(host, peer, [0, 1]);
                     entry.refresh_echo().unwrap();
                     Ok(())
                 })
                 .unwrap();
-            wait_for_readiness(
+            wait_for_readiness_publication(
                 publications,
                 handle,
                 ReadinessFlags::WRITE | ReadinessFlags::ERROR,
             );
-            let mut reply = [0; REPLY.len()];
             assert_eq!(
-                receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
-                Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+                process.check_readiness(handle),
+                Ok(ReadinessFlags::WRITE | ReadinessFlags::ERROR)
             );
+            let mut reply = [0; REPLY.len()];
+            if taken_by_status {
+                assert_eq!(
+                    core_socket::take_error(process, handle),
+                    Ok(Some(SocketError::ConnectionRefused))
+                );
+                assert_eq!(core_socket::take_error(process, handle), Ok(None));
+            } else {
+                assert_eq!(
+                    receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
+                    Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+                );
+            }
             assert_eq!(process.check_readiness(handle), Ok(ReadinessFlags::WRITE));
             assert_eq!(
                 receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
@@ -291,6 +387,39 @@ fn echo_reports_a_host_error_once() {
             );
         },
     );
+}
+
+#[test]
+fn closing_an_echo_socket_releases_its_quota() {
+    let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
+    let broker = test_broker_core(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        Arc::clone(&provider),
+    )
+    .unwrap();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    for _ in 0..2 {
+        let (published, _publications) = channel();
+        let (retired, retirements) = channel();
+        let handle = create_inet_socket(
+            &process,
+            IpProtocol::IcmpEcho,
+            FileOpenFlags::NONBLOCKING,
+            Arc::new(TestReadinessSink { published, retired }),
+        );
+        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        assert_eq!(
+            send_datagram(&process, handle, &REQUEST, SendFlags::NONE, Some(peer)),
+            Ok(SocketOutcome::Completed(REQUEST.len()))
+        );
+        // The next socket fits only within the quota this one releases.
+        process.close_object_reference(handle).unwrap();
+        assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
+    }
 }
 
 #[test]

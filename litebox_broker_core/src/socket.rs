@@ -18,7 +18,6 @@ use litebox_broker_protocol::socket::{
     CreateSocketRequest, IpProtocol, MAX_DATAGRAM_TRANSFER_SIZE, MAX_SOCKET_TRANSFER_SIZE,
     MAX_TCP_LISTEN_BACKLOG, ReceiveFlags, ReceiveFromFlags, SendFlags, ShutdownMode,
     SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
-    SocketType,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, RwLock};
@@ -105,11 +104,12 @@ struct BrokerSocketPortState {
 }
 
 impl BrokerSocketPortState {
-    fn for_transport(&mut self, transport: GuestTransport) -> &mut GuestTransportBindingState {
-        match transport {
-            GuestTransport::Tcp => &mut self.tcp,
-            GuestTransport::Udp => &mut self.udp,
-            GuestTransport::IcmpEcho => &mut self.icmp_echo,
+    fn for_protocol(&mut self, protocol: IpProtocol) -> Result<&mut GuestTransportBindingState> {
+        match protocol {
+            IpProtocol::Tcp => Ok(&mut self.tcp),
+            IpProtocol::Udp => Ok(&mut self.udp),
+            IpProtocol::IcmpEcho => Ok(&mut self.icmp_echo),
+            _ => Err(BrokerError::Internal),
         }
     }
 }
@@ -186,13 +186,6 @@ impl GuestTransportBindingState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GuestTransport {
-    Tcp,
-    Udp,
-    IcmpEcho,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuestBindingKey {
     Wildcard(u16),
     Exact(SocketAddrV4),
@@ -203,7 +196,7 @@ enum GuestBindingKey {
 /// The final owner removes the binding from the broker-wide namespace.
 struct GuestPortBinding {
     ports: BrokerSocketPorts,
-    transport: GuestTransport,
+    protocol: IpProtocol,
     key: GuestBindingKey,
     automatic: bool,
 }
@@ -220,7 +213,7 @@ impl GuestPortBinding {
     ///
     /// Datagrams snapshot source metadata when sent and need no lease.
     fn source_lease_for(self: &Arc<Self>, destination: SocketAddrV4) -> Option<GuestSourceLease> {
-        if self.transport != GuestTransport::Tcp {
+        if self.protocol != IpProtocol::Tcp {
             return None;
         }
         let source_address =
@@ -251,9 +244,9 @@ impl BrokerSocketPorts {
         if !is_internal_socket_address(requested_address) {
             return Ok(SocketOutcome::Failed(SocketError::AddressNotAvailable));
         }
-        let transport = guest_transport(request).ok_or(BrokerError::Internal)?;
+        let protocol = request.protocol;
         let mut state = self.state.lock();
-        let ports = state.for_transport(transport);
+        let ports = state.for_protocol(protocol)?;
         let port = if requested_address.port() == 0 {
             ports.allocate_ephemeral(requested_address)?
         } else if ports.conflicts(requested_address) {
@@ -275,7 +268,7 @@ impl BrokerSocketPorts {
             local_address,
             Arc::new(GuestPortBinding {
                 ports: self.clone(),
-                transport,
+                protocol,
                 key,
                 automatic: requested_address.port() == 0,
             }),
@@ -286,8 +279,9 @@ impl BrokerSocketPorts {
 impl Drop for GuestPortBinding {
     fn drop(&mut self) {
         let mut state = self.ports.state.lock();
-        let ports = state.for_transport(self.transport);
-        let removed = ports.remove(self.key);
+        let removed = state
+            .for_protocol(self.protocol)
+            .is_ok_and(|ports| ports.remove(self.key));
         debug_assert!(removed, "live guest port binding must be registered");
     }
 }
@@ -296,7 +290,7 @@ impl Drop for GuestPortBinding {
 #[derive(Clone)]
 pub struct GuestSocketBinding {
     local_address: SocketAddrV4,
-    transport: GuestTransport,
+    protocol: IpProtocol,
     automatic: bool,
 }
 
@@ -304,7 +298,7 @@ impl GuestSocketBinding {
     fn new(binding: &GuestPortBinding) -> Self {
         Self {
             local_address: binding.local_address(),
-            transport: binding.transport,
+            protocol: binding.protocol,
             automatic: binding.automatic,
         }
     }
@@ -336,13 +330,14 @@ impl GuestSocketBinding {
     /// Returns whether this binding belongs to the TCP guest namespace.
     #[must_use]
     pub fn is_tcp(&self) -> bool {
-        self.transport == GuestTransport::Tcp
+        self.protocol == IpProtocol::Tcp
     }
 
-    /// Returns whether this binding reserves an ICMP echo identifier, not a TCP or UDP port.
+    /// Returns the protocol whose namespace this binding reserves its port
+    /// in: a TCP or UDP port, or an ICMP echo identifier.
     #[must_use]
-    pub fn is_icmp_echo(&self) -> bool {
-        self.transport == GuestTransport::IcmpEcho
+    pub const fn protocol(&self) -> IpProtocol {
+        self.protocol
     }
 
     /// Returns whether this binding covers one concrete guest-network address.
@@ -397,7 +392,7 @@ impl fmt::Debug for GuestSocketBinding {
 
 impl PartialEq for GuestSocketBinding {
     fn eq(&self, other: &Self) -> bool {
-        self.local_address == other.local_address && self.transport == other.transport
+        self.local_address == other.local_address && self.protocol == other.protocol
     }
 }
 
@@ -653,7 +648,10 @@ pub trait PlatformSocket: Send + Sync {
     ///
     /// The original datagram length is returned even when the caller's buffer
     /// is smaller, and zero-length datagrams are successful receives. The
-    /// source address follows [`PlatformDatagramReceive::source_address`].
+    /// source address follows [`PlatformDatagramReceive::source_address`]. An
+    /// echo socket returns only echo replies to its own requests, rewritten to
+    /// carry the identifier of its guest binding, from a source with port
+    /// zero.
     ///
     /// Once the transport applies read shutdown, return a pending error or
     /// `Failed(Shutdown)`, leaving any unconsumed error available through [`Self::status`].
@@ -988,7 +986,7 @@ fn transport_connect(
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let create_request = read_socket(object, |socket| socket.create_request)?;
 
-    if create_request.protocol != IpProtocol::IcmpEcho && is_unaddressable(address) {
+    if create_request.protocol.has_ports() && is_unaddressable(address) {
         return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
     }
     let destination = match normalize_peer(create_request.protocol, address) {
@@ -1461,7 +1459,8 @@ fn transport_send(
 /// Sends `data` as one complete datagram without waiting for readiness.
 ///
 /// A pending error fails the send and is consumed, and a socket shut down for
-/// writing fails with `Shutdown`. Without `destination`, an unconnected
+/// writing fails with `Shutdown`. A datagram longer than its protocol's
+/// maximum fails with `MessageTooLong`. Without `destination`, an unconnected
 /// socket fails with `DestinationAddressRequired`. The first valid send with
 /// an explicit destination on an unbound datagram socket reserves and binds a
 /// guest-visible local endpoint before invoking the platform. A temporarily
@@ -1496,7 +1495,7 @@ fn send_datagram(
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     };
     if data.len() > maximum {
-        return Err(BrokerError::UnsupportedOperation);
+        return Ok(SocketOutcome::Failed(SocketError::MessageTooLong));
     }
     if let Some(error) = take_pending_error(object, false) {
         return Ok(SocketOutcome::Failed(error));
@@ -1861,7 +1860,7 @@ fn transport_receive_from(
 ///
 /// The transport implements a TCP socket's `NoDelay` and `KeepAlive`; the
 /// broker stores the other options, and fails with `UnsupportedOperation` for
-/// `NoDelay` on a datagram socket and `ReceiveExtendedErrors` on a stream.
+/// `NoDelay` on a datagram socket.
 pub fn set_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1873,9 +1872,7 @@ pub fn set_option(
         return Err(BrokerError::InvalidRights);
     };
     if !is_tcp_option(socket.create_request, value.name()) {
-        return socket
-            .options
-            .set(value, is_datagram(socket.create_request));
+        return socket.options.set(value);
     }
     if socket.resource_retired {
         return Err(BrokerError::Internal);
@@ -1898,7 +1895,7 @@ pub fn get_option(
         return Err(BrokerError::InvalidRights);
     };
     if !is_tcp_option(socket.create_request, name) {
-        return socket.options.get(name, is_datagram(socket.create_request));
+        return socket.options.get(name);
     }
     if socket.resource_retired {
         return Err(BrokerError::Internal);
@@ -2920,9 +2917,8 @@ pub(crate) struct SocketOptions {
 
 impl SocketOptions {
     /// Stores `value`, failing with `UnsupportedOperation` for `NoDelay`,
-    /// which only a TCP transport implements, and for
-    /// `ReceiveExtendedErrors` unless the socket is an IPv4 `datagram` one.
-    pub(crate) fn set(&mut self, value: SocketOptionValue, datagram: bool) -> Result<()> {
+    /// which only a TCP transport implements.
+    pub(crate) fn set(&mut self, value: SocketOptionValue) -> Result<()> {
         match value {
             SocketOptionValue::ReceiveTimeout(timeout) => self.receive_timeout = timeout,
             SocketOptionValue::SendTimeout(timeout) => self.send_timeout = timeout,
@@ -2930,19 +2926,17 @@ impl SocketOptions {
             SocketOptionValue::ReuseAddress(value) => self.reuse_address = value,
             SocketOptionValue::KeepAlive(value) => self.keep_alive = value,
             SocketOptionValue::Broadcast(value) => self.broadcast = value,
-            SocketOptionValue::ReceiveExtendedErrors(value) if datagram => {
+            SocketOptionValue::ReceiveExtendedErrors(value) => {
                 self.receive_extended_errors = value;
             }
-            SocketOptionValue::NoDelay(_) | SocketOptionValue::ReceiveExtendedErrors(_) => {
-                return Err(BrokerError::UnsupportedOperation);
-            }
+            SocketOptionValue::NoDelay(_) => return Err(BrokerError::UnsupportedOperation),
         }
         Ok(())
     }
 
     /// Returns the stored value of the option `name`, failing as
     /// [`Self::set`] does.
-    pub(crate) fn get(&self, name: SocketOptionName, datagram: bool) -> Result<SocketOptionValue> {
+    pub(crate) fn get(&self, name: SocketOptionName) -> Result<SocketOptionValue> {
         Ok(match name {
             SocketOptionName::ReceiveTimeout => {
                 SocketOptionValue::ReceiveTimeout(self.receive_timeout)
@@ -2952,12 +2946,10 @@ impl SocketOptions {
             SocketOptionName::ReuseAddress => SocketOptionValue::ReuseAddress(self.reuse_address),
             SocketOptionName::KeepAlive => SocketOptionValue::KeepAlive(self.keep_alive),
             SocketOptionName::Broadcast => SocketOptionValue::Broadcast(self.broadcast),
-            SocketOptionName::ReceiveExtendedErrors if datagram => {
+            SocketOptionName::ReceiveExtendedErrors => {
                 SocketOptionValue::ReceiveExtendedErrors(self.receive_extended_errors)
             }
-            SocketOptionName::NoDelay | SocketOptionName::ReceiveExtendedErrors => {
-                return Err(BrokerError::UnsupportedOperation);
-            }
+            SocketOptionName::NoDelay => return Err(BrokerError::UnsupportedOperation),
         })
     }
 }
@@ -3306,45 +3298,37 @@ impl ReadinessOverlay {
     }
 }
 
+// Socket creation admits only a request whose type is its protocol's, so a
+// request's protocol alone decides its kind.
+
 const fn is_tcp(request: CreateSocketRequest) -> bool {
-    matches!(
-        (request.socket_type, request.protocol),
-        (SocketType::Stream, IpProtocol::Tcp)
-    )
+    matches!(request.protocol, IpProtocol::Tcp)
 }
 
 const fn is_udp(request: CreateSocketRequest) -> bool {
-    matches!(
-        (request.socket_type, request.protocol),
-        (SocketType::Datagram, IpProtocol::Udp)
-    )
+    matches!(request.protocol, IpProtocol::Udp)
 }
 
 const fn is_datagram(request: CreateSocketRequest) -> bool {
-    matches!(
-        (request.socket_type, request.protocol),
-        (SocketType::Datagram, IpProtocol::Udp | IpProtocol::IcmpEcho)
-    )
+    request.protocol.max_datagram_size().is_some()
 }
 
 /// Returns the longest datagram a socket created by `request` carries, or
 /// `None` if it is not a datagram socket.
 fn datagram_limit(request: CreateSocketRequest) -> Option<usize> {
-    if !is_datagram(request) {
-        return None;
-    }
     request
         .protocol
         .max_datagram_size()
         .map(|size| size as usize)
 }
 
-/// Normalizes a peer, dropping the port that echo ignores.
-fn normalize_peer(
+/// Normalizes a `protocol` peer as [`normalize_socket_destination`] does,
+/// first dropping its port if the protocol has none.
+pub fn normalize_peer(
     protocol: IpProtocol,
     mut peer: SocketAddrV4,
 ) -> core::result::Result<SocketAddrV4, SocketError> {
-    if protocol == IpProtocol::IcmpEcho {
+    if !protocol.has_ports() {
         peer.set_port(0);
     }
     normalize_socket_destination(peer)
@@ -3363,7 +3347,7 @@ fn resolve_datagram_destination(
     requested: Option<SocketAddrV4>,
     connected: Option<SocketAddrV4>,
 ) -> core::result::Result<Option<SocketAddrV4>, SocketError> {
-    if protocol == IpProtocol::IcmpEcho {
+    if !protocol.has_ports() {
         let peer = requested
             .or(connected)
             .ok_or(SocketError::DestinationAddressRequired)?;
@@ -3373,15 +3357,6 @@ fn resolve_datagram_destination(
         Some(destination) if destination.port() == 0 => Err(SocketError::InvalidArgument),
         Some(destination) => normalize_socket_destination(destination).map(Some),
         None => Ok(None),
-    }
-}
-
-const fn guest_transport(request: CreateSocketRequest) -> Option<GuestTransport> {
-    match (request.socket_type, request.protocol) {
-        (SocketType::Stream, IpProtocol::Tcp) => Some(GuestTransport::Tcp),
-        (SocketType::Datagram, IpProtocol::Udp) => Some(GuestTransport::Udp),
-        (SocketType::Datagram, IpProtocol::IcmpEcho) => Some(GuestTransport::IcmpEcho),
-        _ => None,
     }
 }
 

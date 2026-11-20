@@ -395,7 +395,7 @@ fn guest_binding_namespaces_support_exact_and_wildcard_guest_addresses() {
     assert_eq!(
         GuestSocketBinding {
             local_address: private,
-            transport: GuestTransport::Tcp,
+            protocol: IpProtocol::Tcp,
             automatic: false,
         }
         .source_address_for_destination(external),
@@ -3218,7 +3218,7 @@ fn check_udp_socket_operations(broker: &TestBroker, provider: &TestSocketProvide
             SendFlags::NONE,
             Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
         ),
-        Err(BrokerError::UnsupportedOperation)
+        Ok(SocketOutcome::Failed(SocketError::MessageTooLong))
     );
     assert_eq!(
         provider.state.send_calls.load(Ordering::Relaxed),

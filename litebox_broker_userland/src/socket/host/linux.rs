@@ -67,6 +67,8 @@ impl HostErrno for Errno {
     const MSGSIZE: Self = Self(RustixErrno::MSGSIZE);
     const TIMEDOUT: Self = Self(RustixErrno::TIMEDOUT);
     const INVAL: Self = Self(RustixErrno::INVAL);
+    const ACCES: Self = Self(RustixErrno::ACCESS);
+    const OPNOTSUPP: Self = Self(RustixErrno::OPNOTSUPP);
 
     fn broker_resource_error(self) -> Option<BrokerError> {
         match self.0 {
@@ -338,7 +340,7 @@ impl HostSocket for Socket {
         }
     }
 
-    fn events(&self) -> Result<SocketEvents, Errno> {
+    fn poll_events(&self) -> Result<SocketEvents, Errno> {
         let polled = self.polled_events(PollFlags::IN | PollFlags::OUT)?;
         let mut events = SocketEvents::empty();
         for (flag, event) in [
