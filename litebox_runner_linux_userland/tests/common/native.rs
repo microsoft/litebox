@@ -144,13 +144,13 @@ fn isolate(parent: u32, uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
         unsafe {
             libc::close(status_writer);
         }
-        let mapped = mapper
+        let setup_result = mapper
             .read_exact(&mut [0])
             .and_then(|()| write_proc_file(first, b"setgroups", b"deny"))
             .and_then(|()| write_proc_file(first, b"uid_map", uid_map))
             .and_then(|()| write_proc_file(first, b"gid_map", gid_map))
             .and_then(|()| mapper.write_all(&[0]));
-        if let Err(error) = mapped {
+        if let Err(error) = setup_result {
             // SAFETY: `first` is this process's child, which is waiting for its maps.
             unsafe {
                 libc::kill(first, libc::SIGKILL);
