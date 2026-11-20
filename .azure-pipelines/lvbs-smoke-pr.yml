@@ -1,0 +1,50 @@
+trigger: none
+
+pr:
+  autoCancel: true
+  branches:
+    include:
+    - main
+
+resources:
+  repositories:
+  - repository: lvbsPipelines
+    type: git
+    name: LSG-linux/LSG-lvbs-pipelines
+    ref: refs/heads/prapal/smoke-unfederated
+
+jobs:
+- job: LvbsSmoke
+  displayName: LVBS Smoke Test
+  timeoutInMinutes: 210
+  cancelTimeoutInMinutes: 5
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), ne(variables['System.PullRequest.IsFork'], 'True'))
+  pool:
+    vmImage: ubuntu-latest
+  steps:
+  - checkout: lvbsPipelines
+    path: s/lvbs-pipelines
+    persistCredentials: false
+  - bash: python3 "$(Pipeline.Workspace)/s/lvbs-pipelines/scripts/lvbs-smoke-pr-candidate.py"
+    name: validate
+    displayName: Check PR eligibility and exact head SHA
+    env:
+      PR_NUMBER: $(System.PullRequest.PullRequestNumber)
+      PR_COMMIT: $(System.PullRequest.SourceCommitId)
+  - bash: python3 "$(Pipeline.Workspace)/s/lvbs-pipelines/scripts/lvbs-smoke-pr-run.py"
+    displayName: Queue LVBS smoke and wait for result
+    condition: and(succeeded(), eq(variables['validate.Eligible'], 'true'))
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+      SYSTEM_TEAMPROJECT: $(System.TeamProject)
+      PR_COMMIT: $(System.PullRequest.SourceCommitId)
+      SMOKE_BUILD_STATE: $(Agent.TempDirectory)/lvbs-smoke-build-id
+  - bash: python3 "$(Pipeline.Workspace)/s/lvbs-pipelines/scripts/lvbs-smoke-pr-run.py" --cancel
+    displayName: Cancel superseded LVBS smoke run
+    condition: canceled()
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+      SYSTEM_TEAMPROJECT: $(System.TeamProject)
+      SMOKE_BUILD_STATE: $(Agent.TempDirectory)/lvbs-smoke-build-id
