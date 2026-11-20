@@ -135,6 +135,14 @@ default-members = [
 [workspace.lints.cargo]
 unused_dependencies = "deny"
 
+# Retain workspace file/line backtraces, but omit locals/types and dependency
+# debug info to reduce development build artifact sizes.
+# Set CARGO_PROFILE_DEV_DEBUG=2 for full debug info in workspace crates.
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = false
+
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy
 # but not _too_ ridiculous.
