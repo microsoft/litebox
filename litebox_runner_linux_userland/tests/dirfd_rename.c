@@ -66,13 +66,13 @@ static void test_program_directory(const char *program) {
 }
 
 // Usage: dirfd_rename [base-directory [no-symlinks]]. The working directory is created under
-// `base-directory` (default `/tmp`); `no-symlinks` skips the steps that create symlinks, for
+// `base-directory` (default `test_dir()`); `no-symlinks` skips the steps that create symlinks, for
 // filesystems that cannot create them.
 int main(int argc, char **argv) {
-    const char *base = argc > 1 ? argv[1] : "/tmp";
+    const char *base = argc > 1 ? argv[1] : test_dir();
     test_program_directory(argv[0]);
     int symlinks = !(argc > 2 && strcmp(argv[2], "no-symlinks") == 0);
-    char tmp[64];
+    char tmp[4096];
     TEST_ASSERT(snprintf(tmp, sizeof(tmp), "%s/lb-dirfd-XXXXXX", base) < (int)sizeof(tmp),
                 "base directory name is short");
     TEST_ASSERT(mkdtemp(tmp) != NULL && chdir(tmp) == 0, "create working directory");
