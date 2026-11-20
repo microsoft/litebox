@@ -4,7 +4,6 @@
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::event::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest,
-    EventConsumeMode,
 };
 use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::message::{
@@ -27,10 +26,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         initial_count: u64,
         flags: FileOpenFlags,
+        semaphore: bool,
     ) -> Result<ObjectHandle, Channel::Error> {
         let response = self.request_event(EventRequest::Create(CreateEventRequest {
             initial_count,
             flags,
+            semaphore,
         }))?;
         match response {
             EventResponse::Create(response) => Ok(response.handle),
@@ -65,10 +66,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn consume_event(
         &self,
         handle: ObjectHandle,
-        mode: EventConsumeMode,
     ) -> Result<ConsumeEventResponse, Channel::Error> {
-        let response =
-            self.request_event(EventRequest::Consume(ConsumeEventRequest { handle, mode }))?;
+        let response = self.request_event(EventRequest::Consume(ConsumeEventRequest { handle }))?;
         match response {
             EventResponse::Consume(response) => Ok(response),
             response => panic!("broker returned unexpected event response: {response:?}"),

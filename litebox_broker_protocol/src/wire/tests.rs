@@ -7,7 +7,7 @@ use core::time::Duration;
 use crate::error::ErrorCode;
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
-    CreateEventResponse, EventConsumeMode, EventConsumption,
+    CreateEventResponse, EventConsumption,
 };
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileLockOperation, FileMode,
@@ -77,7 +77,7 @@ use crate::socket::{
 };
 use crate::timer::{
     CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
-    ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
+    ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerClock, TimerSetting, TimerSpec,
 };
 use crate::unix_socket::{
     AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
@@ -143,34 +143,33 @@ fn request_codec_round_trips_all_variants() {
             mask: FileOpenFlags::STATUS,
             flags: FileOpenFlags::APPEND,
         }),
-        BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
-            initial_count: 0,
-            flags: FileOpenFlags::NONE,
-        })),
+        BrokerOperation::Event(EventRequest::Create(CreateEventRequest::default())),
         BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
             initial_count: 7,
             flags: FileOpenFlags::NONBLOCKING,
+            semaphore: true,
         })),
         BrokerOperation::Event(EventRequest::Add(AddEventRequest { handle, value: 3 })),
-        BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
-            handle,
-            mode: EventConsumeMode::All,
-        })),
-        BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
-            handle,
-            mode: EventConsumeMode::One,
-        })),
-        BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest {
-            flags: FileOpenFlags::NONE,
-        })),
+        BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest { handle })),
+        BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest::default())),
         BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest {
             flags: FileOpenFlags::NONBLOCKING,
+            clock: TimerClock::RealTime,
         })),
         BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest {
             handle,
-            spec: TimerSpec {
+            setting: TimerSetting::Relative(TimerSpec {
                 value_ns: u64::MAX,
                 interval_ns: 1,
+            }),
+        })),
+        BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest {
+            handle,
+            setting: TimerSetting::Absolute {
+                deadline: Duration::new(u64::MAX, 1),
+                interval_ns: 2,
+                realtime_now: Duration::new(3, 4),
+                monotonic_now: Duration::new(5, 6),
             },
         })),
         BrokerOperation::Timer(TimerRequest::Get(GetTimerRequest { handle })),
@@ -1494,10 +1493,7 @@ fn decode_rejects_malformed_handshake_request_frames() {
     assert_eq!(
         decode_handshake_request(&encode_request(&BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
-                initial_count: 0,
-                flags: FileOpenFlags::NONE,
-            })),
+            operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest::default())),
         })),
         Err(WireError::WrongMessagePhase)
     );
@@ -1538,16 +1534,13 @@ fn decode_rejects_malformed_request_frames() {
         decode_request(&unknown_operation),
         Err(WireError::InvalidTag)
     );
-    let mut unknown_consume_mode = encode_request(&BrokerRequest {
+    let mut invalid_semaphore_flag = encode_request(&BrokerRequest {
         request_id: TEST_REQUEST_ID,
-        operation: BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
-            handle: ObjectHandle(13),
-            mode: EventConsumeMode::All,
-        })),
+        operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest::default())),
     });
-    *unknown_consume_mode.last_mut().unwrap() = 0xff;
+    *invalid_semaphore_flag.last_mut().unwrap() = 0xff;
     assert_eq!(
-        decode_request(&unknown_consume_mode),
+        decode_request(&invalid_semaphore_flag),
         Err(WireError::InvalidTag)
     );
     let mut unknown_timer_request = encode_request(&BrokerRequest {
@@ -1563,7 +1556,7 @@ fn decode_rejects_malformed_request_frames() {
         request_id: TEST_REQUEST_ID,
         operation: BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest {
             handle: ObjectHandle(13),
-            spec: TimerSpec::default(),
+            setting: TimerSpec::default().into(),
         })),
     });
     assert_eq!(
@@ -1812,10 +1805,7 @@ fn decode_rejects_malformed_request_frames() {
     );
     let mut frame = encode_request(&BrokerRequest {
         request_id: TEST_REQUEST_ID,
-        operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
-            initial_count: 0,
-            flags: FileOpenFlags::NONE,
-        })),
+        operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest::default())),
     });
     frame.push(0xff);
     assert_eq!(decode_request(&frame), Err(WireError::TrailingBytes));
@@ -2691,11 +2681,12 @@ fn event_create_request_wire_shape_is_pinned() {
             request_id: RequestId(13),
             operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 7,
-                flags: FileOpenFlags::NONBLOCKING
+                flags: FileOpenFlags::NONBLOCKING,
+                semaphore: true,
             })),
         }),
         [
-            1, 13, 0, 0, 0, 0, 0, 0, 0, 5, 0, 7, 0, 0, 0, 0, 0, 0, 0, 32, 0
+            1, 13, 0, 0, 0, 0, 0, 0, 0, 5, 0, 7, 0, 0, 0, 0, 0, 0, 0, 32, 0, 1
         ]
     );
 }

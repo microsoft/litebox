@@ -6,7 +6,6 @@ use alloc::sync::Arc;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::ConsumeEventResponse;
-pub use litebox_broker_protocol::event::EventConsumeMode as EventCounterReadMode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::time::TimeProvider;
@@ -46,8 +45,8 @@ pub enum EventCounterError {
     Unavailable,
 }
 
-/// A local-core event counter object, whose count and status flags the broker
-/// owns.
+/// A local-core event counter whose count, status flags, and semaphore mode
+/// the broker owns.
 pub struct EventCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
@@ -60,7 +59,8 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     /// Creates a local-core event counter with the status flags `flags`,
-    /// within [`FileOpenFlags::STATUS`].
+    /// within [`FileOpenFlags::STATUS`]. If `semaphore` is set, each read
+    /// consumes one credit instead of the full count.
     ///
     /// # Panics
     ///
@@ -70,12 +70,13 @@ where
         litebox: &LiteBox<Platform>,
         initial_count: u64,
         flags: FileOpenFlags,
+        semaphore: bool,
     ) -> Result<Self, EventCounterError> {
         let Some(broker) = litebox.broker_control() else {
             return Err(EventCounterError::Unavailable);
         };
         let handle = broker
-            .create_event_with_count(initial_count, flags)
+            .create_event_with_count(initial_count, flags, semaphore)
             .map_err(BrokerObjectError::from)
             .map_err(EventCounterError::from)?;
         Ok(Self::from_handle(litebox, broker, handle))
@@ -107,12 +108,11 @@ where
     pub fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
-        mode: EventCounterReadMode,
     ) -> Result<u64, TryOpError<EventCounterError>> {
         // On a non-blocking counter, the broker returns `NonBlockingWouldBlock`
         // instead of `WouldBlock`, so the wait returns instead of blocking.
         self.pollee.wait(cx, false, Events::IN, || {
-            let response = self.consume(mode)?;
+            let response = self.consume()?;
             if response.readiness.contains(ReadinessFlags::WRITE) {
                 self.pollee.notify_observers(Events::OUT);
             }
@@ -157,12 +157,9 @@ where
         Ok(self.broker.set_status_flags(self.handle, mask, flags)?)
     }
 
-    fn consume(
-        &self,
-        mode: EventCounterReadMode,
-    ) -> Result<ConsumeEventResponse, TryOpError<EventCounterError>> {
+    fn consume(&self) -> Result<ConsumeEventResponse, TryOpError<EventCounterError>> {
         self.broker
-            .consume_event(self.handle, mode)
+            .consume_event(self.handle)
             .map_err(|error| self.broker_request_error(error))
     }
 
@@ -274,17 +271,14 @@ mod tests {
             test_shared_memory(),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
-        let counter = Arc::new(EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap());
+        let counter = Arc::new(EventCounter::new(&litebox, 0, FileOpenFlags::NONE, false).unwrap());
 
         let (result_sender, result_receiver) = std::sync::mpsc::channel();
         {
             let counter = counter.clone();
             std::thread::spawn(move || {
                 result_sender
-                    .send(counter.read(
-                        &WaitState::new(platform).context(),
-                        EventCounterReadMode::One,
-                    ))
+                    .send(counter.read(&WaitState::new(platform).context()))
                     .unwrap();
             });
         }
@@ -330,16 +324,13 @@ mod tests {
             test_shared_memory(),
         );
         let litebox = Arc::new(LiteBox::new_with_broker_local(platform, local));
-        let counter = Arc::new(EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap());
+        let counter = Arc::new(EventCounter::new(&litebox, 0, FileOpenFlags::NONE, false).unwrap());
 
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
         let read_counter = Arc::clone(&counter);
         let reader = std::thread::spawn(move || {
             result_sender
-                .send(read_counter.read(
-                    &WaitState::new(platform).context(),
-                    EventCounterReadMode::One,
-                ))
+                .send(read_counter.read(&WaitState::new(platform).context()))
                 .unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -379,8 +370,8 @@ mod tests {
             test_shared_memory(),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
-        let first = EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap();
-        let second = EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap();
+        let first = EventCounter::new(&litebox, 0, FileOpenFlags::NONE, false).unwrap();
+        let second = EventCounter::new(&litebox, 0, FileOpenFlags::NONE, false).unwrap();
         let first_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
         let first_observer_dyn: Arc<dyn Observer<Events>> = first_observer.clone();
         first.register_observer(Arc::downgrade(&first_observer_dyn), Events::ERR);
@@ -414,7 +405,7 @@ mod tests {
             test_shared_memory(),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
-        let counter = EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap();
+        let counter = EventCounter::new(&litebox, 0, FileOpenFlags::NONE, false).unwrap();
         let read_observer = Arc::new(ReadObserver(AtomicBool::new(false)));
         let read_observer_dyn: Arc<dyn Observer<Events>> = read_observer.clone();
         counter.register_observer(Arc::downgrade(&read_observer_dyn), Events::IN);

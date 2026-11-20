@@ -2080,18 +2080,21 @@ fn handle_event_request(
     request: EventRequest,
 ) -> RequestResult<EventResponse> {
     match request {
-        EventRequest::Create(request) => {
-            litebox_broker_core::event::create(process, request.initial_count, request.flags)
-                .map(|handle| EventResponse::Create(CreateEventResponse { handle }))
-                .map_err(RequestFailure::from)
-        }
+        EventRequest::Create(request) => litebox_broker_core::event::create_with_mode(
+            process,
+            request.initial_count,
+            request.flags,
+            request.semaphore,
+        )
+        .map(|handle| EventResponse::Create(CreateEventResponse { handle }))
+        .map_err(RequestFailure::from),
         EventRequest::Add(request) => {
             litebox_broker_core::event::add(process, request.handle, request.value)
                 .map(|readiness| EventResponse::Add(AddEventResponse { readiness }))
                 .map_err(RequestFailure::from)
         }
         EventRequest::Consume(request) => {
-            litebox_broker_core::event::consume(process, request.handle, request.mode)
+            litebox_broker_core::event::consume(process, request.handle)
                 .map(EventResponse::Consume)
                 .map_err(RequestFailure::from)
         }
@@ -2133,12 +2136,15 @@ fn handle_timer_request(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<TimerResponse> {
     let response = match request {
-        TimerRequest::Create(request) => {
-            litebox_broker_core::timer::create(process, readiness_sink, request.flags)
-                .map(|handle| TimerResponse::Create(CreateTimerResponse { handle }))
-        }
+        TimerRequest::Create(request) => litebox_broker_core::timer::create(
+            process,
+            readiness_sink,
+            request.flags,
+            request.clock,
+        )
+        .map(|handle| TimerResponse::Create(CreateTimerResponse { handle })),
         TimerRequest::Set(request) => {
-            litebox_broker_core::timer::set(process, request.handle, request.spec)
+            litebox_broker_core::timer::set(process, request.handle, request.setting)
                 .map(|previous| TimerResponse::Set(SetTimerResponse { previous }))
         }
         TimerRequest::Get(request) => litebox_broker_core::timer::get(process, request.handle)
@@ -2329,7 +2335,7 @@ mod tests {
     };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy};
     use litebox_broker_protocol::event::{
-        AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
+        AddEventRequest, ConsumeEventRequest, CreateEventRequest,
     };
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags, FileTimeUpdate,
@@ -2353,7 +2359,8 @@ mod tests {
         SocketOptionValue, SocketType,
     };
     use litebox_broker_protocol::timer::{
-        CreateTimerRequest, GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
+        CreateTimerRequest, GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerClock,
+        TimerSetting, TimerSpec,
     };
     use litebox_broker_protocol::unix_socket::{
         ConnectUnixSocketRequest, CreateUnixSocketRequest, ReceiveUnixSocketRequest,
@@ -3254,7 +3261,7 @@ mod tests {
             &process,
             BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 1,
-                flags: FileOpenFlags::NONE,
+                ..CreateEventRequest::default()
             })),
         );
         let BrokerResult::Event(EventResponse::Create(CreateEventResponse { handle: event })) =
@@ -3505,10 +3512,7 @@ mod tests {
             }))]),
             std::vec::Vec::from([
                 Ok(HostReceive::Message(BrokerOperation::Event(
-                    EventRequest::Create(CreateEventRequest {
-                        initial_count: 0,
-                        flags: FileOpenFlags::NONE,
-                    }),
+                    EventRequest::Create(CreateEventRequest::default()),
                 ))),
                 Ok(HostReceive::PeerClosed),
             ]),
@@ -3641,10 +3645,7 @@ mod tests {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             }))]),
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerOperation::Event(
-                EventRequest::Create(CreateEventRequest {
-                    initial_count: 0,
-                    flags: FileOpenFlags::NONE,
-                }),
+                EventRequest::Create(CreateEventRequest::default()),
             )))]),
         );
         channel.response_send_error = true;
@@ -3663,8 +3664,9 @@ mod tests {
             }))]),
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerOperation::Event(
                 EventRequest::Create(CreateEventRequest {
-                    initial_count: 0,
+                    initial_count: 1,
                     flags: FileOpenFlags::NONE,
+                    semaphore: true,
                 }),
             )))]),
         );
@@ -3683,7 +3685,8 @@ mod tests {
                 BrokerResult::Event(EventResponse::Consume(
                     litebox_broker_protocol::event::ConsumeEventResponse {
                         value: 1,
-                        readiness: litebox_broker_protocol::readiness::ReadinessFlags::WRITE,
+                        readiness: litebox_broker_protocol::readiness::ReadinessFlags::READ
+                            | litebox_broker_protocol::readiness::ReadinessFlags::WRITE,
                     }
                 )),
             ]
@@ -3703,10 +3706,7 @@ mod tests {
                     }),
                 ))),
                 Ok(HostReceive::Message(BrokerOperation::Event(
-                    EventRequest::Create(CreateEventRequest {
-                        initial_count: 0,
-                        flags: FileOpenFlags::NONE,
-                    }),
+                    EventRequest::Create(CreateEventRequest::default()),
                 ))),
                 Ok(HostReceive::PeerClosed),
             ]),
@@ -3818,10 +3818,7 @@ mod tests {
             .unwrap();
         let response = handle_test_request(
             &process,
-            BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
-                initial_count: 0,
-                flags: FileOpenFlags::NONE,
-            })),
+            BrokerOperation::Event(EventRequest::Create(CreateEventRequest::default())),
         );
         let BrokerResult::Event(EventResponse::Create(response)) = response else {
             panic!("unexpected create response: {response:?}");
@@ -3920,21 +3917,26 @@ mod tests {
             .unwrap();
         let response = handle_test_request(
             &process,
-            BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest::default())),
+            BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest {
+                flags: FileOpenFlags::NONE,
+                clock: TimerClock::RealTime,
+            })),
         );
         let BrokerResult::Timer(TimerResponse::Create(CreateTimerResponse { handle })) = response
         else {
             panic!("unexpected create response: {response:?}");
         };
-        let spec = TimerSpec {
-            value_ns: 10,
+        let setting = TimerSetting::Absolute {
+            deadline: Duration::new(1, 10),
             interval_ns: 5,
+            realtime_now: Duration::from_secs(1),
+            monotonic_now: Duration::ZERO,
         };
 
         assert_eq!(
             handle_test_request(
                 &process,
-                BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest { handle, spec }))
+                BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest { handle, setting }))
             ),
             BrokerResult::Timer(TimerResponse::Set(SetTimerResponse {
                 previous: TimerSpec::default()
@@ -4785,10 +4787,7 @@ mod tests {
     fn event_create_request(request_id: u64) -> BrokerRequest {
         BrokerRequest {
             request_id: RequestId(request_id),
-            operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
-                initial_count: 0,
-                flags: FileOpenFlags::NONE,
-            })),
+            operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest::default())),
         }
     }
 
@@ -5113,7 +5112,6 @@ mod tests {
                     .push(Ok(HostReceive::Message(BrokerOperation::Event(
                         EventRequest::Consume(ConsumeEventRequest {
                             handle: response.handle,
-                            mode: EventConsumeMode::One,
                         }),
                     ))));
                 self.operations.push(Ok(HostReceive::PeerClosed));

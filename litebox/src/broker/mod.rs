@@ -13,7 +13,7 @@ use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
+use litebox_broker_protocol::event::ConsumeEventResponse;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
     FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, MapFileResponse,
@@ -44,7 +44,7 @@ use litebox_broker_protocol::socket::{
     SocketType,
 };
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
-use litebox_broker_protocol::timer::TimerSpec;
+use litebox_broker_protocol::timer::{TimerClock, TimerSetting, TimerSpec};
 use litebox_broker_protocol::unix_socket::{
     CreateUnixSocketPairResponse, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE,
     ReceiveUnixSocketResponse, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
@@ -371,6 +371,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         initial_count: u64,
         flags: FileOpenFlags,
+        semaphore: bool,
     ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn check_readiness(
@@ -399,18 +400,18 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn consume_event(
         &self,
         handle: ObjectHandle,
-        mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError>;
 
     fn create_timer(
         &self,
         flags: FileOpenFlags,
+        clock: TimerClock,
     ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn set_timer(
         &self,
         handle: ObjectHandle,
-        spec: TimerSpec,
+        setting: TimerSetting,
     ) -> core::result::Result<TimerSpec, BrokerControlError>;
 
     fn get_timer(
@@ -1497,8 +1498,9 @@ where
         &self,
         initial_count: u64,
         flags: FileOpenFlags,
+        semaphore: bool,
     ) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(|local| local.create_event_with_count(initial_count, flags))
+        self.request(|local| local.create_event_with_count(initial_count, flags, semaphore))
     }
 
     fn check_readiness(
@@ -1535,24 +1537,24 @@ where
     fn consume_event(
         &self,
         handle: ObjectHandle,
-        mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError> {
-        self.request(|local| local.consume_event(handle, mode))
+        self.request(|local| local.consume_event(handle))
     }
 
     fn create_timer(
         &self,
         flags: FileOpenFlags,
+        clock: TimerClock,
     ) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(|local| local.create_timer(flags))
+        self.request(|local| local.create_timer(flags, clock))
     }
 
     fn set_timer(
         &self,
         handle: ObjectHandle,
-        spec: TimerSpec,
+        setting: TimerSetting,
     ) -> core::result::Result<TimerSpec, BrokerControlError> {
-        self.request(|local| local.set_timer(handle, spec))
+        self.request(|local| local.set_timer(handle, setting))
     }
 
     fn get_timer(

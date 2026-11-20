@@ -7,7 +7,8 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, TimerRequest, TimerResponse,
 };
 use litebox_broker_protocol::timer::{
-    CreateTimerRequest, GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
+    CreateTimerRequest, GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerClock,
+    TimerSetting, TimerSpec,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -21,8 +22,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued timer request.
-    pub fn create_timer(&self, flags: FileOpenFlags) -> Result<ObjectHandle, Channel::Error> {
-        match self.request_timer(TimerRequest::Create(CreateTimerRequest { flags }))? {
+    pub fn create_timer(
+        &self,
+        flags: FileOpenFlags,
+        clock: TimerClock,
+    ) -> Result<ObjectHandle, Channel::Error> {
+        match self.request_timer(TimerRequest::Create(CreateTimerRequest { flags, clock }))? {
             TimerResponse::Create(response) => Ok(response.handle),
             response => panic!("broker returned unexpected timer response: {response:?}"),
         }
@@ -37,9 +42,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn set_timer(
         &self,
         handle: ObjectHandle,
-        spec: TimerSpec,
+        setting: TimerSetting,
     ) -> Result<TimerSpec, Channel::Error> {
-        match self.request_timer(TimerRequest::Set(SetTimerRequest { handle, spec }))? {
+        match self.request_timer(TimerRequest::Set(SetTimerRequest { handle, setting }))? {
             TimerResponse::Set(response) => Ok(response.previous),
             response => panic!("broker returned unexpected timer response: {response:?}"),
         }

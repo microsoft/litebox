@@ -557,17 +557,17 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
-                InheritedFdKind::Eventfd { semaphore } => {
+                InheritedFdKind::Eventfd => {
                     self.install_inherited_fd(litebox, first_fd, raw_fd, || {
                         global
-                            .adopt_inherited_eventfd(handle, semaphore)
+                            .adopt_inherited_eventfd(handle)
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
-                InheritedFdKind::Timerfd { clock } => {
+                InheritedFdKind::Timerfd => {
                     self.install_inherited_fd(litebox, first_fd, raw_fd, || {
                         global
-                            .adopt_inherited_timerfd(handle, clock)
+                            .adopt_inherited_timerfd(handle)
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
@@ -946,17 +946,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 AnyTypedFd::Eventfd(eventfd) => self.global.with_eventfd(&eventfd, |file| {
                     Ok((
-                        InheritedFdKind::Eventfd {
-                            semaphore: file.is_semaphore(),
-                        },
+                        InheritedFdKind::Eventfd,
                         InheritableFd::EventCounter(alloc::sync::Arc::clone(file.counter())),
                     ))
                 })?,
                 AnyTypedFd::Timerfd(timerfd) => self.global.with_timerfd(&timerfd, |file| {
                     Ok((
-                        InheritedFdKind::Timerfd {
-                            clock: file.clock(),
-                        },
+                        InheritedFdKind::Timerfd,
                         InheritableFd::Timer(alloc::sync::Arc::clone(file.timer())),
                     ))
                 })?,

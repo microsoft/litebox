@@ -3258,7 +3258,7 @@ mod tests {
     use crate::{
         BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine, SocketPolicy,
     };
-    use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
+    use litebox_broker_protocol::event::EventConsumption;
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags,
         FileType, FileUser, SetStatusFlagsRequest,
@@ -3514,7 +3514,7 @@ mod tests {
         assert_eq!(crate::event::add(&parent, event, 0), Ok(ready));
         assert_eq!(take_republished(&parent_sink), []);
         assert_eq!(
-            crate::event::consume(&parent, event, EventConsumeMode::All),
+            crate::event::consume(&parent, event),
             Ok(EventConsumption {
                 value: 2,
                 readiness: ReadinessFlags::WRITE,
@@ -3531,7 +3531,7 @@ mod tests {
 
         // Status flags belong to the event, so the parent sees the child's change.
         assert_eq!(
-            crate::event::consume(&parent, event, EventConsumeMode::One),
+            crate::event::consume(&parent, event),
             Err(BrokerError::WouldBlock)
         );
         child
@@ -3549,7 +3549,7 @@ mod tests {
             })
         );
         assert_eq!(
-            crate::event::consume(&parent, event, EventConsumeMode::One),
+            crate::event::consume(&parent, event),
             Err(BrokerError::NonBlockingWouldBlock)
         );
 
@@ -5600,7 +5600,7 @@ mod tests {
             .create_process(CallerCredential::HostGuaranteed)
             .unwrap();
 
-        let event = crate::event::create(&source, 1, FileOpenFlags::NONE).unwrap();
+        let event = crate::event::create_with_mode(&source, 2, FileOpenFlags::NONE, true).unwrap();
         let duplicated_event = source
             .duplicate_object_reference_to(event, &target, ObjectRights::WAIT)
             .unwrap();
@@ -5615,10 +5615,10 @@ mod tests {
             Err(BrokerError::InvalidRights)
         );
         assert_eq!(
-            crate::event::consume(&target, duplicated_event, EventConsumeMode::One),
+            crate::event::consume(&target, duplicated_event),
             Ok(EventConsumption {
                 value: 1,
-                readiness: ReadinessFlags::WRITE,
+                readiness: ReadinessFlags::READ | ReadinessFlags::WRITE,
             })
         );
         assert_eq!(
@@ -5732,7 +5732,7 @@ mod tests {
             Err(BrokerError::InvalidRights)
         );
         assert_eq!(
-            crate::event::consume(&source, file, EventConsumeMode::One),
+            crate::event::consume(&source, file),
             Err(BrokerError::InvalidRights)
         );
         assert_eq!(
@@ -6070,7 +6070,7 @@ mod tests {
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
         );
         assert_eq!(
-            crate::event::consume(&process, handle, EventConsumeMode::One),
+            crate::event::consume(&process, handle),
             Ok(EventConsumption {
                 value: 1,
                 readiness: ReadinessFlags::WRITE,

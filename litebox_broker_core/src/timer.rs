@@ -14,7 +14,7 @@ use core::time::Duration;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::timer::TimerSpec;
+use litebox_broker_protocol::timer::{TimerClock, TimerSetting, TimerSpec};
 
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
@@ -55,7 +55,7 @@ impl TimerProvider for UnsupportedTimerProvider {
     }
 }
 
-/// Creates a disarmed broker-owned timer.
+/// Creates a disarmed broker-owned timer that uses `guest_clock` for absolute deadlines.
 ///
 /// The timer starts with the status flags `flags`, which must be within
 /// [`FileOpenFlags::STATUS`], and its reference publishes readiness through
@@ -64,6 +64,7 @@ pub fn create(
     process: &BrokerProcess,
     readiness_sink: &Arc<dyn ReadinessSink>,
     flags: FileOpenFlags,
+    guest_clock: TimerClock,
 ) -> Result<ObjectHandle> {
     let status = StatusFlags::new(flags)?;
     let rights = process
@@ -78,6 +79,7 @@ pub fn create(
     let alarm = clock.create_alarm(watchers.clone())?;
     reference.commit_with_readiness(
         ObjectEntry::Timer(TimerObject {
+            guest_clock,
             clock,
             alarm,
             watchers,
@@ -91,12 +93,16 @@ pub fn create(
 
 /// Arms or disarms a timer, returning its previous schedule.
 ///
-/// A nonzero `spec.value_ns` arms the timer relative to now; zero disarms it.
-/// Unconsumed expirations are discarded.
-pub fn set(process: &BrokerProcess, handle: ObjectHandle, spec: TimerSpec) -> Result<TimerSpec> {
+/// A zero deadline or relative delay disarms the timer. Unconsumed expirations
+/// are discarded.
+pub fn set(
+    process: &BrokerProcess,
+    handle: ObjectHandle,
+    setting: impl Into<TimerSetting>,
+) -> Result<TimerSpec> {
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let mut object = object.write();
-    Ok(object.as_timer_mut()?.set(spec))
+    Ok(object.as_timer_mut()?.set(setting.into()))
 }
 
 /// Returns a timer's current schedule.
@@ -133,8 +139,9 @@ impl ObjectEntry {
     }
 }
 
-/// A timer, whose references share its schedule and status flags.
+/// A timer, whose references share its clock, schedule, and status flags.
 pub(crate) struct TimerObject {
+    guest_clock: TimerClock,
     clock: Arc<dyn TimerProvider>,
     alarm: Box<dyn Alarm>,
     /// Registrations of the timer's references, which its alarm wakes.
@@ -155,7 +162,31 @@ impl TimerObject {
         }
     }
 
-    fn set(&mut self, spec: TimerSpec) -> TimerSpec {
+    fn set(&mut self, setting: TimerSetting) -> TimerSpec {
+        let spec = match setting {
+            TimerSetting::Relative(spec) => spec,
+            TimerSetting::Absolute {
+                deadline,
+                interval_ns,
+                realtime_now,
+                monotonic_now,
+            } => {
+                let guest_now = match self.guest_clock {
+                    TimerClock::Monotonic => monotonic_now,
+                    TimerClock::RealTime => realtime_now,
+                };
+                let value_ns = if deadline.is_zero() {
+                    0
+                } else {
+                    // XXX: Preserve the original phase and overruns of a past absolute deadline.
+                    saturating_nanos(deadline.saturating_sub(guest_now)).max(1)
+                };
+                TimerSpec {
+                    value_ns,
+                    interval_ns,
+                }
+            }
+        };
         let now = self.clock.now();
         let previous = self.current(now);
         self.interval = Duration::from_nanos(spec.interval_ns);
@@ -247,7 +278,7 @@ mod tests {
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::fs::FileOpenFlags;
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::timer::TimerSpec;
+    use litebox_broker_protocol::timer::{TimerClock, TimerSetting, TimerSpec};
 
     use crate::readiness::ReadinessSink;
     use crate::readiness::tests::TestReadinessSink;
@@ -278,7 +309,12 @@ mod tests {
         sink: &Arc<TestReadinessSink>,
         flags: FileOpenFlags,
     ) -> crate::Result<ObjectHandle> {
-        super::create(process, &(sink.clone() as Arc<dyn ReadinessSink>), flags)
+        super::create(
+            process,
+            &(sink.clone() as Arc<dyn ReadinessSink>),
+            flags,
+            TimerClock::Monotonic,
+        )
     }
 
     #[test]
@@ -384,7 +420,13 @@ mod tests {
             .unwrap();
         let source_sink = Arc::new(TestReadinessSink::default());
         let target_sink = Arc::new(TestReadinessSink::default());
-        let handle = create(&source, &source_sink, FileOpenFlags::NONE).unwrap();
+        let handle = super::create(
+            &source,
+            &(source_sink.clone() as Arc<dyn ReadinessSink>),
+            FileOpenFlags::NONE,
+            TimerClock::RealTime,
+        )
+        .unwrap();
         let duplicated = source
             .duplicate_object_reference_to(handle, &target, ObjectRights::all())
             .unwrap();
@@ -392,8 +434,18 @@ mod tests {
             .register_readiness(&(target_sink.clone() as Arc<dyn ReadinessSink>))
             .unwrap();
 
-        // Either reference arms the shared schedule, and its alarm wakes both.
-        super::set(&target, duplicated, spec(10, 0)).unwrap();
+        // The duplicated reference uses the original clock and arms the shared alarm.
+        super::set(
+            &target,
+            duplicated,
+            TimerSetting::Absolute {
+                deadline: Duration::new(1, 10),
+                interval_ns: 0,
+                realtime_now: Duration::from_secs(1),
+                monotonic_now: Duration::ZERO,
+            },
+        )
+        .unwrap();
         assert_eq!(super::get(&source, handle), Ok(spec(10, 0)));
         clock.advance(Duration::from_nanos(10));
         assert_eq!(
