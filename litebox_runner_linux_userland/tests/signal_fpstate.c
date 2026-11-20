@@ -455,21 +455,32 @@ static void test_red_zone(void) {
 }
 
 /* A frame must fit in an alternate stack of the advertised minimum size. */
-static void test_min_altstack(void) {
-    static unsigned char buffer[65536] __attribute__((aligned(64)));
-    unsigned long size = getauxval(AT_MINSIGSTKSZ);
+static void test_min_altstack(size_t page_size) {
+    /* Under _GNU_SOURCE, glibc's MINSIGSTKSZ is sysconf(_SC_MINSIGSTKSZ), derived from host
+       CPUID; using it could enlarge the stack and mask a too-small AT_MINSIGSTKSZ. */
+    const size_t linux_min_sigstack = 2048;
+    size_t size = getauxval(AT_MINSIGSTKSZ);
     check(size != 0, "AT_MINSIGSTKSZ");
-    if (size < (unsigned long)MINSIGSTKSZ)
-        size = (unsigned long)MINSIGSTKSZ;
-    check(size <= sizeof(buffer) / 2, "AT_MINSIGSTKSZ too large");
+    if (size < linux_min_sigstack)
+        size = linux_min_sigstack;
+
+    /* Leave writable headroom below the registered stack for the handler's own frames. */
+    const size_t headroom = 8 * page_size;
+    const size_t overhead = page_size + headroom;
+    check(size <= SIZE_MAX - overhead - (page_size - 1), "alternate stack size overflow");
+    const size_t length = overhead + (size + page_size - 1) / page_size * page_size;
+    unsigned char *mapping = mmap(NULL, length, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(mapping != MAP_FAILED, "mmap minimum alternate stack");
+    check(mprotect(mapping, page_size, PROT_NONE) == 0, "mprotect alternate stack guard");
     stack_t old;
-    /* The handler's own frames may grow below the alternate stack into `buffer`. */
-    current_altstack = (stack_t){ .ss_sp = buffer + sizeof(buffer) - size, .ss_size = size };
+    current_altstack = (stack_t){ .ss_sp = mapping + length - size, .ss_size = size };
     check(sigaltstack(&current_altstack, &old) == 0, "minimum sigaltstack");
     mode = MIN_ALTSTACK;
     handled = 0;
     check(syscall(SYS_tgkill, pid, tid, SIGXCPU) == 0 && handled, "minimum-altstack delivery");
     check(sigaltstack(&old, NULL) == 0, "restore sigaltstack");
+    check(munmap(mapping, length) == 0, "munmap minimum alternate stack");
 }
 
 int main(void) {
@@ -507,7 +518,7 @@ int main(void) {
     test_fault();
     test_async();
     test_red_zone();
-    test_min_altstack();
+    test_min_altstack((size_t)page_size);
     unsigned int a, b, c, d;
     __cpuid(1, a, b, c, d);
     if ((c & bit_AVX) && (c & bit_OSXSAVE)) {
