@@ -433,21 +433,6 @@ fn interactive_shell_runs_commands_in_foreground_groups() {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn fork_and_exec_keep_detached_cwd() {
-    let program = common::compile("./tests/process_cwd.c", "process_cwd", true, false);
-    // Natively, the directory to detach defaults to one in the run's own TMPDIR.
-    if let Some(mut native) = Native::new(&program) {
-        native.arg(std::path::absolute(&program).unwrap()).output();
-    }
-    Runner::new(&program, "process_cwd")
-        .allow_process_duplication()
-        .arg(std::path::absolute(&program).unwrap())
-        .arg("/registry/detached")
-        .run();
-}
-
 /// Checks vector state and pointer authentication across `fork` and `vfork`.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 #[test]

@@ -22,15 +22,15 @@ int main(int argc, char **argv) {
         check_detached();
         return 0;
     }
-    // Usage: process_cwd <absolute path of this program> [absolute directory to detach], the
-    // directory defaulting to one in `test_dir()`.
-    assert((argc == 2 || argc == 3) && argv[1][0] == '/');
-    const char *dir = argc == 3 ? argv[2] : test_path("detached");
+    // Usage: process_cwd [absolute directory to detach], defaulting to one in `test_dir()`. The
+    // program re-executes itself, so it must be started by its absolute path.
+    assert(argc <= 2 && argv[0][0] == '/');
+    const char *dir = argc == 2 ? argv[1] : test_path("detached");
     assert(dir[0] == '/');
     assert(mkdir(dir, 0700) == 0);
     int fd = open(dir, O_PATH | O_DIRECTORY);
     assert(fd >= 0 && fchdir(fd) == 0 && rmdir(dir) == 0);
-    char *args[] = {argv[1], "child", NULL};
+    char *args[] = {argv[0], "child", NULL};
     int status;
     pid_t pid = fork();
     assert(pid >= 0);
@@ -43,7 +43,7 @@ int main(int argc, char **argv) {
     assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     char fd_arg[16];
     snprintf(fd_arg, sizeof(fd_arg), "%d", fd);
-    char *fd_args[] = {argv[1], "child-fd", fd_arg, NULL};
+    char *fd_args[] = {argv[0], "child-fd", fd_arg, NULL};
     pid = fork();
     assert(pid >= 0);
     if (pid == 0) {
