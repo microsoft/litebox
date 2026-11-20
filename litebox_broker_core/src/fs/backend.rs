@@ -66,6 +66,21 @@ pub enum SeekBehavior {
 /// The result of [`Backend::dir_path`].
 pub type DirPath = Result<Option<Vec<String>>, WalkError>;
 
+/// Names `dir` relative to its backend's root by walking up. `step` returns a directory's parent
+/// and its name there, or `None` at the root.
+pub(super) fn name_by_walking_up<D>(
+    mut dir: D,
+    mut step: impl FnMut(&D) -> Result<Option<(D, String)>, WalkError>,
+) -> Result<Vec<String>, WalkError> {
+    let mut path = Vec::new();
+    while let Some((parent, name)) = step(&dir)? {
+        path.push(name);
+        dir = parent;
+    }
+    path.reverse();
+    Ok(path)
+}
+
 /// A backend that can be used to support a (full or subset of) a LiteBox filesystem.
 pub trait Backend: Send + Sync + Any {
     /// Resolve the root directory.
@@ -127,7 +142,8 @@ pub trait Backend: Send + Sync + Any {
     /// Implementations must not follow `..` beyond their exported subtree.
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError>;
 
-    /// Check the caller's search permission on `dir`.
+    /// Check search permission on `dir` with the backend's own credentials. The resolver calls
+    /// this only for directories reporting [`PermissionCheck::ByBackend`].
     fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError>;
 
     /// Open the already-resolved file after resolver authorization, validating `flags`.

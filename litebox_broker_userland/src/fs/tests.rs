@@ -175,11 +175,28 @@ fn root_and_resolved_children_are_not_reopened_by_name() {
 }
 
 #[test]
+fn rename_into_own_subtree_is_invalid_before_destination_type() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join("dir")).unwrap();
+    fs::write(root.join("dir/file"), b"").unwrap();
+    let local = LocalFs::new(root, InodeAllocators::new().next()).unwrap();
+    let parent = open_path_dir(&local, &[]);
+    let dir = open_path_dir(&local, &["dir"]);
+    // Linux: rename("dir", "dir/file") fails with EINVAL, not ENOTDIR (native probe).
+    assert!(matches!(
+        local.rename_at(parent, "dir", dir, "file"),
+        Err(RenameError::InvalidArgument)
+    ));
+    assert!(root.join("dir/file").is_file());
+}
+
+#[test]
 fn legacy_timestamps_only_update_pinned_non_links() {
     use rustix::fs::{Timespec, Timestamps};
     use std::os::unix::fs::MetadataExt;
     let temp = tempfile::tempdir().unwrap();
-    let root = Location::root(temp.path()).unwrap();
+    let root = Location::pin_dir(temp.path()).unwrap();
     fs::create_dir(root.join("dir")).unwrap();
     fs::write(root.join("file"), b"").unwrap();
     let times = Timestamps {
@@ -199,7 +216,7 @@ fn legacy_timestamps_only_update_pinned_non_links() {
         symlink("untouched", root.join(name)).unwrap();
         linux::set_times_legacy(&pinned, &times).unwrap();
         assert_eq!(fs::metadata(moved).unwrap().mtime(), 2);
-        // A pinned symlink is never updated, whatever the fallback reports.
+        // The fallback refuses a pinned symlink rather than following it.
         assert!(linux::set_times_legacy(&root.child(name).unwrap(), &times).is_err());
     }
 }

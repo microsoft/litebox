@@ -164,11 +164,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         use litebox_broker_protocol::fs::FileError;
 
         let context = Context::new(user);
-        let path = self
+        let (path, walked) = self
             .resolve_path(&context, None, path, true, false)
             .map_err(file_walk_error)?;
         let ResolvedTarget::Dir(target) = self
-            .resolve_target(&context, &path)
+            .resolve_target(&context, &path, walked)
             .map_err(file_walk_error)?
         else {
             return Err(FileError::NotDirectory);
@@ -222,8 +222,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             })
     }
 
-    // XXX(jayb): callers rewalk the result, so this is non-atomic and walks twice; returning the
-    // final walking handle alongside the path would fix both.
+    /// Also returns the final resolution of the path when its last step was a walk, so callers
+    /// need not walk again. A path ending in `.` or `..`, or naming the walk start itself, has
+    /// none; [`Self::final_resolution`] rewalks those.
     // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
     // outside the chrooted part.
     fn resolve_path(
@@ -233,7 +234,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         path: &str,
         follow_final: bool,
         allow_missing: bool,
-    ) -> Result<ResolvedPath, WalkError> {
+    ) -> Result<(ResolvedPath, Option<Resolution<'_>>), WalkError> {
         if path.is_empty() {
             return Err(PathError::NoSuchFileOrDirectory.into());
         }
@@ -250,6 +251,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         let mut require_directory = path.ends_with('/');
         let mut resolved: Vec<String> = Vec::new();
         let mut links = 0;
+        // Kept only once nothing is pending, so no walking handle (which may hold a backend
+        // lock) outlives its run while another walk starts.
+        let mut walked = None;
         // Each run re-resolves from the same held directory, since `Backend::resolve` consumes its
         // starting directory and does not report symlinks mid-walk.
         while let Some(name) = pending.front() {
@@ -309,8 +313,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             let final_component = pending.is_empty();
             match resolution {
                 Resolution::Found(ResolvedTarget::Dir(dir)) => {
-                    // `sub/../f` must still require search permission on `sub`.
-                    if !pending.is_empty() {
+                    if final_component {
+                        walked = Some(Resolution::Found(ResolvedTarget::Dir(dir)));
+                    } else {
+                        // `sub/../f` must still require search permission on `sub`.
                         self.check_dir_search(context, &dir)?;
                     }
                 }
@@ -318,6 +324,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     if file.file_type == FileType::SymbolicLink =>
                 {
                     if final_component && !follow_final && !require_directory {
+                        walked = Some(Resolution::Found(ResolvedTarget::File(file)));
                         break;
                     }
                     // TODO(jayb): add a resolved-file read_link to avoid re-resolving the parent.
@@ -350,13 +357,15 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                         pending.push_front(String::from(part));
                     }
                 }
-                Resolution::Found(ResolvedTarget::File(_)) => {
+                Resolution::Found(ResolvedTarget::File(file)) => {
                     if !final_component || require_directory {
                         return Err(PathError::ComponentNotADirectory.into());
                     }
+                    walked = Some(Resolution::Found(ResolvedTarget::File(file)));
                 }
-                Resolution::MissingFinal { .. } => {
+                Resolution::MissingFinal { parent } => {
                     if final_component && allow_missing && !require_directory {
+                        walked = Some(Resolution::MissingFinal { parent });
                         break;
                     }
                     return Err(if final_component {
@@ -368,10 +377,28 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 }
             }
         }
-        Ok(ResolvedPath {
-            anchor,
-            components: resolved,
-        })
+        Ok((
+            ResolvedPath {
+                anchor,
+                components: resolved,
+            },
+            walked,
+        ))
+    }
+
+    /// The resolution of `path`, reusing `walked` from [`Self::resolve_path`] when present.
+    fn final_resolution<'a>(
+        &'a self,
+        context: &Context,
+        path: &ResolvedPath,
+        walked: Option<Resolution<'a>>,
+    ) -> Result<Resolution<'a>, WalkError> {
+        if let Some(resolution) = walked {
+            return Ok(resolution);
+        }
+        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
+        self.resolve_components(context, path.anchor.as_ref(), &components)
+            .map_err(|error| error.error)
     }
 
     fn parent_dir_and_name(
@@ -395,12 +422,8 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         };
         // Entry mutations resolve the parent but retain the final name, so neither a link nor
         // a final `.`/`..` can redirect a removal to an ordinary target directory.
-        let parent_path = self.resolve_path(context, anchor, parent_path, true, false)?;
-        let parent_components: Vec<_> = parent_path.components.iter().map(String::as_str).collect();
-        let parent = match self
-            .resolve_components(context, parent_path.anchor.as_ref(), &parent_components)
-            .map_err(|error| error.error)?
-        {
+        let (parent_path, walked) = self.resolve_path(context, anchor, parent_path, true, false)?;
+        let parent = match self.final_resolution(context, &parent_path, walked)? {
             Resolution::Found(ResolvedTarget::Dir(parent)) => parent,
             Resolution::Found(ResolvedTarget::File(_)) => {
                 return Err(PathError::ComponentNotADirectory.into());
@@ -437,14 +460,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         path: &str,
     ) -> Result<String, WalkError> {
         let context = Context::new(user);
-        let path = self.resolve_path(&context, anchor, path, false, false)?;
+        let (path, walked) = self.resolve_path(&context, anchor, path, false, false)?;
         let Some((components, name)) = path.parent_and_name() else {
             return Err(PathError::InvalidPathname.into());
         };
-        let all: Vec<_> = path.components.iter().map(String::as_str).collect();
+        // Released before walking to the parent.
         let is_link = matches!(
-            self.resolve_components(&context, path.anchor.as_ref(), &all)
-                .map_err(|error| error.error)?,
+            self.final_resolution(&context, &path, walked)?,
             Resolution::Found(ResolvedTarget::File(file))
                 if file.file_type == FileType::SymbolicLink
         );
@@ -480,16 +502,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         }
     }
 
-    fn resolve_target(
-        &self,
+    fn resolve_target<'a>(
+        &'a self,
         context: &Context,
         path: &ResolvedPath,
-    ) -> Result<ResolvedTarget<'_>, WalkError> {
-        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
-        match self
-            .resolve_components(context, path.anchor.as_ref(), &components)
-            .map_err(|error| error.error)?
-        {
+        walked: Option<Resolution<'a>>,
+    ) -> Result<ResolvedTarget<'a>, WalkError> {
+        match self.final_resolution(context, path, walked)? {
             Resolution::Found(target) => Ok(target),
             Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
         }
@@ -613,10 +632,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             )
         {
             let terminal = controlling_terminal().ok_or(OpenError::NoSuchDevice)?;
-            entry.controlling_terminal = Some(Arc::new(ReopenedTerminal {
+            entry.controlling_terminal = Some(ReopenedTerminal {
                 _file: Arc::clone(&terminal).reopen()?,
                 terminal,
-            }));
+            });
         }
         Ok(entry)
     }
@@ -667,7 +686,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 .map_err(OpenError::from)?;
             return Err(OpenError::IsDirectory);
         }
-        let path = self
+        let (path, walked) = self
             .resolve_path(
                 &context,
                 anchor,
@@ -694,14 +713,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             nonblocking,
             path_only,
             seek_behavior,
-            name: Arc::new(path),
+            name: path,
             controlling_terminal: None,
         };
 
-        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
         let resolution = self
-            .resolve_components(&context, path.anchor.as_ref(), &components)
-            .map_err(|error| OpenError::from(error.error))?;
+            .final_resolution(&context, &path, walked)
+            .map_err(OpenError::from)?;
         match resolution {
             Resolution::Found(_) if flags.contains(OFlags::CREAT | OFlags::EXCL) => {
                 Err(OpenError::AlreadyExists)
@@ -756,7 +774,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 Ok(entry(Handle::File(file), seek_behavior, path))
             }
             Resolution::MissingFinal { parent } if flags.contains(OFlags::CREAT) => {
-                let Some(name) = components.last() else {
+                let Some(name) = path.components.last() else {
                     // Empty components name the walk start (root or anchor), which always exists.
                     unreachable!()
                 };
@@ -1101,7 +1119,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             .status(entry.handle.as_ref())
             .map_err(|_| SetTimesError::Io)?;
         let target = self
-            .resolve_target(context, &entry.name)
+            .resolve_target(context, &entry.name, None)
             .map_err(map_walk)?;
         let resolved = self
             .backend
@@ -1124,14 +1142,14 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         mode: Mode,
     ) -> Result<(), ChmodError> {
         let context = Context::new(user);
-        let path = self
+        let (path, walked) = self
             .resolve_path(&context, anchor, path, true, false)
             .map_err(|error| match error {
                 WalkError::Io => ChmodError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
         let target = self
-            .resolve_target(&context, &path)
+            .resolve_target(&context, &path, walked)
             .map_err(|error| match error {
                 WalkError::Io => ChmodError::Io,
                 WalkError::PathError(error) => error.into(),
@@ -1152,14 +1170,14 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let context = Context::new(acting_user);
-        let path = self
+        let (path, walked) = self
             .resolve_path(&context, anchor, path, true, false)
             .map_err(|error| match error {
                 WalkError::Io => ChownError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
         let target = self
-            .resolve_target(&context, &path)
+            .resolve_target(&context, &path, walked)
             .map_err(|error| match error {
                 WalkError::Io => ChownError::Io,
                 WalkError::PathError(error) => error.into(),
@@ -1550,14 +1568,14 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         follow_symlinks: bool,
     ) -> Result<super::FileStatus, FileStatusError> {
         let context = Context::new(user);
-        let path = self
+        let (path, walked) = self
             .resolve_path(&context, anchor, path, follow_symlinks, false)
             .map_err(|error| match error {
                 WalkError::Io => FileStatusError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
         let target = self
-            .resolve_target(&context, &path)
+            .resolve_target(&context, &path, walked)
             .map_err(|error| match error {
                 WalkError::Io => FileStatusError::Io,
                 WalkError::PathError(error) => error.into(),
@@ -1566,11 +1584,12 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         self.backend.resolved_status(&target)
     }
 
-    /// Returns the current physical name of a directory, or the name a file was opened by.
+    /// Returns the current physical name of a directory (or, where the backend cannot name it,
+    /// the name it was opened by), or the name a file was opened by.
     ///
     /// A file opened relative to a directory is named under that directory's current name. An
     /// unlinked directory has no name.
-    pub fn handle_path(&self, entry: &ResolverEntry<Backend>) -> Result<String, WalkError> {
+    pub(super) fn handle_path(&self, entry: &ResolverEntry<Backend>) -> Result<String, WalkError> {
         match &entry.handle {
             Handle::Dir(dir) => match self.backend.dir_path(dir)? {
                 Some(components) => Ok(ResolvedPath::join(String::new(), &components)),
@@ -1723,29 +1742,10 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     /// Symlink-expanded location of the opened object, relative to the directory it was opened
     /// from (or to the root), as resolved when it was opened. Backend operations that need a
     /// path rewalk it; later renames or removals of the object are not reflected.
-    name: Arc<ResolvedPath>,
+    name: ResolvedPath,
     /// The controlling terminal that the file referred to when it was opened,
     /// if it refers to the opener's (see [`FileTerminal::OpenersControlling`]).
-    controlling_terminal: Option<Arc<ReopenedTerminal>>,
-}
-
-// Snapshot an entry without requiring `Backend: Clone`.
-impl<Backend: super::backend::Backend> Clone for ResolverEntry<Backend> {
-    fn clone(&self) -> Self {
-        Self {
-            handle: self.handle.clone(),
-            _backend: PhantomData,
-            read_allowed: self.read_allowed,
-            write_allowed: self.write_allowed,
-            position: self.position,
-            append_mode: self.append_mode,
-            nonblocking: self.nonblocking,
-            path_only: self.path_only,
-            seek_behavior: self.seek_behavior,
-            name: Arc::clone(&self.name),
-            controlling_terminal: self.controlling_terminal.clone(),
-        }
-    }
+    controlling_terminal: Option<ReopenedTerminal>,
 }
 
 /// A terminal reopened by [`TerminalEndpoint::reopen`], which stays open

@@ -48,9 +48,9 @@ pub struct SharedFileObject<Object> {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    /// The directory handle the broker resolves `path` from: none for an absolute path, and `dir`
-    /// for a relative one.
-    fn broker_dir(
+    /// The handle a relative `path` resolves from. Rejects an empty path, a relative path without
+    /// `dir`, and a `dir` from another broker connection.
+    fn checked_path_anchor(
         broker: &Arc<dyn BrokerControl>,
         dir: Option<&File<Platform>>,
         path: &str,
@@ -86,7 +86,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             return Err(OpenError::AccessNotAllowed);
         }
         let broker = self.broker_control().ok_or(OpenError::Io)?;
-        let dir = Self::broker_dir(&broker, dir, path)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
         let handle = broker
             .open_file(
                 dir,
@@ -125,7 +125,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         mode: Mode,
     ) -> Result<(), ChmodError> {
         let broker = self.broker_control().ok_or(ChmodError::Io)?;
-        let dir = Self::broker_dir(&broker, dir, path)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
         broker
             .chmod_file(dir, path, context.acting_user(), mode & Mode::SUPPORTED)
             .map_err(|_| ChmodError::Io)?
@@ -143,7 +143,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let broker = self.broker_control().ok_or(ChownError::Io)?;
-        let dir = Self::broker_dir(&broker, dir, path)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
         broker
             .chown_file(dir, path, context.acting_user(), user, group)
             .map_err(|_| ChownError::Io)?
@@ -163,7 +163,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         linkpath: &str,
     ) -> Result<(), SymlinkError> {
         let broker = self.broker_control().ok_or(SymlinkError::Io)?;
-        let dir = Self::broker_dir(&broker, dir, linkpath)?;
+        let dir = Self::checked_path_anchor(&broker, dir, linkpath)?;
         broker
             .symlink_file(target, dir, linkpath, context.acting_user())
             .map_err(|_| SymlinkError::Io)?
@@ -178,7 +178,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         path: &str,
     ) -> Result<(), UnlinkError> {
         let broker = self.broker_control().ok_or(UnlinkError::Io)?;
-        let dir = Self::broker_dir(&broker, dir, path)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
         broker
             .unlink_file(dir, path, context.acting_user())
             .map_err(|_| UnlinkError::Io)?
@@ -197,8 +197,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         new_path: &str,
     ) -> Result<(), RenameError> {
         let broker = self.broker_control().ok_or(RenameError::Io)?;
-        let old_dir = Self::broker_dir(&broker, old_dir, old_path)?;
-        let new_dir = Self::broker_dir(&broker, new_dir, new_path)?;
+        let old_dir = Self::checked_path_anchor(&broker, old_dir, old_path)?;
+        let new_dir = Self::checked_path_anchor(&broker, new_dir, new_path)?;
         broker
             .rename_file(old_dir, old_path, new_dir, new_path, context.acting_user())
             .map_err(|_| RenameError::Io)?
@@ -215,7 +215,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         mode: Mode,
     ) -> Result<(), MkdirError> {
         let broker = self.broker_control().ok_or(MkdirError::Io)?;
-        let dir = Self::broker_dir(&broker, dir, path)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
         broker
             .mkdir_file(dir, path, context.acting_user(), mode & Mode::SUPPORTED)
             .map_err(|_| MkdirError::Io)?
@@ -225,8 +225,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// Mount a fresh in-memory filesystem at an absolute directory path.
     pub fn mount_in_mem(&self, context: &Context, path: &str) -> Result<(), FileError> {
         let broker = self.broker_control().ok_or(FileError::Io)?;
-        // Mounting names an absolute path.
-        Self::broker_dir(&broker, None, path)?;
+        // Validation only: rejects empty and relative paths like other path operations.
+        Self::checked_path_anchor(&broker, None, path)?;
         broker
             .mount_in_mem(path, context.acting_user())
             .map_err(|_| FileError::Io)?
@@ -240,7 +240,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         path: &str,
     ) -> Result<(), RmdirError> {
         let broker = self.broker_control().ok_or(RmdirError::Io)?;
-        let dir = Self::broker_dir(&broker, dir, path)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
         broker
             .rmdir_file(dir, path, context.acting_user())
             .map_err(|_| RmdirError::Io)?
@@ -259,7 +259,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         follow_symlinks: bool,
     ) -> Result<FileStatus, FileStatusError> {
         let broker = self.broker_control().ok_or(FileStatusError::Io)?;
-        let dir = Self::broker_dir(&broker, dir, path)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
         broker
             .path_file_status(dir, path, context.acting_user(), follow_symlinks)
             .map_err(|_| FileStatusError::Io)?
@@ -275,7 +275,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         path: &str,
     ) -> Result<String, WalkError> {
         let broker = self.broker_control().ok_or(WalkError::Io)?;
-        let dir = Self::broker_dir(&broker, dir, path)?;
+        let dir = Self::checked_path_anchor(&broker, dir, path)?;
         broker
             .read_link_file(dir, path, context.acting_user())
             .map_err(|_| WalkError::Io)?

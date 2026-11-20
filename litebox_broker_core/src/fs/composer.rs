@@ -853,9 +853,9 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 };
                 let mut path = mount.path.clone();
                 path.extend(suffix);
-                // A new mount may have been added that covers this path, which would make it inaccessible.
-                // E.g., A handle to /mnt/data/dir could become inaccessible after /mnt/data becomes a new
-                // mount point. For now, report no name rather than return the unreachable path.
+                // A later mount may cover this path, making it unreachable by name (e.g., a handle
+                // to /mnt/data/dir after /mnt/data becomes a mount point). Report no name, so callers
+                // fall back to the recorded name instead of treating the directory as removed.
                 if self
                     .nested_mounts(mount)
                     .any(|other| path.starts_with(&other.path))

@@ -470,9 +470,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn dir_path(&self, dir: &super::backend::DirHandle) -> Result<Option<Vec<String>>, WalkError> {
         let _rename = self.rename_lock.lock();
-        let mut child = dir.get_typed::<Self>().dir.clone();
-        let mut path = Vec::new();
-        while !Arc::ptr_eq(&child, &self.root) {
+        super::backend::name_by_walking_up(dir.get_typed::<Self>().dir.clone(), |child| {
+            if Arc::ptr_eq(child, &self.root) {
+                return Ok(None);
+            }
             let parent = child
                 .read()
                 .parent
@@ -484,14 +485,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 .children
                 .iter()
                 .find_map(|(name, node)| {
-                    matches!(node, Node::Dir(dir) if Arc::ptr_eq(dir, &child)).then(|| name.clone())
+                    matches!(node, Node::Dir(dir) if Arc::ptr_eq(dir, child)).then(|| name.clone())
                 })
                 .ok_or(PathError::NoSuchFileOrDirectory)?;
-            path.push(name);
-            child = parent;
-        }
-        path.reverse();
-        Ok(Some(path))
+            Ok(Some((parent, name)))
+        })
+        .map(Some)
     }
 
     fn parent_dir(

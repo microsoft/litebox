@@ -250,7 +250,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     }
 
     /// The LiteBox file behind `fd`, failing with `ENOTDIR` for other kinds of descriptor.
-    pub(crate) fn file_of(
+    pub(crate) fn dirfd_file(
         &self,
         fd: &AnyTypedFd<Platform>,
     ) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
@@ -356,7 +356,7 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         Arc::clone(&self.cwd.read())
     }
 
-    pub(crate) fn set_cwd_handle(&self, dir: Arc<litebox::fs::File<Platform>>) {
+    pub(super) fn set_cwd_handle(&self, dir: Arc<litebox::fs::File<Platform>>) {
         *self.cwd.write() = dir;
     }
 
@@ -815,9 +815,9 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 enum FsPath {
     /// Absolute path
     Absolute { path: String },
-    /// Current working directory
+    /// Empty path at `AT_FDCWD`
     Cwd,
-    /// Path is relative to a file descriptor
+    /// Relative path; `fd` is a descriptor or `AT_FDCWD`
     FdRelative { fd: i32, path: String },
     /// Fd
     Fd(i32),
@@ -1050,23 +1050,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.fs.borrow().umask()
     }
 
-    pub(super) fn pinned_cwd_dir(&self) -> Arc<litebox::fs::File<Platform>> {
+    pub(super) fn cwd_handle(&self) -> Arc<litebox::fs::File<Platform>> {
         self.fs.borrow().cwd_handle()
     }
 
     /// Queries the broker for the working directory's current name.
     fn query_cwd_name(&self) -> Result<String, Errno> {
-        Ok(self.pinned_cwd_dir().path()?)
+        Ok(self.cwd_handle().path()?)
     }
 
     /// The file a dirfd refers to, which need not be a directory.
     fn file_for_dirfd(&self, fd: i32) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
-        self.global.file_of(&self.typed_fd(fd)?)
+        self.global.dirfd_file(&self.typed_fd(fd)?)
     }
 
     fn lookup_relative(&self, fd: i32, path: String) -> Result<LookupPath<Platform>, Errno> {
         let dir = if fd == litebox_common_linux::AT_FDCWD {
-            self.pinned_cwd_dir()
+            self.cwd_handle()
         } else {
             self.file_for_dirfd(fd)?
         };
@@ -1078,7 +1078,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Rewrites a relative lookup that lexically spells a `/proc/self/fd/` entry to its absolute
     /// name, which [`Self::proc_self_fd`] then reaches as an absolute path would.
-    fn spell_proc_self_fd(&self, path: LookupPath<Platform>) -> LookupPath<Platform> {
+    fn absolutize_proc_self_fd(&self, path: LookupPath<Platform>) -> LookupPath<Platform> {
         // Skip the broker round trip unless `path` itself spells `fd/`; this assumes no directory
         // named `/proc/self/fd` (or below it) exists.
         let Some(dir) = path.dir.as_deref().filter(|_| path.path.contains("fd/")) else {
@@ -1410,7 +1410,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             FsPath::Absolute { path } => LookupPath { dir: None, path },
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 let user = self.fs.borrow().context.read().acting_user();
-                return Ok(self.pinned_cwd_dir().set_times(user, &times)?);
+                return Ok(self.cwd_handle().set_times(user, &times)?);
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 return self.set_fd_times(fd, &times);
@@ -2476,7 +2476,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match fs_path {
             FsPath::Absolute { path } => self.do_access(None, &path, mode, caller, follow_symlink),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let status = self.pinned_cwd_dir().status()?;
+                let status = self.cwd_handle().status()?;
                 Self::do_access_mode(status.mode, status.owner.into(), caller, &mode)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
@@ -2568,7 +2568,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: &str,
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
-        let pathname = self.spell_proc_self_fd(self.lookup_path_at(dirfd, pathname)?);
+        let pathname = self.absolutize_proc_self_fd(self.lookup_path_at(dirfd, pathname)?);
         let path = self.do_readlink(pathname.dir.as_deref(), &pathname.path)?;
         let bytes = path.as_bytes();
         let min_len = core::cmp::min(buf.len(), bytes.len());
@@ -2724,14 +2724,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match fs_path {
             FsPath::Absolute { path } => self.do_path_stat(None, &path, follow_symlink),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                T::try_from(self.pinned_cwd_dir().status()?)
+                T::try_from(self.cwd_handle().status()?)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 self.with_typed_fd(fd, |fd| self.do_stat(fd))
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
             FsPath::FdRelative { fd, path } => {
-                let path = self.spell_proc_self_fd(self.lookup_relative(fd, path)?);
+                let path = self.absolutize_proc_self_fd(self.lookup_relative(fd, path)?);
                 self.do_path_stat(path.dir.as_deref(), &path.path, follow_symlink)
             }
         }

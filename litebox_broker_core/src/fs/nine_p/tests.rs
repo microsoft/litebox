@@ -702,9 +702,9 @@ fn test_nine_p_broken_read() {
     )
     .unwrap();
 
-    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // 4 writes: version + attach + walk (reused by the open) + lopen.
     // Then read will fail.
-    let fs = connect_9p_broken(&server, 6);
+    let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
         .open(
             USER,
@@ -730,9 +730,9 @@ fn test_nine_p_broken_read_after_progress() {
         .collect();
     std::fs::write(server.export_path().join("read_me.bin"), &data).unwrap();
 
-    // 7 writes: version + attach + resolution walk + clunk + open walk + lopen + the first Tread.
+    // 5 writes: version + attach + walk (reused by the open) + lopen + the first Tread.
     // The second Tread fails.
-    let fs = connect_9p_broken(&server, 7);
+    let fs = connect_9p_broken(&server, 5);
     let mut fd = fs
         .open(USER, None, "/read_me.bin", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
@@ -779,9 +779,9 @@ fn test_nine_p_faulting_read_after_progress() {
 fn test_nine_p_broken_write() {
     let server = DiodServer::start();
 
-    // 6 writes: version + attach + resolution walk + open walk (both report the missing file)
-    // + the clone of the parent directory's fid + create. Then write will fail.
-    let fs = connect_9p_broken(&server, 6);
+    // 5 writes: version + attach + walk (reporting the missing file) + the clone of the parent
+    // directory's fid + create. Then write will fail.
+    let fs = connect_9p_broken(&server, 5);
     let mut fd = fs
         .open(
             USER,
@@ -868,9 +868,9 @@ fn test_nine_p_broken_truncate() {
 
     std::fs::write(server.export_path().join("to_trunc.txt"), b"some data").unwrap();
 
-    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // 4 writes: version + attach + walk (reused by the open) + lopen.
     // Then truncate will fail.
-    let fs = connect_9p_broken(&server, 6);
+    let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
         .open(USER, None, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
         .expect("open should succeed before break");
@@ -886,9 +886,9 @@ fn test_nine_p_broken_seek() {
 
     std::fs::write(server.export_path().join("to_seek.txt"), b"data").unwrap();
 
-    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // 4 writes: version + attach + walk (reused by the open) + lopen.
     // Then the getattr for seek will fail.
-    let fs = connect_9p_broken(&server, 6);
+    let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
         .open(USER, None, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");

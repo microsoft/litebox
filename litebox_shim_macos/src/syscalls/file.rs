@@ -401,8 +401,8 @@ impl<P: ShimPlatform> Task<P> {
     /// without following and must be a directory: a symbolic link fails with
     /// ELOOP, anything else with ENOTDIR, a missing one with ENOENT. A
     /// trailing slash makes the last name non-final. The caller handles the
-    /// final name. LiteBox filesystems cannot create links or rename at run
-    /// time, so checking before the open does not race.
+    /// final name. This shim offers no way to create links or rename, so
+    /// checking before the open does not race the guest's own operations.
     fn path_without_links(
         &self,
         context: &litebox::fs::Context,

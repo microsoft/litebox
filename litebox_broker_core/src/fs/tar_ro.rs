@@ -187,21 +187,21 @@ impl super::backend::Backend for TarRo {
     }
 
     fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
-        let mut child = dir.get_typed::<Self>().idx;
-        let mut path = Vec::new();
-        while let Some(parent) = self.tar_index.dirs[child].parent {
-            let name = self.tar_index.dirs[parent]
+        let dirs = &self.tar_index.dirs;
+        super::backend::name_by_walking_up(dir.get_typed::<Self>().idx, |&child| {
+            let Some(parent) = dirs[child].parent else {
+                return Ok(None);
+            };
+            let name = dirs[parent]
                 .children
                 .iter()
                 .find_map(|(name, node)| {
                     matches!(node, IndexedChild::Dir(idx) if *idx == child).then(|| name.clone())
                 })
                 .ok_or(WalkError::Io)?;
-            path.push(name);
-            child = parent;
-        }
-        path.reverse();
-        Ok(Some(path))
+            Ok(Some((parent, name)))
+        })
+        .map(Some)
     }
 
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {

@@ -513,7 +513,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 // Broker inheritance deduplicates references. If fchdir used an fd that was
                 // also inherited, share its already adopted file; never own its handle twice.
                 if let Some(fd) = inherited.find(|fd| fd.handle == *handle) {
-                    self.0.file_of(&files.typed_fd_from_raw(fd.fd as usize)?)?
+                    self.0
+                        .dirfd_file(&files.typed_fd_from_raw(fd.fd as usize)?)?
                 } else {
                     Arc::new(self.0.litebox.adopt_inherited_file(*handle)?)
                 }

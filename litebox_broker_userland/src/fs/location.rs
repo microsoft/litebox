@@ -23,8 +23,7 @@ pub(super) struct Location {
 }
 
 // Other Unix hosts retain a directory fd as an identity witness, not a path locator. They
-// reject stale names. Serialize the checks and operations with guest renames/removals across
-// *all* LocalFs instances, even when two exports overlap.
+// reject stale names.
 #[cfg(all(unix, not(target_os = "linux")))]
 #[derive(Debug)]
 struct CheckedDir {
@@ -91,13 +90,13 @@ impl Location {
     }
 
     /// The directory's current host name, or `NotFound` once it has been removed.
-    pub(super) fn directory_name(&self) -> io::Result<PathBuf> {
+    pub(super) fn linked_path(&self) -> io::Result<PathBuf> {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::MetadataExt;
             // Ask the kernel without reopening any ancestor. Its procfs suffix " (deleted)" can
             // also be part of a legitimate name.
-            let name = self.host_name()?;
+            let name = self.host_path()?;
             if self.pin.metadata()?.nlink() == 0 {
                 return Err(io::ErrorKind::NotFound.into());
             }
@@ -108,14 +107,14 @@ impl Location {
         // with `NotFound`, so a moved directory has no name.
         #[cfg(not(target_os = "linux"))]
         {
-            self.host_name()
+            self.host_path()
         }
     }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
 impl Location {
-    pub(super) fn root(path: &Path) -> io::Result<Self> {
+    pub(super) fn pin_dir(path: &Path) -> io::Result<Self> {
         let file = open_directory(path)?;
         Ok(Self {
             path: path.into(),
@@ -139,7 +138,7 @@ impl Location {
                     "directory was moved or replaced",
                 ));
             }
-            Self::root(&canonical)
+            Self::pin_dir(&canonical)
         } else {
             Ok(Self {
                 path,
@@ -169,7 +168,7 @@ impl Location {
         Ok(())
     }
 
-    pub(super) fn host_name(&self) -> io::Result<PathBuf> {
+    pub(super) fn host_path(&self) -> io::Result<PathBuf> {
         self.check_directory()?;
         Ok(self.path.clone())
     }
@@ -186,7 +185,7 @@ impl Location {
             .parent()
             .filter(|p| p.starts_with(root))
             .ok_or_else(super::invalid_path)?;
-        Self::root(parent).map(Some)
+        Self::pin_dir(parent).map(Some)
     }
 }
 
@@ -215,7 +214,7 @@ impl Location {
         }
     }
 
-    pub(super) fn root(path: &Path) -> io::Result<Self> {
+    pub(super) fn pin_dir(path: &Path) -> io::Result<Self> {
         use rustix::fs::{Mode, OFlags, open};
         Ok(Self::opened(Arc::new(File::from(open(
             path,
@@ -240,21 +239,25 @@ impl Location {
     }
 
     /// The kernel's name for the pinned file, for containment checks. Unlike
-    /// [`Self::directory_name`], an unlinked directory keeps a ` (deleted)` suffix.
-    pub(super) fn host_name(&self) -> io::Result<PathBuf> {
+    /// [`Self::linked_path`], an unlinked directory keeps a ` (deleted)` suffix.
+    pub(super) fn host_path(&self) -> io::Result<PathBuf> {
         fs::read_link(&self.path)
     }
 
     /// Pin the actual parent without looking up the child from it. The canonical names are
-    /// only containment checks, never locators used for a subsequent open.
+    /// only containment checks, never locators used for a subsequent open. Like
+    /// `LocalFs::check_dir`, a directory moved outside the root fails with `NotFound`.
     pub(super) fn parent_under(&self, root: &Self) -> io::Result<Option<Self>> {
         use rustix::fs::{Mode, OFlags, openat};
         use std::os::unix::fs::MetadataExt;
         let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
-        let root_name = root.host_name()?;
-        let name = self.host_name()?;
+        let root_name = root.host_path()?;
+        let name = self.host_path()?;
         if !name.starts_with(&root_name) {
-            return Err(super::invalid_path());
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "directory was moved outside the LocalFs root",
+            ));
         }
         if name == root_name {
             let a = self.metadata()?;
@@ -272,7 +275,7 @@ impl Location {
             Mode::empty(),
         )?)));
         // A root moved since `root_name` was read fails this check closed.
-        if !parent.host_name()?.starts_with(&root_name) {
+        if !parent.host_path()?.starts_with(&root_name) {
             return Err(super::invalid_path());
         }
         Ok(Some(parent))
@@ -285,7 +288,7 @@ fn directory_identity_witness_rejects_replaced_ancestor() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     fs::create_dir_all(root.join("ancestor/sub")).unwrap();
-    let pinned = Location::root(&root)
+    let pinned = Location::pin_dir(&root)
         .unwrap()
         .child("ancestor")
         .unwrap()
@@ -294,7 +297,7 @@ fn directory_identity_witness_rejects_replaced_ancestor() {
     assert!(pinned.metadata().is_ok());
     fs::rename(root.join("ancestor"), root.join("renamed")).unwrap();
     fs::create_dir_all(root.join("ancestor/sub")).unwrap();
-    assert!(pinned.host_name().is_err());
+    assert!(pinned.host_path().is_err());
 }
 
 #[cfg(all(test, windows, target_arch = "x86_64"))]
@@ -304,7 +307,7 @@ fn directory_pins_preclude_ancestor_replacement() {
     let original = temp.path().join("ancestor");
     let renamed = temp.path().join("renamed");
     fs::create_dir_all(original.join("sub")).unwrap();
-    let sub = Location::root(&fs::canonicalize(temp.path()).unwrap())
+    let sub = Location::pin_dir(&fs::canonicalize(temp.path()).unwrap())
         .unwrap()
         .child("ancestor")
         .unwrap()
@@ -336,7 +339,7 @@ impl Location {
         Ok(Arc::new(pin))
     }
 
-    pub(super) fn root(path: &Path) -> io::Result<Self> {
+    pub(super) fn pin_dir(path: &Path) -> io::Result<Self> {
         let mut ancestors: Vec<_> = path.ancestors().collect();
         ancestors.reverse();
         let locks = ancestors
@@ -376,7 +379,7 @@ impl Location {
         Ok(metadata)
     }
 
-    pub(super) fn host_name(&self) -> io::Result<PathBuf> {
+    pub(super) fn host_path(&self) -> io::Result<PathBuf> {
         self.metadata()?;
         Ok(self.path.clone())
     }

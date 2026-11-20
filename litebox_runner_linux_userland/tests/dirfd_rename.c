@@ -4,7 +4,8 @@
 #include "helpers.h"
 
 // Walking from a held directory needs search permission on that directory only, not on its
-// ancestors. Runs in the working directory `tmp`.
+// ancestors; neither does `getcwd` under an unsearchable ancestor. Runs in the working directory
+// `tmp`.
 static void test_search_permission(const char *tmp) {
     // Root can search any directory.
     if (geteuid() == 0) {

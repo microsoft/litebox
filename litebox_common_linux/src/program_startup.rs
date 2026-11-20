@@ -1541,7 +1541,8 @@ mod tests {
             Err(LinuxProgramStartupError::InvalidExecfn)
         );
 
-        // A zero cwd length announces a handle, so a path cwd must not be empty.
+        // A path cwd must be absolute; in particular it cannot be empty, since a zero length
+        // announces a handle.
         for cwd in ["", "relative"] {
             let invalid_cwd = LinuxProgramStartup {
                 cwd: InheritedCwd::Path(cwd.into()),
