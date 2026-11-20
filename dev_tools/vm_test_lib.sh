@@ -153,6 +153,7 @@ os.set_inheritable(4, True)
 os.execvp(sys.argv[2], sys.argv[2:])
 '
 vsock_connect=()
+netns=()
 
 # Sets $vsock for boot $1's vsock device, with its host side at
 # $WORK/$1.vsock; for QEMU, also starts its daemon, $daemon, and sets
@@ -202,12 +203,12 @@ stop_vsock() {
 
 # run_vm NAME KERNEL PAYLOAD [VMM_ARG]...: boots KERNEL with PAYLOAD as its
 # initrd and records the outcome; with $verbose set, prints passing logs too.
-# $kernel_args, if set, goes on the kernel's command line, and QEMU runs
-# through $vsock_connect. If $client names a function, `$client NAME` runs
-# alongside as the host client, and a pass needs it to exit 0; its end stops
-# the VM, and the VM's end stops it after 5s. If $check names a function, a
-# guest pass also needs `$check NAME` to succeed; it prints why not
-# otherwise.
+# $kernel_args, if set, goes on the kernel's command line, QEMU runs through
+# $vsock_connect, and Cloud Hypervisor through $netns. If $client names a
+# function, `$client NAME` runs alongside as the host client, and a pass needs
+# it to exit 0; its end stops the VM, and the VM's end stops it after 5s. If
+# $check names a function, a guest pass also needs `$check NAME` to succeed;
+# it prints why not otherwise.
 run_vm() {
     local name=$1 kernel=$2 payload=$3 log="$WORK/$1.log" status why vm_pid cpid
     local client_status=0 stopped=0 panicked=0 rebooted=0 cmdline exit_line
@@ -226,7 +227,7 @@ run_vm() {
             ;;
         cloud-hypervisor)
             # shellcheck disable=SC2206 # CLOUD_HYPERVISOR is a command line
-            vm+=($CLOUD_HYPERVISOR
+            vm+=("${netns[@]}" $CLOUD_HYPERVISOR
                 --cpus "boot=$VM_CPUS" --memory "size=${VM_MIB}M"
                 --kernel "$kernel" --initramfs "$payload" --cmdline "$cmdline"
                 --serial tty)

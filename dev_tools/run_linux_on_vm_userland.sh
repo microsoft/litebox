@@ -57,9 +57,10 @@
 # (to greeting.txt), self (to .), and abs.txt (to /mnt/host/greeting.txt), is
 # mounted read-only at /mnt/host over virtio-9p (its mount tag).
 #
-# Under Cloud Hypervisor, a TAP device, made with (passwordless) sudo, has the
-# guest's gateway (10.0.2.1) and the echo server (10.0.2.100:7). It has no
-# virtio-9p, so the share test is skipped there.
+# Under Cloud Hypervisor, the VMs run in a network namespace of the run's own,
+# made with (passwordless) sudo, where a TAP device has the guest's gateway
+# (10.0.2.1) and the echo server (10.0.2.100:7). It has no virtio-9p, so the
+# share test is skipped there.
 #
 # With VM_CPUS above 4, the preempt test is skipped: it checks preemption
 # with 8 CPU-bound programs. With fewer than 2, the smp test is skipped: it
@@ -165,14 +166,20 @@ fi
 half_close=0
 if [[ $VMM == cloud-hypervisor ]]; then
     half_close=1
-    TAP=litebox$$
-    sudo -n ip tuntap add dev "$TAP" mode tap user "$(id -u)" ||
+    ns=litebox$$
+    sudo -n ip netns add "$ns" ||
         { echo "error: Cloud Hypervisor's network needs passwordless sudo (see the header)" >&2; exit 2; }
-    trap 'cleanup; sudo -n ip link delete "$TAP"' EXIT
-    sudo -n ip addr add 10.0.2.1/24 dev "$TAP"
-    sudo -n ip addr add 10.0.2.100/32 dev "$TAP"
-    sudo -n ip link set "$TAP" up
-    sudo -n python3 -c '
+    trap 'cleanup; sudo -n ip netns delete "$ns"' EXIT
+    sudo -n ip -n "$ns" link set lo up
+    sudo -n ip -n "$ns" tuntap add dev tap0 mode tap user "$(id -u)"
+    sudo -n ip -n "$ns" addr add 10.0.2.1/24 dev tap0
+    sudo -n ip -n "$ns" addr add 10.0.2.100/32 dev tap0
+    sudo -n ip -n "$ns" link set tap0 up
+    sudo -n ip netns exec "$ns" sysctl -qw net.ipv4.ip_unprivileged_port_start=0
+    # shellcheck disable=SC2034 # run_vm runs Cloud Hypervisor through it
+    netns=(sudo -n ip netns exec "$ns" setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups --
+        env "PATH=$PATH")
+    "${netns[@]}" python3 -c '
 import socket, threading
 server = socket.create_server(("10.0.2.100", 7))
 def echo(connection):
@@ -272,7 +279,7 @@ network_args() {
             echo -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.1,restrict=on,guestfwd=tcp:10.0.2.100:7-cmd:cat \
                 -device virtio-net-pci,netdev=n0,disable-legacy=on
             ;;
-        cloud-hypervisor) echo --net "tap=$TAP" ;;
+        cloud-hypervisor) echo --net tap=tap0 ;;
     esac
 }
 
