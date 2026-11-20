@@ -91,11 +91,20 @@ fn deadline(timeout: Duration) -> context::Context {
     context::with_timeout(i64::try_from(timeout.as_nanos()).unwrap_or(i64::MAX))
 }
 
+/// Whether the guest service answered with `failure`, and so did not carry the call out. Its
+/// `DEADLINE_EXCEEDED` is no answer: the call may still take effect.
+fn answered(failure: &crate::ttrpc::Error) -> bool {
+    matches!(
+        failure,
+        crate::ttrpc::Error::RpcStatus(status) if status.code() != Code::DEADLINE_EXCEEDED
+    )
+}
+
 /// Stops `broker` if `result` failed without the guest service's answer (a timeout, or a failed
 /// connection): its processes then exit through their watchers.
 fn stop_unless_answered<T>(broker: &Broker, result: Result<T>) -> Result<T> {
     if let Err(failure) = &result
-        && !matches!(failure, crate::ttrpc::Error::RpcStatus(_))
+        && !answered(failure)
     {
         log::error!(
             "a call failed without the guest service's answer: {failure}; stopping the broker"
@@ -1083,5 +1092,51 @@ impl Task for Service {
     // TODO: report the broker's and its runners' CPU time and memory.
     fn stats(&self, _ctx: &TtrpcContext, _request: StatsRequest) -> TtrpcResult<StatsResponse> {
         Err(unsupported("statistics are not supported yet"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use containerd_shim::protos::ttrpc::{self, Code, TtrpcContext};
+    use litebox_guest_service_protocol::guest_service::{Empty, ExecProcessRequest};
+    use litebox_guest_service_protocol::guest_service_ttrpc::{
+        GuestService, GuestServiceClient, create_guest_service,
+    };
+
+    use super::{answered, deadline};
+    use crate::error;
+
+    struct TimingOut;
+
+    impl GuestService for TimingOut {
+        fn exec_process(&self, _: &TtrpcContext, _: ExecProcessRequest) -> ttrpc::Result<Empty> {
+            Err(error(Code::DEADLINE_EXCEEDED, "timeout"))
+        }
+    }
+
+    #[test]
+    fn the_guest_service_s_deadline_exceeded_is_no_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let address = format!("unix://{}", dir.path().join("socket").display());
+        let mut server = ttrpc::Server::new()
+            .bind(&address)
+            .unwrap()
+            .register_service(create_guest_service(Arc::new(TimingOut)));
+        server.start().unwrap();
+        let client = GuestServiceClient::new(ttrpc::Client::connect(&address).unwrap());
+        let request = ExecProcessRequest::new();
+        let failure = client
+            .exec_process(deadline(Duration::from_secs(5)), &request)
+            .unwrap_err();
+        assert!(
+            matches!(&failure, ttrpc::Error::RpcStatus(status)
+                if status.code() == Code::DEADLINE_EXCEEDED),
+            "{failure:?}"
+        );
+        assert!(!answered(&failure));
+        server.shutdown();
     }
 }

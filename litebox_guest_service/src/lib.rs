@@ -23,10 +23,11 @@ macro_rules! log {
 mod process;
 mod service;
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use litebox_guest_service_protocol::GUEST_SERVICE_PORT;
-use litebox_guest_service_protocol::guest_service_ttrpc::create_guest_service;
+use litebox_guest_service_protocol::guest_service_ttrpc_async::create_guest_service;
 
 /// Runs the guest service until the broker ends.
 pub fn run() -> ! {
@@ -38,25 +39,38 @@ pub fn run() -> ! {
     }));
     // Only LiteBox's first guest process has these, and confines `kill(-1)` to the guest.
     if (std::process::id(), std::os::unix::process::parent_id()) != (1, 0) {
-        log!("not the first process of a LiteBox guest");
-        std::process::exit(1);
+        fail("not the first process of a LiteBox guest");
     }
-    let service = Arc::new(service::Service::default());
-    let reaper = Arc::clone(&service);
-    std::thread::spawn(move || reaper.reap());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .unwrap_or_else(|error| fail(format!("cannot start the runtime: {error}")));
+    // Every thread starts now, so that none can fail to start later.
+    let service = service::Service::new(runtime.handle().clone())
+        .and_then(|service| {
+            let reaper = service.clone();
+            std::thread::Builder::new()
+                .name("reaper".to_owned())
+                .spawn(move || reaper.reap())?;
+            Ok(service)
+        })
+        .unwrap_or_else(|error| fail(format!("cannot start a thread: {error}")));
+    let Err(error) = runtime.block_on(serve(service));
+    fail(format!("cannot serve port {GUEST_SERVICE_PORT}: {error}"));
+}
+
+fn fail(message: impl std::fmt::Display) -> ! {
+    log!("{message}");
+    std::process::exit(1);
+}
+
+async fn serve(service: service::Service) -> ttrpc::Result<Infallible> {
     // Close-on-exec, and on any CID.
-    let served = ttrpc::Server::new()
-        .bind(&format!("vsock://-1:{GUEST_SERVICE_PORT}"))
-        .map(|server| server.register_service(create_guest_service(service)))
-        .and_then(|mut server| server.start().map(|()| server));
-    match served {
-        // The server serves from threads of its own while it lives.
-        Ok(_server) => loop {
-            std::thread::park();
-        },
-        Err(error) => {
-            log!("cannot serve port {GUEST_SERVICE_PORT}: {error}");
-            std::process::exit(1);
-        }
-    }
+    let mut server = ttrpc::r#async::Server::new()
+        .bind(&format!("vsock://-1:{GUEST_SERVICE_PORT}"))?
+        .register_service(create_guest_service(Arc::new(service)));
+    server.start().await?;
+    // The server's tasks run only while `block_on` does.
+    std::future::pending().await
 }

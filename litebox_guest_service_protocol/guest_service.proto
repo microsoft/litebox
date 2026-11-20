@@ -6,15 +6,16 @@
 //
 // The guest service runs one container. A process is named by its exec ID: the empty one for the
 // container's init process, and for an exec process one that the shim never reuses. Failures are
-// answered with ttrpc statuses.
+// answered with ttrpc statuses. A request whose deadline passes is answered `DEADLINE_EXCEEDED`,
+// but may still take effect: `StartContainer` and `ExecProcess` go on to start their process.
 //
-// Lifecycle: `CreateContainer` prepares the init process, once per guest service, and
-// `StartContainer` runs it; `ExecProcess` runs an exec process at once. `WaitProcess` waits for a
-// process's exit and reports it, as often as asked. `ReleaseProcess` releases an exited process:
-// later requests naming it fail with `NOT_FOUND`, and its transfers in flight end (reads return no
-// data, writes fail). When the init process exits, the guest service kills every other guest
-// process, and reports the init's exit last. If `StartContainer` fails, the init process has ended
-// (its `WaitProcess` reports 127), and so has the container.
+// Lifecycle: `CreateContainer` prepares the init process, once per guest service, and the first
+// `StartContainer` launches it: later ones fail with `FAILED_PRECONDITION`. `ExecProcess` runs an
+// exec process at once. `WaitProcess` waits for a process's exit and reports it, as often as asked.
+// `ReleaseProcess` releases an exited process: later requests naming it fail with `NOT_FOUND`, and
+// its transfers in flight end (reads return no data, writes fail). When the init process exits, the
+// guest service kills every other guest process, and reports the init's exit last. If the init
+// process's launch fails, it has ended (its `WaitProcess` reports 127), and so has the container.
 
 syntax = "proto3";
 
