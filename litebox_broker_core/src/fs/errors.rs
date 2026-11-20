@@ -22,6 +22,8 @@ pub enum OpenError {
     ReadOnlyFileSystem,
     #[error("file already exists")]
     AlreadyExists,
+    #[error("cannot create a regular file at a directory path")]
+    IsDirectory,
     #[error("error when truncating: {0}")]
     TruncateError(#[from] TruncateError),
     #[error("I/O error")]

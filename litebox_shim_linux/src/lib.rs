@@ -549,10 +549,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         let fs_state = Arc::new(fs_state);
         match inherited_fds {
             None => {
-                files.initialize_stdio_in_shared_descriptors_table(
-                    &self.0,
-                    &fs_state.context.read(),
-                );
+                let context = fs_state.context.read().clone();
+                files.initialize_stdio_in_shared_descriptors_table(&self.0, &context);
             }
             Some(inherited_fds) => files.install_inherited_fds(&self.0, &inherited_fds)?,
         }
@@ -1962,7 +1960,8 @@ mod test_utils {
                 egid: 0,
             });
             let fs_state = Arc::new(syscalls::file::FsState::new(&credentials));
-            files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
+            let context = fs_state.context.read().clone();
+            files.initialize_stdio_in_shared_descriptors_table(&self, &context);
             let signals = syscalls::signal::SignalState::new_process();
             Task {
                 wait_state: wait::WaitState::new(self.platform),

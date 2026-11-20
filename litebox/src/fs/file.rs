@@ -3,9 +3,8 @@
 
 //! Guest file operations backed by broker-owned file objects.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use alloc::vec;
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::ObjectHandle;
@@ -49,13 +48,6 @@ pub struct SharedFileObject<Object> {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    // XXX: lexical normalization diverges from Linux once symlinks exist: `link/..` names the
-    // link's parent rather than its target's, and dropping a trailing slash means `link/` neither
-    // forces the link to be followed nor requires a directory.
-    fn broker_path(context: &Context, path: &str) -> String {
-        context.resolve(path).to_string()
-    }
-
     /// Opens a file.
     ///
     /// `access` and `flags` use the architecture-independent broker contract.
@@ -63,12 +55,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     pub fn open_file(
         &self,
         context: &Context,
-        path: &str,
+        path: impl PathArg,
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: Mode,
     ) -> Result<File<Platform>, OpenError> {
-        let path = Self::broker_path(context, path);
+        let path = path.broker_path(context)?;
         if FileOpenFlags::from_bits(flags.bits()).is_none() {
             return Err(OpenError::AccessNotAllowed);
         }
@@ -101,8 +93,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Change the permissions of a file.
-    pub fn chmod_file(&self, context: &Context, path: &str, mode: Mode) -> Result<(), ChmodError> {
-        let path = Self::broker_path(context, path);
+    pub fn chmod_file(
+        &self,
+        context: &Context,
+        path: impl PathArg,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
+        let path = path.broker_path(context)?;
         self.broker_control()
             .ok_or(ChmodError::Io)?
             .chmod_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
@@ -114,11 +111,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     pub fn chown_file(
         &self,
         context: &Context,
-        path: &str,
+        path: impl PathArg,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let path = Self::broker_path(context, path);
+        let path = path.broker_path(context)?;
         self.broker_control()
             .ok_or(ChownError::Io)?
             .chown_file(&path, context.acting_user(), user, group)
@@ -134,9 +131,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         &self,
         target: &str,
         context: &Context,
-        linkpath: &str,
+        linkpath: impl PathArg,
     ) -> Result<(), SymlinkError> {
-        let linkpath = Self::broker_path(context, linkpath);
+        let linkpath = linkpath.broker_path(context)?;
         self.broker_control()
             .ok_or(SymlinkError::Io)?
             .symlink_file(target, &linkpath, context.acting_user())
@@ -145,8 +142,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Unlink a file.
-    pub fn unlink_file(&self, context: &Context, path: &str) -> Result<(), UnlinkError> {
-        let path = Self::broker_path(context, path);
+    pub fn unlink_file(&self, context: &Context, path: impl PathArg) -> Result<(), UnlinkError> {
+        let path = path.broker_path(context)?;
         self.broker_control()
             .ok_or(UnlinkError::Io)?
             .unlink_file(&path, context.acting_user())
@@ -158,39 +155,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     pub fn rename_file(
         &self,
         context: &Context,
-        old_path: &str,
-        new_path: &str,
+        old_path: impl PathArg,
+        new_path: impl PathArg,
     ) -> Result<(), RenameError> {
-        if old_path.is_empty() || new_path.is_empty() {
-            return Err(PathError::NoSuchFileOrDirectory.into());
-        }
-        // Not normalized: dot components and trailing slashes are meaningful to rename.
-        let absolute_path = |path: &str| {
-            if path.starts_with('/') {
-                return String::from(path);
-            }
-            // XXX(jayb): cwd is a path snapshot and goes stale if an ancestor is renamed.
-            let mut absolute = context.cwd().to_string();
-            if !absolute.ends_with('/') {
-                absolute.push('/');
-            }
-            absolute.push_str(path);
-            absolute
-        };
+        let old_path = old_path.broker_path(context)?;
+        let new_path = new_path.broker_path(context)?;
         self.broker_control()
             .ok_or(RenameError::Io)?
-            .rename_file(
-                &absolute_path(old_path),
-                &absolute_path(new_path),
-                context.acting_user(),
-            )
+            .rename_file(&old_path, &new_path, context.acting_user())
             .map_err(|_| RenameError::Io)?
             .map_err(RenameError::from)
     }
 
     /// Create a new directory.
-    pub fn mkdir_file(&self, context: &Context, path: &str, mode: Mode) -> Result<(), MkdirError> {
-        let path = Self::broker_path(context, path);
+    pub fn mkdir_file(
+        &self,
+        context: &Context,
+        path: impl PathArg,
+        mode: Mode,
+    ) -> Result<(), MkdirError> {
+        let path = path.broker_path(context)?;
         self.broker_control()
             .ok_or(MkdirError::Io)?
             .mkdir_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
@@ -199,21 +183,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Mount a fresh in-memory filesystem at a directory path.
-    pub fn mount_in_mem(&self, context: &Context, path: &str) -> Result<(), FileError> {
-        if path.is_empty() {
-            return Err(FileError::NoSuchFileOrDirectory);
-        }
-        // Preserve dot components and trailing slashes for the broker's target validation.
-        let path = if path.starts_with('/') {
-            String::from(path)
-        } else {
-            let mut absolute = context.cwd().to_string();
-            if !absolute.ends_with('/') {
-                absolute.push('/');
-            }
-            absolute.push_str(path);
-            absolute
-        };
+    pub fn mount_in_mem(&self, context: &Context, path: impl PathArg) -> Result<(), FileError> {
+        let path = path.broker_path(context)?;
         self.broker_control()
             .ok_or(FileError::Io)?
             .mount_in_mem(&path, context.acting_user())
@@ -221,8 +192,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Remove a directory.
-    pub fn rmdir_file(&self, context: &Context, path: &str) -> Result<(), RmdirError> {
-        let path = Self::broker_path(context, path);
+    pub fn rmdir_file(&self, context: &Context, path: impl PathArg) -> Result<(), RmdirError> {
+        let path = path.broker_path(context)?;
         self.broker_control()
             .ok_or(RmdirError::Io)?
             .rmdir_file(&path, context.acting_user())
@@ -232,14 +203,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
 
     /// Obtain the status of a path.
     ///
-    /// If `follow_symlinks` is false, a final symbolic link is described itself.
+    /// If `follow_symlinks` is false, a final symbolic link is described itself unless the path
+    /// ends in a slash.
     pub fn path_file_status(
         &self,
         context: &Context,
-        path: &str,
+        path: impl PathArg,
         follow_symlinks: bool,
     ) -> Result<FileStatus, FileStatusError> {
-        let path = Self::broker_path(context, path);
+        let path = path.broker_path(context)?;
         self.broker_control()
             .ok_or(FileStatusError::Io)?
             .path_file_status(&path, context.acting_user(), follow_symlinks)
@@ -248,8 +220,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Read a symbolic link's stored target, without following the final link.
-    pub fn read_link_file(&self, context: &Context, path: &str) -> Result<String, WalkError> {
-        let path = Self::broker_path(context, path);
+    pub fn read_link_file(
+        &self,
+        context: &Context,
+        path: impl PathArg,
+    ) -> Result<String, WalkError> {
+        let path = path.broker_path(context)?;
         self.broker_control()
             .ok_or(WalkError::Io)?
             .read_link_file(&path, context.acting_user())
@@ -261,16 +237,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     pub fn resolve_file_path(
         &self,
         context: &Context,
-        path: &str,
+        path: impl PathArg,
     ) -> Result<ResolvedPath, WalkError> {
-        let path = Self::broker_path(context, path);
+        let path = path.broker_path(context)?;
         let resolved = self
             .broker_control()
             .ok_or(WalkError::Io)?
             .resolve_file_path(&path, context.acting_user())
             .map_err(|_| WalkError::Io)?
             .map_err(WalkError::from)?;
-        Ok(Context::new().resolve(&resolved))
+        Ok(ResolvedPath::from_absolute(resolved))
     }
 }
 
@@ -308,7 +284,7 @@ impl Context {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cwd: Arc::new(ResolvedPath { components: vec![] }),
+            cwd: Arc::new(ResolvedPath(String::from("/"))),
             user_info: UserInfo {
                 user: 1000,
                 group: 1000,
@@ -316,23 +292,22 @@ impl Context {
         }
     }
 
-    /// Resolve `path` against the current context.
-    pub fn resolve(&self, path: &str) -> ResolvedPath {
-        let mut components = if path.starts_with('/') {
-            vec![]
-        } else {
-            self.cwd.components.clone()
-        };
-        for component in path.split('/') {
-            match component {
-                "" | "." => {}
-                ".." => {
-                    let _ = components.pop();
-                }
-                _ => components.push(component.into()),
-            }
+    /// Join a relative path to the working directory without removing dots or trailing slashes.
+    /// An absolute path is copied unchanged; an empty path returns the working directory itself.
+    #[must_use]
+    pub fn joined(&self, path: &str) -> BrokerPath {
+        if path.starts_with('/') {
+            return BrokerPath(String::from(path));
         }
-        ResolvedPath { components }
+        // XXX(jayb): cwd is a path snapshot and goes stale if an ancestor is renamed.
+        let mut absolute = self.cwd.0.clone();
+        if !path.is_empty() {
+            if !absolute.ends_with('/') {
+                absolute.push('/');
+            }
+            absolute.push_str(path);
+        }
+        BrokerPath(absolute)
     }
 }
 
@@ -342,21 +317,88 @@ impl Default for Context {
     }
 }
 
-/// Absolute normalized path, created from [`Context::resolve`].
+/// An owned absolute path ready to send to the broker without normalization.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedPath {
-    components: Vec<String>,
+pub struct BrokerPath(String);
+
+impl BrokerPath {
+    /// Keep the exact spelling of an absolute path.
+    ///
+    /// # Panics
+    /// Panics if `path` does not start with `/`.
+    #[must_use]
+    pub fn verbatim(path: String) -> Self {
+        assert!(path.starts_with('/'), "broker path must be absolute");
+        Self(path)
+    }
+
+    /// Borrow the exact path to be sent to the broker.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for BrokerPath {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<BrokerPath> for String {
+    fn from(path: BrokerPath) -> Self {
+        path.0
+    }
+}
+
+/// A string to join to the working directory, or a prepared [`BrokerPath`] to use verbatim.
+/// Shared references to either are also accepted. This trait is sealed.
+pub trait PathArg: sealed::Sealed {}
+
+impl<T: sealed::Sealed + ?Sized> PathArg for T {}
+
+mod sealed {
+    use super::{BrokerPath, Context, FileError, String};
+    use alloc::borrow::Cow;
+
+    pub trait Sealed: AsRef<str> {
+        fn broker_path(&self, context: &Context) -> Result<Cow<'_, str>, FileError> {
+            let path = self.as_ref();
+            if path.is_empty() {
+                Err(FileError::NoSuchFileOrDirectory)
+            } else if path.starts_with('/') {
+                Ok(Cow::Borrowed(path))
+            } else {
+                Ok(Cow::Owned(context.joined(path).0))
+            }
+        }
+    }
+
+    impl Sealed for str {}
+    impl Sealed for String {}
+    impl Sealed for BrokerPath {}
+    impl<T: Sealed + ?Sized> Sealed for &T {}
+}
+
+/// An absolute physical path obtained from the broker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPath(String);
+
+impl ResolvedPath {
+    /// Restore a physical path previously obtained from the broker, e.g. an inherited cwd.
+    ///
+    /// # Panics
+    /// Panics if `path` does not start with `/`.
+    #[must_use]
+    pub fn from_absolute(path: String) -> Self {
+        assert!(path.starts_with('/'), "resolved path must be absolute");
+        Self(path)
+    }
 }
 
 impl core::fmt::Display for ResolvedPath {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        for component in &self.components {
-            write!(formatter, "/{component}")?;
-        }
-        if self.components.is_empty() {
-            formatter.write_str("/")?;
-        }
-        Ok(())
+        formatter.write_str(&self.0)
     }
 }
 
