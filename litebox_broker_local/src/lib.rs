@@ -556,7 +556,7 @@ mod tests {
             let local = test_broker_local(channel, noop_shared_memory());
 
             assert!(matches!(
-                local.create_event_with_count(0, FileOpenFlags::NONE),
+                local.create_event_with_count(0, FileOpenFlags::NONE, false),
                 Err(BrokerLocalError::Broker(actual)) if actual == error
             ));
         }
@@ -568,7 +568,7 @@ mod tests {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::Internal)));
         let local = test_broker_local(channel, noop_shared_memory());
 
-        let _ = local.create_event_with_count(0, FileOpenFlags::NONE);
+        let _ = local.create_event_with_count(0, FileOpenFlags::NONE, false);
     }
 
     #[test]

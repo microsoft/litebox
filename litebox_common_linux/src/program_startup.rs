@@ -167,15 +167,9 @@ pub enum InheritedFdKind {
         socket_type: SocketType,
     },
     /// An eventfd.
-    Eventfd {
-        /// Whether reads consume one count at a time (`EFD_SEMAPHORE`).
-        semaphore: bool,
-    },
+    Eventfd,
     /// A timerfd.
-    Timerfd {
-        /// The clock absolute expiration times are measured against.
-        clock: TimerfdClock,
-    },
+    Timerfd,
     /// An epoll instance.
     Epoll,
     /// An IPv4 socket.
@@ -187,19 +181,6 @@ pub enum InheritedFdKind {
     VsockSocket,
     /// A pidfd.
     Pidfd,
-}
-
-/// Clock against which a timerfd measures absolute expiration times.
-///
-/// The clock is only a shim concern: absolute times are converted to relative ones when the timer
-/// is armed, and the broker timer counts them on its own monotonic clock. Unlike Linux, an armed
-/// `CLOCK_REALTIME` timer therefore does not follow later wall-clock changes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimerfdClock {
-    /// `CLOCK_REALTIME`.
-    RealTime,
-    /// `CLOCK_MONOTONIC` or `CLOCK_BOOTTIME`.
-    Monotonic,
 }
 
 /// Linux process state needed to continue a child duplicated by `fork` in a fresh runner.
@@ -677,14 +658,14 @@ impl InheritedFd {
         INHERITED_FD_HEADER_SIZE
             + match self.kind {
                 InheritedFdKind::File
+                | InheritedFdKind::Eventfd
+                | InheritedFdKind::Timerfd
                 | InheritedFdKind::Epoll
                 | InheritedFdKind::VsockSocket
                 | InheritedFdKind::Pidfd => 0,
                 InheritedFdKind::Pipe { .. }
                 | InheritedFdKind::UnixSocket { .. }
-                | InheritedFdKind::InetSocket { .. }
-                | InheritedFdKind::Eventfd { .. }
-                | InheritedFdKind::Timerfd { .. } => size_of::<u8>(),
+                | InheritedFdKind::InetSocket { .. } => size_of::<u8>(),
             }
     }
 
@@ -709,17 +690,8 @@ impl InheritedFd {
                     HalfPipeType::SenderHalf => 1,
                 });
             }
-            InheritedFdKind::Eventfd { semaphore } => {
-                output.push(EVENTFD_TAG);
-                output.push(u8::from(semaphore));
-            }
-            InheritedFdKind::Timerfd { clock } => {
-                output.push(TIMERFD_TAG);
-                output.push(match clock {
-                    TimerfdClock::RealTime => 0,
-                    TimerfdClock::Monotonic => 1,
-                });
-            }
+            InheritedFdKind::Eventfd => output.push(EVENTFD_TAG),
+            InheritedFdKind::Timerfd => output.push(TIMERFD_TAG),
             InheritedFdKind::Epoll => output.push(EPOLL_TAG),
             InheritedFdKind::InetSocket { socket_type } => {
                 output.push(INET_SOCKET_TAG);
@@ -754,16 +726,8 @@ impl InheritedFd {
                     _ => return Err(LinuxProgramStartupError::Malformed),
                 },
             },
-            EVENTFD_TAG => InheritedFdKind::Eventfd {
-                semaphore: read_bool(input)?,
-            },
-            TIMERFD_TAG => InheritedFdKind::Timerfd {
-                clock: match read_u8(input)? {
-                    0 => TimerfdClock::RealTime,
-                    1 => TimerfdClock::Monotonic,
-                    _ => return Err(LinuxProgramStartupError::Malformed),
-                },
-            },
+            EVENTFD_TAG => InheritedFdKind::Eventfd,
+            TIMERFD_TAG => InheritedFdKind::Timerfd,
             EPOLL_TAG => InheritedFdKind::Epoll,
             INET_SOCKET_TAG => InheritedFdKind::InetSocket {
                 socket_type: match read_u8(input)? {
@@ -1173,14 +1137,12 @@ mod tests {
                 InheritedFd {
                     fd: 8,
                     handle: ObjectHandle(11),
-                    kind: InheritedFdKind::Eventfd { semaphore: true },
+                    kind: InheritedFdKind::Eventfd,
                 },
                 InheritedFd {
                     fd: 9,
                     handle: ObjectHandle(12),
-                    kind: InheritedFdKind::Timerfd {
-                        clock: TimerfdClock::Monotonic,
-                    },
+                    kind: InheritedFdKind::Timerfd,
                 },
                 InheritedFd {
                     fd: 10,
@@ -1360,7 +1322,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 5,
                         handle: ObjectHandle(10),
-                        kind: InheritedFdKind::Eventfd { semaphore: false },
+                        kind: InheritedFdKind::Eventfd,
                     },
                     close_on_exec: true,
                 },
@@ -1368,9 +1330,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 6,
                         handle: ObjectHandle(11),
-                        kind: InheritedFdKind::Timerfd {
-                            clock: TimerfdClock::RealTime,
-                        },
+                        kind: InheritedFdKind::Timerfd,
                     },
                     close_on_exec: false,
                 },

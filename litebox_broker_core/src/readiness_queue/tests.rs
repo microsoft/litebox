@@ -6,7 +6,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::event::EventConsumeMode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest,
 };
@@ -155,7 +154,7 @@ fn edge_triggered_entries_report_once_per_publication() {
 
     // A publication the target no longer matches by the take reports nothing.
     crate::event::add(&process, counter, 1).unwrap();
-    crate::event::consume(&process, counter, EventConsumeMode::All).unwrap();
+    crate::event::consume(&process, counter).unwrap();
     assert_eq!(take(&process, queue), []);
 }
 

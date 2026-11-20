@@ -5,17 +5,6 @@ use crate::ObjectHandle;
 use crate::fs::FileOpenFlags;
 use crate::readiness::ReadinessFlags;
 
-wire_enum! {
-    /// How a broker event consume operation should remove readiness credits.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum EventConsumeMode {
-        /// Consume all currently available credits.
-        All,
-        /// Consume one credit.
-        One,
-    }
-}
-
 wire_struct! {
     /// Request to create a broker-owned event object.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -24,6 +13,8 @@ wire_struct! {
         pub initial_count: u64,
         /// Initial status flags, within [`FileOpenFlags::STATUS`].
         pub flags: FileOpenFlags,
+        /// Whether each read consumes one credit instead of the full count.
+        pub semaphore: bool,
     }
 }
 
@@ -62,8 +53,6 @@ wire_struct! {
     pub struct ConsumeEventRequest {
         /// Event handle.
         pub handle: ObjectHandle,
-        /// Consume mode.
-        pub mode: EventConsumeMode,
     }
 }
 

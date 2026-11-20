@@ -6,12 +6,7 @@
 use alloc::sync::Arc;
 
 use litebox::{
-    event::{
-        Events, IOPollable,
-        counter::{EventCounter, EventCounterReadMode},
-        observer::Observer,
-        wait::WaitContext,
-    },
+    event::{Events, IOPollable, counter::EventCounter, observer::Observer, wait::WaitContext},
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     process::ProcessError,
     sync::RawSyncPrimitivesProvider,
@@ -31,25 +26,14 @@ impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for EventFile<Platform> {}
 
 pub(crate) type EventfdFd<Platform> = TypedFd<EventfdSubsystem<Platform>>;
 
-/// An eventfd, whose count and status flags the broker owns, so processes
-/// that share it through `fork` see one counter.
+/// An eventfd, whose count, status flags, and semaphore mode the broker owns.
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     counter: Arc<EventCounter<Platform>>,
-    semaphore: bool,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
-        self.counter
-            .read(
-                cx,
-                if self.semaphore {
-                    EventCounterReadMode::One
-                } else {
-                    EventCounterReadMode::All
-                },
-            )
-            .map_err(Errno::from)
+        self.counter.read(cx).map_err(Errno::from)
     }
 
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, value: u64) -> Result<usize, Errno> {
@@ -71,10 +55,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
 
     pub(crate) fn counter(&self) -> &Arc<EventCounter<Platform>> {
         &self.counter
-    }
-
-    pub(crate) fn is_semaphore(&self) -> bool {
-        self.semaphore
     }
 }
 
@@ -105,11 +85,15 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         } else {
             FileOpenFlags::NONE
         };
-        let counter =
-            EventCounter::new(&self.litebox, u64::from(initval), status).map_err(Errno::from)?;
+        let counter = EventCounter::new(
+            &self.litebox,
+            u64::from(initval),
+            status,
+            flags.contains(EfdFlags::SEMAPHORE),
+        )
+        .map_err(Errno::from)?;
         Ok(EventFile {
             counter: Arc::new(counter),
-            semaphore: flags.contains(EfdFlags::SEMAPHORE),
         })
     }
 
@@ -131,7 +115,6 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     pub(crate) fn adopt_inherited_eventfd(
         &self,
         handle: ObjectHandle,
-        semaphore: bool,
     ) -> Result<EventfdFd<Platform>, ProcessError> {
         let counter = self.litebox.adopt_inherited_event_counter(handle)?;
         Ok(self
@@ -139,7 +122,6 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             .descriptor_table_mut()
             .insert::<EventfdSubsystem<Platform>>(EventFile {
                 counter: Arc::new(counter),
-                semaphore,
             }))
     }
 }

@@ -34,7 +34,7 @@ fn ratchet_transmutes() -> Result<()> {
 fn ratchet_pub_uses() -> Result<()> {
     ratchet(
         &[
-            ("litebox/", 9),
+            ("litebox/", 8),
             ("litebox_broker_core/", 6),
             ("litebox_broker_host/", 1),
             ("litebox_broker_local/", 1),

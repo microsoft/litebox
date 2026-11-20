@@ -9,6 +9,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 pub use litebox_broker_protocol::timer::TimerSpec;
+use litebox_broker_protocol::timer::{TimerClock, TimerSetting};
 use litebox_platform::time::TimeProvider;
 use thiserror::Error;
 
@@ -44,8 +45,8 @@ pub enum TimerError {
     Unavailable,
 }
 
-/// A local-core timer whose schedule, expirations, and status flags are owned by
-/// the broker.
+/// A local-core timer whose clock, schedule, expirations, and status flags are
+/// owned by the broker.
 ///
 /// The timer is readable ([`Events::IN`]) while it has unconsumed expirations.
 pub struct Timer<Platform: RawSyncPrimitivesProvider + TimeProvider> {
@@ -60,18 +61,22 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     /// Creates a disarmed timer with the status flags `flags`, within
-    /// [`FileOpenFlags::STATUS`].
+    /// [`FileOpenFlags::STATUS`], and a `clock` for absolute deadlines.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued timer request.
-    pub fn new(litebox: &LiteBox<Platform>, flags: FileOpenFlags) -> Result<Self, TimerError> {
+    pub fn new(
+        litebox: &LiteBox<Platform>,
+        flags: FileOpenFlags,
+        clock: TimerClock,
+    ) -> Result<Self, TimerError> {
         let Some(broker) = litebox.broker_control() else {
             return Err(TimerError::Unavailable);
         };
         let handle = broker
-            .create_timer(flags)
+            .create_timer(flags, clock)
             .map_err(BrokerObjectError::from)
             .map_err(TimerError::from)?;
         Ok(Self::from_handle(litebox, broker, handle))
@@ -98,13 +103,13 @@ where
         self.handle
     }
 
-    /// Arms the timer to first expire after `spec.value_ns` and then every
-    /// `spec.interval_ns`, or disarms it if `spec.value_ns` is zero.
+    /// Arms the timer with a relative delay or absolute deadline, or disarms it
+    /// if the delay or deadline is zero.
     ///
     /// Unconsumed expirations are discarded. Returns the previous schedule.
-    pub fn set(&self, spec: TimerSpec) -> Result<TimerSpec, TimerError> {
+    pub fn set(&self, setting: TimerSetting) -> Result<TimerSpec, TimerError> {
         self.broker
-            .set_timer(self.handle, spec)
+            .set_timer(self.handle, setting)
             .map_err(|error| self.request_error(error))
     }
 

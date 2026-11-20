@@ -223,7 +223,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
     );
 
     let handle = local
-        .create_event_with_count(0, FileOpenFlags::NONE)
+        .create_event_with_count(0, FileOpenFlags::NONE, false)
         .unwrap();
     let readiness = ReadinessFlags::READ | ReadinessFlags::WRITE;
     assert_eq!(local.add_event(handle, 1).unwrap(), readiness);

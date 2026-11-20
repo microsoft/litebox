@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::time::Duration;
+
 use crate::ObjectHandle;
 use crate::fs::FileOpenFlags;
 
@@ -17,12 +19,46 @@ wire_struct! {
     }
 }
 
+wire_enum! {
+    /// Guest clock against which absolute expiration times are measured.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum TimerClock {
+        #[default]
+        Monotonic,
+        /// XXX: Unlike Linux, armed absolute timers use a monotonic delay and ignore later wall-clock changes.
+        RealTime,
+    }
+}
+
+wire_enum! {
+    /// Both kinds of schedule arm a broker monotonic alarm. Guest clocks need
+    /// not share the broker clock's epoch.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TimerSetting {
+        Relative(TimerSpec),
+        Absolute {
+            deadline: Duration,
+            interval_ns: u64,
+            realtime_now: Duration,
+            monotonic_now: Duration,
+        },
+    }
+}
+
+impl From<TimerSpec> for TimerSetting {
+    fn from(spec: TimerSpec) -> Self {
+        Self::Relative(spec)
+    }
+}
+
 wire_struct! {
     /// Request to create a disarmed timer.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct CreateTimerRequest {
         /// Initial status flags, within [`FileOpenFlags::STATUS`].
         pub flags: FileOpenFlags,
+        /// Clock used by absolute sets for the life of this timer.
+        pub clock: TimerClock,
     }
 }
 
@@ -41,8 +77,8 @@ wire_struct! {
     pub struct SetTimerRequest {
         /// Timer handle.
         pub handle: ObjectHandle,
-        /// New schedule. A zero `value_ns` disarms the timer.
-        pub spec: TimerSpec,
+        /// New schedule. A zero deadline or relative delay disarms the timer.
+        pub setting: TimerSetting,
     }
 }
 

@@ -7,28 +7,42 @@ use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
 use crate::{BrokerError, BrokerProcess, Result};
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
+use litebox_broker_protocol::event::EventConsumption;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::Mutex;
 
 pub(crate) const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
 
-/// Creates a broker-owned event object with initial readiness credits.
-///
-/// The event starts with the status flags `flags`, which must be within
-/// [`FileOpenFlags::STATUS`].
-pub fn create(
+#[cfg(test)]
+pub(crate) fn create(
     process: &BrokerProcess,
     initial_count: u64,
     flags: FileOpenFlags,
+) -> Result<ObjectHandle> {
+    create_with_mode(process, initial_count, flags, false)
+}
+
+/// Creates a broker-owned event with initial readiness credits and a shared semaphore mode.
+///
+/// The event starts with the status flags `flags`, which must be within
+/// [`FileOpenFlags::STATUS`].
+pub fn create_with_mode(
+    process: &BrokerProcess,
+    initial_count: u64,
+    flags: FileOpenFlags,
+    semaphore: bool,
 ) -> Result<ObjectHandle> {
     let status = StatusFlags::new(flags)?;
     if initial_count > MAX_EVENT_COUNT {
         return Err(BrokerError::ResourceExhausted);
     }
 
-    process.create_object_reference(ObjectEntry::Event(EventObject::new(initial_count, status)))
+    process.create_object_reference(ObjectEntry::Event(EventObject::new(
+        initial_count,
+        status,
+        semaphore,
+    )))
 }
 
 /// Adds readiness credits to a broker-owned event object.
@@ -45,14 +59,10 @@ pub fn add(process: &BrokerProcess, handle: ObjectHandle, value: u64) -> Result<
 ///
 /// Fails with `WouldBlock` if the count is zero, or `NonBlockingWouldBlock`
 /// if the event is also non-blocking.
-pub fn consume(
-    process: &BrokerProcess,
-    handle: ObjectHandle,
-    mode: EventConsumeMode,
-) -> Result<EventConsumption> {
+pub fn consume(process: &BrokerProcess, handle: ObjectHandle) -> Result<EventConsumption> {
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let mut object = object.write();
-    object.as_event_mut()?.consume(mode)
+    object.as_event_mut()?.consume()
 }
 
 impl ObjectEntry {
@@ -64,20 +74,22 @@ impl ObjectEntry {
     }
 }
 
-/// An event counter, whose references share its count and status flags.
+/// An event counter, whose references share its count, status flags, and semaphore mode.
 pub(crate) struct EventObject {
     count: u64,
     status: StatusFlags,
+    semaphore: bool,
     /// Registrations of references that other processes can change the
     /// count under.
     watchers: Mutex<ReadinessWatchers>,
 }
 
 impl EventObject {
-    fn new(count: u64, status: StatusFlags) -> Self {
+    fn new(count: u64, status: StatusFlags, semaphore: bool) -> Self {
         Self {
             count,
             status,
+            semaphore,
             watchers: Mutex::new(ReadinessWatchers::default()),
         }
     }
@@ -95,15 +107,12 @@ impl EventObject {
         Ok(readiness)
     }
 
-    fn consume(&mut self, mode: EventConsumeMode) -> Result<EventConsumption> {
+    fn consume(&mut self) -> Result<EventConsumption> {
         if self.count == 0 {
             return Err(BrokerError::would_block(self.status.nonblocking()));
         }
 
-        let value = match mode {
-            EventConsumeMode::All => self.count,
-            EventConsumeMode::One => 1,
-        };
+        let value = if self.semaphore { 1 } else { self.count };
         self.count -= value;
         let readiness = self.readiness();
         self.watchers.get_mut().publish(readiness);
