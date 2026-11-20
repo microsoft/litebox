@@ -16,7 +16,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, DirPath, FileHandle, HandleRef,
+    Backend, BackendHandles, CreationMetadata, DirHandle, DirPathResult, FileHandle, HandleRef,
     PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
     SeekBehavior,
 };
@@ -348,7 +348,7 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         if !self.has_nested_mount(mount) {
             return Ok(None);
         }
-        Self::route(mount, mount.backend.dir_path(dir))
+        Self::route_from_backend_path(mount, mount.backend.dir_path(dir))
     }
 
     fn has_nested_mount(&self, mount: &Mount) -> bool {
@@ -364,15 +364,18 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
             })
     }
 
-    /// The route of a directory inside `mount` with the backend name `name` (see
+    /// The route of a directory inside `mount` whose backend path is `backend_path` (see
     /// [`Self::current_route`]).
-    fn route(mount: &Mount, name: DirPath) -> Result<Option<Vec<String>>, WalkError> {
+    fn route_from_backend_path(
+        mount: &Mount,
+        backend_path: DirPathResult,
+    ) -> Result<Option<Vec<String>>, WalkError> {
         // Mount paths never contain empty components. Use this marker to keep walking
         // the held directory (e.g., resolve `..` would pop the marker)
         const UNLINKED_ROUTE_COMPONENT: &str = "";
 
         let mut route = mount.path.clone();
-        match name {
+        match backend_path {
             Ok(Some(path)) => route.extend(path),
             Ok(None) => return Ok(None),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
@@ -822,7 +825,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 // make them disagree.
                 let (handle, route) = if self.has_nested_mount(mount) {
                     let (handle, name) = mount.backend.walking_dir_with_path(handle)?;
-                    (handle, Self::route(mount, name)?)
+                    (handle, Self::route_from_backend_path(mount, name)?)
                 } else {
                     (mount.backend.walking_dir_at(handle)?, None)
                 };
@@ -877,7 +880,27 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
             } => {
                 let mount = self.initialized_mount(*mount_index);
                 if let Some(parent) = mount.backend.parent_dir(handle)? {
-                    let route = self.current_route(mount, &parent)?.unwrap_or_else(|| {
+                    let named = self.current_route(mount, &parent)?;
+                    // Like Linux, `..` onto a covered directory lands on the mount covering it.
+                    // Only a route the backend named can identify that directory; an approximated
+                    // one may be stale.
+                    if let Some(route) = &named
+                        && let Some((covering, root)) = self
+                            .exact_mount_root(route)?
+                            .filter(|(index, _)| index != mount_index)
+                    {
+                        let route = route.clone();
+                        let root = ComposerWalkingDirHandleInner::Mounted {
+                            path: route,
+                            mount_index: covering,
+                            target: ResolvedTarget::Dir(root),
+                        };
+                        return self
+                            .open_dir(self.resolved_dir(root.into()), OFlags::PATH)
+                            .map(Some)
+                            .map_err(open_to_walk_error);
+                    }
+                    let route = named.unwrap_or_else(|| {
                         // Approximate the parent's route from the saved child route.
                         // The backend returned a parent inside this mount, so keep the mount prefix.
                         let mut recorded = path.clone();
@@ -972,8 +995,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 // The route only places nested mount points; without it, use the recorded path.
                 let path = self
                     .current_route(mount, &handle)
-                    .ok()
-                    .flatten()
+                    .map_err(|_| ReadDirError::Io)?
                     .unwrap_or(path);
                 let entries = mount.backend.list_dir_at(handle)?;
                 Ok(self.merge_mount_children(entries, &path))

@@ -225,7 +225,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// Mount a fresh in-memory filesystem at an absolute directory path.
     pub fn mount_in_mem(&self, context: &Context, path: &str) -> Result<(), FileError> {
         let broker = self.broker_control().ok_or(FileError::Io)?;
-        // Validation only: rejects empty and relative paths like other path operations.
+        // Validation only.
         Self::checked_path_anchor(&broker, None, path)?;
         broker
             .mount_in_mem(path, context.acting_user())

@@ -71,7 +71,39 @@ fn open_directory(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// The type of a directory entry, without following a final symlink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EntryKind {
+    Directory,
+    RegularFile,
+    Symlink,
+    Other,
+}
+
+/// A directory entry as `lstat` describes it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Entry {
+    pub(super) kind: EntryKind,
+    /// The Windows readonly attribute.
+    #[cfg(windows)]
+    pub(super) readonly: bool,
+}
+
 impl Location {
+    /// The host names of `root` and of this location, failing with `NotFound` once this
+    /// location is no longer inside `root`.
+    pub(super) fn names_under(&self, root: &Self) -> io::Result<(PathBuf, PathBuf)> {
+        let root_name = root.host_path()?;
+        let name = self.host_path()?;
+        if !name.starts_with(&root_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "directory was moved outside the LocalFs root",
+            ));
+        }
+        Ok((root_name, name))
+    }
+
     /// Fails unless the caller may search this directory.
     pub(super) fn check_search(&self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
@@ -104,11 +136,78 @@ impl Location {
         }
         // Other hosts name directories by path. Windows holds the directory and its ancestors
         // without FILE_SHARE_DELETE; other Unix hosts reject a stale name for every operation
-        // with `NotFound`, so a moved directory has no name.
+        // with `NotFound`, so a moved directory is unreachable and reported like a removed one.
         #[cfg(not(target_os = "linux"))]
         {
             self.host_path()
         }
+    }
+}
+
+// Hosts without dirfd-relative std operations reach entries by path.
+#[cfg(not(target_os = "linux"))]
+impl Location {
+    fn entry_path(&self, name: &str) -> io::Result<PathBuf> {
+        super::validate_name(name).map_err(|_| super::invalid_path())?;
+        Ok(self.path.join(name))
+    }
+
+    pub(super) fn entry_at(&self, name: &str) -> io::Result<Entry> {
+        let metadata = fs::symlink_metadata(self.entry_path(name)?)?;
+        let kind = if metadata.file_type().is_symlink() {
+            EntryKind::Symlink
+        } else if metadata.is_dir() {
+            EntryKind::Directory
+        } else if metadata.is_file() {
+            EntryKind::RegularFile
+        } else {
+            EntryKind::Other
+        };
+        Ok(Entry {
+            kind,
+            #[cfg(windows)]
+            readonly: metadata.permissions().readonly(),
+        })
+    }
+
+    pub(super) fn read_link_at(&self, name: &str) -> io::Result<PathBuf> {
+        fs::read_link(self.entry_path(name)?)
+    }
+
+    /// Creates the regular file `name`, failing if it exists. Windows ignores `mode`; the caller
+    /// applies it afterwards.
+    pub(super) fn create_file_at(&self, name: &str, mode: super::Mode) -> io::Result<File> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, super::host_mode(mode));
+        #[cfg(windows)]
+        let _ = mode;
+        options.open(self.entry_path(name)?)
+    }
+
+    /// Creates the directory `name`. Windows ignores `mode`; the caller applies it afterwards.
+    pub(super) fn create_dir_at(&self, name: &str, mode: super::Mode) -> io::Result<()> {
+        let path = self.entry_path(name)?;
+        #[cfg(unix)]
+        {
+            let mut builder = fs::DirBuilder::new();
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, super::host_mode(mode));
+            builder.create(path)
+        }
+        #[cfg(windows)]
+        {
+            let _ = mode;
+            fs::create_dir(path)
+        }
+    }
+
+    pub(super) fn remove_file_at(&self, name: &str) -> io::Result<()> {
+        fs::remove_file(self.entry_path(name)?)
+    }
+
+    pub(super) fn remove_dir_at(&self, name: &str) -> io::Result<()> {
+        fs::remove_dir(self.entry_path(name)?)
     }
 }
 
@@ -125,7 +224,7 @@ impl Location {
         })
     }
 
-    pub(super) fn child(&self, name: &str) -> io::Result<Self> {
+    pub(super) fn pin_child(&self, name: &str) -> io::Result<Self> {
         super::validate_name(name).map_err(|_| super::invalid_path())?;
         let path = self.path.join(name);
         if fs::symlink_metadata(&path)?.is_dir() {
@@ -214,24 +313,29 @@ impl Location {
         }
     }
 
-    pub(super) fn pin_dir(path: &Path) -> io::Result<Self> {
-        use rustix::fs::{Mode, OFlags, open};
-        Ok(Self::opened(Arc::new(File::from(open(
-            path,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+    /// Pins `name` relative to `dir` with `O_PATH`, adding `flags`.
+    fn pin_at(
+        dir: impl std::os::fd::AsFd,
+        name: impl rustix::path::Arg,
+        flags: rustix::fs::OFlags,
+    ) -> io::Result<Self> {
+        use rustix::fs::{Mode, OFlags, openat};
+        Ok(Self::opened(Arc::new(File::from(openat(
+            dir,
+            name,
+            OFlags::PATH | OFlags::CLOEXEC | flags,
             Mode::empty(),
         )?))))
     }
 
-    pub(super) fn child(&self, name: &str) -> io::Result<Self> {
-        use rustix::fs::{Mode, OFlags, openat};
+    pub(super) fn pin_dir(path: &Path) -> io::Result<Self> {
+        use rustix::fs::{CWD, OFlags};
+        Self::pin_at(CWD, path, OFlags::DIRECTORY | OFlags::NOFOLLOW)
+    }
+
+    pub(super) fn pin_child(&self, name: &str) -> io::Result<Self> {
         super::validate_name(name).map_err(|_| super::invalid_path())?;
-        Ok(Self::opened(Arc::new(File::from(openat(
-            &*self.pin,
-            name,
-            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?))))
+        Self::pin_at(&*self.pin, name, rustix::fs::OFlags::NOFOLLOW)
     }
 
     pub(super) fn metadata(&self) -> io::Result<fs::Metadata> {
@@ -245,20 +349,11 @@ impl Location {
     }
 
     /// Pin the actual parent without looking up the child from it. The canonical names are
-    /// only containment checks, never locators used for a subsequent open. Like
-    /// `LocalFs::check_dir`, a directory moved outside the root fails with `NotFound`.
+    /// only containment checks, never locators used for a subsequent open. A directory moved
+    /// outside the root fails with `NotFound` (see [`Self::names_under`]).
     pub(super) fn parent_under(&self, root: &Self) -> io::Result<Option<Self>> {
-        use rustix::fs::{Mode, OFlags, openat};
         use std::os::unix::fs::MetadataExt;
-        let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
-        let root_name = root.host_path()?;
-        let name = self.host_path()?;
-        if !name.starts_with(&root_name) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "directory was moved outside the LocalFs root",
-            ));
-        }
+        let (root_name, name) = self.names_under(root)?;
         if name == root_name {
             let a = self.metadata()?;
             let b = root.metadata()?;
@@ -268,17 +363,69 @@ impl Location {
             self.check_search()?;
             return Ok(None);
         }
-        let parent = Self::opened(Arc::new(File::from(openat(
-            &*self.pin,
-            "..",
-            flags,
-            Mode::empty(),
-        )?)));
+        let parent = Self::pin_at(&*self.pin, "..", rustix::fs::OFlags::DIRECTORY)?;
         // A root moved since `root_name` was read fails this check closed.
         if !parent.host_path()?.starts_with(&root_name) {
             return Err(super::invalid_path());
         }
         Ok(Some(parent))
+    }
+
+    // Entry operations go through the pin rather than its procfs name, sparing the kernel the
+    // magic-link walk and the caller a path allocation.
+
+    pub(super) fn entry_at(&self, name: &str) -> io::Result<Entry> {
+        use rustix::fs::{AtFlags, FileType, statat};
+        super::validate_name(name).map_err(|_| super::invalid_path())?;
+        let stat = statat(&*self.pin, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let kind = match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => EntryKind::Directory,
+            FileType::RegularFile => EntryKind::RegularFile,
+            FileType::Symlink => EntryKind::Symlink,
+            _ => EntryKind::Other,
+        };
+        Ok(Entry { kind })
+    }
+
+    pub(super) fn read_link_at(&self, name: &str) -> io::Result<PathBuf> {
+        use std::os::unix::ffi::OsStringExt;
+        super::validate_name(name).map_err(|_| super::invalid_path())?;
+        let target = rustix::fs::readlinkat(&*self.pin, name, Vec::new())?;
+        Ok(std::ffi::OsString::from_vec(target.into_bytes()).into())
+    }
+
+    /// Creates the regular file `name`, failing if it exists.
+    pub(super) fn create_file_at(&self, name: &str, mode: super::Mode) -> io::Result<File> {
+        use rustix::fs::{Mode, OFlags, openat};
+        super::validate_name(name).map_err(|_| super::invalid_path())?;
+        Ok(File::from(openat(
+            &*self.pin,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_raw_mode(super::host_mode(mode)),
+        )?))
+    }
+
+    pub(super) fn create_dir_at(&self, name: &str, mode: super::Mode) -> io::Result<()> {
+        use rustix::fs::{Mode, mkdirat};
+        super::validate_name(name).map_err(|_| super::invalid_path())?;
+        Ok(mkdirat(
+            &*self.pin,
+            name,
+            Mode::from_raw_mode(super::host_mode(mode)),
+        )?)
+    }
+
+    pub(super) fn remove_file_at(&self, name: &str) -> io::Result<()> {
+        use rustix::fs::{AtFlags, unlinkat};
+        super::validate_name(name).map_err(|_| super::invalid_path())?;
+        Ok(unlinkat(&*self.pin, name, AtFlags::empty())?)
+    }
+
+    pub(super) fn remove_dir_at(&self, name: &str) -> io::Result<()> {
+        use rustix::fs::{AtFlags, unlinkat};
+        super::validate_name(name).map_err(|_| super::invalid_path())?;
+        Ok(unlinkat(&*self.pin, name, AtFlags::REMOVEDIR)?)
     }
 }
 
@@ -290,9 +437,9 @@ fn directory_identity_witness_rejects_replaced_ancestor() {
     fs::create_dir_all(root.join("ancestor/sub")).unwrap();
     let pinned = Location::pin_dir(&root)
         .unwrap()
-        .child("ancestor")
+        .pin_child("ancestor")
         .unwrap()
-        .child("sub")
+        .pin_child("sub")
         .unwrap();
     assert!(pinned.metadata().is_ok());
     fs::rename(root.join("ancestor"), root.join("renamed")).unwrap();
@@ -309,9 +456,9 @@ fn directory_pins_preclude_ancestor_replacement() {
     fs::create_dir_all(original.join("sub")).unwrap();
     let sub = Location::pin_dir(&fs::canonicalize(temp.path()).unwrap())
         .unwrap()
-        .child("ancestor")
+        .pin_child("ancestor")
         .unwrap()
-        .child("sub")
+        .pin_child("sub")
         .unwrap();
     assert!(fs::rename(&original, &renamed).is_err());
     drop(sub);
@@ -353,7 +500,7 @@ impl Location {
         })
     }
 
-    pub(super) fn child(&self, name: &str) -> io::Result<Self> {
+    pub(super) fn pin_child(&self, name: &str) -> io::Result<Self> {
         super::validate_name(name).map_err(|_| super::invalid_path())?;
         let path = self.path.join(name);
         let locked_dir = fs::symlink_metadata(&path)?.is_dir();
@@ -385,6 +532,8 @@ impl Location {
     }
 
     pub(super) fn parent_under(&self, root: &Self) -> io::Result<Option<Self>> {
+        // Require search permission on the starting directory before granting its parent.
+        self.check_search()?;
         if self.path == root.path {
             return Ok(None);
         }

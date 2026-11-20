@@ -25,7 +25,7 @@ use super::backend::{
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RenameError, ResolutionError, RmdirError, SeekError, SymlinkError, TruncateError,
-    UnlinkError, WalkError, WriteError,
+    UnlinkError, WalkError, WriteError, walk_error_or,
 };
 use litebox_platform::buffer::{Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
@@ -127,29 +127,47 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         &self,
         dir: &client::Fid<Platform>,
         qid_path: u64,
-    ) -> Result<Option<Arc<OwnedFid<Platform, T>>>, WalkError> {
+    ) -> Result<Option<WalkedDir<Platform, T>>, WalkError> {
         if qid_path != self.root_qid_path {
-            let fid = self.client.walk(dir, &[".."])?.into_complete_fid()?;
-            return Ok(Some(self.own(fid)));
+            return Ok(Some(self.walk_dot_dot(dir)?));
         }
-        let root_parent = *self.root_parent_qid_path.call_once(|| {
-            self.walk_dot_dot(&self.root.fid)
-                .map(|(qid_path, _)| qid_path)
-        });
-        Ok(match (root_parent, self.walk_dot_dot(dir)) {
-            (Some(root_parent), Some((parent, fid))) if parent != root_parent => Some(fid),
-            _ => None,
-        })
+        // Only a server's answer is cached; transport failures are reported and retried later.
+        let root_parent = *self.root_parent_qid_path.try_call_once(|| {
+            server_refusal_as_none(self.walk_dot_dot(&self.root.fid))
+                .map(|walked| walked.map(|(qid_path, _)| qid_path))
+        })?;
+        Ok(
+            match (root_parent, server_refusal_as_none(self.walk_dot_dot(dir))?) {
+                (Some(root_parent), Some((parent, fid))) if parent != root_parent => {
+                    Some((parent, fid))
+                }
+                _ => None,
+            },
+        )
+    }
+
+    /// The attributes of the directory `dir` holds, failing with `NoSuchFileOrDirectory` once its
+    /// fid names another object. Servers such as diod track fids by path, so a renamed or
+    /// replaced held directory cannot be followed; failing keeps operations from acting on
+    /// whatever now has its old name.
+    fn held_dir_attr(
+        &self,
+        dir: &NinePDirHandle<Platform, T>,
+        mask: fcall::GetattrMask,
+    ) -> Result<fcall::Rgetattr, WalkError> {
+        let attr = self.client.getattr(&dir.fid.fid, mask)?;
+        if attr.qid.path != dir.qid_path {
+            return Err(PathError::NoSuchFileOrDirectory.into());
+        }
+        Ok(attr)
     }
 
     /// Walks `..` from `dir`, returning the qid path and fid it reached.
-    fn walk_dot_dot(
-        &self,
-        dir: &client::Fid<Platform>,
-    ) -> Option<(u64, Arc<OwnedFid<Platform, T>>)> {
-        let walk = self.client.walk(dir, &[".."]).ok()?;
-        let qid_path = walk.wqids.first()?.path;
-        Some((qid_path, self.own(walk.into_complete_fid().ok()?)))
+    fn walk_dot_dot(&self, dir: &client::Fid<Platform>) -> Result<WalkedDir<Platform, T>, Error> {
+        let walk = self.client.walk(dir, &[".."])?;
+        let qid_path = walk.wqids.first().map(|qid| qid.path);
+        let fid = self.own(walk.into_complete_fid()?);
+        Ok((qid_path.ok_or(Error::InvalidResponse)?, fid))
     }
 
     /// Remove `name` from `dir`, via `Tunlinkat` where the server supports it.
@@ -201,6 +219,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     }
 }
 
+/// A directory reached by a walk: its qid path and fid.
+type WalkedDir<Platform, T> = (u64, Arc<OwnedFid<Platform, T>>);
+
 /// Walking directory handle
 pub struct NinePWalkingDirHandle<
     Platform: sync::RawSyncPrimitivesProvider,
@@ -215,6 +236,9 @@ pub struct NinePDirHandle<
     T: transport::Read + transport::Write,
 > {
     fid: Arc<OwnedFid<Platform, T>>,
+    /// Qid path of the directory `fid` named when this handle was created (see
+    /// [`NineP::held_dir_attr`]).
+    qid_path: u64,
     /// Opened clone used for `Treaddir`; `fid` stays unopened because Twalk requires that.
     reader: Option<Arc<OwnedFid<Platform, T>>>,
 }
@@ -224,6 +248,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     fn clone(&self) -> Self {
         Self {
             fid: Arc::clone(&self.fid),
+            qid_path: self.qid_path,
             reader: self.reader.clone(),
         }
     }
@@ -370,6 +395,11 @@ where
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
         assert_supported_oflags(flags);
         let fid = dir.into_typed::<Self>().fid;
+        let qid_path = self
+            .client
+            .getattr(&fid.fid, fcall::GetattrMask::NLINK)?
+            .qid
+            .path;
         let reader = if flags.contains(OFlags::PATH) {
             None
         } else {
@@ -380,26 +410,31 @@ where
         };
         Ok(DirHandle::from_typed::<Self>(NinePDirHandle {
             fid,
+            qid_path,
             reader,
         }))
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError> {
+        let dir = dir.get_typed::<Self>();
+        self.held_dir_attr(dir, fcall::GetattrMask::NLINK)?;
         Ok(ResolvedDir::from_typed::<Self>(
             NinePWalkingDirHandle {
-                fid: Arc::clone(&dir.get_typed::<Self>().fid),
+                fid: Arc::clone(&dir.fid),
             },
             PermissionCheck::ByBackend,
         ))
     }
 
     fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
-        let dir = &dir.get_typed::<Self>().fid.fid;
-        let attr = self.client.getattr(dir, fcall::GetattrMask::NLINK)?;
+        let dir = dir.get_typed::<Self>();
+        let attr = self.held_dir_attr(dir, fcall::GetattrMask::NLINK)?;
         if is_unlinked(&attr) {
             return Err(PathError::NoSuchFileOrDirectory.into());
         }
-        if attr.qid.path == self.root_qid_path && self.walk_parent(dir, attr.qid.path)?.is_none() {
+        if attr.qid.path == self.root_qid_path
+            && self.walk_parent(&dir.fid.fid, attr.qid.path)?.is_none()
+        {
             return Ok(Some(Vec::new()));
         }
         // 9P2000.L cannot request the current name of a fid, and enumerating ancestors would
@@ -408,15 +443,17 @@ where
     }
 
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
-        let dir = &dir.get_typed::<Self>().fid.fid;
-        let qid_path = self
-            .client
-            .getattr(dir, fcall::GetattrMask::NLINK)?
-            .qid
-            .path;
+        let dir = dir.get_typed::<Self>();
+        self.held_dir_attr(dir, fcall::GetattrMask::NLINK)?;
         Ok(self
-            .walk_parent(dir, qid_path)?
-            .map(|fid| DirHandle::from_typed::<Self>(NinePDirHandle { fid, reader: None })))
+            .walk_parent(&dir.fid.fid, dir.qid_path)?
+            .map(|(qid_path, fid)| {
+                DirHandle::from_typed::<Self>(NinePDirHandle {
+                    fid,
+                    qid_path,
+                    reader: None,
+                })
+            }))
     }
 
     fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
@@ -533,11 +570,14 @@ where
     }
 
     fn status(&self, h: HandleRef<'_>) -> Result<super::FileStatus, FileStatusError> {
-        let fid = match h {
-            HandleRef::File(h) => &h.get_typed::<Self>().fid,
-            HandleRef::Dir(h) => &h.get_typed::<Self>().fid,
+        let attr = match h {
+            HandleRef::File(h) => self
+                .client
+                .getattr(&h.get_typed::<Self>().fid.fid, fcall::GetattrMask::ALL)?,
+            HandleRef::Dir(h) => self
+                .held_dir_attr(h.get_typed::<Self>(), fcall::GetattrMask::ALL)
+                .map_err(walk_error_or(FileStatusError::Io))?,
         };
-        let attr = self.client.getattr(&fid.fid, fcall::GetattrMask::ALL)?;
         Ok(rgetattr_to_file_status(&attr, self.device_id)?)
     }
 
@@ -613,12 +653,12 @@ where
         // walk that fails (connection loss, or a concurrent removal) reports a `Tmkdir` that
         // already succeeded as a failure. I should decide if having `mkdir_at` return a dir is the
         // right move, or I want to remove that behavior.
-        let fid = self
-            .client
-            .walk(&dir.fid.fid, &[name])?
-            .into_complete_fid()?;
+        let walk = self.client.walk(&dir.fid.fid, &[name])?;
+        let qid_path = walk.wqids.first().map(|qid| qid.path);
+        let fid = self.own(walk.into_complete_fid()?);
         Ok(DirHandle::from_typed::<Self>(NinePDirHandle {
-            fid: self.own(fid),
+            fid,
+            qid_path: qid_path.ok_or(MkdirError::Io)?,
             reader: None,
         }))
     }
@@ -1223,6 +1263,15 @@ impl From<Error> for WalkError {
 impl From<Rlerror> for Error {
     fn from(err: Rlerror) -> Self {
         Error::Remote(err.ecode)
+    }
+}
+
+/// Maps an error the server reported to `None`, keeping transport failures as errors.
+fn server_refusal_as_none<V>(result: Result<V, Error>) -> Result<Option<V>, WalkError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(Error::Remote(_)) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 

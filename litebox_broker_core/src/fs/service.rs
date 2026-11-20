@@ -715,7 +715,7 @@ pub fn open(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<FileResult<ObjectHandle>> {
     let rights = process.require_object_rights(open_required_rights(access, flags)?)?;
-    with_directory(process, directory, path, |directory| {
+    with_validated_directory(process, directory, path, |directory| {
         let reference = process.reserve_object_reference(rights)?;
         let file = match Arc::clone(&process.fs).open(
             directory,
@@ -960,7 +960,7 @@ pub fn path_status(
     follow_symlinks: bool,
 ) -> Result<FileResult<FileStatus>> {
     process.require_object_rights(ObjectRights::WAIT)?;
-    with_directory(process, directory, path, |dir| {
+    with_validated_directory(process, directory, path, |dir| {
         process.fs.path_status(dir, path, user, follow_symlinks)
     })
 }
@@ -974,7 +974,7 @@ pub fn read_link(
     user: FileUser,
 ) -> Result<FileResult<String>> {
     process.require_object_rights(ObjectRights::WAIT)?;
-    with_directory(process, directory, path, |dir| {
+    with_validated_directory(process, directory, path, |dir| {
         process.fs.read_link(dir, path, user)
     })
 }
@@ -1001,7 +1001,7 @@ pub fn chmod(
     mode: FileMode,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_directory(process, directory, path, |dir| {
+    with_validated_directory(process, directory, path, |dir| {
         process.fs.chmod(dir, path, user, mode)
     })
 }
@@ -1017,7 +1017,7 @@ pub fn chown(
     group: Option<u16>,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_directory(process, directory, path, |dir| {
+    with_validated_directory(process, directory, path, |dir| {
         process.fs.chown(dir, path, acting_user, user, group)
     })
 }
@@ -1031,7 +1031,7 @@ pub fn unlink(
     user: FileUser,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_directory(process, directory, path, |dir| {
+    with_validated_directory(process, directory, path, |dir| {
         process.fs.unlink(dir, path, user)
     })
 }
@@ -1047,8 +1047,8 @@ pub fn rename(
     user: FileUser,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_directory(process, old_directory, old_path, |old_dir| {
-        with_directory(process, new_directory, new_path, |new_dir| {
+    with_validated_directory(process, old_directory, old_path, |old_dir| {
+        with_validated_directory(process, new_directory, new_path, |new_dir| {
             process
                 .fs
                 .rename(old_dir, old_path, new_dir, new_path, user)
@@ -1066,7 +1066,7 @@ pub fn mkdir(
     mode: FileMode,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_directory(process, directory, path, |dir| {
+    with_validated_directory(process, directory, path, |dir| {
         process.fs.mkdir(dir, path, user, mode)
     })
 }
@@ -1090,7 +1090,7 @@ pub fn symlink(
     user: FileUser,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_directory(process, directory, linkpath, |dir| {
+    with_validated_directory(process, directory, linkpath, |dir| {
         process.fs.symlink(target, dir, linkpath, user)
     })
 }
@@ -1104,7 +1104,7 @@ pub fn rmdir(
     user: FileUser,
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    with_directory(process, directory, path, |dir| {
+    with_validated_directory(process, directory, path, |dir| {
         process.fs.rmdir(dir, path, user)
     })
 }
@@ -1136,7 +1136,7 @@ fn validate_path(directory: Option<ObjectHandle>, path: &str) -> FileResult<()> 
     }
 }
 
-fn with_directory<T>(
+fn with_validated_directory<T>(
     process: &BrokerProcess,
     directory: Option<ObjectHandle>,
     path: &str,
@@ -1511,6 +1511,80 @@ mod tests {
         assert_eq!(
             path_status(&owner, Some(anchor), "new", user, true),
             Err(BrokerError::UnknownObject)
+        );
+    }
+
+    #[test]
+    fn relative_directory_handles_are_file_system_scoped() {
+        use crate::fs::{in_mem::InMem, inode_allocator::InodeAllocators, read_only::ReadOnly};
+        use crate::readiness::tests::TestReadinessSink;
+        use crate::test_platform::TestPlatform;
+        use crate::test_support::TestBrokerBuilder;
+        use crate::{CallerCredential, PolicyEngine};
+
+        let allocators = InodeAllocators::new();
+        let in_mem = || InMem::<TestPlatform>::new(allocators.next());
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(in_mem())))
+        .build()
+        .unwrap();
+        let owner = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+        let user = FileUser::ROOT;
+        let anchor = open(
+            &owner,
+            None,
+            "/",
+            user,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::PATH,
+            FileMode::default(),
+            &sink,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Another resolver of the same type fails the identity check; one over another backend
+        // fails the downcast.
+        let other_file_systems: [Arc<dyn FileService>; 2] = [
+            Arc::new(Resolver::<TestPlatform, _>::new(in_mem())),
+            Arc::new(Resolver::<TestPlatform, _>::new(ReadOnly::new(in_mem()))),
+        ];
+        for fs in &other_file_systems {
+            let other = broker
+                .core
+                .create_process(
+                    CallerCredential::Unauthenticated,
+                    &broker.pid_namespace,
+                    fs,
+                    &broker.job,
+                    broker.host_names.clone(),
+                    None,
+                )
+                .unwrap();
+            let transferred = owner
+                .duplicate_object_reference_to(anchor, &other, ObjectRights::WAIT)
+                .unwrap();
+            assert_eq!(
+                mkdir(&other, Some(transferred), "x", user, FileMode::RWXU),
+                Err(BrokerError::InvalidRights)
+            );
+            assert_eq!(
+                path_status(&other, Some(transferred), ".", user, true),
+                Err(BrokerError::InvalidRights)
+            );
+            assert_eq!(
+                path_status(&other, None, "/x", user, true),
+                Ok(Err(FileError::NoSuchFileOrDirectory))
+            );
+        }
+        assert_eq!(
+            path_status(&owner, None, "/x", user, true),
+            Ok(Err(FileError::NoSuchFileOrDirectory))
         );
     }
 

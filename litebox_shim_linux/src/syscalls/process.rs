@@ -1906,7 +1906,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let (fds, mut objects): (Vec<_>, Vec<_>) =
             self.fds_inherited_across_fork()?.into_iter().unzip();
-        let cwd = self.push_cwd_for_child(&mut objects);
         let fs = self.fs.borrow();
         let umask = u32::from(fs.umask().bits());
         drop(fs);
@@ -1920,7 +1919,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             resource_limits: self.thread.process.limits.get(),
             dumpable: self.thread.process.dumpable.load(Ordering::Relaxed),
             no_new_privs: self.thread.no_new_privs.get(),
-            cwd,
+            cwd: placeholder_inherited_cwd(),
             comm: self.comm.get(),
             blocked_signals,
             signal_actions,
@@ -1954,8 +1953,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child = self.allocate_child_process(relation)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
-        let mut handles = child.inherit(&objects).map_err(Errno::from)?;
-        assign_pushed_cwd_handle(&mut startup.cwd, &mut handles);
+        let (cwd, handles) = self.inherit_with_cwd(&child, &mut objects)?;
+        startup.cwd = cwd;
         for (forked, handle) in startup.fds.iter_mut().zip(handles) {
             forked.inherited.handle = handle;
         }
@@ -3883,29 +3882,27 @@ const SHEBANG_MAX_RECURSION: u32 = 6;
 const SHEBANG_MAX_LINE: usize = 256;
 
 impl<P: ShimPlatform> Task<P> {
-    /// Appends the working directory to the objects a child inherits. It must stay last until
-    /// [`assign_pushed_cwd_handle`] takes its inherited handle.
-    fn push_cwd_for_child(
+    /// Gives `child` its own references to `objects` and the working directory, returning the
+    /// child's working directory and its handles for `objects`, in order. The working directory
+    /// is appended to `objects`, which keeps it open until the child has its own reference.
+    fn inherit_with_cwd(
         &self,
+        child: &PendingChild,
         objects: &mut Vec<litebox::process::InheritableFd<P>>,
-    ) -> InheritedCwd {
+    ) -> Result<(InheritedCwd, Vec<litebox_broker_protocol::ObjectHandle>), Errno> {
         objects.push(litebox::process::InheritableFd::File(self.cwd_handle()));
-        // Same encoded size as the child's eventual handle, for the payload size check.
-        InheritedCwd::File(litebox_broker_protocol::ObjectHandle(0))
+        let mut handles = child.inherit(objects).map_err(Errno::from)?;
+        let cwd = handles
+            .pop()
+            .expect("the broker returns one handle per inherited object");
+        Ok((InheritedCwd::File(cwd), handles))
     }
 }
 
-/// Assigns the handle inherited for the object appended by
-/// [`Task::push_cwd_for_child`], which is the last one.
-fn assign_pushed_cwd_handle(
-    cwd: &mut InheritedCwd,
-    handles: &mut Vec<litebox_broker_protocol::ObjectHandle>,
-) {
-    if let InheritedCwd::File(handle) = cwd {
-        *handle = handles
-            .pop()
-            .expect("cwd follows the inherited descriptors");
-    }
+/// Stands in for the working directory [`Task::inherit_with_cwd`] returns, with the same encoded
+/// size, so a startup payload's size can be checked before the child inherits anything.
+fn placeholder_inherited_cwd() -> InheritedCwd {
+    InheritedCwd::File(litebox_broker_protocol::ObjectHandle(0))
 }
 
 /// Parse a `#!interpreter [optional-arg]` line from a file header buffer.
@@ -3989,7 +3986,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<usize, Errno> {
         let (inherited_fds, mut fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
             self.fds_inherited_across_exec()?.into_iter().unzip();
-        let cwd = self.push_cwd_for_child(&mut fds);
         let fs = self.fs.borrow();
         let umask = u32::from(fs.umask().bits());
         drop(fs);
@@ -4014,7 +4010,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             sve_vl_inherit: self.thread.sve_vl_inherit.get(),
             path: path.into(),
             execfn,
-            cwd,
+            cwd: placeholder_inherited_cwd(),
             argv,
             envp,
             inherited_fds,
@@ -4023,8 +4019,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         startup.encode().map_err(|_| Errno::E2BIG)?;
         let vfork = self.vfork.borrow();
         let child = &vfork.as_ref().expect("vfork transfer lost its child").child;
-        let mut handles = child.inherit(&fds).map_err(Errno::from)?;
-        assign_pushed_cwd_handle(&mut startup.cwd, &mut handles);
+        let (cwd, handles) = self.inherit_with_cwd(child, &mut fds)?;
+        startup.cwd = cwd;
         for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
             inherited.handle = handle;
         }
@@ -6516,7 +6512,7 @@ mod fork_tests {
                 .mkdir_file(&fs.context.read(), None, path, FileMode::RWXU)
                 .unwrap();
             fs.set_cwd_handle(
-                shim.inherited_cwd(
+                shim.open_or_adopt_inherited_cwd(
                     &fs.context.read(),
                     &task.files.borrow(),
                     &InheritedCwd::Path(path.into()),

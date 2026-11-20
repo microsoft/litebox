@@ -254,15 +254,20 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         // Kept only once nothing is pending, so no walking handle (which may hold a backend
         // lock) outlives its run while another walk starts.
         let mut walked = None;
-        // Each run re-resolves from the same held directory, since `Backend::resolve` consumes its
-        // starting directory and does not report symlinks mid-walk.
+        // Each run re-resolves from the current walk start (anchor or root), since
+        // `Backend::resolve` consumes its starting directory and does not report symlinks
+        // mid-walk.
         while let Some(name) = pending.front() {
             match name.as_str() {
                 "." => {
                     pending.pop_front();
-                    // Any later component checks search permission on the start itself.
+                    // Any later component checks search permission on the start itself. A
+                    // resolution of no components is the start itself, so keep it rather than
+                    // walking it again.
                     if resolved.is_empty() && pending.is_empty() {
-                        self.check_start_search(context, anchor.as_ref())?;
+                        let start = self.walk_start(anchor.as_ref())?;
+                        self.check_dir_search(context, &start)?;
+                        walked = Some(Resolution::Found(ResolvedTarget::Dir(start)));
                     }
                     continue;
                 }
@@ -778,6 +783,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     // Empty components name the walk start (root or anchor), which always exists.
                     unreachable!()
                 };
+                // A backend-checked parent was already searched by the backend's own walk.
                 if let PermissionCheck::ByResolver(permissions) = &parent.permissions {
                     Self::check_search_permission(&context, permissions)?;
                 }
@@ -1133,7 +1139,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         Ok(target)
     }
 
-    /// Change the permissions of a file.
+    /// Change the permissions of a file. A relative path is resolved from `anchor`, or from the root without one.
     pub fn chmod(
         &self,
         user: UserInfo,
@@ -1160,7 +1166,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         self.backend.chmod(target, mode)
     }
 
-    /// Change the owner of a file.
+    /// Change the owner of a file. A relative path is resolved from `anchor`, or from the root without one.
     pub fn chown(
         &self,
         acting_user: UserInfo,
@@ -1188,7 +1194,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         self.backend.chown(target, user, group)
     }
 
-    /// Unlink a file.
+    /// Unlink a file. A relative path is resolved from `anchor`, or from the root without one.
     pub fn unlink(
         &self,
         user: UserInfo,
@@ -1250,6 +1256,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 
     /// Create a symbolic link at `linkpath`; `target` is stored verbatim, without resolving it.
+    /// A relative `linkpath` is resolved from `anchor`, or from the root without one.
     pub fn symlink(
         &self,
         user: UserInfo,
@@ -1426,7 +1433,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             .rename_at(old_dir, &old_name, new_dir, &new_name)
     }
 
-    /// Create a new directory.
+    /// Create a new directory. A relative path is resolved from `anchor`, or from the root without one.
     pub fn mkdir(
         &self,
         user: UserInfo,
@@ -1482,7 +1489,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         result
     }
 
-    /// Remove a directory.
+    /// Remove a directory. A relative path is resolved from `anchor`, or from the root without one.
     pub fn rmdir(
         &self,
         user: UserInfo,
@@ -1557,7 +1564,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         Ok(entries)
     }
 
-    /// Obtain the status of a file/directory/... on the file-system.
+    /// Obtain the status of a file/directory/... on the file-system. A relative path is resolved from `anchor`, or from the root without one.
     ///
     /// If `follow_symlinks` is false, a final symbolic link is described itself.
     pub fn file_status(
@@ -1756,7 +1763,8 @@ struct ReopenedTerminal {
 }
 
 impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
-    /// Captures this entry as the starting point of relative lookups.
+    /// Captures this entry as the starting point of relative lookups. Relative lookups from the
+    /// anchor of a non-directory fail with [`PathError::ComponentNotADirectory`].
     #[must_use]
     pub fn anchor(&self) -> DirAnchor {
         DirAnchor(match &self.handle {
@@ -1775,7 +1783,7 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
     /// Absolute name of the opened object as recorded when it was opened, naming the directory
     /// it was opened from by that directory's recorded name.
     #[cfg(test)]
-    pub(crate) fn path(&self) -> String {
+    pub(crate) fn recorded_name(&self) -> String {
         self.name.to_absolute()
     }
 
@@ -1894,6 +1902,35 @@ mod tests {
         fs.mount_in_mem(user, "/mnt").unwrap();
         // The shadowed directory is still linked, so it must not be reported as removed.
         assert_eq!(fs.handle_path(&dir).unwrap(), "/mnt/dir");
+    }
+
+    #[test]
+    fn dotdot_onto_a_covered_directory_reaches_the_covering_mount() {
+        use crate::fs::composer::Composer;
+        let fs = Resolver::<TestPlatform, _>::new(
+            Composer::<TestPlatform>::builder()
+                .mount("/", InMem::<TestPlatform>::new)
+                .build()
+                .unwrap(),
+        );
+        let user = UserInfo::ROOT;
+        let mode = Mode::RWXU;
+        fs.mkdir(user, None, "/dir", mode).unwrap();
+        fs.mkdir(user, None, "/dir/sub", mode).unwrap();
+        let sub = fs.open(user, None, "/dir/sub", OFlags::PATH, mode).unwrap();
+        fs.mount_in_mem(user, "/dir").unwrap();
+        // Linux: `handle_dots` steps into whatever is mounted on the parent (fs/namei.c).
+        let parent = fs
+            .open(user, Some(sub.anchor()), "..", OFlags::PATH, mode)
+            .unwrap();
+        assert_eq!(
+            fs.handle_status(&parent).unwrap().node_info,
+            fs.file_status(user, None, "/dir", true).unwrap().node_info
+        );
+        assert!(
+            fs.file_status(user, Some(sub.anchor()), "../sub", true)
+                .is_err()
+        );
     }
 
     #[test]

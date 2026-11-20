@@ -494,7 +494,7 @@ impl<Platform: ShimPlatform> Clone for LinuxShim<Platform> {
 
 impl<Platform: ShimPlatform> LinuxShim<Platform> {
     /// Opens or adopts the working directory a child inherits.
-    fn inherited_cwd(
+    fn open_or_adopt_inherited_cwd(
         &self,
         context: &litebox::fs::Context,
         files: &syscalls::file::FilesState<Platform>,
@@ -514,7 +514,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 // also inherited, share its already adopted file; never own its handle twice.
                 if let Some(fd) = inherited.find(|fd| fd.handle == *handle) {
                     self.0
-                        .dirfd_file(&files.typed_fd_from_raw(fd.fd as usize)?)?
+                        .file_for_dirfd(&files.typed_fd_from_raw(fd.fd as usize)?)?
                 } else {
                     Arc::new(self.0.litebox.adopt_inherited_file(*handle)?)
                 }
@@ -575,9 +575,12 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         }
         // A program started without a working directory runs at the root.
         let cwd = match cwd {
-            Some(cwd) => {
-                self.inherited_cwd(&context, &files, &cwd, inherited_fds.into_iter().flatten())
-            }
+            Some(cwd) => self.open_or_adopt_inherited_cwd(
+                &context,
+                &files,
+                &cwd,
+                inherited_fds.into_iter().flatten(),
+            ),
             None => self.0.open_path_dir(&context, "/").map(Arc::new),
         }
         .map_err(loader::elf::ElfLoaderError::OpenError)?;
@@ -755,7 +758,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         });
         let context = syscalls::file::FsState::<Platform>::context_for(&credentials);
         let cwd = self
-            .inherited_cwd(&context, &files, &cwd, fds.iter().map(|fd| fd.inherited))
+            .open_or_adopt_inherited_cwd(&context, &files, &cwd, fds.iter().map(|fd| fd.inherited))
             .map_err(ForkRestoreError::WorkingDirectory)?;
         let fs_state = syscalls::file::FsState::new(context, cwd);
         fs_state.set_umask(umask);

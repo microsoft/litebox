@@ -88,6 +88,18 @@ int main(int argc, char **argv) {
     TEST_ASSERT(mkdir("old", 0700) == 0 && mkdir("old/sub", 0700) == 0, "replace subtree");
     struct stat st;
     TEST_ASSERT(fstatat(fd, "original", &st, 0) == 0, "lookup follows renamed ancestor");
+    // `fd` was opened as old/sub but now lies in new/sub, so a stale name would let this rename
+    // move `new` into the unrelated old/sub.
+    expect_errno(renameat(AT_FDCWD, "new", fd, "moved"), EINVAL,
+                 "cannot move renamed ancestor into its held descendant");
+    int parent = openat(fd, "..", O_PATH | O_DIRECTORY);
+    TEST_ASSERT(parent >= 0, "open parent of held directory");
+    expect_errno(renameat(parent, "sub", fd, "moved"), EINVAL,
+                 "cannot move held directory into itself");
+    TEST_ASSERT(close(parent) == 0 && stat("new/sub/original", &st) == 0,
+                "rejected renames left the source in place");
+    expect_errno(fstatat(fd, "moved", &st, 0), ENOENT, "rejected renames created nothing");
+    expect_errno(stat("old/sub/moved", &st), ENOENT, "stale name was not a rename target");
     const struct timespec times[2] = {{12345, 0}, {23456, 0}};
     TEST_ASSERT(utimensat(fd, "original", times, 0) == 0, "set times through moved ancestor");
     TEST_ASSERT(stat("new/sub/original", &st) == 0 && st.st_mtime == 23456,

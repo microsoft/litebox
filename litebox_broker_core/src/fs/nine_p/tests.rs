@@ -13,8 +13,8 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::fs::errors::{
-    FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
-    TruncateError, UnlinkError, WriteError,
+    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError,
+    SeekError, TruncateError, UnlinkError, WriteError,
 };
 use crate::fs::inode_allocator::{InodeAllocator, InodeAllocators};
 use crate::fs::resolver::Resolver;
@@ -811,8 +811,8 @@ fn test_nine_p_broken_mkdir() {
 fn test_nine_p_broken_readdir() {
     let server = DiodServer::start();
 
-    // 4 writes: version + attach + walk + lopen for the directory.
-    let fs = connect_9p_broken(&server, 4);
+    // 5 writes: version + attach + walk + getattr (identity) + lopen for the directory.
+    let fs = connect_9p_broken(&server, 5);
     let fd = fs
         .open(
             USER,
@@ -1361,4 +1361,64 @@ fn nine_p_removed_held_directory_has_no_name() {
     }
     // Linux: getdents64 on a removed directory fails with ENOENT (probed natively).
     assert!(matches!(fs.read_dir(&held[0]), Err(ReadDirError::Removed)));
+}
+
+#[test]
+fn nine_p_held_directory_never_acts_on_a_replacement() {
+    let server = DiodServer::start();
+    let fs = connect_9p(&server);
+    fs.mkdir(USER, None, "/old", Mode::RWXU).unwrap();
+    fs.mkdir(USER, None, "/old/sub", Mode::RWXU).unwrap();
+    let sub = fs
+        .open(
+            USER,
+            None,
+            "/old/sub",
+            OFlags::PATH | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap();
+    drop(
+        fs.open(
+            USER,
+            Some(sub.anchor()),
+            "f",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RWXU,
+        )
+        .unwrap(),
+    );
+
+    fs.rename(USER, None, "/old", None, "/new").unwrap();
+    fs.mkdir(USER, None, "/old", Mode::RWXU).unwrap();
+    fs.mkdir(USER, None, "/old/sub", Mode::RWXU).unwrap();
+
+    // The held directory either still refers to the renamed directory or, on servers that track
+    // fids by path (diod), fails as removed; it never resolves to the one now at its old path.
+    match fs.file_status(USER, Some(sub.anchor()), "f", true) {
+        Ok(status) => assert_eq!(
+            status.node_info,
+            fs.file_status(USER, None, "/new/sub/f", true)
+                .unwrap()
+                .node_info
+        ),
+        Err(error) => assert!(
+            matches!(
+                error,
+                FileStatusError::PathError(PathError::NoSuchFileOrDirectory)
+            ),
+            "{error:?}"
+        ),
+    }
+    match fs.mkdir(USER, Some(sub.anchor()), "x", Mode::RWXU) {
+        Ok(()) => assert!(server.export_path().join("new/sub/x").is_dir()),
+        Err(error) => assert!(
+            matches!(
+                error,
+                MkdirError::PathError(PathError::NoSuchFileOrDirectory)
+            ),
+            "{error:?}"
+        ),
+    }
+    assert!(!server.export_path().join("old/sub/x").exists());
 }

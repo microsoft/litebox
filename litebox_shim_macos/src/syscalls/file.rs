@@ -4,12 +4,7 @@
 //! Guest descriptor namespace and LiteBox file operations.
 
 use crate::{ShimPlatform, Task};
-use alloc::{
-    borrow::Cow,
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 use litebox::{
     LiteBox,
@@ -46,10 +41,10 @@ pub(crate) type FileFd<P> = TypedFd<FileSubsystem<P>>;
 /// A file descriptor's open file description.
 pub(crate) struct File<P: ShimPlatform> {
     description: Arc<litebox::fs::File<P>>,
-    /// The absolute path the guest opened it by, which `openat` resolves
-    /// relative paths against. Inherited descriptors (such as stdio) have
-    /// none: they have no path in the guest's namespace.
-    opened_path: Option<Arc<str>>,
+    /// Whether the guest opened it by path. Inherited descriptors (such as
+    /// stdio) were not: they have no path in the guest's namespace, so
+    /// `openat` and `F_GETPATH` refuse them.
+    opened_by_path: bool,
     /// XNU file status flags LiteBox files have no behavior for
     /// ([`XNU_ONLY_STATUS_FLAGS`]): recorded for `F_GETFL` only.
     xnu_status: Arc<AtomicU32>,
@@ -59,7 +54,7 @@ impl<P: ShimPlatform> From<litebox::fs::File<P>> for File<P> {
     fn from(file: litebox::fs::File<P>) -> Self {
         Self {
             description: Arc::new(file),
-            opened_path: None,
+            opened_by_path: false,
             xnu_status: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -100,7 +95,7 @@ fn dot_dot_parents(path: &str) -> Vec<String> {
 
 /// `path` named from the root, which is every guest's working directory, keeping its `.` and
 /// `..` components and any trailing slash for the lookup.
-pub(super) fn from_cwd(path: &str) -> Cow<'_, str> {
+pub(super) fn rooted_at_cwd(path: &str) -> Cow<'_, str> {
     if path.starts_with('/') {
         Cow::Borrowed(path)
     } else {
@@ -146,10 +141,10 @@ impl<P: ShimPlatform> FilesState<P> {
             .map_err(|_| Errno::EBADF)
     }
 
-    pub(crate) fn opened_path(&self, fd: &FileFd<P>) -> Result<Option<Arc<str>>, Errno> {
+    pub(crate) fn opened_by_path(&self, fd: &FileFd<P>) -> Result<bool, Errno> {
         self.litebox
             .descriptor_table()
-            .with_entry(fd, |file| file.opened_path.clone())
+            .with_entry(fd, |file| file.opened_by_path)
             .ok_or(Errno::EBADF)
     }
 
@@ -286,7 +281,7 @@ impl<P: ShimPlatform> Task<P> {
         if path.as_bytes().contains(&0) {
             return Err(Errno::EINVAL);
         }
-        let path = from_cwd(path);
+        let path = rooted_at_cwd(path);
         let path = path.as_ref();
         if flags.bits() & !OpenFlags::all().bits() != 0 {
             return Err(Errno::EINVAL);
@@ -358,7 +353,7 @@ impl<P: ShimPlatform> Task<P> {
         let mut descriptors = self.global.litebox.descriptor_table_mut();
         let fd = descriptors.insert::<FileSubsystem<P>>(File {
             description: Arc::new(file),
-            opened_path: Some(Arc::from(litebox::fs::ResolvedPath::new(path).to_string())),
+            opened_by_path: true,
             xnu_status: Arc::new(AtomicU32::new(0)),
         });
         if flags.contains(OpenFlags::CLOEXEC) {
@@ -532,7 +527,7 @@ impl<P: ShimPlatform> Task<P> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
-        let path = from_cwd(path);
+        let path = rooted_at_cwd(path);
         let context = Self::fs_context(self.params.euid, self.params.egid)?;
         let status = self
             .global
@@ -658,7 +653,7 @@ impl<P: ShimPlatform> Task<P> {
                 // guest's namespace. For a vnode XNU returns its path
                 // (vn_getpath_ext): the broker records it at open, with
                 // symbolic links resolved.
-                if self.files.opened_path(&typed)?.is_none() {
+                if !self.files.opened_by_path(&typed)? {
                     return Err(Errno::EBADF);
                 }
                 let path = self.files.file(&typed)?.path().map_err(file_path_error)?;
@@ -683,9 +678,10 @@ impl<P: ShimPlatform> Task<P> {
 
     /// `openat`. Every guest's working directory is `/`, so `AT_FDCWD` and
     /// absolute paths open like `open`; other relative paths resolve against
-    /// the directory's open path, since this shim emulates namei on paths.
-    // XXX: a directory renamed after it was opened is therefore looked up
-    // under its old path; anchoring to the directory's handle would follow it.
+    /// the directory's current path (as `F_GETPATH` reports it), since this
+    /// shim emulates namei on paths.
+    // XXX: the directory's path is read before the lookup, so a concurrent
+    // rename of it can still race; anchoring to its handle would not.
     pub(crate) fn sys_openat(
         &self,
         dirfd: i32,
@@ -703,15 +699,15 @@ impl<P: ShimPlatform> Task<P> {
         if status.file_type != litebox_broker_protocol::fs::FileType::Directory {
             return Err(Errno::ENOTDIR);
         }
-        let Some(directory) = self.files.opened_path(&fd)? else {
-            // An inherited directory descriptor with no known path.
+        if !self.files.opened_by_path(&fd)? {
+            // An inherited directory descriptor with no path in the guest's namespace.
             self.log_unsupported_once(
                 "openat relative to an inherited directory",
                 0,
                 format_args!(""),
             );
             return Err(Errno::ENOTSUP);
-        };
+        }
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
@@ -722,15 +718,11 @@ impl<P: ShimPlatform> Task<P> {
         // components to resolve them like namei. Only the guest's `path`
         // counts against PATH_MAX: nameiat starts from the directory's vnode
         // (vfs_lookup.c). The directory's path names an existing directory,
-        // and the broker bounds the joined path it accepts. NOFOLLOW_ANY
-        // walks from that vnode, so it starts from the directory's path with
-        // links resolved (as F_GETPATH reports it), which has none to refuse.
-        let directory = if flags.contains(OpenFlags::NOFOLLOW_ANY) {
-            Arc::from(self.files.file(&fd)?.path().map_err(file_path_error)?)
-        } else {
-            directory
-        };
-        let mut joined = String::from(&*directory);
+        // and the broker bounds the joined path it accepts. The walk starts
+        // from that vnode, so it starts from the directory's current path
+        // with links resolved, so a `..` reaches its real parent, and
+        // NOFOLLOW_ANY has no link in that prefix to refuse.
+        let mut joined = self.files.file(&fd)?.path().map_err(file_path_error)?;
         joined.push('/');
         joined.push_str(path);
         self.open_path(&joined, flags, mode)
@@ -861,7 +853,7 @@ impl<P: ShimPlatform> Task<P> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
-        let path = from_cwd(path);
+        let path = rooted_at_cwd(path);
         let path = path.as_ref();
         // NAMEI_NOFOLLOW_ANY fails on any link, even one named with a trailing slash.
         let follow = options & FSOPT_NOFOLLOW_ANY == 0
@@ -1449,6 +1441,77 @@ mod tests {
             assert_eq!(&buffer[..half.len()], half.as_bytes());
             assert_eq!(buffer[half.len()], 0);
             assert!(buffer[half.len() + 1..].iter().all(|byte| *byte == 0xa5));
+        }
+    }
+
+    /// openat starts from the directory's current path, with or without
+    /// O_NOFOLLOW_ANY, once the directory has been renamed.
+    #[test]
+    fn openat_follows_a_renamed_directory() {
+        const AT_FDCWD: usize = (-2isize).cast_unsigned();
+        let mode = FileMode::from_u32_bits_truncate(0o777);
+        let task = task_with(
+            builder_with_files(vec![
+                (
+                    "/",
+                    InitialNode::Directory {
+                        mode,
+                        owner: FileUser::ROOT,
+                    },
+                ),
+                (
+                    "/dir",
+                    InitialNode::Directory {
+                        mode,
+                        owner: FileUser::ROOT,
+                    },
+                ),
+                (
+                    "/dir/data",
+                    InitialNode::File {
+                        mode,
+                        owner: FileUser::ROOT,
+                        data: (&b"x"[..]).into(),
+                    },
+                ),
+            ]),
+            TaskParams::default(),
+        );
+        let call = |number: usize, args: &[usize]| {
+            let mut ctx = PtRegs::default();
+            ctx.regs[16] = number;
+            ctx.regs[..args.len()].copy_from_slice(args);
+            task.do_syscall(&ctx)
+        };
+        let openat = |dirfd: usize, path: &core::ffi::CStr, flags: OpenFlags| {
+            call(
+                nr::OPENAT,
+                &[
+                    dirfd,
+                    path.as_ptr() as usize,
+                    flags.bits().cast_unsigned() as usize,
+                    0,
+                ],
+            )
+        };
+        let get_path = |fd: usize| {
+            let mut buffer = [0u8; PATH_MAX];
+            call(nr::FCNTL, &[fd, 50, buffer.as_mut_ptr() as usize]).unwrap();
+            let end = buffer.iter().position(|byte| *byte == 0).unwrap();
+            String::from_utf8(buffer[..end].to_vec()).unwrap()
+        };
+        let dir = openat(AT_FDCWD, c"/dir", OpenFlags::RDONLY).unwrap();
+        task.global
+            .litebox
+            .rename_file(&litebox::fs::Context::new(), None, "/dir", None, "/moved")
+            .unwrap();
+        for flags in [OpenFlags::RDONLY, OpenFlags::NOFOLLOW_ANY] {
+            for path in [c"data", c"../moved/data"] {
+                let data = openat(dir, path, flags).unwrap();
+                assert_eq!(get_path(data), "/moved/data", "{path:?} {flags:?}");
+                assert_eq!(call(nr::CLOSE, &[data]), Ok(0));
+            }
+            assert_eq!(openat(dir, c"../dir/data", flags), Err(Errno::ENOENT));
         }
     }
 

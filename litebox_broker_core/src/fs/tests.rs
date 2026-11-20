@@ -127,7 +127,7 @@ fn read_path<Backend: super::backend::Backend + 'static>(
     let mut buffer = alloc::vec![0; 1024];
     let len = fs.read(&mut fd, &mut buffer, None).unwrap();
     buffer.truncate(len);
-    (fd.path(), buffer)
+    (fd.recorded_name(), buffer)
 }
 
 /// One entry of an archive built by [`build_tar`].
@@ -1786,7 +1786,7 @@ mod in_mem {
             let entry = fs
                 .open(USER, None, path, flags, Mode::RWXU)
                 .unwrap_or_else(|error| panic!("open {path:?} failed: {error:?}"));
-            entry.path()
+            entry.recorded_name()
         };
 
         assert_eq!(path("/", OFlags::RDONLY), "/");
@@ -2108,7 +2108,7 @@ mod tar_ro {
                 Mode::empty(),
             )
             .unwrap();
-        assert_eq!(fd.path(), "/bin/sh");
+        assert_eq!(fd.recorded_name(), "/bin/sh");
         assert_eq!(fs.handle_status(&fd).unwrap(), link);
         drop(fd);
         assert!(matches!(

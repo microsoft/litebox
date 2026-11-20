@@ -80,8 +80,9 @@ int main(int argc, char **argv) {
     snprintf(link, sizeof(link), "proc/self/fd/%d", top);
     length = readlink(link, target, sizeof(target) - 1);
     TEST_ASSERT(length == 4 && !memcmp(target, "/tmp", 4), "relative fd link from root");
-    TEST_ASSERT(stat(link, &cwd_st) == 0 && fstat(top, &sub_st) == 0 &&
-                cwd_st.st_ino == sub_st.st_ino && close(top) == 0, "relative fd stat from root");
+    struct stat link_st, top_st;
+    TEST_ASSERT(stat(link, &link_st) == 0 && fstat(top, &top_st) == 0 &&
+                link_st.st_ino == top_st.st_ino && close(top) == 0, "relative fd stat from root");
     puts("All cwd rename tests passed.");
     return 0;
 }

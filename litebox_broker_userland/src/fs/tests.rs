@@ -111,28 +111,19 @@ fn moved_out_of_export_fails_closed_even_after_replacement() {
     fs::create_dir_all(root.join("child")).unwrap();
     let local = LocalFs::new(&root, InodeAllocators::new().next()).unwrap();
     let child = open_path_dir(&local, &["child"]);
-    let walking = local.walking_dir_at(&child).unwrap();
     fs::rename(root.join("child"), temp.path().join("outside")).unwrap();
     fs::create_dir(root.join("child")).unwrap();
-    // Outside the export, the directory no longer exists for the guest.
+    // Outside the export, the directory no longer exists for the guest. Operations check this
+    // when they start from the held directory; host changes must not race an operation itself.
     let missing = |error: WalkError| {
         matches!(
             error,
             WalkError::PathError(PathError::NoSuchFileOrDirectory)
         )
     };
-    assert!(
-        local
-            .check_search_permission(&local.walking_dir_at(&child).unwrap())
-            .is_err_and(missing)
-    );
+    assert!(local.walking_dir_at(&child).is_err_and(missing));
     assert!(local.parent_dir(&child).is_err_and(missing));
     assert!(local.list_dir_at(child).is_err());
-    assert!(
-        local
-            .resolve(walking, &["name"], &|_| unreachable!())
-            .is_err_and(|error| missing(error.error))
-    );
 }
 
 #[test]
@@ -210,14 +201,14 @@ fn legacy_timestamps_only_update_pinned_non_links() {
         },
     };
     for name in ["file", "dir"] {
-        let pinned = root.child(name).unwrap();
+        let pinned = root.pin_child(name).unwrap();
         let moved = root.join(format!("{name}.moved"));
         fs::rename(root.join(name), &moved).unwrap();
         symlink("untouched", root.join(name)).unwrap();
         linux::set_times_legacy(&pinned, &times).unwrap();
         assert_eq!(fs::metadata(moved).unwrap().mtime(), 2);
         // The fallback refuses a pinned symlink rather than following it.
-        assert!(linux::set_times_legacy(&root.child(name).unwrap(), &times).is_err());
+        assert!(linux::set_times_legacy(&root.pin_child(name).unwrap(), &times).is_err());
     }
 }
 

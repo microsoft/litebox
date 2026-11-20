@@ -64,7 +64,7 @@ pub enum SeekBehavior {
 }
 
 /// The result of [`Backend::dir_path`].
-pub type DirPath = Result<Option<Vec<String>>, WalkError>;
+pub type DirPathResult = Result<Option<Vec<String>>, WalkError>;
 
 /// Names `dir` relative to its backend's root by walking up. `step` returns a directory's parent
 /// and its name there, or `None` at the root.
@@ -126,7 +126,7 @@ pub trait Backend: Send + Sync + Any {
     fn walking_dir_with_path<'a>(
         &'a self,
         dir: &DirHandle,
-    ) -> Result<(ResolvedDir<'a>, DirPath), WalkError> {
+    ) -> Result<(ResolvedDir<'a>, DirPathResult), WalkError> {
         let path = self.dir_path(dir);
         Ok((self.walking_dir_at(dir)?, path))
     }
@@ -134,8 +134,10 @@ pub trait Backend: Send + Sync + Any {
     /// Current physical name, as components relative to this backend's root (empty at root).
     ///
     /// A directory no longer linked into this namespace has no name and must return
-    /// [`super::errors::PathError::NoSuchFileOrDirectory`]. Returns `Ok(None)` if the backend
-    /// cannot determine the current name of a live directory.
+    /// [`super::errors::PathError::NoSuchFileOrDirectory`]. So must a directory the backend can no
+    /// longer walk (see [`Self::walking_dir_at`]), such as a moved directory on a backend that
+    /// reaches directories by path. Returns `Ok(None)` if the backend cannot determine the current
+    /// name of a live directory.
     fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError>;
 
     /// Walk up from an owned directory, returning `None` at this backend's root.

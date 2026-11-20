@@ -250,7 +250,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     }
 
     /// The LiteBox file behind `fd`, failing with `ENOTDIR` for other kinds of descriptor.
-    pub(crate) fn dirfd_file(
+    pub(crate) fn file_for_dirfd(
         &self,
         fd: &AnyTypedFd<Platform>,
     ) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
@@ -1061,7 +1061,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// The file a dirfd refers to, which need not be a directory.
     fn file_for_dirfd(&self, fd: i32) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
-        self.global.dirfd_file(&self.typed_fd(fd)?)
+        self.global.file_for_dirfd(&self.typed_fd(fd)?)
     }
 
     fn lookup_relative(&self, fd: i32, path: String) -> Result<LookupPath<Platform>, Errno> {
@@ -1947,20 +1947,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.global.with_file(fd, |file| file.seek(offset, whence))
     }
 
-    fn do_mkdir(&self, pathname: LookupPath<Platform>, mode: Mode) -> Result<(), Errno> {
+    fn do_mkdir(&self, lookup: LookupPath<Platform>, mode: Mode) -> Result<(), Errno> {
         let mode = mode & !self.get_umask();
         let fs = self.fs.borrow();
         let context = fs.context.read();
         self.global
             .litebox
-            .mkdir_file(&context, pathname.dir.as_deref(), &pathname.path, mode)
+            .mkdir_file(&context, lookup.dir.as_deref(), &lookup.path, mode)
             .map_err(Errno::from)
     }
 
     /// Handle syscall `mkdirat`
     pub(crate) fn sys_mkdirat(&self, dirfd: i32, pathname: &str, mode: u32) -> Result<(), Errno> {
-        let pathname = self.lookup_path_at(dirfd, pathname)?;
-        self.do_mkdir(pathname, Mode::from_u32_bits_truncate(mode))
+        let lookup = self.lookup_path_at(dirfd, pathname)?;
+        self.do_mkdir(lookup, Mode::from_u32_bits_truncate(mode))
     }
 
     /// Handle syscall `mount` for a fresh tmpfs mount.

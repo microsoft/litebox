@@ -418,10 +418,18 @@ impl From<WalkError> for OpenError {
     }
 }
 
-/// Keeps path errors from an internal open used for walking; everything else is [`WalkError::Io`].
+/// Error mapping for an internal open performed as part of a walk.
 pub(super) fn open_to_walk_error(error: OpenError) -> WalkError {
     match error {
         OpenError::PathError(error) => WalkError::PathError(error),
         _ => WalkError::Io,
+    }
+}
+
+/// Keeps a walk's path error, reporting any other failure as `io`.
+pub(super) fn walk_error_or<E: From<PathError>>(io: E) -> impl FnOnce(WalkError) -> E {
+    move |error| match error {
+        WalkError::PathError(error) => error.into(),
+        WalkError::Io => io,
     }
 }

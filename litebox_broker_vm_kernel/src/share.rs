@@ -12,7 +12,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::fs::backend::{
-    Backend, CreationMetadata, DirHandle, DirPath, FileHandle, FileTerminal, HandleRef,
+    Backend, CreationMetadata, DirHandle, DirPathResult, FileHandle, FileTerminal, HandleRef,
     PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use litebox_broker_core::fs::errors::{
@@ -194,7 +194,7 @@ impl Backend for ShareFs {
     fn walking_dir_with_path<'a>(
         &'a self,
         dir: &DirHandle,
-    ) -> Result<(ResolvedDir<'a>, DirPath), WalkError> {
+    ) -> Result<(ResolvedDir<'a>, DirPathResult), WalkError> {
         self.0.walking_dir_with_path(dir)
     }
 

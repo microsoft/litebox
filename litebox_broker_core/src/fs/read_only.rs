@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
-    Backend, CreationMetadata, DirHandle, DirPath, FileHandle, FileTerminal, HandleRef,
+    Backend, CreationMetadata, DirHandle, DirPathResult, FileHandle, FileTerminal, HandleRef,
     PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
     SeekBehavior,
 };
@@ -103,7 +103,7 @@ impl<B: Backend> Backend for ReadOnly<B> {
     fn walking_dir_with_path<'a>(
         &'a self,
         dir: &DirHandle,
-    ) -> Result<(ResolvedDir<'a>, DirPath), WalkError> {
+    ) -> Result<(ResolvedDir<'a>, DirPathResult), WalkError> {
         let (mut dir, path) = self.inner.walking_dir_with_path(dir)?;
         mark_read_only(&mut dir.permissions);
         Ok((dir, path))

@@ -768,12 +768,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             None => Err(PathError::NoSuchFileOrDirectory.into()),
             Some(Node::File(_)) => Err(RmdirError::NotADirectory),
             Some(Node::Dir(child)) => {
-                let mut child = child.write();
-                if !child.children.is_empty() {
+                if !child.write().detach_if_empty(parent_node) {
                     return Err(RmdirError::NotEmpty);
                 }
-                child.detached_from = Some(parent_node);
-                drop(child);
                 parent.children.remove(name);
                 Ok(())
             }
@@ -852,11 +849,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 (Node::Dir(_), Some(Node::File(_))) => return Err(RenameError::NotADirectory),
                 (Node::File(_), Some(Node::Dir(_))) => return Err(RenameError::IsADirectory),
                 (Node::Dir(_), Some(Node::Dir(dir))) => {
-                    let mut replaced = dir.write();
-                    if !replaced.children.is_empty() {
+                    let detached = dir.write().detach_if_empty(new_dir.clone());
+                    if !detached {
                         return Err(RenameError::NotEmpty);
                     }
-                    replaced.detached_from = Some(new_dir.clone());
                 }
                 _ => {}
             }
@@ -1077,6 +1073,16 @@ struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> DirData<Platform> {
+    /// Marks this directory as removed from `parent` unless it has entries; returns whether it
+    /// was empty. The caller unlinks it while still holding `parent`'s lock.
+    fn detach_if_empty(&mut self, parent: DirNode<Platform>) -> bool {
+        if !self.children.is_empty() {
+            return false;
+        }
+        self.detached_from = Some(parent);
+        true
+    }
+
     /// Fails once the directory has been removed, so that no entry is created unreachable.
     fn ensure_linked(&self) -> Result<(), PathError> {
         if self.detached_from.is_some() {
@@ -1221,7 +1227,7 @@ mod tests {
         let fd = fs
             .open(OWNER, None, "/link", OFlags::RDONLY, Mode::empty())
             .unwrap();
-        assert_eq!(fd.path(), "/target");
+        assert_eq!(fd.recorded_name(), "/target");
         assert_eq!(fs.read_link(OWNER, None, "/link").unwrap(), "/target");
     }
 
