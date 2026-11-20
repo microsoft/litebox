@@ -6,12 +6,21 @@ license = "MIT"
 repository = "https://github.com/microsoft/litebox"
 description = "The ttrpc protocol between the LiteBox guest service and the containerd shim"
 
+[features]
+# `guest_service_ttrpc_async`, on Unix.
+async = ["dep:async-trait", "dep:tokio", "ttrpc/async"]
+
 [dependencies]
+async-trait = { version = "0.1.89", optional = true }
 protobuf = "3.7.2"
 ttrpc = "0.8.6"
 
+# ttrpc's async code needs `tokio/net`, which ttrpc enables only on Linux.
+[target.'cfg(unix)'.dependencies]
+tokio = { version = "1.50", optional = true, default-features = false, features = ["net"] }
+
 [build-dependencies]
-# Generates the messages and the sync ttrpc client and server without `protoc`.
+# Generates the messages and the ttrpc clients and servers without `protoc`.
 ttrpc-codegen = "0.6.0"
 
 [lints]

@@ -11,9 +11,17 @@ name = "litebox-guest-service"
 path = "src/main.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+async-trait = "0.1.89"
 libc = { version = "0.2.177", default-features = false }
-litebox_guest_service_protocol = { version = "0.1.0", path = "../litebox_guest_service_protocol" }
-ttrpc = "0.8.6"
+litebox_guest_service_protocol = { version = "0.1.0", path = "../litebox_guest_service_protocol", features = ["async"] }
+tokio = { version = "1.50", default-features = false, features = [
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "time",
+] }
+ttrpc = { version = "0.8.6", features = ["async"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = "3"

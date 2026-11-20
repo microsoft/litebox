@@ -13,10 +13,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use litebox_guest_service_protocol::guest_service::Process;
+use tokio::io::unix::AsyncFd;
+use tokio::io::{Interest, Ready};
 use ttrpc::Code;
 
 /// The search path when the environment has none, as runc's.
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub const HANG_UP_RETRY: Duration = Duration::from_millis(20);
 
 /// A failed request, as ttrpc answers it.
 pub fn status(code: Code, message: impl ToString) -> ttrpc::Error {
@@ -124,19 +127,26 @@ pub fn set_window_size(manager: &File, rows: u32, columns: u32) -> io::Result<()
     Ok(())
 }
 
-/// Waits up to 100 ms until `file` is ready for `events`, so that callers can check whether to
-/// stop. Sleeps instead while it only reports a hang-up, which a terminal's manager does while no
-/// file is open on its subsidiary.
-pub fn wait_ready(file: &File, events: libc::c_short) {
-    let mut fd = libc::pollfd {
-        fd: file.as_raw_fd(),
-        events,
-        revents: 0,
-    };
-    // SAFETY: `fd` is one valid pollfd.
-    let ready = unsafe { libc::poll(&raw mut fd, 1, 100) };
-    if ready > 0 && fd.revents & events == 0 {
-        std::thread::sleep(Duration::from_millis(20));
+/// Runs `io` on `file` until it does not block. A terminal's manager reports a hang-up while its
+/// subsidiary is closed, and the runtime keeps reporting it once seen: tries without other
+/// readiness are spaced by [`HANG_UP_RETRY`] rather than spin.
+pub async fn when_ready<T>(
+    file: &AsyncFd<File>,
+    interest: Interest,
+    mut io: impl FnMut(&File) -> io::Result<T>,
+) -> io::Result<T> {
+    loop {
+        let hung_up_only = {
+            let mut guard = file.ready(interest).await?;
+            let hung_up_only = (guard.ready() & (Ready::READABLE | Ready::WRITABLE)).is_empty();
+            match guard.try_io(|file| io(file.get_ref())) {
+                Ok(result) => return result,
+                Err(_would_block) => hung_up_only,
+            }
+        };
+        if hung_up_only {
+            tokio::time::sleep(HANG_UP_RETRY).await;
+        }
     }
 }
 
@@ -325,10 +335,14 @@ impl ExitStatus {
 /// Waits for any child to end, without blocking if `block` is unset; returns its pid and its exit
 /// status, `None` if none ended yet.
 pub fn wait_any(block: bool) -> io::Result<Option<(libc::pid_t, ExitStatus)>> {
+    wait(-1, block)
+}
+
+fn wait(pid: libc::pid_t, block: bool) -> io::Result<Option<(libc::pid_t, ExitStatus)>> {
     let mut status: c_int = 0;
     let options = if block { 0 } else { libc::WNOHANG };
     // SAFETY: `status` is a valid, writable int.
-    let pid = unsafe { libc::waitpid(-1, &raw mut status, options) };
+    let pid = unsafe { libc::waitpid(pid, &raw mut status, options) };
     match pid {
         0 => Ok(None),
         pid if pid < 0 => Err(io::Error::last_os_error()),
@@ -354,17 +368,34 @@ pub fn kill(pid: libc::pid_t, signal: c_int) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::cell::Cell;
+    use std::ffi::CString;
+    use std::fs::OpenOptions;
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     use std::path::Path;
+    use std::time::Duration;
 
     use litebox_guest_service_protocol::guest_service::Process;
+    use tokio::io::Interest;
+    use tokio::io::unix::AsyncFd;
     use ttrpc::Code;
 
-    use super::{ExitStatus, Streams, resolve, spawn, wait_any};
+    use super::{ChildStdio, ExitStatus, Streams, resolve, spawn, wait, when_ready};
 
     fn write(path: &Path, content: &str, mode: u32) {
         std::fs::write(path, content).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Never opened: a child that another test forks while it is open for writing would make its
+    /// `execve` fail with `ETXTBSY`.
+    fn empty_executable(path: &Path) {
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated string.
+        assert_eq!(unsafe { libc::mknod(c_path.as_ptr(), libc::S_IFREG, 0) }, 0);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn process(args: &[&str], cwd: &str) -> Process {
@@ -420,7 +451,6 @@ mod tests {
         assert_eq!(libc::WEXITSTATUS(status), 3);
     }
 
-    /// The only child of the test's process, which nextest runs alone.
     #[test]
     fn a_signal_death_is_told_apart_from_an_exit_with_its_status() {
         let exited = ExitStatus::Exited { code: 134 };
@@ -432,7 +462,7 @@ mod tests {
             let (_streams, child) = Streams::new(&process).unwrap();
             let pid = spawn(&process, &child).unwrap();
             assert_eq!(
-                wait_any(true).unwrap(),
+                wait(pid, true).unwrap(),
                 Some((pid, exit_status)),
                 "{script}"
             );
@@ -451,12 +481,60 @@ mod tests {
         assert_eq!(code, Code::INTERNAL);
         assert!(message.starts_with("chdir: "), "{message}");
         let dir = tempfile::tempdir().unwrap();
-        write(&dir.path().join("program"), "not a program", 0o755);
+        empty_executable(&dir.path().join("program"));
         let (code, message) = failure(&process(&["./program"], dir.path().to_str().unwrap()));
         assert_eq!(code, Code::INTERNAL);
         assert!(
             message.starts_with("execve: Exec format error"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn a_terminal_s_reads_wait_again_once_its_subsidiary_reopens() {
+        let process = Process {
+            terminal: true,
+            ..Default::default()
+        };
+        let (streams, child) = Streams::new(&process).unwrap();
+        let ChildStdio::Terminal(path) = child else {
+            panic!("no terminal")
+        };
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(&path)
+                .unwrap()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let manager = AsyncFd::new(streams.stdout).unwrap();
+            let tries = Cell::new(0);
+            let read = || {
+                when_ready(&manager, Interest::READABLE, |file| {
+                    // A spinning read would starve the timeout below.
+                    tries.set(tries.get() + 1);
+                    assert!(tries.get() <= 100, "the read spins");
+                    let mut data = [0; 16];
+                    let read = (&*file).read(&mut data)?;
+                    Ok(data[..read].to_vec())
+                })
+            };
+            open().write_all(b"one").unwrap();
+            assert_eq!(read().await.unwrap(), b"one");
+            let hung_up = read().await.unwrap_err();
+            assert_eq!(hung_up.raw_os_error(), Some(libc::EIO));
+            let mut subsidiary = open();
+            let waited = tokio::time::timeout(Duration::from_millis(200), read()).await;
+            assert!(waited.is_err(), "{waited:?}");
+            subsidiary.write_all(b"two").unwrap();
+            assert_eq!(read().await.unwrap(), b"two");
+        });
     }
 }
