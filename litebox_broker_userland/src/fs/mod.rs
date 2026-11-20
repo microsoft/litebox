@@ -43,7 +43,7 @@ mod win_flags {
 }
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
-use location::{EntryKind, Location};
+use location::Location;
 
 macro_rules! guard_path_operations {
     ($this:expr, $failure:expr) => {
@@ -237,7 +237,8 @@ fn validate_name(name: &str) -> Result<(), PathError> {
     Ok(())
 }
 
-/// Maps a failed check that a held directory is still usable to a path error, else `io`.
+/// Maps a failed check that a held directory or resolved file is still usable to a path error,
+/// else `io`.
 fn usable_dir_error<E: From<PathError>>(error: &std::io::Error, io: E) -> E {
     match error.kind() {
         std::io::ErrorKind::NotFound => PathError::NoSuchFileOrDirectory.into(),
@@ -596,7 +597,7 @@ impl LocalFs {
     }
 
     fn locate(parent: &LocalDir, name: &str) -> std::io::Result<Located> {
-        validate_name(name).map_err(|_| invalid_path())?;
+        // `pin_child` validates `name`.
         let location = parent.location.pin_child(name)?;
         let file_type = host_file_type(&location.metadata()?)?;
         Ok(Located {
@@ -664,6 +665,31 @@ impl Backend for LocalFs {
                 error,
             })?;
         for (index, &name) in components.iter().enumerate() {
+            // An intermediate component must be a directory, which the open itself can check.
+            #[cfg(target_os = "linux")]
+            if index + 1 != components.len() {
+                match dir.location.pin_child_dir(name) {
+                    Ok(location) => {
+                        dir = LocalDir {
+                            instance_tag: self.instance_tag.clone(),
+                            location,
+                        };
+                        continue;
+                    }
+                    // Anything else is classified below, which reports the precise error.
+                    Err(error)
+                        if error.raw_os_error().is_some_and(|errno| {
+                            errno == rustix::io::Errno::NOTDIR.raw_os_error()
+                                || errno == rustix::io::Errno::LOOP.raw_os_error()
+                        }) => {}
+                    Err(error) => {
+                        return Err(ResolutionError {
+                            component: Some(index),
+                            error: walk_error(error),
+                        });
+                    }
+                }
+            }
             let Located {
                 location,
                 file_type,
@@ -829,17 +855,6 @@ impl Backend for LocalFs {
         ))
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
-        guard_path_operations!(self, Err(WalkError::Io));
-        let dir = dir.get_typed::<Self>();
-        if !self.valid_dir(dir) {
-            return Err(WalkError::Io);
-        }
-        let root = self.root.linked_path().map_err(walk_error)?;
-        let name = dir.location.linked_path().map_err(walk_error)?;
-        components_under(&root, &name).map(Some)
-    }
-
     #[cfg(target_os = "linux")]
     fn walking_dir_with_path<'a>(
         &'a self,
@@ -879,6 +894,17 @@ impl Backend for LocalFs {
             ResolvedDir::from_typed::<Self>(dir.clone(), PermissionCheck::ByBackend),
             path,
         ))
+    }
+
+    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+        guard_path_operations!(self, Err(WalkError::Io));
+        let dir = dir.get_typed::<Self>();
+        if !self.valid_dir(dir) {
+            return Err(WalkError::Io);
+        }
+        let root = self.root.linked_path().map_err(walk_error)?;
+        let name = dir.location.linked_path().map_err(walk_error)?;
+        components_under(&root, &name).map(Some)
     }
 
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
@@ -1247,12 +1273,12 @@ impl Backend for LocalFs {
         self.check_walked_dir(&dir, UnlinkError::Io)?;
         let entry = dir.location.entry_at(name).map_err(unlink_error)?;
         match entry.kind {
-            EntryKind::Directory => return Err(UnlinkError::IsADirectory),
-            EntryKind::Other => return Err(UnlinkError::Io),
-            EntryKind::RegularFile | EntryKind::Symlink => {}
+            Some(FileType::Directory) => return Err(UnlinkError::IsADirectory),
+            Some(FileType::RegularFile | FileType::SymbolicLink) => {}
+            _ => return Err(UnlinkError::Io),
         }
         #[cfg(windows)]
-        let is_symlink = entry.kind == EntryKind::Symlink;
+        let is_symlink = entry.kind == Some(FileType::SymbolicLink);
         #[cfg(windows)]
         if !is_symlink && entry.readonly {
             // Rust's Windows remove_file implementation can override the readonly attribute.
@@ -1278,7 +1304,7 @@ impl Backend for LocalFs {
         validate_name(name)?;
         let dir = dir.into_typed::<Self>();
         self.check_walked_dir(&dir, RmdirError::Io)?;
-        if dir.location.entry_at(name).map_err(rmdir_error)?.kind != EntryKind::Directory {
+        if dir.location.entry_at(name).map_err(rmdir_error)?.kind != Some(FileType::Directory) {
             return Err(RmdirError::NotADirectory);
         }
         dir.location.remove_dir_at(name).map_err(rmdir_error)
@@ -1357,10 +1383,7 @@ impl Backend for LocalFs {
             ResolvedTarget::File(file) => {
                 let file = file.get_typed::<Self>();
                 self.check_resolved_file(file)
-                    .map_err(|error| match error.kind() {
-                        std::io::ErrorKind::NotFound => PathError::NoSuchFileOrDirectory.into(),
-                        _ => SetTimesError::Io,
-                    })?;
+                    .map_err(|error| usable_dir_error(&error, SetTimesError::Io))?;
                 &file.location
             }
         };

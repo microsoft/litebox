@@ -118,7 +118,9 @@ pub trait Backend: Send + Sync + Any {
     ///
     /// Walk the directory the handle refers to, even if it has been renamed. If the backend
     /// can no longer walk that directory (for example, because a network handle is stale), fail
-    /// with [`super::errors::PathError::NoSuchFileOrDirectory`]; other failures report [`WalkError::Io`].
+    /// with [`super::errors::PathError::NoSuchFileOrDirectory`]. Other failures report
+    /// [`WalkError::Io`] or a more specific [`super::errors::PathError`] (such as missing search
+    /// permission), which the resolver passes on.
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError>;
 
     /// [`Self::walking_dir_at`] together with [`Self::dir_path`], both taken from one snapshot

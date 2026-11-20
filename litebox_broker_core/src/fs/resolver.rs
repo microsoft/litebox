@@ -104,13 +104,16 @@ impl Context {
 #[derive(Clone)]
 struct WalkAnchor {
     dir: DirHandle,
-    /// Name recorded when `dir` was opened, used only when the backend cannot name `dir`.
-    /// It may be stale after a rename.
+    /// Name recorded when `dir` was opened, used only when the backend cannot name `dir` or
+    /// reports it removed (see [`Resolver::handle_path`]). It may be stale after a rename.
     hint: String,
 }
 
 /// An open entry captured as the starting point of a relative lookup (see
 /// [`ResolverEntry::anchor`]).
+///
+/// The inner `None` anchors a non-directory, from which relative lookups fail. It is unrelated to
+/// an absent `Option<DirAnchor>`, which resolves from the root.
 #[derive(Clone)]
 pub struct DirAnchor(Option<WalkAnchor>);
 
@@ -222,6 +225,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             })
     }
 
+    /// Resolve `path` from `anchor` (or the root) to normalized components, following symbolic
+    /// links.
+    ///
     /// Also returns the final resolution of the path when its last step was a walk, so callers
     /// need not walk again; a bare `.` resolves to the search-checked walk start. A path ending
     /// in `..`, or in `.` after other components, or with no components at all (`/`), has none;
@@ -278,6 +284,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     if resolved.pop().is_none() {
                         self.check_start_search(context, anchor.as_ref())?;
                         if let Some(base) = &mut anchor {
+                            // TODO: on backends that reach directories by path (the overlay
+                            // re-resolves the parent through every layer, and each 9P step is a
+                            // server round trip), a run of leading `..` re-walks once per step.
+                            // Consider caching parents per namespace generation.
                             match self.backend.parent_dir(&base.dir)? {
                                 Some(parent) => {
                                     base.dir = parent;
@@ -1088,7 +1098,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             Handle::Dir(dir) => ResolvedTarget::Dir(
                 self.backend
                     .walking_dir_at(dir)
-                    .map_err(|_| SetTimesError::Io)?,
+                    .map_err(walk_error_or(SetTimesError::Io))?,
             ),
             Handle::File(_) => self.rewalk_open_file(&context, entry)?,
         };
@@ -1385,7 +1395,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             let walking = self
                 .backend
                 .walking_dir_at(&old_dir)
-                .map_err(|_| RenameError::Io)?;
+                .map_err(map_walk_error)?;
             match self
                 .backend
                 .resolve(walking, &[&old_name], &|permissions| {
@@ -1732,6 +1742,8 @@ struct ReopenedTerminal {
 impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
     /// Captures this entry as the starting point of relative lookups. Relative lookups from the
     /// anchor of a non-directory fail with [`PathError::ComponentNotADirectory`].
+    // TODO: this formats the recorded name on every relative lookup although the hint is only
+    // read as a fallback. Store it once (e.g. as `Arc<str>` with a length) when the entry opens.
     #[must_use]
     pub fn anchor(&self) -> DirAnchor {
         DirAnchor(match &self.handle {

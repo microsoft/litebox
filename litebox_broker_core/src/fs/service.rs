@@ -142,7 +142,7 @@ mod private {
     pub trait Service: Send + Sync {
         /// Opens `path`, binding a file that refers to the opener's controlling terminal to
         /// `controlling_terminal()`.
-        #[allow(
+        #[expect(
             clippy::too_many_arguments,
             reason = "one parameter per open request field, plus the terminal binding"
         )]
@@ -700,7 +700,7 @@ where
 /// contain [`FileOpenFlags::NO_CONTROLLING_TERMINAL`], opening a terminal for reading makes it the
 /// controlling terminal of the session that `process` leads, if that session has none and the
 /// terminal controls no other session.
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "one parameter per open request field, plus the readiness sink"
 )]
@@ -1411,39 +1411,42 @@ pub(super) fn file_walk_error(error: WalkError) -> FileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CallerCredential;
+    use crate::fs::{in_mem::InMem, inode_allocator::InodeAllocators};
+    use crate::test_platform::TestPlatform;
+    use crate::test_support::TestBroker;
     use core::num::NonZeroU64;
     use litebox_broker_protocol::fs::{FileNodeInfo, FileType};
 
-    #[test]
-    fn relative_directory_handles_are_process_scoped() {
-        use crate::fs::{in_mem::InMem, inode_allocator::InodeAllocators};
+    /// A broker serving `fs`, one of its processes holding `/` open with `O_PATH`, that handle,
+    /// and a readiness sink for further opens.
+    fn broker_with_root_anchor(
+        fs: Arc<dyn FileService>,
+    ) -> (
+        TestBroker,
+        Arc<BrokerProcess>,
+        ObjectHandle,
+        Arc<dyn ReadinessSink>,
+    ) {
+        use crate::PolicyEngine;
         use crate::readiness::tests::TestReadinessSink;
-        use crate::test_platform::TestPlatform;
         use crate::test_support::TestBrokerBuilder;
-        use crate::{CallerCredential, PolicyEngine};
 
-        let fs = Resolver::<TestPlatform, _>::new(InMem::<TestPlatform>::new(
-            InodeAllocators::new().next(),
-        ));
         let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
-        .with_file_service(Arc::new(fs))
+        .with_file_service(fs)
         .build()
         .unwrap();
         let owner = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let other = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
         let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
-        let user = FileUser::ROOT;
         let anchor = open(
             &owner,
             None,
             "/",
-            user,
+            FileUser::ROOT,
             FileAccessMode::ReadOnly,
             FileOpenFlags::PATH,
             FileMode::default(),
@@ -1451,6 +1454,18 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        (broker, owner, anchor, sink)
+    }
+
+    #[test]
+    fn relative_directory_handles_are_process_scoped() {
+        let fs = InMem::<TestPlatform>::new(InodeAllocators::new().next());
+        let (broker, owner, anchor, sink) =
+            broker_with_root_anchor(Arc::new(Resolver::<TestPlatform, _>::new(fs)));
+        let other = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let user = FileUser::ROOT;
         assert_eq!(
             mkdir(&other, Some(anchor), "old", user, FileMode::RWXU),
             Err(BrokerError::UnknownObject)
@@ -1516,37 +1531,13 @@ mod tests {
 
     #[test]
     fn relative_directory_handles_are_file_system_scoped() {
-        use crate::fs::{in_mem::InMem, inode_allocator::InodeAllocators, read_only::ReadOnly};
-        use crate::readiness::tests::TestReadinessSink;
-        use crate::test_platform::TestPlatform;
-        use crate::test_support::TestBrokerBuilder;
-        use crate::{CallerCredential, PolicyEngine};
+        use crate::fs::read_only::ReadOnly;
 
         let allocators = InodeAllocators::new();
         let in_mem = || InMem::<TestPlatform>::new(allocators.next());
-        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(in_mem())))
-        .build()
-        .unwrap();
-        let owner = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        let sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+        let (broker, owner, anchor, _sink) =
+            broker_with_root_anchor(Arc::new(Resolver::<TestPlatform, _>::new(in_mem())));
         let user = FileUser::ROOT;
-        let anchor = open(
-            &owner,
-            None,
-            "/",
-            user,
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::PATH,
-            FileMode::default(),
-            &sink,
-        )
-        .unwrap()
-        .unwrap();
 
         // Another resolver of the same type fails the identity check; one over another backend
         // fails the downcast.

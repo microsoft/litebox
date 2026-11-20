@@ -411,10 +411,7 @@ impl From<StorageError> for FileStatusError {
 
 impl From<WalkError> for OpenError {
     fn from(error: WalkError) -> Self {
-        match error {
-            WalkError::PathError(error) => Self::PathError(error),
-            WalkError::Io => Self::Io,
-        }
+        walk_error_or(Self::Io)(error)
     }
 }
 

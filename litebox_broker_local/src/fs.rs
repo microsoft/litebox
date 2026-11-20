@@ -35,7 +35,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "one parameter per open request field, plus the path's shared buffer"
     )]

@@ -2395,6 +2395,66 @@ mod tar_ro {
         }
     }
 
+    /// Lookups from a held directory on a read-only mount stay read-only, whether or not a nested
+    /// mount makes the composer walk from the handle with its path: the read-only mount is
+    /// reported before the caller's lack of write permission on the directory.
+    #[test]
+    fn read_only_held_directories_stay_read_only() {
+        use super::InMem;
+        use crate::fs::composer::Composer;
+        use crate::fs::in_mem::InitialNode;
+        use crate::fs::read_only::ReadOnly;
+
+        for nested in [false, true] {
+            let mut builder = Composer::<TestPlatform>::builder()
+                .mount("/", InMem::<TestPlatform>::new)
+                .mount("/ro", |allocator| {
+                    ReadOnly::new(InMem::<TestPlatform>::new_initialized(
+                        [(
+                            "/dir",
+                            InitialNode::Directory {
+                                mode: Mode::RWXU
+                                    | Mode::RGRP
+                                    | Mode::XGRP
+                                    | Mode::ROTH
+                                    | Mode::XOTH,
+                                owner: ROOT,
+                            },
+                        )],
+                        allocator,
+                    ))
+                });
+            if nested {
+                builder = builder.mount("/ro/nested", InMem::<TestPlatform>::new);
+            }
+            let fs = Resolver::<TestPlatform, _>::new(builder.build().unwrap());
+            let ro = fs
+                .open(ROOT, None, "/ro/dir", OFlags::PATH, Mode::empty())
+                .unwrap();
+            assert!(
+                matches!(
+                    fs.unlink(USER, Some(ro.anchor()), "missing"),
+                    Err(UnlinkError::ReadOnlyFileSystem)
+                ),
+                "unlink, nested: {nested}"
+            );
+            assert!(
+                matches!(
+                    fs.rmdir(USER, Some(ro.anchor()), "missing"),
+                    Err(RmdirError::ReadOnlyFileSystem)
+                ),
+                "rmdir, nested: {nested}"
+            );
+            assert!(
+                matches!(
+                    fs.rename(USER, Some(ro.anchor()), "missing", Some(ro.anchor()), "new"),
+                    Err(RenameError::ReadOnlyFileSystem)
+                ),
+                "rename, nested: {nested}"
+            );
+        }
+    }
+
     #[test]
     fn metadata_and_special_entries_do_not_stop_indexing() {
         use tar_core::builder::{EntryBuilder, HeaderBuilder};
@@ -3657,6 +3717,31 @@ mod devices {
                 .build()
                 .unwrap(),
         )
+    }
+
+    /// Held device directories name themselves and walk up through `..` to the root.
+    #[test]
+    fn held_device_directories_walk_up_to_the_root() {
+        let fs = devices_fs(Arc::new(TestStdioProvider::default()));
+        let pts = fs
+            .open(USER, None, "/dev/pts", OFlags::PATH, Mode::empty())
+            .unwrap();
+        assert_eq!(fs.handle_path(&pts).unwrap(), "/dev/pts");
+        for (path, expected) in [("..", "/dev"), ("../..", "/")] {
+            let parent = fs
+                .open(USER, Some(pts.anchor()), path, OFlags::PATH, Mode::empty())
+                .unwrap();
+            assert_eq!(fs.handle_path(&parent).unwrap(), expected);
+        }
+        let dev = fs
+            .open(USER, Some(pts.anchor()), "..", OFlags::PATH, Mode::empty())
+            .unwrap();
+        assert_eq!(
+            fs.file_status(USER, Some(dev.anchor()), "pts", true)
+                .unwrap()
+                .file_type,
+            FileType::Directory
+        );
     }
 
     /// Device I/O and terminal queries reach the providers the backend was built with.

@@ -15,12 +15,8 @@ static void *enter_parent(void *unused) {
 // `base-directory` (default `test_dir()`); `no-symlinks` skips the steps that create symlinks, for
 // filesystems that cannot create them.
 int main(int argc, char **argv) {
-    const char *base = argc > 1 ? argv[1] : test_dir();
-    int symlinks = !(argc > 2 && strcmp(argv[2], "no-symlinks") == 0);
     char tmp[4096];
-    TEST_ASSERT(snprintf(tmp, sizeof(tmp), "%s/lb-cwd-XXXXXX", base) < (int)sizeof(tmp),
-                "base directory name is short");
-    TEST_ASSERT(mkdtemp(tmp) && chdir(tmp) == 0, "enter temporary directory");
+    int symlinks = enter_test_dir(argc, argv, "lb-cwd", tmp, sizeof(tmp));
     int root = open(".", O_PATH | O_DIRECTORY);
     TEST_ASSERT(root >= 0 && mkdir("a", 0700) == 0 && mkdir("a/sub", 0700) == 0, "setup");
     int sub = open("a/sub", O_PATH | O_DIRECTORY);
@@ -44,7 +40,8 @@ int main(int argc, char **argv) {
     TEST_ASSERT(server >= 0 && bind(server, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
                 listen(server, 1) == 0, "bind a relative socket name");
     int client = socket(AF_UNIX, SOCK_STREAM, 0);
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/b/sub/rel.sock", tmp);
+    int length = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/b/sub/rel.sock", tmp);
+    TEST_ASSERT(length >= 0 && (size_t)length < sizeof(addr.sun_path), "socket path too long");
     TEST_ASSERT(client >= 0 && connect(client, (struct sockaddr *)&addr, sizeof(addr)) == 0,
                 "relative socket name follows the renamed cwd");
     TEST_ASSERT(close(client) == 0 && close(server) == 0 &&
@@ -61,7 +58,6 @@ int main(int argc, char **argv) {
     TEST_ASSERT(fchdir(root) == 0 && fchdir(sub) == 0, "enter renamed fd");
     TEST_ASSERT(unlinkat(root, "b/sub", AT_REMOVEDIR) == 0, "remove cwd");
     char link[64], target[4096];
-    ssize_t length;
     TEST_ASSERT(fchdir(root) == 0 && fchdir(sub) == 0 && close(sub) == 0, "enter removed fd");
     expect_errno(syscall(SYS_getcwd, cwd, sizeof(cwd)), ENOENT, "removed cwd has no name");
     struct stat st;
@@ -75,11 +71,14 @@ int main(int argc, char **argv) {
                 getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, tmp), "leave removed parent");
     TEST_ASSERT(fchdir(root) == 0 && close(root) == 0 && rmdir("a/sub") == 0 &&
                 rmdir("a") == 0 && chdir("/") == 0 && rmdir(tmp) == 0, "cleanup");
-    int top = open("/tmp", O_PATH | O_DIRECTORY);
+    char *dir = realpath(test_dir(), NULL);
+    int top = dir ? open(dir, O_PATH | O_DIRECTORY) : -1;
     TEST_ASSERT(top >= 0, "open directory for its fd link");
     snprintf(link, sizeof(link), "proc/self/fd/%d", top);
-    length = readlink(link, target, sizeof(target) - 1);
-    TEST_ASSERT(length == 4 && !memcmp(target, "/tmp", 4), "relative fd link from root");
+    ssize_t target_length = readlink(link, target, sizeof(target) - 1);
+    TEST_ASSERT(target_length == (ssize_t)strlen(dir) && !memcmp(target, dir, strlen(dir)),
+                "relative fd link from root");
+    free(dir);
     struct stat link_st, top_st;
     TEST_ASSERT(stat(link, &link_st) == 0 && fstat(top, &top_st) == 0 &&
                 link_st.st_ino == top_st.st_ino && close(top) == 0, "relative fd stat from root");

@@ -71,19 +71,12 @@ fn open_directory(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// The type of a directory entry, without following a final symlink.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum EntryKind {
-    Directory,
-    RegularFile,
-    Symlink,
-    Other,
-}
-
 /// A directory entry as `lstat` describes it.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Entry {
-    pub(super) kind: EntryKind,
+    /// The entry's type without following a final symlink, or `None` for a host object
+    /// LocalFs does not expose (see `host_file_type`).
+    pub(super) kind: Option<super::FileType>,
     /// The Windows readonly attribute.
     #[cfg(windows)]
     pub(super) readonly: bool,
@@ -167,17 +160,8 @@ impl Location {
 
     pub(super) fn entry_at(&self, name: &str) -> io::Result<Entry> {
         let metadata = fs::symlink_metadata(self.entry_path(name)?)?;
-        let kind = if metadata.file_type().is_symlink() {
-            EntryKind::Symlink
-        } else if metadata.is_dir() {
-            EntryKind::Directory
-        } else if metadata.is_file() {
-            EntryKind::RegularFile
-        } else {
-            EntryKind::Other
-        };
         Ok(Entry {
-            kind,
+            kind: super::host_file_type(&metadata).ok(),
             #[cfg(windows)]
             readonly: metadata.permissions().readonly(),
         })
@@ -237,6 +221,8 @@ impl Location {
         })
     }
 
+    /// Locates the entry `name`. Only a directory child gets a pin of its own; any other entry
+    /// is reached by name under this directory's pin.
     pub(super) fn pin_child(&self, name: &str) -> io::Result<Self> {
         check_name(name)?;
         let path = self.path.join(name);
@@ -316,6 +302,8 @@ impl std::ops::Deref for Location {
 
 #[cfg(target_os = "linux")]
 impl Location {
+    // TODO: format the procfs name lazily. Each walked component pays for this allocation
+    // although most locations only ever use the pin.
     pub(super) fn opened(file: Arc<File>) -> Self {
         use std::os::fd::AsRawFd;
         // Only the kernel-supplied magic link for *our own live descriptor* is followed.
@@ -346,9 +334,18 @@ impl Location {
         Self::pin_at(CWD, path, OFlags::DIRECTORY | OFlags::NOFOLLOW)
     }
 
+    /// Pins the entry `name`, whatever its type, without following a final symlink.
     pub(super) fn pin_child(&self, name: &str) -> io::Result<Self> {
         check_name(name)?;
         Self::pin_at(&*self.pin, name, rustix::fs::OFlags::NOFOLLOW)
+    }
+
+    /// Pins the child directory `name`, failing with `ENOTDIR` or `ELOOP` if it is anything
+    /// else. Unlike [`Self::pin_child`], the caller needs no `fstat` to learn its type.
+    pub(super) fn pin_child_dir(&self, name: &str) -> io::Result<Self> {
+        use rustix::fs::OFlags;
+        check_name(name)?;
+        Self::pin_at(&*self.pin, name, OFlags::DIRECTORY | OFlags::NOFOLLOW)
     }
 
     pub(super) fn metadata(&self) -> io::Result<fs::Metadata> {
@@ -392,10 +389,10 @@ impl Location {
         check_name(name)?;
         let stat = statat(&*self.pin, name, AtFlags::SYMLINK_NOFOLLOW)?;
         let kind = match FileType::from_raw_mode(stat.st_mode) {
-            FileType::Directory => EntryKind::Directory,
-            FileType::RegularFile => EntryKind::RegularFile,
-            FileType::Symlink => EntryKind::Symlink,
-            _ => EntryKind::Other,
+            FileType::Directory => Some(super::FileType::Directory),
+            FileType::RegularFile => Some(super::FileType::RegularFile),
+            FileType::Symlink => Some(super::FileType::SymbolicLink),
+            _ => None,
         };
         Ok(Entry { kind })
     }
@@ -513,6 +510,8 @@ impl Location {
         })
     }
 
+    /// Locates the entry `name`, locking it against rename or deletion only if it is a
+    /// directory; any other entry is reached by name under this directory's locks.
     pub(super) fn pin_child(&self, name: &str) -> io::Result<Self> {
         check_name(name)?;
         let path = self.path.join(name);

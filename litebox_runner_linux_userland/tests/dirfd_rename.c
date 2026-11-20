@@ -71,13 +71,9 @@ static void test_program_directory(const char *program) {
 // `base-directory` (default `test_dir()`); `no-symlinks` skips the steps that create symlinks, for
 // filesystems that cannot create them.
 int main(int argc, char **argv) {
-    const char *base = argc > 1 ? argv[1] : test_dir();
     test_program_directory(argv[0]);
-    int symlinks = !(argc > 2 && strcmp(argv[2], "no-symlinks") == 0);
     char tmp[4096];
-    TEST_ASSERT(snprintf(tmp, sizeof(tmp), "%s/lb-dirfd-XXXXXX", base) < (int)sizeof(tmp),
-                "base directory name is short");
-    TEST_ASSERT(mkdtemp(tmp) != NULL && chdir(tmp) == 0, "create working directory");
+    int symlinks = enter_test_dir(argc, argv, "lb-dirfd", tmp, sizeof(tmp));
     test_search_permission(tmp);
     TEST_ASSERT(mkdir("old", 0700) == 0 && mkdir("old/sub", 0700) == 0, "create subtree");
     int fd = open("old/sub", O_PATH | O_DIRECTORY);
@@ -90,6 +86,13 @@ int main(int argc, char **argv) {
     TEST_ASSERT(mkdir("old", 0700) == 0 && mkdir("old/sub", 0700) == 0, "replace subtree");
     struct stat st;
     TEST_ASSERT(fstatat(fd, "original", &st, 0) == 0, "lookup follows renamed ancestor");
+    char link[64], target[4096], expect[4096];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", file);
+    snprintf(expect, sizeof(expect), "%s/new/sub/original", tmp);
+    ssize_t length = readlink(link, target, sizeof(target) - 1);
+    TEST_ASSERT(length >= 0, "read file fd link");
+    target[length] = '\0';
+    TEST_ASSERT(!strcmp(target, expect), "file fd link follows renamed ancestor");
     // `fd` was opened as old/sub but now lies in new/sub, so a stale name would let this rename
     // move `new` into the unrelated old/sub.
     expect_errno(renameat(AT_FDCWD, "new", fd, "moved"), EINVAL,

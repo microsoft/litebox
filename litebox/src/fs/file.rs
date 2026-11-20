@@ -71,6 +71,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
 
     /// Opens a file. A relative `path` resolves from `dir`; an absolute path ignores `dir`.
     ///
+    /// A relative `path` requires `dir`, which must be a directory opened through this same
+    /// `LiteBox`; otherwise the call fails. The other path-taking methods share these rules.
+    ///
     /// `access` and `flags` use the architecture-independent broker contract.
     /// The `mode` is only significant when creating a file.
     pub fn open_file(
@@ -117,6 +120,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
 
     /// Change the permissions of a file. A relative `path` resolves from `dir`; an absolute path
     /// ignores `dir`.
+    /// See [`Self::open_file`] for the rules on `dir`.
     pub fn chmod_file(
         &self,
         context: &Context,
@@ -134,6 +138,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
 
     /// Change the owner of a file. A relative `path` resolves from `dir`; an absolute path
     /// ignores `dir`.
+    /// See [`Self::open_file`] for the rules on `dir`.
     pub fn chown_file(
         &self,
         context: &Context,
@@ -152,6 +157,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
 
     /// Create a symbolic link at `linkpath`, storing `target` verbatim. A relative `linkpath`
     /// resolves from `dir`; an absolute one ignores `dir`.
+    /// See [`Self::open_file`] for the rules on `dir`.
     ///
     /// A relative target is interpreted relative to the link's parent when the link is
     /// subsequently followed.
@@ -171,6 +177,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Unlink a file. A relative `path` resolves from `dir`; an absolute path ignores `dir`.
+    /// See [`Self::open_file`] for the rules on `dir`.
     pub fn unlink_file(
         &self,
         context: &Context,
@@ -188,6 +195,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// Rename a file or directory, replacing an existing destination when permitted. Relative
     /// source and destination paths resolve from `old_dir` and `new_dir` respectively; absolute
     /// paths ignore them.
+    /// See [`Self::open_file`] for the rules on `dir`.
     pub fn rename_file(
         &self,
         context: &Context,
@@ -207,6 +215,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
 
     /// Create a new directory. A relative `path` resolves from `dir`; an absolute path
     /// ignores `dir`.
+    /// See [`Self::open_file`] for the rules on `dir`.
     pub fn mkdir_file(
         &self,
         context: &Context,
@@ -223,6 +232,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Mount a fresh in-memory filesystem at an absolute directory path.
+    // TODO: take a `dir` anchor like the other path methods. Callers name a relative target from
+    // their cwd's current path, so a concurrent rename of that directory can mount at a stale
+    // location. Needs a protocol change, since the broker's mount table is name-based.
     pub fn mount_in_mem(&self, context: &Context, path: &str) -> Result<(), FileError> {
         let broker = self.broker_control().ok_or(FileError::Io)?;
         // Validation only.
@@ -233,6 +245,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Remove a directory. A relative `path` resolves from `dir`; an absolute path ignores `dir`.
+    /// See [`Self::open_file`] for the rules on `dir`.
     pub fn rmdir_file(
         &self,
         context: &Context,
@@ -249,6 +262,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
 
     /// Obtain the status of a path. A relative `path` resolves from `dir`; an absolute path
     /// ignores `dir`.
+    /// See [`Self::open_file`] for the rules on `dir`.
     ///
     /// If `follow_symlinks` is false, a final symbolic link is described itself.
     pub fn path_file_status(
@@ -268,6 +282,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
 
     /// Read a symbolic link's stored target, without following the final link. A relative `path`
     /// resolves from `dir`; an absolute path ignores `dir`.
+    /// See [`Self::open_file`] for the rules on `dir`.
     pub fn read_link_file(
         &self,
         context: &Context,

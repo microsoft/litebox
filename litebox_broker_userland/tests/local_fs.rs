@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 use litebox_broker_core::fs::SeekWhence;
 use litebox_broker_core::fs::backend::{
-    Backend, HandleRef, Resolution, ResolvedFile, ResolvedTarget,
+    Backend, DirHandle, HandleRef, Resolution, ResolvedFile, ResolvedTarget,
 };
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::errors::{
@@ -61,6 +61,19 @@ fn resolved_file<'a>(local: &'a LocalFs, name: &str) -> ResolvedFile<'a> {
         Resolution::Found(ResolvedTarget::File(file)) => file,
         _ => panic!("expected a resolved file"),
     }
+}
+
+/// Opens the directory at `components` with `O_PATH`.
+fn open_path_dir(local: &LocalFs, components: &[&str]) -> DirHandle {
+    let Resolution::Found(ResolvedTarget::Dir(dir)) = local
+        .resolve(local.root().unwrap(), components, &|_| {
+            panic!("LocalFs must enforce host permissions itself")
+        })
+        .unwrap()
+    else {
+        panic!("expected a directory");
+    };
+    local.open_dir(dir, OFlags::PATH).unwrap()
 }
 
 fn host_timestamps(metadata: &fs::Metadata) -> FileTimestamps {
@@ -820,13 +833,7 @@ fn direct_backend_mutations_and_flags() {
     );
     assert_eq!(fs::metadata(temp.path().join("new")).unwrap().len(), 4097);
     fs::create_dir(temp.path().join("dir")).unwrap();
-    let Resolution::Found(ResolvedTarget::Dir(dir)) = local
-        .resolve(local.root().unwrap(), &["dir"], &|_| unreachable!())
-        .unwrap()
-    else {
-        panic!("expected directory");
-    };
-    let dir = local.open_dir(dir, OFlags::PATH).unwrap();
+    let dir = open_path_dir(&local, &["dir"]);
     assert!(local.status(HandleRef::Dir(&dir)).is_ok());
     assert!(local.walking_dir_at(&dir).is_ok());
     local.unlink_at(local.root().unwrap(), "new").unwrap();
@@ -1349,16 +1356,7 @@ fn held_directories_name_themselves_and_walk_up_to_the_root() {
     let root = temp.path().join("export");
     fs::create_dir_all(root.join("a/b")).unwrap();
     let local = backend(&root);
-    let open_dir = |components: &[&str]| {
-        let Resolution::Found(ResolvedTarget::Dir(dir)) = local
-            .resolve(local.root().unwrap(), components, &|_| unreachable!())
-            .unwrap()
-        else {
-            panic!("expected a directory");
-        };
-        local.open_dir(dir, OFlags::PATH).unwrap()
-    };
-    let mut dir = open_dir(&["a", "b"]);
+    let mut dir = open_path_dir(&local, &["a", "b"]);
     for expected in [&["a", "b"][..], &["a"], &[]] {
         assert_eq!(local.dir_path(&dir).unwrap().unwrap(), expected);
         let Some(parent) = local.parent_dir(&dir).unwrap() else {

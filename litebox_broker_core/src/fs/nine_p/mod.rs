@@ -201,8 +201,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         dir: &client::Fid<Platform>,
         name: &str,
     ) -> Result<WalkedDir<Platform, T>, Error> {
-        let walk = self.client.walk(dir, &[name])?;
-        let qid_path = walk.wqids.first().map(|qid| qid.path);
+        self.walk_complete(dir, &[name])
+    }
+
+    /// Walks all of `names` from `dir`, returning the qid path and fid it reached.
+    fn walk_complete(
+        &self,
+        dir: &client::Fid<Platform>,
+        names: &[&str],
+    ) -> Result<WalkedDir<Platform, T>, Error> {
+        let walk = self.client.walk(dir, names)?;
+        let qid_path = walk.wqids.last().map(|qid| qid.path);
         let fid = self.own(walk.into_complete_fid()?);
         Ok((qid_path.ok_or(Error::InvalidResponse)?, fid))
     }
@@ -409,27 +418,13 @@ where
             }
             // Short walks establish no fid. Recover the parent before reporting a creatable name.
             if walked != 0 {
-                let recovery = self
-                    .client
-                    .walk(&current.fid.fid, &chunk[..walked])
+                let (qid_path, fid) = self
+                    .walk_complete(&current.fid.fid, &chunk[..walked])
                     .map_err(|error| ResolutionError {
                         component: None,
                         error: error.into(),
                     })?;
-                let qid_path = recovery.wqids.last().map(|qid| qid.path);
-                let fid = recovery
-                    .into_complete_fid()
-                    .map_err(|error| ResolutionError {
-                        component: None,
-                        error: error.into(),
-                    })?;
-                current = NinePWalkingDirHandle {
-                    fid: self.own(fid),
-                    qid_path: qid_path.ok_or(ResolutionError {
-                        component: None,
-                        error: WalkError::Io,
-                    })?,
-                };
+                current = NinePWalkingDirHandle { fid, qid_path };
             }
             return Ok(Resolution::MissingFinal {
                 parent: ResolvedDir::from_typed::<Self>(current, PermissionCheck::ByBackend),

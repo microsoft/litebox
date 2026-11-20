@@ -296,6 +296,38 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         }
     }
 
+    /// A walk from the held `dir`, along with its current path when `want_path` is set (and
+    /// `Ok(None)` when it is not), to save cloning a path the caller discards.
+    fn held_walking_dir<'a>(
+        &'a self,
+        dir: &DirHandle,
+        want_path: bool,
+    ) -> Result<(ScopedDir<'a>, DirPathResult), WalkError> {
+        let locked = self.namespace.lock();
+        let dir = dir.get_typed::<Self>();
+        if let Ok((path, resolved)) = self
+            .resolve_held_dir(&locked, dir)
+            .map_err(open_to_walk_error)?
+        {
+            let name = Ok(want_path.then(|| path.clone()));
+            let walking = self
+                .scoped_dir(Ok(path), resolved, locked)
+                .map_err(open_to_walk_error)?;
+            Ok((walking, name))
+        } else {
+            let mut resolved = ResolvedDir {
+                upper: None,
+                lowers: vec![None; self.lowers.len()],
+            };
+            let (layer, backing) = &dir.backing;
+            *resolved.layer_mut(*layer) = Some(backing.clone());
+            let walking = self
+                .scoped_dir(Err(dir.clone()), resolved, locked)
+                .map_err(open_to_walk_error)?;
+            Ok((walking, Err(PathError::NoSuchFileOrDirectory.into())))
+        }
+    }
+
     /// A held directory's current path and per-layer directories, reusing the resolution cached
     /// at the current namespace generation. A removed directory yields its former parent.
     fn resolve_held_dir(
@@ -547,10 +579,9 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         status: &FileStatus,
     ) -> Result<DirHandle, OpenError> {
         let lower_dir = self.resolve_dir(parent)?;
-        let lower_dir = lower_dir.lowers[layer]
-            .as_ref()
-            .and_then(|dir| self.lowers[layer].walking_dir_at(dir).ok())
-            .ok_or(OpenError::Io)?;
+        let lower_dir = self.lowers[layer]
+            .walking_dir_at(lower_dir.lowers[layer].as_ref().ok_or(OpenError::Io)?)
+            .map_err(walk_error_or(OpenError::Io))?;
         let link = self.lowers[layer]
             .read_link_at(&lower_dir, name)
             .map_err(OpenError::from)?;
@@ -871,10 +902,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             Some(entry.lower.ok_or(WalkError::Io)?)
         };
         let backend = self.layer_backend(layer);
-        let parent = dir
-            .layer(layer)
-            .and_then(|dir| backend.walking_dir_at(dir).ok())
-            .ok_or(WalkError::Io)?;
+        let parent = backend.walking_dir_at(dir.layer(layer).ok_or(WalkError::Io)?)?;
         Ok((layer, backend, parent))
     }
 
@@ -1306,36 +1334,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ScopedDir<'a>, WalkError> {
-        Ok(self.walking_dir_with_path(dir)?.0)
+        Ok(self.held_walking_dir(dir, false)?.0)
     }
 
     fn walking_dir_with_path<'a>(
         &'a self,
         dir: &DirHandle,
     ) -> Result<(ScopedDir<'a>, DirPathResult), WalkError> {
-        let locked = self.namespace.lock();
-        let dir = dir.get_typed::<Self>();
-        if let Ok((path, resolved)) = self
-            .resolve_held_dir(&locked, dir)
-            .map_err(open_to_walk_error)?
-        {
-            let name = Ok(Some(path.clone()));
-            let walking = self
-                .scoped_dir(Ok(path), resolved, locked)
-                .map_err(open_to_walk_error)?;
-            Ok((walking, name))
-        } else {
-            let mut resolved = ResolvedDir {
-                upper: None,
-                lowers: vec![None; self.lowers.len()],
-            };
-            let (layer, backing) = &dir.backing;
-            *resolved.layer_mut(*layer) = Some(backing.clone());
-            let walking = self
-                .scoped_dir(Err(dir.clone()), resolved, locked)
-                .map_err(open_to_walk_error)?;
-            Ok((walking, Err(PathError::NoSuchFileOrDirectory.into())))
-        }
+        self.held_walking_dir(dir, true)
     }
 
     fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {

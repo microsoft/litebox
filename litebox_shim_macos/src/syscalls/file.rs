@@ -681,7 +681,11 @@ impl<P: ShimPlatform> Task<P> {
     /// the directory's current path (as `F_GETPATH` reports it), since this
     /// shim emulates namei on paths.
     // XXX: the directory's path is read before the lookup, so a concurrent
-    // rename of it can still race; anchoring to its handle would not.
+    // rename of it can still race; anchoring to its handle would not. This is
+    // the missing backport of the Linux shim's anchored lookups (passing the
+    // directory as `dir` to the LiteBox path APIs), which would also save the
+    // extra `path()` round trip per call; `open_path`'s namei emulation would
+    // need to walk from the handle instead of a joined path.
     pub(crate) fn sys_openat(
         &self,
         dirfd: i32,

@@ -1101,7 +1101,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Names a path for interfaces that require an absolute name, querying the broker for the
     /// working directory's current name if `path` is relative. Filesystem operations should
-    /// instead pass the cwd handle so they continue to work after unlink.
+    /// instead pass the cwd handle so they continue to work after a rename.
     pub(super) fn absolute_name(&self, path: &str) -> Result<String, Errno> {
         if path.is_empty() {
             return Err(Errno::ENOENT);
