@@ -3988,7 +3988,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             no_new_privs: self.no_new_privs(),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit: self.thread.sve_vl_inherit.get(),
-            path,
+            path: path.into(),
             execfn,
             cwd,
             argv,

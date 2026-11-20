@@ -8,7 +8,7 @@
 //! guest-neutral Unix socket operations.
 
 use alloc::{
-    string::{String, ToString as _},
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -136,13 +136,10 @@ impl UnixSocketAddr {
         match self {
             UnixSocketAddr::Unnamed => Err(Errno::EINVAL),
             UnixSocketAddr::Abstract(name) => Ok(UnixSocketAddress::Abstract(name.clone())),
-            UnixSocketAddr::Path(path) => {
-                let resolved = task.fs.borrow().context.read().resolve(path.as_str());
-                Ok(UnixSocketAddress::Path {
-                    path: resolved.to_string(),
-                    name: path.as_bytes().to_vec(),
-                })
-            }
+            UnixSocketAddr::Path(path) => Ok(UnixSocketAddress::Path {
+                path: task.resolve_path(path)?.into(),
+                name: path.as_bytes().to_vec(),
+            }),
         }
     }
 }
@@ -442,7 +439,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
 }
 
 impl<Platform: ShimPlatform> GlobalState<Platform> {
-    /// Runs `f` on the Unix socket at `fd`, without holding the descriptor table.
+    /// Runs `f` on the Unix socket at `fd`, without holding shim descriptor locks.
     pub(super) fn with_unix_socket<R>(
         &self,
         fd: &UnixSocketFd<Platform>,
@@ -453,7 +450,10 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             .descriptor_table()
             .entry_handle(fd)
             .ok_or(Errno::EBADF)?;
-        handle.with_entry(f)
+        let socket = handle.with_entry(|entry| UnixSocket {
+            socket: Arc::clone(&entry.socket),
+        });
+        f(&socket)
     }
 
     /// Adopts a Unix socket of type `socket_type` this process inherited from

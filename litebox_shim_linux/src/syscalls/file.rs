@@ -15,7 +15,10 @@ use litebox::{
         wait::{WaitContext, WaitError},
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
-    fs::errors::{LockError, OpenError},
+    fs::{
+        BrokerPath, Context, ResolvedPath,
+        errors::{LockError, OpenError},
+    },
     process::{InheritableFd, ProcessError},
     sync::Mutex,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
@@ -141,11 +144,6 @@ impl<Platform: ShimPlatform> File<Platform> {
         Ok(self.file.status()?)
     }
 
-    /// Absolute path of the file, with symbolic links resolved, as of when it was opened.
-    pub(crate) fn path(&self) -> Result<String, Errno> {
-        Ok(self.file.path()?)
-    }
-
     /// Controls the shared terminal, waiting interruptibly for output-draining operations.
     pub(crate) fn terminal_control(
         &self,
@@ -253,6 +251,14 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
+    /// Keep a file open after releasing its shim descriptor entry lock.
+    fn broker_file(
+        &self,
+        fd: &FileFd<Platform>,
+    ) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
+        self.with_file(fd, |file| Ok(Arc::clone(file.file())))
+    }
+
     /// Adopts a file this process inherited from its parent as `handle`.
     pub(crate) fn adopt_inherited_file(
         &self,
@@ -335,9 +341,9 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         if !cwd.starts_with('/') {
             return Err(Errno::EINVAL);
         }
-        let mut context = self.context.write();
-        let cwd = context.resolve(cwd);
-        context.set_cwd(cwd);
+        self.context
+            .write()
+            .set_cwd(ResolvedPath::from_absolute(cwd.into()));
         Ok(())
     }
 }
@@ -783,7 +789,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 #[derive(Debug)]
 enum FsPath {
     /// Absolute path
-    Absolute { path: String },
+    Absolute(BrokerPath),
     /// Current working directory
     Cwd,
     /// Path is relative to a file descriptor
@@ -799,12 +805,16 @@ impl FsPath {
     /// Create a new `FsPath` from a dirfd and path.
     ///
     /// CWD-relative paths are resolved immediately to absolute paths.
-    fn new(dirfd: i32, path: &str, get_cwd: impl FnOnce() -> String) -> Result<Self, Errno> {
+    fn new(
+        dirfd: i32,
+        path: &str,
+        join_cwd: impl FnOnce(&str) -> BrokerPath,
+    ) -> Result<Self, Errno> {
         if path.len() > PATH_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
         let fs_path = if path.starts_with('/') {
-            FsPath::Absolute { path: path.into() }
+            FsPath::Absolute(BrokerPath::verbatim(path.into()))
         } else if dirfd >= 0 {
             if path.is_empty() {
                 FsPath::Fd(dirfd)
@@ -818,20 +828,14 @@ impl FsPath {
             if path.is_empty() {
                 FsPath::Cwd
             } else {
-                // Resolve CWD-relative path to absolute.
-                let mut abs = get_cwd();
-                abs.push_str(path);
-                FsPath::Absolute { path: abs }
+                FsPath::Absolute(join_cwd(path))
             }
         } else {
             // TODO: Linux rejects an empty path with ENOENT before checking dirfd, unless AT_EMPTY_PATH.
             return Err(Errno::EBADF);
         };
-        match &fs_path {
-            FsPath::Absolute { path } | FsPath::FdRelative { path, .. } if path.contains('\0') => {
-                return Err(Errno::EINVAL);
-            }
-            _ => {}
+        if path.contains('\0') {
+            return Err(Errno::EINVAL);
         }
         Ok(fs_path)
     }
@@ -1007,25 +1011,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.fs.borrow().umask()
     }
 
-    /// The current working directory, as a prefix that a relative path can be appended to.
-    ///
-    /// Always ends with a `/`.
-    fn cwd_prefix(&self) -> String {
-        let mut cwd = self.fs.borrow().context.read().cwd().to_string();
-        if !cwd.ends_with('/') {
-            cwd.push('/');
-        }
-        cwd
+    /// Snapshot the filesystem context without keeping it locked during broker calls.
+    fn fs_context(&self) -> Context {
+        self.fs.borrow().context.read().clone()
     }
 
     /// Resolve `path`, relative to the directory open at `fd`, to an absolute path.
-    fn resolve_fd_relative(&self, fd: i32, path: &str) -> Result<String, Errno> {
+    fn resolve_fd_relative(&self, fd: i32, path: &str) -> Result<BrokerPath, Errno> {
         let mut abs = self.dirfd_directory(fd)?.1;
         if !abs.ends_with('/') {
             abs.push('/');
         }
         abs.push_str(path);
-        Ok(abs)
+        Ok(BrokerPath::verbatim(abs))
     }
 
     /// The status, and the absolute path with symbolic links resolved, of the directory open at
@@ -1037,42 +1035,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
     // track the directory itself rather than its path.
     fn dirfd_directory(&self, fd: i32) -> Result<(FileStatus, String), Errno> {
         let fd = self.typed_fd(fd)?;
-        let file = fd.file_only(Errno::ENOTDIR)?;
-        self.global.with_file(file, |file| {
-            let status = file.status()?;
-            if status.file_type != FileType::Directory {
-                return Err(Errno::ENOTDIR);
-            }
-            Ok((status, file.path()?))
-        })
+        let file = self.global.broker_file(fd.file_only(Errno::ENOTDIR)?)?;
+        let status = file.status()?;
+        if status.file_type != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        Ok((status, file.path()?))
     }
 
     /// Resolve a path against the current working directory.
-    pub(crate) fn resolve_path(&self, path: &str) -> Result<String, Errno> {
-        if path.is_empty() {
-            return Err(Errno::ENOENT);
-        }
-        let path = if path.starts_with('/') {
-            String::from(path)
-        } else {
-            let mut cwd = self.cwd_prefix();
-            cwd.push_str(path);
-            cwd
-        };
-        if path.contains('\0') {
-            return Err(Errno::EINVAL);
-        }
-        Ok(path)
+    pub(crate) fn resolve_path(&self, path: &str) -> Result<BrokerPath, Errno> {
+        self.resolve_path_at(litebox_common_linux::AT_FDCWD, path)
     }
 
     /// Resolve a path relative to a dirfd.
     ///
     /// Note that an empty path is not valid for this function, and will be rejected with `ENOENT`.
-    fn resolve_path_at(&self, dirfd: i32, pathname: &str) -> Result<String, Errno> {
-        let get_cwd = || self.cwd_prefix();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        match fs_path {
-            FsPath::Absolute { path } => Ok(path),
+    fn resolve_path_at(&self, dirfd: i32, pathname: &str) -> Result<BrokerPath, Errno> {
+        match FsPath::new(dirfd, pathname, |path| self.fs_context().joined(path))? {
+            FsPath::Absolute(path) => Ok(path),
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
             FsPath::FdRelative { fd, path } => self.resolve_fd_relative(fd, &path),
         }
@@ -1080,13 +1061,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     pub(crate) fn do_open(
         &self,
-        path: &str,
+        path: &BrokerPath,
         flags: OFlags,
         mode: Mode,
     ) -> Result<litebox::fs::File<Platform>, Errno> {
         let mode = mode & !self.get_umask();
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         // The broker opens on behalf of a `vfork` child's parent, so the open must not give the
         // parent's session a controlling terminal. The child can still acquire one with
         // `TIOCSCTTY`.
@@ -1202,8 +1182,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENAMETOOLONG);
         }
         let linkpath = self.resolve_path_at(dirfd, linkpath)?;
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         self.global
             .litebox
             .symlink_file(target, &context, &linkpath)
@@ -1213,8 +1192,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle path-based `chmod` and `fchmodat`.
     pub(crate) fn sys_fchmodat(&self, dirfd: i32, pathname: &str, mode: u32) -> Result<(), Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         self.global
             .litebox
             .chmod_file(&context, &path, Mode::from_u32_bits_truncate(mode))
@@ -1341,17 +1319,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Some(path) => path.to_cstring::<Platform>().ok_or(Errno::EFAULT)?,
         };
         let path = path.to_str().map_err(|_| Errno::EINVAL)?;
-        let path = match FsPath::new(dirfd, path, || self.cwd_prefix())? {
-            FsPath::Absolute { path } => path,
-            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => self.cwd_prefix(),
+        let context = self.fs_context();
+        let path = match FsPath::new(dirfd, path, |path| context.joined(path))? {
+            FsPath::Absolute(path) => path,
+            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => context.joined(""),
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 return self.set_fd_times(fd, &times);
             }
             FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
             FsPath::FdRelative { fd, path } => self.resolve_fd_relative(fd, &path)?,
         };
-        let user = self.fs.borrow().context.read().acting_user();
-        // Like fchmodat, path forms resolve in the shim; the broker only sets times by handle.
+        let user = context.acting_user();
+        // The broker only sets times by handle.
         let flags = if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
             OFlags::PATH | OFlags::NOFOLLOW
         } else {
@@ -1365,9 +1344,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let user = self.fs.borrow().context.read().acting_user();
         // XXX: the NULL-path form does not reject O_PATH fds (Linux: EBADF).
         self.with_typed_fd(fd, |fd| match fd.as_file() {
-            Some(fd) => self
-                .global
-                .with_file(fd, |file| Ok(file.file().set_times(user, times)?)),
+            Some(fd) => Ok(self.global.broker_file(fd)?.set_times(user, times)?),
             None => Ok(()),
         })
     }
@@ -1400,8 +1377,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let owner = to_id(owner)?;
         let group = to_id(group)?;
         let path = self.resolve_path_at(dirfd, pathname)?;
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         self.global
             .litebox
             .chown_file(&context, &path, owner, group)
@@ -1482,8 +1458,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let oldpath = self.resolve_path_at(olddirfd, oldpath)?;
         let newpath = self.resolve_path_at(newdirfd, newpath)?;
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         self.global
             .litebox
             .rename_file(&context, &oldpath, &newpath)
@@ -1502,8 +1477,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let path = self.resolve_path_at(dirfd, pathname)?;
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
+        let context = self.fs_context();
         if flags.contains(AtFlags::AT_REMOVEDIR) {
             self.global
                 .litebox
@@ -1873,20 +1847,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.global.with_file(fd, |file| file.seek(offset, whence))
     }
 
-    fn do_mkdir(&self, pathname: &str, mode: Mode) -> Result<(), Errno> {
-        let mode = mode & !self.get_umask();
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
-        self.global
-            .litebox
-            .mkdir_file(&context, pathname, mode)
-            .map_err(Errno::from)
-    }
-
     /// Handle syscall `mkdirat`
     pub(crate) fn sys_mkdirat(&self, dirfd: i32, pathname: &str, mode: u32) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        self.do_mkdir(&pathname, Mode::from_u32_bits_truncate(mode))
+        let mode = Mode::from_u32_bits_truncate(mode) & !self.get_umask();
+        self.global
+            .litebox
+            .mkdir_file(&self.fs_context(), pathname, mode)
+            .map_err(Errno::from)
     }
 
     /// Handle syscall `mount` for a fresh tmpfs mount.
@@ -1913,11 +1881,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             log_unsupported!("mount filesystem {filesystemtype}");
             return Err(Errno::ENODEV);
         }
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
         self.global
             .litebox
-            .mount_in_mem(&context, target)
+            .mount_in_mem(&self.fs_context(), target)
             .map_err(|error| {
                 use litebox_broker_protocol::fs::FileError;
                 match error {
@@ -2362,18 +2328,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn do_access(
         &self,
-        pathname: &str,
+        pathname: &BrokerPath,
         mode: AccessFlags,
         caller: AccessUserInfo,
         follow_symlink: bool,
     ) -> Result<(), Errno> {
-        let status = {
-            let fs = self.fs.borrow();
-            let context = fs.context.read();
+        let status =
             self.global
                 .litebox
-                .path_file_status(&context, pathname, follow_symlink)?
-        };
+                .path_file_status(&self.fs_context(), pathname, follow_symlink)?;
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
     }
@@ -2395,22 +2358,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Self::validate_access_mode(&mode)?;
         let caller = self.access_user(&flags);
         let follow_symlink = !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
-        let get_cwd = || self.cwd_prefix();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        match fs_path {
-            FsPath::Absolute { path } => self.do_access(&path, mode, caller, follow_symlink),
+        match FsPath::new(dirfd, pathname, |path| self.fs_context().joined(path))? {
+            FsPath::Absolute(path) => self.do_access(&path, mode, caller, follow_symlink),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let cwd = get_cwd();
+                let cwd = self.fs_context().joined("");
                 self.do_access(&cwd, mode, caller, follow_symlink)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let files = self.files.borrow();
-                let typed_fd = files.typed_fd(fd)?;
+                let typed_fd = self.typed_fd(fd)?;
                 if let Some(file) = typed_fd.as_file() {
-                    let status = self.global.with_file(file, File::status)?;
+                    let status = self.global.broker_file(file)?.status()?;
                     return Self::do_access_mode(status.mode, status.owner.into(), caller, &mode);
                 }
-                drop(files);
                 let stat: FileStat = self.do_stat(&typed_fd)?;
                 let owner = AccessUserInfo {
                     user: stat.st_uid,
@@ -2447,14 +2406,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         )
     }
 
-    /// Read the target of a symbolic link
-    ///
-    /// The caller must pass an absolute path.
-    fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
-        if let Some(fd) = self.proc_self_fd(fullpath) {
+    /// Read the target of a symbolic link.
+    fn do_readlink(&self, fullpath: &BrokerPath) -> Result<String, Errno> {
+        if let Some(fd) = self.proc_self_fd(fullpath.as_str()) {
             // Like Linux, a non-file descriptor names its kind; the inode numbers match `fstat`.
             return fd?.dispatch(
-                |fd| self.global.with_file(fd, File::path),
+                |fd| Ok(self.global.broker_file(fd)?.path()?),
                 |_fd| Ok("socket:[0]".into()),
                 |_fd| Ok("pipe:[0]".into()),
                 |_fd| Ok("anon_inode:[eventfd]".into()),
@@ -2466,9 +2423,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             );
         }
 
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
-        Ok(self.global.litebox.read_link_file(&context, fullpath)?)
+        Ok(self
+            .global
+            .litebox
+            .read_link_file(&self.fs_context(), fullpath)?)
     }
 
     /// Handle syscall `readlink`
@@ -2556,7 +2514,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | u32::from((Mode::RWXU | Mode::RWXG | Mode::RWXO).bits());
         let rw_user_mode = u32::from((Mode::RUSR | Mode::WUSR).bits());
         fd.dispatch(
-            |fd| T::try_from(self.global.with_file(fd, File::status)?),
+            |fd| T::try_from(self.global.broker_file(fd)?.status()?),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
             |fd| {
                 let mode_bits = self.global.with_pipe_end(fd, |pipe| Ok(pipe.mode_bits()))?;
@@ -2572,24 +2530,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Get the file status of `pathname`.
-    ///
-    /// The `pathname` must be absolute.
-    fn do_path_stat<T>(&self, pathname: &str, follow_symlink: bool) -> Result<T, Errno>
+    fn do_path_stat<T>(&self, pathname: &BrokerPath, follow_symlink: bool) -> Result<T, Errno>
     where
         T: TryFrom<FileStatus, Error = Errno> + From<FileStat>,
     {
         // The shim, not the file system, serves `/proc/self/fd/<fd>`; following it reaches the open
         // descriptor itself.
-        if follow_symlink && let Some(fd) = self.proc_self_fd(pathname) {
+        if follow_symlink && let Some(fd) = self.proc_self_fd(pathname.as_str()) {
             return self.do_stat(&fd?);
         }
-        let status = {
-            let fs = self.fs.borrow();
-            let context = fs.context.read();
+        let status =
             self.global
                 .litebox
-                .path_file_status(&context, pathname, follow_symlink)?
-        };
+                .path_file_status(&self.fs_context(), pathname, follow_symlink)?;
         T::try_from(status)
     }
 
@@ -2629,19 +2582,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     where
         T: TryFrom<FileStatus, Error = Errno> + From<FileStat>,
     {
-        let get_cwd = || self.cwd_prefix();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        match fs_path {
-            FsPath::Absolute { path } => {
+        match FsPath::new(dirfd, pathname, |path| self.fs_context().joined(path))? {
+            FsPath::Absolute(path) => {
                 self.do_path_stat(&path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
             }
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                // Take the cwd before locking the context: this lock is not recursive, so a
-                // waiting writer would deadlock a nested read.
-                let cwd = get_cwd();
-                let fs = self.fs.borrow();
-                let context = fs.context.read();
-                T::try_from(self.global.litebox.path_file_status(&context, &cwd, true)?)
+                let context = self.fs_context();
+                let cwd = context.joined("");
+                T::try_from(self.global.litebox.path_file_status(&context, cwd, true)?)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 self.with_typed_fd(fd, |fd| self.do_stat(fd))
@@ -2968,24 +2916,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub fn sys_chdir(&self, pathname: &str) -> Result<(), Errno> {
         use litebox::fs::errors::{FileStatusError, PathError};
 
-        let fs = self.fs.borrow();
-        if pathname.is_empty() {
-            return Err(Errno::ENOENT);
-        }
-
-        // Resolve relative paths against the CWD, following symlinks and `.` / `..`.
-        let target = {
-            let context = fs.context.read();
-            self.global.litebox.resolve_file_path(&context, pathname)?
-        };
+        let context = self.fs_context();
+        let target = self.global.litebox.resolve_file_path(&context, pathname)?;
 
         // Verify the path exists and is a directory.
         {
-            let context = fs.context.read();
             match self
                 .global
                 .litebox
-                .path_file_status(&context, &target.to_string(), true)
+                .path_file_status(&context, target.to_string(), true)
             {
                 Ok(status) => {
                     if status.file_type != FileType::Directory {
@@ -3003,7 +2942,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
 
-        fs.context.write().set_cwd(target);
+        self.fs.borrow().context.write().set_cwd(target);
         Ok(())
     }
 
@@ -3016,9 +2955,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if caller.user != 0 {
             Self::do_access_mode(status.mode, status.owner.into(), caller, &AccessFlags::X_OK)?;
         }
-        let fs = self.fs.borrow();
-        let cwd = fs.context.read().resolve(&path);
-        fs.context.write().set_cwd(cwd);
+        self.fs
+            .borrow()
+            .context
+            .write()
+            .set_cwd(ResolvedPath::from_absolute(path));
         Ok(())
     }
 }
@@ -4056,42 +3997,44 @@ mod tests {
     #[test]
     fn fspath_new() {
         // Absolute paths should never invoke the get_cwd closure.
-        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "/usr/bin", || {
-            panic!("get_cwd should not be called for absolute paths")
+        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "/usr/bin", |_| {
+            panic!("join_cwd should not be called for absolute paths")
         })
         .unwrap();
-        assert!(matches!(fp, FsPath::Absolute { path } if path == "/usr/bin"));
+        assert!(matches!(fp, FsPath::Absolute(path) if path.as_str() == "/usr/bin"));
 
         // Relative path resolves against CWD.
-        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "foo/bar", || {
-            String::from("/home/")
+        let mut context = Context::new();
+        context.set_cwd(ResolvedPath::from_absolute("/home".into()));
+        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "foo/bar", |path| {
+            context.joined(path)
         })
         .unwrap();
-        assert!(matches!(fp, FsPath::Absolute { path } if path == "/home/foo/bar"));
+        assert!(matches!(fp, FsPath::Absolute(path) if path.as_str() == "/home/foo/bar"));
 
         // Empty path at AT_FDCWD → Cwd variant.
-        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "", || {
-            panic!("get_cwd should not be called for empty Cwd path")
+        let fp = FsPath::new(litebox_common_linux::AT_FDCWD, "", |_| {
+            panic!("join_cwd should not be called for empty Cwd path")
         })
         .unwrap();
         assert!(matches!(fp, FsPath::Cwd));
 
         // Positive fd + empty path → Fd variant.
-        let fp = FsPath::new(5, "", || panic!("should not be called")).unwrap();
+        let fp = FsPath::new(5, "", |_| panic!("should not be called")).unwrap();
         assert!(matches!(fp, FsPath::Fd(5)));
 
         // Positive fd + relative path → FdRelative variant, left for the caller to resolve.
-        let fp = FsPath::new(5, "foo/bar", || panic!("should not be called")).unwrap();
+        let fp = FsPath::new(5, "foo/bar", |_| panic!("should not be called")).unwrap();
         assert!(matches!(fp, FsPath::FdRelative { fd: 5, path } if path == "foo/bar"));
 
         // Invalid dirfd → EBADF.
-        let err = FsPath::new(-1, "file.txt", || panic!("should not be called")).unwrap_err();
+        let err = FsPath::new(-1, "file.txt", |_| panic!("should not be called")).unwrap_err();
         assert_eq!(err, Errno::EBADF);
 
         // Path exceeding PATH_MAX → ENAMETOOLONG.
         let long_path = "a".repeat(PATH_MAX + 1);
-        let err = FsPath::new(litebox_common_linux::AT_FDCWD, long_path.as_str(), || {
-            String::from("/")
+        let err = FsPath::new(litebox_common_linux::AT_FDCWD, long_path.as_str(), |_| {
+            panic!("should not be called")
         })
         .unwrap_err();
         assert_eq!(err, Errno::ENAMETOOLONG);

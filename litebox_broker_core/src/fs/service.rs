@@ -1035,6 +1035,7 @@ fn file_open_error(error: OpenError) -> FileError {
         OpenError::NoWritePerms => FileError::NoWritePermissions,
         OpenError::ReadOnlyFileSystem => FileError::ReadOnlyFs,
         OpenError::AlreadyExists => FileError::AlreadyExists,
+        OpenError::IsDirectory => FileError::IsDirectory,
         OpenError::TruncateError(error) => file_truncate_error(error),
         OpenError::PathError(error) => file_path_error(error),
         OpenError::Io => FileError::Io,

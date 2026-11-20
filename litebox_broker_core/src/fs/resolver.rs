@@ -213,11 +213,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     // final walking handle alongside the path would fix both.
     // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
     // outside the chrooted part.
-    // XXX: broker paths are absolute, so resolution always starts at the root. The client
-    // (`litebox::fs::Context::resolve`) also normalizes paths lexically before sending them: it
-    // collapses `.`/`..` (so `link/..` names the link's parent rather than, as on Linux, its
-    // target's parent) and drops trailing slashes, so `require_directory` and the final `.`/`..`
-    // checks below never trigger for guest paths (e.g. `unlink("link/")` removes the link).
     fn resolve_path(
         &self,
         context: &Context,
@@ -233,21 +228,25 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         let mut require_directory = path.ends_with('/');
         let mut resolved: Vec<String> = Vec::new();
         let mut links = 0;
+        let mut root_search_checked = false;
         // XXX(jayb): each run re-resolves from the root, since `Backend::resolve` consumes its
         // starting directory and does not report symlinks mid-walk.
         while let Some(name) = pending.front() {
-            match name.as_str() {
-                "." => {
-                    pending.pop_front();
-                    continue;
+            if matches!(name.as_str(), "." | "..") {
+                // A leading dot component still requires search permission on the root.
+                if !root_search_checked {
+                    if let PermissionCheck::ByResolver(permissions) =
+                        &self.backend.root()?.permissions
+                    {
+                        Self::check_search_permission(context, permissions)?;
+                    }
+                    root_search_checked = true;
                 }
-                ".." => {
-                    pending.pop_front();
-                    // The remaining prefix was already resolved (and search-checked) above.
+                if name == ".." {
                     resolved.pop();
-                    continue;
                 }
-                _ => {}
+                pending.pop_front();
+                continue;
             }
             let run_len = pending
                 .iter()
@@ -271,6 +270,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     result => break result.map_err(|error| error.error)?,
                 }
             };
+            root_search_checked = true;
             for part in resolved.drain(end..).rev() {
                 pending.push_front(part);
             }
@@ -311,6 +311,8 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                         resolved.clear();
                     }
                     if final_component && target.ends_with('/') {
+                        // XXX(jayb): O_CREAT should reject an ordinary final name with EISDIR
+                        // even when the trailing slash comes from the link target.
                         require_directory = true;
                     }
                     for part in target.split('/').filter(|part| !part.is_empty()).rev() {
@@ -584,6 +586,23 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         }
 
         let context = Context::new(user);
+        let map_walk_error = |error| match error {
+            WalkError::Io => OpenError::Io,
+            WalkError::PathError(error) => error.into(),
+        };
+        let trailing_create = flags.contains(OFlags::CREAT) && path.ends_with('/');
+        if trailing_create
+            && !matches!(
+                path.trim_end_matches('/').rsplit('/').next(),
+                Some("" | "." | "..")
+            )
+        {
+            // Linux resolves the parent but rejects O_CREAT with a trailing slash before
+            // looking up an ordinary final name (even when it is missing or a symlink).
+            self.parent_dir_and_name(&context, path)
+                .map_err(map_walk_error)?;
+            return Err(OpenError::IsDirectory);
+        }
         let path = self
             .resolve_path(
                 &context,
@@ -591,10 +610,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 !flags.contains(OFlags::NOFOLLOW) && !flags.contains(OFlags::CREAT | OFlags::EXCL),
                 flags.contains(OFlags::CREAT),
             )
-            .map_err(|error| match error {
-                WalkError::Io => OpenError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+            .map_err(map_walk_error)?;
+        if trailing_create && !flags.contains(OFlags::EXCL) {
+            return Err(OpenError::IsDirectory);
+        }
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
         let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
         let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
@@ -615,12 +634,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         };
 
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
-        let resolution =
-            self.resolve_components(&context, &components)
-                .map_err(|error| match error.error {
-                    WalkError::Io => OpenError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?;
+        let resolution = self
+            .resolve_components(&context, &components)
+            .map_err(|error| map_walk_error(error.error))?;
         match resolution {
             Resolution::Found(_) if flags.contains(OFlags::CREAT | OFlags::EXCL) => {
                 Err(OpenError::AlreadyExists)
@@ -1130,17 +1146,30 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             return Err(PathError::InvalidPathname.into());
         }
         let context = Context::new(user);
-        let Some((parent, name)) =
-            self.parent_dir_and_name(&context, linkpath)
-                .map_err(|error| match error {
-                    WalkError::Io => SymlinkError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
+        let map_walk_error = |error| match error {
+            WalkError::Io => SymlinkError::Io,
+            WalkError::PathError(error) => error.into(),
+        };
+        let Some((parent, name)) = self
+            .parent_dir_and_name(&context, linkpath)
+            .map_err(map_walk_error)?
         else {
             return Err(SymlinkError::AlreadyExists);
         };
         if matches!(name.as_str(), "." | "..") {
             return Err(SymlinkError::AlreadyExists);
+        }
+        if linkpath.ends_with('/') {
+            return Err(
+                if self
+                    .name_exists(&context, parent, &name)
+                    .map_err(map_walk_error)?
+                {
+                    SymlinkError::AlreadyExists
+                } else {
+                    PathError::NoSuchFileOrDirectory.into()
+                },
+            );
         }
         if let Err(error) = Self::check_dir_entries_change(
             &context,

@@ -10,4 +10,4 @@
 pub mod errors;
 mod file;
 
-pub use file::{Context, File, ResolvedPath, SharedFileObject};
+pub use file::{BrokerPath, Context, File, PathArg, ResolvedPath, SharedFileObject};

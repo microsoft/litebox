@@ -199,7 +199,9 @@ pub fn bind(
                 ino: status.node_info.ino,
             }
         }
-        Err(FileError::AlreadyExists) => return Ok(Err(UnixSocketError::AddressInUse)),
+        Err(FileError::AlreadyExists | FileError::IsDirectory) => {
+            return Ok(Err(UnixSocketError::AddressInUse));
+        }
         Err(error) => return Ok(Err(UnixSocketError::File(error))),
     };
     let registered = socket.register_name(&mut state, key, address.name())?;
