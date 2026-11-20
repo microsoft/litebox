@@ -143,30 +143,34 @@ pub(crate) fn find_rewriter_source_files() -> Vec<PathBuf> {
     source_files
 }
 
-/// Compile C code into an executable with caching
+/// Compile C code into an executable with caching.
+///
+/// Tests that compile the same source the same way may share `unique_name`: the output is replaced
+/// only once complete, so that no test runs a partly written binary, and rebuilding one that
+/// another test runs doesn't fail with `ETXTBSY`.
 pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: bool) -> PathBuf {
     let dir_path = env!("CARGO_TARGET_TMPDIR").to_string();
     let path = std::path::Path::new(dir_path.as_str()).join(unique_name);
     let output = path.to_str().unwrap();
 
-    let mut args = vec!["-o", output, src_path];
+    let mut flags = vec![src_path];
     if exec_or_lib {
-        args.push("-static");
+        flags.push("-static");
     }
     if nolibc {
-        args.push("-nostdlib");
+        flags.push("-nostdlib");
     }
     // Select the x86 ABI explicitly; AArch64 gcc rejects both x86 flags.
     match std::env::consts::ARCH {
-        "x86_64" => args.push("-m64"),
-        "x86" => args.push("-m32"),
+        "x86_64" => flags.push("-m64"),
+        "x86" => flags.push("-m32"),
         "aarch64" => (),
         arch => unimplemented!("no gcc ABI flag known for {arch}"),
     }
 
     // Create command string for caching
-    let mut command_parts = vec!["gcc"];
-    command_parts.extend_from_slice(&args);
+    let mut command_parts = vec!["gcc", "-o", output];
+    command_parts.extend_from_slice(&flags);
     let command = command_parts.join(" ");
 
     // Check cache first. Include any sibling `.h` files in the source's directory
@@ -191,8 +195,16 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
 
     println!("Compiling: {src_path} -> {unique_name}");
 
+    // Build beside the output, so that renaming the result into place is atomic.
+    let staging = tempfile::Builder::new()
+        .prefix(".compile")
+        .tempdir_in(path.parent().unwrap())
+        .unwrap();
+    let staged = staging.path().join(path.file_name().unwrap());
     let output = std::process::Command::new("gcc")
-        .args(args)
+        .arg("-o")
+        .arg(&staged)
+        .args(flags)
         .output()
         .expect("Failed to compile");
     assert!(
@@ -200,6 +212,7 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
         "failed to compile: {:?}",
         std::str::from_utf8(output.stderr.as_slice()).unwrap()
     );
+    std::fs::rename(&staged, &path).unwrap();
 
     // Create cache entry after successful compilation
     if let Err(e) = crate::cache::create_cache_entry(&input_paths, &path, &command) {

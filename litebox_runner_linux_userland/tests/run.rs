@@ -144,6 +144,9 @@ fn test_mount_tmpfs() {
 
 include!(concat!(env!("OUT_DIR"), "/c_tests.rs"));
 
+/// The program that C tests of the `with_exec_child` kind execute.
+const EXEC_CHILD: &str = "./tests/vfork_exec_child.c";
+
 fn c_test_stem(path: &str) -> &str {
     Path::new(path)
         .file_stem()
@@ -151,15 +154,12 @@ fn c_test_stem(path: &str) -> &str {
         .expect("failed to get file stem")
 }
 
-/// Builds `vfork_exec_child.c` for the C test `stem`, like the test with `suffix` and
-/// `exec_or_lib`, under a name of its own so that concurrent tests don't share it.
-fn build_exec_child(stem: &str, suffix: &str, exec_or_lib: bool) -> PathBuf {
-    common::compile(
-        "./tests/vfork_exec_child.c",
-        &format!("{stem}_child{suffix}"),
-        exec_or_lib,
-        false,
-    )
+/// Builds the C program at `path`, as a static executable if `exec_or_lib`, under a name that every
+/// test building it the same way shares.
+fn build_c_program(path: &str, exec_or_lib: bool) -> PathBuf {
+    let linkage = if exec_or_lib { "static" } else { "dynamic" };
+    let name = format!("{}.{linkage}", c_test_stem(path));
+    common::compile(path, &name, exec_or_lib, false)
 }
 
 /// Runs a C test in LiteBox, letting it create processes if `allow_duplication`, and passing it
@@ -171,10 +171,8 @@ fn run_c_test(
     allow_duplication: bool,
     with_exec_child: bool,
 ) {
-    let stem = c_test_stem(path);
-    let unique_name = format!("{stem}{suffix}");
-    let target = common::compile(path, &unique_name, exec_or_lib, false);
-    let mut runner = Runner::new(&target, &unique_name);
+    let target = build_c_program(path, exec_or_lib);
+    let mut runner = Runner::new(&target, &format!("{}{suffix}", c_test_stem(path)));
     #[cfg(target_os = "linux")]
     {
         configure_pipe_broker(Path::new(path), &mut runner);
@@ -185,7 +183,7 @@ fn run_c_test(
     #[cfg(not(target_os = "linux"))]
     assert!(!allow_duplication, "only Linux runners create processes");
     if with_exec_child {
-        let child = build_exec_child(stem, suffix, exec_or_lib);
+        let child = build_c_program(EXEC_CHILD, exec_or_lib);
         // The guest finds the child where the host keeps it.
         let child_guest_path = std::path::absolute(&child).unwrap();
         runner.arg(&child_guest_path).with_fs_path(|root| {
@@ -247,8 +245,7 @@ mod test_static_exec_with_rewriter {
 /// hold on Linux and not only under LiteBox.
 #[cfg(target_os = "linux")]
 fn run_native_c_test(path: &str, with_exec_child: bool) {
-    let stem = c_test_stem(path);
-    let target = common::compile(path, &format!("{stem}_native"), true, false);
+    let target = build_c_program(path, true);
     let Some(mut native) = Native::new(&target) else {
         return;
     };
@@ -256,7 +253,7 @@ fn run_native_c_test(path: &str, with_exec_child: bool) {
         native.env(PIPE_BROKER_VARIABLE, "1");
     }
     if with_exec_child {
-        let child = build_exec_child(stem, "_native", true);
+        let child = build_c_program(EXEC_CHILD, true);
         native.arg(std::path::absolute(child).unwrap());
     }
     native.output();

@@ -69,7 +69,8 @@ impl CacheEntry {
     }
 
     fn save_to_file(&self, cache_path: &Path) -> std::io::Result<()> {
-        let mut file = std::fs::File::create(cache_path)?;
+        // Replace the entry whole, as another process may be reading it.
+        let mut file = tempfile::NamedTempFile::new_in(cache_path.parent().unwrap())?;
 
         for summary in &self.input_summaries {
             writeln!(file, "input:{summary}")?;
@@ -77,6 +78,7 @@ impl CacheEntry {
         writeln!(file, "output:{}", self.output_summary)?;
         writeln!(file, "command:{}", self.command_hash)?;
 
+        file.persist(cache_path).map_err(|error| error.error)?;
         Ok(())
     }
 
