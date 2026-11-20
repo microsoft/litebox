@@ -266,16 +266,18 @@ int main(int argc, char **argv) {
         printf("child-read-byte n=%zd byte=%c\n", n, byte);
         return n == 1 && byte == argv[2][0] ? 42 : 43;
     }
+    if (strcmp(marker, "from-vfork") != 0 && strcmp(marker, "from-spawn") != 0 &&
+        strcmp(marker, "from-clone") != 0) {
+        fprintf(stderr, "unknown or incomplete child mode: %s\n", marker);
+        return 43;
+    }
     const char *environment = getenv("VFORK_EXEC_TEST");
     printf("child pid=%d ppid=%d tid=%ld marker=%s env=%s\n", getpid(),
            getppid(), syscall(SYS_gettid), marker,
            environment == NULL ? "" : environment);
-    // A parent that names itself expects this process to be its only thread, the parent's child,
-    // and to have the marker `from-<VFORK_EXEC_TEST>`.
     const char *parent = getenv("VFORK_EXEC_PARENT");
-    if (parent != NULL &&
-        (syscall(SYS_gettid) != getpid() || getppid() != atoi(parent) || environment == NULL ||
-         strncmp(marker, "from-", 5) != 0 || strcmp(marker + 5, environment) != 0)) {
+    if (parent == NULL || environment == NULL || syscall(SYS_gettid) != getpid() ||
+        getppid() != atoi(parent) || strcmp(marker + 5, environment) != 0) {
         return 43;
     }
     // A parent that names a descriptor checks the ID reported through it (see `helpers.h`).

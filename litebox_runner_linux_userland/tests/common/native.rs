@@ -12,7 +12,8 @@
 //! which kills anything the program left running.
 
 use std::ffi::{CStr, OsStr};
-use std::io;
+use std::io::{self, Read as _, Write as _};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -110,37 +111,45 @@ fn isolated(program: impl AsRef<OsStr>) -> Command {
     // The child may not allocate, so the maps are formatted here.
     let uid_map = format!("{uid} {uid} 1");
     let gid_map = format!("{gid} {gid} 1");
+    let parent = std::process::id();
     let mut command = Command::new(program);
     // SAFETY: `isolate` only makes async-signal-safe system calls and allocates nothing, and the
     // processes it forks never return from it, except the one that goes on to run the program.
     unsafe {
-        command.pre_exec(move || isolate(uid_map.as_bytes(), gid_map.as_bytes()));
+        command.pre_exec(move || isolate(parent, uid_map.as_bytes(), gid_map.as_bytes()));
     }
     command
 }
 
 /// Forks the first process of new user and PID namespaces, mapping the user and group IDs in
 /// `uid_map` and `gid_map` in them, and has it fork the process that returns to run the program.
-/// Neither of the other two returns: each exits as the program does.
+/// PID 1 relays the wait status to the outer supervisor, which exits as the program does.
 ///
 /// This process, which stays in the user namespace of the test, writes the maps: Ubuntu's
 /// `kernel.apparmor_restrict_unprivileged_userns` denies a process in a new namespace that right.
-fn isolate(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
+fn isolate(parent: u32, uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
     // Ends the namespace if the test running the program ends early, e.g. on a timeout.
     // SAFETY: setting the parent-death signal affects only this process.
     check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) })?;
-    let [mapped_reader, mapped_writer] = pipe()?;
+    // SAFETY: `getppid` has no preconditions. Parent death before `prctl` is not signalled.
+    if unsafe { libc::getppid() }.cast_unsigned() != parent {
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    let (mut mapper, mut init) = UnixStream::pair()?;
     let [status_reader, status_writer] = pipe()?;
     let first = fork(libc::CLONE_NEWUSER | libc::CLONE_NEWPID)?;
     if first != 0 {
+        drop(init);
         // SAFETY: this process no longer needs the descriptors.
         unsafe {
-            libc::close(mapped_reader);
             libc::close(status_writer);
         }
-        let mapped = write_proc_file(first, b"setgroups", b"deny")
+        let mapped = mapper
+            .read_exact(&mut [0])
+            .and_then(|()| write_proc_file(first, b"setgroups", b"deny"))
             .and_then(|()| write_proc_file(first, b"uid_map", uid_map))
-            .and_then(|()| write_proc_file(first, b"gid_map", gid_map));
+            .and_then(|()| write_proc_file(first, b"gid_map", gid_map))
+            .and_then(|()| mapper.write_all(&[0]));
         if let Err(error) = mapped {
             // SAFETY: `first` is this process's child, which is waiting for its maps.
             unsafe {
@@ -149,11 +158,7 @@ fn isolate(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
             }
             return Err(error);
         }
-        // SAFETY: the byte is valid for reads, and nothing else uses the descriptor.
-        unsafe {
-            libc::write(mapped_writer, [0u8].as_ptr().cast(), 1);
-            libc::close(mapped_writer);
-        }
+        drop(mapper);
         keep_only_standard_streams_and(status_reader);
         // SAFETY: `first` is this process's child.
         unsafe { libc::waitpid(first, core::ptr::null_mut(), 0) };
@@ -176,20 +181,16 @@ fn isolate(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
     }
 
     // This is the namespace's first process.
+    drop(mapper);
     // SAFETY: setting the parent-death signal affects only this process.
-    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
-    let mut mapped = 0u8;
-    // SAFETY: `mapped` has room for the byte read, and the descriptors are this process's.
-    let size = unsafe {
-        libc::close(mapped_writer);
-        libc::close(status_reader);
-        libc::read(mapped_reader, (&raw mut mapped).cast(), 1)
-    };
-    if size != 1 {
-        fail(b"the test ended before mapping the namespace's IDs", 0)
-    }
+    check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) })?;
+    // Its parent is outside this PID namespace, so getppid() cannot tell if it died before
+    // prctl. A reply to this post-prctl handshake proves the mapper was still alive.
+    init.write_all(&[0])?;
+    init.read_exact(&mut [0])?;
+    drop(init);
     // SAFETY: this process no longer needs the descriptor.
-    unsafe { libc::close(mapped_reader) };
+    unsafe { libc::close(status_reader) };
     let program = match fork(0) {
         Ok(program) => program,
         Err(error) => fail(b"forking the program", error.raw_os_error().unwrap_or(0)),

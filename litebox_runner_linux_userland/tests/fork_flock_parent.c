@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 // A forked child shares its parent's `flock` ownership through the open file description they
-// share, while a fresh open of the file conflicts with it. Separate opens of a file the test didn't
-// create, its own program, which LiteBox serves from the read-only image, conflict too.
+// share, while a fresh open of the file conflicts with it, on both a writable filesystem and
+// LiteBox's read-only program image.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -102,26 +102,8 @@ static void child_checks(const char *path, int inherited, int request, int reply
     _exit(0);
 }
 
-static void check_program_lock(const char *program) {
-    TEST_ASSERT(program[0] == '/', "program path must be absolute");
-    int locked = open(program, O_RDONLY);
-    int fresh = open(program, O_RDONLY);
-    TEST_ASSERT(locked >= 0 && fresh >= 0, "open program");
-    TEST_ASSERT(flock(locked, LOCK_EX | LOCK_NB) == 0, "lock program");
-    expect_conflict(fresh, LOCK_SH);
-    TEST_ASSERT(close(locked) == 0, "close locked program");
-    TEST_ASSERT(flock(fresh, LOCK_EX | LOCK_NB) == 0, "close releases program lock");
-    TEST_ASSERT(close(fresh) == 0, "close program");
-}
-
-int main(int argc, char **argv) {
-    (void)argc;
-    check_program_lock(argv[0]);
-    const char *path = test_path("fork_flock_lock");
-    set_handler(SIGALRM, on_timeout, 0);
+static void check_fork_locks(const char *path) {
     alarm(30);
-    int created = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    TEST_ASSERT(created >= 0 && close(created) == 0, "create lock file");
     int fd = open(path, O_RDONLY);
     TEST_ASSERT(fd >= 0, "parent open");
     TEST_ASSERT(flock(fd, LOCK_EX | LOCK_NB) == 0, "parent exclusive lock");
@@ -170,6 +152,16 @@ int main(int argc, char **argv) {
     close(request[1]);
     close(reply[0]);
     alarm(0);
+}
+
+int main(int argc, char **argv) {
+    TEST_ASSERT(argc > 0 && argv[0][0] == '/', "program path must be absolute");
+    set_handler(SIGALRM, on_timeout, 0);
+    check_fork_locks(argv[0]);
+    const char *path = test_path("fork_flock_lock");
+    int created = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    TEST_ASSERT(created >= 0 && close(created) == 0, "create lock file");
+    check_fork_locks(path);
     TEST_ASSERT(unlink(path) == 0, "remove lock file");
     puts("flock-fork inherited=1 conflict=1 shared=1 blocked=1 close=1 interrupted=1 exit=1");
     return 0;
