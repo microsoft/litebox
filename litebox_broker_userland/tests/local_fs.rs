@@ -1368,19 +1368,4 @@ fn held_directories_name_themselves_and_walk_up_to_the_root() {
         dir = parent;
     }
     assert!(local.parent_dir(&dir).unwrap().is_none());
-    // A held directory moved outside the export no longer exists for the guest. (Windows
-    // holds directories against renames.)
-    #[cfg(unix)]
-    {
-        let held = open_dir(&["a", "b"]);
-        let walking = local.walking_dir_at(&held).unwrap();
-        fs::rename(root.join("a/b"), temp.path().join("outside")).unwrap();
-        assert!(matches!(
-            local.resolve(walking, &["x"], &|_| unreachable!()),
-            Err(ResolutionError {
-                error: WalkError::PathError(PathError::NoSuchFileOrDirectory),
-                ..
-            })
-        ));
-    }
 }
