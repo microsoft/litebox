@@ -1,0 +1,35 @@
+name: verification
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+      - vlitebox
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+# If a new commit is pushed to the branch before ongoing runs finish, cancel the ongoing runs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_VERSION: 0.9.114
+
+jobs:
+  verification:
+    name: Verification
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'verification')
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Install Verus tools
+        run: .github/tools/install_verus
+      - name: Run verification
+        run: cargo verus focus -p litebox_platform_lvbs

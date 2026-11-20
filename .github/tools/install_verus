@@ -1,0 +1,226 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+#
+# Copyright (c) Microsoft Corporation
+#
+# Author: Ziqiao Zhou <ziqiaozhou@microsoft.com>
+# A script to install verus tools
+#
+# Usage:
+#   ./install_verus [--use-prebuilt] [--verus-dir PATH [--verus-rev REV]] [--force]
+
+set -euo pipefail
+trap 'echo "Error at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+# Verus release version and commit hash
+VERUS_VERSION=0.2026.05.24.ecee80a
+VERUS_RELEASE_TAG=release/$VERUS_VERSION
+DEFAULT_VERUS_REV=ecee80a2139923d503338e6989f79fb690ec7847
+VERUS_RUST_VERSION=1.95.0
+
+# Verusfmt version
+VERUSFMT_VERSION=v0.6.4
+
+VERUS_INSTALL_DIR="$HOME/.cargo/bin"
+
+TMPDIRS=()
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Install Verus and related tools into $VERUS_INSTALL_DIR.
+
+Options:
+  --use-prebuilt    Install release binaries. This is the default unless --verus-dir is passed.
+  --verus-dir PATH  Build from a Verus source checkout at PATH, cloning it if needed.
+  --verus-rev REV   Check out REV before building from source. Requires --verus-dir.
+  --force           Reinstall even if the expected Verus version is already present.
+  -h, --help        Show this help text.
+EOF
+}
+
+cleanup() {
+    local tmpdir
+    for tmpdir in "${TMPDIRS[@]}"; do
+        rm -rf "$tmpdir"
+    done
+}
+trap cleanup EXIT
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+command_exists() {
+    command -v "$1" > /dev/null 2>&1
+}
+
+require_commands() {
+    local cmd
+    for cmd in "$@"; do
+        command_exists "$cmd" || die "required command not found: $cmd"
+    done
+}
+
+make_temp_dir() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    TMPDIRS+=("$tmpdir")
+    echo "$tmpdir"
+}
+
+# Parse arguments
+INSTALL_PREBUILT=false
+FORCE_INSTALL=false
+VERUS_DIR=
+VERUS_REV=$DEFAULT_VERUS_REV
+VERUS_REV_SPECIFIED=false
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --use-prebuilt) INSTALL_PREBUILT=true ;;
+        --force) FORCE_INSTALL=true ;;
+        --verus-dir)
+            [ "$#" -gt 1 ] || die "--verus-dir requires a path"
+            VERUS_DIR=$2
+            shift
+            ;;
+        --verus-rev)
+            [ "$#" -gt 1 ] || die "--verus-rev requires a revision"
+            VERUS_REV=$2
+            VERUS_REV_SPECIFIED=true
+            shift
+            ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; die "unknown argument: $1" ;;
+    esac
+    shift
+done
+
+require_commands grep
+
+if $VERUS_REV_SPECIFIED && [ -z "$VERUS_DIR" ]; then
+    die "--verus-rev requires --verus-dir"
+fi
+
+if $INSTALL_PREBUILT && { [ -n "$VERUS_DIR" ] || $VERUS_REV_SPECIFIED; }; then
+    die "--use-prebuilt cannot be combined with --verus-dir or --verus-rev"
+fi
+
+fetch_code() {
+    url=$1
+    commit=$2
+    destdir=$3
+    require_commands git
+    git clone --no-checkout --depth 1 "$url" "$destdir"
+    pushd "$destdir" > /dev/null
+    git fetch --depth 1 origin "$commit"
+    git checkout FETCH_HEAD -b "$commit"
+    popd > /dev/null
+}
+
+# Install verus toolchain into your ~/.cargo/bin
+install_verus_assets() {
+    VERUS_ASSETS=(
+        "verus"
+        "rust_verify"
+        "z3"
+        "cargo-verus"
+        "verus-root"
+    )
+    local src_dir=$1
+    local dst_dir=$2
+    mkdir -p "$dst_dir"
+    for asset in "${VERUS_ASSETS[@]}"; do
+        [ -e "$src_dir/$asset" ] || die "missing Verus asset: $src_dir/$asset"
+        echo "Installing $asset to $dst_dir"
+        install "$src_dir/$asset" "$dst_dir"
+    done
+}
+
+verify_verus_assets() {
+    local asset
+    for asset in verus rust_verify z3 cargo-verus verus-root; do
+        [ -x "$VERUS_INSTALL_DIR/$asset" ] || die "installed asset is missing or not executable: $VERUS_INSTALL_DIR/$asset"
+    done
+    if [ "$VERUS_REV" = "$DEFAULT_VERUS_REV" ]; then
+        "$VERUS_INSTALL_DIR/verus" --version | grep -q "$VERUS_VERSION" \
+            || die "installed verus does not report expected version $VERUS_VERSION"
+    fi
+}
+
+# Ensure the Rust toolchain Verus requires is present before any verus invocation
+# (both prebuilt and from-source paths need it; from-source also installs targets/components below).
+require_commands rustup curl git install mktemp sh
+rustup toolchain install "$VERUS_RUST_VERSION" --profile minimal --no-self-update
+# Install x86_64-unknown-none target for verus-compatible Rust version
+export RUSTUP_TOOLCHAIN=$VERUS_RUST_VERSION
+rustup target add x86_64-unknown-none --toolchain "$RUSTUP_TOOLCHAIN"
+
+# Skip building Verus from source if the correct version is already installed
+if ! $FORCE_INSTALL && command_exists verus && verus --version 2> /dev/null | grep -q "$VERUS_VERSION"; then
+    echo "Verus version $VERUS_VERSION already installed, skipping build."
+    exit 0
+fi
+
+# Prebuilt path: download binaries and exit early
+install_prebuilt() {
+    require_commands curl install mktemp uname unzip
+    ARCH=$(uname -m)
+    OS=$(uname -s)
+    case "$ARCH" in
+        x86_64)        PLATFORM_ARCH="x86" ;;
+        aarch64|arm64) PLATFORM_ARCH="arm64" ;;
+        *) die "unsupported architecture: $ARCH" ;;
+    esac
+    case "$OS" in
+        Linux)  PLATFORM_OS="linux" ;;
+        Darwin) PLATFORM_OS="macos" ;;
+        *) die "unsupported OS: $OS" ;;
+    esac
+    PLATFORM="${PLATFORM_ARCH}-${PLATFORM_OS}"
+    ZIPFILE="verus-${VERUS_VERSION}-${PLATFORM}.zip"
+    VERUS_RELEASE_URL="https://github.com/verus-lang/verus/releases/download/release/${VERUS_VERSION}/${ZIPFILE}"
+
+    TMPDIR=$(make_temp_dir)
+    curl --proto '=https' --tlsv1.2 -LsSf "$VERUS_RELEASE_URL" -o "$TMPDIR/$ZIPFILE"
+    unzip -q "$TMPDIR/$ZIPFILE" -d "$TMPDIR"
+    install_verus_assets "$TMPDIR/verus-$PLATFORM" "$VERUS_INSTALL_DIR"
+    verify_verus_assets
+}
+
+if $INSTALL_PREBUILT; then
+    install_prebuilt
+    exit 0
+fi
+
+if [ -z "$VERUS_DIR" ]; then
+    install_prebuilt
+    exit 0
+fi
+
+# Install verusfmt
+curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/verus-lang/verusfmt/releases/download/$VERUSFMT_VERSION/verusfmt-installer.sh" | sh
+
+# Fetch Verus source code if VERUS_DIR does not exist.
+if [ ! -d "$VERUS_DIR" ]; then
+    fetch_code https://github.com/verus-lang/verus.git "$VERUS_REV" "$VERUS_DIR"
+elif $VERUS_REV_SPECIFIED; then
+    pushd "$VERUS_DIR" > /dev/null
+    git fetch --depth 1 origin "$VERUS_REV"
+    git checkout FETCH_HEAD -b "$VERUS_REV"
+    popd > /dev/null
+fi
+
+# Build and install Verus from source
+set +u
+source "$VERUS_DIR/tools/activate"
+set -euo pipefail
+pushd "$VERUS_DIR/source" > /dev/null
+./tools/get-z3.sh
+rustup component add rust-src rustc-dev llvm-tools-preview --toolchain "$RUSTUP_TOOLCHAIN"
+vargo build --release --vstd-no-verify
+popd > /dev/null
+install_verus_assets "$VERUS_DIR/source/target-verus/release" "$VERUS_INSTALL_DIR"
+verify_verus_assets

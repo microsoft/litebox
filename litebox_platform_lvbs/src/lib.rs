@@ -5,6 +5,8 @@
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
+#![cfg_attr(verus_only, feature(proc_macro_hygiene))]
+use vstd::prelude::*;
 
 use crate::host::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables};
 use alloc::sync::Arc;
