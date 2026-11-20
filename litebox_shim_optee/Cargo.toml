@@ -41,3 +41,4 @@ workspace = true
 litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0", default-features = false, features = ["optee_syscall"] }
 sha2 = { version = "0.10", default-features = false, features = ["oid"] }
 x509-cert = { version = "0.2.5", features = ["builder"] }
+tempfile = "3"

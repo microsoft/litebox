@@ -46,6 +46,8 @@ pub mod msg_handler;
 
 pub mod idk;
 
+pub(crate) mod keystack;
+
 pub use loader::elf::ElfLoaderError;
 // Re-export session management types for convenience
 pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
@@ -390,6 +392,8 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// With `allow-unsigned-dynamic-ta`, raw ELF TAs are also accepted. Signed TAs
     /// still require a valid signature and a configured signing certificate.
     ///
+    /// A TA with a reserved UUID is always rejected with [`ElfLoaderError::UnverifiedTa`].
+    ///
     /// `ldelf_bin` is read in place: it must be trusted memory the normal world cannot modify.
     ///
     /// The loaded program is an *instance*: a single instance can serve many
@@ -403,6 +407,11 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         ta_uuid: TeeUuid,
         dynamic_ta_bin: Option<Vec<u8>>,
     ) -> Result<LoadedProgram<Platform>, loader::elf::ElfLoaderError> {
+        // A TA with this UUID could derive any TA's key-stack root through
+        // `PTA_SYSTEM_DERIVE_TA_UNIQUE_KEY`, so it is never loaded, signed or not.
+        if keystack::is_reserved_ta_uuid(&ta_uuid) {
+            return Err(ElfLoaderError::UnverifiedTa);
+        }
         let ta_dynamic = dynamic_ta_bin.is_some();
         let ta: TaInfo<TaImage> = match dynamic_ta_bin {
             Some(ta_bin) => self
@@ -1969,11 +1978,20 @@ mod test_utils {
     impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
         /// Make a new task with default values for testing.
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task<Platform> {
+            self.new_test_task_with_uuid_and_svn(TeeUuid::default(), 0)
+        }
+
+        /// Make a new task with the provided TA UUID and SVN for testing.
+        pub(crate) fn new_test_task_with_uuid_and_svn(
+            self: Arc<Self>,
+            ta_app_id: TeeUuid,
+            ta_svn: u32,
+        ) -> Task<Platform> {
             Task {
                 global: self.clone(),
                 thread: ThreadState::new(),
-                ta_app_id: TeeUuid::default(),
-                ta_svn: 0,
+                ta_app_id,
+                ta_svn,
                 ta_digest: [0; TA_DIGEST_LEN],
                 ta_dynamic: false,
                 ta_elf: RefCell::new(None),

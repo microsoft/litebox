@@ -11,7 +11,8 @@ pub(crate) fn shim_builder() -> crate::OpteeShimBuilder<Platform> {
 
     let platform = *PLATFORM.call_once(|| {
         let platform = Platform::new(None);
-        // `compute_with_derived_key` (used by IDKS) needs the boot ID.
+        // `compute_with_derived_key` (used by IDKS) and `derive_key` (used by
+        // KeyStack) need the boot ID.
         platform.initialize_boot_specific_kdf_support();
         platform
     });
