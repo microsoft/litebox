@@ -1275,7 +1275,7 @@ impl<const ALIGN: usize> litebox::platform::ThreadProvider for WindowsUserland<A
             .wrapping_sub(litebox_trampoline::SYSCALL_ENTRY_INSTRUCTION_LEN);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-support")]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         let tls = TlsState::new();
         ThreadHandle::run_with_handle(&tls, f)

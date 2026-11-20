@@ -1606,7 +1606,7 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
             .wrapping_sub(litebox_trampoline::SYSCALL_ENTRY_INSTRUCTION_LEN);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-support")]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         initialize_thread_tls();
         assert_eq!(read_tls(tls_offset::CURRENT_THREAD), 0);

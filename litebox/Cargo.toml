@@ -34,6 +34,8 @@ windows-sys = { version = "0.60.2", features = [
 lock_tracing = ["litebox_platform/lock_tracing"]
 panic_on_unclosed_fd_drop = []
 enforce_singleton_litebox_instance = []
+# `ThreadProvider::run_test_thread`, for other crates' tests.
+test-support = []
 
 [dev-dependencies]
 litebox_broker_local = { version = "0.1.0", path = "../litebox_broker_local", features = ["test-support"] }

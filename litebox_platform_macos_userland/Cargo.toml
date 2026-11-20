@@ -19,6 +19,7 @@ rangemap = { version = "1.5.1", features = ["const_fn"] }
 # The host's dyld shared cache for guest-private instances (`HostSharedCache`).
 shared_cache = ["dep:litebox_util_log"]
 subpage_compat = []
+test-support = ["litebox/test-support"]
 
 [lints]
 workspace = true

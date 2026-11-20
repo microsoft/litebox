@@ -993,7 +993,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         arch::rewind_syscall(ctx);
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-support")]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         // Sets `gsbase = fsbase` (x86_64) on the current thread
         // to mirror the TLS base used in guest context, so that test threads can use the
