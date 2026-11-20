@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 //! PCI: configuration space through the legacy mechanism #1 ports
-//! (`0xCF8`/`0xCFC`), on bus 0, and MSI-X. Firmware (SeaBIOS under QEMU) has
-//! already assigned BARs.
+//! (`0xCF8`/`0xCFC`), on bus 0, and MSI-X. Firmware (SeaBIOS under QEMU) or
+//! the VMM (Cloud Hypervisor) has already assigned BARs.
 
 use crate::dma::Hal;
 use crate::interrupt::MsiMessage;

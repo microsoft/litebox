@@ -3,8 +3,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# Run Linux programs under QEMU with stacked runners:
-# litebox_runner_vm_kernel as the guest kernel and
+# Run Linux programs under QEMU or Cloud Hypervisor (VMM) with stacked
+# runners: litebox_runner_vm_kernel as the guest kernel and
 # litebox_runner_linux_on_vm_userland as a ring-3 process per guest process.
 # Every litebox_runner_vm_kernel/tests/linux/<name>.c, and each of SHARED,
 # the hosted runner's tests that run here as they are, is compiled three
@@ -57,15 +57,16 @@
 # (to greeting.txt), self (to .), and abs.txt (to /mnt/host/greeting.txt), is
 # mounted read-only at /mnt/host over virtio-9p (its mount tag).
 #
-# With QEMU_SMP above 4, the preempt test is skipped: it checks preemption
+# Under Cloud Hypervisor, the VMs run in a network namespace of the run's own,
+# made with (passwordless) sudo, where a TAP device has the guest's gateway
+# (10.0.2.1) and the echo server (10.0.2.100:7). It has no virtio-9p, so the
+# share test is skipped there.
+#
+# With VM_CPUS above 4, the preempt test is skipped: it checks preemption
 # with 8 CPU-bound programs. With fewer than 2, the smp test is skipped: it
-# checks threads of a program running at once. Unless QEMU_MEM's size (its
-# first field, maybe after size=) is at least 4G, as an integer in MiB or
-# suffixed M or G (e.g., 6144, 6g, or size=6G,maxmem=8G), the highmem test is
-# skipped: it needs RAM above 4 GiB. A test given with -t that would be
-# skipped is an error instead. QEMU_SMP must give the CPU count as QEMU does:
-# cpus= (or a bare count), else maxcpus=, else the product of the topology's
-# counts (e.g., sockets=2,cores=2).
+# checks threads of a program running at once. With VM_MEM below 4G, the
+# highmem test is skipped: it needs RAM above 4 GiB. A test given with -t that
+# would be skipped is an error instead.
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
@@ -76,11 +77,14 @@
 #   CC            C compiler with a static and a shared glibc (default: cc)
 #   RUSTC         Rust compiler with the x86_64-unknown-none target (default:
 #                 rustc)
+#   VMM           qemu or cloud-hypervisor (default: qemu)
+#   VM_CPUS       guest CPUs (default: 1)
+#   VM_MEM        guest RAM, in MiB or suffixed M or G (default: 2G)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
-#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
-#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1)
+#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command (default:
+#                 cloud-hypervisor)
 #   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   VHOST_DEVICE_VSOCK  the vhost-user vsock daemon (default:
@@ -100,8 +104,8 @@ TESTS_DIR="$KERNEL_DIR/tests/linux"
 HOSTED_TESTS_DIR="$REPO_DIR/litebox_runner_linux_userland/tests"
 SHARED=(fork_threads_parent.c fork_interrupt_parent.c fork_event_parent.c fork_epoll_parent.c
     fork_shared_futex_parent.c)
-# shellcheck source=dev_tools/qemu_test_lib.sh
-source "$SCRIPT_DIR/qemu_test_lib.sh"
+# shellcheck source=dev_tools/vm_test_lib.sh
+source "$SCRIPT_DIR/vm_test_lib.sh"
 
 tests=()
 profile=debug
@@ -116,40 +120,6 @@ while getopts "t:rvh" opt; do
     esac
 done
 
-# The CPU count in QEMU_SMP $1 (see the header); fails for another form.
-smp_cpus() {
-    local field key value cpus='' maxcpus='' product=1
-    local -a fields
-    IFS=, read -r -a fields <<<"$1"
-    for field in "${fields[@]}"; do
-        key=cpus value=$field
-        [[ $field != *=* ]] || { key=${field%%=*}; value=${field#*=}; }
-        [[ $value =~ ^[1-9][0-9]*$ ]] || return 1
-        case $key in
-            cpus) cpus=$value ;;
-            maxcpus) maxcpus=$value ;;
-            drawers | books | sockets | dies | clusters | modules | cores | threads)
-                product=$((product * value)) ;;
-            *) return 1 ;;
-        esac
-    done
-    echo "${cpus:-${maxcpus:-$product}}"
-}
-smp=$(smp_cpus "$QEMU_SMP") || {
-    echo "error: no CPU count in QEMU_SMP=$QEMU_SMP (see the header)" >&2
-    exit 2
-}
-
-# QEMU_MEM's size in MiB, or 0 for a form the header does not list.
-mem=${QEMU_MEM%%,*}
-mem=${mem#size=}
-if [[ $mem =~ ^([1-9][0-9]*)([MmGg]?)$ ]]; then
-    mem=${BASH_REMATCH[1]}
-    [[ ${BASH_REMATCH[2]} != [Gg] ]] || mem=$((mem * 1024))
-else
-    mem=0
-fi
-
 # The log level of the boots that check the processes' counts (see the header).
 counted_log=debug
 [[ ${LITEBOX_LOG:-} != trace ]] || counted_log=trace
@@ -162,9 +132,10 @@ declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writ
 # is.
 skip_reason() {
     case $1 in
-        preempt) [[ $smp -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
-        smp) [[ $smp -ge 2 ]] || echo "needs threads running at once" ;;
-        highmem) [[ $mem -ge 4096 ]] || echo "needs QEMU_MEM of at least 4G, as an integer in MiB or suffixed M or G" ;;
+        preempt) [[ $VM_CPUS -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
+        smp) [[ $VM_CPUS -ge 2 ]] || echo "needs threads running at once" ;;
+        highmem) [[ $VM_MIB -ge 4096 ]] || echo "needs VM_MEM of at least 4G" ;;
+        share) [[ $VMM == qemu ]] || echo "needs virtio-9p, which only QEMU has" ;;
     esac
 }
 
@@ -186,9 +157,39 @@ client_tests=0
 for t in "${tests[@]}"; do
     [[ -n ${INIT_TESTS[$t]:-} ]] || client_tests=1
 done
-if [[ $client_tests -ne 0 ]] && ! command -v "$VHOST_DEVICE_VSOCK" >/dev/null; then
+if [[ $VMM == qemu && $client_tests -ne 0 ]] && ! command -v "$VHOST_DEVICE_VSOCK" >/dev/null; then
     echo "error: no $VHOST_DEVICE_VSOCK, which the tests with a programs.json need" >&2
     exit 2
+fi
+# Whether the hybrid vsock may pass the guest's half-close on (Cloud
+# Hypervisor's does from v53), for the host clients.
+half_close=0
+if [[ $VMM == cloud-hypervisor ]]; then
+    half_close=1
+    ns=litebox$$
+    sudo -n ip netns add "$ns" ||
+        { echo "error: Cloud Hypervisor's network needs passwordless sudo (see the header)" >&2; exit 2; }
+    trap 'cleanup; sudo -n ip netns delete "$ns"' EXIT
+    sudo -n ip -n "$ns" link set lo up
+    sudo -n ip -n "$ns" tuntap add dev tap0 mode tap user "$(id -u)"
+    sudo -n ip -n "$ns" addr add 10.0.2.1/24 dev tap0
+    sudo -n ip -n "$ns" addr add 10.0.2.100/32 dev tap0
+    sudo -n ip -n "$ns" link set tap0 up
+    sudo -n ip netns exec "$ns" sysctl -qw net.ipv4.ip_unprivileged_port_start=0
+    # shellcheck disable=SC2034 # run_vm runs Cloud Hypervisor through it
+    netns=(sudo -n ip netns exec "$ns" setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups --
+        env "PATH=$PATH")
+    "${netns[@]}" python3 -c '
+import socket, threading
+server = socket.create_server(("10.0.2.100", 7))
+def echo(connection):
+    with connection:
+        while data := connection.recv(65536):
+            connection.sendall(data)
+while True:
+    threading.Thread(target=echo, args=(server.accept()[0],), daemon=True).start()
+' </dev/null &
+    daemons+=("$!")
 fi
 
 # The VM's userland runner has its own target directory.
@@ -207,7 +208,7 @@ for f in "$KERNEL" "$USERLAND" "$GUEST_SERVICE" "$CLIENT"; do
 done
 echo "[*] kernel: $KERNEL"
 echo "[*] userland runner: $USERLAND"
-echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU, -smp $QEMU_SMP"
+describe_vm
 
 # Tests that need a dynamic linker (e.g., dlopen), not built static.
 DYNAMIC_ONLY=(dynamic)
@@ -261,19 +262,30 @@ pack_payload() {
 
 # The virtio console for boot $1, backed by a file.
 console_args() {
-    echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
-        -chardev "file,id=con0,path=$WORK/$1.console" \
-        -device virtconsole,chardev=con0,bus=vs0.0
+    case $VMM in
+        qemu)
+            echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
+                -chardev "file,id=con0,path=$WORK/$1.console" \
+                -device virtconsole,chardev=con0,bus=vs0.0
+            ;;
+        cloud-hypervisor) echo --console "file=$WORK/$1.console" ;;
+    esac
 }
 
 # The network device: see the header.
 network_args() {
-    echo -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.1,restrict=on,guestfwd=tcp:10.0.2.100:7-cmd:cat \
-        -device virtio-net-pci,netdev=n0,disable-legacy=on
+    case $VMM in
+        qemu)
+            echo -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.1,restrict=on,guestfwd=tcp:10.0.2.100:7-cmd:cat \
+                -device virtio-net-pci,netdev=n0,disable-legacy=on
+            ;;
+        cloud-hypervisor) echo --net tap=tap0 ;;
+    esac
 }
 
 # The virtio-9p share for boot $1: see the header.
 share_args() {
+    [[ $VMM == qemu ]] || return 0
     mkdir "$WORK/$1.share"
     echo "hello from the host" >"$WORK/$1.share/greeting.txt"
     ln -s greeting.txt "$WORK/$1.share/link.txt"
@@ -289,7 +301,8 @@ run_clients() {
     local host=
     wait_vsock_started "$1" || return 1
     if [[ -f "$TESTS_DIR/$test.host.py" ]]; then
-        TIMEOUT=$TIMEOUT python3 "$TESTS_DIR/$test.host.py" "$WORK/$1.vsock" "$WORK/$1.stdout" \
+        TIMEOUT=$TIMEOUT VSOCK_HALF_CLOSE=$half_close \
+            python3 "$TESTS_DIR/$test.host.py" "$WORK/$1.vsock" "$WORK/$1.stdout" \
             >"$WORK/$1.host" 2>&1 &
         host=$!
     fi
@@ -426,12 +439,12 @@ boot() {
 # Boots test $test's programs, those of client_args, as boot $1.
 boot_client() {
     : >"$WORK/$1.stdout"
-    start_vsock_daemon "$1"
+    start_vsock "$1"
     [[ ! -f "$TESTS_DIR/$test.input.txt" ]] || client_args+=(--input "$TESTS_DIR/$test.input.txt")
     client=run_clients
     boot "$1" "$WORK/$test.tar"
     client=
-    stop_vsock_daemon
+    stop_vsock
 }
 
 for test in "${tests[@]}"; do

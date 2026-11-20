@@ -28,12 +28,12 @@
 //! - **Windows host clients** should poll (e.g., `WSAPoll`) before each
 //!   receive, or retry receives on a short timeout and on `WSAEINTR`: a
 //!   blocking receive can miss the stream's end (a Winsock `AF_UNIX` bug).
-//! - **No half-close**, as Firecracker's, Cloud Hypervisor's and
-//!   vhost-device-vsock's hybrid vsock: the host's EOF, reset or error ends
-//!   the connection both ways (the guest reads what arrived, then EOF, and
-//!   its sends fail; the host reads what the guest sent, then EOF), and a
-//!   guest's shutdown of one direction is not forwarded: only its shutdown
-//!   of both, or its close, ends the stream.
+//! - **No half-close**, as Firecracker's and vhost-device-vsock's hybrid
+//!   vsock (Cloud Hypervisor's has it from v53): the host's EOF, reset or
+//!   error ends the connection both ways (the guest reads what arrived, then
+//!   EOF, and its sends fail; the host reads what the guest sent, then EOF),
+//!   and a guest's shutdown of one direction is not forwarded: only its
+//!   shutdown of both, or its close, ends the stream.
 //! - **Thread.** It waits with `epoll` (on Windows, mio) for the listener,
 //!   the streams, and an eventfd (on Windows, a mio `Waker`) that operations
 //!   write when the provider needs a poll it would not otherwise get, and

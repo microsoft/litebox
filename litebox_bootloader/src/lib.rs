@@ -2,9 +2,9 @@
 // Licensed under the MIT license.
 
 //! Boots a LiteBox kernel-mode runner: takes the handoff from a boot front
-//! end, finds the CPUs (ACPI), brings up a `VmKernel` (heap, interrupts, TSC)
-//! on the boot CPU, and runs the runner's `entry!` function, which may start
-//! the others (`Kernel::start_cpus`).
+//! end, finds the CPUs and how to power off (ACPI), brings up a `VmKernel`
+//! (heap, interrupts, TSC) on the boot CPU, and runs the runner's `entry!`
+//! function, which may start the others (`Kernel::start_cpus`).
 //!
 //! Front ends: PVH.
 //!
@@ -155,6 +155,7 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
     litebox_util_log::info!(mib:% = bytes >> 20; "heap seeded from the boot mapping");
     // ACPI tables are reachable only through the boot mapping.
     let cpus = find_cpus(&info);
+    find_soft_off(&info);
     report_unused_ram(&info, ram_end);
     let ram: arrayvec::ArrayVec<_, { handoff::MAX_RAM_REGIONS }> = info
         .usable
@@ -239,6 +240,24 @@ fn find_cpus(info: &BootInfo) -> Cpus {
         limit,
         // Below the image, so the heap never gets it (see `seed_heap`).
         trampoline: info.trampoline_page(PhysAddr::new(text_start_address() - KERNEL_IMAGE_OFFSET)),
+    }
+}
+
+/// For `litebox_hal::power::exit` where the VMM has no debug-exit device
+/// (e.g., Cloud Hypervisor).
+fn find_soft_off(info: &BootInfo) {
+    // Safety: as in `find_cpus`.
+    let memory = unsafe { MappedMemory::new(KERNEL_OFFSET, info.mapped_limit.as_u64()) };
+    match acpi::soft_off(&memory, info.rsdp.map(PhysAddr::as_u64)) {
+        Ok(soft_off) => {
+            litebox_util_log::debug!(soft_off:? = soft_off; "ACPI soft-off");
+            // Safety: from the firmware's FADT and DSDT, which it is trusted for.
+            unsafe { litebox_hal::power::set_soft_off(soft_off) };
+        }
+        Err(error) => litebox_util_log::warn!(
+            error:% = error;
+            "no ACPI soft-off: without a debug-exit device, exits reset the machine"
+        ),
     }
 }
 

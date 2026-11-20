@@ -15,12 +15,11 @@
 #   -v   print the full guest log for passing runs too
 #
 # Environment:
+#   VM_CPUS       guest CPUs (default: 1); the kernel uses only the first
+#   VM_MEM        guest RAM, in MiB or suffixed M or G (default: 2G)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
-#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
-#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1); the kernel uses
-#                 only the first
 #   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runner, run in its directory
@@ -33,8 +32,9 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(dirname "$SCRIPT_DIR")
 RUNNER_DIR="$REPO_DIR/litebox_runner_optee_on_qemu"
 TESTS_DIR="$REPO_DIR/litebox_runner_optee_on_linux_userland/tests"
-# shellcheck source=dev_tools/qemu_test_lib.sh
-source "$SCRIPT_DIR/qemu_test_lib.sh"
+# shellcheck source=dev_tools/vm_test_lib.sh
+source "$SCRIPT_DIR/vm_test_lib.sh"
+[[ $VMM == qemu ]] || { echo "error: this runner boots under QEMU only, not VMM=$VMM" >&2; exit 2; }
 
 tas=()
 profile=debug
@@ -57,7 +57,7 @@ echo "[*] building litebox_runner_optee_on_qemu ($profile)"
 (cd "$RUNNER_DIR" && $CARGO_BUILD "${cargo_flags[@]}")
 [[ -x $KERNEL ]] || { echo "error: the build did not produce $KERNEL" >&2; exit 2; }
 echo "[*] kernel: $KERNEL"
-echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU, -smp $QEMU_SMP"
+describe_vm
 
 for ta in "${tas[@]}"; do
     name=${ta%@default}

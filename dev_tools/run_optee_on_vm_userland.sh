@@ -4,11 +4,11 @@
 # Licensed under the MIT license.
 
 # Run OP-TEE TAs from litebox_runner_optee_on_linux_userland/tests under QEMU
-# with stacked runners: litebox_runner_vm_kernel as the guest kernel and
-# litebox_runner_optee_on_vm_userland as a ring-3 process per TA instance.
-# ldelf and each TA are syscall-rewritten ahead of time (unless -u), then
-# packed with the userland runner and the test's cmds.json into a tar passed
-# as the initrd.
+# or Cloud Hypervisor (VMM) with stacked runners: litebox_runner_vm_kernel as
+# the guest kernel and litebox_runner_optee_on_vm_userland as a ring-3 process
+# per TA instance. ldelf and each TA are syscall-rewritten ahead of time
+# (unless -u), then packed with the userland runner and the test's cmds.json
+# into a tar passed as the initrd.
 #
 # A test is a scenario litebox_runner_vm_kernel/tests/<test>-cmds.json, whose
 # open_session commands name the TAs it needs in their "ta" fields, or a TA
@@ -16,7 +16,8 @@
 #
 # Runner processes' standard streams are a virtio console, backed by files:
 # TA output must reach it, and in debug builds, whose runners echo standard
-# input, so must the line fed to it.
+# input, so must the line fed to it (but under Cloud Hypervisor, whose file
+# console takes no input).
 #
 # Usage: dev_tools/run_optee_on_vm_userland.sh [-t <test>]... [-u] [-r] [-v]
 #   -t   test to run, e.g. ta-death or hello-ta; append @default to a TA to
@@ -27,11 +28,14 @@
 #   -v   print the full guest log and console output for passing runs too
 #
 # Environment:
+#   VMM           qemu or cloud-hypervisor (default: qemu)
+#   VM_CPUS       guest CPUs (default: 1)
+#   VM_MEM        guest RAM, in MiB or suffixed M or G (default: 2G)
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
-#   QEMU_MEM      guest RAM, as QEMU's -m (default: 2G)
-#   QEMU_SMP      guest CPUs, as QEMU's -smp (default: 1)
+#   CLOUD_HYPERVISOR  Cloud Hypervisor binary/command (default:
+#                 cloud-hypervisor)
 #   TIMEOUT       per-run timeout in seconds (default: 120, or 600 with tcg)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runners (and the rewriter unless
@@ -46,8 +50,8 @@ KERNEL_DIR="$REPO_DIR/litebox_runner_vm_kernel"
 USERLAND_DIR="$REPO_DIR/litebox_runner_optee_on_vm_userland"
 TESTS_DIR="$REPO_DIR/litebox_runner_optee_on_linux_userland/tests"
 VM_TESTS_DIR="$KERNEL_DIR/tests"
-# shellcheck source=dev_tools/qemu_test_lib.sh
-source "$SCRIPT_DIR/qemu_test_lib.sh"
+# shellcheck source=dev_tools/vm_test_lib.sh
+source "$SCRIPT_DIR/vm_test_lib.sh"
 
 tas=()
 profile=debug
@@ -87,7 +91,7 @@ for f in "${built[@]}"; do
 done
 echo "[*] kernel: $KERNEL"
 echo "[*] userland runner: $USERLAND"
-echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU, -smp $QEMU_SMP"
+describe_vm
 if [[ $rewrite -eq 1 ]]; then echo "[*] TAs: syscall-rewritten"; else echo "[*] TAs: unmodified"; fi
 
 # Copies a guest binary, syscall-rewritten unless -u. Sites the rewriter
@@ -106,9 +110,14 @@ STDIN_LINE="hello from the host"
 console_args() {
     printf '%s\n' "$STDIN_LINE" >"$WORK/$1.stdin"
     : >"$WORK/$1.stdout"
-    echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
-        -chardev "file,id=con0,path=$WORK/$1.stdout,input-path=$WORK/$1.stdin" \
-        -device virtconsole,chardev=con0,bus=vs0.0
+    case $VMM in
+        qemu)
+            echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
+                -chardev "file,id=con0,path=$WORK/$1.stdout,input-path=$WORK/$1.stdin" \
+                -device virtconsole,chardev=con0,bus=vs0.0
+            ;;
+        cloud-hypervisor) echo --console "file=$WORK/$1.stdout" ;;
+    esac
 }
 
 # Run check: TA output, and the echoed input, on the console.
@@ -120,7 +129,7 @@ check_console() {
         echo "---" >&2
     fi
     grep -q "/TA:" "$out" || { echo "no TA output on the console"; return 1; }
-    if [[ $profile == debug ]] && ! grep -qF "[stdin] $STDIN_LINE" "$out"; then
+    if [[ $VMM == qemu && $profile == debug ]] && ! grep -qF "[stdin] $STDIN_LINE" "$out"; then
         echo "standard input was not echoed on the console"
         return 1
     fi

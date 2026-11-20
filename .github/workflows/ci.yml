@@ -70,7 +70,7 @@ jobs:
           # `litebox_runner_optee_on_vm_userland` and `litebox_runner_linux_on_vm_userland` are
           # ring-3 programs for them, all for
           # `x86_64-unknown-none` as set by their `.cargo/config.toml`, so they are linted from
-          # their directories and tested in the `test_qemu` job.
+          # their directories and tested in the `test_vmm` job.
           # `litebox_runner_optee_on_linux_userland` conflicts with `litebox_runner_linux_userland` due to
           # feature unification (`optee_syscall` versus `linux_syscall`). Build it separately for now.
       - run: |
@@ -145,12 +145,14 @@ jobs:
         # Fixtures are cached separately above; keep them out of rust-cache.
         run: rm -rf -- target/tmp
 
-  test_qemu:
-    name: Build and Test on QEMU (KVM)
+  test_vmm:
+    name: Build and Test on VMMs (KVM)
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
       VHOST_DEVICE_VSOCK_VERSION: 0.3.0
+      CLOUD_HYPERVISOR_VERSION: v54.1
+      CLOUD_HYPERVISOR_SHA256: f9ffb9646783233d1f0fb09e77db1fca66499d1041e63bc011b90683c0d49933
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -190,6 +192,14 @@ jobs:
             vhost-device-vsock --version "$VHOST_DEVICE_VSOCK_VERSION"
       - name: Put vhost-device-vsock on the PATH
         run: echo "$HOME/vhost-device-vsock/bin" >> "$GITHUB_PATH"
+      - name: Install Cloud Hypervisor
+        run: |
+          mkdir -p ~/cloud-hypervisor
+          curl -fsSL --retry 3 -o ~/cloud-hypervisor/cloud-hypervisor \
+            "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$CLOUD_HYPERVISOR_VERSION/cloud-hypervisor-static"
+          echo "$CLOUD_HYPERVISOR_SHA256  $HOME/cloud-hypervisor/cloud-hypervisor" | sha256sum -c -
+          chmod +x ~/cloud-hypervisor/cloud-hypervisor
+          echo "$HOME/cloud-hypervisor" >> "$GITHUB_PATH"
       - name: Run OP-TEE TAs in a QEMU VM (KVM)
         # Also builds the runner.
         run: |
@@ -207,11 +217,11 @@ jobs:
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
       - name: Run static and dynamic Linux programs in a QEMU VM with stacked runners on 2 CPUs with RAM above 4 GiB (KVM)
         run: |
-          QEMU_MEM=6G QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          VM_MEM=6G VM_CPUS=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh
       - name: Run threaded Linux programs in a QEMU VM with stacked runners on 4 CPUs, release (KVM)
         run: |
-          QEMU_SMP=4 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          VM_CPUS=4 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_linux_on_vm_userland.sh -r -t smp -t sched -t fork -t pthread
       - name: Allow unprivileged user namespaces
         # For the containerd shim's privileged tests; Ubuntu's AppArmor restricts them.
@@ -229,12 +239,22 @@ jobs:
           unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'test(/^vm::(with_mount_privilege|with_litebox_user|as_root_)/)'
       - name: Run OP-TEE TAs in a QEMU VM with stacked runners on 2 CPUs (KVM)
         run: |
-          QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          VM_CPUS=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh
       - name: Run unmodified OP-TEE TAs in a QEMU VM with stacked runners on 2 CPUs (KVM)
         run: |
-          QEMU_SMP=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+          VM_CPUS=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
+      - name: Smoke-test Linux programs and OP-TEE TAs in a Cloud Hypervisor VM with stacked runners on 2 CPUs
+        run: |
+          export VMM=cloud-hypervisor VM_CPUS=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build"
+          VM_MEM=6G ./dev_tools/run_linux_on_vm_userland.sh \
+            -t hello -t pid1 -t smp -t highmem -t console_flood -t net -t vsock_hybrid
+          ./dev_tools/run_optee_on_vm_userland.sh -t hello-ta
+      - name: Run threaded Linux programs in a Cloud Hypervisor VM with stacked runners on 4 CPUs, release
+        run: |
+          VMM=cloud-hypervisor VM_CPUS=4 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+            ./dev_tools/run_linux_on_vm_userland.sh -r -t smp -t sched -t fork -t pthread
       - name: Save vhost-device-vsock
         if: github.event_name != 'merge_group' && steps.vhost-device-vsock.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
