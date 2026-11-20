@@ -39,8 +39,7 @@ use litebox::event::{
 };
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::fs::errors::{
-    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, TruncateError,
-    WriteError,
+    FileStatusError, MkdirError, OpenError, PathError, ReadError, TruncateError, WriteError,
 };
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::sync::Mutex;
@@ -51,6 +50,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::fs::{Fs, REGISTRY_ROOT};
 use crate::syscalls::Handle;
+use crate::syscalls::file::map_read_dir_error;
 use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value, raw_handle_entry};
 
 use crate::nt_types::{
@@ -2557,15 +2557,6 @@ fn map_read_error(error: ReadError) -> NtStatus {
     match error {
         ReadError::NotForReading => NtStatus::ACCESS_DENIED,
         ReadError::NotAFile => NtStatus::OBJECT_TYPE_MISMATCH,
-        _ => NtStatus::UNSUCCESSFUL,
-    }
-}
-
-fn map_read_dir_error(error: ReadDirError) -> NtStatus {
-    match error {
-        ReadDirError::NotADirectory => NtStatus::NOT_A_DIRECTORY,
-        ReadDirError::NotForReading => NtStatus::ACCESS_DENIED,
-        ReadDirError::Removed => NtStatus::DELETE_PENDING,
         _ => NtStatus::UNSUCCESSFUL,
     }
 }

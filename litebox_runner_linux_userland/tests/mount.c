@@ -68,16 +68,19 @@ static void test_mount_boundaries(const char *directory) {
     int held = open("held", O_PATH | O_DIRECTORY);
     int below = open("held/t", O_PATH | O_DIRECTORY);
     TEST_ASSERT(held >= 0 && below >= 0 && stat("held/t", &covered) == 0, "hold tree");
+    // The held directory moves first, so the mount is found from where it is, not from the name
+    // it was opened by.
+    TEST_ASSERT(rename("held", "moved") == 0, "move held tree");
     char path[4096];
-    snprintf(path, sizeof(path), "%s/held/t", directory);
+    snprintf(path, sizeof(path), "%s/moved/t", directory);
     TEST_ASSERT(mount(NULL, path, "tmpfs", 0, NULL) == 0, "mount below held directory");
-    TEST_ASSERT(stat("held/t", &root) == 0 && root.st_dev != covered.st_dev,
+    TEST_ASSERT(stat("moved/t", &root) == 0 && root.st_dev != covered.st_dev,
                 "mountpoint path names the mount");
     // Linux: walking `t` from the held directory crosses the mount added since it was opened.
     int file = openat(held, "t/x", O_CREAT | O_EXCL | O_WRONLY, 0600);
     TEST_ASSERT(file >= 0 && fstat(file, &st) == 0 && st.st_dev == root.st_dev &&
                 close(file) == 0, "creation through held directory lands in the mount");
-    TEST_ASSERT(stat("held/t/x", &st) == 0 && st.st_dev == root.st_dev,
+    TEST_ASSERT(stat("moved/t/x", &st) == 0 && st.st_dev == root.st_dev,
                 "created file is visible in the mount");
     expect_errno(fstatat(below, "x", &st, 0), ENOENT, "covered directory is untouched");
     TEST_ASSERT(unlinkat(held, "t/x", 0) == 0 && close(below) == 0 && close(held) == 0,

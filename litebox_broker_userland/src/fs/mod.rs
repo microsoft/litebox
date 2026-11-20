@@ -237,6 +237,24 @@ fn validate_name(name: &str) -> Result<(), PathError> {
     Ok(())
 }
 
+/// Maps a failed check that a held directory is still usable to a path error, else `io`.
+fn usable_dir_error<E: From<PathError>>(error: &std::io::Error, io: E) -> E {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => PathError::NoSuchFileOrDirectory.into(),
+        std::io::ErrorKind::PermissionDenied => PathError::NoSearchPerms.into(),
+        _ => io,
+    }
+}
+
+/// The components of the host name `name` below `root`; a name outside it was moved out.
+fn components_under(root: &Path, name: &Path) -> Result<Vec<String>, WalkError> {
+    name.strip_prefix(root)
+        .map_err(|_| PathError::NoSuchFileOrDirectory)?
+        .iter()
+        .map(|part| part.to_str().map(String::from).ok_or(WalkError::Io))
+        .collect()
+}
+
 fn check_flags(flags: OFlags) -> Result<(), OpenError> {
     const ALLOWED: OFlags = OFlags::CREAT
         .union(OFlags::WRONLY)
@@ -517,11 +535,8 @@ impl LocalFs {
 
     /// [`Self::check_dir`], with its failures mapped to path errors (else `io`).
     fn check_usable_dir<E: From<PathError>>(&self, dir: &LocalDir, io: E) -> Result<(), E> {
-        self.check_dir(dir).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => PathError::NoSuchFileOrDirectory.into(),
-            std::io::ErrorKind::PermissionDenied => PathError::NoSearchPerms.into(),
-            _ => io,
-        })
+        self.check_dir(dir)
+            .map_err(|error| usable_dir_error(&error, io))
     }
 
     /// Checks a directory reached within the current operation. On Linux, such a directory was
@@ -548,7 +563,7 @@ impl LocalFs {
         if Arc::ptr_eq(&dir.location.pin, &self.root.pin) {
             return Ok(());
         }
-        dir.location.names_under(&self.root).map(drop)
+        dir.location.checked_names_under(&self.root).map(drop)
     }
 
     fn valid_dir(&self, dir: &LocalDir) -> bool {
@@ -715,7 +730,10 @@ impl Backend for LocalFs {
             target.components().next(),
             Some(std::path::Component::Prefix(_) | std::path::Component::RootDir)
         ) {
-            let (root, dir_name) = dir.location.names_under(&self.root).map_err(walk_error)?;
+            let (root, dir_name) = dir
+                .location
+                .checked_names_under(&self.root)
+                .map_err(walk_error)?;
             let inside = target.strip_prefix(&root);
             // The root is canonical, but targets may spell it differently (Windows verbatim or 8.3
             // short prefixes, case, host symlinks in ancestors). Canonicalize the parent only, so
@@ -819,12 +837,48 @@ impl Backend for LocalFs {
         }
         let root = self.root.linked_path().map_err(walk_error)?;
         let name = dir.location.linked_path().map_err(walk_error)?;
-        name.strip_prefix(root)
-            .map_err(|_| PathError::NoSuchFileOrDirectory)?
-            .iter()
-            .map(|part| part.to_str().map(String::from).ok_or(WalkError::Io))
-            .collect::<Result<_, _>>()
-            .map(Some)
+        components_under(&root, &name).map(Some)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn walking_dir_with_path<'a>(
+        &'a self,
+        dir: &DirHandle,
+    ) -> Result<
+        (
+            ResolvedDir<'a>,
+            litebox_broker_core::fs::backend::DirPathResult,
+        ),
+        WalkError,
+    > {
+        let dir = dir.get_typed::<Self>();
+        if !self.valid_dir(dir) {
+            return Err(WalkError::Io);
+        }
+        let path = if Arc::ptr_eq(&dir.location.pin, &self.root.pin) {
+            // The root is trivially inside itself (see `check_dir`).
+            self.root
+                .ensure_linked()
+                .map_err(walk_error)
+                .map(|()| Some(Vec::new()))
+        } else {
+            // One pair of procfs readlinks serves both the containment check of
+            // `walking_dir_at` and the name of `dir_path`.
+            let (root, name) = dir
+                .location
+                .checked_names_under(&self.root)
+                .map_err(|error| usable_dir_error(&error, WalkError::Io))?;
+            self.root
+                .ensure_linked()
+                .and_then(|()| dir.location.ensure_linked())
+                .map_err(walk_error)
+                .and_then(|()| components_under(&root, &name))
+                .map(Some)
+        };
+        Ok((
+            ResolvedDir::from_typed::<Self>(dir.clone(), PermissionCheck::ByBackend),
+            path,
+        ))
     }
 
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {

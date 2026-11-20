@@ -811,8 +811,9 @@ fn test_nine_p_broken_mkdir() {
 fn test_nine_p_broken_readdir() {
     let server = DiodServer::start();
 
-    // 5 writes: version + attach + walk + getattr (identity) + lopen for the directory.
-    let fs = connect_9p_broken(&server, 5);
+    // 4 writes: version + attach + clone of the root fid for reading + lopen. The first Treaddir
+    // fails.
+    let fs = connect_9p_broken(&server, 4);
     let fd = fs
         .open(
             USER,

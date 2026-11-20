@@ -141,7 +141,7 @@ impl<P: ShimPlatform> FilesState<P> {
             .map_err(|_| Errno::EBADF)
     }
 
-    pub(crate) fn opened_by_path(&self, fd: &FileFd<P>) -> Result<bool, Errno> {
+    fn opened_by_path(&self, fd: &FileFd<P>) -> Result<bool, Errno> {
         self.litebox
             .descriptor_table()
             .with_entry(fd, |file| file.opened_by_path)
@@ -651,8 +651,8 @@ impl<P: ShimPlatform> Task<P> {
                 // Only vnodes have a path; XNU fails others with EBADF, as
                 // this fails inherited descriptors, which have no path in the
                 // guest's namespace. For a vnode XNU returns its path
-                // (vn_getpath_ext): the broker records it at open, with
-                // symbolic links resolved.
+                // (vn_getpath_ext): a directory's current path, or the
+                // name a file was opened by, with symbolic links resolved.
                 if !self.files.opened_by_path(&typed)? {
                     return Err(Errno::EBADF);
                 }

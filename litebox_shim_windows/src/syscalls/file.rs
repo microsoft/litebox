@@ -2848,7 +2848,7 @@ fn map_file_status_error(error: FileStatusError) -> NtStatus {
     }
 }
 
-fn map_read_dir_error(error: ReadDirError) -> NtStatus {
+pub(super) fn map_read_dir_error(error: ReadDirError) -> NtStatus {
     match error {
         ReadDirError::ClosedFd => NtStatus::INVALID_HANDLE,
         ReadDirError::NotADirectory => NtStatus::NOT_A_DIRECTORY,

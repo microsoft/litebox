@@ -53,6 +53,8 @@ static void test_program_directory(const char *program) {
     if (mkdirat(fd, sub, 0700) != 0) {
         // Only a program directory that belongs to another user may refuse the creation.
         TEST_ASSERT(errno == EACCES, "create in program directory");
+        fprintf(stderr, "skipping program directory checks: %s is not writable\n",
+                dir[0] ? dir : "/");
         TEST_ASSERT(close(fd) == 0, "close program directory");
         return;
     }
@@ -96,6 +98,12 @@ int main(int argc, char **argv) {
     TEST_ASSERT(parent >= 0, "open parent of held directory");
     expect_errno(renameat(parent, "sub", fd, "moved"), EINVAL,
                  "cannot move held directory into itself");
+    // Linux: do_renameat2() rejects a source that is an ancestor of the target with EINVAL
+    // before comparing the two entries' types, so an existing file there does not give ENOTDIR.
+    create_test_file("new/sub/blocker", 0600);
+    expect_errno(renameat(parent, "sub", fd, "blocker"), EINVAL,
+                 "cannot move held directory over a file inside itself");
+    TEST_ASSERT(unlinkat(fd, "blocker", 0) == 0, "remove blocker");
     TEST_ASSERT(close(parent) == 0 && stat("new/sub/original", &st) == 0,
                 "rejected renames left the source in place");
     expect_errno(fstatat(fd, "moved", &st, 0), ENOENT, "rejected renames created nothing");

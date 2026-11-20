@@ -17,7 +17,7 @@ use litebox_platform::sync::RawSyncPrimitivesProvider;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RenameError, ResolutionError, RmdirError, SeekError, SetTimesError,
-    SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
+    SymlinkError, TruncateError, UnlinkError, WalkError, WriteError, walk_error_or,
 };
 use super::{
     FileTimeUpdate, FileType, Mode, OFlags, SetFileTimes,
@@ -223,8 +223,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 
     /// Also returns the final resolution of the path when its last step was a walk, so callers
-    /// need not walk again. A path ending in `.` or `..`, or naming the walk start itself, has
-    /// none; [`Self::final_resolution`] rewalks those.
+    /// need not walk again; a bare `.` resolves to the search-checked walk start. A path ending
+    /// in `..`, or in `.` after other components, or with no components at all (`/`), has none;
+    /// [`Self::final_resolution`] rewalks those.
     // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
     // outside the chrooted part.
     fn resolve_path(
@@ -1150,16 +1151,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         let context = Context::new(user);
         let (path, walked) = self
             .resolve_path(&context, anchor, path, true, false)
-            .map_err(|error| match error {
-                WalkError::Io => ChmodError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+            .map_err(walk_error_or(ChmodError::Io))?;
         let target = self
             .resolve_target(&context, &path, walked)
-            .map_err(|error| match error {
-                WalkError::Io => ChmodError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+            .map_err(walk_error_or(ChmodError::Io))?;
         if !Self::may_change_metadata(&context, &target) {
             return Err(ChmodError::NotTheOwner);
         }
@@ -1178,16 +1173,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         let context = Context::new(acting_user);
         let (path, walked) = self
             .resolve_path(&context, anchor, path, true, false)
-            .map_err(|error| match error {
-                WalkError::Io => ChownError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+            .map_err(walk_error_or(ChownError::Io))?;
         let target = self
             .resolve_target(&context, &path, walked)
-            .map_err(|error| match error {
-                WalkError::Io => ChownError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+            .map_err(walk_error_or(ChownError::Io))?;
         if !Self::may_change_metadata(&context, &target) {
             return Err(ChownError::NotTheOwner);
         }
@@ -1203,12 +1192,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     ) -> Result<(), UnlinkError> {
         let context = Context::new(user);
         let trailing_slash = path.ends_with('/');
-        let Some((parent, name)) =
-            self.parent_dir_and_name(&context, anchor, path)
-                .map_err(|error| match error {
-                    WalkError::Io => UnlinkError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
+        let Some((parent, name)) = self
+            .parent_dir_and_name(&context, anchor, path)
+            .map_err(walk_error_or(UnlinkError::Io))?
         else {
             return Err(UnlinkError::IsADirectory);
         };
@@ -1236,10 +1222,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                         PathError::ComponentNotADirectory.into()
                     }
                     Ok(Resolution::MissingFinal { .. }) => PathError::NoSuchFileOrDirectory.into(),
-                    Err(error) => match error.error {
-                        WalkError::Io => UnlinkError::Io,
-                        WalkError::PathError(error) => error.into(),
-                    },
+                    Err(error) => walk_error_or(UnlinkError::Io)(error.error),
                 },
             );
         }
@@ -1271,13 +1254,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             return Err(PathError::InvalidPathname.into());
         }
         let context = Context::new(user);
-        let map_walk_error = |error| match error {
-            WalkError::Io => SymlinkError::Io,
-            WalkError::PathError(error) => error.into(),
-        };
         let Some((parent, name)) = self
             .parent_dir_and_name(&context, anchor.clone(), linkpath)
-            .map_err(map_walk_error)?
+            .map_err(walk_error_or(SymlinkError::Io))?
         else {
             return Err(SymlinkError::AlreadyExists);
         };
@@ -1288,7 +1267,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             return Err(
                 if self
                     .name_exists(&context, parent, &name)
-                    .map_err(map_walk_error)?
+                    .map_err(walk_error_or(SymlinkError::Io))?
                 {
                     SymlinkError::AlreadyExists
                 } else {
@@ -1342,10 +1321,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         new_path: &str,
     ) -> Result<(), RenameError> {
         let context = Context::new(user);
-        let map_walk_error = |error| match error {
-            WalkError::Io => RenameError::Io,
-            WalkError::PathError(error) => error.into(),
-        };
+        let map_walk_error = |error| walk_error_or(RenameError::Io)(error);
         let parent = |anchor, path: &str| {
             if path.is_empty() {
                 return Err(PathError::NoSuchFileOrDirectory.into());
@@ -1444,10 +1420,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         let context = Context::new(user);
         let Some((parent, name)) = self
             .parent_dir_and_name(&context, anchor.clone(), path)
-            .map_err(|error| match error {
-                WalkError::Io => MkdirError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?
+            .map_err(walk_error_or(MkdirError::Io))?
         else {
             return Err(MkdirError::AlreadyExists);
         };
@@ -1497,12 +1470,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         path: &str,
     ) -> Result<(), RmdirError> {
         let context = Context::new(user);
-        let Some((parent, name)) =
-            self.parent_dir_and_name(&context, anchor, path)
-                .map_err(|error| match error {
-                    WalkError::Io => RmdirError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
+        let Some((parent, name)) = self
+            .parent_dir_and_name(&context, anchor, path)
+            .map_err(walk_error_or(RmdirError::Io))?
         else {
             return Err(RmdirError::Busy);
         };
@@ -1577,16 +1547,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         let context = Context::new(user);
         let (path, walked) = self
             .resolve_path(&context, anchor, path, follow_symlinks, false)
-            .map_err(|error| match error {
-                WalkError::Io => FileStatusError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+            .map_err(walk_error_or(FileStatusError::Io))?;
         let target = self
             .resolve_target(&context, &path, walked)
-            .map_err(|error| match error {
-                WalkError::Io => FileStatusError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+            .map_err(walk_error_or(FileStatusError::Io))?;
         // Unlike an O_PATH open, this must not trigger backend open hooks.
         self.backend.resolved_status(&target)
     }
@@ -1600,14 +1564,17 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         match &entry.handle {
             Handle::Dir(dir) => match self.backend.dir_path(dir)? {
                 Some(components) => Ok(ResolvedPath::join(String::new(), &components)),
-                None => self.opened_name(entry),
+                None => self.name_under_current_anchor(entry),
             },
-            Handle::File(_) => self.opened_name(entry),
+            Handle::File(_) => self.name_under_current_anchor(entry),
         }
     }
 
     /// The name an entry was opened by, following renames of the directory it was opened from.
-    fn opened_name(&self, entry: &ResolverEntry<Backend>) -> Result<String, WalkError> {
+    fn name_under_current_anchor(
+        &self,
+        entry: &ResolverEntry<Backend>,
+    ) -> Result<String, WalkError> {
         let Some(anchor) = &entry.name.anchor else {
             return Ok(entry.name.to_absolute());
         };
@@ -1783,7 +1750,7 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
     /// Absolute name of the opened object as recorded when it was opened, naming the directory
     /// it was opened from by that directory's recorded name.
     #[cfg(test)]
-    pub(crate) fn recorded_name(&self) -> String {
+    pub(super) fn recorded_name(&self) -> String {
         self.name.to_absolute()
     }
 

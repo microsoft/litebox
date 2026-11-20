@@ -1,16 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#define _GNU_SOURCE
+#include "helpers.h"
 #include <assert.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 static void check_detached(void) {
     char buf[4096];
@@ -30,10 +22,14 @@ int main(int argc, char **argv) {
         check_detached();
         return 0;
     }
-    assert(argc == 3 && argv[1][0] == '/' && argv[2][0] == '/');
-    assert(mkdir(argv[2], 0700) == 0);
-    int fd = open(argv[2], O_PATH | O_DIRECTORY);
-    assert(fd >= 0 && fchdir(fd) == 0 && rmdir(argv[2]) == 0);
+    // Usage: process_cwd <absolute path of this program> [absolute directory to detach], the
+    // directory defaulting to one in `test_dir()`.
+    assert((argc == 2 || argc == 3) && argv[1][0] == '/');
+    const char *dir = argc == 3 ? argv[2] : test_path("detached");
+    assert(dir[0] == '/');
+    assert(mkdir(dir, 0700) == 0);
+    int fd = open(dir, O_PATH | O_DIRECTORY);
+    assert(fd >= 0 && fchdir(fd) == 0 && rmdir(dir) == 0);
     char *args[] = {argv[1], "child", NULL};
     int status;
     pid_t pid = fork();
@@ -58,9 +54,9 @@ int main(int argc, char **argv) {
     assert(close(fd) == 0); // vfork/exec now has no descriptor naming the cwd.
     // Replace the old cwd name. A relative exec must start lookup at the detached
     // directory, and the fresh runner must be able to repeat that lookup.
-    assert(symlink(args[0], argv[2]) == 0);
+    assert(symlink(args[0], dir) == 0);
     char relative[4096];
-    int len = snprintf(relative, sizeof(relative), "..%s", strrchr(argv[2], '/'));
+    int len = snprintf(relative, sizeof(relative), "..%s", strrchr(dir, '/'));
     assert(len > 0 && (size_t)len < sizeof(relative));
     pid = vfork();
     if (pid == 0) {
@@ -69,7 +65,7 @@ int main(int argc, char **argv) {
     }
     assert(pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     check_detached();
-    assert(unlink(argv[2]) == 0);
+    assert(unlink(dir) == 0);
     puts("All process cwd tests passed.");
     return 0;
 }
