@@ -2724,7 +2724,7 @@ pub enum PrctlArg {
     CapBSetRead(usize),
     /// PR_GET_KEEPCAPS: read the calling thread's keep-capabilities flag
     GetKeepCaps,
-    /// PR_SET_KEEPCAPS: set the calling thread's keep-capabilities flag, which `execve` clears
+    /// PR_SET_KEEPCAPS: set the calling thread's keep-capabilities flag
     SetKeepCaps(bool),
     /// PR_SET_CHILD_SUBREAPER: set whether this process adopts orphaned descendants
     SetChildSubreaper(usize),

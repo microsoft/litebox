@@ -57,8 +57,8 @@ const OVERHEAD_MEMORY_MIB: u64 = 128;
 const MAX_MEMORY_MIB: u64 = (512 - 2) << 10;
 
 /// Fails if the VM cannot run `plan`: on hosts other than x86-64, with more egress destinations of
-/// a protocol than its kernel's broker takes, or with published ports, which it does not serve yet
-/// (see the crate's docs).
+/// a protocol than its kernel's broker takes, or with published ports or ICMP echo egress, which it
+/// does not serve yet (see the crate's docs).
 pub fn check(plan: &Plan) -> Result<()> {
     if cfg!(not(target_arch = "x86_64")) {
         return Err(unsupported("the VM backend runs on x86-64 hosts only"));
@@ -75,6 +75,11 @@ pub fn check(plan: &Plan) -> Result<()> {
     if !plan.publish.is_empty() {
         return Err(unsupported(
             "the VM backend publishes no ports yet (io.litebox.publish.*)",
+        ));
+    }
+    if !plan.egress.icmp_echo.is_empty() {
+        return Err(unsupported(
+            "the VM backend serves no ICMP echo yet (io.litebox.egress.icmp-echo)",
         ));
     }
     Ok(())
@@ -213,7 +218,8 @@ pub fn guardian_arguments(
     Ok(())
 }
 
-/// The payload's `policy` (see `litebox_broker_vm_kernel`'s docs): `egress`'s rules, a line each.
+/// The payload's `policy` (see `litebox_broker_vm_kernel`'s docs): `egress`'s TCP and UDP rules, a
+/// line each ([`check`] refuses ICMP echo rules).
 fn policy(egress: &Egress) -> String {
     let mut policy = String::new();
     for (protocol, destinations) in [("tcp", &egress.tcp), ("udp", &egress.udp)] {

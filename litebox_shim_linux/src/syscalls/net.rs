@@ -1074,6 +1074,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         msg_ptr: UserPtrMut<litebox_common_linux::UserMsgHdr>,
         flags: ReceiveFlags,
     ) -> Result<usize, Errno> {
+        // TODO: Linux ignores MSG_ERRQUEUE on Unix sockets (returning data or EAGAIN) rather than
+        // failing; match it once their receive path can take the flag.
         if flags.contains(ReceiveFlags::ERRQUEUE) && !matches!(socket, ReceiveSocket::Inet(_)) {
             return Err(Errno::EINVAL);
         }

@@ -229,7 +229,8 @@ impl GuestPortBinding {
 ///
 /// Socket resources own reservations. Processes remain ownership, quota, and
 /// teardown domains rather than separate network namespaces. TCP ports, UDP
-/// ports, and echo identifiers occupy independent spaces.
+/// ports, and echo identifiers occupy independent spaces, and all remain
+/// independent of the host's.
 #[derive(Clone, Default)]
 pub(crate) struct BrokerSocketPorts {
     state: Arc<Mutex<BrokerSocketPortState>>,
@@ -978,7 +979,7 @@ pub fn set_error(process: &BrokerProcess, handle: ObjectHandle, error: SocketErr
 /// Starts a transport connection attempt.
 ///
 /// TCP connected and failed states are terminal. Datagram connects complete
-/// synchronously, and a failed attempt preserves the previous peer.
+/// synchronously, with the peer outcomes [`connect`] describes.
 fn transport_connect(
     process: &BrokerProcess,
     object: &RwLock<ObjectEntry>,

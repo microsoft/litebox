@@ -255,6 +255,26 @@ static void fork_and_execve_carry_the_flags(void) {
     CHECK(pr(PR_GET_KEEPCAPS, 0, 0, 0, 0) == 1);
 }
 
+// An unknown capability version fails with EINVAL and is rewritten to the preferred one, with
+// which dropping every capability then succeeds. In a child, so natively the test keeps its own.
+static void capset_negotiates_its_version(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child == 0) {
+        struct __user_cap_header_struct caps = {.version = 0};
+        struct __user_cap_data_struct empty[2] = {0};
+        errno = 0;
+        if (syscall(SYS_capset, &caps, empty) != -1 || errno != EINVAL) {
+            _exit(1);
+        }
+        if (caps.version != _LINUX_CAPABILITY_VERSION_3) {
+            _exit(2);
+        }
+        _exit(syscall(SYS_capset, &caps, empty) == 0 ? 0 : 3);
+    }
+    CHECK(child > 0 && exited_with(child, 0));
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[1], "exec-child") == 0) {
         return dumpable() == 1 && no_new_privs() == atoi(argv[2]) &&
@@ -271,6 +291,7 @@ int main(int argc, char **argv) {
     execve_from_a_thread_keeps_its_flag();
     no_new_privs_sticks_to_its_thread();
     fork_and_execve_carry_the_flags();
+    capset_negotiates_its_version();
     printf("prctl-flags failures=%d\n", failures);
     return failures != 0;
 }

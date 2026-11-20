@@ -37,6 +37,17 @@
         }                                                                     \
     } while (0)
 
+// Waits up to 30 s, retrying interrupted polls, for `fd` to become readable; returns whether it
+// did. The bound stops a test that never gets its input instead of hanging it.
+static inline int fd_readable_within_timeout(int fd) {
+    struct pollfd poll_fd = {.fd = fd, .events = POLLIN};
+    int ready;
+    do {
+        ready = poll(&poll_fd, 1, 30000);
+    } while (ready == -1 && errno == EINTR);
+    return ready == 1 && (poll_fd.revents & POLLIN);
+}
+
 static inline long itimer_value_us(const struct itimerval *iv) {
     return (long)iv->it_value.tv_sec * 1000000L + (long)iv->it_value.tv_usec;
 }

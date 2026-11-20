@@ -147,7 +147,7 @@ trait PermitsDestination: Copy {
 
 /// Whether a rule for `rule_caller` and `network` covers `caller_credential`
 /// reaching the IP of `destination`.
-fn rule_covers_host(
+fn rule_matches_caller_and_host(
     rule_caller: CallerCredential,
     network: Ipv4Cidr,
     caller_credential: CallerCredential,
@@ -158,7 +158,7 @@ fn rule_covers_host(
 
 impl PermitsDestination for DestinationRule {
     fn permits(self, caller_credential: CallerCredential, destination: SocketAddrV4) -> bool {
-        rule_covers_host(
+        rule_matches_caller_and_host(
             self.caller_credential,
             self.destination,
             caller_credential,
@@ -214,7 +214,7 @@ impl IcmpEchoDestinationRule {
 
 impl PermitsDestination for IcmpEchoDestinationRule {
     fn permits(self, caller_credential: CallerCredential, destination: SocketAddrV4) -> bool {
-        rule_covers_host(
+        rule_matches_caller_and_host(
             self.caller_credential,
             self.destination,
             caller_credential,
@@ -223,7 +223,7 @@ impl PermitsDestination for IcmpEchoDestinationRule {
     }
 }
 
-const EMPTY_ECHO_RULE: IcmpEchoDestinationRule = IcmpEchoDestinationRule {
+const EMPTY_ICMP_ECHO_RULE: IcmpEchoDestinationRule = IcmpEchoDestinationRule {
     caller_credential: EMPTY_DESTINATION_RULE.caller_credential,
     destination: EMPTY_DESTINATION_RULE.destination,
 };
@@ -310,7 +310,7 @@ impl SocketPolicy {
         Self {
             tcp: Some(DestinationPolicy::empty(EMPTY_DESTINATION_RULE)),
             udp: Some(DestinationPolicy::empty(EMPTY_DESTINATION_RULE)),
-            icmp_echo: Some(DestinationPolicy::empty(EMPTY_ECHO_RULE)),
+            icmp_echo: Some(DestinationPolicy::empty(EMPTY_ICMP_ECHO_RULE)),
         }
     }
 
@@ -337,7 +337,7 @@ impl SocketPolicy {
         mut self,
         rules: &[IcmpEchoDestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        self.icmp_echo = Some(copy_destination_rules(rules, EMPTY_ECHO_RULE)?);
+        self.icmp_echo = Some(copy_destination_rules(rules, EMPTY_ICMP_ECHO_RULE)?);
         Ok(self)
     }
 
@@ -1090,6 +1090,41 @@ mod tests {
         ] {
             assert_eq!(
                 policy.authorize_socket_destination(principal, protocol, destination),
+                Err(BrokerError::PolicyDenied)
+            );
+        }
+    }
+
+    #[test]
+    fn socket_create_requires_the_protocol_s_socket_type() {
+        // Every protocol is permitted, so only the mismatched type denies these. The socket core
+        // classifies a socket by its protocol alone, relying on this check.
+        let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network());
+        let caller = CallerCredential::Unauthenticated;
+        let echo = CreateSocketRequest {
+            protocol: IpProtocol::IcmpEcho,
+            ..IPV4_UDP
+        };
+        for allowed in [IPV4_TCP, IPV4_UDP, echo] {
+            assert!(policy.authorize_socket_create(caller, allowed).is_ok());
+        }
+        for mismatched in [
+            CreateSocketRequest {
+                socket_type: SocketType::Stream,
+                ..echo
+            },
+            CreateSocketRequest {
+                socket_type: SocketType::Stream,
+                ..IPV4_UDP
+            },
+            CreateSocketRequest {
+                socket_type: SocketType::Datagram,
+                ..IPV4_TCP
+            },
+        ] {
+            assert_eq!(
+                policy.authorize_socket_create(caller, mismatched),
                 Err(BrokerError::PolicyDenied)
             );
         }

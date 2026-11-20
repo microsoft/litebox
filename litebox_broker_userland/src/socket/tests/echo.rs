@@ -234,27 +234,28 @@ fn echo_loopback_peek_truncation_and_connect() {
     });
 }
 
-#[test]
-fn echo_drops_loopback_replies_beyond_its_queue_but_not_requests() {
-    use crate::socket::echo::MAX_REPLIES;
-
+/// Sends one more loopback request of `length` bytes than the `fitting`
+/// replies the queue holds: every send succeeds, and only the first `fitting`
+/// replies arrive, in order.
+fn assert_loopback_replies_beyond_the_queue_are_dropped(length: usize, fitting: usize) {
     with_echo(&SocketPolicy::guest_network(), |process, handle, _| {
         let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
-        let mut request = REQUEST;
-        for sequence in 0..=MAX_REPLIES {
+        let mut request = vec![0; length];
+        request[0] = 8;
+        for sequence in 0..=fitting {
             request[7] = u8::try_from(sequence).unwrap();
             assert_eq!(
                 send_datagram(process, handle, &request, SendFlags::NONE, Some(peer)),
-                Ok(SocketOutcome::Completed(request.len()))
+                Ok(SocketOutcome::Completed(length))
             );
         }
-        let mut reply = [0; REPLY.len()];
-        for sequence in 0..MAX_REPLIES {
+        let mut reply = vec![0; length];
+        for sequence in 0..fitting {
             assert_eq!(
                 receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
                 Ok(SocketOutcome::Completed(PlatformDatagramReceive {
-                    received: REPLY.len(),
-                    datagram_length: REPLY.len(),
+                    received: length,
+                    datagram_length: length,
                     source_address: peer,
                 }))
             );
@@ -268,39 +269,19 @@ fn echo_drops_loopback_replies_beyond_its_queue_but_not_requests() {
 }
 
 #[test]
+fn echo_drops_loopback_replies_beyond_its_queue_but_not_requests() {
+    use crate::socket::echo::MAX_REPLIES;
+
+    assert_loopback_replies_beyond_the_queue_are_dropped(REQUEST.len(), MAX_REPLIES);
+}
+
+#[test]
 fn echo_bounds_the_bytes_of_its_queued_loopback_replies() {
     use crate::socket::echo::MAX_REPLY_BYTES;
     use litebox_broker_protocol::socket::MAX_ICMP_ECHO_MESSAGE_SIZE;
 
-    with_echo(&SocketPolicy::guest_network(), |process, handle, _| {
-        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
-        let mut request = vec![0; MAX_ICMP_ECHO_MESSAGE_SIZE as usize];
-        request[0] = 8;
-        let fitting = MAX_REPLY_BYTES / request.len();
-        for sequence in 0..=fitting {
-            request[7] = u8::try_from(sequence).unwrap();
-            assert_eq!(
-                send_datagram(process, handle, &request, SendFlags::NONE, Some(peer)),
-                Ok(SocketOutcome::Completed(request.len()))
-            );
-        }
-        let mut reply = vec![0; request.len()];
-        for sequence in 0..fitting {
-            assert_eq!(
-                receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
-                Ok(SocketOutcome::Completed(PlatformDatagramReceive {
-                    received: request.len(),
-                    datagram_length: request.len(),
-                    source_address: peer,
-                }))
-            );
-            assert_eq!(usize::from(reply[7]), sequence);
-        }
-        assert_eq!(
-            receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
-            Err(BrokerError::NonBlockingWouldBlock)
-        );
-    });
+    let length = MAX_ICMP_ECHO_MESSAGE_SIZE as usize;
+    assert_loopback_replies_beyond_the_queue_are_dropped(length, MAX_REPLY_BYTES / length);
 }
 
 #[cfg(target_os = "linux")]
@@ -345,7 +326,7 @@ fn echo_reports_a_host_error_once(taken_by_status: bool) {
             )];
             host.send(RawParts::from(&parts), None).unwrap();
             let deadline = Instant::now() + TEST_TIMEOUT;
-            while !host.poll_events().unwrap().contains(SocketEvents::ERROR) {
+            while !host.ready_events().unwrap().contains(SocketEvents::ERROR) {
                 assert!(Instant::now() < deadline, "no ICMP error arrived");
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -490,14 +471,19 @@ fn echo_gateway_roundtrip_and_connected_reconnect() {
     );
 }
 
+/// Permits the unauthenticated caller to echo `ip`.
+#[cfg(target_os = "linux")]
+fn host_echo_rule(ip: Ipv4Addr) -> litebox_broker_core::IcmpEchoDestinationRule {
+    litebox_broker_core::IcmpEchoDestinationRule::new(
+        CallerCredential::Unauthenticated,
+        Ipv4Cidr::new(Ipv4Address(ip.octets()), 32).unwrap(),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn echo_gateway_roundtrip_and_connected_reconnect_with_ping_sockets() {
-    let rule = litebox_broker_core::IcmpEchoDestinationRule::new(
-        CallerCredential::Unauthenticated,
-        Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
-    );
     let policy = SocketPolicy::guest_network()
-        .with_icmp_echo_destination_rules(&[rule])
+        .with_icmp_echo_destination_rules(&[host_echo_rule(HOST_GATEWAY_IPV4_ADDRESS)])
         .unwrap();
     with_echo(&policy, |process, handle, publications| {
         let peer = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 0);
@@ -562,50 +548,59 @@ fn echo_reconnect_keeps_host_replies() {
         let other = Ipv4Addr::new(198, 51, 100, 1);
         ip(&format!("addr add {other}/32 dev lo"));
         std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0 0").unwrap();
-        let rules = [HOST_GATEWAY_IPV4_ADDRESS, other].map(|ip| {
-            litebox_broker_core::IcmpEchoDestinationRule::new(
-                CallerCredential::Unauthenticated,
-                Ipv4Cidr::new(Ipv4Address(ip.octets()), 32).unwrap(),
-            )
-        });
+        probe_native_loopback_echo().unwrap();
+        let rules = [HOST_GATEWAY_IPV4_ADDRESS, other].map(host_echo_rule);
         let policy = SocketPolicy::guest_network()
             .with_icmp_echo_destination_rules(&rules)
             .unwrap();
-        with_echo(&policy, |process, handle, publications| {
-            let gateway = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 0);
-            let local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0x1234);
-            assert_eq!(
-                core_socket::bind(process, handle, local),
-                Ok(SocketOutcome::Completed(local))
-            );
-            // The provider stages one host reply at a time, so the second
-            // stays queued in the host socket across the connect.
-            let mut request = REQUEST;
-            for sequence in 1..=2 {
-                request[7] = sequence;
+        let provider = Arc::new(UserlandSocketProvider::new(1, 1).unwrap());
+        with_echo_provider(
+            &policy,
+            Arc::clone(&provider),
+            |process, handle, publications| {
+                let gateway = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, 0);
+                let local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0x1234);
                 assert_eq!(
-                    send_datagram(process, handle, &request, SendFlags::NONE, Some(gateway)),
-                    Ok(SocketOutcome::Completed(request.len()))
+                    core_socket::bind(process, handle, local),
+                    Ok(SocketOutcome::Completed(local))
                 );
-            }
-            wait_until_ready(process, publications, handle, ReadinessFlags::READ);
-            assert_eq!(
-                core_socket::connect(process, handle, SocketAddrV4::new(other, 0)),
-                Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
-            );
-            for sequence in 1..=2 {
+                // The provider stages one host reply at a time, so the second
+                // stays queued in the host socket across the connect.
+                let mut request = REQUEST;
+                for sequence in 1..=2 {
+                    request[7] = sequence;
+                    assert_eq!(
+                        send_datagram(process, handle, &request, SendFlags::NONE, Some(gateway)),
+                        Ok(SocketOutcome::Completed(request.len()))
+                    );
+                }
                 wait_until_ready(process, publications, handle, ReadinessFlags::READ);
-                let mut reply = [0; REPLY.len()];
+                let deadline = Instant::now() + TEST_TIMEOUT;
+                while !only_socket(&provider)
+                    .call(|entry| Ok(entry.echo_test_host_readable()))
+                    .unwrap()
+                {
+                    assert!(Instant::now() < deadline, "the second reply never arrived");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 assert_eq!(
-                    receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
-                    Ok(SocketOutcome::Completed(PlatformDatagramReceive {
-                        received: REPLY.len(),
-                        datagram_length: REPLY.len(),
-                        source_address: gateway,
-                    }))
+                    core_socket::connect(process, handle, SocketAddrV4::new(other, 0)),
+                    Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
                 );
-                assert_eq!(reply[7], sequence);
-            }
-        });
+                for sequence in 1..=2 {
+                    wait_until_ready(process, publications, handle, ReadinessFlags::READ);
+                    let mut reply = [0; REPLY.len()];
+                    assert_eq!(
+                        receive_datagram_into(process, handle, &mut reply, ReceiveFromFlags::NONE),
+                        Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                            received: REPLY.len(),
+                            datagram_length: REPLY.len(),
+                            source_address: gateway,
+                        }))
+                    );
+                    assert_eq!(reply[7], sequence);
+                }
+            },
+        );
     });
 }

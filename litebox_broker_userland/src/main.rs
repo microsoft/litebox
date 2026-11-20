@@ -563,7 +563,7 @@ fn finish_in_process_runner(
 fn configured_socket_policy(
     allowed_tcp_destinations: &[AllowedDestination],
     allowed_udp_destinations: &[AllowedDestination],
-    allowed_echo_destinations: &[Ipv4Cidr],
+    allowed_icmp_echo_destinations: &[Ipv4Cidr],
 ) -> Result<SocketPolicy, SocketPolicyError> {
     let mut policy = SocketPolicy::guest_network();
     if !allowed_tcp_destinations.is_empty() {
@@ -574,8 +574,8 @@ fn configured_socket_policy(
         let rules = destination_rules(allowed_udp_destinations);
         policy = policy.with_udp_destination_rules(&rules)?;
     }
-    if !allowed_echo_destinations.is_empty() {
-        let rules: Vec<_> = allowed_echo_destinations
+    if !allowed_icmp_echo_destinations.is_empty() {
+        let rules: Vec<_> = allowed_icmp_echo_destinations
             .iter()
             .map(|&destination| {
                 IcmpEchoDestinationRule::new(CallerCredential::HostGuaranteed, destination)

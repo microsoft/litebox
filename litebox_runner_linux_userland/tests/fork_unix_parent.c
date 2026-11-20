@@ -16,22 +16,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// Bounds every wait, so a failure cannot hang the test.
-#define TIMEOUT_MS 30000
-
-static int wait_readable(int fd) {
-    struct pollfd poll_fd = {.fd = fd, .events = POLLIN};
-    int ready;
-    do {
-        ready = poll(&poll_fd, 1, TIMEOUT_MS);
-    } while (ready == -1 && errno == EINTR);
-    return ready == 1;
-}
-
 static int read_exact(int fd, char *buffer, size_t length) {
     size_t received = 0;
     while (received < length) {
-        if (!wait_readable(fd)) {
+        if (!fd_readable_within_timeout(fd)) {
             return 0;
         }
         ssize_t n = read(fd, buffer + received, length - received);
@@ -60,7 +48,7 @@ static int send_all(int fd, const char *message) {
 // `listener` is nonblocking, so a connection taken by the other process sharing it fails the accept
 // rather than blocking it.
 static int accept_within(int listener) {
-    return wait_readable(listener) ? accept(listener, NULL, NULL) : -1;
+    return fd_readable_within_timeout(listener) ? accept(listener, NULL, NULL) : -1;
 }
 
 // Returns the exit code of `child`, or -1 if it did not exit normally.
@@ -103,7 +91,7 @@ static int stream_pair(void) {
     failures = finish(child, failures, 0);
     // The child's exit closed the only other reference to the peer.
     char byte;
-    failures += !wait_readable(pair[0]) || read(pair[0], &byte, 1) != 0;
+    failures += !fd_readable_within_timeout(pair[0]) || read(pair[0], &byte, 1) != 0;
     close(pair[0]);
     return failures;
 }
@@ -235,9 +223,9 @@ static int seqpacket_exec(const char *child_path) {
         return 1;
     }
     char buffer[16];
-    int failures = !wait_readable(pair[0]) || recv(pair[0], buffer, sizeof buffer, 0) != 6 ||
+    int failures = !fd_readable_within_timeout(pair[0]) || recv(pair[0], buffer, sizeof buffer, 0) != 6 ||
                    memcmp(buffer, "forked", 6) != 0;
-    failures += !wait_readable(pair[0]) || recv(pair[0], buffer, sizeof buffer, 0) != 0;
+    failures += !fd_readable_within_timeout(pair[0]) || recv(pair[0], buffer, sizeof buffer, 0) != 0;
     // Only a child that exec'd is still running to be killed.
     kill(child, SIGKILL);
     failures += wait_code(child) != -1;

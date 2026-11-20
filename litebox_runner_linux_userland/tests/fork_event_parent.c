@@ -19,18 +19,6 @@
 
 #include "helpers.h"
 
-// Bounds every wait, so a failure cannot hang the test.
-#define TIMEOUT_MS 30000
-
-static int wait_readable(int fd) {
-    struct pollfd poll_fd = {.fd = fd, .events = POLLIN};
-    int ready;
-    do {
-        ready = poll(&poll_fd, 1, TIMEOUT_MS);
-    } while (ready == -1 && errno == EINTR);
-    return ready == 1;
-}
-
 static uint64_t read_count(int fd) {
     uint64_t value = 0;
     ssize_t n;
@@ -71,7 +59,7 @@ static int check_blocking_eventfd(void) {
     }
     // Give the child time to block.
     sleep_ms(100);
-    int ok = write_count(request, 5) && wait_readable(reply) && read_count(reply) == 6;
+    int ok = write_count(request, 5) && fd_readable_within_timeout(reply) && read_count(reply) == 6;
     ok &= reap(child, ok) == 0;
     close(request);
     close(reply);
@@ -123,7 +111,7 @@ static int check_timerfd(void) {
     if (child < 0) {
         return 0;
     }
-    int ok = wait_readable(reply) && read_count(reply) == 1;
+    int ok = fd_readable_within_timeout(reply) && read_count(reply) == 1;
     ok &= reap(child, ok) == 0;
     int on = 1;
     ok &= ioctl(timer, FIONBIO, &on) == 0 && read_would_block(timer);

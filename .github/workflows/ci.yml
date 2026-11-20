@@ -47,6 +47,9 @@ jobs:
       - name: Install diod
         run: |
           sudo apt install -y diod
+      - name: Install iputils ping
+        run: |
+          command -v ping >/dev/null || sudo apt install -y iputils-ping
       - name: Install AArch64 binutils
         run: |
           sudo apt install -y binutils-aarch64-linux-gnu
@@ -344,6 +347,9 @@ jobs:
       - name: Install diod
         run: |
           sudo apt install -y diod
+      - name: Install iputils ping
+        run: |
+          command -v ping >/dev/null || sudo apt install -y iputils-ping
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.event_name != 'merge_group' }}

@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#include "helpers.h"
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
@@ -13,11 +14,6 @@
 
 // Largest ICMP message an IPv4 datagram carries: 0xffff less a 20-byte IP header.
 #define MAX_ECHO_MESSAGE 65515
-
-static int wait_readable(int fd) {
-    struct pollfd ready = {.fd = fd, .events = POLLIN};
-    return poll(&ready, 1, 2000) == 1 && (ready.revents & POLLIN);
-}
 
 // An RFC 1071 sum over a message whose checksum field is set folds to all ones.
 static int checksum_valid(const unsigned char *message, size_t length) {
@@ -54,7 +50,7 @@ static void truncated_receive_discards_the_rest(int fd, const struct sockaddr_in
     unsigned char request[] = {8, 0, 0, 0, 0, 0, 0, 7, 'x', 'y', 'z'};
     assert(sendto(fd, request, sizeof(request), 0, (const struct sockaddr *)dst, sizeof(*dst)) ==
            sizeof(request));
-    assert(wait_readable(fd));
+    assert(fd_readable_within_timeout(fd));
     unsigned char header[8];
     assert(recv(fd, header, sizeof(header), 0) == sizeof(header));
     assert(header[0] == 0 && header[7] == 7);
@@ -85,7 +81,7 @@ static void requests_are_validated_up_to_the_largest(int fd, const struct sockad
     // all-ones payload, whose sum carries out of 16 bits.
     memset(large + 8, 0xff, MAX_ECHO_MESSAGE - 8);
     assert(sendto(fd, large, MAX_ECHO_MESSAGE, 0, to, sizeof(*dst)) == MAX_ECHO_MESSAGE);
-    assert(wait_readable(fd));
+    assert(fd_readable_within_timeout(fd));
     memset(large, 0, MAX_ECHO_MESSAGE + 1);
     assert(recv(fd, large, MAX_ECHO_MESSAGE + 1, 0) == MAX_ECHO_MESSAGE);
     assert(large[0] == 0 && large[8] == 0xff && large[MAX_ECHO_MESSAGE - 1] == 0xff);
@@ -116,7 +112,7 @@ static void connected_socket_accepts_any_reply(void) {
         unsigned char reply[16];
         struct sockaddr_in src;
         len = sizeof(src);
-        assert(wait_readable(fd));
+        assert(fd_readable_within_timeout(fd));
         assert(recvfrom(fd, reply, sizeof(reply), 0, (struct sockaddr *)&src, &len) ==
                sizeof(request));
         assert(reply[7] == sequence);
@@ -148,7 +144,7 @@ int main(void) {
     request[7]++;
     assert(sendto(fd, request, sizeof(request), 0, (struct sockaddr *)&dst, sizeof(dst)) ==
            sizeof(request));
-    assert(wait_readable(fd));
+    assert(fd_readable_within_timeout(fd));
     // There is no extended error queue to read, and asking leaves the replies queued.
     unsigned char ignored[1];
     errno = 0;
@@ -174,11 +170,14 @@ int main(void) {
     len = sizeof(local);
     assert(getsockname(fd, (struct sockaddr *)&local, &len) == 0);
     assert(local.sin_port != 0 && memcmp(reply + 4, &local.sin_port, 2) == 0);
-    assert(wait_readable(fd));
+    assert(fd_readable_within_timeout(fd));
     assert(recv(fd, reply, sizeof(reply), 0) == sizeof(request));
     assert(checksum_valid(reply, sizeof(request)));
     assert(memcmp(reply + 6, request + 6, sizeof(request) - 6) == 0);
     assert(recv(fd, reply, sizeof(reply), 0) == -1 && errno == EAGAIN);
+    // Draining the replies clears readability, as Linux's level-triggered poll reports.
+    struct pollfd drained = {.fd = fd, .events = POLLIN | POLLOUT};
+    assert(poll(&drained, 1, 0) == 1 && drained.revents == POLLOUT);
     truncated_receive_discards_the_rest(fd, &dst);
     requests_are_validated_up_to_the_largest(fd, &dst);
     assert(close(fd) == 0);

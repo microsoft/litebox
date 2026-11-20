@@ -18,12 +18,12 @@ use litebox_platform::buffer::RawBytes;
 use std::collections::VecDeque;
 
 const ECHO_HEADER_LEN: usize = 8;
-const MAX_ECHO_MESSAGE: usize = MAX_ICMP_ECHO_MESSAGE_SIZE as usize;
+const MAX_ECHO_MESSAGE_LEN: usize = MAX_ICMP_ECHO_MESSAGE_SIZE as usize;
 /// Like a UDP socket's queue, an echo socket's is bounded by both its replies
 /// and their bytes.
 pub(super) const MAX_REPLIES: usize = 64;
-pub(super) const MAX_REPLY_BYTES: usize = 4 * MAX_ECHO_MESSAGE;
-const MAX_OUTSTANDING: usize = 64;
+pub(super) const MAX_REPLY_BYTES: usize = 4 * MAX_ECHO_MESSAGE_LEN;
+const MAX_OUTSTANDING_REQUESTS: usize = 64;
 pub(super) const HOST_SCAN_BUDGET: usize = 16;
 
 #[derive(Default)]
@@ -36,8 +36,8 @@ pub(super) struct EchoSocketState {
     reply_bytes: usize,
     write_blocked: bool,
     pending_error: Option<BrokerResult<SocketError>>,
-    /// Only deliver host replies to recent sends on this socket. Bounded even
-    /// when a destination never replies.
+    /// The guest peer and sequence number of recent external requests, oldest
+    /// first, at most [`MAX_OUTSTANDING_REQUESTS`].
     outstanding: VecDeque<(SocketAddrV4, [u8; 2])>,
 }
 
@@ -74,6 +74,68 @@ impl EchoSocketState {
     }
 }
 
+/// How a scan of a host ping socket's input ended.
+enum HostScan {
+    /// No input is left.
+    Drained,
+    Failed(SocketError),
+    /// A reply to a recent send, rewritten for the guest, with its guest peer.
+    Matched(SocketAddrV4, Vec<u8>),
+    /// Input may remain after [`HOST_SCAN_BUDGET`] unmatched datagrams.
+    BudgetExhausted,
+}
+
+/// Scans up to [`HOST_SCAN_BUDGET`] datagrams from `host` into `scratch` for a
+/// reply to one of the `outstanding` requests, taking it from `outstanding`
+/// and rewriting it for the guest socket with echo identifier `id`.
+fn scan_host_echo_replies(
+    host: &Socket,
+    outstanding: &mut VecDeque<(SocketAddrV4, [u8; 2])>,
+    scratch: &mut Vec<u8>,
+    id: u16,
+) -> BrokerResult<HostScan> {
+    // A ping socket may return only the length it copied, so give the
+    // kernel room for one byte more than the longest echo message.
+    if scratch.is_empty() {
+        *scratch = zeroed_vec(MAX_ECHO_MESSAGE_LEN + 1)?;
+    }
+    for _ in 0..HOST_SCAN_BUDGET {
+        let parts = [RawBytes::from(scratch.as_mut_slice())];
+        let (length, source) =
+            match retry_intr(|| host.receive_datagram(RawParts::from(&parts), false)) {
+                Ok((n, Some(source))) if (ECHO_HEADER_LEN..=MAX_ECHO_MESSAGE_LEN).contains(&n) => {
+                    (n, source)
+                }
+                Ok(_) => continue,
+                Err(Errno::AGAIN) => return Ok(HostScan::Drained),
+                Err(error) => {
+                    return Ok(HostScan::Failed(socket_operation_error_from_errno(error)?));
+                }
+            };
+        let message = &mut scratch[..length];
+        if message[..2] != [0, 0] {
+            continue;
+        }
+        let sequence = echo_sequence(message);
+        let Some(index) = outstanding.iter().position(|&(peer, seq)| {
+            host_socket_destination(peer).ip() == source.ip() && seq == sequence
+        }) else {
+            continue;
+        };
+        let Some((peer, _)) = outstanding.remove(index) else {
+            return Err(BrokerError::Internal);
+        };
+        rewrite_as_guest_reply(message, id);
+        let mut reply = Vec::new();
+        reply
+            .try_reserve_exact(length)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        reply.extend_from_slice(message);
+        return Ok(HostScan::Matched(peer, reply));
+    }
+    Ok(HostScan::BudgetExhausted)
+}
+
 fn echo_sequence(message: &[u8]) -> [u8; 2] {
     [message[6], message[7]]
 }
@@ -84,7 +146,7 @@ fn rewrite_as_guest_reply(message: &mut [u8], identifier: u16) {
     message[0] = 0;
     message[2..4].fill(0);
     message[4..6].copy_from_slice(&identifier.to_be_bytes());
-    // At most MAX_ECHO_MESSAGE bytes, so this sum fits in a u32.
+    // At most MAX_ECHO_MESSAGE_LEN bytes, so this sum fits in a u32.
     let mut sum = message
         .chunks(2)
         .map(|p| u32::from(u16::from_be_bytes([p[0], p.get(1).copied().unwrap_or(0)])))
@@ -244,7 +306,7 @@ impl SocketEntry<'_> {
             return Ok(SocketOutcome::Failed(SocketError::AddressNotAvailable));
         };
         let length = data.len();
-        if !(ECHO_HEADER_LEN..=MAX_ECHO_MESSAGE).contains(&length) {
+        if !(ECHO_HEADER_LEN..=MAX_ECHO_MESSAGE_LEN).contains(&length) {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         // Guest memory can change between validation and sendmsg.
@@ -272,7 +334,7 @@ impl SocketEntry<'_> {
         }
         let echo = self.echo_state_mut()?;
         let sequence = echo_sequence(&message);
-        if echo.outstanding.len() < MAX_OUTSTANDING {
+        if echo.outstanding.len() < MAX_OUTSTANDING_REQUESTS {
             echo.outstanding
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
@@ -288,7 +350,7 @@ impl SocketEntry<'_> {
         });
         let outcome = match result {
             Ok(n) => {
-                if echo.outstanding.len() == MAX_OUTSTANDING {
+                if echo.outstanding.len() == MAX_OUTSTANDING_REQUESTS {
                     echo.outstanding.pop_front();
                 }
                 echo.outstanding.push_back((peer, sequence));
@@ -305,7 +367,8 @@ impl SocketEntry<'_> {
 
     /// Stages one host reply so peeking, truncated reads, identifier
     /// rewriting and the ICMP checksum all refer to the same complete
-    /// datagram.
+    /// datagram. Discards up to [`HOST_SCAN_BUDGET`] unmatched datagrams,
+    /// then schedules another scan; returns a host receive error, if any.
     fn stage_host_echo_reply(&mut self) -> BrokerResult<Option<SocketError>> {
         let core = self.core();
         let echo = self.echo_state_mut()?;
@@ -318,50 +381,32 @@ impl SocketEntry<'_> {
             .ok_or(BrokerError::Internal)?
             .local_address()
             .port();
-        let mut scratch = lock(&core.echo_scratch);
-        // A ping socket may return only the length it copied, so give the
-        // kernel room for one byte more than the longest echo message.
-        if scratch.is_empty() {
-            *scratch = zeroed_vec(MAX_ECHO_MESSAGE + 1)?;
-        }
-        for _ in 0..HOST_SCAN_BUDGET {
-            let parts = [RawBytes::from(scratch.as_mut_slice())];
-            let (length, source) =
-                match retry_intr(|| host.receive_datagram(RawParts::from(&parts), false)) {
-                    Ok((n, Some(source))) if (ECHO_HEADER_LEN..=MAX_ECHO_MESSAGE).contains(&n) => {
-                        (n, source)
-                    }
-                    Ok(_) => continue,
-                    Err(Errno::AGAIN) => return Ok(None),
-                    Err(error) => return Ok(Some(socket_operation_error_from_errno(error)?)),
-                };
-            let message = &mut scratch[..length];
-            if message[..2] != [0, 0] {
-                continue;
+        // Never wait for another socket's scan: the event thread calls this
+        // too, and must not wait for a lock that guest calls can keep taking.
+        let mut scratch = match core.echo_scratch.try_lock() {
+            Ok(scratch) => scratch,
+            Err(TryLockError::WouldBlock) => {
+                core.posted.post(self.id());
+                return Ok(None);
             }
-            let sequence = echo_sequence(message);
-            let Some(index) = echo.outstanding.iter().position(|&(peer, seq)| {
-                host_socket_destination(peer).ip() == source.ip() && seq == sequence
-            }) else {
-                continue;
-            };
-            let Some((peer, _)) = echo.outstanding.remove(index) else {
-                return Err(BrokerError::Internal);
-            };
-            rewrite_as_guest_reply(message, id);
-            let mut reply = Vec::new();
-            reply
-                .try_reserve_exact(length)
-                .map_err(|_| BrokerError::OutOfMemory)?;
-            reply.extend_from_slice(message);
-            echo.push_reply(peer, reply)?;
-            return Ok(None);
-        }
+            Err(TryLockError::Poisoned(_)) => panic!("socket provider lock poisoned"),
+        };
+        let staged = scan_host_echo_replies(host, &mut echo.outstanding, &mut scratch, id)?;
         drop(scratch);
-        // Edge-triggered input may still be queued. Yield to other sockets
-        // before scanning another batch, even if the guest never calls recv.
-        core.posted.post(self.id());
-        Ok(None)
+        match staged {
+            HostScan::Drained => Ok(None),
+            HostScan::Failed(error) => Ok(Some(error)),
+            HostScan::Matched(peer, reply) => {
+                echo.push_reply(peer, reply)?;
+                Ok(None)
+            }
+            HostScan::BudgetExhausted => {
+                // Edge-triggered input may still be queued. Yield to other sockets
+                // before scanning another batch, even if the guest never calls recv.
+                core.posted.post(self.id());
+                Ok(None)
+            }
+        }
     }
 
     pub(super) fn receive_echo(
@@ -369,18 +414,22 @@ impl SocketEntry<'_> {
         output: RawParts<'_>,
         flags: ReceiveFromFlags,
     ) -> BrokerResult<ReceiveFromOutcome> {
-        if self.read_shutdown {
-            return Ok(ReceiveFromOutcome::Failed(SocketError::NotConnected));
+        // As for UDP, and as Linux's datagram receive checks `sk_err` before
+        // its queue, a pending error comes before shutdown and queued replies.
+        if let Some(error) = self.take_echo_error()? {
+            return Ok(ReceiveFromOutcome::Failed(error));
         }
-        let echo = self.echo_state()?;
-        if echo.replies.is_empty() && echo.pending_error.is_none() {
+        if self.read_shutdown {
+            return Ok(ReceiveFromOutcome::Failed(SocketError::Shutdown));
+        }
+        if self.echo_state()?.replies.is_empty() {
             self.refresh_echo()?;
+            if let Some(error) = self.take_echo_error()? {
+                return Ok(ReceiveFromOutcome::Failed(error));
+            }
         }
         let Some((source, message)) = self.echo_state()?.replies.front() else {
-            return match self.take_echo_error()? {
-                Some(error) => Ok(ReceiveFromOutcome::Failed(error)),
-                None => Err(BrokerError::WouldBlock),
-            };
+            return Err(BrokerError::WouldBlock);
         };
         let result = ReceiveFromOutcome::copy_out(output, message, *source);
         if !flags.contains(ReceiveFromFlags::PEEK) {
@@ -399,7 +448,7 @@ impl SocketEntry<'_> {
     fn sync_host_echo(&mut self) -> BrokerResult<Option<SocketError>> {
         let echo = self.echo_state_mut()?;
         let events = match &echo.host {
-            Some(host) => host.poll_events().map_err(broker_error_from_errno)?,
+            Some(host) => host.ready_events().map_err(broker_error_from_errno)?,
             None => SocketEvents::WRITABLE,
         };
         echo.write_blocked = !events.contains(SocketEvents::WRITABLE);
@@ -508,5 +557,20 @@ impl SocketEntry<'_> {
         let echo = self.echo_state_mut().unwrap();
         echo.host = Some(host);
         echo.outstanding.push_back((peer, seq));
+    }
+
+    /// Whether the socket's host ping socket has input the provider has not
+    /// taken yet.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn echo_test_host_readable(&self) -> bool {
+        self.echo_state()
+            .unwrap()
+            .host
+            .as_ref()
+            .is_some_and(|host| {
+                host.ready_events()
+                    .unwrap()
+                    .contains(SocketEvents::READABLE)
+            })
     }
 }

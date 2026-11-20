@@ -194,6 +194,13 @@ fn run_c_test(
             assert!(common::rewrite_with_cache(&child, &destination, &[]));
         });
     }
+    // A hung guest process would otherwise outlive the test and stall it without diagnostics.
+    #[cfg(target_os = "linux")]
+    if allow_duplication {
+        let output = runner.output_with_watchdog();
+        print!("{}", String::from_utf8_lossy(&output));
+        return;
+    }
     runner.run();
 }
 
@@ -1634,6 +1641,10 @@ fn test_runner_iputils_ping() {
         .filter(|output| output.status.success())
         .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
     else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI runner must provide iputils ping"
+        );
         eprintln!("skipped: iputils ping is not installed");
         return;
     };

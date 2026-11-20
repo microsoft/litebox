@@ -276,7 +276,7 @@ pub(crate) trait HostSocket: Sized + Send {
     /// Polls, without waiting, which of [`SocketEvents::READABLE`],
     /// [`SocketEvents::WRITABLE`], and [`SocketEvents::ERROR`] a ping socket
     /// raises now.
-    fn poll_events(&self) -> Result<SocketEvents, Self::Errno>;
+    fn ready_events(&self) -> Result<SocketEvents, Self::Errno>;
 
     /// Sets whether a TCP socket sends small segments without delay.
     ///

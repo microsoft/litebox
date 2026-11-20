@@ -1457,21 +1457,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Ok(0)
             }
             PrctlArg::SetNoNewPrivs => {
-                match self.vfork.borrow_mut().as_mut() {
-                    Some(vfork) => vfork.no_new_privs = true,
-                    None => self.thread.no_new_privs.set(true),
-                }
+                self.set_own_thread_flag(
+                    |vfork| &mut vfork.no_new_privs,
+                    |t| &t.no_new_privs,
+                    true,
+                );
                 Ok(0)
             }
             PrctlArg::GetNoNewPrivs => Ok(usize::from(self.no_new_privs())),
             PrctlArg::SetKeepCaps(value) => {
-                match self.vfork.borrow_mut().as_mut() {
-                    Some(vfork) => vfork.keep_caps = value,
-                    None => self.thread.keep_caps.set(value),
-                }
+                self.set_own_thread_flag(|vfork| &mut vfork.keep_caps, |t| &t.keep_caps, value);
                 Ok(0)
             }
-            PrctlArg::GetKeepCaps => Ok(usize::from(self.keep_caps())),
+            PrctlArg::GetKeepCaps => Ok(usize::from(
+                self.own_thread_flag(|vfork| vfork.keep_caps, |t| &t.keep_caps),
+            )),
             #[cfg(target_arch = "aarch64")]
             PrctlArg::SveGetVl => {
                 let flags = if self.thread.sve_vl_inherit.get() {
@@ -1499,22 +1499,35 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.global.platform.get_guest_sve_vl().ok_or(Errno::EINVAL)
     }
 
-    /// Returns whether this thread has `no_new_privs` set, which a `vfork` child keeps its own
-    /// copy of.
-    fn no_new_privs(&self) -> bool {
+    /// Returns a per-thread flag that a `vfork` child keeps its own copy of: the child's copy
+    /// (`vfork_flag`) while one runs on this thread, or else the thread's (`thread_flag`).
+    fn own_thread_flag(
+        &self,
+        vfork_flag: impl FnOnce(&crate::VforkState<Platform>) -> bool,
+        thread_flag: impl FnOnce(&ThreadState<Platform>) -> &Cell<bool>,
+    ) -> bool {
         match &*self.vfork.borrow() {
-            Some(vfork) => vfork.no_new_privs,
-            None => self.thread.no_new_privs.get(),
+            Some(vfork) => vfork_flag(vfork),
+            None => thread_flag(&self.thread).get(),
         }
     }
 
-    /// Returns whether this thread keeps its capabilities across a change of user IDs
-    /// (`PR_SET_KEEPCAPS`), which a `vfork` child keeps its own copy of.
-    fn keep_caps(&self) -> bool {
-        match &*self.vfork.borrow() {
-            Some(vfork) => vfork.keep_caps,
-            None => self.thread.keep_caps.get(),
+    /// Sets the flag that [`Self::own_thread_flag`] with the same selectors returns.
+    fn set_own_thread_flag(
+        &self,
+        vfork_flag: impl FnOnce(&mut crate::VforkState<Platform>) -> &mut bool,
+        thread_flag: impl FnOnce(&ThreadState<Platform>) -> &Cell<bool>,
+        value: bool,
+    ) {
+        match self.vfork.borrow_mut().as_mut() {
+            Some(vfork) => *vfork_flag(vfork) = value,
+            None => thread_flag(&self.thread).set(value),
         }
+    }
+
+    /// Returns whether this thread has `no_new_privs` set.
+    fn no_new_privs(&self) -> bool {
+        self.own_thread_flag(|vfork| vfork.no_new_privs, |t| &t.no_new_privs)
     }
 
     /// Returns the signal this process receives when its parent exits, or 0 for none.

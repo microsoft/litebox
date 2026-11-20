@@ -340,7 +340,7 @@ impl HostSocket for Socket {
         }
     }
 
-    fn poll_events(&self) -> Result<SocketEvents, Errno> {
+    fn ready_events(&self) -> Result<SocketEvents, Errno> {
         let polled = self.polled_events(PollFlags::IN | PollFlags::OUT)?;
         let mut events = SocketEvents::empty();
         for (flag, event) in [

@@ -716,7 +716,7 @@ impl HostSocket for Socket {
         Ok(seconds == u32::MAX)
     }
 
-    fn poll_events(&self) -> Result<SocketEvents, Errno> {
+    fn ready_events(&self) -> Result<SocketEvents, Errno> {
         let polled = self.polled_events(POLLRDNORM | POLLWRNORM)?;
         let mut events = SocketEvents::empty();
         for (flag, event) in [

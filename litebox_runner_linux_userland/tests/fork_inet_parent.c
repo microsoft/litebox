@@ -4,6 +4,7 @@
 // Checks that forked and exec'd children share IPv4 sockets with their parent.
 
 #define _GNU_SOURCE
+#include "helpers.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -16,22 +17,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// Bounds every wait, so a failure cannot hang the test.
-#define TIMEOUT_MS 30000
-
-static int wait_readable(int fd) {
-    struct pollfd poll_fd = {.fd = fd, .events = POLLIN};
-    int ready;
-    do {
-        ready = poll(&poll_fd, 1, TIMEOUT_MS);
-    } while (ready == -1 && errno == EINTR);
-    return ready == 1;
-}
-
 static int read_exact(int fd, char *buffer, size_t length) {
     size_t received = 0;
     while (received < length) {
-        if (!wait_readable(fd)) {
+        if (!fd_readable_within_timeout(fd)) {
             return 0;
         }
         ssize_t n = read(fd, buffer + received, length - received);
@@ -60,13 +49,13 @@ static int send_all(int fd, const char *message) {
 // Returns whether the peer of `fd` closed it.
 static int expect_eof(int fd) {
     char byte;
-    return wait_readable(fd) && read(fd, &byte, 1) == 0;
+    return fd_readable_within_timeout(fd) && read(fd, &byte, 1) == 0;
 }
 
 // `listener` is nonblocking, so a connection taken by the other process sharing it fails the accept
 // rather than blocking it.
 static int accept_within(int listener) {
-    return wait_readable(listener) ? accept(listener, NULL, NULL) : -1;
+    return fd_readable_within_timeout(listener) ? accept(listener, NULL, NULL) : -1;
 }
 
 // Returns the exit code of `child`, or of any child if `child` is -1, or -1 if it did not exit
@@ -174,7 +163,7 @@ static int udp_shared(void) {
     if (child == 0) {
         close(peer);
         char buffer[16] = {0};
-        int ok = wait_readable(shared) && recv(shared, buffer, sizeof buffer, 0) == 4 &&
+        int ok = fd_readable_within_timeout(shared) && recv(shared, buffer, sizeof buffer, 0) == 4 &&
                  memcmp(buffer, "ping", 4) == 0;
         ok &= sendto(shared, "pong", 4, 0, (struct sockaddr *)&peer_address, sizeof peer_address) ==
               4;
@@ -190,7 +179,7 @@ static int udp_shared(void) {
     char buffer[16] = {0};
     struct sockaddr_in source = {0};
     socklen_t length = sizeof source;
-    failures += !wait_readable(peer) ||
+    failures += !fd_readable_within_timeout(peer) ||
                 recvfrom(peer, buffer, sizeof buffer, 0, (struct sockaddr *)&source, &length) != 4 ||
                 memcmp(buffer, "pong", 4) != 0 || source.sin_port != shared_address.sin_port;
     failures = finish(child, failures, 0);
@@ -294,7 +283,7 @@ static int exec_echo(const char *child_path) {
     }
     unsigned char reply[16];
     socklen_t len = sizeof recverr;
-    int failed = child < 0 || wait_code(child) != 0 || !wait_readable(fd) ||
+    int failed = child < 0 || wait_code(child) != 0 || !fd_readable_within_timeout(fd) ||
                  recv(fd, reply, sizeof reply, 0) != 9 || reply[0] != 0 ||
                  memcmp(reply + 4, &local.sin_port, 2) != 0 || reply[7] != 42 || reply[8] != 'e' ||
                  getsockopt(fd, IPPROTO_IP, IP_RECVERR, &recverr, &len) != 0 || recverr != 0;

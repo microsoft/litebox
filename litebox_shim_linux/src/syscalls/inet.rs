@@ -30,7 +30,7 @@ use litebox::{
 use litebox_broker_protocol::{
     ObjectHandle,
     fs::FileOpenFlags,
-    socket::{self, IpProtocol, SocketType},
+    socket::{self, IpProtocol as BrokerIpProtocol, SocketType},
 };
 use litebox_common_linux::{
     AddressFamily, IPProtocol, IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags,
@@ -166,9 +166,9 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                 Errno::EPROTONOSUPPORT
             })?;
         let protocol = match (ty, protocol) {
-            (SockType::Stream, IPProtocol::Default | IPProtocol::TCP) => IpProtocol::Tcp,
-            (SockType::Datagram, IPProtocol::Default | IPProtocol::UDP) => IpProtocol::Udp,
-            (SockType::Datagram, IPProtocol::ICMP) => IpProtocol::IcmpEcho,
+            (SockType::Stream, IPProtocol::Default | IPProtocol::TCP) => BrokerIpProtocol::Tcp,
+            (SockType::Datagram, IPProtocol::Default | IPProtocol::UDP) => BrokerIpProtocol::Udp,
+            (SockType::Datagram, IPProtocol::ICMP) => BrokerIpProtocol::IcmpEcho,
             (SockType::Stream | SockType::Datagram, _) => return Err(Errno::EPROTONOSUPPORT),
             (SockType::Raw, _) => return Err(Errno::EPERM),
             _ => return Err(Errno::ESOCKTNOSUPPORT),
@@ -218,7 +218,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
             },
             // `MSG_TRUNC` discards stream data.
             check_write_prefix: is_stream && !flags.contains(ReceiveFlags::TRUNC),
-            report_full_length_on_trunc: self.socket.protocol() != IpProtocol::IcmpEcho,
+            report_full_length_on_trunc: self.socket.protocol() != BrokerIpProtocol::IcmpEcho,
         })
     }
 
@@ -851,12 +851,11 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts the internet socket this process inherited
-    /// from its parent as `handle`.
+    /// Adopts the internet socket this process inherited from its parent as `handle`.
     pub(super) fn adopt_inherited_inet_socket(
         &self,
         handle: ObjectHandle,
-        protocol: IpProtocol,
+        protocol: BrokerIpProtocol,
     ) -> Result<InetSocketFd<Platform>, ProcessError> {
         let socket = self.litebox.adopt_inherited_inet_socket(handle, protocol)?;
         Ok(self

@@ -724,10 +724,10 @@ fn a_container_runs_and_reports_its_exit(backend: Backend) {
     std::fs::write(first.join("sh"), "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(first.join("sh"), std::fs::Permissions::from_mode(0o641)).unwrap();
     shim.configure(|spec| {
-        spec["annotations"] = serde_json::json!({
-            "io.litebox.egress.tcp": "10.1.0.0/16:80-81",
-            "io.litebox.egress.icmp-echo": "192.0.2.0/24",
-        });
+        spec["annotations"] = serde_json::json!({ "io.litebox.egress.tcp": "10.1.0.0/16:80-81" });
+        if backend == Backend::Userland {
+            spec["annotations"]["io.litebox.egress.icmp-echo"] = "192.0.2.0/24".into();
+        }
     });
     let pid = shim.create().unwrap();
     // The init's pid is the broker's, which allows the annotations' egress (that it started shows

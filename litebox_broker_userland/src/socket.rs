@@ -17,8 +17,9 @@
 //! socket's `inbox`.
 //!
 //! Locks are taken in this order: a socket's `state`, then `topology`, then
-//! one leaf (`registry`, `udp_ports`, `published`, `unmirrored`, or any
-//! socket's `inbox`). A thread holds at most one socket's `state`, except that
+//! one leaf (`registry`, `udp_ports`, `published`, `unmirrored`,
+//! `echo_scratch`, or any socket's `inbox`). `echo_scratch` is only
+//! try-locked, under a socket's `state`, so no thread waits for it. A thread holds at most one socket's `state`, except that
 //! accept also holds the new socket's. It never takes a `state` while holding
 //! `topology` or a leaf, and never holds two leaves at once. On Windows, a host
 //! accept takes `INHERITABLE` under any of these, so it is innermost: nothing
@@ -198,7 +199,7 @@ struct ProviderCore {
     /// Datagrams and bytes queued between guest UDP sockets broker-wide.
     udp_queued: Arc<QueueCounter>,
     /// Receives host echo replies for any socket, which keeps only the
-    /// reply it matches.
+    /// reply it matches. Only ever try-locked.
     echo_scratch: Mutex<Vec<u8>>,
     /// Whether the host's lack of ping sockets has been reported.
     ping_unavailable_reported: AtomicBool,
@@ -413,8 +414,8 @@ impl ProviderCore {
             topology: Mutex::new(Topology::default()),
             registry: RwLock::new(registry),
             udp_ports: RwLock::new(UdpPorts::default()),
-            udp_queued: Arc::new(QueueCounter::default()),
             echo_scratch: Mutex::new(Vec::new()),
+            udp_queued: Arc::new(QueueCounter::default()),
             ping_unavailable_reported: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             thread: Mutex::new(None),

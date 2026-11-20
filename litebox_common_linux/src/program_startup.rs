@@ -206,7 +206,7 @@ pub struct LinuxForkStartup {
     pub dumpable: bool,
     /// Whether the thread calling `fork` has `no_new_privs` set, which the child copies.
     pub no_new_privs: bool,
-    /// The calling thread's keep-capabilities flag; `fork` copies it, `execve` clears it.
+    /// The calling thread's keep-capabilities flag, which the child copies.
     pub keep_caps: bool,
     /// Absolute working directory.
     pub cwd: String,
