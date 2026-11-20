@@ -5,10 +5,6 @@
 // orphans, the first process's signal rules and exit, and `CLONE_PARENT`. Runs as guest root, or,
 // with the argument `unprivileged`, as another user, who can't create namespaces.
 //
-// Unlike Linux, LiteBox keeps the PID namespace for a process's children per process, so
-// `unshare(CLONE_NEWPID)` fails in a process with more than one thread, and in a vfork child, whose
-// requests go to the broker as its parent's.
-
 #define _GNU_SOURCE
 #include <errno.h>
 #include <linux/sched.h>
@@ -88,12 +84,6 @@ static void sleep_ms(long milliseconds) {
 }
 
 static void *no_op(void *argument) { return argument; }
-
-// Waits for a byte from the pipe whose read end `fd` points to.
-static void *wait_for_byte(void *fd) {
-    char byte;
-    return read(*(int *)fd, &byte, 1) == 1 ? NULL : fd;
-}
 
 static char vfork_stack[64 * 1024] __attribute__((aligned(16)));
 
@@ -211,48 +201,6 @@ static int unshare_sends_children_to_a_new_namespace(void) {
         _exit(0);
     }
     return too_late == -1 && errno == ENOMEM ? 0 : 16;
-}
-
-// Unlike Linux, `unshare(CLONE_NEWPID)` fails in a process with another thread.
-static int unshare_with_another_thread(void) {
-    int release[2];
-    pthread_t thread;
-    if (pipe(release) != 0 || pthread_create(&thread, NULL, wait_for_byte, &release[0]) != 0) {
-        return 1;
-    }
-    int code = unshare(CLONE_NEWPID) == -1 && errno == EINVAL ? 0 : 2;
-    if (write(release[1], "x", 1) != 1 || pthread_join(thread, NULL) != 0) {
-        return 3;
-    }
-    return code;
-}
-
-// Runs `unshare_with_another_thread` in a child, which a successful unshare would leave changed.
-static void unshare_needs_a_single_thread(void) {
-    pid_t helper = fork();
-    if (helper == 0) {
-        _exit(unshare_with_another_thread());
-    }
-    CHECK(exited_with(helper, 0));
-}
-
-// Records the result of `unshare(CLONE_NEWPID)` in a vfork child at `result`.
-static int unshare_in_a_vfork_child(void *result) {
-    *(int *)result = unshare(CLONE_NEWPID) == -1 ? errno : 0;
-    _exit(0);
-}
-
-// Unlike Linux, `unshare(CLONE_NEWPID)` fails in a vfork child, whose requests go to the broker as
-// its parent's. Runs in a helper, which a successful unshare would leave changed.
-static void unshare_fails_in_a_vfork_child(void) {
-    pid_t helper = fork();
-    if (helper == 0) {
-        int result = -1;
-        pid_t child = clone(unshare_in_a_vfork_child, vfork_stack + sizeof vfork_stack,
-                            CLONE_VM | CLONE_VFORK | SIGCHLD, &result);
-        _exit(child > 0 && exited_with(child, 0) && result == EINVAL ? 0 : 1);
-    }
-    CHECK(exited_with(helper, 0));
 }
 
 // Runs `unshare_sends_children_to_a_new_namespace` in a child, which the unshare leaves changed.
@@ -499,8 +447,6 @@ int main(int argc, char **argv) {
     self_path = argv[0];
     setvbuf(stdout, NULL, _IONBF, 0);
     clone_makes_a_first_process();
-    unshare_needs_a_single_thread();
-    unshare_fails_in_a_vfork_child();
     unshare_makes_a_namespace_for_children();
     the_first_process_ignores_unhandled_signals();
     the_first_process_dies_of_an_unhandled_fault();

@@ -1,5 +1,5 @@
 [
-  { "argv": ["/xstate", "xcr0"], "expect_stdout": "xcr0: ok\n" },
+  { "argv": ["/xstate", "xcr0", "0x60200"], "expect_stdout": "xcr0: ok\n" },
   { "argv": ["/xstate", "signal"], "expect_stdout": "signal: ok\n" },
   { "argv": ["/xstate", "fork"], "expect_stdout": "fork: ok\n" },
   { "argv": ["/xstate", "thread"], "expect_stdout": "thread: ok\n" },

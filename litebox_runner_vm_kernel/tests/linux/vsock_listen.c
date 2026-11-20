@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// AF_VSOCK sockets where the broker has vsock, with no host client (see vsock.c): creation
+// AF_VSOCK sockets over the hybrid transport, with no host client (see vsock.c): creation
 // and bind rules, names, address checks, unreachable connects, unconnected sends and shutdowns,
 // socket options, and a listener inherited across fork and exec (as `PROGRAM child FD PORT`).
 
@@ -274,6 +274,11 @@ int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "child") == 0) {
         check_listener(atoi(argv[2]), (unsigned int)atoi(argv[3]));
         return 0;
+    }
+    // The harness selects hybrid for the datagram and unreachable-CID checks.
+    if (argc != 2 || strcmp(argv[1], "hybrid") != 0) {
+        fprintf(stderr, "usage: %s hybrid (requires the hybrid vsock transport)\n", argv[0]);
+        return 2;
     }
     creation_rules();
     bind_rules();

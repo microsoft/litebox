@@ -1,11 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// User extended state under the VM kernel, which gives user mode every XCR0
-// component the CPU offers but PKRU and AMX, and no CET (whose user state is
-// not in XCR0). The first argument picks a mode:
-// - "xcr0": XCR0 is CPUID.(EAX=0Dh,ECX=0):EDX:EAX but PKRU and AMX, and
-//   protection keys are off (CPUID.(EAX=7,ECX=0):ECX.OSPKE clear).
+// User extended state. The first argument picks a mode:
+// - "xcr0 [EXCLUDED_MASK]": XCR0 only enables CPU-supported components. With
+//   a mask, also check the VM policy: enable the supported components not
+//   in the mask and leave protection keys off.
 // - "signal": vector registers survive a signal whose handler clobbers them.
 // - "fork": vector registers survive a fork, on both sides.
 // - "thread": a new thread starts with its creator's MXCSR and x87 control
@@ -35,8 +34,6 @@
 #include <unistd.h>
 #include <x86intrin.h>
 
-// XCR0 components that the kernel withholds: PKRU, and AMX tile state.
-#define XCR0_EXCLUDED ((1ULL << 9) | (1ULL << 17) | (1ULL << 18))
 #define XCR0_AVX 0x6ULL
 #define XCR0_AVX512 0xe6ULL
 
@@ -209,23 +206,33 @@ static long vector_syscall(const struct vregs *in, struct vregs *out, long nr, l
                            : syscall_avx(in, out, nr, a, b, c);
 }
 
-static int xcr0_mode(void) {
+static int xcr0_mode(const char *excluded_mask) {
     unsigned int eax, ebx, ecx, edx;
     __cpuid(1, eax, ebx, ecx, edx);
     if (!(ecx & bit_OSXSAVE)) {
+        if (excluded_mask == NULL) {
+            printf("xcr0: skipped (OSXSAVE is clear)\n");
+            return 0;
+        }
         fprintf(stderr, "xcr0: OSXSAVE is clear\n");
         return 1;
     }
     __cpuid_count(0xd, 0, eax, ebx, ecx, edx);
     unsigned long long supported = ((unsigned long long)edx << 32) | eax;
-    unsigned long long expected = supported & ~XCR0_EXCLUDED;
     unsigned long long xcr0 = xgetbv0();
-    __cpuid_count(7, 0, eax, ebx, ecx, edx);
-    int ospke = (ecx & bit_OSPKE) != 0;
-    if (xcr0 != expected || ospke) {
-        fprintf(stderr, "xcr0: %#llx, expected %#llx (supported %#llx), OSPKE %d\n", xcr0,
-                expected, supported, ospke);
+    if ((xcr0 & ~supported) != 0 || (xcr0 & 1) == 0) {
+        fprintf(stderr, "xcr0: %#llx is invalid (supported %#llx)\n", xcr0, supported);
         return 1;
+    }
+    if (excluded_mask != NULL) {
+        unsigned long long expected = supported & ~strtoull(excluded_mask, NULL, 0);
+        __cpuid_count(7, 0, eax, ebx, ecx, edx);
+        int ospke = (ecx & bit_OSPKE) != 0;
+        if (xcr0 != expected || ospke) {
+            fprintf(stderr, "xcr0: %#llx, expected %#llx (supported %#llx), OSPKE %d\n", xcr0,
+                    expected, supported, ospke);
+            return 1;
+        }
     }
     printf("xcr0: ok\n");
     return 0;
@@ -373,8 +380,8 @@ static int yield_mode(long count, int pattern) {
 int main(int argc, char *argv[]) {
     level = detect_level();
     const char *mode = argc > 1 ? argv[1] : "";
-    if (strcmp(mode, "xcr0") == 0) {
-        return xcr0_mode();
+    if (strcmp(mode, "xcr0") == 0 && argc <= 3) {
+        return xcr0_mode(argc == 3 ? argv[2] : NULL);
     } else if (strcmp(mode, "signal") == 0) {
         return signal_mode();
     } else if (strcmp(mode, "fork") == 0) {
@@ -386,7 +393,8 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(mode, "yield") == 0 && argc == 4) {
         return yield_mode(atol(argv[2]), atoi(argv[3]));
     }
-    fprintf(stderr, "usage: %s xcr0|signal|fork|thread|spin MS PATTERN|yield COUNT PATTERN\n",
+    fprintf(stderr, "usage: %s xcr0 [EXCLUDED_MASK]|signal|fork|thread|spin MS PATTERN|"
+                    "yield COUNT PATTERN\n",
             argv[0]);
     return 2;
 }

@@ -4,13 +4,10 @@
 // Live SVE state survives repeated asynchronous interruptions: signals from the
 // main thread interrupt two threads that hold different live states at once.
 // Each handler finds its thread's state in a full sve_context and clobbers
-// registers, which then return from the frame. LiteBox does not support
-// `tgkill` to another thread, so each thread unblocks its own signal and the
-// main thread sends that signal to the process. Under LiteBox, each signal also
-// interrupts the threads that block it, which resume without a handler. Among
-// them is a third thread with a live state that blocks both signals: no
-// handler's `rt_sigreturn` replaces its last syscall, the one right before its
-// loop head, so it often resumes at the PC that syscall returned to.
+// registers, which then return from the frame. Each target thread unblocks its
+// own signal, and the main thread sends that signal to the process.
+// Process-directed signals can interrupt the masked bystander without a handler.
+// Check its SVE state without requiring an interruption.
 
 #include "helpers.h"
 
@@ -107,7 +104,6 @@ static void *spin_thread(void *index) {
 }
 
 // Spins with every thread signal blocked, as inherited from the main thread.
-// Under LiteBox, each of them interrupts it without a handler.
 static void *spin_bystander(void *unused) {
     (void)unused;
     spin_with_live_state(&bystander);

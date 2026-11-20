@@ -14,6 +14,9 @@ use common::native::Native;
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(target_os = "linux")]
+const TEST_RANDOM_BYTE: u8 = 0x5a;
+
+#[cfg(target_os = "linux")]
 struct TestRandomProvider;
 
 #[cfg(target_os = "linux")]
@@ -22,7 +25,7 @@ impl litebox_broker_core::random::RandomProvider for TestRandomProvider {
         &self,
         output: &mut [u8],
     ) -> Result<(), litebox_broker_core::random::RandomProviderError> {
-        output.fill(0x5a);
+        output.fill(TEST_RANDOM_BYTE);
         Ok(())
     }
 }
@@ -1357,7 +1360,10 @@ console.log(content);
     // pipe_broker.c creates five pipes; each endpoint owns one broker object.
     assert_eq!(broker_thread.next_close_object_count(), 10);
 
-    urandom_runner.broker_socket(&control_socket_path).run();
+    urandom_runner
+        .broker_socket(&control_socket_path)
+        .arg(TEST_RANDOM_BYTE.to_string())
+        .run();
     assert_eq!(broker_thread.next_close_object_count(), 0);
 
     node_runner.broker_socket(&control_socket_path).run();
@@ -1979,6 +1985,7 @@ fn vsock_sockets_work_on_the_userland_broker_with_a_hybrid_bridge() {
     // The guest exits 0 only after `vsock-listen ok`; a failure shows its output.
     Runner::new(&target, name)
         .allow_process_duplication()
+        .arg("hybrid")
         .broker_arg("--vsock-uds")
         .broker_arg(&vsock_uds)
         .run();

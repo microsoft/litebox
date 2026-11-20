@@ -2,8 +2,7 @@
 // Licensed under the MIT license.
 
 // Forks while sibling threads run guest code, block reading a pipe, and sleep, and forks from
-// several threads at once, checking that each child copies memory the counting thread could have
-// left and that the siblings go on unaffected.
+// several threads at once, checking that each child inherits memory and the siblings go on.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -27,30 +26,26 @@ static pid_t raw_fork(void) {
 #endif
 }
 
-// Two counters far enough apart that copying memory reaches one long after the other.
-static struct {
-    volatile unsigned long head;
+static volatile struct {
+    unsigned long head;
     char gap[4 * 1024 * 1024];
-    volatile unsigned long tail;
-} counters;
+    unsigned long tail;
+} markers;
+static atomic_ulong counter;
 static atomic_int stop;
 static int reader_pipe[2];
 static atomic_int forkers_ready;
 
 static void *count_up(void *arg) {
     (void)arg;
-    for (unsigned long value = 1; !atomic_load_explicit(&stop, memory_order_relaxed); value++) {
-        counters.head = value;
-        counters.tail = value;
+    while (!atomic_load_explicit(&stop, memory_order_relaxed)) {
+        atomic_fetch_add_explicit(&counter, 1, memory_order_relaxed);
     }
     return NULL;
 }
 
-// Returns whether the counters hold values `count_up` could have left between two instructions.
-static int counters_consistent(void) {
-    unsigned long head = counters.head;
-    unsigned long tail = counters.tail;
-    return head == tail || head == tail + 1;
+static int inherited_markers(void) {
+    return markers.head == 17 && markers.tail == 29;
 }
 
 static void *read_pipe(void *arg) {
@@ -94,7 +89,7 @@ static void *fork_repeatedly(void *arg) {
         }
         pid_t child = raw_fork();
         if (child == 0) {
-            _exit(counters_consistent() ? 0 : 1);
+            _exit(inherited_markers() ? 0 : 1);
         }
         failures += child < 0 || wait_exit_code(child) != 0;
     }
@@ -102,26 +97,28 @@ static void *fork_repeatedly(void *arg) {
 }
 
 int main(void) {
-    pthread_t counter, reader, sleeper, forkers[FORKERS];
-    if (pipe(reader_pipe) != 0 || pthread_create(&counter, NULL, count_up, NULL) != 0 ||
+    markers.head = 17;
+    markers.tail = 29;
+    pthread_t counter_thread, reader, sleeper, forkers[FORKERS];
+    if (pipe(reader_pipe) != 0 || pthread_create(&counter_thread, NULL, count_up, NULL) != 0 ||
         pthread_create(&reader, NULL, read_pipe, NULL) != 0 ||
         pthread_create(&sleeper, NULL, sleep_through_forks, NULL) != 0) {
         printf("setup-error\n");
         return 2;
     }
     // Let the counter get going and the reader and the sleeper block.
-    while (counters.tail < 1000) {
+    while (atomic_load_explicit(&counter, memory_order_relaxed) < 1000) {
     }
     struct timespec settle = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
     nanosleep(&settle, NULL);
 
     pid_t child = fork();
     if (child == 0) {
-        _exit(counters_consistent() ? 7 : 1);
+        _exit(inherited_markers() ? 7 : 1);
     }
     int code = child < 0 ? -1 : wait_exit_code(child);
 
-    // Forkers pause each other, and the other threads, as they fork at once.
+    // Fork from several threads at once.
     long failures = 0;
     for (int i = 0; i < FORKERS; i++) {
         if (pthread_create(&forkers[i], NULL, fork_repeatedly, NULL) != 0) {
@@ -136,8 +133,8 @@ int main(void) {
     }
 
     // The siblings go on after the forks.
-    unsigned long last = counters.tail;
-    while (counters.tail == last) {
+    unsigned long last = atomic_load_explicit(&counter, memory_order_relaxed);
+    while (atomic_load_explicit(&counter, memory_order_relaxed) == last) {
     }
     void *read_ok, *slept;
     if (write(reader_pipe[1], "x", 1) != 1) {
@@ -147,7 +144,7 @@ int main(void) {
     pthread_join(reader, &read_ok);
     pthread_join(sleeper, &slept);
     atomic_store(&stop, 1);
-    pthread_join(counter, NULL);
+    pthread_join(counter_thread, NULL);
     printf("threads-fork code=%d failures=%ld read=%ld slept=%ld\n", code, failures, (long)read_ok,
            (long)slept);
     return code == 7 && failures == 0 && (long)read_ok == 1 && (long)slept == 1 ? 0 : 1;

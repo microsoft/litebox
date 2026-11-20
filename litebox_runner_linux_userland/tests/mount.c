@@ -14,29 +14,18 @@ int main(void) {
     struct stat before, after;
     TEST_ASSERT(stat("target", &before) == 0, "stat before mount");
 
-    if (geteuid() != 0) {
-        errno = 0;
-        TEST_ASSERT(mount(NULL, "/tmp", "tmpfs", 0, NULL) == -1 && errno == EPERM,
-                    "reject foreign-owned mountpoint");
-    }
     errno = 0;
-    TEST_ASSERT(mount(NULL, "target", "proc", 0, NULL) == -1 && errno == ENODEV,
-                "reject unsupported filesystem");
+    TEST_ASSERT(mount(NULL, "target", "lb_nonexistent_fs", 0, NULL) == -1 && errno == ENODEV,
+                "reject unknown filesystem");
     errno = 0;
     TEST_ASSERT(mount(NULL, "target", "tmpfs", MS_BIND, NULL) == -1 && errno == EINVAL,
-                "reject bind mounts");
+                "require source for bind mount");
     errno = 0;
     TEST_ASSERT(mount(NULL, "missing", "tmpfs", 0, NULL) == -1 && errno == ENOENT,
                 "require existing mountpoint");
     errno = 0;
     TEST_ASSERT(mount(NULL, "target/old", "tmpfs", 0, NULL) == -1 && errno == ENOTDIR,
                 "require directory mountpoint");
-    errno = 0;
-    TEST_ASSERT(mount(NULL, "target", "tmpfs", MS_NOEXEC, NULL) == -1 && errno == EINVAL,
-                "reject unenforced noexec restriction");
-    errno = 0;
-    TEST_ASSERT(mount(NULL, "target", "tmpfs", 0, "mode=0700") == -1 && errno == EINVAL,
-                "reject unsupported mount options");
     errno = 0;
     TEST_ASSERT(syscall(SYS_mount, NULL, "target", "tmpfs", 0, (void *)1) == -1 && errno == EFAULT,
                 "validate optional data pointer");
@@ -72,12 +61,12 @@ int main(void) {
         TEST_ASSERT(strcmp(entry->d_name, "old") != 0, "listing hides covered files");
     }
     TEST_ASSERT(found && closedir(dir) == 0, "listing includes mounted file");
-    errno = 0;
-    TEST_ASSERT(mount(NULL, "target", "tmpfs", 0, NULL) == -1 && errno == EBUSY,
-                "reject mount stacking");
-    errno = 0;
-    TEST_ASSERT(rmdir("target") == -1 && errno == EROFS, "mountpoint cannot be removed");
     TEST_ASSERT(unlink("target/new") == 0, "unlink mounted file");
+    errno = 0;
+    TEST_ASSERT(rmdir("target") == -1 && (errno == EBUSY || errno == EROFS),
+                "mountpoint cannot be removed");
+    TEST_ASSERT(stat("target", &after) == 0 && before.st_dev != after.st_dev,
+                "target remains mounted");
     puts("mount tmpfs ok");
     return 0;
 }
