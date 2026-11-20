@@ -137,11 +137,9 @@ static int datagram_pair(void) {
 // A forked child connects to its parent's listener by path, then accepts the parent's connection
 // on the listener it inherited.
 static int path_listener(void) {
-    char *path = test_path("fork_unix_parent.sock");
-    struct sockaddr_un address = {.sun_family = AF_UNIX};
-    TEST_ASSERT(strlen(path) < sizeof address.sun_path, "socket path too long");
-    snprintf(address.sun_path, sizeof address.sun_path, "%s", path);
-    unlink(path);
+    struct sockaddr_un address;
+    test_socket_address(&address, "fork_unix_parent.sock", 0);
+    const char *path = address.sun_path;
     int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (listener < 0 || bind(listener, (struct sockaddr *)&address, sizeof address) != 0 ||
         listen(listener, 4) != 0) {

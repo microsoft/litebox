@@ -14,6 +14,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,7 @@
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
@@ -51,6 +53,56 @@ static inline char *test_path(const char *name) {
     char *path = NULL;
     TEST_ASSERT(asprintf(&path, "%s/%s", test_dir(), name) >= 0, "asprintf failed");
     return path;
+}
+
+// Sets `address` to the Unix socket path `name` in `test_dir()`, removing any file there, or, if
+// `abstract`, to the abstract name made of that path, which is as unique to the run as the
+// directory is. Returns the address's length.
+static inline socklen_t test_socket_address(struct sockaddr_un *address, const char *name,
+                                            int abstract) {
+    memset(address, 0, sizeof(*address));
+    address->sun_family = AF_UNIX;
+    size_t offset = abstract ? 1 : 0;
+    size_t room = sizeof(address->sun_path) - offset;
+    int length = snprintf(address->sun_path + offset, room, "%s/%s", test_dir(), name);
+    TEST_ASSERT(length >= 0 && (size_t)length < room, "socket path too long");
+    if (!abstract) {
+        unlink(address->sun_path);
+    }
+    // A path includes its terminating NUL; an abstract name doesn't.
+    return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + offset + (size_t)length +
+                       (abstract ? 0 : 1));
+}
+
+// The signal `__builtin_trap` raises (`ud2` on x86-64, `brk` on AArch64), left undefined elsewhere
+// so that only the tests that use it fail to build there.
+#if defined(__x86_64__)
+#define TRAP_SIGNAL SIGILL
+#elif defined(__aarch64__)
+#define TRAP_SIGNAL SIGTRAP
+#endif
+
+// A pipe through which a child running `vfork_exec_child.c` reports its process ID after `execve`,
+// for its parent to check against the ID it got for the child. `variable`, in the child's
+// environment, names the write end.
+struct pid_report {
+    int fds[2];
+    char variable[32];
+};
+
+static inline void open_pid_report(struct pid_report *report) {
+    TEST_ASSERT(pipe(report->fds) == 0 && fcntl(report->fds[0], F_SETFD, FD_CLOEXEC) == 0,
+                "pid report pipe");
+    snprintf(report->variable, sizeof(report->variable), "VFORK_EXEC_PID_FD=%d", report->fds[1]);
+}
+
+// Closes `report`, once `child` has exited, and returns whether `child` reported itself through it.
+static inline int pid_reported(struct pid_report *report, pid_t child) {
+    close(report->fds[1]);
+    pid_t reported = 0;
+    ssize_t length = read(report->fds[0], &reported, sizeof(reported));
+    close(report->fds[0]);
+    return length == (ssize_t)sizeof(reported) && reported == child;
 }
 
 static inline void die(const char *msg) {

@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// A vfork child's `execve` starts the child's program and resumes the parent, which then waits for
-// the child: one that exits, one that dies of a signal, and one whose `execve` fails, returning the
-// error to the child.
+// A vfork child's `execve` starts the child's program, as the process the parent got for the child,
+// and resumes the parent, which then waits for the child: one that exits, one that dies of a signal,
+// and one whose `execve` fails, returning the error to the child.
 
-#define _GNU_SOURCE
+#include "helpers.h"
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -18,12 +18,15 @@
 static pid_t parent_before;
 
 // Vforks a child that runs `path` with `marker`, waits for it, and returns its wait status, or -1
-// if the parent didn't resume as itself or didn't reap exactly that child.
-static int run(const char *path, const char *marker) {
+// if the parent didn't resume as itself or didn't reap exactly that child, or if `reports`, but the
+// child didn't report itself as that child.
+static int run(const char *path, const char *marker, int reports) {
     char *child_argv[] = {(char *)path, (char *)marker, NULL};
     char parent[32];
     snprintf(parent, sizeof parent, "VFORK_EXEC_PARENT=%d", parent_before);
-    char *child_envp[] = {"VFORK_EXEC_TEST=vfork", parent, NULL};
+    struct pid_report report;
+    open_pid_report(&report);
+    char *child_envp[] = {"VFORK_EXEC_TEST=vfork", parent, report.variable, NULL};
     fflush(stdout);
     pid_t child_pid = vfork();
     if (child_pid == 0) {
@@ -45,12 +48,13 @@ static int run(const char *path, const char *marker) {
     pid_t waited = waitpid(child_pid, &status, 0);
     pid_t again = waitpid(-1, NULL, WNOHANG);
     int echild = again == -1 && errno == ECHILD;
+    int reported = pid_reported(&report, child_pid);
     printf("parent marker=%s before=%d after=%d child=%d waited=%d exited=%d code=%d "
-           "signaled=%d signal=%d again=%d echild=%d\n",
+           "signaled=%d signal=%d again=%d echild=%d reported=%d\n",
            marker, parent_before, parent_after, child_pid, waited, WIFEXITED(status),
-           WEXITSTATUS(status), WIFSIGNALED(status), WTERMSIG(status), again, echild);
+           WEXITSTATUS(status), WIFSIGNALED(status), WTERMSIG(status), again, echild, reported);
     return parent_after == parent_before && child_pid != parent_before && waited == child_pid &&
-                   echild
+                   echild && (reported || !reports)
                ? status
                : -1;
 }
@@ -69,11 +73,11 @@ int main(int argc, char **argv) {
 
     int failures = 0;
     // The child checks that it is this process's child, with the marker and environment passed.
-    int status = run(argv[1], "from-vfork");
+    int status = run(argv[1], "from-vfork", 1);
     failures += status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 42;
-    status = run(argv[1], "abort");
+    status = run(argv[1], "abort", 0);
     failures += status == -1 || !WIFSIGNALED(status) || WTERMSIG(status) != SIGABRT;
-    status = run(MISSING, "from-vfork");
+    status = run(MISSING, "from-vfork", 0);
     failures += status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 111;
     printf("vfork-exec failures=%d\n", failures);
     return failures != 0;

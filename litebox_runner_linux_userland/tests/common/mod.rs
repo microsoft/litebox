@@ -5,7 +5,6 @@ use glob::glob;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
-#[allow(dead_code, reason = "not used by every test binary")]
 pub(crate) mod native;
 #[cfg(target_os = "linux")]
 pub mod pty;

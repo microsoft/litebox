@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#include "helpers.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <stddef.h>
@@ -36,11 +37,9 @@ static int make_bound_dgram(void) {
         exit(2);
     }
     struct sockaddr_un sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sun_family = AF_UNIX;
-    int n = snprintf(sa.sun_path + 1, sizeof(sa.sun_path) - 1,
-                     "litebox-recvmsg-test-%d-%d", getpid(), counter++);
-    socklen_t addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
+    char name[64];
+    snprintf(name, sizeof(name), "litebox-recvmsg-test-%d", counter++);
+    socklen_t addrlen = test_socket_address(&sa, name, 1);
     if (bind(fd, (struct sockaddr *)&sa, addrlen) < 0) {
         perror("bind");
         exit(2);

@@ -117,7 +117,7 @@ fn test_vfork_exec_with_windows_broker() {
         numeric_field(child_line, "ppid="),
         numeric_field(parent, "before=")
     );
-    assert!(child_line.contains("marker=from-vfork env=1"));
+    assert!(child_line.contains("marker=from-vfork env=vfork"));
 }
 
 /// The broker arguments that permit TCP connections to every port of the host gateway, 10.0.2.1,

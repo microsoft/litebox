@@ -17,20 +17,27 @@ use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// Runs a program natively, as [`super::runner::Runner`] runs one in LiteBox: with the environment
-/// LiteBox gives the guest, no standard input, and standard error passed through. Its working
-/// directory is a new, empty one, which ends with the `Native`, and `TMPDIR` names it, so that a
-/// program that uses `TMPDIR`, rather than `/tmp`, keeps its files out of the host's.
+/// Runs a program natively, as [`super::runner::Runner`] runs one in LiteBox: with only `HOME=/`
+/// and the variables given with [`Native::env`] in its environment, no standard input, and
+/// standard error passed through. Its working directory is a new, empty one, which ends with the
+/// `Native`, and `TMPDIR` names it, so that a program that uses `TMPDIR`, rather than `/tmp`, keeps
+/// its files out of the host's.
+#[allow(dead_code, reason = "not used by every test binary")]
 pub(crate) struct Native {
     command: Command,
     directory: tempfile::TempDir,
 }
 
+#[allow(dead_code, reason = "not used by every test binary")]
 impl Native {
     /// Prepares to run `program`, or returns `None`, after reporting why, if the host doesn't let
-    /// it run in a namespace of its own (see [`command`]).
+    /// unprivileged users create the namespaces it runs in (see [`namespaces_available`]).
     pub(crate) fn new(program: &Path) -> Option<Self> {
-        let mut command = command(program)?;
+        if !namespaces_available() {
+            return None;
+        }
+        println!("Running `{}` natively", program.display());
+        let mut command = isolated(program);
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         command
             .env_clear()
@@ -44,6 +51,11 @@ impl Native {
 
     pub(crate) fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
         self.command.arg(arg);
+        self
+    }
+
+    pub(crate) fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
+        self.command.env(key, value);
         self
     }
 
@@ -64,27 +76,34 @@ impl Native {
     }
 }
 
-/// Returns a command that runs `program` natively in a namespace of its own, or `None`, after
-/// reporting why, if the host doesn't let unprivileged users create one.
-///
-/// The command's exit status is the program's. Natively, a program runs as the second process of
-/// its PID namespace, with the namespace's first process as its parent, and leads its own session.
-fn command(program: &Path) -> Option<Command> {
-    match isolated("true").status() {
-        Ok(status) if status.success() => (),
-        result => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "CI runner must let unprivileged users create user and PID namespaces: {result:?}"
-            );
-            eprintln!("skipped: no unprivileged user and PID namespaces: {result:?}");
-            return None;
-        }
-    }
-    println!("Running `{}` natively", program.display());
-    Some(isolated(program))
+/// Returns whether the host lets unprivileged users create the user and PID namespaces a program
+/// runs in, after reporting why not if it doesn't. Panics if it doesn't under CI, which must, or if
+/// running a program fails for any other reason.
+fn namespaces_available() -> bool {
+    let error = match isolated("true").status() {
+        Ok(status) if status.success() => return true,
+        Ok(status) => panic!("failed to run `true` natively: {status}"),
+        Err(error) => error,
+    };
+    // Creating the namespaces fails with these when they're off limits, and writing the ID maps
+    // with the last two when a security module restricts them.
+    let unavailable = [libc::ENOSPC, libc::EUSERS, libc::EPERM, libc::EACCES];
+    assert!(
+        error
+            .raw_os_error()
+            .is_some_and(|errno| unavailable.contains(&errno)),
+        "failed to run `true` natively: {error}"
+    );
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "CI runner must let unprivileged users create user and PID namespaces: {error}"
+    );
+    eprintln!("skipped: no unprivileged user and PID namespaces: {error}");
+    false
 }
 
+/// Returns a command that runs `program` natively, in namespaces of its own, as the second process
+/// of its PID namespace. The command's exit status is the program's.
 fn isolated(program: impl AsRef<OsStr>) -> Command {
     // SAFETY: `getuid` and `getgid` cannot fail.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
@@ -148,8 +167,10 @@ fn isolate(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
             )
         };
         if size != size_of::<libc::c_int>().cast_signed() {
-            // The first process ended before reporting the program's status.
-            exit(127)
+            fail(
+                b"the namespace's first process ended before reporting the program's status",
+                0,
+            )
         }
         exit_as(status)
     }
@@ -165,27 +186,31 @@ fn isolate(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
         libc::read(mapped_reader, (&raw mut mapped).cast(), 1)
     };
     if size != 1 {
-        exit(127)
+        fail(b"the test ended before mapping the namespace's IDs", 0)
     }
     // SAFETY: this process no longer needs the descriptor.
     unsafe { libc::close(mapped_reader) };
-    let Ok(program) = fork(0) else { exit(127) };
+    let program = match fork(0) {
+        Ok(program) => program,
+        Err(error) => fail(b"forking the program", error.raw_os_error().unwrap_or(0)),
+    };
     if program == 0 {
         // SAFETY: the program doesn't need the descriptor.
         unsafe { libc::close(status_writer) };
         // Like LiteBox's initial process, the program starts with only the standard streams, not
         // whatever the test inherited, and leads its own process group and session.
-        // SAFETY: marking this process's descriptors close-on-exec affects nothing else, and
-        // `setsid` affects only this process, which leads no group yet.
-        unsafe {
-            check(libc::syscall(
+        // SAFETY: marking this process's descriptors close-on-exec affects nothing else.
+        let marked = unsafe {
+            libc::syscall(
                 libc::SYS_close_range,
                 3,
                 u32::MAX,
                 libc::CLOSE_RANGE_CLOEXEC,
-            ) as libc::c_int)?;
-            return check(libc::setsid());
-        }
+            )
+        };
+        check(i32::try_from(marked).unwrap_or(-1))?;
+        // SAFETY: `setsid` affects only this process, which leads no group yet.
+        return check(unsafe { libc::setsid() });
     }
     keep_only_standard_streams_and(status_writer);
     loop {
@@ -203,8 +228,14 @@ fn isolate(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
             }
             exit(0)
         }
-        if reaped < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            exit(127)
+        if reaped < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                fail(
+                    b"waiting for the program",
+                    error.raw_os_error().unwrap_or(0),
+                )
+            }
         }
     }
 }
@@ -225,22 +256,25 @@ fn write_proc_file(pid: libc::pid_t, name: &[u8], contents: &[u8]) -> io::Result
         length += bytes.len();
     };
     push(b"/proc/");
-    let mut digits = [0u8; 10];
-    let mut start = digits.len();
-    let mut rest = pid.cast_unsigned();
-    loop {
-        start -= 1;
-        digits[start] = b'0' + u8::try_from(rest % 10).unwrap_or(0);
-        rest /= 10;
-        if rest == 0 {
-            break;
-        }
-    }
-    push(&digits[start..]);
+    push(decimal(pid.cast_unsigned(), &mut [0; 10]));
     push(b"/");
     push(name);
     let path = CStr::from_bytes_until_nul(&path).map_err(|_| io::ErrorKind::InvalidInput)?;
     write_file(path, contents)
+}
+
+/// Formats `value` in `digits`, returning the digits used.
+fn decimal(mut value: u32, digits: &mut [u8; 10]) -> &[u8] {
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + u8::try_from(value % 10).unwrap_or(0);
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    &digits[start..]
 }
 
 fn check(result: libc::c_int) -> io::Result<()> {
@@ -293,6 +327,24 @@ fn keep_only_standard_streams_and(fd: libc::c_int) {
     }
 }
 
+/// Reports on standard error, without allocating, that running the program failed at `what`, with
+/// error number `errno` unless it is 0, and exits with 127.
+fn fail(what: &[u8], errno: libc::c_int) -> ! {
+    write_stderr(b"native run failed: ");
+    write_stderr(what);
+    if errno != 0 {
+        write_stderr(b": errno ");
+        write_stderr(decimal(errno.cast_unsigned(), &mut [0; 10]));
+    }
+    write_stderr(b"\n");
+    exit(127)
+}
+
+fn write_stderr(bytes: &[u8]) {
+    // SAFETY: `bytes` is valid for reads of its length.
+    unsafe { libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len()) };
+}
+
 fn exit(code: libc::c_int) -> ! {
     // SAFETY: `_exit` ends this process without running any of its handlers.
     unsafe { libc::_exit(code) }
@@ -306,15 +358,16 @@ fn exit_as(status: libc::c_int) -> ! {
             rlim_cur: 0,
             rlim_max: 0,
         };
-        let mut signals = core::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: a `sigset_t` is plain data, for which all zeros is valid.
+        let mut signals: libc::sigset_t = unsafe { core::mem::zeroed() };
         // SAFETY: these calls only change this process's own limits and signal state, so that the
         // signal ends it, as it ended the program, without leaving a second core dump.
         unsafe {
             libc::setrlimit(libc::RLIMIT_CORE, &raw const no_core);
             libc::signal(signal, libc::SIG_DFL);
-            libc::sigemptyset(signals.as_mut_ptr());
-            libc::sigaddset(signals.as_mut_ptr(), signal);
-            libc::sigprocmask(libc::SIG_UNBLOCK, signals.as_ptr(), core::ptr::null_mut());
+            libc::sigemptyset(&raw mut signals);
+            libc::sigaddset(&raw mut signals, signal);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &raw const signals, core::ptr::null_mut());
             libc::kill(libc::getpid(), signal);
         }
         exit(128 + signal)

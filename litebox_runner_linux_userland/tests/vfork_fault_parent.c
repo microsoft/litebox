@@ -1,20 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#define _GNU_SOURCE
+#include "helpers.h"
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-// The signal `__builtin_trap` raises (`ud2` on x86-64, `brk` on AArch64).
-#if defined(__x86_64__)
-#define TRAP_SIGNAL SIGILL
-#elif defined(__aarch64__)
-#define TRAP_SIGNAL SIGTRAP
-#endif
 
 // A vfork child that faults dies of the fault's signal, and its parent resumes as itself and
 // reaps it.

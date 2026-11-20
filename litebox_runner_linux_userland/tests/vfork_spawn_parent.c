@@ -2,10 +2,11 @@
 // Licensed under the MIT license.
 
 // Children created by `posix_spawn`, which uses `clone3`, and by glibc's `clone` wrapper, each with
-// a separate child stack, start like vfork children; spawn attributes change their signal state,
-// and `CLONE_CLEAR_SIGHAND` drops the parent's handlers.
+// a separate child stack, start like vfork children, as the processes the parent got for them;
+// spawn attributes change their signal state, and `CLONE_CLEAR_SIGHAND` drops the parent's
+// handlers.
 
-#define _GNU_SOURCE
+#include "helpers.h"
 #include <errno.h>
 #include <linux/sched.h>
 #include <sched.h>
@@ -21,6 +22,7 @@
 
 static char *child_path;
 static char parent_variable[32];
+static struct pid_report clone_report;
 static char child_stack[64 * 1024] __attribute__((aligned(16)));
 
 static void on_signal(int signal) { (void)signal; }
@@ -50,7 +52,7 @@ static int exited_with(int status, int code) {
 static int clone_child(void *marker) {
     char *argv[] = {child_path, marker, NULL};
     // The child checks that it is this process's child, with the marker `from-clone`.
-    char *envp[] = {"VFORK_EXEC_TEST=clone", parent_variable, NULL};
+    char *envp[] = {"VFORK_EXEC_TEST=clone", parent_variable, clone_report.variable, NULL};
     execve(child_path, argv, envp);
     return 111;
 }
@@ -136,12 +138,17 @@ int main(int argc, char **argv) {
     char *spawn_argv[] = {child_path, "from-spawn", NULL};
     // The child checks that it is this process's child, with the marker `from-spawn`.
     char *spawn_envp[] = {"VFORK_EXEC_TEST=spawn", parent_variable, NULL};
-    int ret = posix_spawn(&child, child_path, NULL, NULL, spawn_argv, spawn_envp);
+    struct pid_report spawn_report;
+    open_pid_report(&spawn_report);
+    char *reporting_envp[] = {"VFORK_EXEC_TEST=spawn", parent_variable, spawn_report.variable,
+                              NULL};
+    int ret = posix_spawn(&child, child_path, NULL, NULL, spawn_argv, reporting_envp);
     if (ret != 0) {
         printf("spawn-error ret=%d\n", ret);
         return 4;
     }
     int failures = !exited_with(report("spawn", child), 42);
+    failures += !pid_reported(&spawn_report, child);
 
     // Spawn attributes change the child's signal state before it execs.
     posix_spawnattr_t attr;
@@ -176,6 +183,7 @@ int main(int argc, char **argv) {
     failures += ret != ENOENT || !echild;
 
     // glibc's `clone` wrapper uses the `clone` syscall with a separate child stack.
+    open_pid_report(&clone_report);
     child = clone(clone_child, child_stack + sizeof(child_stack),
                   CLONE_VM | CLONE_VFORK | SIGCHLD, "from-clone");
     if (child < 0) {
@@ -183,6 +191,7 @@ int main(int argc, char **argv) {
         return 7;
     }
     failures += !exited_with(report("clone", child), 42);
+    failures += !pid_reported(&clone_report, child);
 
     child = clone3_clear_sighand();
     if (child < 0) {

@@ -2,21 +2,14 @@
 // Licensed under the MIT license.
 
 // A vfork child's termination signals its parent, whose `SIGCHLD` handler learns the child's
-// process ID, termination, and user, and interrupts the parent's `pause` or wait as on Linux.
+// process ID, termination, and user, and interrupts the parent's `sigsuspend` or wait as on Linux.
 
-#define _GNU_SOURCE
+#include "helpers.h"
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-// The signal `__builtin_trap` raises (`ud2` on x86-64, `brk` on AArch64).
-#if defined(__x86_64__)
-#define TRAP_SIGNAL SIGILL
-#elif defined(__aarch64__)
-#define TRAP_SIGNAL SIGTRAP
-#endif
 
 static const char *child_path;
 
@@ -144,17 +137,32 @@ int main(int argc, char **argv) {
                 !(handled(child, CLD_KILLED, TRAP_SIGNAL) || handled(child, CLD_DUMPED, TRAP_SIGNAL)) ||
                 early != 1;
 
-    // An exec'd child's exit interrupts the sleeping parent.
+    // An exec'd child's exit interrupts the sleeping parent. SIGCHLD stays blocked until the
+    // parent sleeps, so that it can't come first; the alarm, set once the child has exec'd, ends a
+    // parent it never wakes.
+    sigset_t chld_set;
+    sigset_t unblocked;
+    sigemptyset(&chld_set);
+    sigaddset(&chld_set, SIGCHLD);
     catch_sigchld(0);
+    if (sigprocmask(SIG_BLOCK, &chld_set, &unblocked) != 0) {
+        perror("sigprocmask");
+        return 6;
+    }
     child = spawn_sleeper();
-    early = chld_count;
+    alarm(10);
     errno = 0;
-    int paused = pause();
+    int paused = sigsuspend(&unblocked);
     int pause_eintr = paused == -1 && errno == EINTR;
+    alarm(0);
+    if (sigprocmask(SIG_SETMASK, &unblocked, NULL) != 0) {
+        perror("sigprocmask");
+        return 6;
+    }
     waited = waitpid(child, NULL, 0);
     report("paused", child, waited);
-    printf(" early=%d eintr=%d\n", early, pause_eintr);
-    failures += waited != child || !handled(child, CLD_EXITED, 42) || early != 0 || !pause_eintr;
+    printf(" eintr=%d\n", pause_eintr);
+    failures += waited != child || !handled(child, CLD_EXITED, 42) || !pause_eintr;
 
     // Like Linux, a wait interrupted by the waited child's SIGCHLD reports the child, even
     // without SA_RESTART.
@@ -179,9 +187,6 @@ int main(int argc, char **argv) {
     failures += !handled(child, CLD_EXITED, 9) || early != 1 || !echild;
 
     // Like Linux, a child terminating while SIGCHLD is ignored sends no signal, even if blocked.
-    sigset_t chld_set;
-    sigemptyset(&chld_set);
-    sigaddset(&chld_set, SIGCHLD);
     struct sigaction ignore = {.sa_handler = SIG_IGN};
     if (sigprocmask(SIG_BLOCK, &chld_set, NULL) != 0) {
         perror("sigprocmask");
@@ -199,16 +204,23 @@ int main(int argc, char **argv) {
     printf("ignored-blocked child=%d waited=%d count=%d\n", child, waited, chld_count);
     failures += waited != -1 || chld_count != 0;
 
-    // The default SIGCHLD action does not interrupt the sleeping parent. This runs last since
-    // vfork fails once an alarm has been set.
+    // The default SIGCHLD action does not interrupt the sleeping parent, which the alarm wakes.
+    // SIGALRM stays blocked until the parent sleeps, so that it can't come first.
     struct sigaction action = {.sa_handler = SIG_DFL};
     set_action(SIGCHLD, &action);
     action.sa_handler = on_alrm;
     set_action(SIGALRM, &action);
+    sigset_t alrm_set;
+    sigemptyset(&alrm_set);
+    sigaddset(&alrm_set, SIGALRM);
+    if (sigprocmask(SIG_BLOCK, &alrm_set, &unblocked) != 0) {
+        perror("sigprocmask");
+        return 6;
+    }
     child = spawn_sleeper();
     alarm(1);
     errno = 0;
-    paused = pause();
+    paused = sigsuspend(&unblocked);
     pause_eintr = paused == -1 && errno == EINTR;
     waited = waitpid(child, &status, 0);
     printf("default child=%d waited=%d alarmed=%d eintr=%d exit=%d\n", child, waited, alarmed,

@@ -70,9 +70,10 @@ static int echild(pid_t pid) {
     return waitpid(pid, NULL, 0) == -1 && errno == ECHILD;
 }
 
-// Runs the child with `mode`, its stdout a pipe this process reads, as its exit code may be reaped
-// automatically, and returns whether it reported exactly `expected`.
-static int reports(const char *mode, const char *expected) {
+// Starts the child with `mode`, its stdout a pipe this process reads, as its exit code may be reaped
+// automatically, and returns whether it reported exactly `expected`. The caller reaps the child, if
+// it can be reaped.
+static int spawn_reporting(const char *mode, const char *expected) {
     int out[2];
     if (pipe(out) != 0) {
         perror("pipe");
@@ -158,12 +159,12 @@ int main(int argc, char **argv) {
 
     // A program started while SIGCHLD is ignored keeps reaping its children.
     set_sigchld(SIG_IGN, 0);
-    failures += !reports("reap-inherited", "reap-inherited reaped=1\n");
+    failures += !spawn_reporting("reap-inherited", "reap-inherited reaped=1\n");
     echild(-1);
     set_sigchld(SIG_DFL, 0);
 
     // Exec clears SA_NOCLDWAIT, so the new program's children are waitable.
-    failures += !reports("reap-nocldwait", "reap-reset reaped=0\n");
+    failures += !spawn_reporting("reap-nocldwait", "reap-reset reaped=0\n");
     wait(NULL);
     printf("vfork-reap failures=%d\n", failures);
     return failures != 0;

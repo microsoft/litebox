@@ -145,12 +145,16 @@ int main(int argc, char **argv) {
         int pipe_from_main = take_now(SIGPIPE, &info) == SIGPIPE;
         int rt_without_sender =
             take_now(SIGRTMIN, &info) == SIGRTMIN && info.si_code == SI_USER && info.si_pid == 0;
+        if (take_now(SIGRTMIN, &info) != -1 || errno != EAGAIN) {
+            rt_without_sender = -1;
+        }
         int rt_from_self = 0;
         for (int i = 0; i < 2; i++) {
-            rt_from_self += take_now(SIGRTMIN, &info) == SIGRTMIN && info.si_code == SI_USER &&
-                            info.si_pid == getpid() && info.si_uid == getuid();
+            rt_from_self += take_now(SIGRTMIN + 1, &info) == SIGRTMIN + 1 &&
+                            info.si_code == SI_USER && info.si_pid == getpid() &&
+                            info.si_uid == getuid();
         }
-        if (take_now(SIGRTMIN, &info) != -1 || errno != EAGAIN) {
+        if (take_now(SIGRTMIN + 1, &info) != -1 || errno != EAGAIN) {
             rt_from_self = -1;
         }
         int values[] = {disposition_is(SIGPIPE, SIG_IGN), disposition_is(SIGHUP, SIG_IGN),
@@ -273,6 +277,14 @@ int main(int argc, char **argv) {
         (syscall(SYS_gettid) != getpid() || getppid() != atoi(parent) || environment == NULL ||
          strncmp(marker, "from-", 5) != 0 || strcmp(marker + 5, environment) != 0)) {
         return 43;
+    }
+    // A parent that names a descriptor checks the ID reported through it (see `helpers.h`).
+    const char *pid_fd = getenv("VFORK_EXEC_PID_FD");
+    if (pid_fd != NULL) {
+        pid_t self = getpid();
+        if (write(atoi(pid_fd), &self, sizeof self) != (ssize_t)sizeof self) {
+            return 43;
+        }
     }
     return 42;
 }

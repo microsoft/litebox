@@ -14,43 +14,9 @@
 //   - Verify the non‑CLOEXEC fd is still open.
 // Exit status 0 on success; nonzero on failure.
 
-#define _GNU_SOURCE
-#include <errno.h>
-#include <fcntl.h>
+#include "helpers.h"
 #include <pthread.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 #include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-
-static void die(const char *msg) {
-    perror(msg);
-    exit(2);
-}
-
-// Keep these copies in sync with helpers.h; including it would redefine die().
-static const char *test_dir(void) {
-    const char *directory = getenv("TMPDIR");
-    return directory != NULL && directory[0] != 0 ? directory : "/tmp";
-}
-
-static char *test_path(const char *name) {
-    char *path = NULL;
-    if (asprintf(&path, "%s/%s", test_dir(), name) < 0) die("asprintf");
-    return path;
-}
-
-#if defined(__x86_64__) || defined(__i386__)
-#define SPIN_HINT() __asm__ __volatile__("pause")
-#elif defined(__aarch64__)
-#define SPIN_HINT() __asm__ __volatile__("yield")
-#else
-#define SPIN_HINT() __asm__ __volatile__("")
-#endif
 
 void* spin_thread(void* arg) {
     for (;;) {

@@ -6,8 +6,7 @@
 #include <sys/mount.h>
 
 int main(void) {
-    char temporary[] = "/tmp/lb_mount_XXXXXX";
-    char *directory = mkdtemp(temporary);
+    char *directory = mkdtemp(test_path("lb_mount_XXXXXX"));
     TEST_ASSERT(directory != NULL && chdir(directory) == 0, "enter mount test directory");
     TEST_ASSERT(mkdir("target", 0700) == 0, "create mountpoint");
     int old = open("target/old", O_CREAT | O_RDWR, 0600);

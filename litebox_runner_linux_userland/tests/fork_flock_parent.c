@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 // A forked child shares its parent's `flock` ownership through the open file description they
-// share, while a fresh open of the file conflicts with it.
+// share, while a fresh open of the file conflicts with it. Separate opens of a file the test didn't
+// create, its own program, which LiteBox serves from the read-only image, conflict too.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -101,7 +102,21 @@ static void child_checks(const char *path, int inherited, int request, int reply
     _exit(0);
 }
 
-int main(void) {
+static void check_program_lock(const char *program) {
+    TEST_ASSERT(program[0] == '/', "program path must be absolute");
+    int locked = open(program, O_RDONLY);
+    int fresh = open(program, O_RDONLY);
+    TEST_ASSERT(locked >= 0 && fresh >= 0, "open program");
+    TEST_ASSERT(flock(locked, LOCK_EX | LOCK_NB) == 0, "lock program");
+    expect_conflict(fresh, LOCK_SH);
+    TEST_ASSERT(close(locked) == 0, "close locked program");
+    TEST_ASSERT(flock(fresh, LOCK_EX | LOCK_NB) == 0, "close releases program lock");
+    TEST_ASSERT(close(fresh) == 0, "close program");
+}
+
+int main(int argc, char **argv) {
+    (void)argc;
+    check_program_lock(argv[0]);
     const char *path = test_path("fork_flock_lock");
     set_handler(SIGALRM, on_timeout, 0);
     alarm(30);

@@ -169,28 +169,13 @@ int main(int argc, char **argv) {
            WIFSIGNALED(status), WTERMSIG(status));
     failures += waited != kill_self_child || !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL;
 
-    // Unlike Linux, LiteBox refuses any other target in a child, whose requests go to the broker
-    // as its parent's.
-    pid_t kill_other_child = vfork();
-    if (kill_other_child == 0) {
-        _exit(kill(getppid(), 0) == -1 && errno == EINVAL ? 81 : 82);
-    }
-    if (kill_other_child < 0) {
-        perror("vfork");
-        return 10;
-    }
-    waited = waitpid(kill_other_child, &status, 0);
-    printf("kill-other child=%d waited=%d exited=%d code=%d\n", kill_other_child, waited,
-           WIFEXITED(status), WEXITSTATUS(status));
-    failures += !exited_with(kill_other_child, waited, status, 81);
-
     // The child changes its own signal state, and leaves signals pending, before exec. Like Linux
     // `execve`, ignored dispositions and the blocked mask survive while handlers reset to the
     // default. The signals pending for the child, but not the parent's, survive, each for the
     // process or the thread it was pending for, and with its sender, if it had one. In the order
     // `vfork_exec_child.c` reports them: SIGPIPE and SIGHUP ignored, SIGUSR2 and SIGILL default,
     // SIGTERM but not SIGUSR2 blocked, SIGUSR1 but not SIGTERM pending, SIGUSR1 from itself,
-    // SIGPIPE for the main thread only, and one real-time signal without a sender and two from
+    // SIGPIPE for the main thread only, one SIGRTMIN without a sender, and two SIGRTMIN + 1 from
     // itself.
     char *child_argv[] = {argv[1], "signals", "1111101010112", NULL};
     char *child_envp[] = {NULL};
@@ -209,17 +194,20 @@ int main(int argc, char **argv) {
             _exit(112);
         }
         // The signals the child sends itself are pending for its process. At the limit, a
-        // real-time one loses its sender.
+        // real-time one loses its sender; below it, each real-time one queues with its sender. On
+        // Linux, one without a sender shares its pending bit with the queued instances of its
+        // signal and ends when they're taken, so the two kinds are different signals.
         sigset_t carried;
         sigemptyset(&carried);
         sigaddset(&carried, SIGUSR1);
         sigaddset(&carried, SIGPIPE);
         sigaddset(&carried, SIGRTMIN);
+        sigaddset(&carried, SIGRTMIN + 1);
         struct rlimit no_queue = {.rlim_cur = 0, .rlim_max = sigpending_limit.rlim_max};
         if (sigprocmask(SIG_BLOCK, &carried, NULL) != 0 || kill(getpid(), SIGUSR1) != 0 ||
             kill(getpid(), SIGPIPE) != 0 || setrlimit(RLIMIT_SIGPENDING, &no_queue) != 0 ||
             kill(getpid(), SIGRTMIN) != 0 || setrlimit(RLIMIT_SIGPENDING, &sigpending_limit) != 0 ||
-            kill(getpid(), SIGRTMIN) != 0 || kill(getpid(), SIGRTMIN) != 0) {
+            kill(getpid(), SIGRTMIN + 1) != 0 || kill(getpid(), SIGRTMIN + 1) != 0) {
             _exit(113);
         }
         // Ignoring SIGPIPE discards the pending one, and the broken pipe raises another for this

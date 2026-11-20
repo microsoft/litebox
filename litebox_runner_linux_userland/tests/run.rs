@@ -87,10 +87,21 @@ fn gateway_udp_policy() -> litebox_broker_core::SocketPolicy {
         .unwrap()
 }
 
+/// The variable that has `sendfile.c` check pipes, which in LiteBox need the userland broker.
+#[cfg(target_os = "linux")]
+const PIPE_BROKER_VARIABLE: &str = "LITEBOX_PIPE_BROKER";
+
+#[cfg(target_os = "linux")]
+fn checks_broker_pipes(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("sendfile.c")
+}
+
 #[cfg(target_os = "linux")]
 fn configure_pipe_broker(path: &Path, runner: &mut Runner) {
-    if path.file_name().and_then(|name| name.to_str()) == Some("sendfile.c") {
-        runner.use_userland_broker().env("LITEBOX_PIPE_BROKER=1");
+    if checks_broker_pipes(path) {
+        runner
+            .use_userland_broker()
+            .env(format!("{PIPE_BROKER_VARIABLE}=1"));
     }
 }
 
@@ -133,32 +144,48 @@ fn test_mount_tmpfs() {
 
 include!(concat!(env!("OUT_DIR"), "/c_tests.rs"));
 
-/// Runs a C test in LiteBox, letting it create processes if `duplicate`, and passing it the path
-/// of `vfork_exec_child.c`, built like it, if `exec_child`.
-fn run_c_test(path: &str, suffix: &str, exec_or_lib: bool, duplicate: bool, exec_child: bool) {
-    let stem = Path::new(path)
+fn c_test_stem(path: &str) -> &str {
+    Path::new(path)
         .file_stem()
         .and_then(|s| s.to_str())
-        .expect("failed to get file stem");
+        .expect("failed to get file stem")
+}
+
+/// Builds `vfork_exec_child.c` for the C test `stem`, like the test with `suffix` and
+/// `exec_or_lib`, under a name of its own so that concurrent tests don't share it.
+fn build_exec_child(stem: &str, suffix: &str, exec_or_lib: bool) -> PathBuf {
+    common::compile(
+        "./tests/vfork_exec_child.c",
+        &format!("{stem}_child{suffix}"),
+        exec_or_lib,
+        false,
+    )
+}
+
+/// Runs a C test in LiteBox, letting it create processes if `allow_duplication`, and passing it
+/// the path of `vfork_exec_child.c`, built like it, if `with_exec_child`.
+fn run_c_test(
+    path: &str,
+    suffix: &str,
+    exec_or_lib: bool,
+    allow_duplication: bool,
+    with_exec_child: bool,
+) {
+    let stem = c_test_stem(path);
     let unique_name = format!("{stem}{suffix}");
     let target = common::compile(path, &unique_name, exec_or_lib, false);
     let mut runner = Runner::new(&target, &unique_name);
     #[cfg(target_os = "linux")]
     {
         configure_pipe_broker(Path::new(path), &mut runner);
-        if duplicate {
+        if allow_duplication {
             runner.allow_process_duplication();
         }
     }
     #[cfg(not(target_os = "linux"))]
-    assert!(!duplicate, "only Linux runners create processes");
-    if exec_child {
-        let child = common::compile(
-            "./tests/vfork_exec_child.c",
-            &format!("{stem}_child{suffix}"),
-            exec_or_lib,
-            false,
-        );
+    assert!(!allow_duplication, "only Linux runners create processes");
+    if with_exec_child {
+        let child = build_exec_child(stem, suffix, exec_or_lib);
         // The guest finds the child where the host keeps it.
         let child_guest_path = std::path::absolute(&child).unwrap();
         runner.arg(&child_guest_path).with_fs_path(|root| {
@@ -169,35 +196,37 @@ fn run_c_test(path: &str, suffix: &str, exec_or_lib: bool, duplicate: bool, exec
     runner.run();
 }
 
+/// Generates a LiteBox sweep test for a C test of the kind `build.rs` gives it.
 macro_rules! c_test {
+    ($kind:ident $stem:ident, $path:literal, ignore_natively = $reason:literal) => {
+        c_test!($kind $stem, $path);
+    };
     (dedicated $stem:ident, $path:literal) => {
         c_test!(@test #[ignore = "has a dedicated test"] $stem, $path, false, false);
     };
+    // With `--run-ignored`, these would fail without a broker.
     (broker $stem:ident, $path:literal) => {
         c_test!(@test #[ignore = "needs the broker"] $stem, $path, false, false);
-    };
-    (plain r#mount, $path:literal) => {
-        c_test!(dedicated r#mount, $path);
     };
     (plain $stem:ident, $path:literal) => {
         c_test!(@test $stem, $path, false, false);
     };
-    (forking $stem:ident, $path:literal) => {
+    (duplicating $stem:ident, $path:literal) => {
         c_test!(@test
             #[cfg_attr(not(target_os = "linux"), ignore = "only Linux runners create processes")]
             $stem, $path, true, false);
     };
-    (exec_child $stem:ident, $path:literal) => {
+    (with_exec_child $stem:ident, $path:literal) => {
         c_test!(@test
             #[cfg_attr(not(target_os = "linux"), ignore = "only Linux runners create processes")]
             $stem, $path, true, true);
     };
-    (@test $(#[$attribute:meta])* $stem:ident, $path:literal, $duplicate:literal,
-        $exec_child:literal) => {
+    (@test $(#[$attribute:meta])* $stem:ident, $path:literal, $allow_duplication:literal,
+        $with_exec_child:literal) => {
         $(#[$attribute])*
         #[test]
         fn $stem() {
-            super::run_c_test($path, SUFFIX, EXEC_OR_LIB, $duplicate, $exec_child);
+            super::run_c_test($path, SUFFIX, EXEC_OR_LIB, $allow_duplication, $with_exec_child);
         }
     };
 }
@@ -217,99 +246,41 @@ mod test_static_exec_with_rewriter {
 /// Runs a C test natively, as the LiteBox sweeps run it, to check that the test's expectations
 /// hold on Linux and not only under LiteBox.
 #[cfg(target_os = "linux")]
-fn run_native_c_test(path: &str, exec_child: bool) {
-    let stem = Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .expect("failed to get file stem");
+fn run_native_c_test(path: &str, with_exec_child: bool) {
+    let stem = c_test_stem(path);
     let target = common::compile(path, &format!("{stem}_native"), true, false);
     let Some(mut native) = Native::new(&target) else {
         return;
     };
-    if exec_child {
-        let child = common::compile(
-            "./tests/vfork_exec_child.c",
-            &format!("{stem}_child_native"),
-            true,
-            false,
-        );
+    if checks_broker_pipes(Path::new(path)) {
+        native.env(PIPE_BROKER_VARIABLE, "1");
+    }
+    if with_exec_child {
+        let child = build_exec_child(stem, "_native", true);
         native.arg(std::path::absolute(child).unwrap());
     }
     native.output();
 }
 
-/// The C tests the native sweep skips, beyond those with a dedicated test, and why.
+/// Generates a native sweep test for a C test of the kind `build.rs` gives it, which, if it has a
+/// dedicated test or `build.rs` says to skip it natively, runs only when asked to, e.g. with
+/// `--run-ignored`.
 #[cfg(target_os = "linux")]
 macro_rules! native_c_test {
     (dedicated $stem:ident, $path:literal) => {
         native_c_test!(@test #[ignore = "has a dedicated test"] $stem, $path, false);
     };
-    ($kind:ident r#mount, $path:literal) => {
-        native_c_test!(@skip $kind "mounting needs root on the host", r#mount, $path);
+    (with_exec_child $stem:ident, $path:literal $(, ignore_natively = $reason:literal)?) => {
+        native_c_test!(@test $(#[ignore = $reason])? $stem, $path, true);
     };
-    ($kind:ident r#vsock_unsupported, $path:literal) => {
-        native_c_test!(@skip $kind "checks LiteBox's policy; Linux supports AF_VSOCK",
-            r#vsock_unsupported, $path);
+    ($kind:ident $stem:ident, $path:literal $(, ignore_natively = $reason:literal)?) => {
+        native_c_test!(@test $(#[ignore = $reason])? $stem, $path, false);
     };
-    ($kind:ident r#urandom_broker, $path:literal) => {
-        native_c_test!(@skip $kind "expects the test broker's fixed random bytes",
-            r#urandom_broker, $path);
-    };
-    ($kind:ident r#pipe_broker, $path:literal) => {
-        native_c_test!(@skip $kind "Linux keeps a writer to a full pipe blocked until a reader \
-            frees a whole page; LiteBox wakes it after a 1-byte read", r#pipe_broker, $path);
-    };
-    ($kind:ident r#process_tree_parent, $path:literal) => {
-        native_c_test!(@skip $kind "expects LiteBox's initial process to have no parent and \
-            adopt orphans, which natively only the first process of a PID namespace does, but that \
-            one also ignores signals it has no handler for", r#process_tree_parent, $path);
-    };
-    ($kind:ident r#fork_inet_parent, $path:literal) => {
-        native_c_test!(@skip $kind "expects LiteBox's initial process to adopt an orphan, which \
-            natively the first process of the PID namespace does", r#fork_inet_parent, $path);
-    };
-    ($kind:ident r#vfork_exit_parent, $path:literal) => {
-        native_c_test!(@skip $kind "Linux lets a process vfork with an alarm armed; LiteBox fails \
-            the vfork with EAGAIN", r#vfork_exit_parent, $path);
-    };
-    ($kind:ident r#vfork_signal_parent, $path:literal) => {
-        native_c_test!(@skip $kind "Linux lets a vfork child signal its parent, which LiteBox \
-            refuses with EINVAL, and drops a real-time signal sent at the RLIMIT_SIGPENDING limit \
-            once its queued instances are taken, which LiteBox keeps without a sender",
-            r#vfork_signal_parent, $path);
-    };
-    ($kind:ident r#tcp_broker, $path:literal) => {
-        native_c_test!(@skip $kind "needs arguments from its broker test", r#tcp_broker, $path);
-    };
-    ($kind:ident r#tcp_broker_states, $path:literal) => {
-        native_c_test!(@skip $kind "needs arguments from its broker test", r#tcp_broker_states,
-            $path);
-    };
-    ($kind:ident r#udp_broker, $path:literal) => {
-        native_c_test!(@skip $kind "needs arguments from its broker test", r#udp_broker, $path);
-    };
-    ($kind:ident r#udp_broker_namespace, $path:literal) => {
-        native_c_test!(@skip $kind "needs arguments from its broker test",
-            r#udp_broker_namespace, $path);
-    };
-    (exec_child $stem:ident, $path:literal) => {
-        native_c_test!(@test $stem, $path, true);
-    };
-    ($kind:ident $stem:ident, $path:literal) => {
-        native_c_test!(@test $stem, $path, false);
-    };
-    // A skipped test still runs as its kind says when asked to, e.g. with `--run-ignored`.
-    (@skip exec_child $reason:literal, $stem:ident, $path:literal) => {
-        native_c_test!(@test #[ignore = $reason] $stem, $path, true);
-    };
-    (@skip $kind:ident $reason:literal, $stem:ident, $path:literal) => {
-        native_c_test!(@test #[ignore = $reason] $stem, $path, false);
-    };
-    (@test $(#[$attribute:meta])* $stem:ident, $path:literal, $exec_child:literal) => {
+    (@test $(#[$attribute:meta])* $stem:ident, $path:literal, $with_exec_child:literal) => {
         $(#[$attribute])*
         #[test]
         fn $stem() {
-            super::run_native_c_test($path, $exec_child);
+            super::run_native_c_test($path, $with_exec_child);
         }
     };
 }

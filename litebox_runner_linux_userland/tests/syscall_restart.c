@@ -137,13 +137,9 @@ static void test_timed_recv_not_restarted(void) {
 }
 
 static void test_timed_accept_not_restarted(void) {
-    const char *path = test_path("syscall_restart.sock");
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    TEST_ASSERT(strlen(path) < sizeof(addr.sun_path), "socket path too long");
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
-    unlink(path);
+    test_socket_address(&addr, "syscall_restart.sock", 0);
+    const char *path = addr.sun_path;
 
     int listener = socket(AF_UNIX, SOCK_STREAM, 0);
     TEST_ASSERT(listener >= 0, "socket failed");

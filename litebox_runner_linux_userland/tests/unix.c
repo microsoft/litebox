@@ -274,15 +274,10 @@ int main() {
         test_failed = 1;
     }
 
-    // Clean up any existing socket file
-    char *socket_path = test_path("test_unix_socket.sock");
-    unlink(socket_path);
-
     // Initialize context
     memset(&ctx, 0, sizeof(ctx));
-    ctx.addr.sun_family = AF_UNIX;
-    TEST_ASSERT(strlen(socket_path) < sizeof(ctx.addr.sun_path), "socket path too long");
-    snprintf(ctx.addr.sun_path, sizeof(ctx.addr.sun_path), "%s", socket_path);
+    test_socket_address(&ctx.addr, "test_unix_socket.sock", 0);
+    const char *socket_path = ctx.addr.sun_path;
     ctx.ready = 0;
     pthread_mutex_init(&ctx.mutex, NULL);
     pthread_cond_init(&ctx.cond, NULL);
