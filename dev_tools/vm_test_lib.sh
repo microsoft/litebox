@@ -186,17 +186,22 @@ wait_vsock_started() {
     return 1
 }
 
-# Stops the daemon `start_vsock` started, if any.
-stop_vsock() {
-    [[ -n ${daemon:-} ]] || return 0
-    kill "$daemon" 2>/dev/null || true
-    wait "$daemon" 2>/dev/null || true
+# Stops the daemon $1, one of $daemons.
+stop_daemon() {
+    kill "$1" 2>/dev/null || true
+    wait "$1" 2>/dev/null || true
     # Reaped, so exit cleanup must not signal its PID.
     local pid kept=()
     for pid in "${daemons[@]}"; do
-        [[ $pid == "$daemon" ]] || kept+=("$pid")
+        [[ $pid == "$1" ]] || kept+=("$pid")
     done
     daemons=("${kept[@]}")
+}
+
+# Stops the daemon `start_vsock` started, if any.
+stop_vsock() {
+    [[ -n ${daemon:-} ]] || return 0
+    stop_daemon "$daemon"
     daemon=
     vsock_connect=()
 }
@@ -204,7 +209,9 @@ stop_vsock() {
 # run_vm NAME KERNEL PAYLOAD [VMM_ARG]...: boots KERNEL with PAYLOAD as its
 # initrd and records the outcome; with $verbose set, prints passing logs too.
 # $kernel_args, if set, goes on the kernel's command line, QEMU runs through
-# $vsock_connect, and Cloud Hypervisor through $netns. If $client names a
+# $vsock_connect, and Cloud Hypervisor through $netns, with its RAM shared
+# (e.g., with a vhost-user daemon) if $vm_shared_memory is set (QEMU's
+# arguments share it themselves). If $client names a
 # function, `$client NAME` runs alongside as the host client, and a pass needs
 # it to exit 0; its end stops the VM, and the VM's end stops it after 5s. If
 # $check names a function, a guest pass also needs `$check NAME` to succeed;
@@ -228,7 +235,7 @@ run_vm() {
         cloud-hypervisor)
             # shellcheck disable=SC2206 # CLOUD_HYPERVISOR is a command line
             vm+=("${netns[@]}" $CLOUD_HYPERVISOR
-                --cpus "boot=$VM_CPUS" --memory "size=${VM_MIB}M"
+                --cpus "boot=$VM_CPUS" --memory "size=${VM_MIB}M${vm_shared_memory:+,shared=on}"
                 --kernel "$kernel" --initramfs "$payload" --cmdline "$cmdline"
                 --serial tty)
             [[ " $* " == *" --console "* ]] || vm+=(--console off)
