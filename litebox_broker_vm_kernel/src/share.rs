@@ -1,9 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Host directories over 9P2000.L ([`Share`]), read-only for now, like
-//! `litebox_broker_userland`'s `--mount-ro HOST:GUEST`. The runner's [`Transport`]s
-//! carry whole messages (e.g., a virtio-9p device), where the 9P client
+//! Host directories ([`Share`]) over 9P2000.L or FUSE ([`Server`]),
+//! read-only for now, like `litebox_broker_userland`'s `--mount-ro
+//! HOST:GUEST`: only [`ReadOnly`] enforces that, as the backends would write.
+//! The runner's [`NinePTransport`]s carry whole messages, where the 9P client
 //! expects a byte stream. Symlink targets are passed through unchanged: an
 //! absolute one resolves from the guest's root, not from the share's.
 
@@ -20,6 +21,8 @@ use litebox_broker_core::fs::errors::{
     ReadError as FsReadError, RenameError, ResolutionError, RmdirError, SetTimesError,
     SymlinkError, TruncateError, UnlinkError, WalkError, WriteError as FsWriteError,
 };
+use litebox_broker_core::fs::fuse::transport::Transport as FuseTransport;
+use litebox_broker_core::fs::fuse::{self, Fuse};
 use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 use litebox_broker_core::fs::nine_p::transport::{Read, ReadError, Write, WriteError};
 use litebox_broker_core::fs::nine_p::{self, NineP};
@@ -33,7 +36,7 @@ use litebox_platform_vm_kernel::VmKernel;
 /// Carries 9P messages to a server, one request at a time: whole messages,
 /// unlike the byte stream of `nine_p::transport`, which the share adapts it
 /// to.
-pub trait Transport: Send {
+pub trait NinePTransport: Send {
     /// The largest message either way, at least 8 KiB; the client's `msize`.
     fn max_message_size(&self) -> usize;
 
@@ -44,13 +47,25 @@ pub trait Transport: Send {
     ///
     /// The transport failed, e.g., the server did not answer in time; it is
     /// not used again.
-    fn round_trip(&mut self, request: &[u8], response: &mut [u8]) -> Result<usize, TransportError>;
+    fn round_trip(
+        &mut self,
+        request: &[u8],
+        response: &mut [u8],
+    ) -> Result<usize, NinePTransportError>;
 }
 
-/// A [`Transport`] failed; the share's operations fail with I/O errors from
-/// then on.
+/// A [`NinePTransport`] failed; the share's operations fail with I/O errors
+/// from then on.
 #[derive(Clone, Copy, Debug)]
-pub struct TransportError;
+pub struct NinePTransportError;
+
+/// A [`Share`]'s server, by the protocol it speaks.
+pub enum Server {
+    /// 9P2000.L, e.g., QEMU's virtio-9p.
+    NineP(Box<dyn NinePTransport>),
+    /// FUSE, e.g., virtiofsd behind a virtio-fs device.
+    Fuse(Box<dyn FuseTransport>),
+}
 
 /// A host directory mounted, read-only, at `path`.
 pub struct Share {
@@ -60,13 +75,13 @@ pub struct Share {
     /// does not check: such a share would be the root, or sit among the
     /// devices.
     pub path: String,
-    pub transport: Box<dyn Transport>,
+    pub server: Server,
 }
 
 /// The 9P client writes a whole request, then reads its response; a request
 /// goes out once complete (its size field says so).
-struct Stream {
-    transport: Box<dyn Transport>,
+pub(crate) struct Stream {
+    transport: Box<dyn NinePTransport>,
     request: Vec<u8>,
     response: Vec<u8>,
     response_len: usize,
@@ -74,7 +89,7 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(transport: Box<dyn Transport>) -> Self {
+    fn new(transport: Box<dyn NinePTransport>) -> Self {
         let response = alloc::vec![0; transport.max_message_size()];
         Self {
             transport,
@@ -115,7 +130,7 @@ impl Write for Stream {
             let result = self.transport.round_trip(&self.request, &mut self.response);
             self.request.clear();
             self.response_len = result
-                .map_err(|TransportError| WriteError)?
+                .map_err(|NinePTransportError| WriteError)?
                 .min(self.response.len());
         }
         Ok(buf.len())
@@ -134,40 +149,65 @@ impl Read for Stream {
 }
 
 /// A [`Share`]'s directory, as `litebox_broker_userland`'s `--mount-ro` is a
-/// host directory: the 9P backend in a [`ReadOnly`] view, which refuses what
-/// would change it. Its files report no times.
-pub(crate) struct ShareFs(ReadOnly<NineP<VmKernel, Stream>>);
+/// host directory: the protocol's backend `B` in a [`ReadOnly`] view, which
+/// refuses what would change it. A 9P share's files report no times.
+pub(crate) struct ShareFs<B: Backend> {
+    inner: ReadOnly<B>,
+    timed: bool,
+}
 
 /// Linux's defaults for the user and tree a 9P mount attaches as; servers
 /// such as QEMU's ignore them.
 const USER: &str = "nobody";
 const TREE: &str = "";
 
-impl ShareFs {
+impl ShareFs<NineP<VmKernel, Stream>> {
     /// Attaches to the 9P server at the other end of `transport`.
     ///
     /// # Errors
     ///
     /// Version negotiation or the attach failed.
-    pub(crate) fn new(
-        transport: Box<dyn Transport>,
+    pub(crate) fn nine_p(
+        transport: Box<dyn NinePTransport>,
         allocator: InodeAllocator,
     ) -> Result<Self, nine_p::Error> {
         let stream = Stream::new(transport);
         let msize = u32::try_from(stream.max_message_size()).unwrap_or(u32::MAX);
-        NineP::new(stream, msize, USER, TREE, allocator).map(|fs| Self(ReadOnly::new(fs)))
+        let fs = NineP::new(stream, msize, USER, TREE, allocator)?;
+        Ok(Self {
+            inner: ReadOnly::new(fs),
+            timed: false,
+        })
     }
 }
 
-/// `status` without times.
-fn untimed(mut status: FileStatus) -> FileStatus {
-    status.times = None;
-    status
+impl ShareFs<Fuse<VmKernel, Box<dyn FuseTransport>>> {
+    /// Connects to the FUSE server at the other end of `transport`
+    /// (`FUSE_INIT`).
+    pub(crate) fn fuse(
+        transport: Box<dyn FuseTransport>,
+        allocator: InodeAllocator,
+    ) -> Result<Self, fuse::Error> {
+        Ok(Self {
+            inner: ReadOnly::new(Fuse::new(transport, allocator)?),
+            timed: true,
+        })
+    }
 }
 
-impl Backend for ShareFs {
+impl<B: Backend> ShareFs<B> {
+    /// `status`, without times unless the share reports them.
+    fn timed(&self, mut status: FileStatus) -> FileStatus {
+        if !self.timed {
+            status.times = None;
+        }
+        status
+    }
+}
+
+impl<B: Backend> Backend for ShareFs<B> {
     fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        self.0.root()
+        self.inner.root()
     }
 
     fn resolve<'a>(
@@ -176,50 +216,50 @@ impl Backend for ShareFs {
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError> {
-        self.0.resolve(from, components, authorize_dir_lookup)
+        self.inner.resolve(from, components, authorize_dir_lookup)
     }
 
     fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
-        self.0.read_link_at(dir, name)
+        self.inner.read_link_at(dir, name)
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
-        self.0.open_dir(dir, flags)
+        self.inner.open_dir(dir, flags)
     }
 
     fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Result<ResolvedDir<'a>, WalkError> {
-        self.0.walking_dir_at(dir)
+        self.inner.walking_dir_at(dir)
     }
 
     fn walking_dir_with_path<'a>(
         &'a self,
         dir: &DirHandle,
     ) -> Result<(ResolvedDir<'a>, DirPathResult), WalkError> {
-        self.0.walking_dir_with_path(dir)
+        self.inner.walking_dir_with_path(dir)
     }
 
     fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
-        self.0.dir_path(dir)
+        self.inner.dir_path(dir)
     }
 
     fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
-        self.0.parent_dir(dir)
+        self.inner.parent_dir(dir)
     }
 
     fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
-        self.0.check_search_permission(dir)
+        self.inner.check_search_permission(dir)
     }
 
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
-        self.0.open_file(file, flags)
+        self.inner.open_file(file, flags)
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        self.0.list_dir_at(handle)
+        self.inner.list_dir_at(handle)
     }
 
     fn lookup_at(&self, dir: &DirHandle, name: &str) -> Result<Option<DirEntry>, ReadDirError> {
-        self.0.lookup_at(dir, name)
+        self.inner.lookup_at(dir, name)
     }
 
     fn read(
@@ -228,15 +268,15 @@ impl Backend for ShareFs {
         buf: &mut dyn ReadBuffer,
         offset: usize,
     ) -> Result<usize, FsReadError> {
-        self.0.read(h, buf, offset)
+        self.inner.read(h, buf, offset)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
-        self.0.get_static_backing_data(h)
+        self.inner.get_static_backing_data(h)
     }
 
     fn map_shared(&self, h: &FileHandle) -> Result<Arc<SharedFile>, MapSharedError> {
-        self.0.map_shared(h)
+        self.inner.map_shared(h)
     }
 
     fn write(
@@ -245,31 +285,33 @@ impl Backend for ShareFs {
         buf: &dyn WriteBuffer,
         offset: usize,
     ) -> Result<usize, FsWriteError> {
-        self.0.write(h, buf, offset)
+        self.inner.write(h, buf, offset)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
-        self.0.truncate(h, length)
+        self.inner.truncate(h, length)
     }
 
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
-        self.0.seek_behavior(h)
+        self.inner.seek_behavior(h)
     }
 
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
-        self.0.status(h).map(untimed)
+        self.inner.status(h).map(|status| self.timed(status))
     }
 
     fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
-        self.0.resolved_status(target).map(untimed)
+        self.inner
+            .resolved_status(target)
+            .map(|status| self.timed(status))
     }
 
     fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {
-        self.0.terminal(h)
+        self.inner.terminal(h)
     }
 
     fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
-        self.0.readiness_source(h)
+        self.inner.readiness_source(h)
     }
 
     fn create_file_at(
@@ -278,7 +320,7 @@ impl Backend for ShareFs {
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
-        self.0.create_file_at(dir, name, metadata)
+        self.inner.create_file_at(dir, name, metadata)
     }
 
     fn symlink_at(
@@ -288,7 +330,7 @@ impl Backend for ShareFs {
         target: &str,
         metadata: CreationMetadata,
     ) -> Result<(), SymlinkError> {
-        self.0.symlink_at(dir, name, target, metadata)
+        self.inner.symlink_at(dir, name, target, metadata)
     }
 
     fn mkdir_at(
@@ -297,15 +339,15 @@ impl Backend for ShareFs {
         name: &str,
         metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
-        self.0.mkdir_at(dir, name, metadata)
+        self.inner.mkdir_at(dir, name, metadata)
     }
 
     fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
-        self.0.unlink_at(dir, name)
+        self.inner.unlink_at(dir, name)
     }
 
     fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
-        self.0.rmdir_at(dir, name)
+        self.inner.rmdir_at(dir, name)
     }
 
     fn rename_at(
@@ -315,7 +357,7 @@ impl Backend for ShareFs {
         new_dir: DirHandle,
         new_name: &str,
     ) -> Result<(), RenameError> {
-        self.0.rename_at(old_dir, old_name, new_dir, new_name)
+        self.inner.rename_at(old_dir, old_name, new_dir, new_name)
     }
 
     fn set_times(
@@ -323,11 +365,11 @@ impl Backend for ShareFs {
         target: ResolvedTarget<'_>,
         times: &SetFileTimes,
     ) -> Result<(), SetTimesError> {
-        self.0.set_times(target, times)
+        self.inner.set_times(target, times)
     }
 
     fn chmod(&self, target: ResolvedTarget<'_>, mode: Mode) -> Result<(), ChmodError> {
-        self.0.chmod(target, mode)
+        self.inner.chmod(target, mode)
     }
 
     fn chown(
@@ -336,6 +378,6 @@ impl Backend for ShareFs {
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        self.0.chown(target, user, group)
+        self.inner.chown(target, user, group)
     }
 }

@@ -12,8 +12,8 @@
 //! device, if there is one, their sockets reach the VM's network device, if
 //! there is one, as the payload's `policy` allows ([`init::POLICY`]), and
 //! their vsock sockets the host through the VM's socket device, if there is
-//! one; programs also see the host directories of virtio-9p devices,
-//! read-only, at their mount tags ([`devices`]).
+//! one; programs also see the host directories of virtio-9p and virtio-fs
+//! devices, read-only, at their tags ([`devices`]).
 //!
 //! Every CPU runs the processes ([`litebox_shim_vm_kernel::sched`],
 //! [`cpu_main`]).
