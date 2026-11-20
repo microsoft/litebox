@@ -8,7 +8,7 @@
 //! guest-neutral Unix socket operations.
 
 use alloc::{
-    string::{String, ToString as _},
+    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -136,14 +136,12 @@ impl UnixSocketAddr {
         match self {
             UnixSocketAddr::Unnamed => Err(Errno::EINVAL),
             UnixSocketAddr::Abstract(name) => Ok(UnixSocketAddress::Abstract(name.clone())),
-            UnixSocketAddr::Path(path) => {
-                let absolute = task.absolute_name(path.as_str())?;
-                let resolved = litebox::fs::ResolvedPath::new(&absolute);
-                Ok(UnixSocketAddress::Path {
-                    path: resolved.to_string(),
-                    name: path.as_bytes().to_vec(),
-                })
-            }
+            // Sent unnormalized: the broker resolves `..` after following symlinks and enforces
+            // trailing slashes.
+            UnixSocketAddr::Path(path) => Ok(UnixSocketAddress::Path {
+                path: task.absolute_name(path.as_str())?,
+                name: path.as_bytes().to_vec(),
+            }),
         }
     }
 }
