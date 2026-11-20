@@ -7,7 +7,8 @@
 //! [`Backend`](backend::Backend)s. Such backends can be composed together: mounted at distinct paths
 //! via the [`Composer`](composer::Composer), or stacked as a writable upper over immutable lowers
 //! via the [`Overlay`](overlay::Overlay). Any backend can be made read-only through
-//! [`ReadOnly`](read_only::ReadOnly).
+//! [`ReadOnly`](read_only::ReadOnly). Remote file systems are reached over 9P
+//! ([`NineP`](nine_p::NineP)) or FUSE ([`Fuse`](fuse::Fuse)).
 
 use bitflags::bitflags;
 
@@ -18,6 +19,7 @@ pub mod composer;
 pub mod devices;
 pub mod errors;
 mod flock;
+pub mod fuse;
 pub mod in_mem;
 #[doc(hidden)]
 pub mod inode_allocator;
