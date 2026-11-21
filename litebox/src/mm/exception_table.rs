@@ -91,6 +91,44 @@ use litebox_platform::buffer::Fault;
 /// `dst` and `src` must be valid for reads and writes of `size` bytes, or
 /// pointers that are guaranteed to be in non-Rust memory.
 pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Result<(), Fault> {
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: Both ranges satisfy the caller's contract. Only issue ld/sd
+    // when both addresses are naturally aligned; handle all other bytes with lbu/sb.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "or {tmp}, {src}, {dst}",
+            "andi {tmp}, {tmp}, 7",
+            "bnez {tmp}, 4f",
+            "li {width}, 8",
+            "3:",
+            "bltu {left}, {width}, 4f",
+            "ld {tmp}, 0({src})",
+            "sd {tmp}, 0({dst})",
+            "addi {src}, {src}, 8",
+            "addi {dst}, {dst}, 8",
+            "addi {left}, {left}, -8",
+            "j 3b",
+            "4:",
+            "beqz {left}, 6f",
+            "5:",
+            "lbu {tmp}, 0({src})",
+            "sb {tmp}, 0({dst})",
+            "addi {src}, {src}, 1",
+            "addi {dst}, {dst}, 1",
+            "addi {left}, {left}, -1",
+            "bnez {left}, 5b",
+            "6:",
+            ex_table_entry!("2b", "6b", "{fault}"),
+            src = inout(reg) src => _,
+            dst = inout(reg) dst => _,
+            left = inout(reg) size => _,
+            tmp = out(reg) _,
+            width = out(reg) _,
+            fault = label { return Err(Fault) },
+            options(nostack),
+        );
+    }
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm! {
@@ -311,6 +349,77 @@ write_fn!(
     "str {src}, [{dest}]",
     core::convert::identity
 );
+
+// Keep naturally aligned guest accesses single-copy atomic. Guest pointers
+// (e.g. to a packed field) need not be aligned; copy those bytewise instead.
+#[cfg(target_arch = "riscv64")]
+macro_rules! scalar {
+    ($read:ident, $write:ident, $ty:ty, $load:literal, $store:literal) => {
+        /// Reads a possibly unaligned value, returning `Fault` on a recovered exception.
+        ///
+        /// # Safety
+        /// `src` must be valid for reads or point into non-Rust memory.
+        pub unsafe fn $read(src: *const $ty) -> Result<$ty, Fault> {
+            if !src.is_aligned() {
+                let mut value: $ty = 0;
+                // SAFETY: The source is covered by the caller; the destination holds one value.
+                unsafe { memcpy_fallible((&raw mut value).cast(), src.cast(), size_of::<$ty>())? };
+                return Ok(value);
+            }
+            let value: u64;
+            let failed: usize;
+            // SAFETY: A naturally aligned load; on fault skip the instruction that clears `failed`.
+            unsafe {
+                core::arch::asm!(
+                    "2:",
+                    concat!($load, " {value}, 0({src})"),
+                    "li {failed}, 0",
+                    "3:",
+                    ex_table_entry!("2b", "3b", "3b"),
+                    src = in(reg) src,
+                    value = out(reg) value,
+                    failed = inout(reg) 1usize => failed,
+                    options(nostack),
+                );
+            }
+            if failed == 0 { Ok(value.trunc()) } else { Err(Fault) }
+        }
+
+        /// Writes a possibly unaligned value, returning `Fault` on a recovered exception.
+        ///
+        /// # Safety
+        /// `dst` must be valid for writes or point into non-Rust memory.
+        pub unsafe fn $write(dst: *mut $ty, value: $ty) -> Result<(), Fault> {
+            if !dst.is_aligned() {
+                // SAFETY: The source holds one value; the destination is covered by the caller.
+                return unsafe { memcpy_fallible(dst.cast(), (&raw const value).cast(), size_of::<$ty>()) };
+            }
+            // SAFETY: The caller supplies the destination; the exception table covers the store.
+            unsafe {
+                core::arch::asm!(
+                    "2:",
+                    concat!($store, " {value}, 0({dst})"),
+                    "3:",
+                    ex_table_entry!("2b", "3b", "{fault}"),
+                    dst = in(reg) dst,
+                    value = in(reg) u64::from(value),
+                    fault = label { return Err(Fault) },
+                    options(nostack),
+                );
+            }
+            Ok(())
+        }
+    };
+}
+
+#[cfg(target_arch = "riscv64")]
+scalar!(read_u8_fallible, write_u8_fallible, u8, "lbu", "sb");
+#[cfg(target_arch = "riscv64")]
+scalar!(read_u16_fallible, write_u16_fallible, u16, "lhu", "sh");
+#[cfg(target_arch = "riscv64")]
+scalar!(read_u32_fallible, write_u32_fallible, u32, "lwu", "sw");
+#[cfg(target_arch = "riscv64")]
+scalar!(read_u64_fallible, write_u64_fallible, u64, "ld", "sd");
 
 /// Exception table entry with relative offsets
 #[repr(C)]
