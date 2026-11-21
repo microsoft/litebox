@@ -9,6 +9,8 @@
 //! let them (see [`Egress`](crate::spec::Egress)); without, the VM has no network device. QEMU's
 //! NAT keeps one destination per guest UDP port, the last: an unconnected UDP socket that sends to
 //! 10.0.2.1 or 10.0.2.3 and to other destinations may lose the replies of those it sent to earlier.
+//! It reports no ICMP errors: a connected guest UDP socket gets no `ECONNREFUSED`, and a datagram
+//! that a guest UDP socket sends after one refused may be lost.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};

@@ -4,14 +4,15 @@
 //! Runs the shim daemon as containerd does, against a fake containerd event service, with the
 //! real broker and guest service, on each backend: `userland::<test>`; and, ignored by default,
 //! `vm::<test>`, in QEMU with `vhost-device-vsock` (`VHOST_DEVICE_VSOCK`, else from `PATH`), and
-//! `ch::<test>`, in Cloud Hypervisor (`CLOUD_HYPERVISOR`, else from `PATH`), both with `virtiofsd`
-//! (`VIRTIOFSD`, else as the shim finds it).
+//! `ch::<test>`, in Cloud Hypervisor (`CLOUD_HYPERVISOR`, else from `PATH`), with passt (`PASST`,
+//! else as the shim finds it), both with `virtiofsd` (`VIRTIOFSD`, else as the shim finds it).
 
 #![cfg(target_os = "linux")]
 
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
@@ -200,6 +201,7 @@ on_both_backends! {
     a_guest_service_that_does_not_answer_an_exec_is_taken_for_dead,
     binds_copy_files_and_serve_directories,
     a_container_with_a_small_memory_limit_runs,
+    the_guest_reaches_the_namespace_s_loopback_as_far_as_egress_rules_allow,
     refused_or_unsupported_specs_and_annotations_fail_create;
     privileged: with_mount_privilege_bind_and_overlay_mounts_are_read_then_unmounted;
     as root: as_root_the_broker_joins_or_creates_the_container_s_network_namespace;
@@ -309,6 +311,7 @@ impl Shim {
                 for (variable, shims) in [
                     ("VIRTIOFSD", "LITEBOX_VIRTIOFSD"),
                     ("CLOUD_HYPERVISOR", "LITEBOX_CLOUD_HYPERVISOR"),
+                    ("PASST", "LITEBOX_PASST"),
                 ] {
                     if let Some(value) = std::env::var_os(variable) {
                         daemon.env(shims, value);
@@ -708,12 +711,9 @@ fn a_container_runs_and_reports_its_exit(backend: Backend) {
     std::fs::create_dir(&first).unwrap();
     std::fs::write(first.join("sh"), "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(first.join("sh"), std::fs::Permissions::from_mode(0o641)).unwrap();
-    // Cloud Hypervisor's has no network yet.
-    if backend != Backend::CloudHypervisor {
-        shim.configure(|spec| {
-            spec["annotations"] = serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80-81"});
-        });
-    }
+    shim.configure(|spec| {
+        spec["annotations"] = serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80-81"});
+    });
     let pid = shim.create().unwrap();
     // The init's pid is the broker's, which allows the annotation's egress; or QEMU's, whose
     // payload does.
@@ -728,6 +728,7 @@ fn a_container_runs_and_reports_its_exit(backend: Backend) {
         }
         Backend::CloudHypervisor => {
             assert!(cmdline.contains("cloud-hypervisor"), "{cmdline}");
+            assert!(cmdline.contains("--net\u{0}vhost_user=true"), "{cmdline}");
         }
         Backend::Vm => {
             assert!(cmdline.contains("qemu-system-x86_64"), "{cmdline}");
@@ -1312,18 +1313,35 @@ fn as_root_the_broker_joins_or_creates_the_container_s_network_namespace(backend
         let path = format!("/proc/{pid}/ns/net");
         std::fs::metadata(path).unwrap().ino()
     };
-    // Joined: one held by a child, killed alone before anything can panic.
+    // Joined: one held by a child, killed alone before anything can panic, whose loopback the
+    // guest reaches as 10.0.2.1.
     let mut holder = Command::new("unshare")
-        .args(["--net", "sleep", "60"])
+        .args(["--net", "sh", "-c", "ip link set lo up && exec sleep 60"])
         .spawn()
         .unwrap();
-    wait_until("the child did not unshare", || {
-        namespace(&holder.id()) != namespace(&"self")
-    });
-    let mut shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
     let path = format!("/proc/{}/ns/net", holder.id());
+    wait_until("the child did not unshare", || {
+        std::fs::read_to_string(format!("/proc/{}/comm", holder.id())).unwrap() == "sleep\n"
+    });
+    let held = std::fs::File::open(&path).unwrap();
+    // A socket stays in the namespace it was created in.
+    let server = std::thread::spawn(move || {
+        // SAFETY: `held` is a network namespace's descriptor; this thread alone joins it.
+        assert_eq!(
+            unsafe { libc::setns(held.as_raw_fd(), libc::CLONE_NEWNET) },
+            0
+        );
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap()
+    })
+    .join()
+    .unwrap();
+    let port = server.local_addr().unwrap().port();
+    let server = serve_once(server);
+    let mut shim = Shim::launch(backend, &process(&["guest", "tcp", &port.to_string()]));
     shim.configure(|spec| {
         spec["linux"] = serde_json::json!({"namespaces": [{"type": "network", "path": path}]});
+        spec["annotations"] =
+            serde_json::json!({"io.litebox.egress.tcp": format!("10.0.2.1/32:{port}")});
     });
     let broker = shim.create();
     let joined = broker.as_ref().map(|broker| namespace(broker));
@@ -1331,6 +1349,11 @@ fn as_root_the_broker_joins_or_creates_the_container_s_network_namespace(backend
     holder.kill().unwrap();
     holder.wait().unwrap();
     assert_eq!(joined.unwrap(), held);
+    // The broker and the server keep the namespace.
+    shim.start("").unwrap();
+    assert_eq!(shim.wait(""), 0, "{}", shim.output("c.out"));
+    assert!(shim.output("c.out").ends_with("tcp=[ping-pong]\n"));
+    server.join().unwrap();
     shim.finish(broker.unwrap());
     // New: its loopback up, and the guest runs.
     let mut shim = Shim::launch(backend, &process(&["guest", "family"]));
@@ -1920,6 +1943,161 @@ fn qemu_takes_the_cpu_quota_and_prefers_kvm() {
     shim.finish(qemu);
 }
 
+/// Answers the request of `server`'s first client, until its end, with the request and "-pong".
+fn serve_once(server: std::net::TcpListener) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let (mut client, _) = server.accept().unwrap();
+        client.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let mut request = String::new();
+        client.read_to_string(&mut request).unwrap();
+        client
+            .write_all(format!("{request}-pong").as_bytes())
+            .unwrap();
+    })
+}
+
+/// As 10.0.2.1: a TCP server, a closed port, which refuses the guest, and two UDP servers, which
+/// one guest socket reaches both.
+fn the_guest_reaches_the_namespace_s_loopback_as_far_as_egress_rules_allow(backend: Backend) {
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp = server.local_addr().unwrap().port();
+    // Bound, without listening: refused, and nobody else's.
+    let closed_socket = rustix::net::socket(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::STREAM,
+        None,
+    )
+    .unwrap();
+    rustix::net::bind(
+        &closed_socket,
+        &std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+    )
+    .unwrap();
+    let closed =
+        std::net::SocketAddrV4::try_from(rustix::net::getsockname(&closed_socket).unwrap())
+            .unwrap()
+            .port();
+    // Connected elsewhere: refuses others' datagrams, and nobody else's.
+    let closed_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    closed_udp.connect("127.0.0.1:9").unwrap();
+    let closed_udp_port = closed_udp.local_addr().unwrap().port();
+    // Half-closes as soon as it accepts.
+    let server_first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server_first_port = server_first.local_addr().unwrap().port();
+    let server_first = std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        let (mut stream, _) = server_first.accept().unwrap();
+        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+        stream.write_all(b"hello").unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut received = String::new();
+        stream.read_to_string(&mut received).unwrap();
+        received
+    });
+    // Listening, but not in the rules.
+    let denied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let udp = [(); 3].map(|()| std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let udp_ports = udp
+        .each_ref()
+        .map(|socket| socket.local_addr().unwrap().port());
+    let tcp_server = serve_once(server);
+    // QEMU does not use the third (see below).
+    let used = if backend == Backend::Vm { 2 } else { 3 };
+    for socket in udp.into_iter().take(used) {
+        std::thread::spawn(move || {
+            let mut buffer = [0; 64];
+            let (size, from) = socket.recv_from(&mut buffer).unwrap();
+            let reply = [&buffer[..size], b"-pong"].concat();
+            socket.send_to(&reply, from).unwrap();
+        });
+    }
+    let mut shim = Shim::launch(backend, &process(&["guest", "pause"]));
+    shim.configure(|spec| {
+        spec["annotations"] = serde_json::json!({
+            "io.litebox.egress.tcp": format!(
+                "10.0.2.1/32:{tcp},10.0.2.1/32:{closed},10.0.2.1/32:{server_first_port}"
+            ),
+            "io.litebox.egress.udp": format!(
+                "10.0.2.1/32:{},10.0.2.1/32:{},10.0.2.1/32:{},10.0.2.1/32:{closed_udp_port}",
+                udp_ports[0], udp_ports[1], udp_ports[2]
+            ),
+        });
+    });
+    let pid = shim.create().unwrap();
+    shim.start("").unwrap();
+    let run = |id: &str, args: &[&str]| {
+        shim.exec(id, args, "", false).unwrap();
+        shim.start(id).unwrap();
+        let code = shim.wait(id);
+        let output = shim.output(&format!("{id}.out"));
+        shim.delete(id).unwrap();
+        (code, output)
+    };
+    let (code, output) = run("e1", &["guest", "tcp", &tcp.to_string()]);
+    assert!(
+        code == 0 && output.ends_with("tcp=[ping-pong]\n"),
+        "{code} {output}"
+    );
+    tcp_server.join().unwrap();
+    let (code, output) = run("e2", &["guest", "tcp", &closed.to_string()]);
+    assert!(
+        code == 71 && output.ends_with("connect: Connection refused\n"),
+        "{code} {output}"
+    );
+    drop(closed_socket);
+    let denied_port = denied.local_addr().unwrap().port().to_string();
+    let (code, output) = run("e4", &["guest", "tcp", &denied_port]);
+    assert!(
+        code == 71 && output.ends_with("connect: Permission denied\n"),
+        "{code} {output}"
+    );
+    denied.set_nonblocking(true).unwrap();
+    assert_eq!(
+        denied.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let (code, output) = run(
+        "e5",
+        &["guest", "tcp-server-first", &server_first_port.to_string()],
+    );
+    assert!(
+        code == 0 && output.ends_with("tcp=[hello]\n"),
+        "{code} {output}"
+    );
+    assert_eq!(server_first.join().unwrap(), "ping");
+    let ports = udp_ports.map(|port| port.to_string());
+    let (code, output) = run("e3", &["guest", "udp", &ports[0], &ports[1]]);
+    assert_eq!(code, 0, "{output}");
+    for port in &ports[..2] {
+        assert!(
+            output.contains(&format!("udp=[ping-pong] from {port}\n")),
+            "{output}"
+        );
+    }
+    // QEMU's NAT reports no ICMP errors, and may lose a datagram after one refused (see
+    // `vm/qemu.rs`).
+    if backend != Backend::Vm {
+        let closed_udp_port = closed_udp_port.to_string();
+        let (code, output) = run("e6", &["guest", "udp-connected", &closed_udp_port]);
+        assert!(
+            code == 0 && output.ends_with("recv: Connection refused\n"),
+            "{code} {output}"
+        );
+        let (code, output) = run(
+            "e7",
+            &["guest", "udp-past-refused", &closed_udp_port, &ports[2]],
+        );
+        assert!(
+            code == 0 && output.ends_with("udp=[ping-pong]\n"),
+            "{code} {output}"
+        );
+    }
+    drop(closed_udp);
+    shim.kill("", 9, false).unwrap();
+    assert_eq!(shim.wait(""), 137);
+    shim.finish(pid);
+}
+
 fn refused_or_unsupported_specs_and_annotations_fail_create(backend: Backend) {
     let mut shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
     let config = std::fs::read(shim.bundle.join("config.json")).unwrap();
@@ -1973,13 +2151,8 @@ fn refused_or_unsupported_specs_and_annotations_fail_create(backend: Backend) {
         ),
     ];
     if backend == Backend::CloudHypervisor {
-        // It has no network yet; and a comma separates its options.
+        // A comma separates its options.
         let bind = serde_json::json!({"destination": "/a,b", "type": "bind", "source": data, "options": ["ro"]});
-        cases.push((
-            "annotations",
-            serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80"}),
-            Code::UNIMPLEMENTED,
-        ));
         cases.push(("mounts", serde_json::json!([bind]), Code::UNIMPLEMENTED));
     }
     if backend != Backend::Userland {

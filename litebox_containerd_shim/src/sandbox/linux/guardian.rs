@@ -123,14 +123,16 @@ fn pass_fd(command: &mut Command, fd: OwnedFd, number: RawFd) {
     }
 }
 
-/// The VM's guardian, with the VM's device daemons, each `connect SOCKET PROGRAM ARGS...` or
-/// `listen SOCKET PROGRAM ARGS...`, and then the VMM's command, separated by `--` (see
-/// `vm::guardian_arguments`):
+/// The VM's guardian, with the VM's device daemons, each `connect SOCKET PROGRAM ARGS...`,
+/// `listen SOCKET PROGRAM ARGS...` or `run PROGRAM ARGS...`, and then the VMM's command, separated
+/// by `--` (see `vm::guardian_arguments`):
 ///
 /// - `connect`: a daemon that listens on `SOCKET`, to which the guardian connects once it does, for
 ///   the VMM to take as [`DEVICE_FD`]; one at most.
 /// - `listen`: a daemon that takes `SOCKET`, which the guardian binds, as [`LISTENER_FD`], so that
 ///   the VMM may connect to it at once.
+/// - `run`: a daemon that listens on a socket of its own, to which the VMM connects, retrying until
+///   it does.
 pub(super) fn guard_vm(args: &[OsString]) -> io::Result<i32> {
     let private = || io::Error::other("this mode is private to the shim");
     let mut commands: Vec<&[OsString]> = args.split(|arg| arg == "--").collect();
@@ -140,7 +142,16 @@ pub(super) fn guard_vm(args: &[OsString]) -> io::Result<i32> {
     let lifeline = lifeline()?;
     let (mut daemons, mut connection) = (Vec::new(), None);
     for daemon in commands {
-        let [mode, socket, program, daemon_args @ ..] = daemon else {
+        let (mode, daemon) = daemon.split_first().ok_or_else(private)?;
+        if mode == "run" {
+            let [program, daemon_args @ ..] = daemon else {
+                return Err(private());
+            };
+            let spawned = spawn(Command::new(program).args(daemon_args))?;
+            daemons.push(Helper::new(spawned, program));
+            continue;
+        }
+        let [socket, program, daemon_args @ ..] = daemon else {
             return Err(private());
         };
         let mut command = Command::new(program);
@@ -150,11 +161,11 @@ pub(super) fn guard_vm(args: &[OsString]) -> io::Result<i32> {
                 let listener = UnixListener::bind(socket)?;
                 let listener = rustix::io::fcntl_dupfd_cloexec(listener, LISTENER_FD + 1)?;
                 pass_fd(&mut command, listener, LISTENER_FD);
-                daemons.push(spawn(&mut command)?.1);
+                daemons.push(Helper::new(spawn(&mut command)?, program));
             }
             Some("connect") if connection.is_none() => {
-                let (_, daemon) = spawn(&mut command)?;
-                let connected = connect_daemon(Path::new(socket), &lifeline, &daemon)?;
+                let daemon = Helper::new(spawn(&mut command)?, program);
+                let connected = connect_daemon(Path::new(socket), &lifeline, &daemon.pidfd)?;
                 connection = Some(rustix::io::fcntl_dupfd_cloexec(connected, DEVICE_FD + 1)?);
                 daemons.push(daemon);
             }
@@ -203,18 +214,36 @@ fn connect_daemon(
     }
 }
 
+/// A child that `main` needs (see [`guard`]).
+struct Helper {
+    pidfd: OwnedFd,
+    pid: u32,
+    program: OsString,
+}
+
+impl Helper {
+    fn new((child, pidfd): (Child, OwnedFd), program: &OsString) -> Self {
+        Self {
+            pidfd,
+            pid: child.id(),
+            program: program.clone(),
+        }
+    }
+}
+
 /// Reports the pid of `main`, the broker's, on the `lifeline`, and waits for the lifeline's end,
-/// or `main`'s, or the end of a child of the pidfds `helpers`. Then kills and reaps every child,
-/// and returns `main`'s status.
+/// or `main`'s, or a helper's, which it reports last on stderr, as the shim reports the broker's
+/// last words. Then kills and reaps every child, and returns `main`'s status.
 fn guard(
     lifeline: &UnixStream,
     (main, main_pidfd): (Child, OwnedFd),
-    helpers: &[OwnedFd],
+    helpers: &[Helper],
 ) -> io::Result<i32> {
     // The children's stdout is their own from here on, so that the daemon sees it end with them.
     let null = std::fs::File::open("/dev/null")?;
     // SAFETY: replacing descriptor 1 invalidates no owned descriptor.
     unsafe { libc::dup2(null.as_raw_fd(), 1) };
+    let mut ended = None;
     if (&*lifeline).write_all(&main.id().to_le_bytes()).is_ok() {
         // The daemon never writes: the lifeline is readable once it ends.
         let mut fds = vec![
@@ -224,9 +253,13 @@ fn guard(
         fds.extend(
             helpers
                 .iter()
-                .map(|helper| PollFd::new(helper, PollFlags::IN)),
+                .map(|helper| PollFd::new(&helper.pidfd, PollFlags::IN)),
         );
         while rustix::event::poll(&mut fds, None) == Err(rustix::io::Errno::INTR) {}
+        if fds[..2].iter().all(|fd| fd.revents().is_empty()) {
+            ended = (helpers.iter().zip(&fds[2..]))
+                .find_map(|(helper, fd)| (!fd.revents().is_empty()).then_some(helper));
+        }
     }
     let pid = Pid::from_child(&main);
     let _ = rustix::process::kill_process(pid, Signal::KILL);
@@ -255,6 +288,16 @@ fn guard(
                 } else {
                     128 + libc::WTERMSIG(status)
                 };
+            }
+            reaped if ended.is_some_and(|helper| u32::try_from(reaped) == Ok(helper.pid)) => {
+                let helper = ended.expect("matched");
+                let how = if libc::WIFEXITED(status) {
+                    format!("exit status {}", libc::WEXITSTATUS(status))
+                } else {
+                    format!("signal {}", libc::WTERMSIG(status))
+                };
+                let program = Path::new(&helper.program).display();
+                eprintln!("litebox guardian: {program} ended ({how})");
             }
             reaped if reaped > 0 => {}
             _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}

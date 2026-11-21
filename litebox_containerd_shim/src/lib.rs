@@ -22,8 +22,8 @@
 //!
 //! The VM backends run LiteBox's VM kernel in QEMU or Cloud Hypervisor (see `sandbox::linux::vm`)
 //! as `LITEBOX_USER`, with the group of `/dev/kvm` if present, regardless of `LITEBOX_ROOT_BROKER`.
-//! In QEMU, the guest reaches QEMU's user network, which NATs it, as far as the egress annotations
-//! allow; Cloud Hypervisor's has no network yet, and refuses them. Both refuse the publish
+//! The guest reaches the container's network namespace, as far as the egress annotations allow,
+//! through a NAT: QEMU's user network, or passt in Cloud Hypervisor. Both refuse the publish
 //! annotations, and serve no guest listener.
 //!
 //! # Windows x86-64

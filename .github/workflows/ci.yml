@@ -152,6 +152,8 @@ jobs:
       VHOST_DEVICE_VSOCK_VERSION: 0.3.0
       CLOUD_HYPERVISOR_VERSION: v54.1
       CLOUD_HYPERVISOR_SHA256: f9ffb9646783233d1f0fb09e77db1fca66499d1041e63bc011b90683c0d49933
+      PASST_VERSION: 2026_10_02.cba3570
+      PASST_COMMIT: cba357068dc586e7540971eb40bb56c5e62c4de1
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -201,6 +203,15 @@ jobs:
           echo "$CLOUD_HYPERVISOR_SHA256  $HOME/cloud-hypervisor/cloud-hypervisor" | sha256sum -c -
           chmod +x ~/cloud-hypervisor/cloud-hypervisor
           echo "$HOME/cloud-hypervisor" >> "$GITHUB_PATH"
+      - name: Install passt
+        # Cloud Hypervisor's network device.
+        run: |
+          git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$PASST_VERSION" \
+            https://passt.top/passt ~/passt
+          test "$(git -C ~/passt rev-parse HEAD)" = "$PASST_COMMIT"
+          # passt runs passt.avx2 where it can.
+          make -C ~/passt passt passt.avx2
+          echo "$HOME/passt" >> "$GITHUB_PATH"
       - name: Run OP-TEE TAs in a QEMU VM (KVM)
         # Also builds the runner.
         run: |

@@ -160,8 +160,10 @@ pub struct Bind {
 /// `--allow-tcp-destination` and `--allow-udp-destination` (or the VM payload's `policy`). An
 /// allowed range reaches what the broker's network namespace ([`Network`]) reaches: the guests'
 /// gateway, 10.0.2.1, is that namespace's loopback: a pod's, shared by its containers, or in the
-/// daemon's namespace ([`Network::Daemon`]), the host's. The VM's network, QEMU's, takes
-/// 10.0.2.0/24: of it, only the gateway and QEMU's DNS forwarder, 10.0.2.3, are reachable.
+/// daemon's namespace ([`Network::Daemon`]), the host's. The VMs' network takes 10.0.2.0/24: in
+/// QEMU, only the gateway and the DNS forwarder, 10.0.2.3, are reachable of it; in Cloud Hypervisor,
+/// passt sends the rest to the namespace's network, as any other address, but drops UDP to port 67
+/// (DHCP's), whatever the destination.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Egress {
     pub tcp: Vec<Destination>,
