@@ -11,6 +11,11 @@ on:
   pull_request:
   merge_group:
   workflow_dispatch:
+    inputs:
+      windows_node_stress:
+        description: Only stress test_node_with_rewriter on Windows (alone and alongside Python)
+        type: boolean
+        default: false
 
 # If a new commit is pushed to the branch before ongoing runs finish, cancel the ongoing runs
 concurrency:
@@ -24,6 +29,7 @@ env:
 jobs:
   build_and_test:
     name: Build and Test
+    if: ${{ !inputs.windows_node_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -146,6 +152,7 @@ jobs:
 
   test_vmm:
     name: Build and Test on VMMs (KVM)
+    if: ${{ !inputs.windows_node_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -263,6 +270,7 @@ jobs:
 
   build_and_test_riscv64:
     name: Build and Test (RV64 Linux, QEMU user mode)
+    if: ${{ !inputs.windows_node_stress }}
     runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: -Dwarnings
@@ -292,6 +300,7 @@ jobs:
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
+    if: ${{ !inputs.windows_node_stress }}
     runs-on: ubuntu-24.04-arm
     env:
       RUSTFLAGS: -Dwarnings
@@ -419,6 +428,7 @@ jobs:
 
   build_and_test_macos_arm64:
     name: Build and Test (macOS AArch64)
+    if: ${{ !inputs.windows_node_stress }}
     runs-on: macos-26
     env:
       RUSTFLAGS: -Dwarnings
@@ -469,6 +479,7 @@ jobs:
 
   build_and_test_lvbs:
     name: Build and Test LVBS
+    if: ${{ !inputs.windows_node_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -532,8 +543,12 @@ jobs:
           key: ${{ steps.custom-out-cache.outputs.cache-primary-key }}
 
   build_and_test_windows:
-    name: Build and Test Windows
+    name: ${{ inputs.windows_node_stress && format('Windows Node stress ({0})', matrix.mode) || 'Build and Test Windows' }}
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ${{ fromJSON(inputs.windows_node_stress && '["alone","with-python"]' || '["ci"]') }}
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
@@ -579,8 +594,9 @@ jobs:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.event_name != 'merge_group' }}
+          save-if: ${{ github.event_name != 'merge_group' && !inputs.windows_node_stress }}
       - run: cargo clippy --locked --verbose --all-targets --all-features ($env:WINDOWS_CRATES -split ' ')
+        if: ${{ !inputs.windows_node_stress }}
       - run: cargo build --locked --verbose ($env:WINDOWS_CRATES -split ' ')
       - name: Identify Windows OCI test fixtures
         id: fixture-key
@@ -603,6 +619,7 @@ jobs:
           key: ${{ steps.fixture-key.outputs.key }}
           restore-keys: ${{ steps.fixture-key.outputs.prefix }}
       - name: Set up WSL for the Windows loader tests
+        if: ${{ !inputs.windows_node_stress }}
         timeout-minutes: 10
         uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
         with:
@@ -610,13 +627,22 @@ jobs:
           use-cache: 'true'
           set-as-default: 'true'
           additional-packages: gcc libc6-dev
+      - name: Stress test_node_with_rewriter
+        if: inputs.windows_node_stress
+        timeout-minutes: 45
+        env:
+          RUST_BACKTRACE: '1'
+        run: .\.github\tools\windows_node_stress.ps1 ${{ matrix.mode }}
       - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
+        if: ${{ !inputs.windows_node_stress }}
       - run: |
           cargo test --locked --verbose --doc ($env:WINDOWS_CRATES -split ' ')
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
+        if: ${{ !inputs.windows_node_stress }}
       - name: Build documentation (fail on warnings)
+        if: ${{ !inputs.windows_node_stress }}
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items ($env:WINDOWS_CRATES -split ' ')
       # Save before rust-cache's post step, and avoid large PR-scoped caches.
       - name: Save Windows OCI test fixtures
@@ -638,6 +664,7 @@ jobs:
 
   build_and_test_snp:
     name: Build and Test SNP
+    if: ${{ !inputs.windows_node_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -663,6 +690,7 @@ jobs:
 
   confirm_no_std:
     name: Confirm no_std
+    if: ${{ !inputs.windows_node_stress }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
