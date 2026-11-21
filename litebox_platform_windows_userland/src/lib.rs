@@ -212,33 +212,21 @@ unsafe extern "system" fn vectored_exception_handler_inner(
     {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    let Some(tls) = get_tls_ptr() else {
-        // TLS slot not initialized yet; cannot be in guest
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
-    let tls = unsafe { &*tls };
-    let (info, exception_record, context);
-    unsafe {
-        info = *exception_info;
-        exception_record = &*info.ExceptionRecord;
-        context = &mut *info.ContextRecord;
-    }
-
-    if !tls.is_in_guest.get() {
-        // This might be a faulting guest memory access in LiteBox code. Try to
-        // recover.
+    // SAFETY: Windows supplies a writable context for this exception.
+    let context = unsafe { &mut *(*exception_info).ContextRecord };
+    // SAFETY: An installed TLS pointer is valid until this thread uninstalls it.
+    let tls = get_tls_ptr().map(|ptr| unsafe { &*ptr });
+    let Some(tls) = tls.filter(|tls| tls.is_in_guest.get()) else {
+        // Task teardown can still access guest memory after managed TLS is uninstalled.
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
             && let Some(recover) =
                 litebox::mm::exception_table::search_exception_tables(context.Rip.trunc())
         {
-            // Found a matching exception table entry.
             context.Rip = recover as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
-        } else {
-            // Not one of our exceptions; let other handlers process it.
-            return EXCEPTION_CONTINUE_SEARCH;
         }
-    }
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
     tls.is_in_guest.set(false);
 
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
@@ -2188,6 +2176,18 @@ mod tests {
 
     use crate::{PAGE_SIZE, XsaveArea, XsaveLayout};
     use litebox_platform::sync::RawMutex;
+
+    #[test]
+    fn fallible_copy_recovers_without_managed_tls() {
+        let _platform = crate::WindowsUserland::<PAGE_SIZE>::new();
+        assert!(crate::get_tls_ptr().is_none());
+        let mut byte = 0u8;
+        // SAFETY: `byte` is writable and the null page cannot contain Rust memory.
+        let result = unsafe {
+            litebox::mm::exception_table::memcpy_fallible(&raw mut byte, core::ptr::null(), 1)
+        };
+        assert_eq!(result, Err(litebox_platform::buffer::Fault));
+    }
 
     #[test]
     fn interrupt_capture_preserves_xstate_on_reuse() {
