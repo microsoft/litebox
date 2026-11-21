@@ -1642,6 +1642,19 @@ fn wake_robust_list<Platform: ShimPlatform>(
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
+        self.prepare_for_exit_with(|head| {
+            let _ = wake_robust_list::<Platform>(head);
+        });
+    }
+
+    fn prepare_for_exit_with(
+        &mut self,
+        walk_robust_list: impl FnOnce(UserPtr<litebox_common_linux::RobustListHead>),
+    ) {
+        // A joiner may reclaim the robust list as soon as it sees the zero TID.
+        if let Some(robust_list) = self.thread.robust_list.take() {
+            walk_robust_list(robust_list);
+        }
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
@@ -1654,9 +1667,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 flags: litebox_common_linux::FutexFlags::empty(),
                 count: 1,
             });
-        }
-        if let Some(robust_list) = self.thread.robust_list.take() {
-            let _ = wake_robust_list::<Platform>(robust_list);
         }
     }
 
@@ -2797,8 +2807,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `set_robust_list`.
     pub(crate) fn sys_set_robust_list(&self, head: usize) {
-        let head = UserPtr::from_usize(head);
-        self.thread.robust_list.set(Some(head));
+        self.thread
+            .robust_list
+            .set((head != 0).then(|| UserPtr::from_usize(head)));
     }
 
     /// Handle syscall `get_robust_list`.
@@ -4328,6 +4339,38 @@ mod tests {
         BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, ThreadRequest,
     };
     use litebox_broker_transport::channel::LocalCallChannel;
+
+    #[test]
+    fn robust_list_is_processed_before_clearing_tid() {
+        use crate::syscalls::tests::{TestPlatform, init_platform};
+        use core::cell::Cell;
+        use litebox_common_linux::{RobustList, RobustListHead};
+
+        let mut task = init_platform();
+        let tid = Cell::new(task.tid());
+        let mut head = RobustListHead {
+            list: RobustList { next: 0 },
+            futex_offset: 0,
+            list_op_pending: 0,
+        };
+        head.list.next = (&raw const head.list).expose_provenance();
+        let address = (&raw const head).expose_provenance();
+        task.sys_set_robust_list(address);
+        task.sys_set_tid_address(UserPtrMut::from_ptr(tid.as_ptr()));
+        let mut walked = false;
+        task.prepare_for_exit_with(|registered| {
+            assert_ne!(tid.get(), 0, "a joiner could already reclaim the head");
+            assert_eq!(registered.as_usize(), address);
+            super::wake_robust_list::<TestPlatform>(registered).unwrap();
+            walked = true;
+        });
+        assert!(walked);
+        assert_eq!(tid.get(), 0);
+
+        task.sys_set_robust_list(address);
+        task.sys_set_robust_list(0);
+        task.prepare_for_exit_with(|_| panic!("walked a deregistered robust list"));
+    }
 
     struct ForkRecordingChannel {
         inner: InProcessBrokerChannel,

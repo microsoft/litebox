@@ -2180,13 +2180,17 @@ mod tests {
     #[test]
     fn fallible_copy_recovers_without_managed_tls() {
         let _platform = crate::WindowsUserland::<PAGE_SIZE>::new();
-        assert!(crate::get_tls_ptr().is_none());
-        let mut byte = 0u8;
-        // SAFETY: `byte` is writable and the null page cannot contain Rust memory.
-        let result = unsafe {
-            litebox::mm::exception_table::memcpy_fallible(&raw mut byte, core::ptr::null(), 1)
-        };
-        assert_eq!(result, Err(litebox_platform::buffer::Fault));
+        std::thread::spawn(|| {
+            assert!(crate::get_tls_ptr().is_none());
+            let mut byte = 0u8;
+            // SAFETY: `byte` is writable and the null page cannot contain Rust memory.
+            let result = unsafe {
+                litebox::mm::exception_table::memcpy_fallible(&raw mut byte, core::ptr::null(), 1)
+            };
+            assert_eq!(result, Err(litebox_platform::buffer::Fault));
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
