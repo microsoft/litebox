@@ -3,12 +3,12 @@
 
 //! The parts of an OCI spec that the shim applies, and the few it refuses (see [`plan`]). The
 //! network namespace is the broker's; other kernel isolation settings (other namespaces, cgroups
-//! but the VM's [`Resources`], seccomp, AppArmor, SELinux, capabilities, rlimits, the umask) are
+//! except VM resource limits, seccomp, AppArmor, SELinux, capabilities, rlimits, the umask) are
 //! ignored, and so, until LiteBox supports them, are the user and a read-only root.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use litebox_guest_service_protocol::guest_service::Process;
@@ -54,8 +54,20 @@ pub struct Plan {
     pub network: Network,
     /// The spec's `net.*` sysctls, as paths under `/proc/sys`, for a network namespace of the
     /// container's own.
+    #[cfg_attr(
+        all(windows, not(test)),
+        expect(
+            dead_code,
+            reason = "Windows refuses a network namespace of the container's own"
+        )
+    )]
     pub sysctl: Vec<(String, String)>,
+    #[cfg(target_os = "linux")]
     pub resources: Resources,
+    /// The Windows root that runs the broker: layer folders, the parents topmost first, then the
+    /// scratch. containerd's root mounts replace the spec's `windows.layerFolders`.
+    #[cfg(windows)]
+    pub layers: Vec<PathBuf>,
 }
 
 /// The broker's network namespace, where it opens the guests' host sockets.
@@ -101,6 +113,7 @@ pub struct Ingress {
 
 /// The spec's limits that the VM backend applies, as its memory and CPUs; the userland broker has
 /// no cgroups.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Resources {
     /// `linux.resources.memory.limit`, in bytes, if positive.
@@ -294,10 +307,11 @@ fn published(annotations: &HashMap<String, String>) -> Result<Vec<Publish>> {
     Ok(published)
 }
 
-/// The resources of `spec` (see [`Resources`]).
 /// Linux's CFS period, in microseconds, where a spec's quota has none.
+#[cfg(target_os = "linux")]
 const DEFAULT_CPU_PERIOD: u64 = 100_000;
 
+#[cfg(target_os = "linux")]
 fn resources(spec: &Spec) -> Resources {
     let Some(resources) = spec
         .linux()
@@ -350,10 +364,8 @@ pub fn process(process: &oci_spec::runtime::Process, terminal: bool) -> Result<(
     Ok((guest, process.user().uid()))
 }
 
-/// Checks `spec`. Refused: `createContainer` and `startContainer` hooks, which runc runs in the
-/// container's namespaces, and Kata Containers not at all; and malformed or unknown `io.litebox.*`
-/// annotations. Not supported yet: mounts of other types. A network namespace without a path, or
-/// with an empty one, is a new one, as runc takes it.
+/// `createContainer` and `startContainer` are refused because they require hooks to run inside
+/// the container. An empty network namespace path requests a new namespace, as in runc.
 pub fn plan(spec: &Spec) -> Result<Plan> {
     let process = spec
         .process()
@@ -372,6 +384,8 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
             "createContainer and startContainer hooks are not supported",
         ));
     }
+    #[cfg(windows)]
+    crate::hooks::check(spec)?;
     let namespaces = spec
         .linux()
         .as_ref()
@@ -389,9 +403,11 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
         let destination = normalize(mount.destination())?;
         let typ = mount.typ().as_deref().unwrap_or_default();
         let options = mount.options().as_deref().unwrap_or_default();
-        let served = SERVED_PATHS
-            .iter()
-            .any(|served| Path::new(&destination).starts_with(served));
+        let served = SERVED_PATHS.iter().any(|served| {
+            destination
+                .strip_prefix(served)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        });
         if served || IGNORED_MOUNTS.contains(&typ) {
             continue;
         }
@@ -440,8 +456,39 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
         publish: published(annotations)?,
         network,
         sysctl,
+        #[cfg(target_os = "linux")]
         resources: resources(spec),
+        #[cfg(windows)]
+        layers: layer_folders(spec)?,
     })
+}
+
+#[cfg(windows)]
+fn layer_folders(spec: &Spec) -> Result<Vec<PathBuf>> {
+    let Some(windows) = spec.windows() else {
+        return Ok(Vec::new());
+    };
+    // Even an empty one asks for Hyper-V isolation.
+    if windows.hyperv().is_some() {
+        return Err(unsupported("Hyper-V isolation is not supported"));
+    }
+    // containerd's default spec has one with DNS settings only.
+    if let Some(network) = windows.network() {
+        let named = |name: &Option<String>| name.as_ref().is_some_and(|name| !name.is_empty());
+        if named(network.network_namespace())
+            || named(network.network_shared_container_name())
+            || network
+                .endpoint_list()
+                .as_ref()
+                .is_some_and(|list| !list.is_empty())
+        {
+            return Err(unsupported(
+                "attaching the container to a network is not supported on Windows yet",
+            ));
+        }
+    }
+    let folders = windows.layer_folders().iter().flatten();
+    Ok(folders.map(PathBuf::from).collect())
 }
 
 /// The spec's `net.*` sysctls as paths under `/proc/sys`, in order, which runc sets in a network
@@ -481,7 +528,7 @@ fn sysctl(spec: &Spec, network: &Network) -> Result<Vec<(String, String)>> {
     Ok(paths)
 }
 
-/// `path` as an absolute guest path without `.`; never `/`.
+/// Use Linux separators even on Windows, where `Path` treats `\` and `//` differently.
 fn normalize(path: &Path) -> Result<String> {
     let refuse = || {
         invalid(format!(
@@ -489,19 +536,19 @@ fn normalize(path: &Path) -> Result<String> {
             path.display()
         ))
     };
-    // Not `is_absolute`, which on Windows also wants a drive.
-    if !path.has_root() {
-        return Err(refuse());
-    }
+    let text = path
+        .to_str()
+        .filter(|text| text.starts_with('/'))
+        .ok_or_else(refuse)?;
     let mut normalized = String::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::Normal(name) => {
+    for name in text.split('/') {
+        match name {
+            "" | "." => {}
+            ".." => return Err(refuse()),
+            name => {
                 normalized.push('/');
-                normalized.push_str(name.to_str().ok_or_else(refuse)?);
+                normalized.push_str(name);
             }
-            Component::ParentDir | Component::Prefix(_) => return Err(refuse()),
         }
     }
     if normalized.is_empty() {
@@ -539,6 +586,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn resources_are_the_memory_limit_and_the_cpus() {
         let resources = |value: serde_json::Value| {
@@ -572,6 +620,7 @@ mod tests {
 
     #[test]
     fn mounts_are_binds_or_ignored() {
+        let source = if cfg!(windows) { r"C:\x" } else { "/x" };
         let spec = |mounts: serde_json::Value| -> Spec {
             serde_json::from_value(serde_json::json!({
                 "ociVersion": "1.2.0",
@@ -584,12 +633,12 @@ mod tests {
         let plan = plan(&spec(serde_json::json!([
             {"destination": "/proc", "type": "proc"},
             {"destination": "/run", "type": "tmpfs"},
-            {"destination": "/dev/x", "type": "bind", "source": "/x"},
-            {"destination": "/data/./x/", "type": "none", "source": "/x", "options": ["rbind", "ro"]},
+            {"destination": "/dev/x", "type": "bind", "source": source},
+            {"destination": "/data/./x/", "type": "none", "source": source, "options": ["rbind", "ro"]},
         ])))
         .unwrap();
         let bind = Bind {
-            source: "/x".into(),
+            source: source.into(),
             destination: "/data/x".to_owned(),
             read_only: true,
         };
@@ -601,15 +650,15 @@ mod tests {
             (serde_json::json!(["ro", "rw"]), false),
         ] {
             let mounts = serde_json::json!([
-                {"destination": "/d", "type": "bind", "source": "/x", "options": options},
+                {"destination": "/d", "type": "bind", "source": source, "options": options},
             ]);
             let binds = super::plan(&spec(mounts)).unwrap().binds;
             assert_eq!(binds[0].read_only, read_only, "{options}");
         }
         for bad in [
-            serde_json::json!([{"destination": "/a/../b", "type": "bind", "source": "/x"}]),
+            serde_json::json!([{"destination": "/a/../b", "type": "bind", "source": source}]),
             serde_json::json!([{"destination": "/a", "type": "bind", "source": "x"}]),
-            serde_json::json!([{"destination": "/a", "type": "overlay", "source": "/x"}]),
+            serde_json::json!([{"destination": "/a", "type": "overlay", "source": source}]),
         ] {
             assert!(super::plan(&spec(bad.clone())).is_err(), "{bad}");
         }
@@ -645,6 +694,41 @@ mod tests {
         assert_eq!(joined.sysctl, paths);
         for bad in ["net.ipv4..x", "net/ipv4/../x", "net.ipv4.x y"] {
             assert!(plan(&spec(json!({"type": "network"}), json!({bad: "1"}))).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hyper_v_and_network_attachments_are_not_supported() {
+        let plan = |windows: serde_json::Value| {
+            super::plan(
+                &serde_json::from_value(json!({
+                    "ociVersion": "1.2.0",
+                    "root": {"path": "rootfs"},
+                    "process": {"args": ["sh"], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+                    "windows": windows,
+                }))
+                .unwrap(),
+            )
+        };
+        let unattached =
+            json!({"allowUnqualifiedDNSQuery": true, "endpointList": [], "networkNamespace": ""});
+        let accepted =
+            plan(json!({"layerFolders": [r"C:\base", r"C:\scratch"], "network": unattached}));
+        let folders = [r"C:\base", r"C:\scratch"].map(PathBuf::from);
+        assert_eq!(accepted.unwrap().layers, folders);
+        let code = |refused: serde_json::Value| match plan(refused) {
+            Err(crate::ttrpc::Error::RpcStatus(status)) => status.code(),
+            other => panic!("not refused: {:?}", other.map(|plan| plan.layers)),
+        };
+        for refused in [
+            json!({"hyperv": {}}),
+            json!({"network": {"networkNamespace": "c3a5d1e2-0000-0000-0000-000000000000"}}),
+            json!({"network": {"networkSharedContainerName": "pause"}}),
+            json!({"network": {"endpointList": ["c3a5d1e2-0000-0000-0000-000000000000"]}}),
+        ] {
+            let code = code(refused.clone());
+            assert_eq!(code, crate::ttrpc::Code::UNIMPLEMENTED, "{refused}");
         }
     }
 }

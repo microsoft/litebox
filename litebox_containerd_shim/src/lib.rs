@@ -4,39 +4,45 @@
 //! The containerd runtime v2 shims of LiteBox, one per [`Backend`]: `containerd-shim-litebox-v1`
 //! (`io.containerd.litebox.v1`) and `containerd-shim-litebox-vm-v1` (`io.containerd.litebox-vm.v1`).
 //!
-//! Each container has a shim daemon, which mounts containerd's root file system for as long as it
-//! builds the container's root archive from it, runs `litebox-broker-userland` with the LiteBox
-//! guest service as its root process, and drives the guest service through the broker's hybrid
-//! vsock bridge. The broker runs each guest process in LiteBox's own runner; on Linux, the same
-//! executable is the broker's guardian and the root file system's mounter.
+//! # Linux
 //!
-//! A daemon that is root runs the guardian, the broker and its runners as `LITEBOX_USER`, a numeric
-//! `uid[:gid]` other than 0, without supplementary groups: by default where its root may be the
-//! host's (rootful containerd), as 2100000000:2100000000 (no account needed) if unset; elsewhere
-//! (rootless containerd), only if it is set. That user must be able to read and execute the shim,
-//! the broker and the runner, and to traverse the parents of read-only directory bind sources, else
-//! the broker cannot start (see the shim's log); the guest reads only what that user can. With
-//! `LITEBOX_ROOT_BROKER=1` (`0` by default), the guardian and the broker stay the daemon's user,
-//! and only the runners run as `LITEBOX_USER`: binds are then read as the daemon's user. The state
-//! root must then be at most 40 bytes long.
+//! With a root daemon, the guardian, broker and runners run without supplementary groups as
+//! `LITEBOX_USER` (a non-root numeric `uid[:gid]`). Rootful containerd defaults to
+//! `2100000000:2100000000` without a user account; rootless containerd has no default.
+//! This user needs read/execute access to the binaries and traversal access to read-only bind
+//! sources' parents. `LITEBOX_ROOT_BROKER=1` drops privileges only for runners: binds use the
+//! daemon's identity, and the state root must be at most 40 bytes long.
 //!
-//! The broker runs in the container's network namespace, or the daemon's if the spec has none.
-//! There it serves the ports that the annotations `io.litebox.publish.tcp` and `.udp` name and, in
-//! a namespace of the container's own, every guest TCP listener and fixed-port UDP socket at
-//! 0.0.0.0 and its own port, which cannot be turned off. A port it cannot bind, such as a low one
-//! unless the spec lowers `net.ipv4.ip_unprivileged_port_start` (as Docker, nerdctl and CRI's
-//! `enable_unprivileged_ports` do), fails the create if an annotation names it, and otherwise stays
-//! unpublished, as the shim's log says. Published ports admit only clients from the networks that
-//! the annotations `io.litebox.ingress.tcp` and `.udp` name, as comma-separated CIDRs (`0.0.0.0/0`
-//! for any), local ones as 10.0.2.1; others are reset (TCP) or dropped (UDP). The spec's `net.*`
-//! sysctls are set as the broker starts, before the hooks.
+//! Without an OCI network namespace, the broker inherits the daemon's. In a private namespace,
+//! guest TCP listeners and fixed-port UDP sockets automatically publish on `0.0.0.0` at their
+//! guest ports. Bind failures (including privileged ports) fail Create only for explicit
+//! `io.litebox.publish.tcp` and `.udp` ports. Limit ingress with `io.litebox.ingress.tcp` and `.udp`
+//! (comma-separated CIDRs); local peers appear as `10.0.2.1`. Network sysctls precede hooks.
 //!
-//! The VM backend runs LiteBox's VM kernel in QEMU in place of the broker (see
-//! `sandbox::linux::vm`), as `LITEBOX_USER` with `/dev/kvm`'s group, whatever
-//! `LITEBOX_ROOT_BROKER`. Its guest reaches QEMU's user network, which NATs it, as far as the
-//! egress annotations allow; it refuses the publish annotations, and serves no guest listener.
+//! The VM backend runs LiteBox's VM kernel in QEMU as `LITEBOX_USER`, with the group of `/dev/kvm`
+//! if present, regardless of `LITEBOX_ROOT_BROKER`. Its guest reaches QEMU's user network, which
+//! NATs it, as far as the egress annotations allow; it refuses the publish annotations, and serves
+//! no guest listener.
+//!
+//! # Windows x86-64
+//!
+//! As runhcs does, the shim creates a process-isolated container (a server silo on the host's
+//! kernel) through the Host Compute Service, so that LiteBox fits the Windows container ecosystem;
+//! it needs administrator rights and the Containers feature. The container's `C:` is a Windows
+//! image's layers whose version the host runs process-isolated, such as
+//! `mcr.microsoft.com/windows/nanoserver:ltsc2025`: run it with containerd's `windows`
+//! snapshotter, or give the spec's `windows.layerFolders`. The guest's root is a Linux rootfs tar
+//! from `litebox_packager --oci-image` at `root.path`.
+//!
+//! The shim copies the broker and the runner, with any `vcruntime140.dll` next to them (Nano
+//! Server lacks it), into the container, but nothing else from their directories; they run there
+//! as `ContainerUser`. LiteBox does not sandbox guests on Windows yet. The container has no
+//! network: OCI network namespaces, `windows.network` attachments, and the publish, egress and
+//! ingress annotations are not supported yet. Nor are `binary://` logging programs. A hook gets
+//! its `path` as `args[0]`, so one whose `args[0]` is not that path, its file name or stem is
+//! refused.
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 
 mod hooks;
 mod rootfs;
@@ -46,7 +52,8 @@ mod spec;
 mod stdio;
 
 use std::ffi::OsString;
-use std::process::{Child, ExitStatus};
+use std::io::Write as _;
+use std::process::{Child, Command, ExitStatus};
 use std::time::Duration;
 
 use containerd_shim::protos::protobuf::{Message as _, MessageField};
@@ -60,6 +67,7 @@ pub enum Backend {
     /// `litebox-broker-userland`, which runs each guest process in a host process.
     Userland,
     /// LiteBox's VM kernel in QEMU, which runs each guest process in a process of its own.
+    #[cfg(target_os = "linux")]
     Vm,
 }
 
@@ -69,15 +77,20 @@ impl Backend {
     pub fn runtime(self) -> &'static str {
         match self {
             Self::Userland => "io.containerd.litebox.v1",
+            #[cfg(target_os = "linux")]
             Self::Vm => "io.containerd.litebox-vm.v1",
         }
     }
 
     /// The backend whose [`Self::runtime`] is `runtime`.
     pub(crate) fn from_runtime(runtime: &str) -> Option<Self> {
-        [Self::Userland, Self::Vm]
-            .into_iter()
-            .find(|backend| backend.runtime() == runtime)
+        [
+            Self::Userland,
+            #[cfg(target_os = "linux")]
+            Self::Vm,
+        ]
+        .into_iter()
+        .find(|backend| backend.runtime() == runtime)
     }
 }
 
@@ -108,7 +121,25 @@ fn internal(message: impl ToString) -> ttrpc::Error {
     error(Code::INTERNAL, message)
 }
 
+#[cfg(windows)]
+fn exits_within(child: &Child, timeout: Duration) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+
+    // `INFINITE` never times out.
+    let millis = timeout.as_nanos().div_ceil(1_000_000);
+    let millis = u32::try_from(millis).unwrap_or(INFINITE).min(INFINITE - 1);
+    // SAFETY: `child` owns its process handle, open for the call.
+    match unsafe { WaitForSingleObject(child.as_raw_handle(), millis) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
 /// Waits up to `timeout` for `child`, not reaped yet, to exit; returns whether it did.
+#[cfg(target_os = "linux")]
 fn exits_within(child: &Child, timeout: Duration) -> std::io::Result<bool> {
     // Not reaped yet, so its pid still names it.
     let pid = rustix::process::Pid::from_child(child);
@@ -143,10 +174,39 @@ fn wait_or_kill(
     child.wait().map(Some)
 }
 
+/// Spawns `command`, whose child may outlive this process. containerd waits for its actions'
+/// stdio to close, and a Windows child inherits every inheritable handle, stdio included.
+fn spawn_detached(command: &mut Command) -> std::io::Result<Child> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+        let stdio = [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ];
+        for handle in stdio {
+            // SAFETY: Changes only a flag of a handle that the process's std streams keep open,
+            // and fails harmlessly on an invalid one.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+    command.spawn()
+}
+
+/// Writes `message` to stderr, which containerd records for its actions; unlike `eprintln!`,
+/// survives a closed stderr, as the `delete` action's cleaner may outlive its reader.
+fn report(message: impl std::fmt::Display) {
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
 /// Runs the shim of `backend`: a private mode, or one of containerd's actions.
 pub fn main(backend: Backend) {
     let args: Vec<OsString> = std::env::args_os().collect();
     sandbox::run_private_mode(&args);
+    service::run_private_mode(&args);
     // containerd asks for the runtime's information with `-info`, which the crate ignores.
     if containerd_shim::parse(args.get(1..).unwrap_or_default()).is_ok_and(|flags| flags.info) {
         let info = RuntimeInfo {
@@ -167,6 +227,8 @@ pub fn main(backend: Backend) {
     let config = containerd_shim::Config {
         no_reaper: true,
         no_sub_reaper: true,
+        // The shim serves its own (see `Shim::create_task_service`).
+        no_setup_logger: cfg!(windows),
         ..Default::default()
     };
     // A panic ends the shim at once, whichever thread it hits, rather than leaving the others to

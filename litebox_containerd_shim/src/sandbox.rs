@@ -1,50 +1,48 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The container's broker: `litebox-broker-userland`, or LiteBox's VM kernel in QEMU, with the
-//! guest service as its root process, its state directory, and the guest service's client.
-//!
-//! The broker bridges the guest's vsock sockets to sockets in the container's socket directory
-//! (the broker's `--vsock-uds`, or the VM's vsock device's daemon), which is private to the daemon
-//! and the broker's user: whoever can connect there reaches the guest service. Its stdout and
-//! stderr, the guest service's log among them, go to the shim's log, a line at a time.
-//!
-//! This module is every platform's; each platform provides what the `use`s below import:
-//! [`linux`] the broker, the private modes, the root file system's mounts, where the sockets are,
-//! and who runs as an unprivileged user; [`unix`] the private directories, their locks and the
-//! bridge's socket. Elsewhere the `containerd-shim` crate's mount helpers do nothing: a port
-//! without mounts refuses them.
+//! Access to the private socket directory grants access to the guest service on either backend.
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+mod windows;
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use containerd_shim::protos::ttrpc;
+#[cfg(unix)]
 use containerd_shim::protos::types::mount::Mount;
 use litebox_guest_service_protocol::GUEST_SERVICE_PORT;
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 
 #[cfg(target_os = "linux")]
-pub(crate) use self::linux::{Broker, run_private_mode};
-#[cfg(target_os = "linux")]
 use self::linux::{
-    Deprivileged, deprivileged, grant_access, mount_rootfs, socket_dir, socket_root, temp_dir,
-    unmount_rootfs,
+    Deprivileged, Tree, deprivileged, grant_access, mount_rootfs, socket_dir, socket_root,
+    temp_dir, unmount_rootfs,
 };
+#[cfg(target_os = "linux")]
+pub(crate) use self::linux::{remove_leftovers, run_private_mode};
 #[cfg(unix)]
 use self::unix::{
     Lock, client, connect_bridge, create_dir, create_traversable, default_state_root, lock,
     private_root, wait_lock,
 };
+#[cfg(windows)]
+use self::windows::{
+    Deprivileged, Lock, Tree, client, connect_bridge, create_dir, create_traversable,
+    default_state_root, deprivileged, grant_access, lock, private_root, socket_dir, socket_root,
+    temp_dir,
+};
+#[cfg(windows)]
+pub(crate) use self::windows::{init_log, layer_folders, remove_leftovers, run_private_mode};
 use crate::rootfs::GUEST_SERVICE_PATH;
 use crate::spec::{Bind, Plan};
 use crate::{Backend, Result, internal};
@@ -53,11 +51,20 @@ use crate::{Backend, Result, internal};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the broker may take to end everything once told to.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long the `delete` action waits for a dead daemon's mounters: well within the 5 s that
-/// containerd gives it (`io.containerd.timeout.shim.cleanup`) before it kills it.
+/// How long the `delete` action's cleaner waits for a dead daemon's mounters: well within the 4 s
+/// that the action waits for it.
+#[cfg(unix)]
 const LEFTOVER_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 /// The longest piece of a line of the broker's output that is logged at once.
 const MAX_LOG_LINE: u64 = 16 * 1024;
+
+/// The error of a `Create` whose container ID an earlier container's cleanup still holds.
+fn cleanup_pending() -> ttrpc::Error {
+    crate::error(
+        ttrpc::Code::FAILED_PRECONDITION,
+        "an earlier container with this ID is still being cleaned up; try again later",
+    )
+}
 
 /// The directories of a container: `<root>/<namespace>/<id>` holds the root archive, or the VM's
 /// payload; the socket directory, short enough for socket paths, holds the bridge (and the VM's
@@ -115,8 +122,11 @@ impl StateDir {
         let failed =
             |error: io::Error| internal(format!("cannot create the state directory: {error}"));
         self.deprivileged = match (backend, deprivileged()?) {
+            #[cfg(target_os = "linux")]
             (Backend::Vm, Deprivileged::Runners(uid, gid)) => Deprivileged::Broker(uid, gid),
-            (_, deprivileged) => deprivileged,
+            (Backend::Userland, deprivileged) => deprivileged,
+            #[cfg(target_os = "linux")]
+            (Backend::Vm, deprivileged) => deprivileged,
         };
         self.private_roots().map_err(failed)?;
         // The namespace's directory and the socket root, which the broker's user traverses.
@@ -126,10 +136,7 @@ impl StateDir {
         }
         create_dir(&self.path).map_err(failed)?;
         if !self.try_lock() {
-            return Err(crate::error(
-                ttrpc::Code::FAILED_PRECONDITION,
-                "an earlier container with this ID is still being cleaned up; try again later",
-            ));
+            return Err(cleanup_pending());
         }
         let mut stale: Vec<PathBuf> = std::fs::read_dir(&self.path)
             .map_err(failed)?
@@ -207,11 +214,13 @@ impl StateDir {
 /// `delete` action from cleaning up while a mount may still be made: the daemon holds it from
 /// before it mounts until it has unmounted, and its mounters inherit it, so that it outlives a
 /// killed daemon until they are gone too.
+#[cfg(unix)]
 pub struct RootMount {
     path: PathBuf,
     lock: Lock,
 }
 
+#[cfg(unix)]
 impl RootMount {
     /// Mounts `mounts`, in order, at `<bundle>/rootfs`, creating it if missing.
     pub fn new(bundle: &Path, mounts: &[Mount]) -> Result<Self> {
@@ -237,7 +246,7 @@ impl RootMount {
 
     /// Unmounts a dead daemon's leftovers at `<bundle>/rootfs`, once its mounters are gone (or
     /// after [`LEFTOVER_LOCK_TIMEOUT`]).
-    pub fn unmount_leftovers(bundle: &Path) -> std::result::Result<(), String> {
+    fn unmount_leftovers(bundle: &Path) -> std::result::Result<(), String> {
         let lock = wait_lock(bundle, LEFTOVER_LOCK_TIMEOUT);
         unmount_rootfs(&bundle.join("rootfs"))?;
         match lock {
@@ -250,6 +259,7 @@ impl RootMount {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RootMount {
     /// Unmounts, then releases the lock.
     fn drop(&mut self) {
@@ -295,38 +305,35 @@ fn program(variable: &str, name: &str) -> PathBuf {
     )
 }
 
-/// Adds the broker's arguments to `command`: serving the archive of `state` and the directory
-/// `binds` (read-only: `--mount-ro`), allowing `plan`'s egress and ingress, publishing its ports,
-/// and running the guest service with the runner `runner`.
+/// The paths are as the broker sees them.
 fn broker_arguments(
-    command: &mut Command,
-    state: &StateDir,
+    bridge: &Path,
+    archive: &Path,
     binds: &[Bind],
     plan: &Plan,
     runner: &Path,
-) {
-    command
-        .args([
-            "--unstable",
-            "--allow-process-duplication",
-            "--root-process-as-init",
-            "--vsock-uds",
-        ])
-        .arg(state.bridge())
-        .arg("--fs-initial-files")
-        .arg(state.archive());
+) -> Vec<OsString> {
+    let mut arguments: Vec<OsString> = [
+        "--unstable",
+        "--allow-process-duplication",
+        "--root-process-as-init",
+        "--vsock-uds",
+    ]
+    .map(OsString::from)
+    .into();
+    arguments.extend([bridge.into(), "--fs-initial-files".into(), archive.into()]);
     // Only read-only ones reach here (see `RootFs::bind`).
     for bind in binds {
         let mut mount = OsString::from(&bind.source);
         mount.push(format!("::{}", bind.destination));
-        command.arg("--mount-ro").arg(mount);
+        arguments.extend(["--mount-ro".into(), mount]);
     }
     for (option, destinations) in [
         ("--allow-tcp-destination", &plan.egress.tcp),
         ("--allow-udp-destination", &plan.egress.udp),
     ] {
         for destination in destinations {
-            command.arg(option).arg(destination.to_string());
+            arguments.extend([option.into(), destination.to_string().into()]);
         }
     }
     for (option, sources) in [
@@ -334,17 +341,19 @@ fn broker_arguments(
         ("--allow-udp-source", &plan.ingress.udp),
     ] {
         for source in sources {
-            command.arg(option).arg(source.to_string());
+            arguments.extend([option.into(), source.to_string().into()]);
         }
     }
     for publish in &plan.publish {
-        command.arg("--publish").arg(publish.to_string());
+        arguments.extend(["--publish".into(), publish.to_string().into()]);
     }
-    command
-        .arg("--runner")
-        .arg(runner)
-        .arg("--")
-        .arg(GUEST_SERVICE_PATH);
+    arguments.extend([
+        "--runner".into(),
+        runner.into(),
+        "--".into(),
+        GUEST_SERVICE_PATH.into(),
+    ]);
+    arguments
 }
 
 /// Logs the broker's `output` (its `source`) a line at a time, until its end, and passes each line
@@ -402,13 +411,66 @@ fn handshake(stream: &mut (impl Read + Write)) -> io::Result<()> {
     Ok(())
 }
 
+/// A running broker.
+pub struct Broker {
+    pid: u32,
+    ended: Arc<Ended>,
+    /// The last line of the broker's stderr (on Linux, its guardian's), once that ends.
+    stderr: Mutex<Receiver<Vec<u8>>>,
+    tree: Tree,
+}
+
+/// Set by the broker's reaper.
+#[derive(Default)]
+struct Ended {
+    ended: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Ended {
+    fn set(&self) {
+        *self.ended.lock().expect("lock poisoned") = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self, timeout: Duration) -> bool {
+        let ended = self.ended.lock().expect("lock poisoned");
+        let ended = self
+            .changed
+            .wait_timeout_while(ended, timeout, |ended| !*ended);
+        *ended.expect("lock poisoned").0
+    }
+}
+
 impl Broker {
+    /// The host PID of the broker, or of the VM's VMM, which containerd knows as the pid of every
+    /// process.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Waits up to `timeout` for the broker to end; returns whether it did.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        self.ended.wait(timeout)
+    }
+
+    /// Why the broker ended early. Gives its stderr a second to end after it.
+    fn last_words(&self) -> String {
+        let stderr = self.stderr.lock().expect("lock poisoned");
+        match stderr.recv_timeout(Duration::from_secs(1)) {
+            Ok(last) if !last.is_empty() => {
+                crate::truncated(&String::from_utf8_lossy(&last)).to_owned()
+            }
+            _ => "see the shim's log".to_owned(),
+        }
+    }
+
     /// Connects to the guest service through the broker's bridge of `state`. A VM's boot, until its
     /// bridge takes connections, has no deadline: how long it takes depends on the host.
     pub fn connect(&self, state: &StateDir) -> Result<GuestServiceClient> {
         let mut deadline = None;
         loop {
-            let connected = self.vsock_started.load(Ordering::Relaxed).then(|| {
+            let connected = self.tree.bridge_open().then(|| {
                 deadline.get_or_insert_with(|| Instant::now() + CONNECT_TIMEOUT);
                 connect_bridge(&state.bridge())
             });

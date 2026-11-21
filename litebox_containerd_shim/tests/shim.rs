@@ -15,35 +15,29 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as 
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 #[path = "support/cargo.rs"]
 mod cargo;
+#[path = "support/common.rs"]
+mod common;
 
+use common::{EventLog, TIMEOUT, code, deadline, process, wait_until};
 use containerd_shim::api::{
     CloseIORequest, ConnectRequest, CreateTaskRequest, DeleteRequest, DeleteResponse,
     ExecProcessRequest, KillRequest, ResizePtyRequest, ShutdownRequest, StartRequest, StateRequest,
     Status, WaitRequest,
 };
-use containerd_shim::protos::events::task::{
-    TaskCreate, TaskDelete, TaskExecAdded, TaskExecStarted, TaskExit, TaskStart,
-};
 use containerd_shim::protos::protobuf::well_known_types::any::Any;
 use containerd_shim::protos::protobuf::{Message, MessageField};
-use containerd_shim::protos::shim::events::ForwardRequest;
-use containerd_shim::protos::shim_sync::{Client, Events, TaskClient, create_events};
-use containerd_shim::protos::ttrpc::{self, Code, Server, TtrpcContext, context};
+use containerd_shim::protos::shim_sync::{Client, TaskClient, create_events};
+use containerd_shim::protos::ttrpc::{self, Code, Server, context};
 use containerd_shim::protos::types::empty::Empty;
 use containerd_shim::protos::types::introspection::RuntimeInfo;
 use containerd_shim::protos::types::mount::Mount;
 
 const NAMESPACE: &str = "litebox-test";
-const TIMEOUT: Duration = Duration::from_mins(1);
-
-fn deadline() -> context::Context {
-    context::with_timeout(i64::try_from(TIMEOUT.as_nanos()).unwrap())
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -159,6 +153,7 @@ on_both_backends! {
     hooks_run_on_the_host_with_the_state,
     a_logging_program_gets_the_output,
     the_delete_action_finishes_a_delete_cut_short,
+    a_cleanup_that_outlasts_the_delete_action_goes_on,
     a_broker_that_dies_before_start_stops_the_init,
     a_broker_that_dies_stops_created_execs_and_refuses_more,
     the_container_cannot_kill_the_guest_service,
@@ -175,15 +170,6 @@ on_both_backends! {
         as_root_a_vm_takes_back_a_state_directory_another_user_owns,
 }
 
-/// Polls `done` until it holds, failing with `what` after [`TIMEOUT`].
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while !done() {
-        assert!(start.elapsed() < TIMEOUT, "{what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// containerd runs a runtime type's shim by the type's name, and checks the name the shim reports.
 #[test]
 fn each_backends_shim_reports_its_runtime() {
@@ -195,40 +181,6 @@ fn each_backends_shim_reports_its_runtime() {
         assert!(output.status.success(), "{output:?}");
         let info = RuntimeInfo::parse_from_bytes(&output.stdout).unwrap();
         assert_eq!(info.name, runtime);
-    }
-}
-
-/// The events the shim publishes, as `topic summary`.
-#[derive(Default)]
-struct EventLog {
-    events: Mutex<Vec<String>>,
-    published: Condvar,
-}
-
-impl Events for EventLog {
-    fn forward(&self, _ctx: &TtrpcContext, request: ForwardRequest) -> ttrpc::Result<Empty> {
-        let envelope = request.envelope.unwrap_or_default();
-        assert_eq!(envelope.namespace, NAMESPACE);
-        let value = &envelope.event.value;
-        let summary = match envelope.topic.as_str() {
-            "/tasks/create" => TaskCreate::parse_from_bytes(value).unwrap().container_id,
-            "/tasks/start" => TaskStart::parse_from_bytes(value).unwrap().container_id,
-            "/tasks/exec-added" => TaskExecAdded::parse_from_bytes(value).unwrap().exec_id,
-            "/tasks/exec-started" => TaskExecStarted::parse_from_bytes(value).unwrap().exec_id,
-            "/tasks/exit" => {
-                let event = TaskExit::parse_from_bytes(value).unwrap();
-                format!("{} {}", event.id, event.exit_status)
-            }
-            "/tasks/delete" => {
-                let event = TaskDelete::parse_from_bytes(value).unwrap();
-                format!("{} {}", event.container_id, event.exit_status)
-            }
-            topic => panic!("unexpected event topic {topic}"),
-        };
-        let mut events = self.events.lock().unwrap();
-        events.push(format!("{} {summary}", envelope.topic));
-        self.published.notify_all();
-        Ok(Empty::new())
     }
 }
 
@@ -295,7 +247,7 @@ impl Shim {
             "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}]},
         });
         std::fs::write(bundle.join("config.json"), config.to_string()).unwrap();
-        let events = Arc::new(EventLog::default());
+        let events = Arc::new(EventLog::new(NAMESPACE));
         let event_socket = dir.path().join("events.sock");
         let mut event_server = Server::new()
             .bind(&format!("unix://{}", event_socket.display()))
@@ -555,17 +507,7 @@ impl Shim {
 
     /// Runs the shim's `delete` action, calling `during` with its pid meanwhile.
     fn delete_action_while(&self, during: impl FnOnce(u32)) -> u32 {
-        let delete = shim_command(self.backend)
-            .arg("-bundle")
-            .arg(&self.bundle)
-            .arg("delete")
-            .current_dir(&self.bundle)
-            .env("TTRPC_ADDRESS", self.path("events.sock"))
-            .env("LITEBOX_SHIM_STATE_ROOT", self.dir.path().join("state"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let delete = self.delete_action_command().spawn().unwrap();
         during(delete.id());
         let output = delete.wait_with_output().unwrap();
         // Nothing to unmount is no error, not even for an unprivileged action.
@@ -580,15 +522,24 @@ impl Shim {
             .exit_status
     }
 
+    /// The shim's `delete` action, as containerd runs it, with its output piped.
+    fn delete_action_command(&self) -> Command {
+        let mut command = shim_command(self.backend);
+        command
+            .arg("-bundle")
+            .arg(&self.bundle)
+            .arg("delete")
+            .current_dir(&self.bundle)
+            .env("TTRPC_ADDRESS", self.path("events.sock"))
+            .env("LITEBOX_SHIM_STATE_ROOT", self.dir.path().join("state"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
     /// Waits for `count` events and returns them.
     fn events(&self, count: usize) -> Vec<String> {
-        let events = self.events.events.lock().unwrap();
-        let (events, _) = self
-            .events
-            .published
-            .wait_timeout_while(events, TIMEOUT, |events| events.len() < count)
-            .unwrap();
-        events.clone()
+        self.events.wait_for(count)
     }
 
     fn shutdown(&self) {
@@ -651,22 +602,6 @@ fn shim_command(backend: Backend) -> Command {
     let address = "/run/containerd/containerd.sock";
     command.args(["-namespace", NAMESPACE, "-id", "c", "-address", address]);
     command
-}
-
-fn code(error: &ttrpc::Error) -> Code {
-    match error {
-        ttrpc::Error::RpcStatus(status) => status.code(),
-        other => panic!("not a status: {other:?}"),
-    }
-}
-
-fn process(args: &[&str]) -> serde_json::Value {
-    serde_json::json!({
-        "args": args,
-        "env": ["PATH=/bin"],
-        "cwd": "/",
-        "user": {"uid": 0, "gid": 0},
-    })
 }
 
 /// An `Exec` request of `args`, without I/O.
@@ -1154,19 +1089,22 @@ fn with_mount_privilege_bind_and_overlay_mounts_are_read_then_unmounted(backend:
             shim.daemon.wait().unwrap();
             wait_until("the broker's group outlived the daemon", || members() == 0);
             // A dead daemon's orphaned mounter holds the bundle's lock, and mounts while the
-            // `delete` action waits for it.
+            // `delete` action's cleaner waits for it.
             let lock = File::open(&shim.bundle).unwrap();
             rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
             let bundle = shim.bundle.canonicalize().unwrap();
             let deleted = shim.delete_action_while(|delete| {
                 let waits = || {
-                    let fds = std::fs::read_dir(format!("/proc/{delete}/fd")).into_iter();
-                    let mut fds = fds.flatten().flatten();
-                    fds.any(|fd| std::fs::read_link(fd.path()).is_ok_and(|open| open == bundle))
+                    processes_with(1, delete).into_iter().any(|cleaner| {
+                        let fds = std::fs::read_dir(format!("/proc/{cleaner}/fd")).into_iter();
+                        let mut fds = fds.flatten().flatten();
+                        fds.any(|fd| std::fs::read_link(fd.path()).is_ok_and(|open| open == bundle))
+                    })
                 };
-                wait_until("the delete action did not lock the bundle", || {
-                    waits() || is_gone(delete)
-                });
+                wait_until(
+                    "the delete action's cleaner did not lock the bundle",
+                    || waits() || is_gone(delete),
+                );
                 rustix::mount::mount_bind(&lower, bundle.join("rootfs")).unwrap();
                 drop(lock);
             });
@@ -1593,6 +1531,34 @@ fn the_delete_action_finishes_a_delete_cut_short(backend: Backend) {
     assert!(!shim.state_dir().exists());
     let state: serde_json::Value = serde_json::from_str(&shim.output("poststop")).unwrap();
     assert_eq!(state["status"], "stopped");
+}
+
+/// containerd kills the `delete` action after 5 s, and runs it again only once it reloads.
+fn a_cleanup_that_outlasts_the_delete_action_goes_on(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
+    let hook = script(&shim, "hook", "sleep 6\ncat > \"$1\"\n");
+    let state = shim.path("poststop");
+    shim.configure(|spec| {
+        spec["hooks"] = serde_json::json!({"poststop": [{"path": hook, "args": ["hook", state]}]});
+    });
+    shim.create().unwrap();
+    shim.daemon.kill().unwrap();
+    shim.daemon.wait().unwrap();
+    let started = Instant::now();
+    let output = shim.delete_action_command().output().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5), "{output:?}");
+    // Failed, so that containerd keeps the bundle.
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("the cleanup goes on"),
+        "{output:?}"
+    );
+    wait_until("the poststop hook did not run", || {
+        std::fs::read_to_string(&state)
+            .is_ok_and(|state| serde_json::from_str::<serde_json::Value>(&state).is_ok())
+    });
+    assert!(!shim.state_dir().exists());
+    assert_eq!(shim.delete_action(), 137);
 }
 
 fn a_broker_that_dies_before_start_stops_the_init(backend: Backend) {

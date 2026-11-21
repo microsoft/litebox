@@ -561,6 +561,7 @@ jobs:
         -p litebox_shim_windows
         -p litebox_runner_linux_on_windows_userland
         -p litebox_runner_windows_userland
+        -p litebox_containerd_shim
         -p dev_test_support
     steps:
       - name: Check out repo
@@ -574,7 +575,7 @@ jobs:
           architecture: x64
       - name: Set up Rust
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-pc-windows-msvc,x86_64-unknown-none
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-pc-windows-msvc,x86_64-unknown-none,x86_64-unknown-linux-musl
       - name: Set up Nextest
         uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
@@ -604,7 +605,7 @@ jobs:
             target/tmp/windows_node_rewriter
           key: ${{ steps.fixture-key.outputs.key }}
           restore-keys: ${{ steps.fixture-key.outputs.prefix }}
-      - name: Set up WSL for the Windows loader tests
+      - name: Set up WSL for the Windows loader and containerd-shim tests
         timeout-minutes: 10
         uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
         with:
@@ -612,7 +613,58 @@ jobs:
           use-cache: 'true'
           set-as-default: 'true'
           additional-packages: gcc libc6-dev
+      - name: Build Windows containerd-shim test fixtures
+        env:
+          LITEBOX_SHIM_TEST_FIXTURES: ${{ runner.temp }}\litebox-shim-fixtures
+          RUSTFLAGS: -Dwarnings -C linker=rust-lld -C linker-flavor=ld.lld -C target-feature=+crt-static
+        run: |
+          cargo build --locked -p litebox_guest_service --target x86_64-unknown-linux-musl --target-dir target\static-guest-service
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $fixtures = New-Item -ItemType Directory -Path $env:LITEBOX_SHIM_TEST_FIXTURES
+          # Stage copies so concurrent Cargo builds cannot replace executables that tests are using.
+          Copy-Item -Destination $fixtures.FullName -Path @(
+            'target\debug\litebox-broker-userland.exe'
+            'target\debug\litebox_runner_linux_on_windows_userland.exe'
+            'target\static-guest-service\x86_64-unknown-linux-musl\debug\litebox-guest-service'
+          )
+          wsl.exe --exec bash litebox_runner_linux_on_windows_userland/tests/build_windows_linux_guest.sh litebox_containerd_shim/tests/guest.c "$($fixtures.FullName)\guest" static
       - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
+        env:
+          LITEBOX_SHIM_TEST_FIXTURES: ${{ runner.temp }}\litebox-shim-fixtures
+      # The HCS tests need a Windows image's layers: this runner is elevated, with the Containers
+      # feature and Docker.
+      - name: Pull the Windows image of the containerd-shim HCS tests
+        id: windows-layers
+        run: |
+          $image = 'mcr.microsoft.com/windows/nanoserver:ltsc2025'
+          # Docker's service sometimes stops during the runner's boot; starting it again recovers
+          # (https://github.com/actions/runner-images/issues/13729).
+          $deadline = (Get-Date).AddMinutes(3)
+          while ($true) {
+            docker version *> $null
+            if ($LASTEXITCODE -eq 0) { break }
+            if ((Get-Date) -gt $deadline) { throw 'Docker did not start' }
+            if ((Get-Service docker).Status -eq 'Stopped') { Start-Service docker -ErrorAction Continue }
+            Start-Sleep -Seconds 5
+          }
+          foreach ($try in 1..3) {
+            docker pull --quiet $image
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($try -eq 3) { exit $LASTEXITCODE }
+            Start-Sleep -Seconds 10
+          }
+          $driver = docker info --format '{{.Driver}}'
+          if ($driver -ne 'windowsfilter') { throw "Docker's storage driver is $driver, not windowsfilter" }
+          $top = docker image inspect --format '{{.GraphDriver.Data.dir}}' $image
+          # The parents, topmost first; a base layer has none.
+          $chain = Join-Path $top 'layerchain.json'
+          $parents = if (Test-Path $chain) { @(Get-Content -Raw $chain | ConvertFrom-Json | Where-Object { $_ }) } else { @() }
+          "layers=$((@($top) + $parents) -join ';')" >> $env:GITHUB_OUTPUT
+      - name: Run the containerd-shim HCS tests
+        run: cargo nextest run --locked --profile ci -p litebox_containerd_shim --test shim_windows --run-ignored only
+        env:
+          LITEBOX_SHIM_TEST_FIXTURES: ${{ runner.temp }}\litebox-shim-fixtures
+          LITEBOX_TEST_WINDOWS_LAYERS: ${{ steps.windows-layers.outputs.layers }}
       - run: |
           cargo test --locked --verbose --doc ($env:WINDOWS_CRATES -split ' ')
           # We need to run `cargo test --doc` separately because doc tests
