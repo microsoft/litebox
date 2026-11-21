@@ -71,6 +71,10 @@ fn stat_conversions_preserve_optional_signed_timestamps() {
 }
 
 fn decode(sysno: syscalls::Sysno, args: [usize; 4]) -> SyscallRequest {
+    try_decode(sysno, args).unwrap()
+}
+
+fn try_decode(sysno: syscalls::Sysno, args: [usize; 4]) -> Result<SyscallRequest, errno::Errno> {
     #[cfg(target_arch = "x86_64")]
     let regs = PtRegs {
         rdi: args[0],
@@ -85,7 +89,7 @@ fn decode(sysno: syscalls::Sysno, args: [usize; 4]) -> SyscallRequest {
         regs: core::array::from_fn(|i| args.get(i).copied().unwrap_or(0)),
         ..Default::default()
     };
-    SyscallRequest::try_from_raw(sysno as usize, &regs, |_| {}).unwrap()
+    SyscallRequest::try_from_raw(sysno as usize, &regs, |_| {})
 }
 
 #[test]
@@ -157,25 +161,32 @@ fn sysv_shm_decode() {
     let wide = 0x1_0000_1000;
     let neg_id = 0xffff_fffe;
     let flags = 0x1_0000_0201;
+    // Flags keep bits they don't name, including `shmget`'s mode bits.
     assert!(matches!(
         decode(Sysno::shmget, [neg_id, wide, flags, 0]),
-        SyscallRequest::Shmget { key: -2, size, shmflg: 0x201 } if size == wide
+        SyscallRequest::Shmget { key: -2, size, shmflg } if size == wide && shmflg.bits() == 0x201
     ));
     assert!(matches!(
         decode(Sysno::shmat, [neg_id, wide, flags, 0]),
-        SyscallRequest::Shmat { shmid: -2, shmaddr, shmflg: 0x201 } if shmaddr == wide
+        SyscallRequest::Shmat { shmid: -2, shmaddr, shmflg }
+            if shmaddr == wide && shmflg.bits() == 0x201
     ));
     assert!(matches!(
         decode(Sysno::shmdt, [wide, 0, 0, 0]),
         SyscallRequest::Shmdt { shmaddr } if shmaddr == wide
     ));
-    for (cmd, addr) in [(IPC_STAT, wide), (IPC_RMID, 0)] {
+    for (cmd, expected, addr) in [(2, ShmctlCmd::Stat, wide), (0, ShmctlCmd::Remove, 0)] {
         assert!(matches!(
-            decode(Sysno::shmctl, [neg_id, cmd.cast_unsigned() as usize, addr, 0]),
+            decode(Sysno::shmctl, [neg_id, cmd, addr, 0]),
             SyscallRequest::Shmctl { shmid: -2, cmd: actual_cmd, buf }
-                if actual_cmd == cmd && buf.as_usize() == addr
+                if actual_cmd == expected && buf.as_usize() == addr
         ));
     }
+    // Linux: `shmctl` rejects a command it doesn't define with EINVAL.
+    assert_eq!(
+        try_decode(Sysno::shmctl, [0, 99, 0, 0]).err(),
+        Some(errno::Errno::EINVAL)
+    );
 }
 
 #[test]

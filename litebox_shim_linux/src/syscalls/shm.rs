@@ -11,10 +11,10 @@
 use crate::{ShimPlatform, Task, UserPtrMut};
 use litebox::segment::{PreparedAttach, SegmentError};
 use litebox_broker_protocol::fs::FileUser;
-use litebox_broker_protocol::segment::{GetSegmentRequest, SetSegmentRequest};
+use litebox_broker_protocol::segment::{GetSegmentRequest, SegmentId, SetSegmentRequest};
 use litebox_common_linux::{
-    IPC_CREAT, IPC_EXCL, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, PAGE_SIZE, SHM_DEST, SHM_EXEC,
-    SHM_RDONLY, SHM_REMAP, SHM_RND, ShmidDs, errno::Errno, vmem::SharedObjectMapping,
+    IpcPerm, PAGE_SIZE, SHM_DEST, ShmatFlags, ShmctlCmd, ShmgetFlags, ShmidDs, errno::Errno,
+    vmem::SharedObjectMapping,
 };
 
 impl<Platform: ShimPlatform> Task<Platform> {
@@ -30,48 +30,52 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
-    pub(crate) fn sys_shmget(&self, key: i32, size: usize, flags: i32) -> Result<usize, Errno> {
-        const SHM_HUGETLB: i32 = 0o4000;
+    pub(crate) fn sys_shmget(
+        &self,
+        key: i32,
+        size: usize,
+        flags: ShmgetFlags,
+    ) -> Result<usize, Errno> {
         self.einval_in_vfork_child()?;
-        if flags & SHM_HUGETLB != 0 {
+        if flags.contains(ShmgetFlags::SHM_HUGETLB) {
             return Err(Errno::EOPNOTSUPP);
         }
         let id = self.global.litebox.get_segment(GetSegmentRequest {
             key,
             size: size as u64,
-            mode: (flags.cast_unsigned() & 0o777) as u16,
-            create: flags & IPC_CREAT != 0,
-            exclusive: flags & IPC_EXCL != 0,
+            mode: (flags.bits().cast_unsigned() & 0o777) as u16,
+            create: flags.contains(ShmgetFlags::IPC_CREAT),
+            exclusive: flags.contains(ShmgetFlags::IPC_EXCL),
         })?;
-        Ok(id as usize)
+        Ok(id.0 as usize)
     }
 
     pub(crate) fn sys_shmat(
         &self,
         shmid: i32,
         addr: usize,
-        flags: i32,
+        flags: ShmatFlags,
     ) -> Result<UserPtrMut<u8>, Errno> {
         self.einval_in_vfork_child()?;
-        let id = u32::try_from(shmid).map_err(|_| Errno::EINVAL)?;
-        if flags & SHM_REMAP != 0 && addr == 0 {
+        let id = SegmentId(u32::try_from(shmid).map_err(|_| Errno::EINVAL)?);
+        if flags.contains(ShmatFlags::SHM_REMAP) && addr == 0 {
             return Err(Errno::EINVAL);
         }
         // Refuse rather than replacing an unrelated VMA or permitting execution of data pages.
-        if flags & (SHM_REMAP | SHM_EXEC) != 0 {
+        if flags.intersects(ShmatFlags::SHM_REMAP | ShmatFlags::SHM_EXEC) {
             return Err(Errno::EOPNOTSUPP);
         }
         let address = match addr {
             0 => None,
             addr if addr.is_multiple_of(PAGE_SIZE) => Some(addr),
-            addr if flags & SHM_RND != 0 => match addr & !(PAGE_SIZE - 1) {
+            addr if flags.contains(ShmatFlags::SHM_RND) => match addr & !(PAGE_SIZE - 1) {
                 // Linux maps the rounded address 0, below the lowest address it maps.
                 0 => return Err(Errno::EPERM),
                 rounded => Some(rounded),
             },
             _ => return Err(Errno::EINVAL),
         };
-        let readonly = flags & SHM_RDONLY != 0;
+        let readonly = flags.contains(ShmatFlags::SHM_RDONLY);
         let PreparedAttach {
             object,
             size,
@@ -119,15 +123,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_shmctl(
         &self,
         shmid: i32,
-        cmd: i32,
+        cmd: ShmctlCmd,
         buf: UserPtrMut<ShmidDs>,
     ) -> Result<usize, Errno> {
         self.einval_in_vfork_child()?;
-        let id = u32::try_from(shmid).map_err(|_| Errno::EINVAL)?;
+        let id = SegmentId(u32::try_from(shmid).map_err(|_| Errno::EINVAL)?);
         let litebox = &self.global.litebox;
         match cmd {
-            IPC_RMID => litebox.remove_segment(id)?,
-            IPC_SET => {
+            ShmctlCmd::Remove => litebox.remove_segment(id)?,
+            ShmctlCmd::Set => {
                 let ds = buf.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 let owner = FileUser {
                     user: ds.shm_perm.uid.try_into().map_err(|_| Errno::EINVAL)?,
@@ -139,7 +143,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     mode: (ds.shm_perm.mode & 0o777) as u16,
                 })?;
             }
-            IPC_STAT => {
+            ShmctlCmd::Stat => {
                 let status = litebox.segment_status(id)?;
                 let ds = ShmidDs {
                     shm_perm: IpcPerm {
@@ -148,12 +152,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         gid: status.owner.group.into(),
                         cuid: status.creator.user.into(),
                         cgid: status.creator.group.into(),
-                        mode: u32::from(status.mode)
-                            | if status.removed {
-                                SHM_DEST.cast_unsigned()
-                            } else {
-                                0
-                            },
+                        mode: u32::from(status.mode) | if status.removed { SHM_DEST } else { 0 },
                         ..IpcPerm::default()
                     },
                     shm_segsz: status.size,
@@ -168,7 +167,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 buf.write_at_offset::<Platform>(0, ds)
                     .ok_or(Errno::EFAULT)?;
             }
-            _ => return Err(Errno::EINVAL),
         }
         Ok(0)
     }

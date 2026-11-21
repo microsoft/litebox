@@ -39,7 +39,7 @@ use crate::readiness_queue::{
 };
 use crate::segment::{
     GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-    SegmentStatus, SetSegmentAttachmentsRequest, SetSegmentRequest,
+    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentStatus, SetSegmentRequest,
 };
 use crate::shared_buffer::SharedBufferSequence;
 use crate::shared_futex::{
@@ -405,12 +405,12 @@ wire_enum! {
         /// Look up a key, optionally creating a segment.
         Get(GetSegmentRequest),
         /// Read a segment's metadata.
-        Status(u32),
+        Status(SegmentId),
         /// Change a segment's owner and permission bits.
         Set(SetSegmentRequest),
         /// Unpublish a segment's key; it is freed once no attachments or
         /// reservations remain.
-        Remove(u32),
+        Remove(SegmentId),
         /// Reserve an attachment and deliver the backing object, without
         /// changing metadata.
         PrepareAttach(PrepareSegmentAttachRequest),
@@ -418,12 +418,9 @@ wire_enum! {
         ConfirmAttach(SegmentAttachId),
         /// Release an unused reservation without recording an attach or detach.
         CancelAttach(SegmentAttachId),
-        /// Replace the caller's attachment count after splitting or releasing
+        /// Replace the caller's attachment counts after splitting or releasing
         /// mapped regions.
-        SetAttachments(SetSegmentAttachmentsRequest),
-        /// Copy the caller's attachments to its pending child, which inherits
-        /// its address space.
-        Inherit(ProcessId),
+        SetAttachments(SegmentAttachmentCounts),
     }
 }
 
@@ -823,7 +820,7 @@ wire_enum! {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum SegmentResponse {
         /// The segment's ID.
-        Get(u32),
+        Get(SegmentId),
         /// The segment's metadata.
         Status(SegmentStatus),
         /// The owner and permission bits were changed.
@@ -836,12 +833,10 @@ wire_enum! {
         ConfirmAttach,
         /// The reservation was released.
         CancelAttach,
-        /// The attachment count was replaced.
+        /// The attachment counts were replaced.
         SetAttachments,
-        /// The pending child holds copies of the caller's attachments.
-        Inherit,
         /// Segment operation failed with a guest-visible error.
-        Failed(FileError),
+        Failed(SegmentError),
     }
 }
 

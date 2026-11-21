@@ -1,21 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::ProcessId;
-use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, SegmentRequest, SegmentResponse,
 };
 use litebox_broker_protocol::segment::{
     GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-    SegmentStatus, SetSegmentAttachmentsRequest, SetSegmentRequest,
+    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentStatus, SetSegmentRequest,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 /// The outcome of a segment operation: its result, or a guest-visible error.
-type SegmentResult<T> = core::result::Result<T, FileError>;
+type SegmentResult<T> = core::result::Result<T, SegmentError>;
 
 /// Matches `$response` against the response pattern for its request, or panics.
 macro_rules! expect_segment_response {
@@ -35,7 +33,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn get_segment(
         &self,
         request: GetSegmentRequest,
-    ) -> Result<SegmentResult<u32>, Channel::Error> {
+    ) -> Result<SegmentResult<SegmentId>, Channel::Error> {
         expect_segment_response!(
             self.request_segment(SegmentRequest::Get(request))?,
             SegmentResponse::Get(id) => id
@@ -43,7 +41,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Reads a segment's metadata.
-    pub fn segment_status(&self, id: u32) -> Result<SegmentResult<SegmentStatus>, Channel::Error> {
+    pub fn segment_status(
+        &self,
+        id: SegmentId,
+    ) -> Result<SegmentResult<SegmentStatus>, Channel::Error> {
         expect_segment_response!(
             self.request_segment(SegmentRequest::Status(id))?,
             SegmentResponse::Status(status) => status
@@ -62,7 +63,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Unpublishes a segment's key, freeing it once no attachments remain.
-    pub fn remove_segment(&self, id: u32) -> Result<SegmentResult<()>, Channel::Error> {
+    pub fn remove_segment(&self, id: SegmentId) -> Result<SegmentResult<()>, Channel::Error> {
         expect_segment_response!(
             self.request_segment(SegmentRequest::Remove(id))?,
             SegmentResponse::Remove => ()
@@ -103,22 +104,16 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         )
     }
 
-    /// Replaces this process's attachment count of a segment.
+    /// Replaces this process's attachment counts of up to
+    /// [`SegmentAttachmentCounts::CAPACITY`] segments, applying each even if
+    /// another fails.
     pub fn set_segment_attachments(
         &self,
-        request: SetSegmentAttachmentsRequest,
+        counts: SegmentAttachmentCounts,
     ) -> Result<SegmentResult<()>, Channel::Error> {
         expect_segment_response!(
-            self.request_segment(SegmentRequest::SetAttachments(request))?,
+            self.request_segment(SegmentRequest::SetAttachments(counts))?,
             SegmentResponse::SetAttachments => ()
-        )
-    }
-
-    /// Copies this process's attachments to its pending child `target`.
-    pub fn inherit_segments(&self, target: ProcessId) -> Result<SegmentResult<()>, Channel::Error> {
-        expect_segment_response!(
-            self.request_segment(SegmentRequest::Inherit(target))?,
-            SegmentResponse::Inherit => ()
         )
     }
 

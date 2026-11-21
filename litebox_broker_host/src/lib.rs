@@ -55,12 +55,11 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    AllocateChildRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    GetHostNamesRequest, HostName, HostNameSizes, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE,
-    MAX_CHILD_OBJECT_DUPLICATES, MAX_EXISTING_RUNNER_START_SIZE, MAX_HOST_NAME_SIZE,
-    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, ProcessStartupData,
-    ProcessStartupDescriptor, SetHostNameRequest, StartChildProcessRequest,
-    StartChildWithExistingRunnerRequest, WriteChildMemoryRequest,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest, HostName,
+    HostNameSizes, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_EXISTING_RUNNER_START_SIZE, MAX_HOST_NAME_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE,
+    MAX_RUNNER_DESCRIPTOR_SIZE, ProcessStartupData, ProcessStartupDescriptor, SetHostNameRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness_queue::{
@@ -595,11 +594,8 @@ fn handle_process_request<Memory: SharedMemory>(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<ProcessResponse> {
     let response = match request {
-        ProcessRequest::AllocateChild(AllocateChildRequest {
-            new_pid_namespace,
-            sibling,
-        }) => process
-            .allocate_child_process(new_pid_namespace, sibling)
+        ProcessRequest::AllocateChild(request) => process
+            .allocate_child(request)
             .map(ProcessResponse::AllocateChild),
         ProcessRequest::CreateNamespaces(request) => process
             .create_namespaces(request)
@@ -2108,6 +2104,7 @@ fn handle_segment_request(
     request: SegmentRequest,
 ) -> RequestResult<SegmentResponse> {
     use litebox_broker_core::segment;
+    use litebox_broker_protocol::segment::SegmentError;
 
     let response = match request {
         SegmentRequest::Get(request) => segment::get(process, request)?.map(SegmentResponse::Get),
@@ -2119,7 +2116,7 @@ fn handle_segment_request(
             segment::remove(process, id)?.map(|()| SegmentResponse::Remove)
         }
         SegmentRequest::PrepareAttach(request) => {
-            segment::prepare_attach(process, request, |_, _, _| Err(FileError::NoSuchDevice))?
+            segment::prepare_attach(process, request, |_, _, _| Err(SegmentError::Unavailable))?
                 .map(SegmentResponse::PrepareAttach)
         }
         SegmentRequest::ConfirmAttach(attachment) => {
@@ -2128,11 +2125,8 @@ fn handle_segment_request(
         SegmentRequest::CancelAttach(attachment) => {
             segment::cancel_attach(process, attachment)?.map(|()| SegmentResponse::CancelAttach)
         }
-        SegmentRequest::SetAttachments(request) => {
-            segment::set_attachments(process, request)?.map(|()| SegmentResponse::SetAttachments)
-        }
-        SegmentRequest::Inherit(target) => {
-            segment::inherit(process, target)?.map(|()| SegmentResponse::Inherit)
+        SegmentRequest::SetAttachments(counts) => {
+            segment::set_attachments(process, counts)?.map(|()| SegmentResponse::SetAttachments)
         }
     };
     Ok(response.unwrap_or_else(SegmentResponse::Failed))

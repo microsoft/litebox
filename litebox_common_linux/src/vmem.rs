@@ -34,6 +34,7 @@ use litebox::platform::{
     common_providers::reservations::{NoTrackedReservations, TrackedReservations},
     page_mgmt::{DeallocationError, PageReservation, PermissionUpdateError, ReservationStore},
 };
+use litebox_broker_protocol::segment::{SegmentAttachmentCount, SegmentId};
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 
 use crate::PAGE_SIZE;
@@ -217,8 +218,8 @@ struct SysvView {
 }
 
 type SysvAttachmentKey = (usize, NonZeroU64);
-/// Publishes the number of areas that map a segment in this address space.
-pub(super) type SysvPublish = Arc<dyn Fn(u32, u64) + Send + Sync>;
+/// Publishes the number of areas that map each of some segments in this address space.
+pub(super) type SysvPublish = Arc<dyn Fn(&[SegmentAttachmentCount]) + Send + Sync>;
 
 /// How [`Vmem::attach_sysv`] places one new SysV attachment.
 pub(super) struct SysvPlacement<const ALIGN: usize> {
@@ -966,11 +967,11 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     sysv_attachments: BTreeMap<SysvAttachmentKey, SysvAttachment>,
     pub(super) sysv_publish: Option<SysvPublish>,
     /// Segments whose counts changed, to publish while the owner still holds the VMA write lock.
-    sysv_changed: BTreeSet<u32>,
+    sysv_changed: BTreeSet<SegmentId>,
 }
 
 struct SysvAttachment {
-    segment: u32,
+    segment: SegmentId,
     end: usize,
     /// The areas that map it.
     pieces: u64,
@@ -1018,7 +1019,7 @@ where
     }
 
     /// Takes the segments whose counts changed since the last call, with their counts now.
-    pub(super) fn take_sysv_changes(&mut self) -> BTreeMap<u32, u64> {
+    pub(super) fn take_sysv_changes(&mut self) -> BTreeMap<SegmentId, u64> {
         let changed = core::mem::take(&mut self.sysv_changed);
         changed
             .into_iter()
@@ -1034,7 +1035,12 @@ where
 
     /// Marks a just-created, offset-zero shared object mapping as one `shmat`. Only this
     /// mapping's pages get the identity, even when mmap coalesced it with adjacent areas.
-    pub(super) fn register_sysv(&mut self, range: Range<usize>, segment: u32, readonly: bool) {
+    pub(super) fn register_sysv(
+        &mut self,
+        range: Range<usize>,
+        segment: SegmentId,
+        readonly: bool,
+    ) {
         let identity = self.next_sysv_tag();
         let mut vma = *self.vmas.get(&range.start).unwrap();
         let Sharing::Named(ref mut view) = vma.sharing else {
@@ -1157,7 +1163,7 @@ where
         &mut self,
         placement: SysvPlacement<ALIGN>,
         mapping: SharedObjectMapping<SharedObjectOf<Platform, ALIGN>>,
-        segment: u32,
+        segment: SegmentId,
         confirm: impl FnOnce() -> Result<(), E>,
     ) -> Result<Platform::RawMutPointer<u8>, SysvAttachError<E>>
     where
@@ -2984,7 +2990,7 @@ mod tests {
             .unwrap();
         };
         map(&mut vm, 0, 5, 0);
-        vm.register_sysv(page(0)..page(5), 1, true);
+        vm.register_sysv(page(0)..page(5), SegmentId(1), true);
         // Even a writable backing descriptor cannot override SHM_RDONLY.
         let piece = PageRange::new(page(3), page(4)).unwrap();
         // SAFETY: the test owns these mock pages.
@@ -3003,7 +3009,7 @@ mod tests {
         }
         // Splitting the middle adds two VMAs. Restoring the original permissions does
         // not close either of the split VMAs.
-        assert_eq!(vm.take_sysv_changes(), [(1, 3)].into());
+        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 3)].into());
         // Replace the middle page with the *same* shared object at the *same* offset.
         // Futex keys still match, but shmdt must not remove this ordinary shared mapping.
         map(&mut vm, 2, 1, 2 * PAGE_SIZE);
@@ -3011,13 +3017,13 @@ mod tests {
         // SAFETY: there are no users of these mock pages.
         unsafe { vm.remove_mapping(PageRange::new(page(0), page(1)).unwrap()) }.unwrap();
         map(&mut vm, 0, 1, 0);
-        vm.register_sysv(page(0)..page(1), 1, false);
+        vm.register_sysv(page(0)..page(1), SegmentId(1), false);
         assert!(vm.take_sysv_changes().is_empty());
         detach(&mut vm, page(0)).unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(1, 3)].into());
+        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 3)].into());
         assert!(vm.vmas.get(&page(1)).is_some());
         detach(&mut vm, page(0)).unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(1, 0)].into());
+        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 0)].into());
         assert_eq!(detach(&mut vm, page(0)), Err(crate::errno::Errno::EINVAL));
         assert!(
             vm.iter()
@@ -3026,13 +3032,13 @@ mod tests {
         );
 
         map(&mut vm, 4, 1, 0);
-        vm.register_sysv(page(4)..page(5), 2, true);
+        vm.register_sysv(page(4)..page(5), SegmentId(2), true);
         map(&mut vm, 4, 1, 0);
         assert_eq!(detach(&mut vm, page(4)), Err(crate::errno::Errno::EINVAL));
         map(&mut vm, 5, 1, 0);
-        vm.register_sysv(page(5)..page(6), 3, true);
+        vm.register_sysv(page(5)..page(6), SegmentId(3), true);
         map(&mut vm, 6, 3, 0);
-        vm.register_sysv(page(6)..page(9), 4, true);
+        vm.register_sysv(page(6)..page(9), SegmentId(4), true);
         // Shrinking is an unmap of the tail; an ordinary fixed mmap can then replace the
         // last page, which ends the attachment.
         // SAFETY: the test owns these mock mappings and excludes other users.
@@ -3053,19 +3059,22 @@ mod tests {
         // Exec drains remaining attachments; previously released ones are not charged twice.
         // SAFETY: the test is done using all mock mappings.
         unsafe { vm.release_all() }.unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(2, 0), (3, 0), (4, 0)].into());
+        assert_eq!(
+            vm.take_sysv_changes(),
+            [(SegmentId(2), 0), (SegmentId(3), 0), (SegmentId(4), 0)].into()
+        );
 
         map(&mut vm, 0, 3, 0);
-        vm.register_sysv(page(0)..page(3), 1, false);
+        vm.register_sysv(page(0)..page(3), SegmentId(1), false);
         vm.take_sysv_changes();
         // SAFETY: the test owns the pages; no one else uses them.
         unsafe { vm.remove_mapping(PageRange::new(page(1), page(2)).unwrap()) }.unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(1, 2)].into());
+        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 2)].into());
         detach(&mut vm, page(0)).unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(1, 0)].into());
+        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 0)].into());
 
         map(&mut vm, 0, 4, 0);
-        vm.register_sysv(page(0)..page(4), 1, false);
+        vm.register_sysv(page(0)..page(4), SegmentId(1), false);
         vm.take_sysv_changes();
         // SAFETY: the test owns these pages and there are no concurrent accesses.
         unsafe {
@@ -3082,9 +3091,9 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(vm.take_sysv_changes(), [(1, 2)].into());
+        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 2)].into());
         detach(&mut vm, page(0)).unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(1, 0)].into());
+        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 0)].into());
     }
 
     #[test]
@@ -3102,9 +3111,12 @@ mod tests {
                       confirmed: Result<(), ()>| {
             // SAFETY: The test owns the mock address space, and its objects are mock objects.
             unsafe {
-                vm.attach_sysv(placement(), shared_object_mapping(1, 0, true), 7, || {
-                    confirmed
-                })
+                vm.attach_sysv(
+                    placement(),
+                    shared_object_mapping(1, 0, true),
+                    SegmentId(7),
+                    || confirmed,
+                )
             }
             .map(|ptr| ptr.as_usize())
         };
@@ -3126,7 +3138,7 @@ mod tests {
         ));
         // SAFETY: The test owns the mock pages.
         unsafe { vm.detach_sysv(start) }.unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(7, 0)].into());
+        assert_eq!(vm.take_sysv_changes(), [(SegmentId(7), 0)].into());
     }
 
     #[test]

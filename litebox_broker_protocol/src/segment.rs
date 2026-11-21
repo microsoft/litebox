@@ -4,7 +4,38 @@
 //! Keyed, process-shared memory segments. The deployment binds each
 //! association's segment credential; requests never carry one.
 
+use thiserror::Error;
+
 use crate::fs::{FileUser, MapFileResponse};
+
+/// Names one segment, unique across namespaces while it lives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SegmentId(pub u32);
+
+wire_newtype!(SegmentId: u32);
+
+wire_enum! {
+    /// Segment operation failure that is meaningful to the guest.
+    #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+    pub enum SegmentError {
+        #[error("the deployment provides no segments")]
+        Unavailable,
+        #[error("the key already has a segment")]
+        Exists,
+        #[error("the key has no segment")]
+        Missing,
+        #[error("invalid segment ID, size, attachment or count")]
+        InvalidArgument,
+        #[error("insufficient access rights")]
+        AccessDenied,
+        #[error("not the segment's owner or creator")]
+        NotOwner,
+        #[error("segment capacity exhausted")]
+        NoSpace,
+        #[error("segment backing store failed")]
+        Io,
+    }
+}
 
 wire_struct! {
     /// Metadata of one segment. Times are seconds since the Unix epoch, or zero
@@ -68,7 +99,7 @@ wire_struct! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct SetSegmentRequest {
         /// The segment.
-        pub id: u32,
+        pub id: SegmentId,
         /// The new owning identity.
         pub owner: FileUser,
         /// The new permission bits.
@@ -81,7 +112,7 @@ wire_struct! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct PrepareSegmentAttachRequest {
         /// The segment.
-        pub id: u32,
+        pub id: SegmentId,
         /// Whether the attachment may write.
         pub writable: bool,
     }
@@ -101,13 +132,43 @@ wire_struct! {
 }
 
 wire_struct! {
-    /// Replaces how many attachments the caller holds of one segment.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct SetSegmentAttachmentsRequest {
+    /// How many attachments the caller holds of one segment.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct SegmentAttachmentCount {
         /// The segment.
-        pub id: u32,
+        pub id: SegmentId,
         /// The caller's new total, which only confirmed attaches and their splits
         /// can raise above zero.
         pub count: u64,
+    }
+}
+
+/// Up to [`Self::CAPACITY`] attachment counts, replaced together.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegmentAttachmentCounts {
+    len: u8,
+    entries: [SegmentAttachmentCount; Self::CAPACITY],
+}
+
+impl SegmentAttachmentCounts {
+    /// How many counts one request carries; more take further requests.
+    pub const CAPACITY: usize = 6;
+
+    /// Collects `counts`, or returns `None` if there are more than
+    /// [`Self::CAPACITY`].
+    #[must_use]
+    pub fn new(counts: &[SegmentAttachmentCount]) -> Option<Self> {
+        let mut entries = [SegmentAttachmentCount::default(); Self::CAPACITY];
+        entries.get_mut(..counts.len())?.copy_from_slice(counts);
+        Some(Self {
+            len: u8::try_from(counts.len()).ok()?,
+            entries,
+        })
+    }
+
+    /// The counts, in the order given.
+    #[must_use]
+    pub fn as_slice(&self) -> &[SegmentAttachmentCount] {
+        &self.entries[..usize::from(self.len)]
     }
 }

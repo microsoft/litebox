@@ -53,7 +53,8 @@ use crate::readiness_queue::{
 };
 use crate::segment::{
     GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-    SegmentStatus, SetSegmentAttachmentsRequest, SetSegmentRequest,
+    SegmentAttachmentCount, SegmentAttachmentCounts, SegmentError, SegmentId, SegmentStatus,
+    SetSegmentRequest,
 };
 use crate::shared_buffer::{
     MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
@@ -104,18 +105,23 @@ fn segment_and_namespace_wire_shapes_are_pinned() {
     let request = BrokerRequest {
         request_id: RequestId(7),
         operation: BrokerOperation::Segment(SegmentRequest::SetAttachments(
-            SetSegmentAttachmentsRequest {
-                id: 0x1234,
+            SegmentAttachmentCounts::new(&[SegmentAttachmentCount {
+                id: SegmentId(0x1234),
                 count: 0x0102,
-            },
+            }])
+            .unwrap(),
         )),
     };
     assert_eq!(
         encode_request(&request),
         [
-            1, 7, 0, 0, 0, 0, 0, 0, 0, 18, 7, 0x34, 0x12, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0
+            1, 7, 0, 0, 0, 0, 0, 0, 0, 18, 7, 1, 0x34, 0x12, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0
         ]
     );
+    // A count list longer than its capacity is invalid.
+    let mut too_long = encode_request(&request);
+    too_long[11] = u8::try_from(SegmentAttachmentCounts::CAPACITY + 1).unwrap();
+    assert_eq!(decode_request(&too_long), Err(WireError::InvalidTag));
     let response = BrokerResponse {
         request_id: RequestId(7),
         result: BrokerResult::Segment(SegmentResponse::PrepareAttach(PreparedSegmentAttach {
@@ -199,29 +205,38 @@ fn request_codec_round_trips_all_variants() {
             create: true,
             exclusive: false
         })),
-        BrokerOperation::Segment(SegmentRequest::Status(33)),
+        BrokerOperation::Segment(SegmentRequest::Status(SegmentId(33))),
         BrokerOperation::Segment(SegmentRequest::Set(SetSegmentRequest {
-            id: 7,
+            id: SegmentId(7),
             owner: FileUser {
                 user: 41,
                 group: 52
             },
             mode: 0o114
         })),
-        BrokerOperation::Segment(SegmentRequest::Remove(63)),
+        BrokerOperation::Segment(SegmentRequest::Remove(SegmentId(63))),
         BrokerOperation::Segment(SegmentRequest::PrepareAttach(PrepareSegmentAttachRequest {
-            id: 12,
+            id: SegmentId(12),
             writable: true
         })),
         BrokerOperation::Segment(SegmentRequest::ConfirmAttach(SegmentAttachId(u64::MAX))),
         BrokerOperation::Segment(SegmentRequest::CancelAttach(SegmentAttachId(17))),
         BrokerOperation::Segment(SegmentRequest::SetAttachments(
-            SetSegmentAttachmentsRequest {
-                id: 76,
+            SegmentAttachmentCounts::new(&[SegmentAttachmentCount {
+                id: SegmentId(76),
                 count: u64::MAX
-            }
+            }])
+            .unwrap()
         )),
-        BrokerOperation::Segment(SegmentRequest::Inherit(ProcessId(19))),
+        BrokerOperation::Segment(SegmentRequest::SetAttachments(
+            SegmentAttachmentCounts::new(
+                &[SegmentAttachmentCount {
+                    id: SegmentId(u32::MAX),
+                    count: u64::MAX
+                }; SegmentAttachmentCounts::CAPACITY]
+            )
+            .unwrap()
+        )),
         BrokerOperation::Thread(ThreadRequest::Exit(thread_id(17))),
         BrokerOperation::CloseObject(handle),
         BrokerOperation::CheckReadiness(handle),
@@ -619,14 +634,17 @@ fn request_codec_round_trips_all_variants() {
         BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: None,
             sibling: false,
+            inherit_segment_attachments: true,
         })),
         BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
             sibling: true,
+            inherit_segment_attachments: false,
         })),
         BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: Some(PidNamespaceOptions::new(false, true)),
             sibling: false,
+            inherit_segment_attachments: false,
         })),
         BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
             process_id: process_id(7),
@@ -1072,7 +1090,7 @@ fn handshake_response_codec_round_trips_all_variants() {
 fn response_codec_round_trips_all_variants() {
     let handle = ObjectHandle(13);
     let results = alloc::vec![
-        BrokerResult::Segment(SegmentResponse::Get(53)),
+        BrokerResult::Segment(SegmentResponse::Get(SegmentId(53))),
         BrokerResult::Segment(SegmentResponse::Status(SegmentStatus {
             key: -11,
             size: 271,
@@ -1101,9 +1119,8 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::Segment(SegmentResponse::ConfirmAttach),
         BrokerResult::Segment(SegmentResponse::CancelAttach),
         BrokerResult::Segment(SegmentResponse::SetAttachments),
-        BrokerResult::Segment(SegmentResponse::Inherit),
-        BrokerResult::Segment(SegmentResponse::Failed(FileError::NotOwner)),
-        BrokerResult::Segment(SegmentResponse::Failed(FileError::Io)),
+        BrokerResult::Segment(SegmentResponse::Failed(SegmentError::NotOwner)),
+        BrokerResult::Segment(SegmentResponse::Failed(SegmentError::Io)),
         BrokerResult::Thread(ThreadResponse::Create(thread_id(17))),
         BrokerResult::Thread(ThreadResponse::Exit),
         BrokerResult::ObjectClosed,
@@ -1896,16 +1913,17 @@ fn decode_rejects_malformed_request_frames() {
         decode_request(&invalid_orphan_adoption),
         Err(WireError::InvalidTag)
     );
-    // The option tag and all three bool fields reject non-boolean values.
+    // The option tag and all four bool fields reject non-boolean values.
     let allocate_child = encode_request(&BrokerRequest {
         request_id: TEST_REQUEST_ID,
         operation: BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: Some(PidNamespaceOptions::new(true, true)),
             sibling: true,
+            inherit_segment_attachments: true,
         })),
     });
-    assert_eq!(allocate_child[10..], [0, 1, 1, 1, 1]);
-    for (index, value) in [(11, 2), (12, 0b100), (12, 0x80), (13, 2), (14, 2)] {
+    assert_eq!(allocate_child[10..], [0, 1, 1, 1, 1, 1]);
+    for (index, value) in [(11, 2), (12, 0b100), (12, 0x80), (13, 2), (14, 2), (15, 2)] {
         let mut invalid_allocate_child = allocate_child.clone();
         invalid_allocate_child[index] = value;
         assert_eq!(

@@ -5,18 +5,17 @@
 
 use crate::LiteBox;
 use crate::broker::error::BrokerControlError;
-use crate::broker::{BrokerControl, SegmentControlResult};
+use crate::broker::{SegmentControl, SegmentControlResult};
 use crate::fs::SharedFileObject;
 use crate::platform::SharedObjectProvider;
 use crate::platform::page_mgmt::SharedObjectReceiveError;
 use crate::sync::RawSyncPrimitivesProvider;
 use alloc::sync::Arc;
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::segment::{
-    GetSegmentRequest, PrepareSegmentAttachRequest, SegmentAttachId, SegmentStatus,
-    SetSegmentAttachmentsRequest, SetSegmentRequest,
+    GetSegmentRequest, PrepareSegmentAttachRequest, SegmentAttachId, SegmentAttachmentCount,
+    SegmentAttachmentCounts, SegmentError as BrokerSegmentError, SegmentId, SegmentStatus,
+    SetSegmentRequest,
 };
 use litebox_platform::time::TimeProvider;
 
@@ -45,18 +44,17 @@ pub enum SegmentError {
     ServiceFailed,
 }
 
-impl From<FileError> for SegmentError {
-    fn from(error: FileError) -> Self {
+impl From<BrokerSegmentError> for SegmentError {
+    fn from(error: BrokerSegmentError) -> Self {
         match error {
-            FileError::AlreadyExists => Self::Exists,
-            FileError::NoSuchFileOrDirectory => Self::Missing,
-            FileError::InvalidArgument => Self::Invalid,
-            FileError::AccessNotAllowed => Self::AccessDenied,
-            FileError::NotOwner => Self::NotOwner,
-            FileError::NoSpace => Self::NoSpace,
-            FileError::Io => Self::Io,
-            FileError::NoSuchDevice | FileError::NotSupported => Self::Unavailable,
-            _ => Self::ServiceFailed,
+            BrokerSegmentError::Unavailable => Self::Unavailable,
+            BrokerSegmentError::Exists => Self::Exists,
+            BrokerSegmentError::Missing => Self::Missing,
+            BrokerSegmentError::InvalidArgument => Self::Invalid,
+            BrokerSegmentError::AccessDenied => Self::AccessDenied,
+            BrokerSegmentError::NotOwner => Self::NotOwner,
+            BrokerSegmentError::NoSpace => Self::NoSpace,
+            BrokerSegmentError::Io => Self::Io,
         }
     }
 }
@@ -102,7 +100,7 @@ pub struct PreparedAttach<Object> {
 /// A reserved attachment, which pins the segment without counting as an
 /// attachment. Dropping it cancels the reservation.
 pub struct AttachReservation {
-    broker: Arc<dyn BrokerControl>,
+    broker: Arc<dyn SegmentControl>,
     attachment: Option<SegmentAttachId>,
 }
 
@@ -131,18 +129,19 @@ impl Drop for AttachReservation {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    fn segment_broker(&self) -> Result<Arc<dyn BrokerControl>, SegmentError> {
-        self.broker_control().ok_or(SegmentError::Unavailable)
+    fn segment_broker(&self) -> Result<Arc<dyn SegmentControl>, SegmentError> {
+        let broker = self.broker_control().ok_or(SegmentError::Unavailable)?;
+        Ok(broker)
     }
 
     /// Gets the ID of the segment with `request.key`, or creates a
     /// zero-filled one as `request` allows. Key 0 always creates.
-    pub fn get_segment(&self, request: GetSegmentRequest) -> Result<u32, SegmentError> {
+    pub fn get_segment(&self, request: GetSegmentRequest) -> Result<SegmentId, SegmentError> {
         segment_result(self.segment_broker()?.get_segment(request))
     }
 
     /// Reads the segment's metadata.
-    pub fn segment_status(&self, id: u32) -> Result<SegmentStatus, SegmentError> {
+    pub fn segment_status(&self, id: SegmentId) -> Result<SegmentStatus, SegmentError> {
         segment_result(self.segment_broker()?.segment_status(id))
     }
 
@@ -152,7 +151,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     }
 
     /// Unpublishes the segment's key; existing attachments keep it alive.
-    pub fn remove_segment(&self, id: u32) -> Result<(), SegmentError> {
+    pub fn remove_segment(&self, id: SegmentId) -> Result<(), SegmentError> {
         segment_result(self.segment_broker()?.remove_segment(id))
     }
 
@@ -161,7 +160,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn prepare_segment_attach<Provider: SharedObjectProvider<ALIGN>, const ALIGN: usize>(
         &self,
         platform: &Provider,
-        id: u32,
+        id: SegmentId,
         writable: bool,
     ) -> Result<PreparedAttach<Provider::SharedObject>, SegmentError> {
         let broker = self.segment_broker()?;
@@ -182,19 +181,25 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         })
     }
 
-    /// Replaces this process's attachment count of segment `id`, as splitting
-    /// or releasing its mapped areas changed it. Each later change publishes
-    /// the full count, so it also makes up for an earlier failed one.
-    pub fn set_segment_attachments(&self, id: u32, count: u64) -> Result<(), SegmentError> {
-        segment_result(
-            self.segment_broker()?
-                .set_segment_attachments(SetSegmentAttachmentsRequest { id, count }),
-        )
-    }
-
-    /// Copies this process's attachments to pending child `target`, which
-    /// inherits its address space.
-    pub fn inherit_segments(&self, target: ProcessId) -> Result<(), SegmentError> {
-        segment_result(self.segment_broker()?.inherit_segments(target))
+    /// Replaces this process's attachment count of each segment in `counts`, as
+    /// splitting or releasing its mapped areas changed them. Each count is
+    /// replaced even if another fails; this returns the first failure. Each
+    /// later change publishes the full count, so it also makes up for an
+    /// earlier failed one.
+    pub fn set_segment_attachments(
+        &self,
+        counts: &[SegmentAttachmentCount],
+    ) -> Result<(), SegmentError> {
+        let broker = self.segment_broker()?;
+        let mut first_error = None;
+        let batches = counts
+            .chunks(SegmentAttachmentCounts::CAPACITY)
+            .filter_map(SegmentAttachmentCounts::new);
+        for batch in batches {
+            if let Err(error) = segment_result(broker.set_segment_attachments(batch)) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }

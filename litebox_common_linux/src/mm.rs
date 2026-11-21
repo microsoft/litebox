@@ -20,6 +20,7 @@ use litebox::{
     },
     sync::{RawSyncPrimitivesProvider, RwLock, RwLockWriteGuard},
 };
+use litebox_broker_protocol::segment::{SegmentAttachmentCount, SegmentId};
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
 
 use crate::PAGE_SIZE;
@@ -74,10 +75,14 @@ where
 {
     fn drop(&mut self) {
         let changes = self.vmem.take_sysv_changes();
-        if let Some(publish) = &self.vmem.sysv_publish {
-            for (segment, count) in changes {
-                publish(segment, count);
-            }
+        if let Some(publish) = &self.vmem.sysv_publish
+            && !changes.is_empty()
+        {
+            let counts: Vec<_> = changes
+                .into_iter()
+                .map(|(id, count)| SegmentAttachmentCount { id, count })
+                .collect();
+            publish(&counts);
         }
     }
 }
@@ -137,13 +142,17 @@ where
         self.lock_for_update().platform = platform;
     }
 
-    /// Sets how this address space publishes `publish(segment, count)`: how many areas map a
-    /// SysV segment, after a change of them. A native clone must set its own process's before
+    /// Sets how this address space publishes `publish(counts)`: how many areas map each SysV
+    /// segment whose areas one update changed. A native clone must set its own process's before
     /// changing inherited mappings.
     ///
-    /// It runs synchronously, under the VMA write lock, and must not reenter this manager. Each
-    /// publication carries the full count, so the next one makes up for a failed one.
-    pub fn set_sysv_publisher(&self, publish: impl Fn(u32, u64) + Send + Sync + 'static) {
+    /// It runs synchronously, once per update, under the VMA write lock, and must not reenter
+    /// this manager. Each publication carries full counts, so the next one of a segment makes up
+    /// for a failed one.
+    pub fn set_sysv_publisher(
+        &self,
+        publish: impl Fn(&[SegmentAttachmentCount]) + Send + Sync + 'static,
+    ) {
         self.lock_for_update().sysv_publish = Some(alloc::sync::Arc::new(publish));
     }
 
@@ -1156,7 +1165,7 @@ where
         mapping: SharedObjectMapping<
             litebox::platform::page_mgmt::SharedObjectOf<Platform, PAGE_SIZE>,
         >,
-        id: u32,
+        id: SegmentId,
         confirm: impl FnOnce() -> Result<(), Errno>,
     ) -> Result<UserPtrMut<u8>, Errno>
     where
