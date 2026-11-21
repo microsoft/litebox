@@ -9,14 +9,15 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessRequest, ProcessResponse,
 };
 use litebox_broker_protocol::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostName, HostNameKind,
-    HostNameSizes, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_HOST_NAME_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE,
-    OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
-    SetParentExitSignalRequest, SetResourceLimitRequest, StartChildProcessRequest,
-    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostName, HostNameKind, HostNameSizes, HostNames,
+    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
+    MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, OpenProcessHandleRequest,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind,
+    ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest, SetResourceLimitRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+    WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
@@ -266,43 +267,38 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Allocates one pending child process of this process.
     ///
     /// The child goes into the PID namespace for this process's children,
-    /// unless `new_pid_namespace` gives options, in which case it is the first
-    /// process of a new namespace with those options, nested in this
-    /// process's. The child's parent is this process, or this process's
-    /// parent if `sibling` is set.
+    /// unless `request.new_pid_namespace` gives options, in which case it is
+    /// the first process of a new namespace with those options, nested in
+    /// this process's. The child's parent is this process, or this process's
+    /// parent if `request.sibling` is set. With
+    /// `request.inherit_segment_attachments`, it starts with copies of this
+    /// process's segment attachments.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
     pub fn allocate_child_process(
         &self,
-        new_pid_namespace: Option<PidNamespaceOptions>,
-        sibling: bool,
+        request: AllocateChildRequest,
     ) -> Result<ProcessIdentity, Channel::Error> {
-        match self.request_process(ProcessRequest::AllocateChild(AllocateChildRequest {
-            new_pid_namespace,
-            sibling,
-        }))? {
+        match self.request_process(ProcessRequest::AllocateChild(request))? {
             ProcessResponse::AllocateChild(child) => Ok(child),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
-    /// Makes the children this process creates from now on go into a new PID
-    /// namespace with `options`, nested in this process's.
-    ///
-    /// Returns `UnsupportedOperation` if this process's children already go
-    /// to another PID namespace.
+    /// Applies all the namespace changes to this process or its pending child
+    /// in one broker request, or none of them.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
-    pub fn create_children_pid_namespace(
+    pub fn create_namespaces(
         &self,
-        options: PidNamespaceOptions,
+        request: CreateNamespacesRequest,
     ) -> Result<(), Channel::Error> {
-        match self.request_process(ProcessRequest::CreateChildrenPidNamespace(options))? {
-            ProcessResponse::CreateChildrenPidNamespace => Ok(()),
+        match self.request_process(ProcessRequest::CreateNamespaces(request))? {
+            ProcessResponse::CreateNamespaces => Ok(()),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
@@ -478,21 +474,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             name: buffer,
         }))? {
             ProcessResponse::SetHostName => Ok(()),
-            response => panic!("broker returned unexpected process response: {response:?}"),
-        }
-    }
-
-    /// Replaces the host names of this process or of its pending child
-    /// `process_id` with a copy that no other process shares.
-    ///
-    /// Returns `UnknownObject` if `process_id` is neither.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a response for another operation.
-    pub fn copy_host_names(&self, process_id: ProcessId) -> Result<(), Channel::Error> {
-        match self.request_process(ProcessRequest::CopyHostNames(process_id))? {
-            ProcessResponse::CopyHostNames => Ok(()),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

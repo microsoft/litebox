@@ -471,6 +471,18 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     /// Build the shim.
     pub fn build(self) -> LinuxShim<Platform> {
         let litebox = Arc::new(self.litebox);
+        // The child's native clone inherits the VMAs but must publish to its own broker
+        // connection. The publisher must not keep this LiteBox alive with the memory manager; once
+        // it is gone, the broker has released all of this process's attachments.
+        let segment_client = Arc::downgrade(&litebox);
+        self.memory_manager.set_sysv_publisher(move |counts| {
+            if let Some(litebox) = segment_client.upgrade()
+                && let Err(error) = litebox.set_segment_attachments(counts)
+            {
+                // A segment's next publication, with its full count, makes up for this one.
+                litebox_util_log::warn!(counts:?, error:?; "failed to update shared segment attachment counts");
+            }
+        });
         let global = Arc::new(GlobalState {
             platform: self.platform,
             mm: self.memory_manager,
@@ -1064,6 +1076,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Setsid
                     | SyscallRequest::Getsid { .. }
                     | SyscallRequest::Unshare { .. }
+                    // The segment handlers reject these without touching parent state.
+                    | SyscallRequest::Shmget { .. }
+                    | SyscallRequest::Shmat { .. }
+                    | SyscallRequest::Shmdt { .. }
+                    | SyscallRequest::Shmctl { .. }
                     | SyscallRequest::Uname { .. }
                     | SyscallRequest::Sethostname { .. }
                     | SyscallRequest::Setdomainname { .. }
@@ -1333,6 +1350,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .sys_mremap(old_addr, old_size, new_size, flags, new_addr)
                 .map(|ptr| ptr.as_usize()),
             SyscallRequest::Munmap { addr, length } => syscall!(sys_munmap(addr, length)),
+            SyscallRequest::Shmget { key, size, shmflg } => syscall!(sys_shmget(key, size, shmflg)),
+            SyscallRequest::Shmat {
+                shmid,
+                shmaddr,
+                shmflg,
+            } => self
+                .sys_shmat(shmid, shmaddr, shmflg)
+                .map(|ptr| ptr.as_usize()),
+            SyscallRequest::Shmdt { shmaddr } => syscall!(sys_shmdt(shmaddr)),
+            SyscallRequest::Shmctl { shmid, cmd, buf } => syscall!(sys_shmctl(shmid, cmd, buf)),
             SyscallRequest::Brk { addr } => self.sys_brk(addr),
             SyscallRequest::Readv { fd, iovec, iovcnt } => self.sys_readv(fd, iovec, iovcnt),
             SyscallRequest::Writev { fd, iovec, iovcnt } => self.sys_writev(fd, iovec, iovcnt),

@@ -32,8 +32,8 @@ use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit,
-    ThreadInfo,
+    AllocateChildRequest, ChildExit, ChildSelector, CreateNamespacesRequest, PidNamespaceOptions,
+    ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -296,10 +296,7 @@ pub(super) enum RestartBlock<Instant> {
     },
 }
 
-/// The UTS and IPC namespace flags, which need the permission check. A new UTS namespace gets a
-/// copy of its creator's host names (see `ChildRelation::new_host_names`). LiteBox has no IPC
-/// objects, so a new IPC namespace has nothing to scope and is indistinguishable from its
-/// creator's; IPC objects, if added, must be kept per namespace.
+/// Namespace flags requiring administrative permission even without a new PID namespace.
 const UTS_AND_IPC_NAMESPACE_FLAGS: CloneFlags = CloneFlags::NEWUTS.union(CloneFlags::NEWIPC);
 
 /// How a new child process relates to the process creating it.
@@ -310,18 +307,17 @@ struct ChildRelation {
     new_pid_namespace: bool,
     /// Whether the child's parent is the creating process's parent.
     sibling: bool,
-    /// Whether the child is in a new UTS namespace, with its own copy of the creating process's
-    /// host names rather than sharing them.
-    new_host_names: bool,
+    /// Which of its creator's UTS and IPC namespaces the child does not share.
+    new_namespaces: CloneFlags,
 }
 
 impl ChildRelation {
-    /// A plain child, in the PID namespace for the creating process's children, sharing its host
-    /// names.
+    /// A plain child, in the PID namespace for the creating process's children, sharing its UTS
+    /// and IPC namespaces.
     const CHILD: Self = Self {
         new_pid_namespace: false,
         sibling: false,
-        new_host_names: false,
+        new_namespaces: CloneFlags::empty(),
     };
 }
 
@@ -1032,17 +1028,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         })
     }
 
-    /// Allocates a pending child of this process, as `relation` describes.
-    fn allocate_child_process(&self, relation: ChildRelation) -> Result<PendingChild, Errno> {
+    /// Allocates a pending child of this process, as `relation` describes. With
+    /// `inherit_segment_attachments`, the child, which inherits this address space, starts with
+    /// copies of this process's SysV attachments.
+    fn allocate_child_process(
+        &self,
+        relation: ChildRelation,
+        inherit_segment_attachments: bool,
+    ) -> Result<PendingChild, Errno> {
         let child = self
             .global
             .litebox
-            .allocate_child_process(
-                relation
+            .allocate_child_process(AllocateChildRequest {
+                new_pid_namespace: relation
                     .new_pid_namespace
                     .then_some(PidNamespaceOptions::INIT),
-                relation.sibling,
-            )
+                sibling: relation.sibling,
+                inherit_segment_attachments,
+            })
             .map_err(|error| match error {
                 // The child's namespace ended with its first process, as Linux's `alloc_pid`
                 // fails in a namespace whose init exited. The error also stands for refusals
@@ -1054,10 +1057,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 error => error.into(),
             })?;
         // On failure, dropping the child cancels it.
-        if relation.new_host_names {
-            self.global
+        if !relation.new_namespaces.is_empty() {
+            match self
+                .global
                 .litebox
-                .copy_host_names(child.identity().process_id)?;
+                .create_namespaces(CreateNamespacesRequest {
+                    process_id: child.identity().process_id,
+                    children_pid_namespace: None,
+                    new_segment_namespace: relation.new_namespaces.contains(CloneFlags::NEWIPC),
+                    copy_host_names: relation.new_namespaces.contains(CloneFlags::NEWUTS),
+                }) {
+                // Without the services, host names are fixed and there are no segments.
+                Ok(()) | Err(ProcessError::Unavailable) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(child)
     }
@@ -1111,9 +1124,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Unlike Linux, `CLONE_NEWPID` fails in a `vfork` child, whose requests go to the broker as
     /// its parent's, and in a process with more than one thread, since LiteBox keeps the PID
-    /// namespace for a process's children per process rather than per thread. Likewise, since
-    /// LiteBox keeps host names per process, `CLONE_NEWUTS` moves the whole process, with all its
-    /// threads, to the new UTS namespace, not just the calling thread.
+    /// namespace for a process's children per process rather than per thread. UTS and IPC
+    /// namespace changes likewise move all threads in the process, not just the calling thread.
     pub(crate) fn sys_unshare(&self, flags: CloneFlags) -> Result<usize, Errno> {
         if flags.is_empty() {
             return Ok(0);
@@ -1123,7 +1135,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
         self.check_admin()?;
-        if flags.contains(CloneFlags::NEWPID) {
+        let new_pid = flags.contains(CloneFlags::NEWPID);
+        if new_pid {
             // A `vfork` child makes its requests as its parent, whose children this would change.
             if self.vfork.borrow().is_some() {
                 log_unsupported!("unshare(CLONE_NEWPID) in a vfork child");
@@ -1135,30 +1148,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if self.thread.process.nr_threads() > 1 {
                 return Err(Errno::EINVAL);
             }
-            self.global
-                .litebox
-                .create_children_pid_namespace(PidNamespaceOptions::INIT)
-                .map_err(|error| match error {
-                    // The namespace limits, like Linux's nesting and count limits.
-                    ProcessError::ResourceExhausted => Errno::ENOSPC,
-                    error => error.into(),
-                })?;
+        }
+        match self
+            .global
+            .litebox
+            .create_namespaces(CreateNamespacesRequest {
+                process_id: ProcessId(self.own_pid_for_requests().cast_unsigned()),
+                children_pid_namespace: new_pid.then_some(PidNamespaceOptions::INIT),
+                new_segment_namespace: flags.contains(CloneFlags::NEWIPC),
+                copy_host_names: flags.contains(CloneFlags::NEWUTS),
+            }) {
+            Ok(()) => {}
+            // Without the services, host names are fixed and there are no segments.
+            Err(ProcessError::Unavailable) if !new_pid => return Ok(0),
+            // The namespace limits, like Linux's nesting and count limits.
+            Err(ProcessError::ResourceExhausted) => return Err(Errno::ENOSPC),
+            Err(error) => return Err(error.into()),
+        }
+        if new_pid {
             self.thread
                 .process
                 .pid_namespace_unshared
                 .store(true, Ordering::Relaxed);
-        }
-        // Last, so that a failure above leaves the host names shared. If LiteBox can't change host
-        // names (`ProcessError::Unavailable`), they are fixed, so there is nothing to copy.
-        if flags.contains(CloneFlags::NEWUTS) {
-            match self
-                .global
-                .litebox
-                .copy_host_names(ProcessId(self.own_pid_for_requests().cast_unsigned()))
-            {
-                Ok(()) | Err(ProcessError::Unavailable) => {}
-                Err(error) => return Err(error.into()),
-            }
         }
         Ok(0)
     }
@@ -1949,8 +1960,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // The child keeps the references it inherits until it exits, so check the size first.
         startup.encode().map_err(|_| Errno::ENOMEM)?;
 
-        // Dropping the pending child on failure discards it.
-        let child = self.allocate_child_process(relation)?;
+        // Dropping the pending child on failure discards it, releasing any attachments it
+        // inherited. Only a native child inherits SysV attachments, and copy-based fork refuses
+        // shared mappings, so a child with attachments always starts natively or not at all.
+        let child = self.allocate_child_process(relation, self.global.mm.has_sysv_attachments())?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let (cwd, handles) = self.inherit_with_cwd(&child, &mut objects)?;
@@ -2167,7 +2180,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if self.vfork.borrow().is_some() || !self.thread.process.has_default_alarm_state() {
             return Err(Errno::EAGAIN);
         }
-        let child = self.allocate_child_process(relation)?;
+        // A vfork child execs a fresh image, so it gets no SysV attachments.
+        let child = self.allocate_child_process(relation, false)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let child_own_pid =
@@ -2345,7 +2359,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let relation = ChildRelation {
                 new_pid_namespace: self.clone_creates_pid_namespace(flags)?,
                 sibling,
-                new_host_names: flags.contains(CloneFlags::NEWUTS),
+                new_namespaces: flags & UTS_AND_IPC_NAMESPACE_FLAGS,
             };
             let child_tid: usize = child_tid.trunc();
             let tid_if = |flag| if flags.contains(flag) { child_tid } else { 0 };
@@ -2388,7 +2402,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let relation = ChildRelation {
                 new_pid_namespace: self.clone_creates_pid_namespace(flags)?,
                 sibling: false,
-                new_host_names: flags.contains(CloneFlags::NEWUTS),
+                new_namespaces: flags & UTS_AND_IPC_NAMESPACE_FLAGS,
             };
             return self.begin_vfork(
                 ctx,
@@ -4329,6 +4343,31 @@ mod tests {
     };
     use litebox_broker_transport::channel::LocalCallChannel;
 
+    #[test]
+    fn denied_segment_namespace_keeps_pid_namespace_unchanged() {
+        use crate::syscalls::tests::TestPlatform;
+        use litebox::platform::ThreadProvider;
+        use litebox_common_linux::{CloneFlags, errno::Errno};
+
+        let platform = crate::syscalls::tests::test_platform();
+        TestPlatform::run_test_thread(|| {
+            // The test task is guest root, but the broker's segment principal is not.
+            let (litebox, process_id) = crate::syscalls::test_broker::litebox(platform);
+            let shim =
+                crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id).build();
+            let task = shim.0.new_test_task();
+            assert_eq!(
+                task.sys_unshare(CloneFlags::NEWPID | CloneFlags::NEWIPC | CloneFlags::NEWUTS),
+                Err(Errno::EPERM),
+            );
+            assert!(!task.pid_namespace_unshared());
+            // A second PID unshare would be rejected by the broker if it had
+            // changed its children namespace despite the error.
+            assert_eq!(task.sys_unshare(CloneFlags::NEWPID), Ok(0));
+            assert!(task.pid_namespace_unshared());
+        });
+    }
+
     struct ForkRecordingChannel {
         inner: InProcessBrokerChannel,
         requests: alloc::sync::Arc<
@@ -4874,7 +4913,7 @@ mod tests {
 
     #[test]
     fn wait4_echild_drains_unnotified_ignored_child_exit() {
-        use litebox_broker_protocol::process::ProcessExitStatus;
+        use litebox_broker_protocol::process::{AllocateChildRequest, ProcessExitStatus};
         use litebox_common_linux::{
             errno::Errno,
             signal::{SIG_IGN, SigSet, SigmaskHow, Signal},
@@ -4886,7 +4925,7 @@ mod tests {
             let child = task
                 .global
                 .litebox
-                .allocate_child_process(None, false)
+                .allocate_child_process(AllocateChildRequest::default())
                 .unwrap();
             child.exit(ProcessExitStatus::Exited { code: 11 }).unwrap();
             forget_signal_notification(task);
@@ -4933,11 +4972,13 @@ mod tests {
         use litebox::event::{Events, IOPollable as _};
         use litebox::process::ProcessError;
         use litebox_broker_protocol::fs::FileOpenFlags;
-        use litebox_broker_protocol::process::ProcessExitStatus;
+        use litebox_broker_protocol::process::{AllocateChildRequest, ProcessExitStatus};
 
         let platform = crate::syscalls::tests::test_platform();
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child = litebox
+            .allocate_child_process(AllocateChildRequest::default())
+            .unwrap();
         let child_id = child.identity().process_id;
         let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let observer = Arc::new(RecordedEvents::new());
@@ -5000,12 +5041,16 @@ mod tests {
         };
         use litebox::event::{Events, wait::WaitState};
         use litebox_broker_protocol::fs::FileOpenFlags;
-        use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus};
+        use litebox_broker_protocol::process::{
+            AllocateChildRequest, ChildSelector, ProcessExitStatus,
+        };
         use litebox_broker_protocol::readiness_queue::ReadinessQueueEntryFlags;
 
         let platform = crate::syscalls::tests::test_platform();
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child = litebox
+            .allocate_child_process(AllocateChildRequest::default())
+            .unwrap();
         let child_id = child.identity().process_id;
         let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let queue = ReadinessQueue::new(&litebox).unwrap();
@@ -6868,7 +6913,9 @@ mod fork_tests {
         );
         let (litebox, _) =
             crate::syscalls::test_broker::litebox_with_channel(platform, limits, StartChannel);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child = litebox
+            .allocate_child_process(AllocateChildRequest::default())
+            .unwrap();
         let launcher = launcher();
         // SAFETY: No native child is created and no guest threads or guest startup state exist.
         let result = unsafe { launcher.start(&child, b"startup") };

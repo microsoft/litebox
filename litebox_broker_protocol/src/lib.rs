@@ -29,6 +29,7 @@ pub mod process_group;
 pub mod random;
 pub mod readiness;
 pub mod readiness_queue;
+pub mod segment;
 pub mod shared_buffer;
 pub mod shared_futex;
 pub mod signal;
@@ -103,4 +104,4 @@ pub struct SharedObjectToken(pub u64);
 pub struct ProtocolVersion(pub u16);
 
 /// Current broker protocol version.
-pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
+pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(2);

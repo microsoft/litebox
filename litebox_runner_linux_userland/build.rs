@@ -56,6 +56,7 @@ const DUPLICATING_C_TESTS: &[&str] = &[
     "process_tree_parent.c",
     "rlimit_parent.c",
     "shared_file_mapping.c",
+    "shared_memory_segment.c",
     "sigtimedwait_fork_parent.c",
     "thread_kill_process_parent.c",
     "vfork_exit_parent.c",
@@ -108,6 +109,11 @@ const NATIVE_SKIPPED_C_TESTS: &[(&str, &str)] = &[
         "expects LiteBox's initial process to have no parent and adopt orphans, which natively \
          only the first process of a PID namespace does, but that one also ignores signals it has \
          no handler for",
+    ),
+    (
+        "shared_memory_segment.c",
+        "gives a segment to a user the native user namespace doesn't map, and keys segments by \
+         PID in the host's IPC namespace, where every native run has the same PID",
     ),
     ("tcp_broker.c", "needs arguments from its broker test"),
     (

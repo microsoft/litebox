@@ -38,6 +38,21 @@ pub struct ProcessStartupData {
 }
 
 wire_struct! {
+    /// The namespace changes to apply together to the caller or its pending child.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreateNamespacesRequest {
+        /// The caller's process ID, or its pending child's ID in the caller's PID namespace.
+        pub process_id: ProcessId,
+        /// Give the caller's future children a new PID namespace. Only valid for the caller itself.
+        pub children_pid_namespace: Option<PidNamespaceOptions>,
+        /// Move the target into a new, empty shared-segment namespace.
+        pub new_segment_namespace: bool,
+        /// Give the target a private copy of its host names.
+        pub copy_host_names: bool,
+    }
+}
+
+wire_struct! {
     /// How a PID namespace behaves. A namespace that no process created has the
     /// options its host gives it.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,7 +85,7 @@ impl PidNamespaceOptions {
 
 wire_struct! {
     /// Creates a pending child process and its initial thread.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct AllocateChildRequest {
         /// If set, the child is the first process of a new PID namespace with
         /// these options, nested in the caller's. Otherwise, the child goes into
@@ -79,6 +94,9 @@ wire_struct! {
         /// Whether the child's parent is the caller's parent rather than the
         /// caller. Either way, the caller owns the child until it starts.
         pub sibling: bool,
+        /// Whether the child starts with copies of the caller's segment
+        /// attachments, because it inherits the caller's address space.
+        pub inherit_segment_attachments: bool,
     }
 }
 

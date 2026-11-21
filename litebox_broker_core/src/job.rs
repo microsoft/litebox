@@ -13,7 +13,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicU64, AtomicUsize};
 
 use hashbrown::HashMap;
 use spin::rwlock::RwLock;
@@ -32,6 +32,11 @@ pub struct Job {
     /// PID namespaces that this job's processes have created and that still
     /// exist.
     pub(crate) pid_namespaces: Arc<AtomicUsize>,
+    /// Keyed shared segments that this job's processes have created and that
+    /// still exist.
+    pub(crate) segments: Arc<AtomicUsize>,
+    /// The page-rounded bytes of those segments.
+    pub(crate) segment_bytes: Arc<AtomicU64>,
     lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>,
 }
 
@@ -55,6 +60,8 @@ impl Job {
             }),
             threads: AtomicUsize::new(0),
             pid_namespaces: Arc::new(AtomicUsize::new(0)),
+            segments: Arc::new(AtomicUsize::new(0)),
+            segment_bytes: Arc::new(AtomicU64::new(0)),
             lifecycle_sink,
         })
     }

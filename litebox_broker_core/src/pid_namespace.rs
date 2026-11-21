@@ -11,7 +11,7 @@
 //! A root process belongs to the namespace it is created in (see
 //! [`BrokerCore::create_process`](crate::BrokerCore::create_process)), which
 //! is a top-level one. A child belongs to its creator's namespace or to one
-//! nested in it (see [`BrokerProcess::create_children_pid_namespace`]). Root
+//! nested in it (see [`BrokerProcess::create_namespaces`]). Root
 //! processes in different jobs can share a namespace, as containers do when
 //! they share a pod's process namespace.
 
@@ -360,6 +360,19 @@ mod tests {
         BrokerCoreLimits, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
         ProcessShutdown,
     };
+
+    /// Makes `process`'s later children go into a new PID namespace with `options`.
+    fn create_children_pid_namespace(
+        process: &BrokerProcess,
+        options: PidNamespaceOptions,
+    ) -> crate::Result<()> {
+        process.create_namespaces(litebox_broker_protocol::process::CreateNamespacesRequest {
+            process_id: process.id(),
+            children_pid_namespace: Some(options),
+            new_segment_namespace: false,
+            copy_host_names: false,
+        })
+    }
 
     fn broker(limits: BrokerCoreLimits) -> TestBroker {
         TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
@@ -878,8 +891,7 @@ mod tests {
     #[test]
     fn later_children_go_to_the_children_pid_namespace() {
         let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
-        root.create_children_pid_namespace(PidNamespaceOptions::default())
-            .unwrap();
+        create_children_pid_namespace(&root, PidNamespaceOptions::default()).unwrap();
         let first = allocate(&root, None, false).unwrap();
         let second = allocate(&root, None, false).unwrap();
         assert_eq!(first.id(), ProcessId(1));
@@ -888,7 +900,7 @@ mod tests {
         // A process whose children go to another namespace can't make one.
         let new_pid_namespace = Some(PidNamespaceOptions::default());
         assert_eq!(
-            root.create_children_pid_namespace(PidNamespaceOptions::default()),
+            create_children_pid_namespace(&root, PidNamespaceOptions::default()),
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(
@@ -906,7 +918,7 @@ mod tests {
     fn process_info_tells_a_namespace_s_first_process_and_its_options() {
         let (_broker, root) = duplicating_broker(BrokerCoreLimits::DEFAULT);
         let options = PidNamespaceOptions::new(false, true);
-        root.create_children_pid_namespace(options).unwrap();
+        create_children_pid_namespace(&root, options).unwrap();
         let first = allocate(&root, None, false).unwrap();
         let later = allocate(&root, None, false).unwrap();
         let first_in_namespace = |process: &BrokerProcess| {
@@ -943,8 +955,7 @@ mod tests {
         let (nested, _nested) = allocate(Some(PidNamespaceOptions::default()));
         assert_eq!(nested.own_process_id, ProcessId(1));
         assert_ne!(nested.process_id, ProcessId(1));
-        root.create_children_pid_namespace(PidNamespaceOptions::default())
-            .unwrap();
+        create_children_pid_namespace(&root, PidNamespaceOptions::default()).unwrap();
         let (first, _first) = allocate(None);
         let (later, _later) = allocate(None);
         assert_eq!(first.own_process_id, ProcessId(1));
@@ -1075,8 +1086,7 @@ mod tests {
         let limits = BrokerCoreLimits::DEFAULT.with_thread_quotas(2, 2);
         let (broker, root) = duplicating_broker(limits);
         let other = create(&broker, None);
-        root.create_children_pid_namespace(PidNamespaceOptions::new(true, false))
-            .unwrap();
+        create_children_pid_namespace(&root, PidNamespaceOptions::new(true, false)).unwrap();
         assert_eq!(
             allocate(&root, None, false).map(|_| ()),
             Err(BrokerError::ResourceExhausted)
@@ -1096,9 +1106,7 @@ mod tests {
         root.set_orphan_adoption(true).unwrap();
         let parent = create(&broker, Some(&root));
         parent.complete_start().unwrap();
-        parent
-            .create_children_pid_namespace(PidNamespaceOptions::new(true, false))
-            .unwrap();
+        create_children_pid_namespace(&parent, PidNamespaceOptions::new(true, false)).unwrap();
         let first = allocate(&parent, None, false).unwrap();
         first.complete_start().unwrap();
         let starting = allocate(&parent, None, false).unwrap();

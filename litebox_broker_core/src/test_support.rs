@@ -27,6 +27,7 @@ use crate::{
     fs::{
         FileResult, FileService, UnsupportedFileService,
         errors::{ReadError, WriteError},
+        shared_storage::SharedFileMemoryProvider,
     },
     job::Job,
     pid_namespace::{PidNamespace, PidNamespaceId},
@@ -51,6 +52,7 @@ pub struct TestBrokerBuilder {
     vsock_provider: Option<Arc<dyn VsockProvider>>,
     random_provider: Arc<dyn RandomProvider>,
     timer_provider: Arc<dyn TimerProvider>,
+    segment_memory_provider: Option<Arc<dyn SharedFileMemoryProvider>>,
     fs: Arc<dyn FileService>,
     lifecycle_sink: Option<Arc<dyn ProcessLifecycleSink>>,
     host_names: HostNames,
@@ -67,6 +69,7 @@ impl TestBrokerBuilder {
             vsock_provider: None,
             random_provider: Arc::new(FailingRandomProvider),
             timer_provider: Arc::new(UnsupportedTimerProvider),
+            segment_memory_provider: None,
             fs: Arc::new(UnsupportedFileService),
             lifecycle_sink: None,
             host_names: HostNames::default(),
@@ -108,6 +111,16 @@ impl TestBrokerBuilder {
         self
     }
 
+    /// Installs the provider of keyed shared segment storage used by the test.
+    #[must_use]
+    pub fn with_segment_memory_provider(
+        mut self,
+        provider: Arc<dyn SharedFileMemoryProvider>,
+    ) -> Self {
+        self.segment_memory_provider = Some(provider);
+        self
+    }
+
     /// Installs the broker-authoritative file service used by the test.
     #[must_use]
     pub fn with_file_service(mut self, fs: Arc<dyn FileService>) -> Self {
@@ -144,6 +157,7 @@ impl TestBrokerBuilder {
             self.vsock_provider,
             self.random_provider,
             self.timer_provider,
+            self.segment_memory_provider,
         )?;
         let pid_namespace = Arc::new(PidNamespace::new(&core)?);
         Ok(TestBroker {
@@ -504,6 +518,10 @@ struct ManualTimerState {
 }
 
 impl ManualTimerProvider {
+    /// The wall-clock time, in seconds since the Unix epoch, when the clock
+    /// starts.
+    pub const EPOCH_SECONDS: u64 = 1_000_000_000;
+
     /// Advances the clock by `duration` and fires every alarm whose deadline
     /// passed.
     pub fn advance(&self, duration: Duration) {
@@ -533,6 +551,12 @@ impl ManualTimerProvider {
 }
 
 impl TimerProvider for ManualTimerProvider {
+    /// A wall clock that starts at [`ManualTimerProvider::EPOCH_SECONDS`] and
+    /// advances with [`Self::now`].
+    fn unix_seconds(&self) -> u64 {
+        Self::EPOCH_SECONDS + self.state.lock().now.as_secs()
+    }
+
     fn now(&self) -> Duration {
         self.state.lock().now
     }

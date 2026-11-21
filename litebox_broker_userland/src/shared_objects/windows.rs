@@ -17,7 +17,9 @@ use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRIT
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
 };
-use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_EXECUTE_READWRITE};
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+};
 
 use super::SharedObjectDelivery;
 use super::host_file::{
@@ -257,6 +259,27 @@ impl SectionDelivery {
 
 impl SharedObjectDelivery for SectionDelivery {
     fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64> {
+        self.deliver_section(object, writable, end, true)
+    }
+
+    fn deliver_segment(
+        &self,
+        object: &dyn SharedFileObject,
+        writable: bool,
+        end: u64,
+    ) -> IoResult<u64> {
+        self.deliver_section(object, writable, end, false)
+    }
+}
+
+impl SectionDelivery {
+    fn deliver_section(
+        &self,
+        object: &dyn SharedFileObject,
+        writable: bool,
+        end: u64,
+        executable: bool,
+    ) -> IoResult<u64> {
         // The object lends the file's handle, from which the section derives the rights.
         let file = super::host_handle(object, writable)?;
         let file = usize::try_from(file.raw())
@@ -264,14 +287,18 @@ impl SharedObjectDelivery for SectionDelivery {
             as windows_sys::Win32::Foundation::HANDLE;
         // Only a writable section can extend the file to cover `end`. A runner that may only read
         // the file still cannot map it writable: it receives no right to.
-        let section = section(file, end)?;
-        self.0.send(section, writable)
+        let section = section(file, end, executable)?;
+        self.0.send(section, writable, executable)
     }
 }
 
 /// Creates a writable section of the file `file`, `size` bytes long, extending the file if it
-/// is shorter.
-fn section(file: windows_sys::Win32::Foundation::HANDLE, size: u64) -> IoResult<OwnedHandle> {
+/// is shorter. Only an `executable` section can back executable views.
+fn section(
+    file: windows_sys::Win32::Foundation::HANDLE,
+    size: u64,
+    executable: bool,
+) -> IoResult<OwnedHandle> {
     let high = u32::try_from(size >> 32).map_err(IoError::other)?;
     let low = u32::try_from(size & u64::from(u32::MAX)).map_err(IoError::other)?;
     // SAFETY: `file` is a live file handle that the caller borrows for the call. The section is
@@ -280,7 +307,11 @@ fn section(file: windows_sys::Win32::Foundation::HANDLE, size: u64) -> IoResult<
         CreateFileMappingW(
             file,
             std::ptr::null(),
-            PAGE_EXECUTE_READWRITE,
+            if executable {
+                PAGE_EXECUTE_READWRITE
+            } else {
+                PAGE_READWRITE
+            },
             high,
             low,
             std::ptr::null(),
@@ -384,10 +415,39 @@ mod tests {
         use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::System::Memory::{
-            FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-            UnmapViewOfFile,
+            FILE_MAP_EXECUTE, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS,
+            MapViewOfFile, UnmapViewOfFile,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        #[test]
+        fn segment_sections_are_non_executable() {
+            // SAFETY: The pseudo-handle names this process and is always valid.
+            let process = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
+            let delivery = SectionDelivery::new(process).unwrap();
+            let object = TempFileMemoryProvider.create_segment(4096).unwrap();
+            for writable in [false, true] {
+                let token = delivery.deliver_segment(&*object, writable, 4096).unwrap();
+                // SAFETY: This test exclusively owns the newly delivered handle.
+                let section = unsafe {
+                    OwnedHandle::from_raw_handle(usize::try_from(token).unwrap() as HANDLE)
+                };
+                let maps = |access| {
+                    // SAFETY: Maps a view of the live section, which nothing else uses.
+                    let view =
+                        unsafe { MapViewOfFile(section.as_raw_handle(), access, 0, 0, 4096) };
+                    if view.Value.is_null() {
+                        return false;
+                    }
+                    // SAFETY: Unmaps the view just mapped, which nothing borrows.
+                    assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
+                    true
+                };
+                assert!(maps(FILE_MAP_READ));
+                assert_eq!(maps(FILE_MAP_READ | FILE_MAP_WRITE), writable);
+                assert!(!maps(FILE_MAP_READ | FILE_MAP_EXECUTE));
+            }
+        }
 
         #[test]
         fn delivered_sections_share_pages_and_keep_read_only_rights() {

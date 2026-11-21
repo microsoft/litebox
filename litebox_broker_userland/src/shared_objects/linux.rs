@@ -6,15 +6,17 @@ use std::io::{Error as IoError, Result as IoResult};
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
+use rustix::fs::MemfdFlags;
+
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_storage::{
-    HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
+    HostHandle, SegmentStorageError, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
 };
 use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::SharedObjectDelivery;
-use super::host_file::{Exported, HostFile, create, host_len, storage_error};
+use super::host_file::{Exported, HostFile, create, export_only_object, host_len, storage_error};
 
 /// A memfd, whose size is the file's size, so Linux keeps no state of its own.
 #[derive(Default)]
@@ -101,23 +103,46 @@ impl<T: std::os::fd::AsFd + Send> HostHandle for Exported<T> {
 /// Creates memory for files in memfds, accessed only through positional I/O by the broker.
 pub struct MemfdFileMemoryProvider;
 
-fn memfd() -> Result<File, StorageError> {
-    use rustix::fs::{MemfdFlags, memfd_create};
-
-    // Ask for execution support where the host otherwise seals memfds against execution.
-    // Older kernels and hosts that forbid it leave a plain memfd as the best available.
-    memfd_create(
-        c"litebox-shared-file",
-        MemfdFlags::CLOEXEC | MemfdFlags::EXEC,
-    )
-    .or_else(|_| memfd_create(c"litebox-shared-file", MemfdFlags::CLOEXEC))
-    .map(File::from)
-    .map_err(|error| storage_error::<Memfd>(&error.into()))
+/// Creates a close-on-exec memfd named `name` with `flags`.
+fn memfd(name: &core::ffi::CStr, flags: MemfdFlags) -> IoResult<File> {
+    rustix::fs::memfd_create(name, MemfdFlags::CLOEXEC | flags)
+        .map(File::from)
+        .map_err(IoError::from)
 }
 
 impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
     fn create(&self) -> Result<SharedFileMemory, StorageError> {
-        Ok(create::<Memfd>(memfd()?))
+        // Ask for execution support where the host otherwise seals memfds against execution.
+        // Older kernels and hosts that forbid it leave a plain memfd as the best available.
+        let file = memfd(c"litebox-shared-file", MemfdFlags::EXEC)
+            .or_else(|_| memfd(c"litebox-shared-file", MemfdFlags::empty()))
+            .map_err(|error| storage_error::<Memfd>(&error))?;
+        Ok(create::<Memfd>(file))
+    }
+
+    fn create_segment(&self, len: usize) -> Result<Arc<dyn SharedFileObject>, SegmentStorageError> {
+        use rustix::fs::{SealFlags, fcntl_add_seals};
+        let length = u64::try_from(len)
+            .ok()
+            .filter(|length| *length <= Memfd::size_limit())
+            .ok_or(SegmentStorageError::NoSpace)?;
+        let file = memfd(c"litebox-segment", MemfdFlags::ALLOW_SEALING)
+            .map_err(|error| segment_storage_error(&error))?;
+        file.set_len(length)
+            .map_err(|error| segment_storage_error(&error))?;
+        fcntl_add_seals(&file, SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)
+            .map_err(|error| segment_storage_error(&error.into()))?;
+        Ok(export_only_object::<Memfd>(file))
+    }
+}
+
+fn segment_storage_error(error: &IoError) -> SegmentStorageError {
+    if litebox_broker_transport_linux_userland::is_resource_exhaustion(error) {
+        return SegmentStorageError::OutOfMemory;
+    }
+    match error.raw_os_error() {
+        Some(libc::ENOSPC | libc::EFBIG | libc::EDQUOT) => SegmentStorageError::NoSpace,
+        _ => SegmentStorageError::Io,
     }
 }
 
@@ -142,13 +167,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn segment_backing_has_fixed_size_and_attenuated_handles() {
+        use rustix::fs::SealFlags;
+        let object = MemfdFileMemoryProvider.create_segment(8192).unwrap();
+        for writable in [false, true] {
+            let handle = object.host_handle(writable).unwrap();
+            let raw = std::os::fd::RawFd::try_from(handle.raw()).unwrap();
+            // SAFETY: the live HostHandle owns or borrows this descriptor.
+            let fd = unsafe { BorrowedFd::borrow_raw(raw) };
+            assert_eq!(rustix::fs::fstat(fd).unwrap().st_size, 8192);
+            assert!(
+                rustix::fs::fcntl_get_seals(fd)
+                    .unwrap()
+                    .contains(SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)
+            );
+            let access = rustix::fs::fcntl_getfl(fd).unwrap() & rustix::fs::OFlags::ACCMODE;
+            assert_eq!(
+                access,
+                if writable {
+                    rustix::fs::OFlags::RDWR
+                } else {
+                    rustix::fs::OFlags::RDONLY
+                }
+            );
+        }
+    }
+
+    #[test]
     fn memfd_memory_reads_writes_and_resizes() {
         super::super::host_file::tests::check_reads_writes_and_resizes(&MemfdFileMemoryProvider);
     }
 
     #[test]
     fn memfd_memory_stays_within_size_limits() {
-        super::super::host_file::tests::check_size_limit::<Memfd>(memfd().unwrap());
+        super::super::host_file::tests::check_size_limit::<Memfd>(
+            memfd(c"litebox-shared-file", MemfdFlags::empty()).unwrap(),
+        );
     }
 
     #[test]

@@ -21,12 +21,12 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameSizes,
-    OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostNameSizes, OpenProcessHandleRequest, ProcessExitStatus,
+    ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceLimit, SetHostNameRequest,
+    SetParentExitSignalRequest, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -36,6 +36,10 @@ use crate::readiness::ReadinessFlags;
 use crate::readiness_queue::{
     AddReadinessQueueEntryRequest, CreateReadinessQueueResponse, ModifyReadinessQueueEntryRequest,
     ReadinessQueueError, RemoveReadinessQueueEntryRequest, TakeReadyRequest, TakeReadyResponse,
+};
+use crate::segment::{
+    GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
+    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentStatus, SetSegmentRequest,
 };
 use crate::shared_buffer::SharedBufferSequence;
 use crate::shared_futex::{
@@ -121,6 +125,8 @@ wire_enum! {
         SharedFutex(SharedFutexRequest),
         /// Vsock socket request family.
         VsockSocket(VsockSocketRequest),
+        /// Keyed shared segment request family.
+        Segment(SegmentRequest),
     }
 }
 
@@ -203,9 +209,10 @@ impl BrokerOperation {
             | Self::Timer(_)
             | Self::Signal(_)
             | Self::SharedFutex(_)
+            | Self::Segment(_)
             | Self::Process(
                 ProcessRequest::AllocateChild(_)
-                | ProcessRequest::CreateChildrenPidNamespace(_)
+                | ProcessRequest::CreateNamespaces(_)
                 | ProcessRequest::ExitChild(_)
                 | ProcessRequest::CancelChild(_)
                 | ProcessRequest::ReportExitStatus(_)
@@ -218,7 +225,6 @@ impl BrokerOperation {
                 | ProcessRequest::GetChildrenCpuTime
                 | ProcessRequest::GetResourceLimit(_)
                 | ProcessRequest::SetResourceLimit(_)
-                | ProcessRequest::CopyHostNames(_)
                 | ProcessRequest::OpenProcessHandle(_)
                 | ProcessRequest::GetParentExitSignal(_)
                 | ProcessRequest::SetParentExitSignal(_),
@@ -389,6 +395,35 @@ wire_enum! {
 }
 
 wire_enum! {
+    /// Request about keyed shared segments in the caller's namespace, or about
+    /// the caller's attachments, which outlive a move to another namespace.
+    ///
+    /// Ordinary guest-visible failures are [`SegmentResponse::Failed`].
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SegmentRequest {
+        /// Look up a key, optionally creating a segment.
+        Get(GetSegmentRequest),
+        /// Read a segment's metadata.
+        Status(SegmentId),
+        /// Change a segment's owner and permission bits.
+        Set(SetSegmentRequest),
+        /// Unpublish a segment's key; it is freed once no attachments or
+        /// reservations remain.
+        Remove(SegmentId),
+        /// Reserve an attachment and deliver the backing object, without
+        /// changing metadata.
+        PrepareAttach(PrepareSegmentAttachRequest),
+        /// Record a reserved attachment after the caller mapped the backing object.
+        ConfirmAttach(SegmentAttachId),
+        /// Release an unused reservation without recording an attach or detach.
+        CancelAttach(SegmentAttachId),
+        /// Replace the caller's attachment counts after splitting or releasing
+        /// mapped regions.
+        SetAttachments(SegmentAttachmentCounts),
+    }
+}
+
+wire_enum! {
     /// Request about the caller's threads.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum ThreadRequest {
@@ -478,14 +513,6 @@ wire_enum! {
         /// The broker returns `UnknownObject` if the process is neither, and
         /// `PolicyDenied` if the new hard limit exceeds the current one.
         SetResourceLimit(SetResourceLimitRequest),
-        /// Make the children the caller creates from now on go into a new PID
-        /// namespace with these options, nested in the caller's. The first of
-        /// them becomes the namespace's first process.
-        ///
-        /// The broker returns `UnsupportedOperation` if the caller's children
-        /// already go to another PID namespace, and `ResourceExhausted` at a
-        /// namespace count or nesting limit.
-        CreateChildrenPidNamespace(PidNamespaceOptions),
         /// Read the host names of the caller or of its pending child, both from
         /// one moment.
         ///
@@ -496,11 +523,6 @@ wire_enum! {
         ///
         /// The broker returns `UnknownObject` if the process is neither.
         SetHostName(SetHostNameRequest),
-        /// Replace the host names of the caller or of its pending child with a
-        /// copy that no other process shares.
-        ///
-        /// The broker returns `UnknownObject` if the process is neither.
-        CopyHostNames(ProcessId),
         /// Open a handle to a process in the caller's PID namespace.
         ///
         /// The broker returns `UnknownObject` if no such process exists, and
@@ -515,6 +537,16 @@ wire_enum! {
         /// The broker returns `UnknownObject` if the process is neither, and
         /// `UnsupportedOperation` for a signal number above [`crate::signal::MAX_SIGNAL`].
         SetParentExitSignal(SetParentExitSignalRequest),
+        /// Apply the requested namespace changes to the caller or its pending
+        /// child together, or leave all its namespaces unchanged.
+        ///
+        /// The broker returns `UnknownObject` if the process is neither,
+        /// `UnsupportedOperation` if the request asks for a children's PID
+        /// namespace for a pending child or while the caller's children already
+        /// go to another one, `ResourceExhausted` at a namespace count or nesting
+        /// limit, and `PolicyDenied` if the caller may not create a segment
+        /// namespace.
+        CreateNamespaces(CreateNamespacesRequest),
     }
 }
 
@@ -699,6 +731,8 @@ wire_enum! {
         VsockSocket(VsockSocketResponse),
         /// Operation failed with an ABI-neutral broker error.
         Error(ErrorCode),
+        /// Keyed shared segment response family.
+        Segment(SegmentResponse),
     }
 }
 
@@ -781,6 +815,31 @@ wire_enum! {
 }
 
 wire_enum! {
+    /// Response about keyed shared segments.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SegmentResponse {
+        /// The segment's ID.
+        Get(SegmentId),
+        /// The segment's metadata.
+        Status(SegmentStatus),
+        /// The owner and permission bits were changed.
+        Set,
+        /// The key was unpublished.
+        Remove,
+        /// The attachment was reserved and its backing object delivered.
+        PrepareAttach(PreparedSegmentAttach),
+        /// The attachment was recorded.
+        ConfirmAttach,
+        /// The reservation was released.
+        CancelAttach,
+        /// The attachment counts were replaced.
+        SetAttachments,
+        /// Segment operation failed with a guest-visible error.
+        Failed(SegmentError),
+    }
+}
+
+wire_enum! {
     /// Response to a thread request.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum ThreadResponse {
@@ -831,21 +890,18 @@ wire_enum! {
         GetResourceLimit(ResourceLimit),
         /// The limit was replaced; this is the previous one.
         SetResourceLimit(ResourceLimit),
-        /// The children the caller creates from now on go into the new PID
-        /// namespace.
-        CreateChildrenPidNamespace,
         /// The host names were written to the request's buffer, with these sizes.
         GetHostNames(HostNameSizes),
         /// The name was replaced.
         SetHostName,
-        /// The process has its own copy of the host names.
-        CopyHostNames,
         /// A handle to the process was opened.
         OpenProcessHandle(ObjectHandle),
         /// The process's parent-exit signal, or zero for none.
         GetParentExitSignal(u32),
         /// The parent-exit signal was set.
         SetParentExitSignal,
+        /// All the requested namespace changes were applied.
+        CreateNamespaces,
     }
 }
 

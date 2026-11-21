@@ -5,10 +5,10 @@
 //!
 //! The broker answers a request for a host object that this process must hold itself, such as a
 //! memfd, with a token, after it has sent the object's descriptor tagged with the same token over
-//! a dedicated `SOCK_SEQPACKET` socket. Concurrent requests may complete in any order, so
-//! descriptors that arrive for other tokens wait here until their requester takes them.
+//! a dedicated `SOCK_SEQPACKET` socket. Tokens increase in socket order, but concurrent
+//! requesters may take them in any order, so descriptors for other tokens wait here.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind, Result};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::Mutex;
@@ -18,10 +18,6 @@ use std::sync::Mutex;
 /// without bound.
 const MAX_PENDING: usize = 64;
 
-/// Tokens whose descriptors were dropped are remembered up to this many, oldest forgotten first,
-/// so that taking one fails instead of waiting for a descriptor that will not come.
-const MAX_EVICTED: usize = 4096;
-
 /// The receiving end of the broker's shared-object socket.
 pub struct SharedObjectChannel {
     state: Mutex<State>,
@@ -30,7 +26,7 @@ pub struct SharedObjectChannel {
 struct State {
     socket: OwnedFd,
     pending: BTreeMap<u64, Result<OwnedFd>>,
-    evicted: BTreeSet<u64>,
+    last_received: u64,
 }
 
 impl SharedObjectChannel {
@@ -40,7 +36,7 @@ impl SharedObjectChannel {
             state: Mutex::new(State {
                 socket,
                 pending: BTreeMap::new(),
-                evicted: BTreeSet::new(),
+                last_received: 0,
             }),
         }
     }
@@ -48,9 +44,9 @@ impl SharedObjectChannel {
     /// Takes the descriptor that the broker sent under `token`, waiting for it if it has not
     /// been received yet.
     ///
-    /// Fails with [`ErrorKind::NotFound`] if the descriptor was received but dropped, as too
-    /// many others were waiting for their requesters, and with [`ErrorKind::InvalidData`] if its
-    /// message arrived without exactly one descriptor. Descriptor exhaustion instead reports
+    /// Fails with [`ErrorKind::NotFound`] if the token is no longer available, for example if
+    /// it was already taken or dropped because too many others were waiting, and with
+    /// [`ErrorKind::InvalidData`] for an invalid delivery. Descriptor exhaustion instead reports
     /// [`ErrorKind::OutOfMemory`].
     pub fn take(&self, token: u64) -> Result<OwnedFd> {
         let mut state = self
@@ -61,33 +57,29 @@ impl SharedObjectChannel {
             if let Some(fd) = state.pending.remove(&token) {
                 return fd;
             }
-            if state.evicted.remove(&token) {
+            // A token at or below this watermark cannot arrive in a later packet.
+            if token <= state.last_received {
                 return Err(Error::new(
                     ErrorKind::NotFound,
-                    "the shared object was dropped before it was taken",
+                    "the shared-object token is no longer available",
                 ));
             }
             let (received, fd) = receive(&state.socket)?;
+            if received <= state.last_received {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "shared-object tokens arrived out of order",
+                ));
+            }
+            state.last_received = received;
             if received == token {
                 return fd;
             }
-            if state.pending.len() >= MAX_PENDING
-                && let Some((dropped, _)) = state.pending.pop_first()
-            {
-                state.evict(dropped);
+            if state.pending.len() >= MAX_PENDING {
+                state.pending.pop_first();
             }
             state.pending.insert(received, fd);
         }
-    }
-}
-
-impl State {
-    /// Remembers that the descriptor sent under `token` will never be taken.
-    fn evict(&mut self, token: u64) {
-        if self.evicted.len() >= MAX_EVICTED {
-            self.evicted.pop_first();
-        }
-        self.evicted.insert(token);
     }
 }
 
@@ -231,11 +223,14 @@ mod tests {
             channel.take(*batch.last().unwrap()).unwrap();
             tokens.extend(&batch[..batch.len() - 1]);
         }
-        // Beyond the limit, the oldest were dropped.
-        assert_eq!(
-            channel.take(tokens[0]).unwrap_err().kind(),
-            ErrorKind::NotFound
-        );
+        // Close the socket so a regression that tries to read again fails without hanging.
+        drop(sender);
+        for _ in 0..2 {
+            assert_eq!(
+                channel.take(tokens[0]).unwrap_err().kind(),
+                ErrorKind::NotFound
+            );
+        }
         channel.take(*tokens.last().unwrap()).unwrap();
     }
 

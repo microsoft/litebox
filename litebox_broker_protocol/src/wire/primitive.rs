@@ -82,7 +82,7 @@ macro_rules! wire_integer {
     )*};
 }
 
-wire_integer!(u8, u16, u32, u64, u128, i64);
+wire_integer!(u8, u16, u32, u64, u128, i32, i64);
 
 impl<const N: usize> Wire for [u8; N] {
     const MAX_SIZE: usize = N;

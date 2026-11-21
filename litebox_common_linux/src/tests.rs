@@ -71,6 +71,10 @@ fn stat_conversions_preserve_optional_signed_timestamps() {
 }
 
 fn decode(sysno: syscalls::Sysno, args: [usize; 4]) -> SyscallRequest {
+    try_decode(sysno, args).unwrap()
+}
+
+fn try_decode(sysno: syscalls::Sysno, args: [usize; 4]) -> Result<SyscallRequest, errno::Errno> {
     #[cfg(target_arch = "x86_64")]
     let regs = PtRegs {
         rdi: args[0],
@@ -85,7 +89,7 @@ fn decode(sysno: syscalls::Sysno, args: [usize; 4]) -> SyscallRequest {
         regs: core::array::from_fn(|i| args.get(i).copied().unwrap_or(0)),
         ..Default::default()
     };
-    SyscallRequest::try_from_raw(sysno as usize, &regs, |_| {}).unwrap()
+    SyscallRequest::try_from_raw(sysno as usize, &regs, |_| {})
 }
 
 #[test]
@@ -128,6 +132,61 @@ fn mount_decodes_five_arguments_and_nullable_pointers() {
         assert_eq!(mountflags, 0x6789);
         assert_eq!(data.map(|p| p.as_usize()), expected);
     }
+}
+
+#[test]
+fn sysv_shm_abi_layout() {
+    use core::mem::{align_of, offset_of, size_of};
+
+    assert_eq!(size_of::<IpcPerm>(), 48);
+    assert_eq!(align_of::<IpcPerm>(), 8);
+    assert_eq!(offset_of!(IpcPerm, mode), 20);
+    assert_eq!(offset_of!(IpcPerm, seq), 24);
+    assert_eq!(offset_of!(IpcPerm, reserved), 32);
+    assert_eq!(size_of::<ShmidDs>(), 112);
+    assert_eq!(align_of::<ShmidDs>(), 8);
+    assert_eq!(offset_of!(ShmidDs, shm_segsz), 48);
+    assert_eq!(offset_of!(ShmidDs, shm_atime), 56);
+    assert_eq!(offset_of!(ShmidDs, shm_dtime), 64);
+    assert_eq!(offset_of!(ShmidDs, shm_ctime), 72);
+    assert_eq!(offset_of!(ShmidDs, shm_cpid), 80);
+    assert_eq!(offset_of!(ShmidDs, shm_lpid), 84);
+    assert_eq!(offset_of!(ShmidDs, shm_nattch), 88);
+    assert_eq!(offset_of!(ShmidDs, reserved), 96);
+}
+
+#[test]
+fn sysv_shm_decode() {
+    // Narrow int arguments to 32 bits but keep the entire size/address.
+    let wide = 0x1_0000_1000;
+    let neg_id = 0xffff_fffe;
+    let flags = 0x1_0000_0201;
+    // Flags keep bits they don't name, including `shmget`'s mode bits.
+    assert!(matches!(
+        decode(Sysno::shmget, [neg_id, wide, flags, 0]),
+        SyscallRequest::Shmget { key: -2, size, shmflg } if size == wide && shmflg.bits() == 0x201
+    ));
+    assert!(matches!(
+        decode(Sysno::shmat, [neg_id, wide, flags, 0]),
+        SyscallRequest::Shmat { shmid: -2, shmaddr, shmflg }
+            if shmaddr == wide && shmflg.bits() == 0x201
+    ));
+    assert!(matches!(
+        decode(Sysno::shmdt, [wide, 0, 0, 0]),
+        SyscallRequest::Shmdt { shmaddr } if shmaddr == wide
+    ));
+    for (cmd, expected, addr) in [(2, ShmctlCmd::Stat, wide), (0, ShmctlCmd::Remove, 0)] {
+        assert!(matches!(
+            decode(Sysno::shmctl, [neg_id, cmd, addr, 0]),
+            SyscallRequest::Shmctl { shmid: -2, cmd: actual_cmd, buf }
+                if actual_cmd == expected && buf.as_usize() == addr
+        ));
+    }
+    // Linux: `shmctl` rejects a command it doesn't define with EINVAL.
+    assert_eq!(
+        try_decode(Sysno::shmctl, [0, 99, 0, 0]).err(),
+        Some(errno::Errno::EINVAL)
+    );
 }
 
 #[test]
