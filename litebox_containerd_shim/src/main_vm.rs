@@ -6,7 +6,8 @@
 
 #[cfg(target_os = "linux")]
 fn main() {
-    litebox_containerd_shim::main(litebox_containerd_shim::Backend::Vm);
+    use litebox_containerd_shim::{Backend, Vmm, main};
+    main(Backend::Vm(Vmm::Qemu));
 }
 
 #[cfg(not(target_os = "linux"))]

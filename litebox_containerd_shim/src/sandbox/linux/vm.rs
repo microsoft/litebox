@@ -1,33 +1,30 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The VM backend: `litebox_runner_vm_kernel` in QEMU, which boots the guest service as process 1.
-//! The guardian runs QEMU, whose pid is the broker's, `vhost-device-vsock`, whose hybrid vsock
-//! bridge reaches the guest service, and a `virtiofsd` for each directory bind.
+//! The VM backends: `litebox_runner_vm_kernel` in a VMM, QEMU ([`qemu`]) or Cloud Hypervisor
+//! ([`cloud_hypervisor`]), which boots the guest service as process 1. The guardian runs the VMM,
+//! whose pid is the broker's, its daemons, and a `virtiofsd` for each directory bind.
 //!
-//! The payload, QEMU's initrd, holds the VM's Linux runner, the root archive and the `policy`, the
-//! egress rules (see `litebox_broker_vm_kernel`'s docs). The VM serves one directory bind at most
-//! for now, as a virtio-fs device whose tag is its guest path, which the kernel keeps read-only;
-//! `virtiofsd` runs without its sandbox, which needs user namespaces, as the broker's user. With
-//! egress rules,
-//! guest sockets reach QEMU's user network, which NATs them, as far as the rules let them (see
-//! [`Egress`]); without, the VM has no network device. The VM publishes no ports yet. QEMU's NAT
-//! keeps one destination per guest UDP port, the last: an unconnected UDP socket that sends to
-//! 10.0.2.1 or 10.0.2.3 and to other destinations may lose the replies of those it sent to earlier.
-//! QEMU's stdout is the kernel's log, and its stderr the processes' output.
+//! The payload, the VMM's initrd, holds the VM's Linux runner, the root archive and the `policy`,
+//! the egress rules (see `litebox_broker_vm_kernel`'s docs). The VM serves one directory bind at
+//! most for now, as a virtio-fs device whose tag is its guest path, which the kernel keeps
+//! read-only; `virtiofsd` runs without its sandbox, which needs user namespaces, as the broker's
+//! user. The VM publishes no ports yet. The VMM's stdout is the kernel's log, and its stderr the
+//! processes' output.
 //!
-//! The kernel, the runner and `vhost-device-vsock` are next to this executable unless
-//! `LITEBOX_VM_KERNEL`, `LITEBOX_VM_RUNNER` or `LITEBOX_VHOST_DEVICE_VSOCK` name them; the kernel
-//! and the runner must be of this executable's build. QEMU and `virtiofsd` are, unless `LITEBOX_QEMU`
-//! or `LITEBOX_VIRTIOFSD` name them, the first that the broker's user can run next to this
+//! The kernel and the runner are next to this executable unless `LITEBOX_VM_KERNEL` or
+//! `LITEBOX_VM_RUNNER` name them, and must be of this executable's build. The VMM and `virtiofsd`
+//! are, unless their variables name them, the first that the broker's user can run next to this
 //! executable, on the `PATH`, or in `/usr/libexec`, where distributions install `virtiofsd`.
 
-use std::ffi::{OsStr, OsString};
+mod cloud_hypervisor;
+mod qemu;
+
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek as _, SeekFrom};
 use std::os::fd::AsFd;
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,20 +34,18 @@ use tar_core::EntryType;
 use tar_core::builder::EntryBuilder;
 
 use super::super::{StateDir, program};
-use super::guardian::{DEVICE_FD, LISTENER_FD};
+use super::guardian::LISTENER_FD;
 use crate::rootfs::{append, finish};
 use crate::spec::{Bind, Egress, Plan};
-use crate::{Result, internal, invalid, unsupported};
+use crate::{Result, Vmm, internal, invalid, unsupported};
 
 /// The kernel's line once its vsock device runs, which connections wait for (see
 /// `litebox_runner_vm_kernel`'s `devices::VSOCK_STARTED`).
 pub const VSOCK_STARTED: &str = "[litebox] vsock device started";
 
-/// The installed names of the VM's kernel, its Linux runner and its vsock device's daemon.
+/// The installed names of the VM's kernel, its Linux runner and the virtio-fs daemon.
 const KERNEL: &str = "litebox_runner_vm_kernel";
 const RUNNER: &str = "litebox_runner_linux_on_vm_userland";
-const DEVICE_DAEMON: &str = "vhost-device-vsock";
-const QEMU: &str = "qemu-system-x86_64";
 const VIRTIOFSD: &str = "virtiofsd";
 /// The longest tag of a virtio-fs device (`virtio_fs_config`'s).
 const MAX_TAG: usize = 36;
@@ -61,12 +56,15 @@ const OVERHEAD_MEMORY_MIB: u64 = 128;
 /// The most guest RAM the kernel uses: its direct map's 512 GiB, less q35's hole below 4 GiB.
 const MAX_MEMORY_MIB: u64 = (512 - 2) << 10;
 
-/// Fails if the VM cannot run `plan`: on hosts other than x86-64, with more egress destinations of
-/// a protocol than its kernel's broker takes, or with published ports, which it does not serve yet
-/// (see the crate's docs).
-pub fn check(plan: &Plan) -> Result<()> {
+/// Fails if the VM of `vmm` cannot run `plan`: on hosts other than x86-64, with more egress
+/// destinations of a protocol than its kernel's broker takes, with published ports, which it does
+/// not serve yet (see the crate's docs), or as the VMM's own check fails.
+pub fn check(vmm: Vmm, plan: &Plan) -> Result<()> {
     if cfg!(not(target_arch = "x86_64")) {
         return Err(unsupported("the VM backend runs on x86-64 hosts only"));
+    }
+    if vmm == Vmm::CloudHypervisor {
+        cloud_hypervisor::check(plan)?;
     }
     for (protocol, destinations) in [("tcp", &plan.egress.tcp), ("udp", &plan.egress.udp)] {
         if destinations.len() > MAX_DESTINATION_RULES {
@@ -85,7 +83,7 @@ pub fn check(plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-/// The guest's vsock CID, local to its device daemon.
+/// The guest's vsock CID, local to its VM.
 const GUEST_CID: &str = "3";
 
 /// `/dev/kvm`'s group, for the VM's processes to open it, unless it is root's or the overflow
@@ -100,7 +98,7 @@ pub fn kvm_group() -> Option<libc::gid_t> {
     (gid != 0 && gid != overflow).then_some(gid)
 }
 
-/// Lets QEMU, of the broker's user `uid`:`gid`, reopen `stderr`, its own, for the VM's console.
+/// Lets the VMM, of the broker's user `uid`:`gid`, reopen `stderr`, its own, for the VM's console.
 pub fn give_stderr(stderr: &impl AsFd, uid: u32, gid: u32) -> io::Result<()> {
     std::os::unix::fs::fchown(stderr, Some(uid), Some(gid))
 }
@@ -128,14 +126,29 @@ fn cpus(requested: Option<u32>, host: usize) -> usize {
         .clamp(1, host.clamp(1, MAX_CPUS))
 }
 
-/// Adds the VM guardian's arguments to `command`, packing the payload first.
+/// What the VMM runs (see [`guardian_arguments`]).
+struct Vm<'a> {
+    state: &'a StateDir,
+    kernel: PathBuf,
+    memory_mib: u64,
+    cpus: usize,
+    /// Whether the guest has a network device: with egress rules only.
+    network: bool,
+    /// The directory binds' guest paths, their virtio-fs tags, and their `virtiofsd`s' sockets.
+    shares: Vec<(&'a str, PathBuf)>,
+}
+
+/// Adds the guardian's arguments for the VM of `vmm` to `command`, packing the payload first: the
+/// VMM's daemons, a `virtiofsd` for each directory bind (see `guardian::guard_vm`), and the VMM's
+/// command. Returns the guest RAM, in MiB.
 pub fn guardian_arguments(
+    vmm: Vmm,
     command: &mut Command,
     state: &StateDir,
     archive: File,
     binds: &[Bind],
     plan: &Plan,
-) -> Result<()> {
+) -> Result<u64> {
     // TODO: serve any number of directory and file binds, nested ones too, live, through one
     // device for the sandbox exporting a tree the host composes: a device per bind takes a PCI
     // slot each, and file binds are copies in the root archive.
@@ -152,6 +165,9 @@ pub fn guardian_arguments(
             bind.destination
         )));
     }
+    if vmm == Vmm::CloudHypervisor {
+        cloud_hypervisor::check_binds(binds)?;
+    }
     let virtiofsd = std::env::var_os("LITEBOX_VIRTIOFSD").unwrap_or_else(|| VIRTIOFSD.into());
     let kernel = program("LITEBOX_VM_KERNEL", KERNEL);
     if !kernel.is_file() {
@@ -163,25 +179,26 @@ pub fn guardian_arguments(
     let runner = program("LITEBOX_VM_RUNNER", RUNNER);
     let policy = policy(&plan.egress);
     let payload_size = pack_payload(state, archive, &runner, policy.as_bytes())?;
-    let memory_mib = memory_mib(plan.resources.memory, payload_size);
-    let memory = format!("{memory_mib}M");
     let host_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let cpus = cpus(plan.resources.cpus, host_cpus);
-    let socket = state.sockets.join("vhost-user");
-    command
-        .env("PATH", search_path()?)
-        .arg("connect")
-        .arg(&socket)
-        .arg(program("LITEBOX_VHOST_DEVICE_VSOCK", DEVICE_DAEMON))
-        .args(["--guest-cid", GUEST_CID, "--socket"])
-        .arg(&socket)
-        .arg("--uds-path")
-        .arg(state.bridge())
-        .arg("--");
-    let shares: Vec<PathBuf> = (0..binds.len())
-        .map(|index| state.sockets.join(format!("virtiofs{index}")))
-        .collect();
-    for (bind, socket) in binds.iter().zip(&shares) {
+    let vm = Vm {
+        state,
+        kernel,
+        memory_mib: memory_mib(plan.resources.memory, payload_size),
+        cpus: cpus(plan.resources.cpus, host_cpus),
+        network: !policy.is_empty(),
+        shares: (binds.iter().enumerate())
+            .map(|(index, bind)| {
+                let socket = state.device_socket(&format!("virtiofs{index}"));
+                (bind.destination.as_str(), socket)
+            })
+            .collect(),
+    };
+    command.env("PATH", search_path()?);
+    if vmm == Vmm::Qemu {
+        qemu::daemons(command, &vm);
+    }
+    // Only read-only ones reach here (see `RootFs::bind`).
+    for (bind, (_, socket)) in binds.iter().zip(&vm.shares) {
         command
             .arg("listen")
             .arg(socket)
@@ -191,58 +208,11 @@ pub fn guardian_arguments(
             .arg(&bind.source)
             .args(["--sandbox=none", "--log-level=error", "--"]);
     }
-    command.arg(std::env::var_os("LITEBOX_QEMU").unwrap_or_else(|| QEMU.into()));
-    command
-        .args(["-machine", "q35", "-nodefaults", "-m", &memory])
-        // KVM if QEMU, of the broker's user, can use it, else TCG; `max` suits both, and invtsc (not
-        // migratable) lets QEMU publish the TSC frequency to the guest.
-        .args(["-accel", "kvm", "-accel", "tcg", "-cpu", "max,+invtsc"])
-        .args(["-smp", &cpus.to_string(), "-nic", "none", "-kernel"])
-        .arg(kernel)
-        .arg("-initrd")
-        .arg(state.payload())
-        .args(["-append", "litebox.log=info"])
-        .args(["-serial", "stdio", "-display", "none", "-no-reboot"])
-        .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
-        // The console, on QEMU's stderr.
-        .args(["-device", "virtio-serial-pci,id=vs0,disable-legacy=on"])
-        .args(["-chardev", "file,id=con0,path=/proc/self/fd/2"])
-        .args(["-device", "virtconsole,chardev=con0,bus=vs0.0"]);
-    // TODO: a NAT that keeps each UDP flow (passt, or a TAP device) (see the module's docs).
-    if !policy.is_empty() {
-        command
-            .args([
-                "-netdev",
-                "user,id=n0,net=10.0.2.0/24,host=10.0.2.1,ipv6=off",
-            ])
-            .args(["-device", "virtio-net-pci,netdev=n0,disable-legacy=on"]);
+    match vmm {
+        Vmm::Qemu => qemu::command(command, &vm),
+        Vmm::CloudHypervisor => cloud_hypervisor::command(command, &vm),
     }
-    // Only read-only ones reach here (see `RootFs::bind`).
-    for (index, (bind, socket)) in binds.iter().zip(&shares).enumerate() {
-        let mut chardev = OsString::from(format!("socket,id=fs{index},path="));
-        chardev.push(option_value(socket.as_os_str()));
-        let mut device = OsString::from(format!("vhost-user-fs-pci,chardev=fs{index},tag="));
-        device.push(option_value(OsStr::new(&bind.destination)));
-        command
-            .arg("-chardev")
-            .arg(chardev)
-            .arg("-device")
-            .arg(device);
-    }
-    // vhost-user needs the guest's memory shared with the device daemons, the vsock one's
-    // connection the guardian hands QEMU.
-    command
-        .arg("-object")
-        .arg(format!(
-            "memory-backend-memfd,id=mem,size={memory},share=on"
-        ))
-        .args(["-machine", "memory-backend=mem", "-chardev"])
-        .arg(format!("socket,id=vhost-vsock,fd={DEVICE_FD}"))
-        .args([
-            "-device",
-            "vhost-user-vsock-pci,chardev=vhost-vsock,disable-legacy=on",
-        ]);
-    Ok(())
+    Ok(vm.memory_mib)
 }
 
 /// The payload's `policy` (see `litebox_broker_vm_kernel`'s docs): `egress`'s rules, a line each.
@@ -254,18 +224,6 @@ fn policy(egress: &Egress) -> String {
         }
     }
     policy
-}
-
-/// `value` as a value of a QEMU option list, its commas doubled.
-fn option_value(value: &OsStr) -> OsString {
-    let mut escaped = Vec::with_capacity(value.len());
-    for &byte in value.as_bytes() {
-        escaped.push(byte);
-        if byte == b',' {
-            escaped.push(b',');
-        }
-    }
-    OsString::from_vec(escaped)
 }
 
 /// The guest RAM, in MiB, for the memory limit `limit` and a payload of `payload` bytes.
@@ -305,7 +263,7 @@ fn pack_payload(state: &StateDir, mut archive: File, runner: &Path, policy: &[u8
         .mode(0o600)
         .open(&path)
         .map_err(failed)?;
-    // QEMU opens it by path.
+    // The VMM opens it by path.
     super::grant_read(state, &payload).map_err(failed)?;
     let mut writer = BufWriter::new(payload);
     for (name, file, source) in [
@@ -341,15 +299,12 @@ fn append_file(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::fs::File;
     use std::io::Write as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::path::Path;
 
-    use super::{
-        MAX_CPUS, MAX_MEMORY_MIB, StateDir, cpus, memory_mib, option_value, pack_payload, policy,
-    };
+    use super::{MAX_CPUS, MAX_MEMORY_MIB, StateDir, cpus, memory_mib, pack_payload, policy};
 
     /// A state directory below `root`, the runner, and an archive written there, open.
     fn packing(root: &Path) -> (StateDir, std::path::PathBuf, File) {
@@ -428,7 +383,8 @@ mod tests {
             "annotations": {"io.litebox.egress.udp": destinations.join(",")},
         }))
         .unwrap();
-        let error = super::check(&crate::spec::plan(&spec).unwrap()).unwrap_err();
+        let plan = crate::spec::plan(&spec).unwrap();
+        let error = super::check(crate::Vmm::Qemu, &plan).unwrap_err();
         assert!(
             format!("{error:?}").contains("io.litebox.egress.udp"),
             "{error:?}"
@@ -452,10 +408,5 @@ mod tests {
             policy(&plan.egress),
             "egress tcp 10.1.0.0/16:80-81\negress tcp 0.0.0.0/0:443\negress udp 10.0.2.3/32:53\n"
         );
-    }
-
-    #[test]
-    fn option_values_double_their_commas() {
-        assert_eq!(option_value(OsStr::new("/a,b,,c")), "/a,,b,,,,c");
     }
 }

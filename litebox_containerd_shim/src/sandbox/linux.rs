@@ -121,8 +121,8 @@ fn is_daemons(namespace: &File) -> bool {
 /// Runs a guardian or the mount mode, and exits, if this executable's `args` ask for it.
 pub fn run_private_mode(args: &[OsString]) {
     match args.get(1).and_then(|arg| arg.to_str()) {
-        Some(GUARDIAN_MODE) => guardian::main(Backend::Userland, &args[2..]),
-        Some(VM_GUARDIAN_MODE) => guardian::main(Backend::Vm, &args[2..]),
+        Some(GUARDIAN_MODE) => guardian::main(guardian::guard_broker, &args[2..]),
+        Some(VM_GUARDIAN_MODE) => guardian::main(guardian::guard_vm, &args[2..]),
         Some(mount::MOUNT_MODE) => mount::main(&args[2..]),
         _ => {}
     }
@@ -151,7 +151,7 @@ pub fn temp_dir(path: &Path, sockets: &Path, deprivileged: Deprivileged) -> Path
 
 /// Gives who runs as an unprivileged user what they need of `state`'s directories, for `backend`.
 pub fn grant_access(state: &StateDir, backend: Backend) -> io::Result<()> {
-    if backend == Backend::Vm {
+    if matches!(backend, Backend::Vm(_)) {
         // The VMM opens the payload there by path, which nobody else may replace (its `policy`
         // limits the guest); an earlier container's broker user may own the directory.
         let (group, mode) = match state.deprivileged {
@@ -165,9 +165,11 @@ pub fn grant_access(state: &StateDir, backend: Backend) -> io::Result<()> {
     match state.deprivileged {
         Deprivileged::Nobody => Ok(()),
         // The VMM's user uses the temporary and socket directories.
-        Deprivileged::Broker(uid, gid) if backend == Backend::Vm => [&state.temp(), &state.sockets]
-            .into_iter()
-            .try_for_each(|dir| std::os::unix::fs::lchown(dir, Some(uid), Some(gid))),
+        Deprivileged::Broker(uid, gid) if matches!(backend, Backend::Vm(_)) => {
+            [&state.temp(), &state.sockets]
+                .into_iter()
+                .try_for_each(|dir| std::os::unix::fs::lchown(dir, Some(uid), Some(gid)))
+        }
         // The broker's user reads the archive there, and uses the temporary and socket directories.
         Deprivileged::Broker(uid, gid) => [&state.path, &state.temp(), &state.sockets]
             .into_iter()
@@ -268,7 +270,7 @@ impl Broker {
     pub fn check(backend: Backend, plan: &Plan) -> Result<()> {
         match backend {
             Backend::Userland => Ok(()),
-            Backend::Vm => vm::check(plan),
+            Backend::Vm(vmm) => vm::check(vmm, plan),
         }
     }
 
@@ -344,9 +346,9 @@ impl Broker {
                     &runner,
                 ));
             }
-            Backend::Vm => {
+            Backend::Vm(vmm) => {
                 command.arg(VM_GUARDIAN_MODE);
-                vm::guardian_arguments(&mut command, state, archive, binds, plan)?;
+                vm::guardian_arguments(vmm, &mut command, state, archive, binds, plan)?;
             }
         }
         let (lifeline, guardian_socket) = UnixStream::pair().map_err(failed)?;
@@ -356,7 +358,7 @@ impl Broker {
         // Only the guardian keeps its end, so that the lifeline ends if the guardian fails early.
         drop(guardian_socket);
         let (stderr, stderr_end) = io::pipe().map_err(failed)?;
-        if let (Backend::Vm, Deprivileged::Broker(uid, gid)) = (backend, state.deprivileged) {
+        if let (Backend::Vm(_), Deprivileged::Broker(uid, gid)) = (backend, state.deprivileged) {
             vm::give_stderr(&stderr_end, uid, gid).map_err(failed)?;
         }
         command
@@ -388,7 +390,7 @@ impl Broker {
             .collect::<Result<Vec<_>>>()?;
         let groups: Vec<libc::gid_t> = match backend {
             Backend::Userland => Vec::new(),
-            Backend::Vm => vm::kvm_group().into_iter().collect(),
+            Backend::Vm(_) => vm::kvm_group().into_iter().collect(),
         };
         // SAFETY: the hook makes async-signal-safe calls only, on descriptors it owns.
         unsafe {

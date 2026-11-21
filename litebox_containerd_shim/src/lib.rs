@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 //! The containerd runtime v2 shims of LiteBox, one per [`Backend`]: `containerd-shim-litebox-v1`
-//! (`io.containerd.litebox.v1`) and `containerd-shim-litebox-vm-v1` (`io.containerd.litebox-vm.v1`).
+//! (`io.containerd.litebox.v1`), `containerd-shim-litebox-vm-v1` (`io.containerd.litebox-vm.v1`),
+//! and `containerd-shim-litebox-ch-v1` (`io.containerd.litebox-ch.v1`).
 //!
 //! # Linux
 //!
@@ -19,10 +20,11 @@
 //! `io.litebox.publish.tcp` and `.udp` ports. Limit ingress with `io.litebox.ingress.tcp` and `.udp`
 //! (comma-separated CIDRs); local peers appear as `10.0.2.1`. Network sysctls precede hooks.
 //!
-//! The VM backend runs LiteBox's VM kernel in QEMU as `LITEBOX_USER`, with the group of `/dev/kvm`
-//! if present, regardless of `LITEBOX_ROOT_BROKER`. Its guest reaches QEMU's user network, which
-//! NATs it, as far as the egress annotations allow; it refuses the publish annotations, and serves
-//! no guest listener.
+//! The VM backends run LiteBox's VM kernel in QEMU or Cloud Hypervisor (see `sandbox::linux::vm`)
+//! as `LITEBOX_USER`, with the group of `/dev/kvm` if present, regardless of `LITEBOX_ROOT_BROKER`.
+//! In QEMU, the guest reaches QEMU's user network, which NATs it, as far as the egress annotations
+//! allow; Cloud Hypervisor's has no network yet, and refuses them. Both refuse the publish
+//! annotations, and serve no guest listener.
 //!
 //! # Windows x86-64
 //!
@@ -75,9 +77,17 @@ use containerd_shim::protos::types::introspection::{RuntimeInfo, RuntimeVersion}
 pub enum Backend {
     /// `litebox-broker-userland`, which runs each guest process in a host process.
     Userland,
-    /// LiteBox's VM kernel in QEMU, which runs each guest process in a process of its own.
+    /// LiteBox's VM kernel in a VMM, which runs each guest process in a process of its own.
     #[cfg(target_os = "linux")]
-    Vm,
+    Vm(Vmm),
+}
+
+/// What runs the VM of [`Backend::Vm`].
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vmm {
+    Qemu,
+    CloudHypervisor,
 }
 
 impl Backend {
@@ -87,7 +97,9 @@ impl Backend {
         match self {
             Self::Userland => "io.containerd.litebox.v1",
             #[cfg(target_os = "linux")]
-            Self::Vm => "io.containerd.litebox-vm.v1",
+            Self::Vm(Vmm::Qemu) => "io.containerd.litebox-vm.v1",
+            #[cfg(target_os = "linux")]
+            Self::Vm(Vmm::CloudHypervisor) => "io.containerd.litebox-ch.v1",
         }
     }
 
@@ -96,7 +108,9 @@ impl Backend {
         [
             Self::Userland,
             #[cfg(target_os = "linux")]
-            Self::Vm,
+            Self::Vm(Vmm::Qemu),
+            #[cfg(target_os = "linux")]
+            Self::Vm(Vmm::CloudHypervisor),
         ]
         .into_iter()
         .find(|backend| backend.runtime() == runtime)
