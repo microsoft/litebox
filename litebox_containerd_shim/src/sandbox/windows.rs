@@ -5,9 +5,9 @@
 //! container through the Host Compute Service: a server silo on the host's kernel, whose `C:` is
 //! its image's layers (such as Nano Server's) and in which the HCS starts the system processes
 //! (smss, lsass, CExecSvc, ...) that its programs need. The shim then starts the broker in it, as
-//! `ContainerUser`, and maps into it, read-only, the broker and the runner, the state directory
-//! (the root archive) and the binds, and, writable, the bridge's directory. The container has no
-//! network yet.
+//! `ContainerUser`, and maps into it, read-only, copies of the broker and the runner, the state
+//! directory (the root archive) and the binds, and, writable, the bridge's directory. The
+//! container has no network yet.
 
 mod bridge;
 mod hcs;
@@ -55,8 +55,9 @@ const CONTAINER_USER: &str = "ContainerUser";
 /// `ContainerUser` as the host's ACLs name it: the same SID in every container.
 const CONTAINER_USER_SID: &str = "S-1-5-93-2-2";
 const READ: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+/// Copied with a program from its directory, if there: Nano Server lacks them.
+const RUNTIME_LIBRARIES: [&str; 1] = ["vcruntime140.dll"];
 const BIN_DIR: &str = r"C:\litebox\bin";
-const RUNNER_DIR: &str = r"C:\litebox\runner";
 const STATE_DIR: &str = r"C:\litebox\state";
 const RUN_DIR: &str = r"C:\litebox\run";
 const BINDS_DIR: &str = r"C:\litebox\binds";
@@ -231,8 +232,10 @@ struct View {
 
 impl View {
     fn new(state: &StateDir, binds: &[Bind]) -> io::Result<Self> {
-        let (broker_dir, broker) = split(std::path::absolute(broker_program())?)?;
-        let (runner_dir, runner) = split(std::path::absolute(program("LITEBOX_RUNNER", RUNNER))?)?;
+        let programs = state.path.join("bin");
+        create_program_dir(&programs)?;
+        let broker = copy_program(&broker_program(), &programs)?;
+        let runner = copy_program(&program("LITEBOX_RUNNER", RUNNER), &programs)?;
         let mut mapped = Vec::new();
         let mut map = |host: &Path, container: &str, read_only: bool| -> io::Result<PathBuf> {
             mapped.push(json!({
@@ -242,12 +245,7 @@ impl View {
             }));
             Ok(PathBuf::from(container))
         };
-        let bin = map(&broker_dir, BIN_DIR, true)?;
-        let runner_dir = if runner_dir == broker_dir {
-            bin.clone()
-        } else {
-            map(&runner_dir, RUNNER_DIR, true)?
-        };
+        let bin = map(&programs, BIN_DIR, true)?;
         let state_dir = map(&state.path, STATE_DIR, true)?;
         let run_dir = map(&state.sockets, RUN_DIR, false)?;
         // Only read-only directories reach here (see `RootFs::bind`).
@@ -265,12 +263,51 @@ impl View {
         Ok(Self {
             mapped,
             broker: bin.join(broker),
-            runner: runner_dir.join(runner),
+            runner: bin.join(runner),
             bridge: run_dir.join(bridge),
             archive: state_dir.join(archive),
             binds,
         })
     }
+}
+
+/// For copies of the programs alone: their own directories may hold more, such as containerd's
+/// `config.toml` next to the shim, and nothing sandboxes the guest from what the broker reads.
+fn create_program_dir(path: &Path) -> io::Result<()> {
+    std::fs::create_dir(path)?;
+    // Before the copies, which inherit it.
+    security::share_with(path, &format!("(A;OICI;{READ:#x};;;{CONTAINER_USER_SID})"))
+}
+
+/// Copies `program`, and the [`RUNTIME_LIBRARIES`] next to it, to `directory`; returns its name.
+fn copy_program(program: &Path, directory: &Path) -> io::Result<OsString> {
+    let (source_dir, name) = split(std::path::absolute(program)?)?;
+    let copy = directory.join(&name);
+    if copy.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "the broker and the runner are both named {}",
+                Path::new(&name).display()
+            ),
+        ));
+    }
+    let copy_file = |source: &Path, copy: &Path| {
+        std::fs::copy(source, copy).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot copy {}: {error}", source.display()),
+            )
+        })
+    };
+    copy_file(program, &copy)?;
+    for library in RUNTIME_LIBRARIES {
+        let (source, copy) = (source_dir.join(library), directory.join(library));
+        if source.is_file() && !copy.exists() {
+            copy_file(&source, &copy)?;
+        }
+    }
+    Ok(name)
 }
 
 fn split(path: PathBuf) -> io::Result<(PathBuf, OsString)> {
@@ -609,6 +646,38 @@ mod tests {
         assert!(dacl(&archive).contains(CONTAINER_USER_SID), "granted");
         drop(archive);
         state.remove();
+    }
+
+    #[test]
+    fn only_the_programs_and_their_runtime_libraries_are_shared_with_the_container_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path().join("install");
+        std::fs::create_dir(&install).unwrap();
+        for name in [
+            "broker.exe",
+            "runner.exe",
+            "vcruntime140.dll",
+            "config.toml",
+        ] {
+            std::fs::write(install.join(name), name).unwrap();
+        }
+        let programs = dir.path().join("bin");
+        create_program_dir(&programs).unwrap();
+        for name in ["broker.exe", "runner.exe"] {
+            assert_eq!(copy_program(&install.join(name), &programs).unwrap(), name);
+        }
+        let mut copies: Vec<_> = std::fs::read_dir(&programs)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        copies.sort();
+        assert_eq!(copies, ["broker.exe", "runner.exe", "vcruntime140.dll"]);
+        for copy in &copies {
+            let file = File::open(programs.join(copy)).unwrap();
+            assert!(dacl(&file).contains(CONTAINER_USER_SID), "{copy:?}");
+        }
+        let error = copy_program(&install.join("broker.exe"), &programs).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[test]

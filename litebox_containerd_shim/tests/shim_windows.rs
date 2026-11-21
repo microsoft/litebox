@@ -18,7 +18,6 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::ptr::{null, null_mut};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -43,18 +42,10 @@ use tar_core::EntryType;
 use tar_core::builder::EntryBuilder;
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    ERROR_SEM_TIMEOUT, ERROR_SHARING_VIOLATION, ERROR_SUCCESS, FILETIME, INVALID_HANDLE_VALUE,
-    LocalFree, WAIT_OBJECT_0,
+    ERROR_SEM_TIMEOUT, ERROR_SHARING_VIOLATION, FILETIME, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
-use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
-    NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
-};
-use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, SUB_CONTAINERS_AND_OBJECTS_INHERIT};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, PIPE_ACCESS_INBOUND,
-    PIPE_ACCESS_OUTBOUND,
+    FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -70,8 +61,6 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::core::{GUID, HRESULT, PCWSTR};
 
 const SHIM: &str = env!("CARGO_BIN_EXE_containerd-shim-litebox-v1");
-/// The container's `ContainerUser`, which runs the broker.
-const CONTAINER_USER_SID: &str = "S-1-5-93-2-2";
 
 /// hcsshim's `driverInfo`, of the filter driver.
 #[repr(C)]
@@ -123,10 +112,7 @@ impl Shim {
         let dir = tempfile::Builder::new().prefix("lbx").tempdir().unwrap();
         let namespace = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
         let (guest_service, broker, runner, guest) = fixtures(dir.path());
-        share_with_containers(broker.parent().unwrap());
-        if runner.parent() != broker.parent() {
-            share_with_containers(runner.parent().unwrap());
-        }
+        add_runtime_library(broker.parent().unwrap());
         let layers = layer_folders(dir.path());
         let bundle = dir.path().join("c");
         std::fs::create_dir(&bundle).unwrap();
@@ -548,102 +534,22 @@ fn fixtures(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     (guest_service, broker, runner, guest)
 }
 
-/// Lets the container's `ContainerUser` run the programs in `dir`: Nano Server has no
-/// `vcruntime140.dll`, and a temporary directory grants `ContainerUser` nothing.
-fn share_with_containers(dir: &Path) {
+/// Nano Server has no `vcruntime140.dll`: the shim copies the one next to the broker.
+fn add_runtime_library(dir: &Path) {
     let runtime = dir.join("vcruntime140.dll");
-    if !runtime.exists() {
-        let system = std::env::var_os("SystemRoot").expect("SystemRoot is set");
-        let source = Path::new(&system).join(r"System32\vcruntime140.dll");
-        // Tests share a prebuilt fixture directory, so another may have copied it meanwhile.
-        if let Err(error) = std::fs::copy(&source, &runtime) {
-            assert!(
-                runtime.exists(),
-                "cannot copy {}: {error}",
-                source.display()
-            );
-        }
+    if runtime.exists() {
+        return;
     }
-    grant_container_user(dir);
-}
-
-/// Grants `ContainerUser` read and execute on `dir` and below by SID: `icacls` looks the SID up,
-/// which fails (1332) on a host that has no name for it.
-fn grant_container_user(dir: &Path) {
-    let wide = |text: &OsStr| -> Vec<u16> { text.encode_wide().chain([0]).collect() };
-    let mut sid = null_mut();
-    let sid_string = wide(OsStr::new(CONTAINER_USER_SID));
-    // SAFETY: the string is NUL-terminated, and the call writes only `sid`.
-    let converted = unsafe { ConvertStringSidToSidW(sid_string.as_ptr(), &raw mut sid) };
-    assert_ne!(converted, 0, "{}", io::Error::last_os_error());
-    let path = wide(dir.as_os_str());
-    let (mut dacl, mut descriptor) = (null_mut(), null_mut());
-    // SAFETY: the path is NUL-terminated, and the call writes only `dacl` and `descriptor`; `dacl`
-    // points into `descriptor`.
-    let read = unsafe {
-        GetNamedSecurityInfoW(
-            path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            &raw mut dacl,
-            null_mut(),
-            &raw mut descriptor,
-        )
-    };
-    assert_eq!(
-        read,
-        ERROR_SUCCESS,
-        "cannot read the DACL of {}",
-        dir.display()
-    );
-    let access = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
-        grfAccessMode: GRANT_ACCESS,
-        grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.cast(),
-        },
-    };
-    let mut merged = null_mut();
-    // SAFETY: `access`'s SID and `dacl` outlive the call, which writes only `merged`.
-    let merge = unsafe { SetEntriesInAclW(1, &raw const access, dacl, &raw mut merged) };
-    assert_eq!(
-        merge,
-        ERROR_SUCCESS,
-        "cannot add to the DACL of {}",
-        dir.display()
-    );
-    // SAFETY: the path is NUL-terminated, and `merged` outlives the call. Unlike `SetSecurityInfo`,
-    // it passes the inheritable ACE on to what `dir` holds.
-    let set = unsafe {
-        SetNamedSecurityInfoW(
-            path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            merged,
-            null(),
-        )
-    };
-    // SAFETY: the calls above allocated each with `LocalAlloc`, and nothing uses them any longer.
-    unsafe {
-        LocalFree(merged.cast());
-        LocalFree(descriptor);
-        LocalFree(sid);
+    let system = std::env::var_os("SystemRoot").expect("SystemRoot is set");
+    let source = Path::new(&system).join(r"System32\vcruntime140.dll");
+    // Tests share a prebuilt fixture directory, so another may have copied it meanwhile.
+    if let Err(error) = std::fs::copy(&source, &runtime) {
+        assert!(
+            runtime.exists(),
+            "cannot copy {}: {error}",
+            source.display()
+        );
     }
-    assert_eq!(
-        set,
-        ERROR_SUCCESS,
-        "cannot set the DACL of {}",
-        dir.display()
-    );
 }
 
 /// `LITEBOX_TEST_WINDOWS_LAYERS`'s folders, then a new scratch layer's in `dir`.

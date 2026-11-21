@@ -34,12 +34,13 @@
 //! snapshotter, or give the spec's `windows.layerFolders`. The guest's root is a Linux rootfs tar
 //! from `litebox_packager --oci-image` at `root.path`.
 //!
-//! The broker and its runners run in the container as `ContainerUser`, which needs read/execute
-//! access to their directories; Nano Server lacks `vcruntime140.dll`, so put it next to them.
-//! LiteBox does not sandbox guests on Windows yet. The container has no network: OCI network
-//! namespaces, `windows.network` attachments, and the publish, egress and ingress annotations are
-//! not supported yet. Nor are `binary://` logging programs. A hook gets its `path` as `args[0]`,
-//! so one whose `args[0]` is not that path, its file name or stem is refused.
+//! The shim copies the broker and the runner, with any `vcruntime140.dll` next to them (Nano
+//! Server lacks it), into the container, but nothing else from their directories; they run there
+//! as `ContainerUser`. LiteBox does not sandbox guests on Windows yet. The container has no
+//! network: OCI network namespaces, `windows.network` attachments, and the publish, egress and
+//! ingress annotations are not supported yet. Nor are `binary://` logging programs. A hook gets
+//! its `path` as `args[0]`, so one whose `args[0]` is not that path, its file name or stem is
+//! refused.
 
 #![cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 
