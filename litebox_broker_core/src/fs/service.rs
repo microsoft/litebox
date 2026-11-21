@@ -3,13 +3,14 @@
 
 //! Broker-authoritative file operations.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc};
 use core::any::Any;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
-    FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, SetFileTimes,
+    DirectoryReadMode, DirectoryTransferError, FileAccessMode, FileError, FileLockOperation,
+    FileMode, FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser,
+    MAX_FILE_TRANSFER_SIZE, ReadDirectoryResponse, SetFileTimes, encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
@@ -118,7 +119,11 @@ trait OpenFile: Send + Sync {
     fn truncate(&self, length: u64, reset_offset: bool) -> ServiceResult<()>;
     fn map_shared(&self) -> ServiceResult<SharedMapping>;
     fn lock(self: Arc<Self>, operation: FileLockOperation) -> ServiceResult<()>;
-    fn read_directory(&self) -> ServiceResult<Vec<FileDirectoryEntry>>;
+    fn read_directory(
+        &self,
+        output: &mut dyn ReadBuffer,
+        mode: DirectoryReadMode,
+    ) -> ServiceResult<ReadDirectoryResponse>;
     fn handle_status(&self) -> ServiceResult<FileStatus>;
     fn handle_path(&self) -> ServiceResult<String>;
     fn get_status_flags(&self) -> FileStatusFlags;
@@ -552,7 +557,7 @@ where
             return Ok(Err(FileError::InvalidOffset));
         };
         let entry = self.entry.read();
-        let seek = if entry.uses_position() {
+        let seek = if entry.uses_position() || entry.is_directory() {
             drop(entry);
             let mut entry = self.entry.write();
             if entry.is_path_only() {
@@ -614,19 +619,97 @@ where
             .map_err(file_status_error))
     }
 
-    fn read_directory(&self) -> ServiceResult<Vec<FileDirectoryEntry>> {
-        let entry = self.entry.read();
+    fn read_directory(
+        &self,
+        output: &mut dyn ReadBuffer,
+        mode: DirectoryReadMode,
+    ) -> ServiceResult<ReadDirectoryResponse> {
+        // Cursor reads select, transfer, and advance under the same lock as seek and other
+        // cursor reads; listings only need shared access.
+        let read_guard;
+        let mut write_guard = None;
+        let entry = match mode {
+            DirectoryReadMode::List(_) => {
+                read_guard = self.entry.read();
+                &*read_guard
+            }
+            DirectoryReadMode::Cursor(_) => &**write_guard.insert(self.entry.write()),
+        };
         if entry.is_path_only() {
             return Ok(Err(FileError::AccessNotAllowed));
         }
         if !entry.allows_read() {
             return Ok(Err(FileError::NotForReading));
         }
-        let entries = match self.resolver.read_dir(&entry) {
+        let mut entries = match self.resolver.read_dir(entry) {
             Ok(entries) => entries,
             Err(error) => return Ok(Err(file_read_directory_error(error))),
         };
-        Ok(Ok(entries))
+        let (start, end, first_index) = match mode {
+            DirectoryReadMode::List(index) => {
+                let Ok(start) = usize::try_from(index) else {
+                    return Ok(Err(FileError::InvalidOffset));
+                };
+                (start.min(entries.len()), entries.len(), index)
+            }
+            DirectoryReadMode::Cursor(budget) => {
+                // XXX: Page through the backend directly instead of sorting a fresh listing.
+                entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+                let start = entry.directory_after_name.as_ref().map_or_else(
+                    || entry.position.min(entries.len()),
+                    |last| entries.partition_point(|entry| entry.name <= *last),
+                );
+                let mut remaining = budget.capacity as usize;
+                let count = entries[start..]
+                    .iter()
+                    .take_while(|entry| {
+                        let Some(rest) = budget
+                            .record_size(entry.name.len())
+                            .and_then(|len| remaining.checked_sub(len))
+                        else {
+                            return false;
+                        };
+                        remaining = rest;
+                        true
+                    })
+                    .count();
+                if count == 0 && start != entries.len() {
+                    return Ok(Err(FileError::InvalidArgument));
+                }
+                (start, start + count, entry.position as u64)
+            }
+        };
+        let (payload, next_index) =
+            match encode_directory_entries_chunk(&entries[..end], start, output.len()) {
+                Ok(page) => page,
+                Err(DirectoryTransferError::OutOfMemory) => return Err(BrokerError::OutOfMemory),
+                Err(DirectoryTransferError::Payload(_)) => return Ok(Err(FileError::Io)),
+                Err(_) => return Err(BrokerError::Internal),
+            };
+        let cursor = matches!(mode, DirectoryReadMode::Cursor(_));
+        let transferred_end = next_index.map_or(end, |index| usize::try_from(index).unwrap());
+        let advance = if cursor && transferred_end > start {
+            let Some(position) = entry.position.checked_add(transferred_end - start) else {
+                return Ok(Err(FileError::InvalidOffset));
+            };
+            Some(position)
+        } else {
+            None
+        };
+        output.copy_from_slice_at(0, &payload)?;
+        if let Some(position) = advance {
+            let entry = write_guard
+                .as_mut()
+                .expect("cursor reads hold the write lock");
+            entry.position = position;
+            entry.directory_after_name =
+                Some(core::mem::take(&mut entries[transferred_end - 1].name));
+        }
+        Ok(Ok(ReadDirectoryResponse {
+            length: u32::try_from(payload.len()).expect("bounded by the shared buffer"),
+            first_index,
+            next_index: if cursor { None } else { next_index },
+        }))
     }
 
     fn handle_status(&self) -> ServiceResult<FileStatus> {
@@ -871,13 +954,15 @@ pub fn lock(
     file.state.lock(operation)
 }
 
-/// Returns a fresh enumeration of a broker-owned open directory.
+/// Transfers a directory page, advancing the broker-owned cursor only in cursor mode.
 pub fn read_directory(
     process: &BrokerProcess,
     handle: ObjectHandle,
-) -> Result<FileResult<Vec<FileDirectoryEntry>>> {
+    output: &mut dyn ReadBuffer,
+    mode: DirectoryReadMode,
+) -> ServiceResult<ReadDirectoryResponse> {
     let file = file(process, handle, ObjectRights::WAIT)?;
-    file.state.read_directory()
+    file.state.read_directory(output, mode)
 }
 
 /// Returns status for a broker-owned open object.
@@ -1266,7 +1351,6 @@ fn file_write_error(error: WriteError) -> FileError {
 
 fn file_seek_error(error: SeekError) -> FileError {
     match error {
-        SeekError::NotAFile => FileError::NotFile,
         SeekError::InvalidOffset => FileError::InvalidOffset,
         SeekError::NonSeekable => FileError::NonSeekable,
         SeekError::NotOpenForSeeking => FileError::PathOnly,

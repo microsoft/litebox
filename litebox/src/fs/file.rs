@@ -10,9 +10,9 @@ use alloc::vec::Vec;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode as Mode,
-    FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
-    MAX_FILE_TRANSFER_SIZE, SetFileTimes,
+    DirectoryReadMode, DirectoryRecordBudget, FileAccessMode, FileDirectoryEntry, FileError,
+    FileLockOperation, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
+    FileStatusFlags, FileUser as UserInfo, MAX_FILE_TRANSFER_SIZE, SetFileTimes,
 };
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 
@@ -496,11 +496,40 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         })
     }
 
-    /// Reads the entries of the directory this file opens.
-    pub fn read_directory(&self) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
-        self.broker
-            .read_directory(self.handle)?
-            .map_err(ReadDirError::from)
+    /// Lists the entries of the directory this file opens without changing its position.
+    pub fn list_directory(&self) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+        let mut entries = Vec::new();
+        let mut index = 0;
+        loop {
+            let (response, mut page) = self
+                .broker
+                .read_directory(self.handle, DirectoryReadMode::List(index))??;
+            entries
+                .try_reserve(page.len())
+                .map_err(|_| ReadDirError::Io)?;
+            entries.append(&mut page);
+            let Some(next_index) = response.next_index else {
+                return Ok(entries);
+            };
+            index = next_index;
+        }
+    }
+
+    /// Reads one batch at the shared directory cursor and advances it in the same broker call.
+    /// Returns the position before the first entry and the entries that fit the budget and transfer.
+    pub fn read_directory(
+        &self,
+        budget: DirectoryRecordBudget,
+    ) -> Result<(u64, Vec<FileDirectoryEntry>), ReadDirError> {
+        let (response, entries) = self
+            .broker
+            .read_directory(self.handle, DirectoryReadMode::Cursor(budget))?
+            .map_err(|error| match error {
+                // The broker reports a budget too small for the next record as invalid.
+                FileError::InvalidArgument => ReadDirError::BufferTooSmall,
+                error => error.into(),
+            })?;
+        Ok((response.first_index, entries))
     }
 
     /// Equivalent to [`LiteBox::path_file_status`], but on this open file.

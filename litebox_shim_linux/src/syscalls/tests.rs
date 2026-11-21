@@ -1123,7 +1123,7 @@ fn exec_inherits_only_transferable_descriptors() {
     assert_eq!(inherited(), Err(Errno::EAGAIN));
     task.sys_close(259).unwrap();
 
-    // A directory position is local to this runner.
+    // The broker shares a positioned directory with the runner that inherits it.
     let dir_fd = task
         .sys_open("/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .unwrap();
@@ -1135,7 +1135,7 @@ fn exec_inherits_only_transferable_descriptors() {
         buffer.len(),
     )
     .unwrap();
-    assert_eq!(inherited(), Err(Errno::EAGAIN));
+    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, dir_fd]));
 }
 
 #[test]

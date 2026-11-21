@@ -10,16 +10,16 @@ use crate::event::{
     CreateEventResponse, EventConsumption,
 };
 use crate::fs::{
-    ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileLockOperation, FileMode,
-    FileNodeInfo, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileStatusFlags,
-    FileTimeUpdate, FileTimestamp, FileTimestamps, FileType, FileUser, HandleFilePathRequest,
-    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MapFileRequest,
-    MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, RmdirFileRequest, SeekFileRequest,
-    SeekFileResponse, SetFileTimes, SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse,
+    ChmodFileRequest, ChownFileRequest, DirectoryReadMode, DirectoryRecordBudget, FileAccessMode,
+    FileError, FileLockOperation, FileMode, FileNodeInfo, FileOpenFlags, FilePathResponse,
+    FileSeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate, FileTimestamp, FileTimestamps,
+    FileType, FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
+    LockFileRequest, MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest,
+    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
+    RenameFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes,
+    SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::message::{
     BrokerOperation, BrokerResult, EventRequest, EventResponse, FileRequest, FileResponse,
@@ -316,7 +316,16 @@ fn request_codec_round_trips_all_variants() {
         BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle,
             buffer: sequence(4, 256),
-            start_index: 19,
+            mode: DirectoryReadMode::List(19),
+        })),
+        BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
+            handle,
+            buffer: sequence(4, 256),
+            mode: DirectoryReadMode::Cursor(DirectoryRecordBudget {
+                capacity: 96,
+                fixed: 20,
+                alignment: 8,
+            }),
         })),
         BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
             dir: Some(handle),
@@ -1227,6 +1236,7 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::File(FileResponse::Truncate),
         BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {
             length: 23,
+            first_index: 28,
             next_index: Some(29)
         })),
         BrokerResult::File(FileResponse::PathStatus(FileStatus {
@@ -2097,6 +2107,7 @@ fn decode_rejects_malformed_fs_response_frames() {
         request_id: TEST_REQUEST_ID,
         result: BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {
             length: 17,
+            first_index: 4,
             next_index: None,
         })),
     });

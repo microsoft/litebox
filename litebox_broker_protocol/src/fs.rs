@@ -567,6 +567,44 @@ wire_struct! {
 }
 
 wire_struct! {
+    /// Space available for guest records, each rounded up to `alignment` bytes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct DirectoryRecordBudget {
+        /// Maximum bytes that can be written to the guest.
+        pub capacity: u32,
+        /// Bytes other than the name itself, including any name terminator.
+        pub fixed: u16,
+        /// Power-of-two record alignment in bytes.
+        pub alignment: u16,
+    }
+    validate |b| b.fixed != 0 && b.alignment.is_power_of_two()
+}
+
+impl DirectoryRecordBudget {
+    /// Size of a guest record, or `None` for an invalid layout or unrepresentable size.
+    #[must_use]
+    pub fn record_size(self, name_len: usize) -> Option<usize> {
+        if self.fixed == 0 || !self.alignment.is_power_of_two() {
+            return None;
+        }
+        name_len
+            .checked_add(usize::from(self.fixed))?
+            .checked_next_multiple_of(usize::from(self.alignment))
+    }
+}
+
+wire_enum! {
+    /// Where to start reading a directory page.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum DirectoryReadMode {
+        /// List entries starting at the given index without changing the open directory's cursor.
+        List(u64),
+        /// Read and advance the open directory's cursor within the guest's record budget.
+        Cursor(DirectoryRecordBudget),
+    }
+}
+
+wire_struct! {
     /// Reads one bounded page of directory entries into a shared-buffer region.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ReadDirectoryRequest {
@@ -574,8 +612,8 @@ wire_struct! {
         pub handle: ObjectHandle,
         /// Shared-buffer destination for encoded entries.
         pub buffer: SharedBufferSequence,
-        /// Entry index at which this response should begin.
-        pub start_index: u64,
+        /// Where to start and whether to advance the open directory's cursor.
+        pub mode: DirectoryReadMode,
     }
 }
 
@@ -585,7 +623,13 @@ wire_struct! {
     pub struct ReadDirectoryResponse {
         /// Encoded payload length.
         pub length: u32,
-        /// Entry index for the next request, or `None` when this response is complete.
+        /// Directory position before the first returned entry.
+        ///
+        /// In cursor mode this is the count of entries the cursor has already returned. After
+        /// deletions it can differ from the index where the read actually resumed, which is just
+        /// past the last returned name (`directory_after_name`).
+        pub first_index: u64,
+        /// Entry index for the next stateless listing request, or `None` for EOF or cursor reads.
         pub next_index: Option<u64>,
     }
 }
@@ -848,7 +892,7 @@ pub fn encode_directory_entries(
     entries: &[FileDirectoryEntry],
 ) -> Result<Vec<u8>, DirectoryPayloadError> {
     let (payload, next_index) =
-        encode_directory_entries_chunk(entries, 0, SHARED_BUFFER_SLOT_SIZE as usize)
+        encode_directory_entries_chunk(entries, 0, MAX_FILE_TRANSFER_SIZE as usize)
             .map_err(DirectoryTransferError::into_payload_error)?;
     if next_index.is_some() {
         return Err(DirectoryPayloadError::TooLarge);
@@ -901,7 +945,7 @@ pub fn try_decode_directory_entries(
 ) -> Result<Vec<FileDirectoryEntry>, DirectoryTransferError> {
     const MINIMUM_ENTRY_LENGTH: usize = size_of::<u32>() + 2;
 
-    if payload.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+    if payload.len() > MAX_FILE_TRANSFER_SIZE as usize {
         return Err(DirectoryPayloadError::TooLarge.into());
     }
     let mut decoder = DirectoryPayloadDecoder { payload, offset: 0 };
@@ -997,7 +1041,7 @@ fn directory_entries_chunk_end(
     maximum_length: usize,
 ) -> Result<(usize, usize), DirectoryPayloadError> {
     if start_index > entries.len()
-        || !(size_of::<u32>()..=SHARED_BUFFER_SLOT_SIZE as usize).contains(&maximum_length)
+        || !(size_of::<u32>()..=MAX_FILE_TRANSFER_SIZE as usize).contains(&maximum_length)
     {
         return Err(DirectoryPayloadError::TooLarge);
     }
@@ -1215,14 +1259,14 @@ mod tests {
     fn directory_payload_is_bounded_by_one_transfer() {
         const ENTRY_OVERHEAD: usize = size_of::<u32>() + 2;
         let maximum_name_length =
-            SHARED_BUFFER_SLOT_SIZE as usize - size_of::<u32>() - ENTRY_OVERHEAD;
+            MAX_FILE_TRANSFER_SIZE as usize - size_of::<u32>() - ENTRY_OVERHEAD;
         let maximum_entry = FileDirectoryEntry {
             name: "x".repeat(maximum_name_length),
             file_type: FileType::RegularFile,
             ino_info: None,
         };
         let payload = encode_directory_entries(core::slice::from_ref(&maximum_entry)).unwrap();
-        assert_eq!(payload.len(), SHARED_BUFFER_SLOT_SIZE as usize);
+        assert_eq!(payload.len(), MAX_FILE_TRANSFER_SIZE as usize);
         assert_eq!(decode_directory_entries(&payload).unwrap(), [maximum_entry]);
 
         let oversized_entry = FileDirectoryEntry {

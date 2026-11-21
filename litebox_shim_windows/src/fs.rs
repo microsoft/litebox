@@ -109,7 +109,7 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         directory_path: &str,
         file: &File<Platform>,
     ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
-        let mut entries = file.read_directory()?;
+        let mut entries = file.list_directory()?;
         if self.namespace.hides_registry_entry(directory_path) {
             entries.retain(|entry| !is_registry_root_name(&entry.name));
         }
