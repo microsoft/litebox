@@ -13,11 +13,10 @@ use litebox::{
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     fs::errors::{LockError, OpenError},
     process::{InheritableFd, ProcessError},
-    sync::Mutex,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileLockOperation, FileMode as Mode, FileOpenFlags,
+    DirectoryRecordBudget, FileAccessMode, FileLockOperation, FileMode as Mode, FileOpenFlags,
     FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate, FileTimestamp,
     FileType, FileUser, SetFileTimes,
 };
@@ -57,15 +56,12 @@ pub(crate) type FileFd<Platform> = TypedFd<FileSubsystem<Platform>>;
 /// A file descriptor's open file description.
 pub(crate) struct File<Platform: ShimPlatform> {
     file: Arc<litebox::fs::File<Platform>>,
-    /// A directory's position in its sorted entries, once `getdents64` or `lseek` has set it.
-    dir_offset: Mutex<Platform, Option<usize>>,
 }
 
 impl<Platform: ShimPlatform> From<litebox::fs::File<Platform>> for File<Platform> {
     fn from(file: litebox::fs::File<Platform>) -> Self {
         Self {
             file: Arc::new(file),
-            dir_offset: Mutex::new(None),
         }
     }
 }
@@ -110,24 +106,6 @@ impl<Platform: ShimPlatform> File<Platform> {
         Ok(self.file.write(buf, offset, cx)?)
     }
 
-    /// Moves the file offset, or a directory's position in its entries, as `lseek` does.
-    pub(crate) fn seek(&self, offset: isize, whence: SeekWhence) -> Result<usize, Errno> {
-        match self.file.seek(offset, whence) {
-            Err(litebox::fs::errors::SeekError::NotAFile) => {
-                let mut dir_offset = self.dir_offset.lock();
-                let base = match whence {
-                    SeekWhence::RelativeToBeginning => 0,
-                    SeekWhence::RelativeToCurrentOffset => dir_offset.unwrap_or(0),
-                    SeekWhence::RelativeToEnd => return Err(Errno::EINVAL),
-                };
-                let new_pos = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
-                *dir_offset = Some(new_pos);
-                Ok(new_pos)
-            }
-            result => Ok(result?),
-        }
-    }
-
     /// Truncates or extends the file to `length` bytes, keeping the file offset.
     pub(crate) fn truncate(&self, length: usize) -> Result<(), Errno> {
         Ok(self.file.truncate(length, false)?)
@@ -169,68 +147,6 @@ impl<Platform: ShimPlatform> File<Platform> {
         let (mask, flags) = status_flags_change(mask, flags);
         self.file.set_status_flags(mask, flags)?;
         Ok(())
-    }
-
-    /// Returns the file for a child process to inherit, failing with `EAGAIN` once a directory
-    /// position the child could not continue from has been set.
-    fn inheritable(&self) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
-        if self.dir_offset.lock().is_some() {
-            return Err(Errno::EAGAIN);
-        }
-        Ok(Arc::clone(&self.file))
-    }
-
-    /// Writes the directory's entries from its current position to `dirp` as `getdents64` does,
-    /// returning the number of bytes written.
-    fn getdents64(&self, dirp: UserPtrMut<u8>, count: usize) -> Result<usize, Errno> {
-        let mut dir_offset = self.dir_offset.lock();
-        let mut dir_off = dir_offset.unwrap_or(0);
-        let mut nbytes = 0;
-
-        let mut entries = self.file.read_directory()?;
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-        for entry in entries.iter().skip(dir_off) {
-            // include null terminator and make it aligned
-            let len = (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len() + 1)
-                .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
-            if nbytes + len > count {
-                // not enough space
-                if nbytes == 0 {
-                    // not enough space for even a single entry
-                    return Err(Errno::EINVAL);
-                }
-                break;
-            }
-            let dirent64 = litebox_common_linux::LinuxDirent64 {
-                ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino),
-                off: dir_off as u64,
-                len: u16::try_from(len).map_err(|_| Errno::EOVERFLOW)?,
-                typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,
-                __name: [0; 0],
-            };
-            let hdr_ptr = UserPtrMut::from_usize(dirp.as_usize() + nbytes);
-            hdr_ptr
-                .write_at_offset::<Platform>(0, dirent64)
-                .ok_or(Errno::EFAULT)?;
-            let name_ptr =
-                UserPtrMut::from_usize(hdr_ptr.as_usize() + DIRENT_STRUCT_BYTES_WITHOUT_NAME);
-            name_ptr
-                .write_slice_at_offset::<Platform>(0, entry.name.as_bytes())
-                .ok_or(Errno::EFAULT)?;
-            // set the null terminator and padding
-            let zeros_len = len - (DIRENT_STRUCT_BYTES_WITHOUT_NAME + entry.name.len());
-            name_ptr
-                .write_slice_at_offset::<Platform>(
-                    isize::try_from(entry.name.len()).unwrap(),
-                    &vec![0; zeros_len],
-                )
-                .ok_or(Errno::EFAULT)?;
-            nbytes += len;
-            dir_off += 1;
-        }
-        *dir_offset = Some(dir_off);
-        Ok(nbytes)
     }
 }
 
@@ -931,16 +847,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the descriptors a fresh runner inherits, skipping those marked close-on-exec
     /// unless `include_close_on_exec` is set.
     ///
-    /// Linux keeps every inherited descriptor, whatever it refers to. A fresh runner cannot share
-    /// state local to this runner, so this fails with `EAGAIN` if a descriptor is:
-    ///
-    /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
-    ///   runner; or
-    /// - more than [`MAX_INHERITED_FD_GAP`] past the previous one, which a fresh runner cannot
-    ///   install.
-    ///
-    /// Transferred descriptors also differ from Linux in that the parent does not observe the
-    /// child's reads of an inherited directory.
+    /// Fails with `EAGAIN` if a descriptor is more than [`MAX_INHERITED_FD_GAP`] past the
+    /// previous one, which a fresh runner cannot install.
     fn inheritable_fds(
         &self,
         include_close_on_exec: bool,
@@ -963,7 +871,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let (kind, object) = match fd {
                 AnyTypedFd::File(file) => (
                     InheritedFdKind::File,
-                    InheritableFd::File(self.global.with_file(&file, File::inheritable)?),
+                    InheritableFd::File(
+                        self.global
+                            .with_file(&file, |file| Ok(Arc::clone(file.file())))?,
+                    ),
                 ),
                 AnyTypedFd::Pipe(pipe) => {
                     let pipe = self
@@ -1820,10 +1731,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let rewind = isize::try_from(unread_n).map_err(|_| Errno::EOVERFLOW)?;
         let fd = in_fd.file_only(Errno::EINVAL)?;
-        self.global.with_file(fd, |file| {
-            file.seek(-rewind, SeekWhence::RelativeToCurrentOffset)?;
-            Ok(())
-        })
+        let file = self
+            .global
+            .with_file(fd, |file| Ok(Arc::clone(file.file())))?;
+        file.seek(-rewind, SeekWhence::RelativeToCurrentOffset)?;
+        Ok(())
     }
 
     /// Handle syscall `sendfile`
@@ -1943,7 +1855,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         whence: SeekWhence,
     ) -> Result<usize, Errno> {
         let fd = fd.file_only(Errno::ESPIPE)?;
-        self.global.with_file(fd, |file| file.seek(offset, whence))
+        let file = self
+            .global
+            .with_file(fd, |file| Ok(Arc::clone(file.file())))?;
+        Ok(file.seek(offset, whence)?)
     }
 
     fn do_mkdir(&self, lookup: LookupPath<Platform>, mode: Mode) -> Result<(), Errno> {
@@ -4070,11 +3985,63 @@ impl<Platform: ShimPlatform> Task<Platform> {
         dirp: UserPtrMut<u8>,
         count: usize,
     ) -> Result<usize, Errno> {
-        let files = self.files.borrow();
-        let fd = files.typed_fd(fd)?;
-        let file = fd.file_only(Errno::ENOTDIR)?;
-        self.global
-            .with_file(file, |file| file.getdents64(dirp, count))
+        let fd = self.typed_fd(fd)?;
+        let file = self
+            .global
+            .with_file(fd.file_only(Errno::ENOTDIR)?, |file| {
+                Ok(Arc::clone(file.file()))
+            })?;
+        let budget = DirectoryRecordBudget {
+            capacity: u32::try_from(count).unwrap_or(u32::MAX),
+            fixed: u16::try_from(DIRENT_STRUCT_BYTES_WITHOUT_NAME + 1).unwrap(),
+            // The Linux ABI aligns records to 8 bytes even though our header is packed.
+            alignment: 8,
+        };
+        // XXX: The broker advances the shared cursor before the guest copy, so probe the whole
+        // buffer first; a bad `dirp` then fails with EFAULT without consuming any records.
+        // Records can still be lost if another thread unmaps `dirp` after the probe.
+        let probe_len = budget.capacity as usize;
+        let mut offset = 0;
+        while offset < probe_len {
+            let chunk = (probe_len - offset).min(4096);
+            dirp.copy_from_slice::<Platform>(offset, &[0; 4096][..chunk])
+                .ok_or(Errno::EFAULT)?;
+            offset += chunk;
+        }
+        let (first, entries) = file.read_directory(budget)?;
+        let mut nbytes = 0;
+        for (index, entry) in entries.into_iter().enumerate() {
+            let len = budget
+                .record_size(entry.name.len())
+                .ok_or(Errno::EOVERFLOW)?;
+            assert!(
+                len <= count - nbytes,
+                "broker returned directory records exceeding the guest budget"
+            );
+            let dirent64 = litebox_common_linux::LinuxDirent64 {
+                ino: entry.ino_info.map_or(0, |node_info| node_info.ino),
+                off: first + index as u64 + 1,
+                len: u16::try_from(len).map_err(|_| Errno::EOVERFLOW)?,
+                typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,
+                __name: [0; 0],
+            };
+            let hdr_ptr =
+                UserPtrMut::from_usize(dirp.as_usize().checked_add(nbytes).ok_or(Errno::EFAULT)?);
+            hdr_ptr
+                .write_at_offset::<Platform>(0, dirent64)
+                .ok_or(Errno::EFAULT)?;
+            let name_offset = nbytes + DIRENT_STRUCT_BYTES_WITHOUT_NAME;
+            dirp.copy_from_slice::<Platform>(name_offset, entry.name.as_bytes())
+                .ok_or(Errno::EFAULT)?;
+            let padding_offset = name_offset + entry.name.len();
+            dirp.copy_from_slice::<Platform>(
+                padding_offset,
+                &[0; 8][..nbytes + len - padding_offset],
+            )
+            .ok_or(Errno::EFAULT)?;
+            nbytes += len;
+        }
+        Ok(nbytes)
     }
 }
 

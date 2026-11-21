@@ -3260,8 +3260,8 @@ mod tests {
     };
     use litebox_broker_protocol::event::EventConsumption;
     use litebox_broker_protocol::fs::{
-        FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags,
-        FileType, FileUser, SetStatusFlagsRequest,
+        DirectoryReadMode, FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence,
+        FileStatusFlags, FileType, FileUser, SetStatusFlagsRequest, decode_directory_entries,
     };
     use litebox_broker_protocol::process::{
         ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
@@ -5820,9 +5820,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let entries = crate::fs::read_directory(&source, directory)
-            .unwrap()
-            .unwrap();
+        let mut page = [0; 512];
+        let response =
+            crate::fs::read_directory(&source, directory, &mut page, DirectoryReadMode::List(0))
+                .unwrap()
+                .unwrap();
+        let entries = decode_directory_entries(&page[..response.length as usize]).unwrap();
         assert!(entries.iter().any(|entry| entry.name == "."));
         assert!(entries.iter().any(|entry| entry.name == "dev"));
         assert_eq!(source.close_object_reference(directory), Ok(()));
@@ -5840,7 +5843,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(
-            crate::fs::read_directory(&source, write_only_directory),
+            crate::fs::read_directory(
+                &source,
+                write_only_directory,
+                &mut page,
+                DirectoryReadMode::List(0)
+            ),
             Ok(Err(FileError::NotForReading))
         );
         assert_eq!(source.close_object_reference(write_only_directory), Ok(()));

@@ -726,6 +726,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             read_allowed,
             write_allowed,
             position: 0,
+            directory_after_name: None,
             append_mode,
             nonblocking,
             path_only,
@@ -946,13 +947,26 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
-        let file = match &entry.handle {
-            Handle::File(file) => file,
-            Handle::Dir(_) => return Err(SeekError::NotAFile),
-        };
         if entry.path_only {
             return Err(SeekError::NotOpenForSeeking);
         }
+        let Handle::File(file) = &entry.handle else {
+            let base = match whence {
+                SeekWhence::RelativeToBeginning => 0,
+                SeekWhence::RelativeToCurrentOffset => entry.position,
+                SeekWhence::RelativeToEnd => return Err(SeekError::InvalidOffset),
+            };
+            let position = base
+                .checked_add_signed(offset)
+                .ok_or(SeekError::InvalidOffset)?;
+            // XXX: A seek to a different position uses an ordinal in the current listing.
+            // After deletions, even a newly returned d_off may no longer match that ordinal.
+            if position != entry.position || position == 0 {
+                entry.directory_after_name = None;
+            }
+            entry.position = position;
+            return Ok(position);
+        };
 
         match entry.seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::PositionBasedNonSeekable => {
@@ -988,10 +1002,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     pub(crate) fn seek_without_position_update(
         entry: &ResolverEntry<Backend>,
     ) -> Result<usize, SeekError> {
-        match &entry.handle {
-            Handle::File(_) => {}
-            Handle::Dir(_) => return Err(SeekError::NotAFile),
-        }
         if entry.path_only {
             return Err(SeekError::NotOpenForSeeking);
         }
@@ -1723,7 +1733,9 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     _backend: core::marker::PhantomData<Backend>,
     read_allowed: bool,
     write_allowed: bool,
-    position: usize,
+    pub(super) position: usize,
+    /// A sequential directory read resumes after this name even if it has been removed.
+    pub(super) directory_after_name: Option<String>,
     append_mode: bool,
     /// Whether reads and writes that would block fail instead of waiting.
     nonblocking: bool,
@@ -1763,6 +1775,10 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
 
     pub(crate) const fn is_path_only(&self) -> bool {
         self.path_only
+    }
+
+    pub(super) const fn is_directory(&self) -> bool {
+        matches!(self.handle, Handle::Dir(_))
     }
 
     /// Absolute name of the opened object as recorded when it was opened, naming the directory

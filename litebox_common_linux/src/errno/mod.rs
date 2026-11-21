@@ -808,8 +808,8 @@ impl From<litebox::fs::errors::ReadDirError> for Errno {
             litebox::fs::errors::ReadDirError::ClosedFd
             | litebox::fs::errors::ReadDirError::NotForReading
             | litebox::fs::errors::ReadDirError::NotOpenForReading => Errno::EBADF,
-            litebox::fs::errors::ReadDirError::Io => Errno::EIO,
-            _ => unimplemented!(),
+            litebox::fs::errors::ReadDirError::BufferTooSmall => Errno::EINVAL,
+            _ => Errno::EIO,
         }
     }
 }

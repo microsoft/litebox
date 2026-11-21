@@ -7,15 +7,15 @@ use alloc::vec::Vec;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
-    ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
-    FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
-    FilePathResponse, FileSeekWhence, FileStatus, FileUser, HandleFilePathRequest,
-    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MAX_FILE_TRANSFER_SIZE,
-    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, ReadLinkFileRequest,
-    RenameFileRequest, RmdirFileRequest, SeekFileRequest, SetFileTimes, SetTimesFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, try_decode_directory_entries,
+    ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryReadMode,
+    DirectoryTransferError, FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation,
+    FileMode, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileUser,
+    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
+    MAX_FILE_TRANSFER_SIZE, MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest,
+    OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadLinkFileRequest, RenameFileRequest, RmdirFileRequest, SeekFileRequest,
+    SetFileTimes, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -26,7 +26,7 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 type FileOperationResult<T> = core::result::Result<T, FileError>;
-type DirectoryReadResult = FileOperationResult<(Vec<FileDirectoryEntry>, Option<u64>)>;
+type DirectoryReadResult = FileOperationResult<(ReadDirectoryResponse, Vec<FileDirectoryEntry>)>;
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Opens an optionally anchored fs path.
@@ -218,13 +218,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        start_index: u64,
+        mode: DirectoryReadMode,
     ) -> Result<DirectoryReadResult, Channel::Error> {
-        self.validate_file_buffer(buffer, buffer.length() as usize, SHARED_BUFFER_SLOT_SIZE)?;
+        self.validate_file_buffer(buffer, buffer.length() as usize, MAX_FILE_TRANSFER_SIZE)?;
         match self.request_file(FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle,
             buffer,
-            start_index,
+            mode,
         }))? {
             FileResponse::ReadDirectory(response) => {
                 assert!(
@@ -249,16 +249,20 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                         panic!("broker returned unsupported file directory payload error: {error}")
                     }
                 };
-                if let Some(next_index) = response.next_index {
-                    let expected_next_index = start_index
-                        .checked_add(u64::try_from(entries.len()).unwrap())
-                        .expect("file directory index overflow");
-                    assert!(
-                        !entries.is_empty() && next_index == expected_next_index,
-                        "broker returned inconsistent file directory continuation"
-                    );
+                match mode {
+                    DirectoryReadMode::List(start) => {
+                        assert_eq!(response.first_index, start);
+                        if let Some(next_index) = response.next_index {
+                            assert!(
+                                !entries.is_empty()
+                                    && start.checked_add(entries.len() as u64) == Some(next_index),
+                                "broker returned inconsistent file directory continuation"
+                            );
+                        }
+                    }
+                    DirectoryReadMode::Cursor(_) => assert!(response.next_index.is_none()),
                 }
-                Ok(Ok((entries, response.next_index)))
+                Ok(Ok((response, entries)))
             }
             FileResponse::Failed(error) => Ok(Err(error)),
             response => {
@@ -744,8 +748,8 @@ mod tests {
     use alloc::sync::Arc;
     use core::{cell::RefCell, convert::Infallible};
     use litebox_broker_protocol::fs::{
-        FileNodeInfo, FileType, OpenFileResponse, ReadDirectoryResponse, ReadFileResponse,
-        SeekFileResponse, WriteFileResponse, encode_directory_entries,
+        FileNodeInfo, FileType, OpenFileResponse, ReadFileResponse, SeekFileResponse,
+        WriteFileResponse, encode_directory_entries,
     };
     use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
     use litebox_broker_protocol::shared_buffer::{
@@ -781,16 +785,18 @@ mod tests {
             ino_info: None,
         }];
         let directory_payload = encode_directory_entries(&entries).unwrap();
+        let directory_response = ReadDirectoryResponse {
+            length: u32::try_from(directory_payload.len()).unwrap(),
+            first_index: 0,
+            next_index: None,
+        };
         let channel = ScriptedChannel::new([
             BrokerResult::File(FileResponse::Open(OpenFileResponse { handle })),
             BrokerResult::File(FileResponse::Write(WriteFileResponse { written: 3 })),
             BrokerResult::File(FileResponse::Read(ReadFileResponse { read: 2 })),
             BrokerResult::File(FileResponse::Seek(SeekFileResponse { offset: 0 })),
             BrokerResult::File(FileResponse::PathStatus(status)),
-            BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {
-                length: u32::try_from(directory_payload.len()).unwrap(),
-                next_index: None,
-            })),
+            BrokerResult::File(FileResponse::ReadDirectory(directory_response)),
             BrokerResult::File(FileResponse::Failed(FileError::NotForReading)),
             BrokerResult::File(FileResponse::IsTerminal(true)),
         ]);
@@ -853,11 +859,11 @@ mod tests {
             local
                 .read_directory(
                     handle,
-                    sequence([4], u32::try_from(directory_payload.len()).unwrap()),
-                    0,
+                    sequence([4], directory_response.length),
+                    DirectoryReadMode::List(0),
                 )
                 .unwrap(),
-            Ok((entries.into(), None))
+            Ok((directory_response, entries.into()))
         );
         assert_eq!(
             local.handle_file_status(handle).unwrap(),

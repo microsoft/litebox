@@ -33,14 +33,13 @@ use litebox_broker_core::{
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
-    ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
-    FilePathResponse, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
-    LockFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, MountFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SetTimesFileRequest, SymlinkFileRequest,
-    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    WriteFileResponse, encode_directory_entries_chunk,
+    ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, HandleFilePathRequest,
+    HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest, MAX_FILE_TRANSFER_SIZE,
+    MkdirFileRequest, MountFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
+    RenameFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetTimesFileRequest,
+    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
@@ -849,44 +848,15 @@ fn handle_file_request<Memory: SharedMemory>(
         FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle,
             buffer,
-            start_index,
+            mode,
         }) => {
-            validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
-            let entries = match litebox_broker_core::fs::read_directory(process, handle)
+            let mut output = shared_buffer(shared_buffers, buffer, MAX_FILE_TRANSFER_SIZE)?;
+            match litebox_broker_core::fs::read_directory(process, handle, &mut output, mode)
                 .map_err(RequestFailure::from)?
             {
-                Ok(entries) => entries,
-                Err(error) => return Ok(FileResponse::Failed(error)),
-            };
-            let start_index = match usize::try_from(start_index) {
-                // Directory pages are fresh enumerations. If entries disappear
-                // between requests, a stale continuation beyond the new end is EOF.
-                Ok(start_index) => start_index.min(entries.len()),
-                Err(_) => return Ok(FileResponse::Failed(FileError::InvalidOffset)),
-            };
-            let (payload, next_index) = match encode_directory_entries_chunk(
-                &entries,
-                start_index,
-                buffer.length() as usize,
-            ) {
-                Ok(page) => page,
-                Err(DirectoryTransferError::Payload(
-                    DirectoryPayloadError::Malformed | DirectoryPayloadError::TooLarge,
-                )) => return Ok(FileResponse::Failed(FileError::Io)),
-                Err(DirectoryTransferError::OutOfMemory) => {
-                    return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
-                }
-                Err(error) => {
-                    let _ = error;
-                    return Err(RequestFailure::Abort(ErrorCode::Internal));
-                }
-            };
-            write_shared_buffer(shared_buffers, buffer, &payload, SHARED_BUFFER_SLOT_SIZE)?;
-            Ok(FileResponse::ReadDirectory(ReadDirectoryResponse {
-                length: u32::try_from(payload.len())
-                    .expect("directory payload must fit its shared-buffer sequence"),
-                next_index,
-            }))
+                Ok(response) => Ok(FileResponse::ReadDirectory(response)),
+                Err(error) => Ok(FileResponse::Failed(error)),
+            }
         }
         FileRequest::PathStatus(PathFileStatusRequest {
             dir,
@@ -2953,7 +2923,7 @@ mod tests {
             BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
                 handle: directory.handle,
                 buffer: single_slot_sequence(4, 64),
-                start_index: 0,
+                mode: litebox_broker_protocol::fs::DirectoryReadMode::List(0),
             })),
             &shared_buffers,
         );

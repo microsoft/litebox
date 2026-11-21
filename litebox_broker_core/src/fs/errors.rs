@@ -93,8 +93,6 @@ impl From<Fault> for WriteError {
 pub enum SeekError {
     #[error("fd has been closed already")]
     ClosedFd,
-    #[error("file descriptor does not point to a file")]
-    NotAFile,
     #[error("would seek to an invalid (negative or past end) of seekable positions")]
     InvalidOffset,
     #[error("non-seekable file")]

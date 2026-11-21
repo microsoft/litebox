@@ -15,9 +15,9 @@ use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::ConsumeEventResponse;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode, FileOpenFlags,
-    FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE, MapFileResponse,
-    SetFileTimes,
+    DirectoryReadMode, FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode,
+    FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
+    MapFileResponse, ReadDirectoryResponse, SetFileTimes,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
@@ -526,8 +526,9 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn read_directory(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<
-        core::result::Result<Vec<FileDirectoryEntry>, FileError>,
+        mode: DirectoryReadMode,
+    ) -> Result<
+        Result<(ReadDirectoryResponse, Vec<FileDirectoryEntry>), FileError>,
         BrokerControlError,
     >;
 
@@ -1733,33 +1734,24 @@ where
     fn read_directory(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<
-        core::result::Result<Vec<FileDirectoryEntry>, FileError>,
+        mode: DirectoryReadMode,
+    ) -> Result<
+        Result<(ReadDirectoryResponse, Vec<FileDirectoryEntry>), FileError>,
         BrokerControlError,
     > {
-        let mut entries = Vec::new();
-        let mut start_index = 0;
-        loop {
-            let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
-            let response =
-                self.request(|local| local.read_directory(handle, lease.sequence(), start_index))?;
-            let (mut chunk, next_index) = match response {
-                Ok(response) => response,
-                Err(error) => return Ok(Err(error)),
-            };
-            entries
-                .try_reserve(chunk.len())
-                .map_err(|_| BrokerControlError::Broker(ErrorCode::OutOfMemory))?;
-            entries.append(&mut chunk);
-            let Some(next_index) = next_index else {
-                return Ok(Ok(entries));
-            };
-            assert!(
-                next_index > start_index,
-                "broker returned a non-advancing file directory continuation"
-            );
-            start_index = next_index;
-        }
+        let length = match mode {
+            DirectoryReadMode::List(_) => SHARED_BUFFER_SLOT_SIZE as usize,
+            // A broker entry encodes to name+31 bytes, while a Linux dirent is at least
+            // name+20 rounded up to 8. The worst ratio (4-byte name: 35 vs 24) is under 1.5,
+            // so 1.5x the guest capacity plus the count prefix suffices, and glibc's 32 KiB
+            // getdents buffer fits in one shared-buffer slot.
+            DirectoryReadMode::Cursor(budget) => {
+                (budget.capacity as usize).saturating_mul(3) / 2
+                    + size_of::<u32>().min(MAX_FILE_TRANSFER_SIZE as usize)
+            }
+        };
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.read_directory(handle, lease.sequence(), mode))
     }
 
     fn path_file_status(

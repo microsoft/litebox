@@ -318,7 +318,7 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`super::File::read_directory`].
+/// Possible errors from reading an open directory.
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
@@ -332,6 +332,8 @@ pub enum ReadDirError {
     NotForReading,
     #[error("file descriptor is not open for reading")]
     NotOpenForReading,
+    #[error("guest buffer cannot hold the next directory record")]
+    BufferTooSmall,
     #[error("I/O error")]
     Io,
 }

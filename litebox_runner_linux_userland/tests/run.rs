@@ -579,6 +579,40 @@ fn aarch64_hwcaps_expose_only_supported_host_features() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn forked_children_share_directory_position() {
+    let parent = common::compile(
+        "./tests/dup_directory_position.c",
+        "fork_directory_position",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "fork_directory_position");
+    runner.allow_process_duplication().arg("fork");
+    assert_eq!(
+        runner.output(),
+        b"duplicated directory descriptors share position: PASS\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn executed_children_share_directory_position() {
+    let parent = common::compile(
+        "./tests/dup_directory_position.c",
+        "exec_directory_position",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "exec_directory_position");
+    runner.allow_process_duplication().arg("exec");
+    assert_eq!(
+        runner.output(),
+        b"duplicated directory descriptors share position: PASS\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn forked_children_share_futexes_in_shared_memory() {
     const EXPECTED: &str = "shared-futex memory=1 wake=1 timeout=1 interrupted=1 private=1 \
                             mutex=1 semaphore=1 bitset=1 misaligned=1 count=1 inaccessible=1 \
