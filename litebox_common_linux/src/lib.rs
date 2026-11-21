@@ -74,16 +74,45 @@ pub const STDERR_FILENO: i32 = 2;
 
 // linux/ipc.h and linux/shm.h (SysV shared memory)
 pub const IPC_PRIVATE: i32 = 0;
-pub const IPC_CREAT: i32 = 0o1000;
-pub const IPC_EXCL: i32 = 0o2000;
-pub const IPC_RMID: i32 = 0;
-pub const IPC_SET: i32 = 1;
-pub const IPC_STAT: i32 = 2;
-pub const SHM_RDONLY: i32 = 0o10000;
-pub const SHM_RND: i32 = 0o20000;
-pub const SHM_REMAP: i32 = 0o40000;
-pub const SHM_EXEC: i32 = 0o100000;
-pub const SHM_DEST: i32 = 0o1000;
+/// `shm_perm.mode` bit of a segment marked for removal.
+pub const SHM_DEST: u32 = 0o1000;
+
+bitflags::bitflags! {
+    /// `shmflg` argument to `shmget(2)`. Its low nine bits are the new segment's mode.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ShmgetFlags: core::ffi::c_int {
+        const IPC_CREAT = 0o1000;
+        const IPC_EXCL = 0o2000;
+        const SHM_HUGETLB = 0o4000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `shmflg` argument to `shmat(2)`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ShmatFlags: core::ffi::c_int {
+        const SHM_RDONLY = 0o10000;
+        const SHM_RND = 0o20000;
+        const SHM_REMAP = 0o40000;
+        const SHM_EXEC = 0o100000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+/// `cmd` argument to `shmctl(2)`, limited to the supported commands.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntEnum)]
+pub enum ShmctlCmd {
+    /// `IPC_RMID`.
+    Remove = 0,
+    /// `IPC_SET`.
+    Set = 1,
+    /// `IPC_STAT`.
+    Stat = 2,
+}
 
 /// Linux `ipc64_perm` on x86-64 and AArch64.
 #[repr(C)]
@@ -3093,19 +3122,19 @@ pub enum SyscallRequest {
     Shmget {
         key: i32,
         size: usize,
-        shmflg: i32,
+        shmflg: ShmgetFlags,
     },
     Shmat {
         shmid: i32,
         shmaddr: usize,
-        shmflg: i32,
+        shmflg: ShmatFlags,
     },
     Shmdt {
         shmaddr: usize,
     },
     Shmctl {
         shmid: i32,
-        cmd: i32,
+        cmd: ShmctlCmd,
         buf: UserPtrMut<ShmidDs>,
     },
     Mprotect {
@@ -3814,7 +3843,7 @@ impl SyscallRequest {
                 shmflg
             }),
             Sysno::shmdt => sys_req!(Shmdt { shmaddr }),
-            Sysno::shmctl => sys_req!(Shmctl { shmid, cmd, buf:* }),
+            Sysno::shmctl => sys_req!(Shmctl { shmid, cmd:?, buf:* }),
             Sysno::brk => sys_req!(Brk { addr:* }),
             Sysno::mremap => sys_req!(Mremap { old_addr:*, old_size, new_size, flags, new_addr }),
             Sysno::rt_sigprocmask => sys_req!(RtSigprocmask {
@@ -4814,6 +4843,8 @@ reinterpret_truncated_from_usize_for! {
         RngFlags,
         TimerFlags,
         StatxMask,
+        ShmgetFlags,
+        ShmatFlags,
     ],
 }
 

@@ -23,6 +23,7 @@ mod fs;
 mod primitive;
 mod process;
 mod readiness_queue;
+mod segment;
 mod shared_futex;
 mod socket;
 mod terminal;

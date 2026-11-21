@@ -475,12 +475,12 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // connection. The publisher must not keep this LiteBox alive with the memory manager; once
         // it is gone, the broker has released all of this process's attachments.
         let segment_client = Arc::downgrade(&litebox);
-        self.memory_manager.set_sysv_publisher(move |id, count| {
+        self.memory_manager.set_sysv_publisher(move |counts| {
             if let Some(litebox) = segment_client.upgrade()
-                && let Err(error) = litebox.set_segment_attachments(id, count)
+                && let Err(error) = litebox.set_segment_attachments(counts)
             {
-                // The segment's next publication, with its full count, makes up for this one.
-                litebox_util_log::warn!(id, count, error:?; "failed to update shared segment attachment count");
+                // A segment's next publication, with its full count, makes up for this one.
+                litebox_util_log::warn!(counts:?, error:?; "failed to update shared segment attachment counts");
             }
         });
         let global = Arc::new(GlobalState {

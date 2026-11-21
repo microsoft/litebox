@@ -85,7 +85,7 @@ impl PidNamespaceOptions {
 
 wire_struct! {
     /// Creates a pending child process and its initial thread.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct AllocateChildRequest {
         /// If set, the child is the first process of a new PID namespace with
         /// these options, nested in the caller's. Otherwise, the child goes into
@@ -94,6 +94,9 @@ wire_struct! {
         /// Whether the child's parent is the caller's parent rather than the
         /// caller. Either way, the caller owns the child until it starts.
         pub sibling: bool,
+        /// Whether the child starts with copies of the caller's segment
+        /// attachments, because it inherits the caller's address space.
+        pub inherit_segment_attachments: bool,
     }
 }
 

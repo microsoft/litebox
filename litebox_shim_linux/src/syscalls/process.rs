@@ -32,8 +32,8 @@ use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CreateNamespacesRequest, PidNamespaceOptions, ProcessExitStatus,
-    ResourceKind, ResourceLimit, ThreadInfo,
+    AllocateChildRequest, ChildExit, ChildSelector, CreateNamespacesRequest, PidNamespaceOptions,
+    ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -1028,17 +1028,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         })
     }
 
-    /// Allocates a pending child of this process, as `relation` describes.
-    fn allocate_child_process(&self, relation: ChildRelation) -> Result<PendingChild, Errno> {
+    /// Allocates a pending child of this process, as `relation` describes. With
+    /// `inherit_segment_attachments`, the child, which inherits this address space, starts with
+    /// copies of this process's SysV attachments.
+    fn allocate_child_process(
+        &self,
+        relation: ChildRelation,
+        inherit_segment_attachments: bool,
+    ) -> Result<PendingChild, Errno> {
         let child = self
             .global
             .litebox
-            .allocate_child_process(
-                relation
+            .allocate_child_process(AllocateChildRequest {
+                new_pid_namespace: relation
                     .new_pid_namespace
                     .then_some(PidNamespaceOptions::INIT),
-                relation.sibling,
-            )
+                sibling: relation.sibling,
+                inherit_segment_attachments,
+            })
             .map_err(|error| match error {
                 // The child's namespace ended with its first process, as Linux's `alloc_pid`
                 // fails in a namespace whose init exited. The error also stands for refusals
@@ -1953,8 +1960,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // The child keeps the references it inherits until it exits, so check the size first.
         startup.encode().map_err(|_| Errno::ENOMEM)?;
 
-        // Dropping the pending child on failure discards it.
-        let child = self.allocate_child_process(relation)?;
+        // Dropping the pending child on failure discards it, releasing any attachments it
+        // inherited. Only a native child inherits SysV attachments, and copy-based fork refuses
+        // shared mappings, so a child with attachments always starts natively or not at all.
+        let child = self.allocate_child_process(relation, self.global.mm.has_sysv_attachments())?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let (cwd, handles) = self.inherit_with_cwd(&child, &mut objects)?;
@@ -1990,13 +1999,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let payload = startup
                 .encode()
                 .expect("the startup fit with placeholder handles");
-            if self.global.mm.has_sysv_attachments() {
-                // The native child keeps the actual VMAs. A failed launch discards the
-                // pending child, releasing these counts; a fresh-image vfork exec gets none.
-                self.global
-                    .litebox
-                    .inherit_segments(child.identity().process_id)?;
-            }
             // SAFETY: Sibling guest threads remain paused, and the payload snapshots this
             // calling thread and the stable process state.
             match unsafe { launcher.start(child, &payload) } {
@@ -2178,7 +2180,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if self.vfork.borrow().is_some() || !self.thread.process.has_default_alarm_state() {
             return Err(Errno::EAGAIN);
         }
-        let child = self.allocate_child_process(relation)?;
+        // A vfork child execs a fresh image, so it gets no SysV attachments.
+        let child = self.allocate_child_process(relation, false)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let child_own_pid =
@@ -4910,7 +4913,7 @@ mod tests {
 
     #[test]
     fn wait4_echild_drains_unnotified_ignored_child_exit() {
-        use litebox_broker_protocol::process::ProcessExitStatus;
+        use litebox_broker_protocol::process::{AllocateChildRequest, ProcessExitStatus};
         use litebox_common_linux::{
             errno::Errno,
             signal::{SIG_IGN, SigSet, SigmaskHow, Signal},
@@ -4922,7 +4925,7 @@ mod tests {
             let child = task
                 .global
                 .litebox
-                .allocate_child_process(None, false)
+                .allocate_child_process(AllocateChildRequest::default())
                 .unwrap();
             child.exit(ProcessExitStatus::Exited { code: 11 }).unwrap();
             forget_signal_notification(task);
@@ -4969,11 +4972,13 @@ mod tests {
         use litebox::event::{Events, IOPollable as _};
         use litebox::process::ProcessError;
         use litebox_broker_protocol::fs::FileOpenFlags;
-        use litebox_broker_protocol::process::ProcessExitStatus;
+        use litebox_broker_protocol::process::{AllocateChildRequest, ProcessExitStatus};
 
         let platform = crate::syscalls::tests::test_platform();
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child = litebox
+            .allocate_child_process(AllocateChildRequest::default())
+            .unwrap();
         let child_id = child.identity().process_id;
         let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let observer = Arc::new(RecordedEvents::new());
@@ -5036,12 +5041,16 @@ mod tests {
         };
         use litebox::event::{Events, wait::WaitState};
         use litebox_broker_protocol::fs::FileOpenFlags;
-        use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus};
+        use litebox_broker_protocol::process::{
+            AllocateChildRequest, ChildSelector, ProcessExitStatus,
+        };
         use litebox_broker_protocol::readiness_queue::ReadinessQueueEntryFlags;
 
         let platform = crate::syscalls::tests::test_platform();
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child = litebox
+            .allocate_child_process(AllocateChildRequest::default())
+            .unwrap();
         let child_id = child.identity().process_id;
         let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let queue = ReadinessQueue::new(&litebox).unwrap();
@@ -6904,7 +6913,9 @@ mod fork_tests {
         );
         let (litebox, _) =
             crate::syscalls::test_broker::litebox_with_channel(platform, limits, StartChannel);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child = litebox
+            .allocate_child_process(AllocateChildRequest::default())
+            .unwrap();
         let launcher = launcher();
         // SAFETY: No native child is created and no guest threads or guest startup state exist.
         let result = unsafe { launcher.start(&child, b"startup") };

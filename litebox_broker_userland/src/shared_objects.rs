@@ -17,6 +17,7 @@ use litebox_broker_protocol::fs::{FileError, MapFileRequest, MapFileResponse};
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, FileRequest, FileResponse, SegmentRequest, SegmentResponse,
 };
+use litebox_broker_protocol::segment::SegmentError;
 
 /// Delivers host shared objects to the runner of one association.
 pub trait SharedObjectDelivery: Send + Sync {
@@ -85,7 +86,7 @@ pub fn handle_shared_object_request<Delivery: SharedObjectDelivery>(
                 |object, writable, end| {
                     delivery
                         .deliver_segment(object, writable, end)
-                        .map_err(report_delivery_failure)
+                        .map_err(|error| report_delivery_failure(error).segment_error())
                 },
             );
             Some(
@@ -112,7 +113,9 @@ pub fn handle_shared_object_request<Delivery: SharedObjectDelivery>(
                             token,
                             writable: mapping.writable,
                         }),
-                        Err(error) => FileResponse::Failed(report_delivery_failure(error)),
+                        Err(error) => {
+                            FileResponse::Failed(report_delivery_failure(error).file_error())
+                        }
                     }
                 }
             };
@@ -122,18 +125,45 @@ pub fn handle_shared_object_request<Delivery: SharedObjectDelivery>(
     }
 }
 
+/// Why a shared object could not be delivered to the runner.
+#[derive(Clone, Copy, Debug)]
+enum DeliveryFailure {
+    Unsupported,
+    NoSpace,
+    Io,
+}
+
+impl DeliveryFailure {
+    /// Unsupported delivery allows ordinary file mappings to fall back.
+    fn file_error(self) -> FileError {
+        match self {
+            Self::Unsupported => FileError::NoSuchDevice,
+            Self::NoSpace => FileError::NoSpace,
+            Self::Io => FileError::Io,
+        }
+    }
+
+    /// Unsupported delivery fails segment attaches.
+    fn segment_error(self) -> SegmentError {
+        match self {
+            Self::Unsupported => SegmentError::Unavailable,
+            Self::NoSpace => SegmentError::NoSpace,
+            Self::Io => SegmentError::Io,
+        }
+    }
+}
+
 /// Logs a failure to deliver a shared object to the runner and classifies it.
-fn report_delivery_failure(error: IoError) -> FileError {
+fn report_delivery_failure(error: IoError) -> DeliveryFailure {
     litebox_util_log::warn!(error:% = error; "failed to deliver a shared object");
-    // Unsupported delivery allows ordinary file mappings to fall back, but fails segment attaches.
     match error.kind() {
-        ErrorKind::Unsupported => FileError::NoSuchDevice,
-        ErrorKind::OutOfMemory | ErrorKind::WouldBlock => FileError::NoSpace,
+        ErrorKind::Unsupported => DeliveryFailure::Unsupported,
+        ErrorKind::OutOfMemory | ErrorKind::WouldBlock => DeliveryFailure::NoSpace,
         #[cfg(target_os = "linux")]
         _ if litebox_broker_transport_linux_userland::is_resource_exhaustion(&error) => {
-            FileError::NoSpace
+            DeliveryFailure::NoSpace
         }
-        _ => FileError::Io,
+        _ => DeliveryFailure::Io,
     }
 }
 

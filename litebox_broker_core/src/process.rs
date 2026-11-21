@@ -23,9 +23,9 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest,
 };
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind, HostNames,
-    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
-    ResourceLimit, ThreadInfo,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName,
+    HostNameKind, HostNames, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
+    ResourceKind, ResourceLimit, ThreadInfo,
 };
 
 use crate::pid_namespace::PerNamespaceIds;
@@ -946,6 +946,20 @@ impl BrokerProcess {
             .is_some_and(|creator| Arc::ptr_eq(creator, &process.ids))
     }
 
+    /// Allocates one pending child, like [`Self::allocate_child`], that
+    /// inherits no segment attachments.
+    pub fn allocate_child_process(
+        &self,
+        new_pid_namespace: Option<PidNamespaceOptions>,
+        sibling: bool,
+    ) -> Result<ProcessIdentity> {
+        self.allocate_child(AllocateChildRequest {
+            new_pid_namespace,
+            sibling,
+            inherit_segment_attachments: false,
+        })
+    }
+
     /// Allocates and retains one pending child process. The child is its
     /// parent's child from the start, so its exit is reported to the parent
     /// even if it exits before starting its own runner.
@@ -958,14 +972,17 @@ impl BrokerProcess {
     /// is this process, or with `sibling` this process's parent, and this
     /// returns `PolicyDenied` if it has none. Its job, file service,
     /// credential, group, session, limits and host names are this process's
-    /// either way.
+    /// either way. With `inherit_segment_attachments`, it starts with copies of
+    /// this process's segment attachments, and this returns
+    /// `ResourceExhausted` if a segment cannot count them.
     /// The returned IDs are in this process's namespace, plus the child's
     /// process ID in its own namespace.
-    pub fn allocate_child_process(
-        &self,
-        new_pid_namespace: Option<PidNamespaceOptions>,
-        sibling: bool,
-    ) -> Result<ProcessIdentity> {
+    pub fn allocate_child(&self, request: AllocateChildRequest) -> Result<ProcessIdentity> {
+        let AllocateChildRequest {
+            new_pid_namespace,
+            sibling,
+            inherit_segment_attachments,
+        } = request;
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
         }
@@ -1004,7 +1021,13 @@ impl BrokerProcess {
                             initial_thread_id,
                             own_process_id: child.id(),
                         })
-                        .ok_or(BrokerError::Internal);
+                        .ok_or(BrokerError::Internal)
+                        .and_then(|identity| {
+                            if inherit_segment_attachments {
+                                crate::segment::inherit(self, &child)?;
+                            }
+                            Ok(identity)
+                        });
                     if identity.is_ok() {
                         state.pending_child_process = Some(PendingChild {
                             process: Arc::clone(&child),
