@@ -53,14 +53,16 @@
 # isolated from the host (restrict=on) but for an echo server (cat) at
 # 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
 #
-# A fresh host directory per boot, with greeting.txt and the symlinks link.txt
-# (to greeting.txt), self (to .), and abs.txt (to /mnt/host/greeting.txt), is
-# mounted read-only at /mnt/host over virtio-9p (its mount tag).
+# A fresh host directory per boot (see start_share) is mounted read-only at
+# /mnt/host (its tag): for the virtiofs test over virtio-fs, served by an
+# unprivileged virtiofsd ($VIRTIOFSD) of the boot's own, which shares the
+# guest's RAM; for the others, under QEMU, over virtio-9p.
 #
 # Under Cloud Hypervisor, the VMs run in a network namespace of the run's own,
 # made with (passwordless) sudo, where a TAP device has the guest's gateway
 # (10.0.2.1) and the echo server (10.0.2.100:7). It has no virtio-9p, so the
-# share test is skipped there.
+# virtio9p test is skipped there; the virtiofs test checks the same over
+# virtio-fs.
 #
 # With VM_CPUS above 4, the preempt test is skipped: it checks preemption
 # with 8 CPU-bound programs. With fewer than 2, the smp test is skipped: it
@@ -89,6 +91,9 @@
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   VHOST_DEVICE_VSOCK  the vhost-user vsock daemon (default:
 #                 vhost-device-vsock)
+#   VIRTIOFSD     the vhost-user virtio-fs daemon, for the virtiofs test
+#                 (default: virtiofsd on the PATH, else
+#                 /usr/libexec/virtiofsd)
 #   CARGO_BUILD   command that builds the runners, the guest service and the
 #                 test client, run in their directories
 #                 (default: "cargo build"; CI uses
@@ -113,7 +118,12 @@ cargo_flags=()
 verbose=0
 while getopts "t:rvh" opt; do
     case $opt in
-        t) tests+=("$OPTARG") ;;
+        t)
+            # Plain names only: boots' files are named after their tests.
+            [[ $OPTARG =~ ^[A-Za-z0-9_]+$ ]] ||
+                { echo "error: test name $OPTARG is not a plain name ([A-Za-z0-9_]+)" >&2; exit 2; }
+            tests+=("$OPTARG")
+            ;;
         r) profile=release; cargo_flags+=(--release) ;;
         v) verbose=1 ;;
         *) awk 'NR >= 6 { if (!/^#/) exit; print }' "$0"; exit 2 ;;
@@ -123,6 +133,16 @@ done
 # The log level of the boots that check the processes' counts (see the header).
 counted_log=debug
 [[ ${LITEBOX_LOG:-} != trace ]] || counted_log=trace
+
+# $VIRTIOFSD as a path, or nothing if there is none.
+virtiofsd_wanted=${VIRTIOFSD:-virtiofsd or /usr/libexec/virtiofsd}
+if [[ -n ${VIRTIOFSD:-} ]]; then
+    VIRTIOFSD=$(command -v "$VIRTIOFSD" || true)
+else
+    VIRTIOFSD=$(command -v virtiofsd || command -v /usr/libexec/virtiofsd || true)
+fi
+# PID of the virtiofsd `start_share` started, if any.
+virtiofsd=
 
 # Init tests (see the header): their init's path in the root.
 declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writable_root [egress]=/egress
@@ -135,7 +155,8 @@ skip_reason() {
         preempt) [[ $VM_CPUS -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
         smp) [[ $VM_CPUS -ge 2 ]] || echo "needs threads running at once" ;;
         highmem) [[ $VM_MIB -ge 4096 ]] || echo "needs VM_MEM of at least 4G" ;;
-        share) [[ $VMM == qemu ]] || echo "needs virtio-9p, which only QEMU has" ;;
+        virtio9p) [[ $VMM == qemu ]] || echo "needs virtio-9p, which only QEMU has" ;;
+        virtiofs) [[ -n $VIRTIOFSD ]] || echo "needs virtiofsd, not found ($virtiofsd_wanted)" ;;
     esac
 }
 
@@ -283,16 +304,85 @@ network_args() {
     esac
 }
 
-# The virtio-9p share for boot $1: see the header.
+# Starts boot $1's share, if it has one (see the header), and sets $share to
+# virtio9p, virtiofs, or nothing. A virtiofsd serves one connection: one per
+# boot.
+start_share() {
+    share=
+    if [[ $test == virtiofs ]]; then
+        share=virtiofs
+    elif [[ $VMM == qemu ]]; then
+        share=virtio9p
+    fi
+    [[ -n $share ]] || return 0
+    local dir="$WORK/$1.share"
+    # Fresh, even if a boot of the same name ran before.
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    echo "hello from the host" >"$dir/greeting.txt"
+    touch -d @1700000000 "$dir/greeting.txt"
+    ln -s greeting.txt "$dir/link.txt"
+    ln -s . "$dir/self"
+    ln -s /mnt/host/greeting.txt "$dir/abs.txt"
+    if [[ $test == virtio9p || $test == virtiofs ]]; then
+        mkdir -p "$dir/dir/sub" "$dir/many"
+        echo deep >"$dir/dir/sub/deep.txt"
+        # Made once.
+        [[ -f "$WORK/big.bin" ]] ||
+            python3 -c 'import sys; sys.stdout.buffer.write((bytes(range(251)) * 12583)[:3158073])' \
+                >"$WORK/big.bin"
+        ln "$WORK/big.bin" "$dir/big.bin"
+        touch "$dir"/many/f{0000..2999}
+        ln "$WORK/rootfs/hello" "$dir/hello"
+    fi
+    [[ $share == virtiofs ]] || return 0
+    mkfifo "$dir/fifo"
+    # Emptied first: the readiness check must not see an earlier boot's line
+    # before the background redirection truncates the file.
+    : >"$WORK/$1.virtiofsd"
+    # Unprivileged: no sandbox, and the files are accessed as this user. Readiness needs an
+    # info-level log, which a caller's `RUST_LOG` would override `--log-level` on.
+    RUST_LOG=info "$VIRTIOFSD" --socket-path="$WORK/$1.virtiofs" --shared-dir="$dir" --sandbox=none \
+        >"$WORK/$1.virtiofsd" 2>&1 &
+    virtiofsd=$!
+    daemons+=("$virtiofsd")
+    # Ready once it listens, which it logs (its socket exists a little before).
+    local i
+    for ((i = 0; i < 100; i++)); do
+        ! grep -qF "Waiting for vhost-user socket connection" "$WORK/$1.virtiofsd" || return 0
+        kill -0 "$virtiofsd" 2>/dev/null || break
+        sleep 0.1
+    done
+    echo "error: virtiofsd did not start:" >&2
+    cat "$WORK/$1.virtiofsd" >&2
+    exit 2
+}
+
+# Stops the virtiofsd `start_share` started, if any.
+stop_share() {
+    [[ -n $virtiofsd ]] || return 0
+    stop_daemon "$virtiofsd"
+    virtiofsd=
+}
+
+# The devices of boot $1's share (see `start_share`).
 share_args() {
-    [[ $VMM == qemu ]] || return 0
-    mkdir "$WORK/$1.share"
-    echo "hello from the host" >"$WORK/$1.share/greeting.txt"
-    ln -s greeting.txt "$WORK/$1.share/link.txt"
-    ln -s . "$WORK/$1.share/self"
-    ln -s /mnt/host/greeting.txt "$WORK/$1.share/abs.txt"
-    echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none" \
-        -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
+    case $share in
+        virtio9p)
+            echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none" \
+                -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
+            ;;
+        virtiofs)
+            case $VMM in
+                qemu)
+                    # The vsock arguments share the guest's RAM, as vhost-user needs.
+                    echo -chardev "socket,id=vfs0,path=$WORK/$1.virtiofs" \
+                        -device vhost-user-fs-pci,chardev=vfs0,tag=/mnt/host
+                    ;;
+                cloud-hypervisor) echo --fs "tag=/mnt/host,socket=$WORK/$1.virtiofs" ;;
+            esac
+            ;;
+    esac
 }
 
 # Boot $1's clients (see the header): the test client, with $client_args,
@@ -409,13 +499,17 @@ check_boot() {
 }
 check=check_boot
 
-# Shows boot $1's console, runs' output and vsock daemon's output, those it
-# has, if the boot failed since $failed_before failures.
+# Shows boot $1's console, runs' output and vsock and virtio-fs daemons'
+# output, those it has, if the boot failed since $failed_before failures.
 show_failure() {
     [[ $fail -ne $failed_before ]] || return 0
     if [[ -s "$WORK/$1.daemon" ]]; then
         echo "      vsock daemon:"
         sed 's/^/      > /' "$WORK/$1.daemon" | tail -20
+    fi
+    if [[ -s "$WORK/$1.virtiofsd" ]]; then
+        echo "      virtiofsd:"
+        sed 's/^/      > /' "$WORK/$1.virtiofsd" | tail -20
     fi
     if [[ -f "$WORK/$1.console" ]]; then
         echo "      console:"
@@ -430,9 +524,14 @@ show_failure() {
 # Boots the VM as boot $1 with payload $2, and shows its output if it failed.
 boot() {
     local failed_before=$fail
+    start_share "$1"
+    # virtiofsd accesses the guest's RAM.
+    [[ $share != virtiofs ]] || vm_shared_memory=1
     # shellcheck disable=SC2046 # these print separate arguments
     run_vm "$1" "$KERNEL" "$2" $(console_args "$1") $(network_args) $(share_args "$1") \
         "${vsock[@]}"
+    vm_shared_memory=
+    stop_share
     show_failure "$1"
 }
 

@@ -4,9 +4,9 @@
 //! The broker core's providers: hardware randomness, timers, `/dev` (standard
 //! streams from the runner's [`StdioProvider`], `null`, `urandom`),
 //! optionally, a root over a tar, read-only host directories ([`Share`]s)
-//! over 9P, and sockets.
+//! over 9P or FUSE, and sockets.
 
-use crate::share::{Share, ShareFs};
+use crate::share::{Server, Share, ShareFs};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::{
@@ -63,12 +63,16 @@ fn file_service(
         });
     }
     composer = composer.mount("/dev", |allocator| Devices::new(allocator, stdio, random));
-    for share in shares {
-        composer = composer
-            .try_mount(&share.path, |allocator| {
-                ShareFs::new(share.transport, allocator)
-            })
-            .unwrap_or_else(|error| panic!("mounting a share at {}: {error}", share.path));
+    for Share { path, server } in shares {
+        let mounted = match server {
+            Server::NineP(transport) => composer
+                .try_mount(&path, |allocator| ShareFs::nine_p(transport, allocator))
+                .map_err(|error| alloc::format!("9P: {error}")),
+            Server::Fuse(transport) => composer
+                .try_mount(&path, |allocator| ShareFs::fuse(transport, allocator))
+                .map_err(|error| alloc::format!("FUSE: {error}")),
+        };
+        composer = mounted.unwrap_or_else(|error| panic!("mounting a share at {path}: {error}"));
     }
     let devices = composer
         .build()

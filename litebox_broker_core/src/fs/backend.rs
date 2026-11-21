@@ -61,6 +61,8 @@ pub enum SeekBehavior {
     ZeroPosition,
     /// Seek should be resolved against normal resolver-owned file position state.
     PositionBased,
+    /// Seek should fail, but reads and writes use resolver-owned file position state.
+    PositionBasedNonSeekable,
 }
 
 /// The result of [`Backend::dir_path`].

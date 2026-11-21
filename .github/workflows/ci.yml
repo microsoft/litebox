@@ -162,10 +162,12 @@ jobs:
         uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
-      - name: Install QEMU
+      - name: Install QEMU and virtiofsd
+        # virtiofsd serves the virtiofs test's share (in /usr/libexec, not on the PATH).
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 virtiofsd
+          /usr/libexec/virtiofsd --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.event_name != 'merge_group' }}
@@ -248,7 +250,7 @@ jobs:
         run: |
           export VMM=cloud-hypervisor VM_CPUS=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build"
           VM_MEM=6G ./dev_tools/run_linux_on_vm_userland.sh \
-            -t hello -t pid1 -t smp -t highmem -t console_flood -t net -t vsock_hybrid
+            -t hello -t pid1 -t smp -t highmem -t console_flood -t net -t vsock_hybrid -t virtiofs
           ./dev_tools/run_optee_on_vm_userland.sh -t hello-ta
       - name: Run threaded Linux programs in a Cloud Hypervisor VM with stacked runners on 4 CPUs, release
         run: |

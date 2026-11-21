@@ -242,10 +242,10 @@ impl VirtQueue {
 /// Host tests' stand-ins for the kernel and a device.
 #[cfg(test)]
 pub(in crate::virtio) mod testing {
-    use super::{AVAIL_F_NO_INTERRUPT, Buffer, DESC_F_WRITE, DESC_SIZE, VirtQueue};
+    use super::{AVAIL_F_NO_INTERRUPT, Buffer, DESC_F_NEXT, DESC_F_WRITE, DESC_SIZE, VirtQueue};
     use crate::dma::{Hal, Mmio};
     use crate::virtio::pci::PciTransport;
-    use crate::virtio::pci::tests::COMMON_LEN;
+    use crate::virtio::pci::tests::{COMMON_LEN, DEVICE_STATUS};
     use alloc::boxed::Box;
     use core::ptr::NonNull;
 
@@ -275,9 +275,10 @@ pub(in crate::virtio) mod testing {
     }
 
     /// The common configuration's words, then the notify region's and the
-    /// device configuration's.
+    /// device configuration's ([`DEVICE_CONFIG_LEN`] bytes).
     const COMMON_WORDS: usize = COMMON_LEN.div_ceil(8);
-    const REGISTER_WORDS: usize = COMMON_WORDS + 2;
+    const DEVICE_CONFIG_LEN: usize = 40;
+    const REGISTER_WORDS: usize = COMMON_WORDS + 1 + DEVICE_CONFIG_LEN.div_ceil(8);
 
     /// A transport's registers, in heap memory, which no device plays. A
     /// driver started on [`Self::transport`] must be dropped first (declared
@@ -294,8 +295,18 @@ pub(in crate::virtio) mod testing {
             PciTransport::fake(
                 self.mmio(0, COMMON_LEN),
                 self.mmio(COMMON_WORDS, 8),
-                self.mmio(COMMON_WORDS + 1, 8),
+                self.device_config(),
             )
+        }
+
+        /// For the test to play the device.
+        pub(in crate::virtio) fn device_config(&self) -> Mmio {
+            self.mmio(COMMON_WORDS + 1, DEVICE_CONFIG_LEN)
+        }
+
+        /// The device status, as the driver last set it.
+        pub(in crate::virtio) fn status(&self) -> u8 {
+            self.mmio(0, COMMON_LEN).read_u8(DEVICE_STATUS)
         }
 
         /// `len` bytes of them, from word `word`.
@@ -337,6 +348,26 @@ pub(in crate::virtio) mod testing {
                 device_writes: flags & DESC_F_WRITE != 0,
             };
             Some((head, buffer))
+        }
+
+        /// Plays the device: the buffers of the chain in `slot` of the
+        /// available ring, once the driver made it available.
+        pub(in crate::virtio) fn device_chain(&self, slot: u16) -> Option<alloc::vec::Vec<Buffer>> {
+            let (mut id, _) = self.device_takes(slot)?;
+            let mut chain = alloc::vec::Vec::new();
+            loop {
+                let desc = usize::from(id) * DESC_SIZE;
+                let flags: u16 = self.read(desc + 12);
+                chain.push(Buffer {
+                    pa: self.read(desc),
+                    len: self.read(desc + 8),
+                    device_writes: flags & DESC_F_WRITE != 0,
+                });
+                if flags & DESC_F_NEXT == 0 || chain.len() >= usize::from(self.size) {
+                    return Some(chain);
+                }
+                id = self.read(desc + 14);
+            }
         }
 
         /// Plays the device: whether the available ring asks it to interrupt

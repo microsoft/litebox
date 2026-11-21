@@ -843,7 +843,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
         let read_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
-            SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
+            SeekBehavior::PositionBased | SeekBehavior::PositionBasedNonSeekable => {
+                offset.unwrap_or(entry.position)
+            }
         };
         let read = self.backend.read(file, buf, read_offset)?;
         Ok((read, read_offset))
@@ -894,7 +896,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
         let write_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
-            SeekBehavior::PositionBased if entry.append_mode && offset.is_none() => {
+            SeekBehavior::PositionBased | SeekBehavior::PositionBasedNonSeekable
+                if entry.append_mode && offset.is_none() =>
+            {
                 usize::try_from(
                     self.backend
                         .status(HandleRef::File(file))
@@ -903,7 +907,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 )
                 .map_err(|_| WriteError::Io)?
             }
-            SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
+            SeekBehavior::PositionBased | SeekBehavior::PositionBasedNonSeekable => {
+                offset.unwrap_or(entry.position)
+            }
         };
         let written = self.backend.write(file, buf, write_offset)?;
         Ok((written, write_offset))
@@ -949,7 +955,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         }
 
         match entry.seek_behavior {
-            SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
+            SeekBehavior::NonSeekable | SeekBehavior::PositionBasedNonSeekable => {
+                Err(SeekError::NonSeekable)
+            }
             SeekBehavior::ZeroPosition => Ok(0),
             SeekBehavior::PositionBased => {
                 let file_len = self
@@ -989,7 +997,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         }
 
         match entry.seek_behavior {
-            SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
+            SeekBehavior::NonSeekable | SeekBehavior::PositionBasedNonSeekable => {
+                Err(SeekError::NonSeekable)
+            }
             SeekBehavior::ZeroPosition => Ok(0),
             SeekBehavior::PositionBased => {
                 unreachable!("position-based seeks require exclusive resolver-entry access")
@@ -1787,7 +1797,10 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
     }
 
     pub(crate) const fn uses_position(&self) -> bool {
-        matches!(self.seek_behavior, SeekBehavior::PositionBased)
+        matches!(
+            self.seek_behavior,
+            SeekBehavior::PositionBased | SeekBehavior::PositionBasedNonSeekable
+        )
     }
 }
 

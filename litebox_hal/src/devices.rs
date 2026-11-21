@@ -2,13 +2,14 @@
 // Licensed under the MIT license.
 
 //! Devices behind device-neutral types ([`ConsoleDevice`],
-//! [`NetworkDevice`], [`NinePDevice`], [`VsockDevice`]), each probing
-//! the drivers the HAL has for its kind. Runners choose which devices to
-//! probe, where they interrupt, and what to do without one.
+//! [`NetworkDevice`], [`NinePDevice`], [`FuseDevice`], [`VsockDevice`]),
+//! each probing the drivers the HAL has for its kind. Runners choose which
+//! devices to probe, where they interrupt, and what to do without one.
 
 use crate::dma::Hal;
 use crate::interrupt::InterruptTarget;
 use crate::virtio::console::VirtioConsole;
+use crate::virtio::fs::{Shared, VirtioFs};
 use crate::virtio::net::VirtioNet;
 use crate::virtio::nine_p::Virtio9p;
 use crate::virtio::vsock::VirtioVsock;
@@ -241,6 +242,103 @@ impl NinePDevice {
 }
 
 impl fmt::Display for NinePDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "virtio (pci {}, interrupts {})",
+            self.0.transport().function(),
+            self.interrupts()
+        )
+    }
+}
+
+/// A host directory served over FUSE, one request at a time (see
+/// [`crate::virtio::fs`]), through bytes shared with the device ([`Shared`]).
+/// Not internally synchronized.
+pub struct FuseDevice(Box<VirtioFs>);
+
+impl FuseDevice {
+    /// The longest request header and arguments.
+    pub const MAX_REQUEST_SIZE: usize = crate::virtio::fs::MAX_REQUEST_SIZE;
+    /// The largest payload either way: a request's, or a reply's body.
+    pub const MAX_PAYLOAD_SIZE: usize = crate::virtio::fs::MAX_PAYLOAD_SIZE;
+    /// The largest reply body of a request with a payload.
+    pub const MAX_SMALL_REPLY_SIZE: usize = crate::virtio::fs::MAX_SMALL_REPLY_SIZE;
+    /// The longest request without a reply.
+    pub const MAX_ONEWAY_SIZE: usize = crate::virtio::fs::MAX_ONEWAY_SIZE;
+    /// A reply's header, before its body.
+    pub const OUT_HEADER_SIZE: usize = crate::virtio::fs::OUT_HEADER_SIZE;
+
+    /// The VM's FUSE devices, interrupting `interrupt` if they can (see
+    /// [`Self::interrupts`]), or why one cannot be driven.
+    pub fn probe_all(
+        hal: &'static dyn Hal,
+        interrupt: InterruptTarget,
+    ) -> Vec<Result<Self, crate::virtio::Error>> {
+        // Virtio over PCI.
+        VirtioFs::probe_all(hal, interrupt.msi_message())
+            .into_iter()
+            .map(|device| device.map(|device| Self(Box::new(device))))
+            .collect()
+    }
+
+    /// Whether the device raises its interrupt; else it must be polled.
+    pub fn interrupts(&self) -> bool {
+        self.0.transport().interrupts()
+    }
+
+    /// The file system's name: untrusted bytes from the host.
+    pub fn tag(&self) -> &[u8] {
+        self.0.tag()
+    }
+
+    /// See [`VirtioFs::request`].
+    pub fn request(&mut self) -> Option<Shared<'_>> {
+        self.0.request()
+    }
+
+    /// See [`VirtioFs::payload`].
+    pub fn payload(&mut self) -> Option<Shared<'_>> {
+        self.0.payload()
+    }
+
+    /// See [`VirtioFs::transmit`].
+    pub fn transmit(&mut self, request: usize, payload: usize, room: usize) -> bool {
+        self.0.transmit(request, payload, room)
+    }
+
+    /// See [`VirtioFs::receive`].
+    pub fn receive(&mut self) -> Option<usize> {
+        self.0.receive()
+    }
+
+    /// See [`VirtioFs::reply_header`].
+    pub fn reply_header(&self) -> Option<Shared<'_>> {
+        self.0.reply_header()
+    }
+
+    /// See [`VirtioFs::reply_body`].
+    pub fn reply_body(&self) -> Option<Shared<'_>> {
+        self.0.reply_body()
+    }
+
+    /// See [`VirtioFs::oneway`].
+    pub fn oneway(&mut self) -> Option<Shared<'_>> {
+        self.0.oneway()
+    }
+
+    /// See [`VirtioFs::transmit_oneway`].
+    pub fn transmit_oneway(&mut self, len: usize) -> bool {
+        self.0.transmit_oneway(len)
+    }
+
+    /// See [`VirtioFs::oneway_done`].
+    pub fn oneway_done(&mut self) -> bool {
+        self.0.oneway_done()
+    }
+}
+
+impl fmt::Display for FuseDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
