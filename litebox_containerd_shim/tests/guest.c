@@ -4,6 +4,7 @@
 // Static guest for the shim tests. argv[1] selects the behavior; every mode first describes its
 // startup on stdout.
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
@@ -129,6 +130,20 @@ int main(int argc, char **argv) {
         if (file && fputs(argv[3], file) >= 0 && fclose(file) == 0) return 0;
         printf("write: %s\n", strerror(errno));
         return 51;
+    }
+    // Opens the directory argv[2], then prints the file argv[3] relative to it.
+    if (strcmp(mode, "readat") == 0 && argc > 3) {
+        int dir = open(argv[2], O_RDONLY | O_DIRECTORY);
+        int file = dir < 0 ? -1 : openat(dir, argv[3], O_RDONLY);
+        if (file < 0) {
+            printf("openat: %s\n", strerror(errno));
+            return 52;
+        }
+        char content[256];
+        ssize_t size = read(file, content, sizeof content);
+        if (size < 0) return 53;
+        printf("%.*s", (int)size, content);
+        return 0;
     }
     // Listens on port 80, then writes "hello" to one client.
     if (strcmp(mode, "serve") == 0) {

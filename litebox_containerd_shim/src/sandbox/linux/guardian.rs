@@ -14,7 +14,7 @@
 use std::ffi::OsString;
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd, AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command};
@@ -32,9 +32,11 @@ pub const GUARDIAN_MODE: &str = "__litebox-guardian";
 pub const VM_GUARDIAN_MODE: &str = "__litebox-vm-guardian";
 /// The guardian's end of the lifeline.
 pub const LIFELINE_FD: RawFd = 3;
-/// The VMM's connection to the socket of the VM's device daemon.
+/// A `listen` daemon's listening socket (see [`guard_vm`]).
+pub const LISTENER_FD: RawFd = 3;
+/// The VMM's connection to the socket of its `connect` daemon (see [`guard_vm`]).
 pub const DEVICE_FD: RawFd = 4;
-/// How long the VM's device daemon may take to listen on its socket.
+/// How long a `connect` daemon may take to listen on its socket.
 const DAEMON_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Runs the guardian of `backend` with `args` (see `guard_broker` and `guard_vm`), and exits.
@@ -109,51 +111,73 @@ fn guard_broker(args: &[OsString]) -> io::Result<i32> {
     let mut command = Command::new(program);
     command.args(broker_args).env("TMPDIR", tmpdir);
     let broker = spawn(&mut command)?;
-    guard(&lifeline, broker, None)
+    guard(&lifeline, broker, &[])
 }
 
-/// The VM's guardian, with the device daemon's `socket`, the daemon's command, `--`, and the VMM's
-/// command, which takes a connection to the socket as [`DEVICE_FD`] (see `vm::guardian_arguments`).
-fn guard_vm(args: &[OsString]) -> io::Result<i32> {
-    let private = || io::Error::other("this mode is private to the shim");
-    let [socket, commands @ ..] = args else {
-        return Err(private());
-    };
-    let split = commands
-        .iter()
-        .position(|arg| arg == "--")
-        .ok_or_else(private)?;
-    let (Some((daemon, daemon_args)), Some((vmm, vmm_args))) = (
-        commands[..split].split_first(),
-        commands[split + 1..].split_first(),
-    ) else {
-        return Err(private());
-    };
-    let lifeline = lifeline()?;
-    let (_, daemon) = spawn(Command::new(daemon).args(daemon_args))?;
-    // Above `DEVICE_FD`: `dup2` onto its own number would keep it close-on-exec.
-    let connection = rustix::io::fcntl_dupfd_cloexec(
-        connect_daemon(Path::new(socket), &lifeline, &daemon)?,
-        DEVICE_FD + 1,
-    )?;
-    let mut command = Command::new(vmm);
-    command.args(vmm_args);
+/// Has `command` take `fd` as `number` (above which `fd` must be: `dup2` onto its own number would
+/// keep it close-on-exec).
+fn pass_fd(command: &mut Command, fd: OwnedFd, number: RawFd) {
     // SAFETY: the hook makes async-signal-safe calls only, on a descriptor it owns.
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(connection.as_raw_fd(), DEVICE_FD) < 0 {
+            if libc::dup2(fd.as_raw_fd(), number) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
         });
     }
+}
+
+/// The VM's guardian, with the VM's device daemons, each `connect SOCKET PROGRAM ARGS...` or
+/// `listen SOCKET PROGRAM ARGS...`, and then the VMM's command, separated by `--` (see
+/// `vm::guardian_arguments`):
+///
+/// - `connect`: a daemon that listens on `SOCKET`, to which the guardian connects once it does, for
+///   the VMM to take as [`DEVICE_FD`]; one at most.
+/// - `listen`: a daemon that takes `SOCKET`, which the guardian binds, as [`LISTENER_FD`], so that
+///   the VMM may connect to it at once.
+fn guard_vm(args: &[OsString]) -> io::Result<i32> {
+    let private = || io::Error::other("this mode is private to the shim");
+    let mut commands: Vec<&[OsString]> = args.split(|arg| arg == "--").collect();
+    let Some((vmm, vmm_args)) = commands.pop().and_then(<[OsString]>::split_first) else {
+        return Err(private());
+    };
+    let lifeline = lifeline()?;
+    let (mut daemons, mut connection) = (Vec::new(), None);
+    for daemon in commands {
+        let [mode, socket, program, daemon_args @ ..] = daemon else {
+            return Err(private());
+        };
+        let mut command = Command::new(program);
+        command.args(daemon_args);
+        match mode.to_str() {
+            Some("listen") => {
+                let listener = UnixListener::bind(socket)?;
+                let listener = rustix::io::fcntl_dupfd_cloexec(listener, LISTENER_FD + 1)?;
+                pass_fd(&mut command, listener, LISTENER_FD);
+                daemons.push(spawn(&mut command)?.1);
+            }
+            Some("connect") if connection.is_none() => {
+                let (_, daemon) = spawn(&mut command)?;
+                let connected = connect_daemon(Path::new(socket), &lifeline, &daemon)?;
+                connection = Some(rustix::io::fcntl_dupfd_cloexec(connected, DEVICE_FD + 1)?);
+                daemons.push(daemon);
+            }
+            _ => return Err(private()),
+        }
+    }
+    let mut command = Command::new(vmm);
+    command.args(vmm_args);
+    if let Some(connection) = connection {
+        pass_fd(&mut command, connection, DEVICE_FD);
+    }
     let vm = spawn(&mut command)?;
     // The VMM's copy alone keeps the connection, so that the daemon sees it end with the VMM.
     drop(command);
-    guard(&lifeline, vm, Some(&daemon))
+    guard(&lifeline, vm, &daemons)
 }
 
-/// Connects to the device daemon's `socket` once it listens, for the VMM to take: a VMM's
+/// Connects to a `connect` daemon's `socket` once it listens, for the VMM to take: a VMM's
 /// connection may fail if refused, and a probe may end the daemon's one session. Waits up to
 /// [`DAEMON_TIMEOUT`] while the `lifeline` and the `daemon_pidfd` are not readable.
 fn connect_daemon(
@@ -185,12 +209,12 @@ fn connect_daemon(
 }
 
 /// Reports the pid of `main`, the broker's, on the `lifeline`, and waits for the lifeline's end,
-/// or `main`'s, or the end of the child of the pidfd `helper`, if any. Then kills and reaps every
-/// child, and returns `main`'s status.
+/// or `main`'s, or the end of a child of the pidfds `helpers`. Then kills and reaps every child,
+/// and returns `main`'s status.
 fn guard(
     lifeline: &UnixStream,
     (main, main_pidfd): (Child, OwnedFd),
-    helper: Option<&OwnedFd>,
+    helpers: &[OwnedFd],
 ) -> io::Result<i32> {
     // The children's stdout is their own from here on, so that the daemon sees it end with them.
     let null = std::fs::File::open("/dev/null")?;
@@ -202,7 +226,11 @@ fn guard(
             PollFd::new(lifeline, PollFlags::IN),
             PollFd::new(&main_pidfd, PollFlags::IN),
         ];
-        fds.extend(helper.map(|helper| PollFd::new(helper, PollFlags::IN)));
+        fds.extend(
+            helpers
+                .iter()
+                .map(|helper| PollFd::new(helper, PollFlags::IN)),
+        );
         while rustix::event::poll(&mut fds, None) == Err(rustix::io::Errno::INTR) {}
     }
     let pid = Pid::from_child(&main);

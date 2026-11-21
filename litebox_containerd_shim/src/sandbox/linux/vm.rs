@@ -2,21 +2,25 @@
 // Licensed under the MIT license.
 
 //! The VM backend: `litebox_runner_vm_kernel` in QEMU, which boots the guest service as process 1.
-//! The guardian runs QEMU, whose pid is the broker's, and `vhost-device-vsock`, whose hybrid vsock
-//! bridge reaches the guest service.
+//! The guardian runs QEMU, whose pid is the broker's, `vhost-device-vsock`, whose hybrid vsock
+//! bridge reaches the guest service, and a `virtiofsd` for each directory bind.
 //!
 //! The payload, QEMU's initrd, holds the VM's Linux runner, the root archive and the `policy`, the
 //! egress rules (see `litebox_broker_vm_kernel`'s docs). The VM serves one directory bind at most
-//! for now, as a read-only virtio-9p device whose mount tag is its guest path. With egress rules,
+//! for now, as a virtio-fs device whose tag is its guest path, which the kernel keeps read-only;
+//! `virtiofsd` runs without its sandbox, which needs user namespaces, as the broker's user. With
+//! egress rules,
 //! guest sockets reach QEMU's user network, which NATs them, as far as the rules let them (see
 //! [`Egress`]); without, the VM has no network device. The VM publishes no ports yet. QEMU's NAT
 //! keeps one destination per guest UDP port, the last: an unconnected UDP socket that sends to
 //! 10.0.2.1 or 10.0.2.3 and to other destinations may lose the replies of those it sent to earlier.
 //! QEMU's stdout is the kernel's log, and its stderr the processes' output.
 //!
-//! The kernel, the runner and the daemon are next to this executable unless `LITEBOX_VM_KERNEL`,
-//! `LITEBOX_VM_RUNNER` or `LITEBOX_VHOST_DEVICE_VSOCK` name them; the kernel and the runner must be
-//! of this executable's build. QEMU is `qemu-system-x86_64` unless `LITEBOX_QEMU` names it.
+//! The kernel, the runner and `vhost-device-vsock` are next to this executable unless
+//! `LITEBOX_VM_KERNEL`, `LITEBOX_VM_RUNNER` or `LITEBOX_VHOST_DEVICE_VSOCK` name them; the kernel
+//! and the runner must be of this executable's build. QEMU and `virtiofsd` are, unless `LITEBOX_QEMU`
+//! or `LITEBOX_VIRTIOFSD` name them, the first that the broker's user can run next to this
+//! executable, on the `PATH`, or in `/usr/libexec`, where distributions install `virtiofsd`.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -25,7 +29,7 @@ use std::io::{self, BufWriter, Read, Seek as _, SeekFrom};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use litebox_broker_core::MAX_DESTINATION_RULES;
@@ -33,7 +37,7 @@ use tar_core::EntryType;
 use tar_core::builder::EntryBuilder;
 
 use super::super::{StateDir, program};
-use super::guardian::DEVICE_FD;
+use super::guardian::{DEVICE_FD, LISTENER_FD};
 use crate::rootfs::{append, finish};
 use crate::spec::{Bind, Egress, Plan};
 use crate::{Result, internal, invalid, unsupported};
@@ -47,8 +51,9 @@ const KERNEL: &str = "litebox_runner_vm_kernel";
 const RUNNER: &str = "litebox_runner_linux_on_vm_userland";
 const DEVICE_DAEMON: &str = "vhost-device-vsock";
 const QEMU: &str = "qemu-system-x86_64";
-/// The longest mount tag of QEMU's virtio-9p devices: its `MAX_TAG_LEN` but the NUL.
-const MAX_MOUNT_TAG: usize = 31;
+const VIRTIOFSD: &str = "virtiofsd";
+/// The longest tag of a virtio-fs device (`virtio_fs_config`'s).
+const MAX_TAG: usize = 36;
 /// Guest RAM besides the payload's without a memory limit.
 const DEFAULT_MEMORY_MIB: u64 = 2048;
 /// Guest RAM besides a memory limit's and the payload's, for the kernel and the guest service.
@@ -100,6 +105,19 @@ pub fn give_stderr(stderr: &impl AsFd, uid: u32, gid: u32) -> io::Result<()> {
     std::os::unix::fs::fchown(stderr, Some(uid), Some(gid))
 }
 
+/// The guardian's `PATH`, where it finds the VM's programs that their variables do not name (see
+/// the module's docs): as the broker's user, it skips those it cannot run.
+fn search_path() -> Result<OsString> {
+    let beside = std::env::current_exe().unwrap_or_default();
+    // glibc's default, without a `PATH`.
+    let path = std::env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into());
+    let dirs = (beside.parent().map(Path::to_path_buf).into_iter())
+        .chain(std::env::split_paths(&path))
+        .chain(std::iter::once(PathBuf::from("/usr/libexec")));
+    std::env::join_paths(dirs)
+        .map_err(|error| internal(format!("cannot search for the VM's programs: {error}")))
+}
+
 /// The most CPUs the kernel starts (`litebox_platform_vm_kernel`'s `MAX_CPUS`).
 const MAX_CPUS: usize = 64;
 
@@ -120,24 +138,21 @@ pub fn guardian_arguments(
 ) -> Result<()> {
     // TODO: serve any number of directory and file binds, nested ones too, live, through one
     // device for the sandbox exporting a tree the host composes: a device per bind takes a PCI
-    // slot each, whatever the transport (9p or virtio-fs), and file binds are copies in the root
-    // archive.
+    // slot each, and file binds are copies in the root archive.
     if binds.len() > 1 {
         return Err(unsupported(format!(
             "the VM backend serves one directory bind at most for now, not {}",
             binds.len()
         )));
     }
-    if let Some(bind) = binds
-        .iter()
-        .find(|bind| bind.destination.len() > MAX_MOUNT_TAG)
-    {
+    if let Some(bind) = binds.iter().find(|bind| bind.destination.len() > MAX_TAG) {
         return Err(unsupported(format!(
-            "the directory bind at {} is too deep for the VM, whose share is mounted at its 9p \
-             mount tag, of at most {MAX_MOUNT_TAG} bytes",
+            "the directory bind at {} is too deep for the VM, whose share is mounted at its \
+             virtio-fs tag, of at most {MAX_TAG} bytes",
             bind.destination
         )));
     }
+    let virtiofsd = std::env::var_os("LITEBOX_VIRTIOFSD").unwrap_or_else(|| VIRTIOFSD.into());
     let kernel = program("LITEBOX_VM_KERNEL", KERNEL);
     if !kernel.is_file() {
         return Err(internal(format!(
@@ -154,14 +169,29 @@ pub fn guardian_arguments(
     let cpus = cpus(plan.resources.cpus, host_cpus);
     let socket = state.sockets.join("vhost-user");
     command
+        .env("PATH", search_path()?)
+        .arg("connect")
         .arg(&socket)
         .arg(program("LITEBOX_VHOST_DEVICE_VSOCK", DEVICE_DAEMON))
         .args(["--guest-cid", GUEST_CID, "--socket"])
         .arg(&socket)
         .arg("--uds-path")
         .arg(state.bridge())
-        .arg("--")
-        .arg(std::env::var_os("LITEBOX_QEMU").unwrap_or_else(|| QEMU.into()));
+        .arg("--");
+    let shares: Vec<PathBuf> = (0..binds.len())
+        .map(|index| state.sockets.join(format!("virtiofs{index}")))
+        .collect();
+    for (bind, socket) in binds.iter().zip(&shares) {
+        command
+            .arg("listen")
+            .arg(socket)
+            .arg(&virtiofsd)
+            .arg(format!("--fd={LISTENER_FD}"))
+            .arg("--shared-dir")
+            .arg(&bind.source)
+            .args(["--sandbox=none", "--log-level=error", "--"]);
+    }
+    command.arg(std::env::var_os("LITEBOX_QEMU").unwrap_or_else(|| QEMU.into()));
     command
         .args(["-machine", "q35", "-nodefaults", "-m", &memory])
         // KVM if QEMU, of the broker's user, can use it, else TCG; `max` suits both, and invtsc (not
@@ -188,17 +218,19 @@ pub fn guardian_arguments(
             .args(["-device", "virtio-net-pci,netdev=n0,disable-legacy=on"]);
     }
     // Only read-only ones reach here (see `RootFs::bind`).
-    for (index, bind) in binds.iter().enumerate() {
-        let mut fsdev = OsString::from(format!("local,id=fs{index},path="));
-        fsdev.push(option_value(bind.source.as_os_str()));
-        fsdev.push(",security_model=none,readonly=on");
-        let mut device = OsString::from(format!("virtio-9p-pci,fsdev=fs{index},mount_tag="));
+    for (index, (bind, socket)) in binds.iter().zip(&shares).enumerate() {
+        let mut chardev = OsString::from(format!("socket,id=fs{index},path="));
+        chardev.push(option_value(socket.as_os_str()));
+        let mut device = OsString::from(format!("vhost-user-fs-pci,chardev=fs{index},tag="));
         device.push(option_value(OsStr::new(&bind.destination)));
-        device.push(",disable-legacy=on");
-        command.arg("-fsdev").arg(fsdev).arg("-device").arg(device);
+        command
+            .arg("-chardev")
+            .arg(chardev)
+            .arg("-device")
+            .arg(device);
     }
-    // vhost-user needs the guest's memory shared with the device daemon, whose connection the
-    // guardian hands QEMU.
+    // vhost-user needs the guest's memory shared with the device daemons, the vsock one's
+    // connection the guardian hands QEMU.
     command
         .arg("-object")
         .arg(format!(
