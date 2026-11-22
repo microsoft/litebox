@@ -31,7 +31,17 @@ fn receive_message(
     nonblocking: bool,
 ) -> Result<UnixSocketResult<Message>> {
     let mut data = vec![0; capacity as usize];
-    let result = receive(process, handle, &mut data, peek, source, nonblocking)?;
+    let readiness_sink: Arc<dyn ReadinessSink> = Arc::new(TestReadinessSink::default());
+    let result = receive(
+        process,
+        handle,
+        &mut data,
+        peek,
+        source,
+        nonblocking,
+        0,
+        &readiness_sink,
+    )?;
     Ok(result.map(|received| {
         data.truncate(received.received);
         Message {
@@ -44,6 +54,8 @@ fn receive_message(
 
 struct Fixture {
     process: Arc<BrokerProcess>,
+    /// Another process on the same broker.
+    other: Arc<BrokerProcess>,
     sink: Arc<TestReadinessSink>,
     readiness_sink: Arc<dyn ReadinessSink>,
 }
@@ -73,9 +85,13 @@ impl Fixture {
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
+        let other = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
         let sink = Arc::new(TestReadinessSink::default());
         Self {
             process,
+            other,
             readiness_sink: sink.clone(),
             sink,
         }
@@ -139,7 +155,15 @@ impl Fixture {
     }
 
     fn send(&self, handle: ObjectHandle, data: &[u8]) -> Result<UnixSocketResult<usize>> {
-        send(&self.process, handle, None, &data, USER)
+        send(
+            &self.process,
+            handle,
+            None,
+            &[],
+            &data,
+            USER,
+            &self.readiness_sink,
+        )
     }
 
     fn send_to(
@@ -148,7 +172,74 @@ impl Fixture {
         address: &UnixSocketAddress,
         data: &[u8],
     ) -> Result<UnixSocketResult<usize>> {
-        send(&self.process, handle, Some(address), &data, USER)
+        send(
+            &self.process,
+            handle,
+            Some(address),
+            &[],
+            &data,
+            USER,
+            &self.readiness_sink,
+        )
+    }
+
+    /// Sends `data` from `process`'s socket `handle` to its peer, carrying the
+    /// objects `objects` refer to.
+    fn send_objects(
+        &self,
+        process: &BrokerProcess,
+        handle: ObjectHandle,
+        data: &[u8],
+        objects: &[ObjectHandle],
+    ) -> UnixSocketResult<usize> {
+        send(
+            process,
+            handle,
+            None,
+            objects,
+            &data,
+            USER,
+            &self.readiness_sink,
+        )
+        .unwrap()
+    }
+
+    /// Receives up to `capacity` bytes and `max_objects` objects from
+    /// `process`'s socket `handle`.
+    fn receive_objects(
+        &self,
+        process: &BrokerProcess,
+        handle: ObjectHandle,
+        capacity: usize,
+        max_objects: usize,
+        peek: bool,
+    ) -> (Vec<u8>, Received) {
+        let mut data = vec![0; capacity];
+        let received = receive(
+            process,
+            handle,
+            &mut data,
+            peek,
+            false,
+            true,
+            max_objects,
+            &self.readiness_sink,
+        )
+        .unwrap()
+        .unwrap();
+        data.truncate(received.received);
+        (data, received)
+    }
+
+    /// Returns the number of carried sockets.
+    fn in_flight(&self) -> usize {
+        self.process
+            .core
+            .unix_sockets
+            .in_flight
+            .lock()
+            .sockets
+            .len()
     }
 
     fn receive(&self, handle: ObjectHandle, capacity: u32) -> Result<UnixSocketResult<Message>> {
@@ -1177,4 +1268,249 @@ fn opposite_connects_do_not_deadlock() {
         fixture.close(bound);
     }
     assert_eq!(fixture.queued(), (0, 0));
+}
+
+#[test]
+fn messages_carry_references_to_other_processes() {
+    use litebox_broker_protocol::unix_socket::TransferredObjectKind;
+
+    let fixture = Fixture::new();
+    let address = abstract_name(b"carrier");
+    let listener = fixture.listener(&address, 1);
+    let client = create(
+        &fixture.other,
+        SocketType::Stream,
+        FileOpenFlags::NONE,
+        &fixture.readiness_sink,
+    )
+    .unwrap();
+    connect(&fixture.other, client, &address, USER)
+        .unwrap()
+        .unwrap();
+    let server = fixture.accept(listener).unwrap().unwrap();
+
+    let (carried, kept) = fixture.pair(SocketType::SeqPacket);
+    assert_eq!(
+        fixture.send_objects(&fixture.process, server, b"hi", &[carried]),
+        Ok(2)
+    );
+    // The reader's reference keeps the socket open.
+    fixture.close(carried);
+    let (data, received) = fixture.receive_objects(&fixture.other, client, 8, 4, false);
+    assert_eq!(data, b"hi");
+    assert!(!received.objects_truncated);
+    let [object] = received.objects[..] else {
+        panic!("expected one object, got {:?}", received.objects);
+    };
+    assert_eq!(
+        object.kind,
+        TransferredObjectKind::UnixSocket(SocketType::SeqPacket)
+    );
+    assert_eq!(
+        fixture.send_objects(&fixture.other, object.handle, b"ping", &[]),
+        Ok(4)
+    );
+    assert_eq!(fixture.receive_data(kept, 8), b"ping");
+    assert_eq!(fixture.in_flight(), 0);
+    assert_eq!(fixture.queued(), (0, 0));
+}
+
+#[test]
+fn stream_receives_stop_after_the_bytes_sent_with_objects() {
+    let fixture = Fixture::new();
+    let (sender, reader) = fixture.pair(SocketType::Stream);
+    let (carried, _kept) = fixture.pair(SocketType::Datagram);
+    let process = &fixture.process;
+    assert_eq!(fixture.send_objects(process, sender, b"ab", &[]), Ok(2));
+    assert_eq!(
+        fixture.send_objects(process, sender, b"cd", &[carried]),
+        Ok(2)
+    );
+    assert_eq!(
+        fixture.send_objects(process, sender, b"ef", &[carried]),
+        Ok(2)
+    );
+
+    // Peeking duplicates the objects and leaves them queued.
+    let (data, peeked) = fixture.receive_objects(process, reader, 16, 4, true);
+    assert_eq!(data, b"abcd");
+    assert_eq!(peeked.objects.len(), 1);
+    fixture.close(peeked.objects[0].handle);
+    // A receive that ends before the carried bytes gets no objects.
+    let (data, received) = fixture.receive_objects(process, reader, 1, 4, false);
+    assert_eq!((&data[..], received.objects.len()), (&b"a"[..], 0));
+    // A receive that starts in plain bytes stops after the carried ones.
+    let (data, received) = fixture.receive_objects(process, reader, 16, 4, false);
+    assert_eq!((&data[..], received.objects.len()), (&b"bcd"[..], 1));
+    fixture.close(received.objects[0].handle);
+    // A partial receive of carried bytes still gets their objects, once.
+    let (data, received) = fixture.receive_objects(process, reader, 1, 4, false);
+    assert_eq!((&data[..], received.objects.len()), (&b"e"[..], 1));
+    fixture.close(received.objects[0].handle);
+    let (data, received) = fixture.receive_objects(process, reader, 16, 4, false);
+    assert_eq!((&data[..], received.objects.len()), (&b"f"[..], 0));
+    fixture.close(carried);
+    assert_eq!(fixture.queued(), (0, 0));
+}
+
+#[test]
+fn receives_discard_the_objects_beyond_their_limit() {
+    let fixture = Fixture::new();
+    let process = &fixture.process;
+    let (sender, reader) = fixture.pair(SocketType::Datagram);
+    let (first, first_peer) = fixture.pair(SocketType::Stream);
+    let (second, second_peer) = fixture.pair(SocketType::Stream);
+    assert_eq!(
+        fixture.send_objects(process, sender, b"", &[first, second]),
+        Ok(0)
+    );
+    fixture.close(first);
+    fixture.close(second);
+
+    let (data, received) = fixture.receive_objects(process, reader, 16, 1, false);
+    assert_eq!(data, b"");
+    assert!(received.objects_truncated);
+    assert_eq!(received.objects.len(), 1);
+    // The discarded socket closed, so its peer hung up.
+    assert!(
+        fixture
+            .readiness(second_peer)
+            .contains(ReadinessFlags::HANGUP)
+    );
+    assert!(
+        !fixture
+            .readiness(first_peer)
+            .contains(ReadinessFlags::HANGUP)
+    );
+    fixture.close(received.objects[0].handle);
+    assert!(
+        fixture
+            .readiness(first_peer)
+            .contains(ReadinessFlags::HANGUP)
+    );
+    assert_eq!(fixture.queued(), (0, 0));
+}
+
+#[test]
+fn streams_carry_no_objects_without_data() {
+    let fixture = Fixture::new();
+    let process = &fixture.process;
+    let (sender, reader) = fixture.pair(SocketType::Stream);
+    let (carried, peer) = fixture.pair(SocketType::Stream);
+    assert_eq!(
+        fixture.send_objects(process, sender, b"", &[carried]),
+        Ok(0)
+    );
+    fixture.close(carried);
+    assert!(fixture.readiness(peer).contains(ReadinessFlags::HANGUP));
+    assert_eq!(fixture.receive(reader, 8), Err(BrokerError::WouldBlock));
+}
+
+#[test]
+fn the_collector_reclaims_sockets_only_messages_reach() {
+    let fixture = Fixture::new();
+    let process = &fixture.process;
+
+    // A socket sent over itself.
+    let (sender, reader) = fixture.pair(SocketType::Stream);
+    assert_eq!(
+        fixture.send_objects(process, sender, b"x", &[reader]),
+        Ok(1)
+    );
+    fixture.close(reader);
+    assert_eq!(fixture.in_flight(), 0);
+    // Its peer closed, so the sender hung up.
+    assert!(fixture.readiness(sender).contains(ReadinessFlags::HANGUP));
+    fixture.close(sender);
+
+    // Two sockets carried by each other's messages.
+    let (first_sender, first_receiver) = fixture.pair(SocketType::Datagram);
+    let (second_sender, second_receiver) = fixture.pair(SocketType::Datagram);
+    let socket = fixture.socket(first_receiver);
+    fixture
+        .send_objects(process, first_sender, b"1", &[second_receiver])
+        .unwrap();
+    fixture
+        .send_objects(process, second_sender, b"2", &[first_receiver])
+        .unwrap();
+    fixture.close(first_receiver);
+    assert_eq!(fixture.in_flight(), 2);
+    fixture.close(second_receiver);
+    assert_eq!(fixture.in_flight(), 0);
+    assert!(socket.upgrade().is_none());
+    fixture.close(first_sender);
+    fixture.close(second_sender);
+    assert_eq!(fixture.queued(), (0, 0));
+}
+
+#[test]
+fn the_collector_keeps_sockets_that_live_sockets_messages_reach() {
+    let fixture = Fixture::new();
+    let process = &fixture.process;
+    let (sender, reader) = fixture.pair(SocketType::SeqPacket);
+    let (outer, outer_peer) = fixture.pair(SocketType::SeqPacket);
+    let (inner, inner_peer) = fixture.pair(SocketType::SeqPacket);
+    // `inner` is reached only through `outer`'s queue, which `reader`'s
+    // queue reaches.
+    fixture
+        .send_objects(process, outer_peer, b"i", &[inner])
+        .unwrap();
+    fixture
+        .send_objects(process, sender, b"o", &[outer])
+        .unwrap();
+    fixture.close(inner);
+    fixture.close(outer);
+    assert_eq!(fixture.in_flight(), 2);
+
+    let (_, received) = fixture.receive_objects(process, reader, 8, 1, false);
+    let outer = received.objects[0].handle;
+    let (data, received) = fixture.receive_objects(process, outer, 8, 1, false);
+    assert_eq!(data, b"i");
+    let inner = received.objects[0].handle;
+    assert_eq!(fixture.send_objects(process, inner, b"!", &[]), Ok(1));
+    assert_eq!(fixture.receive_data(inner_peer, 8), b"!");
+    for handle in [sender, reader, outer, outer_peer, inner, inner_peer] {
+        fixture.close(handle);
+    }
+    assert_eq!(fixture.in_flight(), 0);
+    assert_eq!(fixture.queued(), (0, 0));
+}
+
+#[test]
+fn carried_sockets_nest_at_most_max_nesting_deep() {
+    let fixture = Fixture::new();
+    let process = &fixture.process;
+    let (mut carried, _) = fixture.pair(SocketType::Datagram);
+    for depth in 0..=MAX_NESTING {
+        let (sender, reader) = fixture.pair(SocketType::Datagram);
+        assert_eq!(
+            fixture.send_objects(process, sender, b"", &[carried]),
+            Ok(0),
+            "depth {depth}"
+        );
+        carried = reader;
+    }
+    let (sender, _) = fixture.pair(SocketType::Datagram);
+    assert_eq!(
+        fixture.send_objects(process, sender, b"", &[carried]),
+        Err(UnixSocketError::TooManyReferences)
+    );
+}
+
+#[test]
+fn failed_sends_do_not_nest_their_sockets() {
+    let fixture = Fixture::new();
+    let process = &fixture.process;
+    let (carried, _) = fixture.pair(SocketType::Datagram);
+    let (sender, reader) = fixture.pair(SocketType::Datagram);
+    shutdown(process, reader, ShutdownMode::Read)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fixture.send_objects(process, sender, b"", &[carried]),
+        Err(UnixSocketError::BrokenPipe)
+    );
+    let socket = fixture.socket(reader).upgrade().unwrap();
+    assert_eq!(socket.nesting.load(Ordering::Relaxed), 0);
+    assert_eq!(fixture.in_flight(), 0);
 }

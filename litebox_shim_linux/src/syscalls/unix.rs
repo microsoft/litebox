@@ -16,18 +16,21 @@ use core::mem::{offset_of, size_of};
 use litebox::{
     event::{Events, IOPollable, observer::Observer, wait::WaitContext},
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
-    process::ProcessError,
-    unix_socket,
+    pipes::HalfPipeType,
+    process::{InheritableFd, ProcessError},
+    unix_socket::{self, ReceivedObject},
 };
 use litebox_broker_protocol::{
     ObjectHandle,
     fs::{FileMode as Mode, FileUser},
     socket::SocketType,
-    unix_socket::{UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketName},
+    unix_socket::{
+        TransferredObjectKind, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketName,
+    },
 };
 use litebox_common_linux::{
-    AddressFamily, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
-    SocketOptionName, UnixProtocol, errno::Errno,
+    AddressFamily, FileDescriptorFlags, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags,
+    SockType, SocketOption, SocketOptionName, UnixProtocol, errno::Errno,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
@@ -158,6 +161,17 @@ impl From<UnixSocketName> for UnixSocketAddr {
     }
 }
 
+/// Objects that data received from a Unix socket carried, for which the receiver gets descriptors.
+#[derive(Debug, Default)]
+pub(super) struct ReceivedObjects {
+    /// Most objects to receive.
+    pub(super) limit: usize,
+    /// The received objects.
+    pub(super) objects: Vec<ReceivedObject>,
+    /// Whether the data carried objects beyond `objects`.
+    pub(super) truncated: bool,
+}
+
 /// A Unix domain socket descriptor's open file description.
 pub(crate) struct UnixSocket<Platform: ShimPlatform> {
     socket: Arc<unix_socket::UnixSocket<Platform>>,
@@ -255,12 +269,15 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         Ok(accepted.into())
     }
 
+    /// Sends `buf` to `addr`, or to the connected peer, carrying `objects`, whose receiver gets
+    /// descriptors for them (`SCM_RIGHTS`).
     pub(super) fn sendto(
         &self,
         task: &Task<Platform>,
         buf: impl WriteBuffer,
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
+        objects: &[InheritableFd<Platform>],
     ) -> Result<usize, Errno> {
         // Like Linux, Unix sockets ignore `MSG_EOR`; each sequenced-packet send already ends a
         // record.
@@ -280,6 +297,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
             &task.wait_cx(),
             address.as_ref(),
             buf,
+            objects,
             acting_user(task),
             flags.contains(SendFlags::DONTWAIT),
         )?)
@@ -290,14 +308,22 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     ///
     /// A datagram or sequenced-packet socket stores its sender's name in `source_addr` if
     /// requested.
+    ///
+    /// The received data's carried objects are stored in `objects` up to its limit, and discarded
+    /// otherwise unless peeking, as Linux discards the descriptors a receive without room for
+    /// them would get.
     pub(super) fn recvfrom(
         &self,
         cx: &WaitContext<'_, Platform>,
         buf: impl ReadBuffer,
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
+        objects: Option<&mut ReceivedObjects>,
     ) -> Result<usize, Errno> {
-        let supported_flags = ReceiveFlags::DONTWAIT | ReceiveFlags::PEEK | ReceiveFlags::TRUNC;
+        let supported_flags = ReceiveFlags::DONTWAIT
+            | ReceiveFlags::PEEK
+            | ReceiveFlags::TRUNC
+            | ReceiveFlags::CMSG_CLOEXEC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvfrom flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -308,9 +334,16 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
             flags.contains(ReceiveFlags::PEEK),
             source_addr.is_some() && !self.is_stream(),
             flags.contains(ReceiveFlags::DONTWAIT),
+            objects.as_ref().map_or(0, |objects| {
+                objects.limit.saturating_sub(objects.objects.len())
+            }),
         )?;
         if let (Some(source_addr), Some(source)) = (source_addr, received.source) {
             *source_addr = Some(source.into());
+        }
+        if let Some(objects) = objects {
+            objects.truncated |= received.objects_truncated;
+            objects.objects.extend(received.objects);
         }
         Ok(received.length)
     }
@@ -472,6 +505,164 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             .litebox
             .descriptor_table_mut()
             .insert::<UnixSocketSubsystem<Platform>>(UnixSocket::from(socket)))
+    }
+}
+
+/// Size of a `struct cmsghdr`, which a control message's data follows.
+pub(super) const CMSG_HEADER_SIZE: usize = cmsg_align(size_of::<usize>() + 2 * size_of::<i32>());
+
+/// `SOL_SOCKET`, the level of the control messages that pass descriptors.
+pub(super) const SOL_SOCKET: i32 = 1;
+
+/// `SCM_RIGHTS`, the type of a control message that passes descriptors.
+pub(super) const SCM_RIGHTS: i32 = 1;
+
+/// Linux's `SCM_MAX_FD`, the most descriptors one message passes.
+pub(super) const SCM_MAX_FD: usize = 253;
+
+/// Rounds `length` up as `CMSG_ALIGN` does.
+pub(super) const fn cmsg_align(length: usize) -> usize {
+    length.next_multiple_of(size_of::<usize>())
+}
+
+/// Returns the most descriptors an `SCM_RIGHTS` message fits in `capacity` control bytes, as
+/// Linux's `scm_max_fds`.
+pub(super) fn max_received_fds(capacity: usize) -> usize {
+    (capacity.saturating_sub(CMSG_HEADER_SIZE) / size_of::<i32>()).min(SCM_MAX_FD)
+}
+
+impl<Platform: ShimPlatform> Task<Platform> {
+    /// Installs descriptors for `received`'s objects, close-on-exec if `close_on_exec` is set, and
+    /// writes the `SCM_RIGHTS` message listing them to the `capacity` control bytes at `control`,
+    /// as Linux's `scm_detach_fds`.
+    ///
+    /// Returns the control bytes used, and whether objects were discarded (`MSG_CTRUNC`): those
+    /// beyond `received`'s limit or this process's descriptor limit, or all of them if the
+    /// control bytes cannot be written.
+    pub(super) fn install_received_objects(
+        &self,
+        received: ReceivedObjects,
+        control: UserPtrMut<u8>,
+        capacity: usize,
+        close_on_exec: bool,
+    ) -> (usize, bool) {
+        let mut truncated = received.truncated;
+        if received.objects.is_empty() {
+            return (0, truncated);
+        }
+        let length = CMSG_HEADER_SIZE + received.objects.len() * size_of::<i32>();
+        // Like Linux, which writes each descriptor before installing it, a receive into control
+        // bytes it cannot write discards the objects.
+        let zeros = alloc::vec![0; length];
+        if control
+            .write_slice_at_offset::<Platform>(0, &zeros)
+            .is_none()
+        {
+            return (0, true);
+        }
+        let mut fds = Vec::with_capacity(received.objects.len());
+        // Like Linux, a failure to install one discards the rest.
+        for object in received.objects {
+            if let Ok(fd) = self.install_received_object(object, close_on_exec) {
+                fds.push(fd);
+            } else {
+                truncated = true;
+                break;
+            }
+        }
+        if fds.is_empty() {
+            return (0, true);
+        }
+        let length = CMSG_HEADER_SIZE + fds.len() * size_of::<i32>();
+        let mut message = Vec::with_capacity(length);
+        message.extend_from_slice(&length.to_ne_bytes());
+        message.extend_from_slice(&SOL_SOCKET.to_ne_bytes());
+        message.extend_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        message.resize(CMSG_HEADER_SIZE, 0);
+        for fd in fds {
+            message.extend_from_slice(&fd.to_ne_bytes());
+        }
+        // Like Linux, the descriptors stay installed even if this faults.
+        let _ = control.write_slice_at_offset::<Platform>(0, &message);
+        (cmsg_align(length).min(capacity), truncated)
+    }
+
+    /// Installs a descriptor for `object` at the lowest free number.
+    fn install_received_object(
+        &self,
+        object: ReceivedObject,
+        close_on_exec: bool,
+    ) -> Result<i32, Errno> {
+        let global = &self.global;
+        match object.kind() {
+            TransferredObjectKind::File => {
+                let fd = global.adopt_inherited_file(object.into_handle())?;
+                self.install_adopted(fd, close_on_exec)
+            }
+            TransferredObjectKind::PipeReadEnd => {
+                let fd = global
+                    .adopt_inherited_pipe_end(object.into_handle(), HalfPipeType::ReceiverHalf)?;
+                self.install_adopted(fd, close_on_exec)
+            }
+            TransferredObjectKind::PipeWriteEnd => {
+                let fd = global
+                    .adopt_inherited_pipe_end(object.into_handle(), HalfPipeType::SenderHalf)?;
+                self.install_adopted(fd, close_on_exec)
+            }
+            TransferredObjectKind::UnixSocket(socket_type) => {
+                let fd = global.adopt_inherited_unix_socket(object.into_handle(), socket_type)?;
+                self.install_adopted(fd, close_on_exec)
+            }
+            TransferredObjectKind::InetSocket(socket_type) => {
+                let fd = global.adopt_inherited_inet_socket(object.into_handle(), socket_type)?;
+                self.install_adopted(fd, close_on_exec)
+            }
+            TransferredObjectKind::VsockSocket => {
+                let fd = global.adopt_inherited_vsock_socket(object.into_handle())?;
+                self.install_adopted(fd, close_on_exec)
+            }
+            TransferredObjectKind::EventCounter => {
+                let fd = global.adopt_inherited_eventfd(object.into_handle())?;
+                self.install_adopted(fd, close_on_exec)
+            }
+            TransferredObjectKind::Timer => {
+                let fd = global.adopt_inherited_timerfd(object.into_handle())?;
+                self.install_adopted(fd, close_on_exec)
+            }
+            TransferredObjectKind::ReadinessQueue => {
+                let fd = global.adopt_inherited_epoll(object.into_handle())?;
+                self.install_adopted(fd, close_on_exec)
+            }
+            TransferredObjectKind::Process => {
+                let fd = global.adopt_inherited_pidfd(object.into_handle())?;
+                self.install_adopted(fd, close_on_exec)
+            }
+            kind => {
+                log_unsupported!("receiving a descriptor for {kind:?}");
+                Err(Errno::EINVAL)
+            }
+        }
+    }
+
+    /// Installs the adopted `fd` at the lowest free number.
+    fn install_adopted<Subsystem: FdEnabledSubsystem>(
+        &self,
+        fd: TypedFd<Subsystem>,
+        close_on_exec: bool,
+    ) -> Result<i32, Errno> {
+        if close_on_exec {
+            let old = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        let raw_fd = self.files.borrow().insert_raw_fd(fd).map_err(|fd| {
+            self.remove_and_drop_descriptor(&fd);
+            Errno::EMFILE
+        })?;
+        Ok(i32::try_from(raw_fd).expect("descriptor numbers fit in i32"))
     }
 }
 

@@ -90,6 +90,9 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
     /// then ends instead of being reported.
     ///
     /// A message-oriented socket stores its sender's address in `source_addr` if requested.
+    ///
+    /// A Unix socket stores the objects the received data carried in `objects`, and discards them
+    /// without it unless peeking.
     fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -97,6 +100,7 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
         flags: ReceiveFlags,
         has_prior_progress: bool,
         source_addr: Option<&mut Option<SocketAddress>>,
+        objects: Option<&mut unix::ReceivedObjects>,
     ) -> Result<usize, Errno> {
         let want_source = source_addr.is_some();
         let (size, addr) = match self {
@@ -116,7 +120,7 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
             ReceiveSocket::Unix(handle) => {
                 let mut addr = None;
                 let size = handle.with_entry(|socket| {
-                    socket.recvfrom(cx, buf, flags, want_source.then_some(&mut addr))
+                    socket.recvfrom(cx, buf, flags, want_source.then_some(&mut addr), objects)
                 })?;
                 (size, addr.map(SocketAddress::Unix))
             }
@@ -148,6 +152,7 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
             &mut probe,
             flags | ReceiveFlags::PEEK,
             has_prior_progress,
+            None,
             None,
         )
         .map(|size| size != 0)
@@ -798,7 +803,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 is_message_oriented.set(!file.is_stream());
-                file.sendto(self, &buf, flags, addr)
+                file.sendto(self, &buf, flags, addr, &[])
             },
             |socket| socket.sendto(&self.wait_cx(), &buf, flags, sockaddr.is_some()),
         );
@@ -840,10 +845,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             None
         };
-        if msg.msg_controllen != 0 {
+        let objects = if matches!(socket, AnyTypedFd::Unix(_)) {
+            self.passed_objects(msg.msg_control, msg.msg_controllen)?
+        } else if msg.msg_controllen != 0 {
             log_unsupported!("ancillary data is not supported");
             return Err(Errno::EINVAL);
-        }
+        } else {
+            alloc::vec::Vec::new()
+        };
         if msg.msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
         }
@@ -876,12 +885,95 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 is_message_oriented.set(!file.is_stream());
-                file.sendto(self, &data, flags, unix_addr)
+                file.sendto(self, &data, flags, unix_addr, &objects)
             },
             |socket| socket.sendto(&self.wait_cx(), &data, flags, vsock_destination),
         );
         self.send_sigpipe_on_epipe(&res, is_message_oriented.get(), flags);
         res
+    }
+
+    /// Returns the objects of the descriptors that the `SCM_RIGHTS` control messages in the
+    /// `length` control bytes at `control` pass, as Linux's `__scm_send`.
+    ///
+    /// Like Linux, this ignores control messages of levels other than `SOL_SOCKET`, and fails with
+    /// `EINVAL` for a malformed message or one passing more than `SCM_MAX_FD` descriptors, and
+    /// with `EBADF` for a descriptor that is not open.
+    fn passed_objects(
+        &self,
+        control: UserPtr<u8>,
+        length: usize,
+    ) -> Result<alloc::vec::Vec<litebox::process::InheritableFd<Platform>>, Errno> {
+        /// Linux's default `optmem_max`, which bounds the control bytes it copies.
+        const MAX_CONTROL_LENGTH: usize = 20480;
+        /// `SCM_CREDENTIALS`, which passes credentials.
+        const SCM_CREDENTIALS: i32 = 2;
+
+        let mut objects = alloc::vec::Vec::new();
+        if length < unix::CMSG_HEADER_SIZE {
+            return Ok(objects);
+        }
+        if length > MAX_CONTROL_LENGTH {
+            return Err(Errno::ENOBUFS);
+        }
+        let control = control
+            .to_owned_slice::<Platform>(length)
+            .ok_or(Errno::EFAULT)?;
+        let int_at = |offset: usize| {
+            i32::from_ne_bytes(
+                control[offset..offset + size_of::<i32>()]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        let mut offset = 0;
+        while length - offset >= unix::CMSG_HEADER_SIZE {
+            let message_length = usize::from_ne_bytes(
+                control[offset..offset + size_of::<usize>()]
+                    .try_into()
+                    .unwrap(),
+            );
+            if message_length < unix::CMSG_HEADER_SIZE || message_length > length - offset {
+                return Err(Errno::EINVAL);
+            }
+            let level = int_at(offset + size_of::<usize>());
+            let kind = int_at(offset + size_of::<usize>() + size_of::<i32>());
+            if level == unix::SOL_SOCKET {
+                match kind {
+                    unix::SCM_RIGHTS => {
+                        let count = (message_length - unix::CMSG_HEADER_SIZE) / size_of::<i32>();
+                        if objects.len() + count > unix::SCM_MAX_FD {
+                            return Err(Errno::EINVAL);
+                        }
+                        for index in 0..count {
+                            let fd =
+                                int_at(offset + unix::CMSG_HEADER_SIZE + index * size_of::<i32>());
+                            let fd = self.files.borrow().typed_fd(fd)?;
+                            match self.global.shareable_object(&fd) {
+                                Ok((_, object)) => objects.push(object),
+                                // The position is local to this runner, and a retryable
+                                // `EAGAIN` would mislead callers.
+                                Err(Errno::EAGAIN) => {
+                                    log_unsupported!("passing a directory with a position");
+                                    return Err(Errno::EINVAL);
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
+                    SCM_CREDENTIALS => {
+                        log_unsupported!("SCM_CREDENTIALS control messages");
+                        return Err(Errno::EINVAL);
+                    }
+                    _ => return Err(Errno::EINVAL),
+                }
+            }
+            match offset.checked_add(unix::cmsg_align(message_length)) {
+                Some(next) if next <= length => offset = next,
+                _ => break,
+            }
+        }
+        Ok(objects)
     }
 
     /// Handle syscall `sendmmsg`
@@ -992,6 +1084,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     None
                 },
+                None,
             ) {
                 Ok(size) => size,
                 // A fault after progress ends the call with that progress.
@@ -1038,7 +1131,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .files
             .borrow()
             .pin_receive_socket(&self.global, socket)?;
-        socket.receive(&self.wait_cx(), buf, flags, false, source_addr)
+        socket.receive(&self.wait_cx(), buf, flags, false, source_addr, None)
     }
 
     /// Handle syscall `recvmsg`
@@ -1051,7 +1144,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let supported_flags = ReceiveFlags::DONTWAIT
             | ReceiveFlags::PEEK
             | ReceiveFlags::TRUNC
-            | ReceiveFlags::WAITALL;
+            | ReceiveFlags::WAITALL
+            | ReceiveFlags::CMSG_CLOEXEC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -1077,11 +1171,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let msg_name = msg.msg_name;
         let msg_iov = msg.msg_iov;
         let msg_iovlen = msg.msg_iovlen;
+        let msg_control = msg.msg_control;
         let msg_controllen = msg.msg_controllen;
 
-        if msg_controllen != 0 {
-            log_unsupported!("ancillary data is not supported");
-        }
+        // A Unix socket passes descriptors in control messages; other ancillary data is
+        // unsupported.
+        let mut objects = if let ReceiveSocket::Unix(_) = socket {
+            Some(unix::ReceivedObjects {
+                limit: unix::max_received_fds(msg_controllen),
+                ..Default::default()
+            })
+        } else {
+            if msg_controllen != 0 {
+                log_unsupported!("ancillary data is not supported");
+            }
+            None
+        };
         if msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
         }
@@ -1141,6 +1246,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     None
                 },
+                objects.as_mut(),
             ) {
                 Ok(size) => size,
                 // A fault after progress ends the call with that progress.
@@ -1153,7 +1259,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let copied = size.min(chunk_len);
             total_received += copied;
             let reported = if plan.wait_all { total_received } else { size };
-            if !plan.wait_all || copied < chunk_len || total_received == total_iov_capacity {
+            // Like Linux, a receive that passed descriptors ends the call.
+            let passed_objects = objects
+                .as_ref()
+                .is_some_and(|objects| !objects.objects.is_empty() || objects.truncated);
+            if !plan.wait_all
+                || copied < chunk_len
+                || total_received == total_iov_capacity
+                || passed_objects
+            {
                 break reported;
             }
         };
@@ -1177,13 +1291,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
 
-        // Ancillary data is not supported, so report that no control bytes were delivered.
+        // Report the control bytes delivered, which only pass descriptors.
+        let control_used = match objects {
+            Some(objects) => {
+                let (used, truncated) = self.install_received_objects(
+                    objects,
+                    UserPtrMut::from_usize(msg_control.as_usize()),
+                    msg_controllen,
+                    flags.contains(ReceiveFlags::CMSG_CLOEXEC),
+                );
+                if truncated {
+                    ret_flags.insert(ReceiveFlags::CTRUNC);
+                }
+                used
+            }
+            None => 0,
+        };
         let controllen_offset =
             core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_controllen);
         let controllen_ptr =
             UserPtrMut::<usize>::from_usize(msg_ptr.as_usize() + controllen_offset);
         controllen_ptr
-            .write_at_offset::<Platform>(0, 0)
+            .write_at_offset::<Platform>(0, control_used)
             .ok_or(Errno::EFAULT)?;
 
         // Write back msg_flags with any status flags (e.g. MSG_TRUNC).
@@ -1209,7 +1338,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | ReceiveFlags::PEEK
             | ReceiveFlags::TRUNC
             | ReceiveFlags::WAITALL
-            | ReceiveFlags::WAITFORONE;
+            | ReceiveFlags::WAITFORONE
+            | ReceiveFlags::CMSG_CLOEXEC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -1559,6 +1689,7 @@ mod tests {
                 &mut old,
                 ReceiveFlags::empty(),
                 false,
+                None,
                 None,
             )
             .unwrap();

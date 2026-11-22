@@ -178,6 +178,84 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         })
     }
 
+    /// Returns the LiteBox object `fd` refers to, which another process can get its own
+    /// reference to, and what kind of descriptor it is.
+    ///
+    /// Fails with `EAGAIN` for a directory with a position, set by `getdents64` or `lseek`, since
+    /// the position is local to this runner.
+    pub(super) fn shareable_object(
+        &self,
+        fd: &AnyTypedFd<Platform>,
+    ) -> Result<(InheritedFdKind, InheritableFd<Platform>), Errno> {
+        Ok(match fd {
+            AnyTypedFd::File(file) => (
+                InheritedFdKind::File,
+                InheritableFd::File(self.with_file(file, |file| Ok(Arc::clone(file.file())))?),
+            ),
+            AnyTypedFd::Pipe(pipe) => {
+                let pipe = self.with_pipe_end(pipe, |pipe| Ok(Arc::clone(pipe.pipe_end())))?;
+                (
+                    InheritedFdKind::Pipe {
+                        endpoint: pipe.endpoint_type(),
+                    },
+                    InheritableFd::Pipe(pipe),
+                )
+            }
+            AnyTypedFd::Unix(socket) => {
+                let socket = self.with_unix_socket(socket, |socket| {
+                    Ok(alloc::sync::Arc::clone(socket.unix_socket()))
+                })?;
+                (
+                    InheritedFdKind::UnixSocket {
+                        socket_type: socket.socket_type(),
+                    },
+                    InheritableFd::UnixSocket(socket),
+                )
+            }
+            AnyTypedFd::Eventfd(eventfd) => self.with_eventfd(eventfd, |file| {
+                Ok((
+                    InheritedFdKind::Eventfd,
+                    InheritableFd::EventCounter(alloc::sync::Arc::clone(file.counter())),
+                ))
+            })?,
+            AnyTypedFd::Timerfd(timerfd) => self.with_timerfd(timerfd, |file| {
+                Ok((
+                    InheritedFdKind::Timerfd,
+                    InheritableFd::Timer(alloc::sync::Arc::clone(file.timer())),
+                ))
+            })?,
+            AnyTypedFd::Epoll(epoll) => self.with_epoll(epoll, |file| {
+                Ok((
+                    InheritedFdKind::Epoll,
+                    InheritableFd::ReadinessQueue(alloc::sync::Arc::clone(file.queue())),
+                ))
+            })?,
+            AnyTypedFd::Inet(socket) => {
+                let socket = self.with_inet_socket(socket, |socket| {
+                    Ok(alloc::sync::Arc::clone(socket.inet_socket()))
+                })?;
+                (
+                    InheritedFdKind::InetSocket {
+                        socket_type: socket.socket_type(),
+                    },
+                    InheritableFd::InetSocket(socket),
+                )
+            }
+            AnyTypedFd::Vsock(socket) => (
+                InheritedFdKind::VsockSocket,
+                InheritableFd::VsockSocket(
+                    self.with_vsock_socket(socket, |socket| Ok(Arc::clone(socket.vsock_socket())))?,
+                ),
+            ),
+            AnyTypedFd::Pidfd(pidfd) => (
+                InheritedFdKind::Pidfd,
+                InheritableFd::Process(
+                    self.with_pidfd(pidfd, |file| Ok(Arc::clone(file.process())))?,
+                ),
+            ),
+        })
+    }
+
     /// Adopts a file this process inherited from its parent as `handle`.
     pub(crate) fn adopt_inherited_file(
         &self,
@@ -851,81 +929,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if raw_fd - next_fd > MAX_INHERITED_FD_GAP {
                 return Err(Errno::EAGAIN);
             }
-            let (kind, object) = match fd {
-                AnyTypedFd::File(file) => (
-                    InheritedFdKind::File,
-                    InheritableFd::File(
-                        self.global
-                            .with_file(&file, |file| Ok(Arc::clone(file.file())))?,
-                    ),
-                ),
-                AnyTypedFd::Pipe(pipe) => {
-                    let pipe = self
-                        .global
-                        .with_pipe_end(&pipe, |pipe| Ok(Arc::clone(pipe.pipe_end())))?;
-                    (
-                        InheritedFdKind::Pipe {
-                            endpoint: pipe.endpoint_type(),
-                        },
-                        InheritableFd::Pipe(pipe),
-                    )
-                }
-                AnyTypedFd::Unix(socket) => {
-                    let socket = self.global.with_unix_socket(&socket, |socket| {
-                        Ok(alloc::sync::Arc::clone(socket.unix_socket()))
-                    })?;
-                    (
-                        InheritedFdKind::UnixSocket {
-                            socket_type: socket.socket_type(),
-                        },
-                        InheritableFd::UnixSocket(socket),
-                    )
-                }
-                AnyTypedFd::Eventfd(eventfd) => self.global.with_eventfd(&eventfd, |file| {
-                    Ok((
-                        InheritedFdKind::Eventfd,
-                        InheritableFd::EventCounter(alloc::sync::Arc::clone(file.counter())),
-                    ))
-                })?,
-                AnyTypedFd::Timerfd(timerfd) => self.global.with_timerfd(&timerfd, |file| {
-                    Ok((
-                        InheritedFdKind::Timerfd,
-                        InheritableFd::Timer(alloc::sync::Arc::clone(file.timer())),
-                    ))
-                })?,
-                AnyTypedFd::Epoll(epoll) => self.global.with_epoll(&epoll, |file| {
-                    Ok((
-                        InheritedFdKind::Epoll,
-                        InheritableFd::ReadinessQueue(alloc::sync::Arc::clone(file.queue())),
-                    ))
-                })?,
-                AnyTypedFd::Inet(socket) => {
-                    let socket = self.global.with_inet_socket(&socket, |socket| {
-                        Ok(alloc::sync::Arc::clone(socket.inet_socket()))
-                    })?;
-                    (
-                        InheritedFdKind::InetSocket {
-                            socket_type: socket.socket_type(),
-                        },
-                        InheritableFd::InetSocket(socket),
-                    )
-                }
-                AnyTypedFd::Vsock(socket) => (
-                    InheritedFdKind::VsockSocket,
-                    InheritableFd::VsockSocket(
-                        self.global.with_vsock_socket(&socket, |socket| {
-                            Ok(Arc::clone(socket.vsock_socket()))
-                        })?,
-                    ),
-                ),
-                AnyTypedFd::Pidfd(pidfd) => (
-                    InheritedFdKind::Pidfd,
-                    InheritableFd::Process(
-                        self.global
-                            .with_pidfd(&pidfd, |file| Ok(Arc::clone(file.process())))?,
-                    ),
-                ),
-            };
+            let (kind, object) = self.global.shareable_object(&fd)?;
             next_fd = raw_fd + 1;
             let inherited_fd = ForkedFd {
                 inherited: InheritedFd {
@@ -1564,6 +1568,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         &mut *buf.borrow_mut(),
                         litebox_common_linux::ReceiveFlags::empty(),
                         None,
+                        None,
                     )
                 })
             },
@@ -1664,7 +1669,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 espipe_for_non_seekable_offset(offset)?;
                 self.global.with_unix_socket(fd, |socket| {
                     is_message_oriented.set(!socket.is_stream());
-                    socket.sendto(self, &buf, litebox_common_linux::SendFlags::empty(), None)
+                    socket.sendto(
+                        self,
+                        &buf,
+                        litebox_common_linux::SendFlags::empty(),
+                        None,
+                        &[],
+                    )
                 })
             },
             |_fd| Err(Errno::EINVAL),

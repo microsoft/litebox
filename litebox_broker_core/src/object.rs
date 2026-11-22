@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::unix_socket::TransferredObjectKind;
 use spin::rwlock::RwLock;
 
 use crate::event::EventObject;
@@ -86,6 +87,24 @@ impl ObjectEntry {
             // Signals belong to their process and a futex waiter to its thread.
             Self::Signals(_) | Self::FutexWaiter(_) => false,
         }
+    }
+
+    /// Returns what a reference to this object another process receives
+    /// refers to, or `None` if references to it may not be duplicated.
+    pub(crate) fn transferred_kind(&self) -> Option<TransferredObjectKind> {
+        Some(match self {
+            Self::Event(_) => TransferredObjectKind::EventCounter,
+            Self::File(_) => TransferredObjectKind::File,
+            Self::UnixSocket(socket) => TransferredObjectKind::UnixSocket(socket.socket_type()),
+            Self::Pipe(pipe) if pipe.is_read_end() => TransferredObjectKind::PipeReadEnd,
+            Self::Pipe(_) => TransferredObjectKind::PipeWriteEnd,
+            Self::Socket(socket) => TransferredObjectKind::InetSocket(socket.socket_type()),
+            Self::VsockSocket(_) => TransferredObjectKind::VsockSocket,
+            Self::Timer(_) => TransferredObjectKind::Timer,
+            Self::ReadinessQueue(_) => TransferredObjectKind::ReadinessQueue,
+            Self::Process(_) => TransferredObjectKind::Process,
+            Self::Signals(_) | Self::FutexWaiter(_) => return None,
+        })
     }
 
     /// Returns a registration that publishes readiness changes to this

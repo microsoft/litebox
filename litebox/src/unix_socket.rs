@@ -9,14 +9,15 @@
 //! inheritance see one socket.
 
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use litebox_broker_protocol::{
     ObjectHandle,
     error::ErrorCode,
     fs::{FileMode, FileOpenFlags, FileStatusFlags, FileUser},
     socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType},
     unix_socket::{
-        UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError as ProtocolError,
-        UnixSocketName,
+        MAX_UNIX_SOCKET_OBJECTS, TransferredObjectKind, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress,
+        UnixSocketError as ProtocolError, UnixSocketName,
     },
 };
 use litebox_platform::time::TimeProvider;
@@ -35,7 +36,7 @@ use crate::{
         wait::{WaitContext, WaitError},
     },
     fs::errors::StatusFlagsError,
-    process::ProcessError,
+    process::{InheritableFd, ProcessError},
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
@@ -43,7 +44,7 @@ use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use errors::UnixSocketError;
 
 /// Data a [`UnixSocket::receive`] copied into its buffer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Received {
     /// Number of bytes copied into the buffer.
     pub received: usize,
@@ -52,6 +53,53 @@ pub struct Received {
     pub length: usize,
     /// Name of the sending socket, if requested.
     pub source: Option<UnixSocketName>,
+    /// References to the objects the received data carried.
+    pub objects: Vec<ReceivedObject>,
+    /// Whether the received data carried objects beyond `objects`, which
+    /// were discarded unless peeking.
+    pub objects_truncated: bool,
+}
+
+/// A reference to an object that received Unix socket data carried, which
+/// closes when dropped unless [adopted](Self::into_handle).
+pub struct ReceivedObject {
+    broker: Arc<dyn BrokerControl>,
+    handle: ObjectHandle,
+    kind: TransferredObjectKind,
+    /// Whether the caller took the handle.
+    adopted: bool,
+}
+
+impl ReceivedObject {
+    /// What the reference refers to, as the broker reports.
+    pub fn kind(&self) -> TransferredObjectKind {
+        self.kind
+    }
+
+    /// Gives up ownership of the reference's handle, which the caller adopts
+    /// as [`Self::kind`] describes, with the `adopt_inherited_*` method of
+    /// [`LiteBox`] for that kind, such as [`LiteBox::adopt_inherited_file`].
+    pub fn into_handle(mut self) -> ObjectHandle {
+        self.adopted = true;
+        self.handle
+    }
+}
+
+impl core::fmt::Debug for ReceivedObject {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReceivedObject")
+            .field("handle", &self.handle)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ReceivedObject {
+    fn drop(&mut self) {
+        if !self.adopted {
+            let _ = self.broker.close_object(self.handle);
+        }
+    }
 }
 
 /// A reference to a broker-owned Unix socket, which closes its handle when
@@ -219,27 +267,40 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     /// non-blocking, for at most the socket's send timeout each time. A
     /// stream socket that stops early after sending some bytes returns their
     /// count instead of failing.
+    ///
+    /// The data carries `objects`, at most [`MAX_UNIX_SOCKET_OBJECTS`], so
+    /// its receiver gets its own references to them with the first byte. A
+    /// stream socket that sends no data carries none.
     pub fn send(
         &self,
         cx: &WaitContext<'_, Platform>,
         address: Option<&UnixSocketAddress>,
         data: impl WriteBuffer,
+        objects: &[InheritableFd<Platform>],
         user: FileUser,
         nonblock: bool,
     ) -> Result<usize, UnixSocketError> {
+        if objects.len() > MAX_UNIX_SOCKET_OBJECTS as usize {
+            return Err(UnixSocketError::ResourceExhausted);
+        }
+        // `objects` holds the objects, which keeps their handles open until
+        // the send completes.
+        let objects: Vec<ObjectHandle> = objects.iter().map(InheritableFd::handle).collect();
         if self.socket_type != SocketType::Stream {
             return self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
                 self.broker
-                    .send_unix_socket(self.handle, address, &data, user)
+                    .send_unix_socket(self.handle, address, &objects, &data, user)
             });
         }
         let mut sent: usize = 0;
         loop {
             let length = (data.len() - sent).min(UNIX_SOCKET_BUFFER_SIZE as usize);
             let chunk = &(&data).sub_buffer(sent, length);
+            // Only the first chunk carries the objects.
+            let objects = if sent == 0 { &objects[..] } else { &[] };
             let result = self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
                 self.broker
-                    .send_unix_socket(self.handle, address, chunk, user)
+                    .send_unix_socket(self.handle, address, objects, chunk, user)
             });
             match result {
                 Ok(written) => sent += written,
@@ -253,7 +314,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     }
 
     /// Receives into `buffer`, leaving the data queued if `peek` is set and
-    /// returning the sender's name if `source` is set.
+    /// returning the sender's name if `source` is set, and references to at
+    /// most `max_objects` of the objects the data carried.
     ///
     /// If copying into `buffer` faults, the operation fails with
     /// [`UnixSocketError::Fault`] and, unless peeking, the bytes received are
@@ -267,6 +329,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     /// means an empty datagram or record arrived, or no more data can arrive;
     /// a datagram socket that would not wait fails with
     /// [`UnixSocketError::WouldBlock`] instead of reporting the end of data.
+    ///
+    /// Unless peeking, the carried objects beyond `max_objects` are
+    /// discarded. A stream socket stops receiving after the bytes sent with
+    /// the objects it receives, so one receive gets the objects of at most
+    /// one send.
     pub fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -274,15 +341,33 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         peek: bool,
         source: bool,
         nonblock: bool,
+        max_objects: usize,
     ) -> Result<Received, UnixSocketError> {
         self.wait(cx, nonblock, SocketOptionName::ReceiveTimeout, || {
             self.broker
-                .receive_unix_socket(self.handle, &mut buffer, peek, source, nonblock)
+                .receive_unix_socket(
+                    self.handle,
+                    &mut buffer,
+                    peek,
+                    source,
+                    nonblock,
+                    max_objects,
+                )
                 .map(|result| {
-                    result.map(|(received, source)| Received {
+                    result.map(|(received, source, objects)| Received {
                         received: received.received as usize,
                         length: received.length as usize,
                         source,
+                        objects: objects
+                            .into_iter()
+                            .map(|object| ReceivedObject {
+                                broker: Arc::clone(&self.broker),
+                                handle: object.handle,
+                                kind: object.kind,
+                                adopted: false,
+                            })
+                            .collect(),
+                        objects_truncated: received.objects_truncated,
                     })
                 })
         })

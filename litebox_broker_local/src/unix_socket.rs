@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::vec::Vec;
+
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileMode, FileOpenFlags, FileUser};
@@ -13,11 +15,13 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_protocol::unix_socket::{
     AcceptUnixSocketRequest, BindUnixSocketRequest, ConnectUnixSocketRequest,
-    CreateUnixSocketPairResponse, CreateUnixSocketRequest, GetUnixSocketNameRequest,
-    GetUnixSocketOptionRequest, ListenUnixSocketRequest, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
-    MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveUnixSocketRequest,
-    ReceiveUnixSocketResponse, SendUnixSocketRequest, SetUnixSocketOptionRequest,
-    ShutdownUnixSocketRequest, UnixSocketError, UnixSocketName,
+    CreateUnixSocketPairResponse, CreateUnixSocketRequest, ENCODED_OBJECT_HANDLE_SIZE,
+    ENCODED_TRANSFERRED_OBJECT_SIZE, GetUnixSocketNameRequest, GetUnixSocketOptionRequest,
+    ListenUnixSocketRequest, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
+    MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE,
+    ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
+    SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, TransferredObject, UnixSocketError,
+    UnixSocketName,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -158,35 +162,48 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Sends `data` from a Unix socket to `address`, an encoded destination
-    /// address that is empty for the connected peer, staging both in
-    /// `buffer`.
+    /// address that is empty for the connected peer, carrying the objects
+    /// `objects` refer to, and staging all three in `buffer`.
     ///
     /// Returns the number of data bytes sent.
     ///
     /// # Panics
     ///
-    /// Panics if `buffer` does not match `address` and `data`, or the broker
-    /// returns an invalid response.
+    /// Panics if `buffer` does not match `address`, `objects`, and `data`,
+    /// if `objects` holds more than [`MAX_UNIX_SOCKET_OBJECTS`] handles, or if
+    /// the broker returns an invalid response.
     pub fn send_unix_socket(
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
         address: &[u8],
+        objects: &[ObjectHandle],
         data: &dyn WriteBuffer,
         user: FileUser,
     ) -> Result<UnixSocketResult<usize>, Channel::Error> {
+        assert!(
+            objects.len() <= MAX_UNIX_SOCKET_OBJECTS as usize,
+            "too many carried objects"
+        );
+        let objects_length = objects.len() * ENCODED_OBJECT_HANDLE_SIZE as usize;
         self.validate_unix_socket_buffer(
             buffer,
-            address.len() + data.len(),
+            address.len() + objects_length + data.len(),
             MAX_UNIX_SOCKET_TRANSFER_SIZE,
         )?;
         self.write_shared_buffer_at(buffer, 0, address);
-        self.copy_to_shared_buffer(buffer, address.len(), data)?;
+        let encoded_objects: Vec<u8> = objects
+            .iter()
+            .flat_map(|object| object.0.to_le_bytes())
+            .collect();
+        self.write_shared_buffer_at(buffer, address.len(), &encoded_objects);
+        self.copy_to_shared_buffer(buffer, address.len() + objects_length, data)?;
         match self.request_unix_socket(UnixSocketRequest::Send(SendUnixSocketRequest {
             handle,
             buffer,
             address_length: u32::try_from(address.len())
                 .expect("staged address fits the transfer limit"),
+            object_count: u32::try_from(objects.len()).expect("checked above"),
             user,
         }))? {
             UnixSocketResponse::Send(response) => {
@@ -203,16 +220,20 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Receives data from a Unix socket into `destination` through
-    /// `buffer`, as for a non-blocking socket if `nonblocking` is set.
+    /// `buffer`, as for a non-blocking socket if `nonblocking` is set, with
+    /// handles to at most `max_objects` of the objects it carried.
     ///
-    /// Returns the received lengths, and the sender's name if `source` is
-    /// set.
+    /// Returns the received lengths, the sender's name if `source` is set,
+    /// and the handles.
     ///
     /// # Panics
     ///
     /// Panics if `buffer` is not `destination.len()` bytes, plus
-    /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] if `source` is set, or the broker
+    /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] if `source` is set, plus
+    /// [`ENCODED_TRANSFERRED_OBJECT_SIZE`] for each of `max_objects`, if
+    /// `max_objects` exceeds [`MAX_UNIX_SOCKET_OBJECTS`], or if the broker
     /// returns an invalid response.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
@@ -221,23 +242,36 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         peek: bool,
         source: bool,
         nonblocking: bool,
-    ) -> Result<UnixSocketResult<(ReceiveUnixSocketResponse, Option<UnixSocketName>)>, Channel::Error>
-    {
+        max_objects: usize,
+    ) -> Result<
+        UnixSocketResult<(
+            ReceiveUnixSocketResponse,
+            Option<UnixSocketName>,
+            Vec<TransferredObject>,
+        )>,
+        Channel::Error,
+    > {
+        assert!(
+            max_objects <= MAX_UNIX_SOCKET_OBJECTS as usize,
+            "too many carried objects"
+        );
         let capacity = destination.len();
         let name_size = if source {
             MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize
         } else {
             0
         };
+        let objects_offset = capacity + name_size;
         self.validate_unix_socket_buffer(
             buffer,
-            capacity + name_size,
+            objects_offset + max_objects * ENCODED_TRANSFERRED_OBJECT_SIZE as usize,
             MAX_UNIX_SOCKET_TRANSFER_SIZE,
         )?;
         match self.request_unix_socket(UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
             handle,
             buffer,
             capacity: u32::try_from(capacity).expect("validated capacity fits in u32"),
+            max_objects: u32::try_from(max_objects).expect("checked above"),
             peek,
             source,
             nonblocking,
@@ -245,20 +279,40 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             UnixSocketResponse::Receive(response) => {
                 let received = response.received as usize;
                 let source_length = response.source_length as usize;
+                let object_count = response.objects as usize;
                 assert!(
                     received <= capacity
                         && received <= response.length as usize
-                        && source_length <= name_size,
+                        && source_length <= name_size
+                        && object_count <= max_objects,
                     "broker returned inconsistent Unix socket receive lengths"
                 );
-                self.copy_from_shared_buffer(buffer, received, destination)?;
+                let mut encoded =
+                    alloc::vec![0; object_count * ENCODED_TRANSFERRED_OBJECT_SIZE as usize];
+                self.read_shared_buffer_at(buffer, objects_offset, &mut encoded);
+                let objects: Vec<_> = encoded
+                    .as_chunks::<{ ENCODED_TRANSFERRED_OBJECT_SIZE as usize }>()
+                    .0
+                    .iter()
+                    .map(|object| {
+                        TransferredObject::decode(object)
+                            .expect("broker returned an invalid carried object")
+                    })
+                    .collect();
+                if let Err(error) = self.copy_from_shared_buffer(buffer, received, destination) {
+                    // The caller never learns of the handles, so they are released.
+                    for object in objects {
+                        let _ = self.close_object(object.handle);
+                    }
+                    return Err(error);
+                }
                 let name = source.then(|| {
                     let mut name = [0; MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize];
                     self.read_shared_buffer_at(buffer, received, &mut name[..source_length]);
                     UnixSocketName::decode(&name[..source_length])
                         .expect("broker returned an invalid Unix socket source name")
                 });
-                Ok(Ok((response, name)))
+                Ok(Ok((response, name, objects)))
             }
             UnixSocketResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected Unix socket response: {response:?}"),

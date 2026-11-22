@@ -2581,7 +2581,9 @@ impl BrokerProcess {
         self.create_object_reference_with_rights(object, rights)
     }
 
-    fn create_object_reference_with_rights(
+    /// Creates a reference with `rights` to `object`, which must be within
+    /// this process's policy.
+    pub(crate) fn create_object_reference_with_rights(
         &self,
         object: Arc<RwLock<ObjectEntry>>,
         rights: ObjectRights,
@@ -2678,6 +2680,19 @@ impl BrokerProcess {
             return Err(BrokerError::PolicyDenied);
         }
         target.create_object_reference_with_rights(object, rights)
+    }
+
+    /// Returns the object `handle` refers to, and the reference's rights.
+    pub(crate) fn object_reference(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<(Arc<RwLock<ObjectEntry>>, ObjectRights)> {
+        let references = self.core.references.read();
+        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
+        if reference.owner != self.key {
+            return Err(BrokerError::UnknownObject);
+        }
+        Ok((Arc::clone(&reference.object), reference.rights))
     }
 
     fn object_reference_rights(&self, handle: ObjectHandle) -> Result<ObjectRights> {
@@ -2952,7 +2967,12 @@ impl BrokerProcess {
     /// lock, so an object may safely release platform resources.
     pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
         let reference = self.remove_object_reference(handle)?;
+        let unix_socket = matches!(&*reference.object.read(), ObjectEntry::UnixSocket(_));
         drop(reference);
+        // Messages may now be all that reach the socket.
+        if unix_socket {
+            self.core.unix_sockets.collect_garbage();
+        }
         Ok(())
     }
 
@@ -3121,6 +3141,8 @@ impl BrokerProcess {
         // run while its lock is held.
         let socket_account = self.socket_account.lock().take();
         drop(socket_account);
+        // Messages may now be all that reach Unix sockets this process held.
+        self.core.unix_sockets.collect_garbage();
         invariant_fault
     }
 
