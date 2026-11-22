@@ -25,11 +25,11 @@ use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 use url::Url;
 
 #[cfg(unix)]
-pub use self::unix::Logger;
+pub(crate) use self::unix::Logger;
 #[cfg(unix)]
 use self::unix::{Output, create_dirs, open_fifo, open_file, pending, wait_readable};
 #[cfg(windows)]
-pub use self::windows::Logger;
+pub(crate) use self::windows::Logger;
 #[cfg(windows)]
 use self::windows::{Output, create_dirs, open_fifo, open_file, pending, wait_readable};
 use crate::{Result, internal, unsupported};
