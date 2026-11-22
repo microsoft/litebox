@@ -5,6 +5,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
 use std::ptr::{null, null_mut};
@@ -14,20 +15,27 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     ERROR_IO_PENDING, ERROR_PIPE_BUSY, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Storage::FileSystem::WriteFile;
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_OVERLAPPED, SECURITY_IDENTIFICATION, WriteFile,
+};
 use windows_sys::Win32::System::IO::{
     CancelIoEx, GetOverlappedResult, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0,
 };
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-use super::WRITE_POLL;
+use super::{INPUT_POLL, WRITE_POLL};
+use crate::{Result, unsupported};
 
 /// go-winio reserves the first instance; containerd's asynchronous `Accept` opens the next.
 const PIPE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// As go-winio's own dialer.
 const PIPE_BUSY_POLL: Duration = Duration::from_millis(10);
 
-pub fn open_pipe(options: &OpenOptions, path: &Path) -> io::Result<File> {
+/// Unlike a Unix FIFO, stdin also gets EOF when containerd closes its end.
+pub fn open_fifo(path: &Path, input: bool) -> io::Result<File> {
+    let mut options = options(input);
+    options.read(input).write(!input);
     let deadline = Instant::now() + PIPE_BUSY_TIMEOUT;
     loop {
         match options.open(path) {
@@ -40,6 +48,24 @@ pub fn open_pipe(options: &OpenOptions, path: &Path) -> io::Result<File> {
             opened => return opened,
         }
     }
+}
+
+pub fn open_file(path: &Path) -> io::Result<File> {
+    options(false).append(true).create(true).open(path)
+}
+
+pub fn create_dirs(path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+/// No pipe server can impersonate the shim; an output is open for [`Output::new`].
+fn options(input: bool) -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.security_qos_flags(SECURITY_IDENTIFICATION);
+    if !input {
+        options.custom_flags(FILE_FLAG_OVERLAPPED);
+    }
+    options
 }
 
 /// Not a [`File`]: std aborts the process when a synchronous write on an overlapped handle pends.
@@ -126,5 +152,49 @@ impl Output {
             return Err(io::Error::last_os_error());
         }
         Ok(written as usize)
+    }
+}
+
+pub fn pending(pipe: &File) -> usize {
+    peek(pipe).unwrap_or(0)
+}
+
+/// Peek before reading so blocked stdin can still observe `CloseIO`.
+pub fn wait_readable(pipe: &File) -> bool {
+    if peek(pipe).is_ok_and(|available| available == 0) {
+        std::thread::sleep(INPUT_POLL);
+        return false;
+    }
+    true
+}
+
+fn peek(pipe: &File) -> io::Result<usize> {
+    let mut available = 0;
+    // SAFETY: the handle is open for as long as `pipe` is borrowed; with no buffer, only
+    // `available` is written, which outlives the call.
+    let peeked = unsafe {
+        PeekNamedPipe(
+            pipe.as_raw_handle(),
+            null_mut(),
+            0,
+            null_mut(),
+            &raw mut available,
+            null_mut(),
+        )
+    };
+    if peeked == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(usize::try_from(available).unwrap_or(usize::MAX))
+}
+
+/// Not supported on Windows yet.
+pub enum Logger {}
+
+impl Logger {
+    pub fn spawn(uri: &str, _id: &str, _namespace: &str) -> Result<(Self, Output, Output)> {
+        Err(unsupported(format!(
+            "the I/O URI {uri:?}: logging programs are not supported on Windows"
+        )))
     }
 }
