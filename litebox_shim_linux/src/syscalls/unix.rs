@@ -29,15 +29,17 @@ use litebox_broker_protocol::{
     },
 };
 use litebox_common_linux::{
-    AddressFamily, FileDescriptorFlags, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags,
-    SockType, SocketOption, SocketOptionName, UnixProtocol, errno::Errno,
+    AddressFamily, CmsgHdr, FileDescriptorFlags, OFlags, ReceiveFlags, SCM_RIGHTS, SendFlags,
+    ShutdownHow, SockFlags, SockType, SocketOption, SocketOptionLevel, SocketOptionName,
+    UnixProtocol, errno::Errno, program_startup::InheritedFdKind,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use zerocopy::IntoBytes as _;
 
 use crate::{
     GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut,
     syscalls::{
-        file::{linux_status_flags, status_flags_change},
+        file::{adopt_handle, linux_status_flags, status_flags_change},
         net::{ReceivePlan, open_flags, shutdown_mode},
     },
 };
@@ -509,13 +511,10 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
 }
 
 /// Size of a `struct cmsghdr`, which a control message's data follows.
-pub(super) const CMSG_HEADER_SIZE: usize = cmsg_align(size_of::<usize>() + 2 * size_of::<i32>());
+pub(super) const CMSG_HEADER_SIZE: usize = cmsg_align(size_of::<CmsgHdr>());
 
 /// `SOL_SOCKET`, the level of the control messages that pass descriptors.
-pub(super) const SOL_SOCKET: i32 = 1;
-
-/// `SCM_RIGHTS`, the type of a control message that passes descriptors.
-pub(super) const SCM_RIGHTS: i32 = 1;
+pub(super) const SOL_SOCKET: i32 = SocketOptionLevel::SOCKET as i32;
 
 /// Linux's `SCM_MAX_FD`, the most descriptors one message passes.
 pub(super) const SCM_MAX_FD: usize = 253;
@@ -574,10 +573,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return (0, true);
         }
         let length = CMSG_HEADER_SIZE + fds.len() * size_of::<i32>();
+        let header = CmsgHdr {
+            cmsg_len: length,
+            cmsg_level: SOL_SOCKET,
+            cmsg_type: SCM_RIGHTS,
+        };
         let mut message = Vec::with_capacity(length);
-        message.extend_from_slice(&length.to_ne_bytes());
-        message.extend_from_slice(&SOL_SOCKET.to_ne_bytes());
-        message.extend_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        message.extend_from_slice(header.as_bytes());
         message.resize(CMSG_HEADER_SIZE, 0);
         for fd in fds {
             message.extend_from_slice(&fd.to_ne_bytes());
@@ -593,55 +595,33 @@ impl<Platform: ShimPlatform> Task<Platform> {
         object: ReceivedObject,
         close_on_exec: bool,
     ) -> Result<i32, Errno> {
-        let global = &self.global;
-        match object.kind() {
-            TransferredObjectKind::File => {
-                let fd = global.adopt_inherited_file(object.into_handle())?;
-                self.install_adopted(fd, close_on_exec)
-            }
-            TransferredObjectKind::PipeReadEnd => {
-                let fd = global
-                    .adopt_inherited_pipe_end(object.into_handle(), HalfPipeType::ReceiverHalf)?;
-                self.install_adopted(fd, close_on_exec)
-            }
-            TransferredObjectKind::PipeWriteEnd => {
-                let fd = global
-                    .adopt_inherited_pipe_end(object.into_handle(), HalfPipeType::SenderHalf)?;
-                self.install_adopted(fd, close_on_exec)
-            }
+        let kind = match object.kind() {
+            TransferredObjectKind::File => InheritedFdKind::File,
+            TransferredObjectKind::PipeReadEnd => InheritedFdKind::Pipe {
+                endpoint: HalfPipeType::ReceiverHalf,
+            },
+            TransferredObjectKind::PipeWriteEnd => InheritedFdKind::Pipe {
+                endpoint: HalfPipeType::SenderHalf,
+            },
             TransferredObjectKind::UnixSocket(socket_type) => {
-                let fd = global.adopt_inherited_unix_socket(object.into_handle(), socket_type)?;
-                self.install_adopted(fd, close_on_exec)
+                InheritedFdKind::UnixSocket { socket_type }
             }
             TransferredObjectKind::InetSocket(socket_type) => {
-                let fd = global.adopt_inherited_inet_socket(object.into_handle(), socket_type)?;
-                self.install_adopted(fd, close_on_exec)
+                InheritedFdKind::InetSocket { socket_type }
             }
-            TransferredObjectKind::VsockSocket => {
-                let fd = global.adopt_inherited_vsock_socket(object.into_handle())?;
-                self.install_adopted(fd, close_on_exec)
-            }
-            TransferredObjectKind::EventCounter => {
-                let fd = global.adopt_inherited_eventfd(object.into_handle())?;
-                self.install_adopted(fd, close_on_exec)
-            }
-            TransferredObjectKind::Timer => {
-                let fd = global.adopt_inherited_timerfd(object.into_handle())?;
-                self.install_adopted(fd, close_on_exec)
-            }
-            TransferredObjectKind::ReadinessQueue => {
-                let fd = global.adopt_inherited_epoll(object.into_handle())?;
-                self.install_adopted(fd, close_on_exec)
-            }
-            TransferredObjectKind::Process => {
-                let fd = global.adopt_inherited_pidfd(object.into_handle())?;
-                self.install_adopted(fd, close_on_exec)
-            }
+            TransferredObjectKind::VsockSocket => InheritedFdKind::VsockSocket,
+            TransferredObjectKind::EventCounter => InheritedFdKind::Eventfd,
+            TransferredObjectKind::Timer => InheritedFdKind::Timerfd,
+            TransferredObjectKind::ReadinessQueue => InheritedFdKind::Epoll,
+            TransferredObjectKind::Process => InheritedFdKind::Pidfd,
             kind => {
                 log_unsupported!("receiving a descriptor for {kind:?}");
-                Err(Errno::EINVAL)
+                return Err(Errno::EINVAL);
             }
-        }
+        };
+        let handle = object.into_handle();
+        adopt_handle!(self.global, kind, handle, |adopt| self
+            .install_adopted(adopt()?, close_on_exec))
     }
 
     /// Installs the adopted `fd` at the lowest free number.

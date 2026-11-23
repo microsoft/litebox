@@ -1102,7 +1102,7 @@ fn response_codec_round_trips_all_variants() {
             received: 1,
             length: u32::MAX,
             source_length: 109,
-            objects: 253,
+            object_count: 253,
             objects_truncated: true,
         })),
         BrokerResult::UnixSocket(UnixSocketResponse::Shutdown),
@@ -1119,9 +1119,6 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::AddressInUse)),
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::NotPermitted)),
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::ConnectionReset)),
-        BrokerResult::UnixSocket(UnixSocketResponse::Failed(
-            UnixSocketError::TooManyReferences,
-        )),
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::File(
             FileError::NoSuchFileOrDirectory
         ))),

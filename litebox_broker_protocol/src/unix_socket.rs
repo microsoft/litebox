@@ -46,17 +46,14 @@ pub const MAX_UNIX_SOCKET_BACKLOG: u32 = 4096;
 /// Most object references one send carries, as Linux's `SCM_MAX_FD`.
 pub const MAX_UNIX_SOCKET_OBJECTS: u32 = 253;
 
-/// Length in bytes of one encoded object handle a send carries.
-pub const ENCODED_OBJECT_HANDLE_SIZE: u32 = 8;
-
 /// Length in bytes of one encoded [`TransferredObject`].
 pub const ENCODED_TRANSFERRED_OBJECT_SIZE: u32 = 10;
 
 const _: () = assert!(
-    UNIX_SOCKET_BUFFER_SIZE
-        + MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE
-        + MAX_UNIX_SOCKET_OBJECTS * ENCODED_OBJECT_HANDLE_SIZE
-        <= MAX_UNIX_SOCKET_TRANSFER_SIZE
+    UNIX_SOCKET_BUFFER_SIZE as usize
+        + MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE as usize
+        + MAX_UNIX_SOCKET_OBJECTS as usize * ObjectHandle::ENCODED_SIZE
+        <= MAX_UNIX_SOCKET_TRANSFER_SIZE as usize
 );
 const _: () = assert!(
     UNIX_SOCKET_BUFFER_SIZE
@@ -236,6 +233,20 @@ pub enum TransferredObjectKind {
     Process,
 }
 
+/// Options of a receive from a Unix socket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReceiveOptions {
+    /// Whether to leave the data queued.
+    pub peek: bool,
+    /// Whether to return the sender's name.
+    pub source: bool,
+    /// Whether the caller will not wait for data, as if the socket were
+    /// non-blocking.
+    pub nonblocking: bool,
+    /// Maximum carried objects to receive handles for.
+    pub max_objects: usize,
+}
+
 /// A handle the receiver of a Unix socket message got for an object the
 /// message carried.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,9 +279,9 @@ impl TransferredObject {
             TransferredObjectKind::Process => (9, 0),
         };
         let mut encoded = [0; ENCODED_TRANSFERRED_OBJECT_SIZE as usize];
-        encoded[..8].copy_from_slice(&self.handle.0.to_le_bytes());
-        encoded[8] = tag;
-        encoded[9] = detail;
+        encoded[..ObjectHandle::ENCODED_SIZE].copy_from_slice(&self.handle.encode());
+        encoded[ObjectHandle::ENCODED_SIZE] = tag;
+        encoded[ObjectHandle::ENCODED_SIZE + 1] = detail;
         encoded
     }
 
@@ -279,7 +290,7 @@ impl TransferredObject {
         encoded: &[u8; ENCODED_TRANSFERRED_OBJECT_SIZE as usize],
     ) -> Result<Self, UnixSocketCodecError> {
         let [h0, h1, h2, h3, h4, h5, h6, h7, tag, detail] = *encoded;
-        let handle = ObjectHandle(u64::from_le_bytes([h0, h1, h2, h3, h4, h5, h6, h7]));
+        let handle = ObjectHandle::decode([h0, h1, h2, h3, h4, h5, h6, h7]);
         let socket_type = || match detail {
             0 => Ok(SocketType::Stream),
             1 => Ok(SocketType::Datagram),
@@ -350,9 +361,6 @@ wire_enum! {
         ConnectionReset,
         #[error("address lookup failed: {0}")]
         File(FileError),
-        /// A carried Unix socket holds carried objects nested too deeply.
-        #[error("carried objects are nested too deeply")]
-        TooManyReferences,
     }
 }
 
@@ -463,8 +471,7 @@ wire_struct! {
         pub handle: ObjectHandle,
         /// Shared-buffer region holding an encoded destination
         /// [`UnixSocketAddress`] of `address_length` bytes, then `object_count`
-        /// little-endian object handles of [`ENCODED_OBJECT_HANDLE_SIZE`] bytes,
-        /// then the data.
+        /// handles encoded by [`ObjectHandle::encode`], then the data.
         pub buffer: SharedBufferSequence,
         /// Length of the destination address, or zero to send to the connected
         /// peer.
@@ -549,9 +556,9 @@ wire_struct! {
         /// if the request did not ask for it.
         pub source_length: u32,
         /// Number of encoded [`TransferredObject`]s in the buffer.
-        pub objects: u32,
+        pub object_count: u32,
         /// Whether the received data carried objects the caller got no handle
-        /// for, beyond `max_objects` or beyond its reference limits.
+        /// for.
         pub objects_truncated: bool,
     }
 }

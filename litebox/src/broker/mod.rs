@@ -9,7 +9,7 @@ use alloc::{
 use core::net::SocketAddrV4;
 
 use hashbrown::HashMap;
-use litebox_broker_local::BrokerLocal;
+use litebox_broker_local::{BrokerLocal, ReceivedUnixSocket};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::ConsumeEventResponse;
 use litebox_broker_protocol::fs::{
@@ -44,10 +44,9 @@ use litebox_broker_protocol::socket::{
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_broker_protocol::timer::{TimerClock, TimerSetting, TimerSpec};
 use litebox_broker_protocol::unix_socket::{
-    CreateUnixSocketPairResponse, ENCODED_OBJECT_HANDLE_SIZE, ENCODED_TRANSFERRED_OBJECT_SIZE,
+    CreateUnixSocketPairResponse, ENCODED_TRANSFERRED_OBJECT_SIZE,
     MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE,
-    ReceiveUnixSocketResponse, TransferredObject, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress,
-    UnixSocketError, UnixSocketName,
+    ReceiveOptions, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError, UnixSocketName,
 };
 use litebox_broker_protocol::vsock_socket::{AcceptVsockSocketResponse, VsockAddress};
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
@@ -723,30 +722,18 @@ pub(crate) trait BrokerControl: Send + Sync {
         user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>;
 
-    /// Receives into at most [`UNIX_SOCKET_BUFFER_SIZE`] bytes of `data`, as
-    /// for a non-blocking socket if `nonblocking` is set, returning the
-    /// sender's name if `source` is set, and handles to at most `max_objects`
-    /// of the objects the data carried.
+    /// Receives into at most [`UNIX_SOCKET_BUFFER_SIZE`] bytes of `data`, with
+    /// handles to at most `options.max_objects` of the objects the data
+    /// carried.
     ///
     /// The caller owns the returned handles.
-    #[allow(clippy::type_complexity)]
     fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
         data: &mut dyn ReadBuffer,
-        peek: bool,
-        source: bool,
-        nonblocking: bool,
-        max_objects: usize,
+        options: ReceiveOptions,
     ) -> core::result::Result<
-        core::result::Result<
-            (
-                ReceiveUnixSocketResponse,
-                Option<UnixSocketName>,
-                Vec<TransferredObject>,
-            ),
-            UnixSocketError,
-        >,
+        core::result::Result<ReceivedUnixSocket, UnixSocketError>,
         BrokerControlError,
     >;
 
@@ -2085,7 +2072,7 @@ where
             },
             None => Vec::new(),
         };
-        let staged = address.len() + objects.len() * ENCODED_OBJECT_HANDLE_SIZE as usize;
+        let staged = address.len() + objects.len() * ObjectHandle::ENCODED_SIZE;
         if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize - staged {
             return Ok(Err(UnixSocketError::MessageTooLarge));
         }
@@ -2099,43 +2086,23 @@ where
         &self,
         handle: ObjectHandle,
         data: &mut dyn ReadBuffer,
-        peek: bool,
-        source: bool,
-        nonblocking: bool,
-        max_objects: usize,
+        mut options: ReceiveOptions,
     ) -> core::result::Result<
-        core::result::Result<
-            (
-                ReceiveUnixSocketResponse,
-                Option<UnixSocketName>,
-                Vec<TransferredObject>,
-            ),
-            UnixSocketError,
-        >,
+        core::result::Result<ReceivedUnixSocket, UnixSocketError>,
         BrokerControlError,
     > {
         let capacity = data.len().min(UNIX_SOCKET_BUFFER_SIZE as usize);
         let data = &mut data.sub_buffer(0, capacity);
-        let name_size = if source {
+        let name_size = if options.source {
             MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize
         } else {
             0
         };
-        let max_objects = max_objects.min(MAX_UNIX_SOCKET_OBJECTS as usize);
+        options.max_objects = options.max_objects.min(MAX_UNIX_SOCKET_OBJECTS as usize);
         let lease = self.acquire_shared_buffer(
-            capacity + name_size + max_objects * ENCODED_TRANSFERRED_OBJECT_SIZE as usize,
+            capacity + name_size + options.max_objects * ENCODED_TRANSFERRED_OBJECT_SIZE as usize,
         )?;
-        self.request(|local| {
-            local.receive_unix_socket(
-                handle,
-                lease.sequence(),
-                data,
-                peek,
-                source,
-                nonblocking,
-                max_objects,
-            )
-        })
+        self.request(|local| local.receive_unix_socket(handle, lease.sequence(), data, options))
     }
 
     fn shutdown_unix_socket(

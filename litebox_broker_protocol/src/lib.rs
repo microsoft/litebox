@@ -86,6 +86,23 @@ impl From<ProcessId> for SessionId {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectHandle(pub u64);
 
+impl ObjectHandle {
+    /// Length in bytes of a handle encoded in a shared buffer.
+    pub const ENCODED_SIZE: usize = size_of::<u64>();
+
+    /// Encodes the handle for a shared buffer.
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::ENCODED_SIZE] {
+        self.0.to_le_bytes()
+    }
+
+    /// Decodes a handle produced by [`Self::encode`].
+    #[must_use]
+    pub fn decode(encoded: [u8; Self::ENCODED_SIZE]) -> Self {
+        Self(u64::from_le_bytes(encoded))
+    }
+}
+
 /// Association-scoped broker request identifier.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

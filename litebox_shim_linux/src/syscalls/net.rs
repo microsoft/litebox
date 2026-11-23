@@ -33,6 +33,7 @@ use litebox_common_linux::{
 use litebox_common_linux::{PAGE_SIZE, mm::VmemManager};
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use litebox_platform::time::Instant as _;
+use zerocopy::FromBytes as _;
 
 use crate::guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
 use crate::syscalls::{
@@ -905,7 +906,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         length: usize,
     ) -> Result<alloc::vec::Vec<litebox::process::InheritableFd<Platform>>, Errno> {
         /// Linux's default `optmem_max`, which bounds the control bytes it copies.
-        const MAX_CONTROL_LENGTH: usize = 20480;
+        const MAX_CONTROL_LENGTH: usize = 128 * 1024;
         /// `SCM_CREDENTIALS`, which passes credentials.
         const SCM_CREDENTIALS: i32 = 2;
 
@@ -928,19 +929,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let mut offset = 0;
         while length - offset >= unix::CMSG_HEADER_SIZE {
-            let message_length = usize::from_ne_bytes(
-                control[offset..offset + size_of::<usize>()]
-                    .try_into()
-                    .unwrap(),
-            );
+            let (header, _) = litebox_common_linux::CmsgHdr::read_from_prefix(&control[offset..])
+                .map_err(|_| Errno::EINVAL)?;
+            let message_length = header.cmsg_len;
             if message_length < unix::CMSG_HEADER_SIZE || message_length > length - offset {
                 return Err(Errno::EINVAL);
             }
-            let level = int_at(offset + size_of::<usize>());
-            let kind = int_at(offset + size_of::<usize>() + size_of::<i32>());
-            if level == unix::SOL_SOCKET {
-                match kind {
-                    unix::SCM_RIGHTS => {
+            if header.cmsg_level == unix::SOL_SOCKET {
+                match header.cmsg_type {
+                    litebox_common_linux::SCM_RIGHTS => {
                         let count = (message_length - unix::CMSG_HEADER_SIZE) / size_of::<i32>();
                         if objects.len() + count > unix::SCM_MAX_FD {
                             return Err(Errno::EINVAL);
@@ -949,16 +946,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             let fd =
                                 int_at(offset + unix::CMSG_HEADER_SIZE + index * size_of::<i32>());
                             let fd = self.files.borrow().typed_fd(fd)?;
-                            match self.global.shareable_object(&fd) {
-                                Ok((_, object)) => objects.push(object),
-                                // The position is local to this runner, and a retryable
-                                // `EAGAIN` would mislead callers.
-                                Err(Errno::EAGAIN) => {
-                                    log_unsupported!("passing a directory with a position");
-                                    return Err(Errno::EINVAL);
-                                }
-                                Err(error) => return Err(error),
-                            }
+                            objects.push(self.global.shareable_object(&fd)?.1);
                         }
                     }
                     SCM_CREDENTIALS => {

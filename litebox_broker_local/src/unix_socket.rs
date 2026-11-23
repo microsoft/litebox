@@ -15,18 +15,17 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_protocol::unix_socket::{
     AcceptUnixSocketRequest, BindUnixSocketRequest, ConnectUnixSocketRequest,
-    CreateUnixSocketPairResponse, CreateUnixSocketRequest, ENCODED_OBJECT_HANDLE_SIZE,
-    ENCODED_TRANSFERRED_OBJECT_SIZE, GetUnixSocketNameRequest, GetUnixSocketOptionRequest,
-    ListenUnixSocketRequest, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
-    MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE,
-    ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
-    SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, TransferredObject, UnixSocketError,
-    UnixSocketName,
+    CreateUnixSocketPairResponse, CreateUnixSocketRequest, ENCODED_TRANSFERRED_OBJECT_SIZE,
+    GetUnixSocketNameRequest, GetUnixSocketOptionRequest, ListenUnixSocketRequest,
+    MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE,
+    MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveOptions,
+    ReceiveUnixSocketRequest, SendUnixSocketRequest, SetUnixSocketOptionRequest,
+    ShutdownUnixSocketRequest, TransferredObject, UnixSocketError, UnixSocketName,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-use crate::{BrokerLocal, BrokerLocalError, Result};
+use crate::{BrokerLocal, BrokerLocalError, ReceivedUnixSocket, Result};
 
 type UnixSocketResult<T> = core::result::Result<T, UnixSocketError>;
 
@@ -185,17 +184,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             objects.len() <= MAX_UNIX_SOCKET_OBJECTS as usize,
             "too many carried objects"
         );
-        let objects_length = objects.len() * ENCODED_OBJECT_HANDLE_SIZE as usize;
+        let objects_length = objects.len() * ObjectHandle::ENCODED_SIZE;
         self.validate_unix_socket_buffer(
             buffer,
             address.len() + objects_length + data.len(),
             MAX_UNIX_SOCKET_TRANSFER_SIZE,
         )?;
         self.write_shared_buffer_at(buffer, 0, address);
-        let encoded_objects: Vec<u8> = objects
-            .iter()
-            .flat_map(|object| object.0.to_le_bytes())
-            .collect();
+        let encoded_objects: Vec<u8> = objects.iter().flat_map(|object| object.encode()).collect();
         self.write_shared_buffer_at(buffer, address.len(), &encoded_objects);
         self.copy_to_shared_buffer(buffer, address.len() + objects_length, data)?;
         match self.request_unix_socket(UnixSocketRequest::Send(SendUnixSocketRequest {
@@ -220,37 +216,29 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Receives data from a Unix socket into `destination` through
-    /// `buffer`, as for a non-blocking socket if `nonblocking` is set, with
-    /// handles to at most `max_objects` of the objects it carried.
-    ///
-    /// Returns the received lengths, the sender's name if `source` is set,
-    /// and the handles.
+    /// `buffer`, with handles to at most `options.max_objects` of the objects
+    /// it carried.
     ///
     /// # Panics
     ///
     /// Panics if `buffer` is not `destination.len()` bytes, plus
-    /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] if `source` is set, plus
-    /// [`ENCODED_TRANSFERRED_OBJECT_SIZE`] for each of `max_objects`, if
-    /// `max_objects` exceeds [`MAX_UNIX_SOCKET_OBJECTS`], or if the broker
-    /// returns an invalid response.
-    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] if `options.source` is set, plus
+    /// [`ENCODED_TRANSFERRED_OBJECT_SIZE`] for each of `options.max_objects`,
+    /// if `options.max_objects` exceeds [`MAX_UNIX_SOCKET_OBJECTS`], or if the
+    /// broker returns an invalid response.
     pub fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
         destination: &mut dyn ReadBuffer,
-        peek: bool,
-        source: bool,
-        nonblocking: bool,
-        max_objects: usize,
-    ) -> Result<
-        UnixSocketResult<(
-            ReceiveUnixSocketResponse,
-            Option<UnixSocketName>,
-            Vec<TransferredObject>,
-        )>,
-        Channel::Error,
-    > {
+        options: ReceiveOptions,
+    ) -> Result<UnixSocketResult<ReceivedUnixSocket>, Channel::Error> {
+        let ReceiveOptions {
+            peek,
+            source,
+            nonblocking,
+            max_objects,
+        } = options;
         assert!(
             max_objects <= MAX_UNIX_SOCKET_OBJECTS as usize,
             "too many carried objects"
@@ -279,7 +267,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             UnixSocketResponse::Receive(response) => {
                 let received = response.received as usize;
                 let source_length = response.source_length as usize;
-                let object_count = response.objects as usize;
+                let object_count = response.object_count as usize;
                 assert!(
                     received <= capacity
                         && received <= response.length as usize
@@ -312,7 +300,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     UnixSocketName::decode(&name[..source_length])
                         .expect("broker returned an invalid Unix socket source name")
                 });
-                Ok(Ok((response, name, objects)))
+                Ok(Ok(ReceivedUnixSocket {
+                    response,
+                    source: name,
+                    objects,
+                }))
             }
             UnixSocketResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected Unix socket response: {response:?}"),

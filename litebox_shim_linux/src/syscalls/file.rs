@@ -180,9 +180,6 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
 
     /// Returns the LiteBox object `fd` refers to, which another process can get its own
     /// reference to, and what kind of descriptor it is.
-    ///
-    /// Fails with `EAGAIN` for a directory with a position, set by `getdents64` or `lseek`, since
-    /// the position is local to this runner.
     pub(super) fn shareable_object(
         &self,
         fd: &AnyTypedFd<Platform>,
@@ -431,6 +428,54 @@ pub(crate) struct FilesState<Platform: ShimPlatform> {
     max_fd: AtomicUsize,
 }
 
+/// Evaluates `$install` with `$adopt` bound to a closure that adopts the inherited or received
+/// broker `$handle` as a descriptor of the kind `$kind` describes.
+///
+/// Needed because a closure cannot be generic over the subsystem type.
+macro_rules! adopt_handle {
+    ($global:expr, $kind:expr, $handle:expr, |$adopt:ident| $install:expr) => {
+        match $kind {
+            InheritedFdKind::File => {
+                let $adopt = || $global.adopt_inherited_file($handle);
+                $install
+            }
+            InheritedFdKind::Pipe { endpoint } => {
+                let $adopt = || $global.adopt_inherited_pipe_end($handle, endpoint);
+                $install
+            }
+            InheritedFdKind::UnixSocket { socket_type } => {
+                let $adopt = || $global.adopt_inherited_unix_socket($handle, socket_type);
+                $install
+            }
+            InheritedFdKind::InetSocket { socket_type } => {
+                let $adopt = || $global.adopt_inherited_inet_socket($handle, socket_type);
+                $install
+            }
+            InheritedFdKind::Eventfd => {
+                let $adopt = || $global.adopt_inherited_eventfd($handle);
+                $install
+            }
+            InheritedFdKind::Timerfd => {
+                let $adopt = || $global.adopt_inherited_timerfd($handle);
+                $install
+            }
+            InheritedFdKind::Epoll => {
+                let $adopt = || $global.adopt_inherited_epoll($handle);
+                $install
+            }
+            InheritedFdKind::VsockSocket => {
+                let $adopt = || $global.adopt_inherited_vsock_socket($handle);
+                $install
+            }
+            InheritedFdKind::Pidfd => {
+                let $adopt = || $global.adopt_inherited_pidfd($handle);
+                $install
+            }
+        }
+    };
+}
+pub(super) use adopt_handle;
+
 impl<Platform: ShimPlatform> FilesState<Platform> {
     pub(crate) fn new() -> Self {
         Self {
@@ -524,71 +569,11 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             }
             let first_fd = descriptions.get(&inherited.handle).copied();
             let handle = inherited.handle;
-            match inherited.kind {
-                InheritedFdKind::File => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_file(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::Pipe { endpoint } => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_pipe_end(handle, endpoint)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::UnixSocket { socket_type } => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_unix_socket(handle, socket_type)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::InetSocket { socket_type } => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_inet_socket(handle, socket_type)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::Eventfd => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_eventfd(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::Timerfd => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_timerfd(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::Epoll => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_epoll(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::VsockSocket => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_vsock_socket(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::Pidfd => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_pidfd(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-            }
+            adopt_handle!(global, inherited.kind, handle, |adopt| {
+                self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                    adopt().map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                })?;
+            });
             descriptions.entry(handle).or_insert(raw_fd);
             next_fd = raw_fd + 1;
         }

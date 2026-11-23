@@ -74,19 +74,7 @@ impl ObjectEntry {
     /// A duplicable kind whose waiters need wake-ups for changes made by
     /// other processes must also implement [`Self::watch`].
     pub(crate) fn is_duplicable(&self) -> bool {
-        match self {
-            Self::Event(_)
-            | Self::File(_)
-            | Self::UnixSocket(_)
-            | Self::Pipe(_)
-            | Self::Socket(_)
-            | Self::VsockSocket(_)
-            | Self::Timer(_)
-            | Self::ReadinessQueue(_)
-            | Self::Process(_) => true,
-            // Signals belong to their process and a futex waiter to its thread.
-            Self::Signals(_) | Self::FutexWaiter(_) => false,
-        }
+        self.transferred_kind().is_some()
     }
 
     /// Returns what a reference to this object another process receives
@@ -103,6 +91,7 @@ impl ObjectEntry {
             Self::Timer(_) => TransferredObjectKind::Timer,
             Self::ReadinessQueue(_) => TransferredObjectKind::ReadinessQueue,
             Self::Process(_) => TransferredObjectKind::Process,
+            // Signals belong to their process and a futex waiter to its thread.
             Self::Signals(_) | Self::FutexWaiter(_) => return None,
         })
     }

@@ -2850,6 +2850,21 @@ pub struct UserMsgHdr {
     _pad2: u32,
 }
 
+/// Linux's `struct cmsghdr`, which heads each control message in a `msghdr`'s ancillary data.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct CmsgHdr {
+    /// Length of the message, header included.
+    pub cmsg_len: usize,
+    /// Level of the message, such as [`SocketOptionLevel::SOCKET`].
+    pub cmsg_level: i32,
+    /// Type of the message within its level, such as [`SCM_RIGHTS`].
+    pub cmsg_type: i32,
+}
+
+/// `SCM_RIGHTS`, the type of a `SOL_SOCKET` control message that passes descriptors.
+pub const SCM_RIGHTS: i32 = 1;
+
 /// Linux's `struct mmsghdr`: a `msghdr` paired with the number of bytes
 /// transmitted, used by `sendmmsg`/`recvmmsg`.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]

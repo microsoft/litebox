@@ -16,8 +16,8 @@ use litebox_broker_protocol::{
     fs::{FileMode, FileOpenFlags, FileStatusFlags, FileUser},
     socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType},
     unix_socket::{
-        MAX_UNIX_SOCKET_OBJECTS, TransferredObjectKind, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress,
-        UnixSocketError as ProtocolError, UnixSocketName,
+        MAX_UNIX_SOCKET_OBJECTS, ReceiveOptions, TransferredObjectKind, UNIX_SOCKET_BUFFER_SIZE,
+        UnixSocketAddress, UnixSocketError as ProtocolError, UnixSocketName,
     },
 };
 use litebox_platform::time::TimeProvider;
@@ -343,22 +343,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         nonblock: bool,
         max_objects: usize,
     ) -> Result<Received, UnixSocketError> {
+        let options = ReceiveOptions {
+            peek,
+            source,
+            nonblocking: nonblock,
+            max_objects,
+        };
         self.wait(cx, nonblock, SocketOptionName::ReceiveTimeout, || {
             self.broker
-                .receive_unix_socket(
-                    self.handle,
-                    &mut buffer,
-                    peek,
-                    source,
-                    nonblock,
-                    max_objects,
-                )
+                .receive_unix_socket(self.handle, &mut buffer, options)
                 .map(|result| {
-                    result.map(|(received, source, objects)| Received {
-                        received: received.received as usize,
-                        length: received.length as usize,
-                        source,
-                        objects: objects
+                    result.map(|received| Received {
+                        received: received.response.received as usize,
+                        length: received.response.length as usize,
+                        source: received.source,
+                        objects: received
+                            .objects
                             .into_iter()
                             .map(|object| ReceivedObject {
                                 broker: Arc::clone(&self.broker),
@@ -367,7 +367,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
                                 adopted: false,
                             })
                             .collect(),
-                        objects_truncated: received.objects_truncated,
+                        objects_truncated: received.response.objects_truncated,
                     })
                 })
         })

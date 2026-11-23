@@ -12,9 +12,11 @@
 //!
 //! A message can carry references to objects, including other Unix sockets,
 //! which its receiver takes as its own references (see [`send`]). A socket
-//! that only messages queued in other such sockets reach, such as one sent
-//! over itself, is garbage that [`UnixSockets::collect_garbage`] reclaims, as
-//! Linux's collector does.
+//! that only messages queued in such sockets reach, such as one sent over
+//! itself, is garbage that `UnixSockets::collect_garbage` reclaims, as
+//! Linux's collector does. Closing a socket releases what its messages carry
+//! in a loop rather than recursively, so however deeply carried sockets
+//! nest, closing them takes bounded stack.
 //!
 //! Locks are taken only in this order:
 //!
@@ -38,7 +40,7 @@
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
@@ -51,7 +53,8 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_protocol::unix_socket::{
     MAX_UNIX_SOCKET_BACKLOG, MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE,
-    TransferredObject, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError, UnixSocketName,
+    ReceiveOptions, TransferredObject, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
+    UnixSocketName,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, MutexGuard, rwlock::RwLock};
@@ -80,14 +83,6 @@ const CONNECTION_OVERHEAD: usize = 256;
 
 /// Bytes charged for each object reference a queued message carries.
 const OBJECT_OVERHEAD: usize = 256;
-
-/// Deepest nesting of a socket that a message may carry, as Linux's
-/// `MAX_RECURSION_LEVEL`.
-///
-/// A socket's nesting is one more than that of the deepest socket a message
-/// queued for it carried, so carried sockets nest at most one level deeper,
-/// which bounds the recursion of closing one.
-const MAX_NESTING: u8 = 4;
 
 /// Result of receiving from a Unix socket.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -365,13 +360,10 @@ pub fn accept(
 /// The sent data carries the objects `objects` refer to, at most
 /// [`MAX_UNIX_SOCKET_OBJECTS`], so its receiver gets its own references to
 /// them with their rights, as [`receive`] describes. A stream socket that
-/// sends no data carries none, like Linux. Fails with
-/// [`UnixSocketError::TooManyReferences`] if a carried socket is nested
-/// deeper than [`MAX_NESTING`]. Since the receiver can then change the
-/// objects, this process's references first start publishing readiness
-/// through `readiness_sink`, as [`BrokerProcess::register_readiness`]
-/// describes.
-#[allow(clippy::too_many_arguments)]
+/// sends no data carries none, like Linux. Since the receiver can then
+/// change the objects, this process's references first start publishing
+/// readiness through `readiness_sink`, as
+/// [`BrokerProcess::register_readiness`] describes.
 pub fn send(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -390,10 +382,7 @@ pub fn send(
     let socket = &lease.socket;
     // Declared before the operations take any lock, so the objects a failed
     // send leaves drop after every lock is released.
-    let mut carrying = match Carrying::new(process, &socket.sockets, objects, readiness_sink)? {
-        Ok(carrying) => carrying,
-        Err(error) => return Ok(Err(error)),
-    };
+    let mut carrying = Carrying::new(process, objects, readiness_sink)?;
     match socket.kind {
         SocketType::Stream => {
             socket.send_stream(address.is_some(), data, &mut carrying, lease.nonblocking)
@@ -421,7 +410,8 @@ pub fn send(
 }
 
 /// Receives bytes from a Unix socket into the start of `output`, leaving them
-/// queued if `peek` is set and returning the sender's name if `source` is set.
+/// queued if `options.peek` is set and returning the sender's name if
+/// `options.source` is set.
 ///
 /// A stream socket receives queued bytes. A datagram or sequenced-packet
 /// socket receives one datagram or record, discarding the bytes beyond
@@ -430,31 +420,35 @@ pub fn send(
 /// data can arrive. Fails with [`BrokerError::WouldBlock`] while nothing is
 /// queued.
 ///
-/// If `nonblocking` is set, the receive acts as for a non-blocking socket:
-/// it fails with [`BrokerError::NonBlockingWouldBlock`], and, as in Linux, a
-/// datagram socket whose receive direction is shut down fails instead of
-/// reporting the end of data, while a sequenced-packet socket still reports
-/// it.
+/// If `options.nonblocking` is set, the receive acts as for a non-blocking
+/// socket: it fails with [`BrokerError::NonBlockingWouldBlock`], and, as in
+/// Linux, a datagram socket whose receive direction is shut down fails
+/// instead of reporting the end of data, while a sequenced-packet socket
+/// still reports it.
 ///
 /// The caller gets references to the objects the received data carried, up
-/// to `max_objects`, as [`Received::objects`] lists. Each has the rights the
-/// sender's reference had, within the caller's policy, and publishes
-/// readiness through `readiness_sink`. Unless peeking, the objects it gets no
-/// reference to are discarded, as [`Received::objects_truncated`] reports. A
-/// stream socket receives the objects with the first byte sent with them,
-/// and stops receiving after the last, so one receive gets the objects of at
-/// most one send, as in Linux.
-#[allow(clippy::too_many_arguments)]
+/// to `options.max_objects`, as [`Received::objects`] lists. Each has the
+/// rights the sender's reference had, within the caller's policy, and
+/// publishes readiness through `readiness_sink`. Unless peeking, the objects
+/// it gets no reference to are discarded, as [`Received::objects_truncated`]
+/// reports; like Linux, a receive that has taken data never fails to give
+/// it, so once one object cannot be given, neither are the rest. A stream
+/// socket receives the objects with the first byte sent with them, and stops
+/// receiving after the last, so one receive gets the objects of at most one
+/// send, as in Linux.
 pub fn receive(
     process: &BrokerProcess,
     handle: ObjectHandle,
     output: &mut dyn ReadBuffer,
-    peek: bool,
-    source: bool,
-    nonblocking: bool,
-    max_objects: usize,
+    options: ReceiveOptions,
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<UnixSocketResult<Received>> {
+    let ReceiveOptions {
+        peek,
+        source,
+        nonblocking,
+        max_objects,
+    } = options;
     if output.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
@@ -472,7 +466,7 @@ pub fn receive(
         Err(error) => return Ok(Err(error)),
     };
     (received.objects, received.objects_truncated) =
-        delivery.install(process, &socket.sockets, max_objects, readiness_sink)?;
+        delivery.install(process, &socket.sockets, max_objects, readiness_sink);
     Ok(Ok(received))
 }
 
@@ -687,7 +681,7 @@ impl Drop for UnixSocketObject {
 /// the locks of the socket and its peer, so callers release every lock
 /// before the lease drops.
 struct Lease {
-    _object: Arc<RwLock<ObjectEntry>>,
+    object: Option<Arc<RwLock<ObjectEntry>>>,
     socket: Arc<Socket>,
     nonblocking: bool,
 }
@@ -700,10 +694,26 @@ impl Lease {
             (Arc::clone(&socket.socket), socket.status.nonblocking())
         };
         Ok(Self {
-            _object: object,
+            object: Some(object),
             socket,
             nonblocking,
         })
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let Some(object) = self.object.take() else {
+            return;
+        };
+        // A close that raced the operation leaves carried references the only
+        // ones once the lease drops.
+        let carried = self.socket.carried.load(Ordering::Relaxed);
+        let maybe_garbage = carried != 0 && Arc::strong_count(&object) <= carried + 1;
+        drop(object);
+        if maybe_garbage {
+            self.socket.sockets.collect_all_garbage();
+        }
     }
 }
 
@@ -787,8 +797,34 @@ impl UnixSockets {
         drop(self.in_flight.lock());
     }
 
-    /// Reclaims the carried sockets that only messages queued in other such
-    /// sockets reach, discarding the messages queued for them.
+    /// Drops `object`, a reference to a Unix socket that its process closed,
+    /// then reclaims any garbage that leaves.
+    pub(crate) fn release_reference(&self, object: Arc<RwLock<ObjectEntry>>) {
+        // Only a socket in flight can become garbage through a closed
+        // reference; closing one that carries sockets releases them as it
+        // tears down, which marks garbage possible itself.
+        let carried = match &*object.read() {
+            ObjectEntry::UnixSocket(socket) => socket.socket.carried.load(Ordering::Relaxed) != 0,
+            _ => false,
+        };
+        drop(object);
+        if carried {
+            self.collect_all_garbage();
+        } else {
+            self.collect_garbage();
+        }
+    }
+
+    /// Reclaims garbage even if nothing marked it possible since the last
+    /// collection.
+    pub(crate) fn collect_all_garbage(&self) {
+        self.in_flight.lock().maybe_garbage = true;
+        self.collect_garbage();
+    }
+
+    /// Reclaims the carried sockets that only messages queued in such sockets
+    /// reach, discarding the messages queued for them, if a carried socket
+    /// lost a reference since the last collection.
     ///
     /// Like Linux's collector, this finds the carried sockets every
     /// reference to which is a carried one, and keeps those that messages
@@ -810,12 +846,13 @@ impl UnixSockets {
         let mut held_sockets = Vec::new();
         let mut wakeups = Vec::new();
         {
-            let in_flight = self.in_flight.lock();
-            if in_flight.sockets.is_empty() {
+            let mut in_flight = self.in_flight.lock();
+            if !core::mem::take(&mut in_flight.maybe_garbage) || in_flight.sockets.is_empty() {
                 return;
             }
             let mut candidates = HashMap::new();
             if candidates.try_reserve(in_flight.sockets.len()).is_err() {
+                in_flight.maybe_garbage = true;
                 return;
             }
             for (&key, carried) in &in_flight.sockets {
@@ -847,7 +884,9 @@ impl UnixSockets {
             for key in &keys {
                 let candidate = &candidates[key];
                 let mut children = Vec::new();
-                held_sockets.extend(candidate.socket.carried_sockets(&mut children));
+                candidate
+                    .socket
+                    .carried_socket_keys(&mut children, &mut held_sockets);
                 for child in &children {
                     if let Some(child) = candidates.get_mut(child) {
                         child.internal += 1;
@@ -893,8 +932,12 @@ impl UnixSockets {
         for wakeups in wakeups {
             wakeups.wake();
         }
-        drop(discarded);
-        drop(held_objects);
+        let mut teardown = Teardown::default();
+        for queue in discarded {
+            teardown.discard(queue);
+        }
+        teardown.objects.extend(held_objects);
+        teardown.run();
         drop(held_sockets);
     }
 
@@ -917,6 +960,9 @@ impl UnixSockets {
 #[derive(Default)]
 struct InFlight {
     sockets: HashMap<usize, CarriedSocket>,
+    /// Whether a carried socket lost a reference since the last collection,
+    /// which only then may have left garbage.
+    maybe_garbage: bool,
 }
 
 /// A socket that queued messages carry.
@@ -932,7 +978,7 @@ struct Candidate {
     socket: Arc<Socket>,
     /// Number of carried references to it.
     carried: usize,
-    /// Number of those that other candidates' messages hold.
+    /// Number of those that candidates' messages, including its own, hold.
     internal: usize,
     /// Keys of the carried sockets this socket's messages carry.
     children: Vec<usize>,
@@ -947,21 +993,20 @@ struct Candidate {
 struct InFlightObject {
     object: Arc<RwLock<ObjectEntry>>,
     rights: ObjectRights,
-    /// The registry counting the object while it is in flight, if it is a
-    /// Unix socket.
-    registry: Option<Arc<UnixSockets>>,
+    /// The socket the object is, counted in flight, if it is a Unix socket.
+    socket: Option<Arc<Socket>>,
 }
 
 impl InFlightObject {
-    /// Puts a reference with `rights` to `object` in flight, counting it in
-    /// `registry` if it is a Unix socket.
+    /// Puts a reference with `rights` to `object` in flight, counting it as
+    /// carrying `socket` if it is that Unix socket.
     fn new(
         object: Arc<RwLock<ObjectEntry>>,
         rights: ObjectRights,
-        registry: Option<&Arc<UnixSockets>>,
+        socket: Option<Arc<Socket>>,
     ) -> Result<Self> {
-        if let Some(registry) = registry {
-            let mut in_flight = registry.in_flight.lock();
+        if let Some(socket) = &socket {
+            let mut in_flight = socket.sockets.in_flight.lock();
             in_flight
                 .sockets
                 .try_reserve(1)
@@ -974,17 +1019,18 @@ impl InFlightObject {
                     count: 0,
                 })
                 .count += 1;
+            socket.carried.fetch_add(1, Ordering::Relaxed);
         }
         Ok(Self {
             object,
             rights,
-            registry: registry.cloned(),
+            socket,
         })
     }
 
     /// Returns the key of the carried socket this refers to, if it is one.
     fn socket_key(&self) -> Option<usize> {
-        self.registry.is_some().then(|| key_of(&self.object))
+        self.socket.is_some().then(|| key_of(&self.object))
     }
 
     /// Returns another reference to the object, which stays in flight.
@@ -992,15 +1038,23 @@ impl InFlightObject {
         (Arc::clone(&self.object), self.rights)
     }
 
-    /// Takes the reference out of flight.
+    /// Takes the reference out of flight for its receiver.
     fn land(mut self) -> (Arc<RwLock<ObjectEntry>>, ObjectRights) {
-        self.stop_counting();
+        self.stop_counting(false);
         (Arc::clone(&self.object), self.rights)
     }
 
-    fn stop_counting(&mut self) {
-        if let Some(registry) = self.registry.take() {
-            let mut in_flight = registry.in_flight.lock();
+    /// Takes the reference out of flight to discard it.
+    fn discard(mut self) -> Arc<RwLock<ObjectEntry>> {
+        self.stop_counting(true);
+        Arc::clone(&self.object)
+    }
+
+    /// Stops counting the reference in flight, noting that the carried socket
+    /// may have become garbage unless `landed`.
+    fn stop_counting(&mut self, discarded: bool) {
+        if let Some(socket) = self.socket.take() {
+            let mut in_flight = socket.sockets.in_flight.lock();
             let key = key_of(&self.object);
             let carried = in_flight
                 .sockets
@@ -1010,13 +1064,15 @@ impl InFlightObject {
             if carried.count == 0 {
                 in_flight.sockets.remove(&key);
             }
+            socket.carried.fetch_sub(1, Ordering::Relaxed);
+            in_flight.maybe_garbage |= discarded;
         }
     }
 }
 
 impl Drop for InFlightObject {
     fn drop(&mut self) {
-        self.stop_counting();
+        self.stop_counting(true);
     }
 }
 
@@ -1029,20 +1085,17 @@ fn key_of(object: &Arc<RwLock<ObjectEntry>>) -> usize {
 #[derive(Default)]
 struct Carrying {
     objects: Vec<InFlightObject>,
-    /// Nesting of the receiving socket once it queues them.
-    nesting: u8,
 }
 
 impl Carrying {
     /// Puts the objects `handles` refer to in flight.
     fn new(
         process: &BrokerProcess,
-        registry: &Arc<UnixSockets>,
         handles: &[ObjectHandle],
         readiness_sink: &Arc<dyn ReadinessSink>,
-    ) -> Result<UnixSocketResult<Self>> {
+    ) -> Result<Self> {
         if handles.is_empty() {
-            return Ok(Ok(Self::default()));
+            return Ok(Self::default());
         }
         // A registration left behind by a later failure only publishes
         // readiness the process does not need.
@@ -1051,37 +1104,21 @@ impl Carrying {
         objects
             .try_reserve_exact(handles.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
-        let mut deepest = 0;
         for &handle in handles {
             let (object, rights) = process.object_reference(handle)?;
-            let nesting = {
+            let socket = {
                 let entry = object.read();
                 if !entry.is_duplicable() {
                     return Err(BrokerError::UnsupportedOperation);
                 }
                 match &*entry {
-                    ObjectEntry::UnixSocket(socket) => {
-                        Some(socket.socket.nesting.load(Ordering::Relaxed))
-                    }
+                    ObjectEntry::UnixSocket(socket) => Some(Arc::clone(&socket.socket)),
                     _ => None,
                 }
             };
-            if let Some(nesting) = nesting {
-                deepest = deepest.max(nesting);
-            }
-            objects.push(InFlightObject::new(
-                object,
-                rights,
-                nesting.is_some().then_some(registry),
-            )?);
+            objects.push(InFlightObject::new(object, rights, socket)?);
         }
-        if deepest > MAX_NESTING {
-            return Ok(Err(UnixSocketError::TooManyReferences));
-        }
-        Ok(Ok(Self {
-            objects,
-            nesting: deepest + 1,
-        }))
+        Ok(Self { objects })
     }
 
     fn is_empty(&self) -> bool {
@@ -1093,11 +1130,44 @@ impl Carrying {
         self.objects.len() * OBJECT_OVERHEAD
     }
 
-    /// Takes the objects, with the nesting of a socket that queues them, or
-    /// zero if there are none.
-    fn take(&mut self) -> (Vec<InFlightObject>, u8) {
-        let nesting = if self.is_empty() { 0 } else { self.nesting };
-        (core::mem::take(&mut self.objects), nesting)
+    fn take(&mut self) -> Vec<InFlightObject> {
+        core::mem::take(&mut self.objects)
+    }
+}
+
+/// Sockets to tear down and carried objects to release, which closing a
+/// socket works through in a loop: releasing a carried socket's last
+/// reference closes it here rather than in a nested drop, so closing sockets
+/// that carry sockets takes bounded stack however deeply they nest.
+#[derive(Default)]
+struct Teardown {
+    sockets: Vec<Arc<Socket>>,
+    objects: Vec<Arc<RwLock<ObjectEntry>>>,
+}
+
+impl Teardown {
+    /// Releases the objects the messages of `queue`, which no socket holds
+    /// any more, carry.
+    fn discard(&mut self, queue: Queue) {
+        self.objects
+            .extend(queue.into_objects().map(InFlightObject::discard));
+    }
+
+    fn run(mut self) {
+        loop {
+            if let Some(socket) = self.sockets.pop() {
+                socket.close_into(&mut self);
+            } else if let Some(object) = self.objects.pop() {
+                if let Ok(object) = Arc::try_unwrap(object)
+                    && let ObjectEntry::UnixSocket(socket) = object.into_inner()
+                {
+                    // Its drop then finds it closed.
+                    socket.socket.close_into(&mut self);
+                }
+            } else {
+                return;
+            }
+        }
     }
 }
 
@@ -1117,65 +1187,61 @@ impl Delivery {
     /// Gives `process` references to at most `max_objects` of the objects,
     /// publishing readiness through `readiness_sink`, and returns them and
     /// whether it discarded any.
+    ///
+    /// The receive already took the data, so this never fails: like Linux,
+    /// once one object cannot be given, neither are the rest.
     fn install(
         self,
         process: &BrokerProcess,
         registry: &UnixSockets,
         max_objects: usize,
         readiness_sink: &Arc<dyn ReadinessSink>,
-    ) -> Result<(Vec<TransferredObject>, bool)> {
+    ) -> (Vec<TransferredObject>, bool) {
         let objects: Vec<_> = match self {
-            Self::None => return Ok((Vec::new(), false)),
+            Self::None => return (Vec::new(), false),
             Self::Taken(objects) => objects.into_iter().map(InFlightObject::land).collect(),
             Self::Peeked(objects) => {
                 registry.synchronize_with_collector();
                 objects
             }
         };
+        let count = objects.len();
         let allowed = process
             .core
             .policy
             .principal_object_rights(process.caller_credential)
             .unwrap_or_default();
         let mut installed = Vec::new();
-        installed
-            .try_reserve_exact(objects.len().min(max_objects))
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        let mut truncated = false;
-        let mut failure = None;
-        for (object, rights) in objects {
+        let max_objects = if installed.try_reserve_exact(count.min(max_objects)).is_ok() {
+            max_objects
+        } else {
+            0
+        };
+        for (object, rights) in objects.into_iter().take(max_objects) {
             let rights = rights & allowed;
             let kind = object.read().transferred_kind();
-            let Some(kind) = kind.filter(|_| {
-                installed.len() < max_objects && !rights.is_empty() && failure.is_none()
-            }) else {
-                truncated = true;
-                continue;
+            let Some(kind) = kind.filter(|_| !rights.is_empty()) else {
+                break;
             };
             match process.create_object_reference_with_rights(object, rights) {
                 Ok(handle) => installed.push(TransferredObject { handle, kind }),
-                // Like Linux, a receiver out of descriptors loses the rest.
-                Err(BrokerError::ResourceExhausted | BrokerError::OutOfMemory) => {
-                    truncated = true;
-                }
-                Err(error) => failure = Some(error),
+                Err(_) => break,
             }
         }
-        let failure = match failure {
-            Some(error) => Some(error),
-            None if installed.is_empty() => None,
-            None => process.register_readiness(readiness_sink).err(),
-        };
-        if let Some(error) = failure {
+        if !installed.is_empty() && process.register_readiness(readiness_sink).is_err() {
             // The caller never learns of the handles. A failed close leaves
-            // one to the process's teardown, and the first error stays the
-            // cause.
-            for object in installed {
+            // one to the process's teardown.
+            for object in core::mem::take(&mut installed) {
                 let _ = process.close_object_reference(object.handle);
             }
-            return Err(error);
         }
-        Ok((installed, truncated))
+        let truncated = installed.len() < count;
+        if truncated {
+            // The discarded references may have been all that reached a
+            // carried socket.
+            registry.collect_all_garbage();
+        }
+        (installed, truncated)
     }
 }
 
@@ -1217,9 +1283,9 @@ struct Socket {
     /// Registrations that receive the socket's readiness. Their lock
     /// serializes publications, so the last one reflects the latest state.
     watchers: Mutex<ReadinessWatchers>,
-    /// How deeply sockets nest in the messages queued for this one, which
-    /// only grows (see [`MAX_NESTING`]).
-    nesting: AtomicU8,
+    /// Number of references to the socket that queued messages carry, which
+    /// changes only under the registry lock.
+    carried: AtomicUsize,
 }
 
 struct State {
@@ -1279,6 +1345,16 @@ impl Queue {
         self.bytes.is_empty() && self.datagrams.is_empty()
     }
 
+    /// Returns the objects the queued messages carry.
+    fn into_objects(self) -> impl Iterator<Item = InFlightObject> {
+        let carried = self.carried.into_iter().flat_map(|carried| carried.objects);
+        let datagrams = self
+            .datagrams
+            .into_iter()
+            .flat_map(|datagram| datagram.objects);
+        carried.chain(datagrams)
+    }
+
     /// Calls `f` with every object the queued messages carry.
     fn for_each_object(&self, mut f: impl FnMut(&InFlightObject)) {
         let carried = self.carried.iter().flat_map(|carried| &carried.objects);
@@ -1299,8 +1375,6 @@ struct Datagram {
     data: Vec<u8>,
     source: UnixSocketName,
     objects: Vec<InFlightObject>,
-    /// Nesting of the socket that queues the datagram.
-    nesting: u8,
 }
 
 impl Datagram {
@@ -1316,12 +1390,10 @@ impl Datagram {
             .map_err(|_| BrokerError::OutOfMemory)?;
         copy.resize(data.len(), 0);
         data.copy_to_slice_at(0, &mut copy)?;
-        let (objects, nesting) = carrying.take();
         Ok(Self {
             data: copy,
             source,
-            objects,
-            nesting,
+            objects: carrying.take(),
         })
     }
 
@@ -1383,7 +1455,7 @@ impl Socket {
             }),
             incoming: Channel::new(Queue::default(), CAPACITY),
             watchers: Mutex::new(ReadinessWatchers::default()),
-            nesting: AtomicU8::new(0),
+            carried: AtomicUsize::new(0),
         }
     }
 
@@ -1652,13 +1724,11 @@ impl Socket {
             }
             if !carrying.is_empty() {
                 let end = channel.queue.head + channel.queue.bytes.len() as u64;
-                let (objects, nesting) = carrying.take();
                 channel.queue.carried.push_back(StreamObjects {
                     start: end - length as u64,
                     end,
-                    objects,
+                    objects: carrying.take(),
                 });
-                peer.nesting.fetch_max(nesting, Ordering::Relaxed);
             }
             channel.add(charge);
             length
@@ -1791,10 +1861,7 @@ impl Socket {
             channel.wait(self)?;
             return Err(BrokerError::would_block(nonblocking));
         }
-        let (charge, nesting) = {
-            let datagram = datagram.as_ref().ok_or(BrokerError::Internal)?;
-            (datagram.charge(), datagram.nesting)
-        };
+        let charge = datagram.as_ref().ok_or(BrokerError::Internal)?.charge();
         self.sockets.charge(&receiver.quota, charge)?;
         if channel.queue.datagrams.try_reserve(1).is_err() {
             self.sockets.refund(&receiver.quota, charge);
@@ -1805,8 +1872,6 @@ impl Socket {
             .datagrams
             .push_back(datagram.take().ok_or(BrokerError::Internal)?);
         channel.add(charge);
-        // Like Linux, only a queued message nests its sockets in the receiver.
-        receiver.nesting.fetch_max(nesting, Ordering::Relaxed);
         Ok(Ok(()))
     }
 
@@ -2067,9 +2132,9 @@ impl Socket {
 
     /// Adds the keys of the carried sockets that the messages queued for
     /// this socket, or for the connections in its backlog, carry to `keys`,
-    /// returning the backlog for the caller to drop once it releases every
-    /// lock.
-    fn carried_sockets(&self, keys: &mut Vec<usize>) -> Vec<Arc<Socket>> {
+    /// and the backlog to `held` for the caller to drop once it releases
+    /// every lock.
+    fn carried_socket_keys(&self, keys: &mut Vec<usize>, held: &mut Vec<Arc<Socket>>) {
         let backlog = self.backlog();
         for socket in core::iter::once(self).chain(backlog.iter().map(|socket| &**socket)) {
             socket
@@ -2078,7 +2143,7 @@ impl Socket {
                 .queue
                 .for_each_object(|object| keys.extend(object.socket_key()));
         }
-        backlog
+        held.extend(backlog);
     }
 
     /// Discards the data queued for this garbage socket and the connections
@@ -2110,6 +2175,14 @@ impl Socket {
     /// Tears the socket down once nothing reaches it through a reference or a
     /// backlog.
     fn close(&self) {
+        let mut teardown = Teardown::default();
+        self.close_into(&mut teardown);
+        teardown.run();
+    }
+
+    /// Tears the socket down, leaving the sockets and objects that releases to
+    /// `teardown`.
+    fn close_into(&self, teardown: &mut Teardown) {
         let (connection, marker, wakeups, discarded) = {
             let mut state = self.state.lock();
             if core::mem::replace(&mut state.closed, true) {
@@ -2131,16 +2204,14 @@ impl Socket {
             )
         };
         drop(marker);
-        drop(discarded);
+        teardown.discard(discarded);
         match connection {
             Connection::Listening { backlog, .. } => {
                 self.sockets
                     .refund(&self.quota, backlog.len() * CONNECTION_OVERHEAD);
                 // Unaccepted sockets have no references, so they close with
                 // their listener.
-                for socket in backlog {
-                    socket.close();
-                }
+                teardown.sockets.extend(backlog);
             }
             Connection::Connected { peer, .. } if self.is_connection_oriented() => {
                 if let Some(peer) = peer.upgrade() {

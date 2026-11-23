@@ -81,9 +81,9 @@ use litebox_broker_protocol::timer::{
 };
 use litebox_broker_protocol::unix_socket::{
     AcceptUnixSocketResponse, CreateUnixSocketPairResponse, CreateUnixSocketResponse,
-    ENCODED_OBJECT_HANDLE_SIZE, ENCODED_TRANSFERRED_OBJECT_SIZE, GetUnixSocketNameResponse,
-    GetUnixSocketOptionResponse, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
-    MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE,
+    ENCODED_TRANSFERRED_OBJECT_SIZE, GetUnixSocketNameResponse, GetUnixSocketOptionResponse,
+    MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE,
+    MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveOptions,
     ReceiveUnixSocketResponse, SendUnixSocketResponse, UnixSocketAddress, UnixSocketError,
 };
 use litebox_broker_protocol::vsock_socket::{
@@ -713,7 +713,7 @@ fn duplicate_objects_to_child<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<()> {
-    const HANDLE_SIZE: usize = size_of::<u64>();
+    const HANDLE_SIZE: usize = ObjectHandle::ENCODED_SIZE;
     const _: () = assert!(
         MAX_CHILD_OBJECT_DUPLICATES as usize * HANDLE_SIZE == SHARED_BUFFER_SLOT_SIZE as usize
     );
@@ -734,7 +734,7 @@ fn duplicate_objects_to_child<Memory: SharedMemory>(
         data.as_chunks::<HANDLE_SIZE>()
             .0
             .iter()
-            .map(|bytes| ObjectHandle(u64::from_le_bytes(*bytes))),
+            .map(|bytes| ObjectHandle::decode(*bytes)),
     );
     let duplicates = process
         .duplicate_object_references_to_child(child_process_id, &handles, readiness_sink)
@@ -745,7 +745,7 @@ fn duplicate_objects_to_child<Memory: SharedMemory>(
         .iter_mut()
         .zip(duplicates)
     {
-        *bytes = duplicate.0.to_le_bytes();
+        *bytes = duplicate.encode();
     }
     write_shared_buffer(shared_buffers, buffer, &data, SHARED_BUFFER_SLOT_SIZE)
 }
@@ -1961,8 +1961,7 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
             if request.object_count > MAX_UNIX_SOCKET_OBJECTS {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
-            let objects_length =
-                request.object_count as usize * ENCODED_OBJECT_HANDLE_SIZE as usize;
+            let objects_length = request.object_count as usize * ObjectHandle::ENCODED_SIZE;
             let length = (request.buffer.length() as usize)
                 .checked_sub(address_length)
                 .and_then(|length| length.checked_sub(objects_length))
@@ -1986,10 +1985,10 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 .copy_to_slice_at(address_length, &mut encoded_objects)
                 .map_err(|Fault| RequestFailure::Abort(ErrorCode::Internal))?;
             let objects: Vec<ObjectHandle> = encoded_objects
-                .as_chunks::<{ ENCODED_OBJECT_HANDLE_SIZE as usize }>()
+                .as_chunks::<{ ObjectHandle::ENCODED_SIZE }>()
                 .0
                 .iter()
-                .map(|bytes| ObjectHandle(u64::from_le_bytes(*bytes)))
+                .map(|bytes| ObjectHandle::decode(*bytes))
                 .collect();
             Ok(unix_socket::send(
                 process,
@@ -2038,14 +2037,17 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                     request.max_objects as usize * ENCODED_TRANSFERRED_OBJECT_SIZE as usize,
                 )
                 .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
+            let options = ReceiveOptions {
+                peek: request.peek,
+                source: request.source,
+                nonblocking: request.nonblocking,
+                max_objects: request.max_objects as usize,
+            };
             let received = match unix_socket::receive(
                 process,
                 request.handle,
                 &mut (&mut buffer).sub_buffer(0, request.capacity as usize),
-                request.peek,
-                request.source,
-                request.nonblocking,
-                request.max_objects as usize,
+                options,
                 readiness_sink,
             )? {
                 Ok(received) => received,
@@ -2077,7 +2079,7 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                         .expect("received bytes fit the capacity"),
                     length,
                     source_length: u32::try_from(source_length).expect("encoded names fit in u32"),
-                    objects: u32::try_from(received.objects.len())
+                    object_count: u32::try_from(received.objects.len())
                         .expect("received objects fit the request's limit"),
                     objects_truncated: received.objects_truncated,
                 }))
@@ -4268,7 +4270,7 @@ mod tests {
                     received: 2,
                     length: 2,
                     source_length: 0,
-                    objects: 0,
+                    object_count: 0,
                     objects_truncated: false,
                 }
             )))
@@ -4285,7 +4287,7 @@ mod tests {
         )) else {
             panic!("expected Unix socket pair creation");
         };
-        let mut staged = carried.first.0.to_le_bytes().to_vec();
+        let mut staged = carried.first.encode().to_vec();
         staged.push(6);
         assert_eq!(
             request(BrokerOperation::UnixSocket(UnixSocketRequest::Send(
@@ -4313,7 +4315,7 @@ mod tests {
         let UnixSocketResponse::Receive(response) = response else {
             panic!("expected a receive response, got {response:?}");
         };
-        assert_eq!((response.received, response.objects), (1, 1));
+        assert_eq!((response.received, response.object_count), (1, 1));
         let mut encoded = [0; ENCODED_TRANSFERRED_OBJECT_SIZE as usize + 8];
         shared_buffers
             .read(SharedBufferSlotIndex(9), &mut encoded)
@@ -4338,6 +4340,35 @@ mod tests {
                 &shared_buffers,
                 &test_readiness_sink(),
             )),
+            Err(ErrorCode::MalformedRequest)
+        );
+        // A receive asks for at most the limit's objects, and the buffer must
+        // hold room for them all.
+        let receive_objects = |max_objects, length| {
+            complete_request(handle_request(
+                &process,
+                BrokerOperation::UnixSocket(UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
+                    handle: pair.second,
+                    buffer: single_slot_sequence(9, length),
+                    capacity: 8,
+                    max_objects,
+                    peek: false,
+                    source: false,
+                    nonblocking: true,
+                })),
+                &shared_buffers,
+                &test_readiness_sink(),
+            ))
+        };
+        assert_eq!(
+            receive_objects(
+                MAX_UNIX_SOCKET_OBJECTS + 1,
+                8 + (MAX_UNIX_SOCKET_OBJECTS + 1) * ENCODED_TRANSFERRED_OBJECT_SIZE
+            ),
+            Err(ErrorCode::MalformedRequest)
+        );
+        assert_eq!(
+            receive_objects(2, 8 + ENCODED_TRANSFERRED_OBJECT_SIZE),
             Err(ErrorCode::MalformedRequest)
         );
     }

@@ -2656,17 +2656,10 @@ impl BrokerProcess {
             return Err(BrokerError::InvalidRights);
         }
 
-        let object = {
-            let references = self.core.references.read();
-            let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-            if reference.owner != self.key {
-                return Err(BrokerError::UnknownObject);
-            }
-            if !reference.rights.contains(rights) {
-                return Err(BrokerError::InvalidRights);
-            }
-            Arc::clone(&reference.object)
-        };
+        let (object, source_rights) = self.object_reference(handle)?;
+        if !source_rights.contains(rights) {
+            return Err(BrokerError::InvalidRights);
+        }
 
         if !object.read().is_duplicable() {
             return Err(BrokerError::UnsupportedOperation);
@@ -2696,12 +2689,7 @@ impl BrokerProcess {
     }
 
     fn object_reference_rights(&self, handle: ObjectHandle) -> Result<ObjectRights> {
-        let references = self.core.references.read();
-        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != self.key {
-            return Err(BrokerError::UnknownObject);
-        }
-        Ok(reference.rights)
+        self.object_reference(handle).map(|(_, rights)| rights)
     }
 
     /// Publishes readiness of all of this process's references through
@@ -2968,10 +2956,10 @@ impl BrokerProcess {
     pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
         let reference = self.remove_object_reference(handle)?;
         let unix_socket = matches!(&*reference.object.read(), ObjectEntry::UnixSocket(_));
-        drop(reference);
-        // Messages may now be all that reach the socket.
         if unix_socket {
-            self.core.unix_sockets.collect_garbage();
+            let object = Arc::clone(&reference.object);
+            drop(reference);
+            self.core.unix_sockets.release_reference(object);
         }
         Ok(())
     }
@@ -3142,7 +3130,7 @@ impl BrokerProcess {
         let socket_account = self.socket_account.lock().take();
         drop(socket_account);
         // Messages may now be all that reach Unix sockets this process held.
-        self.core.unix_sockets.collect_garbage();
+        self.core.unix_sockets.collect_all_garbage();
         invariant_fault
     }
 
