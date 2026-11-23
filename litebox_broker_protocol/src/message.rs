@@ -503,12 +503,6 @@ wire_enum! {
         SetParentExitSignal(SetParentExitSignalRequest),
         /// Apply the requested namespace changes to the caller or its pending
         /// child together, or leave all its namespaces unchanged.
-        ///
-        /// The broker returns `UnknownObject` if the process is neither,
-        /// `UnsupportedOperation` if the request asks for a children's PID
-        /// namespace for a pending child or while the caller's children already
-        /// go to another one, and `ResourceExhausted` at a namespace count or
-        /// nesting limit.
         CreateNamespaces(CreateNamespacesRequest),
     }
 }

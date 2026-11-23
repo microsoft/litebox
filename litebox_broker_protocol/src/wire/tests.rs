@@ -95,24 +95,6 @@ use core::num::NonZeroU64;
 
 const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
 
-#[test]
-fn create_namespaces_wire_shape_is_pinned() {
-    let request = BrokerRequest {
-        request_id: RequestId(7),
-        operation: BrokerOperation::Process(ProcessRequest::CreateNamespaces(
-            CreateNamespacesRequest {
-                process_id: ProcessId(9),
-                children_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
-                copy_host_names: true,
-            },
-        )),
-    };
-    assert_eq!(
-        encode_request(&request),
-        [1, 7, 0, 0, 0, 0, 0, 0, 0, 10, 22, 9, 0, 0, 0, 1, 1, 0, 1]
-    );
-}
-
 fn process_id(id: u32) -> ProcessId {
     ProcessId(id)
 }

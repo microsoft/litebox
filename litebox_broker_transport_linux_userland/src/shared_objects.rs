@@ -3,18 +3,9 @@
 
 //! Out-of-band delivery of host shared objects from the broker to a runner.
 //!
-//! Some broker responses refer to a host object that the runner must hold itself, such as a
-//! memfd that the runner maps. During setup, the broker sends the
-//! runner one end of a `SOCK_SEQPACKET` socket pair (see
-//! [`UnixStreamHostSetupChannel::send_shared_object_channel`](crate::unix_socket::UnixStreamHostSetupChannel::send_shared_object_channel)).
 //! To deliver an object, the broker sends its descriptor over the socket in a message holding an
 //! 8-byte little-endian token, then answers the request with the token. Tokens increase in
 //! socket delivery order, even when broker requests run concurrently.
-//!
-//! Socket sends never block: a runner that does not take its objects only makes later deliveries
-//! to it fail, rather than stalling the broker worker serving it. The socket's small send buffer
-//! bounds how many descriptors such a runner can leave in flight, which the host charges to the
-//! broker.
 
 use std::io::{Error, ErrorKind, IoSlice, Result as IoResult};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};

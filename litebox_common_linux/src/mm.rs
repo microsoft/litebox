@@ -1197,6 +1197,10 @@ where
         }
 
         if flags.intersects(MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_DONTUNMAP) {
+            litebox_util_log::warn!(
+                flags:? = flags;
+                "MREMAP_FIXED and MREMAP_DONTUNMAP are unsupported"
+            );
             return Err(Errno::EINVAL);
         }
 

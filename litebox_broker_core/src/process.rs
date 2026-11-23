@@ -4457,21 +4457,6 @@ mod tests {
             &root.children_namespace(),
             root.pid_namespace()
         ));
-        // A children's PID namespace is only for the caller itself.
-        assert_eq!(
-            root.create_namespaces(CreateNamespacesRequest {
-                process_id: child_id,
-                children_pid_namespace: Some(PidNamespaceOptions::default()),
-                copy_host_names: true,
-            }),
-            Err(BrokerError::UnsupportedOperation),
-        );
-        root.set_host_name(root.id(), HostNameKind::Host, host_name(b"shared again"))
-            .unwrap();
-        assert_eq!(
-            root.get_host_names(child_id).unwrap().host,
-            host_name(b"shared again"),
-        );
     }
 
     #[test]

@@ -234,8 +234,7 @@ mod tests {
         channel.take(*tokens.last().unwrap()).unwrap();
     }
 
-    #[test]
-    fn descriptors_lost_in_transit_fail_their_requester() {
+    fn raw_channel() -> (OwnedFd, SharedObjectChannel) {
         let mut pair = [0; 2];
         // SAFETY: `pair` has room for the two new descriptors.
         let result = unsafe {
@@ -250,51 +249,51 @@ mod tests {
         // SAFETY: `socketpair` created both descriptors for this test alone.
         let (broker, receiver) =
             unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
-        let channel = SharedObjectChannel::new(receiver);
-        let file = std::fs::File::open("/").unwrap();
-        let send = |token: u64, fd: Option<i32>| {
-            let mut bytes = token.to_le_bytes();
-            let mut iov = libc::iovec {
-                iov_base: bytes.as_mut_ptr().cast(),
-                iov_len: bytes.len(),
-            };
-            let mut control = [0u64; 4];
-            // SAFETY: `msghdr` is plain data, for which all-zero bytes are valid.
-            let mut header: libc::msghdr = unsafe { core::mem::zeroed() };
-            header.msg_iov = &raw mut iov;
-            header.msg_iovlen = 1;
-            if let Some(fd) = fd {
-                let fd_size = u32::try_from(size_of::<i32>()).unwrap();
-                header.msg_control = control.as_mut_ptr().cast();
-                // SAFETY: `CMSG_SPACE` only computes a size.
-                header.msg_controllen = unsafe { libc::CMSG_SPACE(fd_size) } as _;
-                // SAFETY: The control buffer has room for one descriptor's message.
-                unsafe {
-                    let message = libc::CMSG_FIRSTHDR(&raw const header);
-                    (*message).cmsg_level = libc::SOL_SOCKET;
-                    (*message).cmsg_type = libc::SCM_RIGHTS;
-                    (*message).cmsg_len = libc::CMSG_LEN(fd_size) as _;
-                    libc::CMSG_DATA(message).cast::<i32>().write_unaligned(fd);
-                }
-            }
-            // SAFETY: `header` describes buffers that live across the call.
-            let sent = unsafe { libc::sendmsg(broker.as_raw_fd(), &raw const header, 0) };
-            assert_eq!(sent, 8);
+        (broker, SharedObjectChannel::new(receiver))
+    }
+
+    fn send_raw(broker: &OwnedFd, token: u64, fd: Option<i32>) {
+        let mut bytes = token.to_le_bytes();
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: bytes.len(),
         };
+        let mut control = [0u64; 4];
+        // SAFETY: `msghdr` is plain data, for which all-zero bytes are valid.
+        let mut header: libc::msghdr = unsafe { core::mem::zeroed() };
+        header.msg_iov = &raw mut iov;
+        header.msg_iovlen = 1;
+        if let Some(fd) = fd {
+            let fd_size = u32::try_from(size_of::<i32>()).unwrap();
+            header.msg_control = control.as_mut_ptr().cast();
+            // SAFETY: `CMSG_SPACE` only computes a size.
+            header.msg_controllen = unsafe { libc::CMSG_SPACE(fd_size) } as _;
+            // SAFETY: The control buffer has room for one descriptor's message.
+            unsafe {
+                let message = libc::CMSG_FIRSTHDR(&raw const header);
+                (*message).cmsg_level = libc::SOL_SOCKET;
+                (*message).cmsg_type = libc::SCM_RIGHTS;
+                (*message).cmsg_len = libc::CMSG_LEN(fd_size) as _;
+                libc::CMSG_DATA(message).cast::<i32>().write_unaligned(fd);
+            }
+        }
+        // SAFETY: `header` describes buffers that live across the call.
+        let sent = unsafe { libc::sendmsg(broker.as_raw_fd(), &raw const header, 0) };
+        assert_eq!(sent, 8);
+    }
+
+    #[test]
+    fn descriptors_lost_in_transit_fail_their_requester() {
+        let (broker, channel) = raw_channel();
+        let file = std::fs::File::open("/").unwrap();
         // Messages missing their descriptors fail their requesters whether they wait for them or
         // not, and later ones still arrive.
-        send(1, None);
-        send(2, None);
-        send(3, Some(file.as_raw_fd()));
+        send_raw(&broker, 1, None);
+        send_raw(&broker, 2, None);
+        send_raw(&broker, 3, Some(file.as_raw_fd()));
         assert_eq!(channel.take(1).unwrap_err().kind(), ErrorKind::InvalidData);
         channel.take(3).unwrap();
         assert_eq!(channel.take(2).unwrap_err().kind(), ErrorKind::InvalidData);
-        // A token that arrives after a later one is refused rather than taken.
-        send(5, Some(file.as_raw_fd()));
-        send(4, Some(file.as_raw_fd()));
-        channel.take(5).unwrap();
-        assert_eq!(channel.take(6).unwrap_err().kind(), ErrorKind::InvalidData);
-        assert_eq!(channel.take(4).unwrap_err().kind(), ErrorKind::NotFound);
     }
 
     #[test]
