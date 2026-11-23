@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
@@ -80,7 +80,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Allocates one pending child process.
     ///
     /// The child goes into the PID namespace for this process's children (see
-    /// [`Self::create_children_pid_namespace`]), unless `new_pid_namespace`
+    /// [`Self::create_namespaces`]), unless `new_pid_namespace`
     /// gives options, in which case it is the first process of a new
     /// namespace with those options, nested in this process's. The child's
     /// parent is this process, or this process's parent if `sibling` is set.
@@ -102,20 +102,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         })
     }
 
-    /// Makes the children this process creates from now on go into a new PID
-    /// namespace with `options`, nested in this process's. The first of them
-    /// becomes the namespace's first process.
+    /// Applies the requested namespace changes to this process or its pending
+    /// child, all of them or none. A new children's PID namespace, only for
+    /// this process, is nested in its own, and the first child created in it
+    /// becomes its first process.
     ///
-    /// Fails with [`ProcessError::Unavailable`] if this process's children
-    /// already go to another PID namespace, and with
+    /// Fails with [`ProcessError::InvalidChild`] if the target is neither,
+    /// with [`ProcessError::Unavailable`] if this process's children already
+    /// go to another PID namespace, and with
     /// [`ProcessError::ResourceExhausted`] at a namespace count or nesting
     /// limit.
-    pub fn create_children_pid_namespace(
-        &self,
-        options: PidNamespaceOptions,
-    ) -> Result<(), ProcessError> {
+    pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(broker.create_children_pid_namespace(options)?)
+        Ok(broker.create_namespaces(request)?)
     }
 
     /// Reports this process's final termination status, which its parent
@@ -237,15 +236,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     ) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.set_host_name(process_id, kind, name)?)
-    }
-
-    /// Replaces the host names of this process or of its pending child
-    /// `process_id` with a copy that no other process shares.
-    ///
-    /// Returns [`ProcessError::InvalidChild`] if `process_id` is neither.
-    pub fn copy_host_names(&self, process_id: ProcessId) -> Result<(), ProcessError> {
-        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(broker.copy_host_names(process_id)?)
     }
 
     /// Returns the parent-exit signal of this process or of its pending child

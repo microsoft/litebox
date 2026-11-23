@@ -1197,9 +1197,6 @@ where
         }
 
         if flags.intersects(MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_DONTUNMAP) {
-            #[cfg(debug_assertions)]
-            todo!("Unsupported flags {:?}", flags);
-            #[cfg(not(debug_assertions))]
             return Err(Errno::EINVAL);
         }
 

@@ -34,12 +34,12 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameKind,
-    HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo, ProcessStartupDescriptor, ResourceKind, ResourceLimit, SetHostNameRequest,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostNameKind, HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind,
+    ResourceLimit, SetHostNameRequest, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -94,6 +94,24 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 use core::num::NonZeroU64;
 
 const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
+
+#[test]
+fn create_namespaces_wire_shape_is_pinned() {
+    let request = BrokerRequest {
+        request_id: RequestId(7),
+        operation: BrokerOperation::Process(ProcessRequest::CreateNamespaces(
+            CreateNamespacesRequest {
+                process_id: ProcessId(9),
+                children_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
+                copy_host_names: true,
+            },
+        )),
+    };
+    assert_eq!(
+        encode_request(&request),
+        [1, 7, 0, 0, 0, 0, 0, 0, 0, 10, 22, 9, 0, 0, 0, 1, 1, 0, 1]
+    );
+}
 
 fn process_id(id: u32) -> ProcessId {
     ProcessId(id)
@@ -566,12 +584,21 @@ fn request_codec_round_trips_all_variants() {
             new_pid_namespace: Some(PidNamespaceOptions::new(false, true)),
             sibling: false,
         })),
-        BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
-            PidNamespaceOptions::default()
-        )),
-        BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
-            PidNamespaceOptions::new(true, true)
-        )),
+        BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
+            process_id: process_id(7),
+            children_pid_namespace: Some(PidNamespaceOptions::new(true, true)),
+            copy_host_names: false,
+        })),
+        BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
+            process_id: process_id(u32::MAX),
+            children_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
+            copy_host_names: true,
+        })),
+        BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
+            process_id: process_id(1),
+            children_pid_namespace: None,
+            copy_host_names: true,
+        })),
         BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(
             DuplicateObjectsToChildRequest {
                 child_process_id: process_id(u32::MAX),
@@ -663,7 +690,6 @@ fn request_codec_round_trips_all_variants() {
             kind: HostNameKind::Domain,
             name: sequence(0, 0),
         })),
-        BrokerOperation::Process(ProcessRequest::CopyHostNames(process_id(u32::MAX))),
         BrokerOperation::UnixSocket(UnixSocketRequest::Create(CreateUnixSocketRequest {
             socket_type: SocketType::Stream,
             flags: FileOpenFlags::NONBLOCKING,
@@ -1333,7 +1359,7 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::Process(ProcessResponse::ReportExitStatus),
         BrokerResult::Process(ProcessResponse::SetChildExitRetention),
         BrokerResult::Process(ProcessResponse::SetOrphanAdoption),
-        BrokerResult::Process(ProcessResponse::CreateChildrenPidNamespace),
+        BrokerResult::Process(ProcessResponse::CreateNamespaces),
         BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
             process_id: process_id(u32::MAX),
             exit_status: ProcessExitStatus::Exited { code: u32::MAX },
@@ -1423,7 +1449,6 @@ fn response_codec_round_trips_all_variants() {
             domain: 0
         })),
         BrokerResult::Process(ProcessResponse::SetHostName),
-        BrokerResult::Process(ProcessResponse::CopyHostNames),
         BrokerResult::Error(ErrorCode::PolicyDenied),
         BrokerResult::Error(ErrorCode::WouldBlock),
         BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
@@ -1811,11 +1836,15 @@ fn decode_rejects_malformed_request_frames() {
     }
     let mut invalid_children_pid_namespace = encode_request(&BrokerRequest {
         request_id: TEST_REQUEST_ID,
-        operation: BrokerOperation::Process(ProcessRequest::CreateChildrenPidNamespace(
-            PidNamespaceOptions::default(),
+        operation: BrokerOperation::Process(ProcessRequest::CreateNamespaces(
+            CreateNamespacesRequest {
+                process_id: process_id(1),
+                children_pid_namespace: Some(PidNamespaceOptions::default()),
+                copy_host_names: false,
+            },
         )),
     });
-    invalid_children_pid_namespace[11] = 0b100;
+    invalid_children_pid_namespace[16] = 0b100;
     assert_eq!(
         decode_request(&invalid_children_pid_namespace),
         Err(WireError::InvalidTag)

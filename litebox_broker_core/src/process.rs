@@ -23,8 +23,9 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest,
 };
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
-    ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind, HostNames,
+    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
+    ResourceLimit, ThreadInfo,
 };
 
 use crate::pid_namespace::PerNamespaceIds;
@@ -250,7 +251,7 @@ impl ProcessKey {
 pub struct BrokerProcess {
     pub(crate) core: Arc<BrokerCore>,
     /// The PID namespace this process's later children get their IDs in, if
-    /// not its own (see [`Self::create_children_pid_namespace`]).
+    /// not its own (see [`Self::create_namespaces`]).
     ///
     /// No other lock is taken while this one is held.
     children_namespace: Mutex<Option<Arc<PidNamespace>>>,
@@ -326,7 +327,7 @@ struct ProcessResourceLimits {
 }
 
 /// Host names that processes share until one takes a copy (see
-/// [`BrokerProcess::copy_host_names`]).
+/// [`BrokerProcess::create_namespaces`]).
 ///
 /// No other lock is taken while this one is held.
 pub(crate) struct SharedHostNames(Mutex<HostNames>);
@@ -855,21 +856,53 @@ impl BrokerProcess {
         Ok(child)
     }
 
-    /// Gives the children this process creates later a new PID namespace with
-    /// `options`, nested in this process's.
+    /// Applies a set of namespace changes to this process or its pending
+    /// child `request.process_id`, leaving all the existing namespaces intact
+    /// on failure.
     ///
-    /// Returns `UnsupportedOperation` if this process's children already go
-    /// to another PID namespace, and `ResourceExhausted` if the namespace
-    /// can't be created.
-    pub fn create_children_pid_namespace(&self, options: PidNamespaceOptions) -> Result<()> {
-        let pid_namespace = self.new_nested_pid_namespace(options)?;
-        // Another call may have given the children a namespace since the
-        // check. The guard drops before the unused namespace does.
-        let mut children_namespace = self.children_namespace.lock();
-        if children_namespace.is_some() {
+    /// Returns `UnknownObject` if the target is neither, and
+    /// `UnsupportedOperation` if the request asks for a children's PID
+    /// namespace for a pending child or while this process's children already
+    /// go to another one. Returns `ResourceExhausted` if that namespace can't
+    /// be created.
+    pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<()> {
+        if request.children_pid_namespace.is_some() && request.process_id != self.id() {
             return Err(BrokerError::UnsupportedOperation);
         }
-        *children_namespace = Some(pid_namespace);
+        // Declared before the guards below, so that an unused namespace drops
+        // after them.
+        let mut pid_namespace = request
+            .children_pid_namespace
+            .map(|options| self.new_nested_pid_namespace(options))
+            .transpose()?;
+        let mut state = self.state.lock();
+        if !self.accepts_operations(&state) {
+            return Err(BrokerError::PeerClosed);
+        }
+        let target = if request.process_id == self.id() {
+            self
+        } else {
+            &self.pending_child(&mut state, request.process_id)?.process
+        };
+        // Holding the child's state keeps it pending until the changes are made.
+        let _child_state = (!core::ptr::eq(target, self)).then(|| target.state.lock());
+
+        // The only check left, last since its lock may not nest another. Each
+        // later change locks only its own namespace and cannot fail.
+        if pid_namespace.is_some() {
+            let mut children_namespace = self.children_namespace.lock();
+            if children_namespace.is_some() {
+                return Err(BrokerError::UnsupportedOperation);
+            }
+            *children_namespace = pid_namespace.take();
+        }
+        if request.copy_host_names {
+            let mut shared = target.host_names.lock();
+            let copy = SharedHostNames::new(shared.0.lock().clone());
+            let previous = core::mem::replace(&mut *shared, Arc::new(copy));
+            drop(shared);
+            drop(previous);
+        }
         Ok(())
     }
 
@@ -902,7 +935,7 @@ impl BrokerProcess {
     /// even if it exits before starting its own runner.
     ///
     /// The child gets its IDs in this process's namespace for its children
-    /// (see [`Self::create_children_pid_namespace`]), or, if
+    /// (see [`Self::create_namespaces`]), or, if
     /// `new_pid_namespace` gives options, in a new namespace with those
     /// options nested in this process's, which returns `UnsupportedOperation`
     /// if this process's children already go to another namespace. Its parent
@@ -1367,19 +1400,6 @@ impl BrokerProcess {
                 HostNameKind::Domain => names.domain = name,
             }
         })
-    }
-
-    /// Replaces the host names of this process or of its pending child
-    /// `target` with a copy that no other process shares.
-    ///
-    /// Returns `UnknownObject` if `target` is neither.
-    pub fn copy_host_names(&self, target: ProcessId) -> Result<()> {
-        self.with_host_names_of(target, |shared| {
-            let mut shared = shared.lock();
-            let copy = SharedHostNames::new(shared.0.lock().clone());
-            core::mem::replace(&mut *shared, Arc::new(copy))
-        })
-        .map(drop)
     }
 
     /// Calls `f` with the host names of this process or of its pending child
@@ -3264,8 +3284,8 @@ mod tests {
         FileStatusFlags, FileType, FileUser, SetStatusFlagsRequest, decode_directory_entries,
     };
     use litebox_broker_protocol::process::{
-        ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames, PidNamespaceOptions,
-        ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
+        ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind,
+        HostNames, PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::readiness_queue::{
@@ -4403,6 +4423,58 @@ mod tests {
     }
 
     #[test]
+    fn failed_pid_namespace_reservation_keeps_host_names_shared() {
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .with_limits(BrokerCoreLimits {
+            max_pid_namespaces_per_process: 0,
+            ..BrokerCoreLimits::DEFAULT
+        })
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        root.complete_start().unwrap();
+        let child_id = root.allocate_child_process(None, false).unwrap().process_id;
+        assert_eq!(
+            root.create_namespaces(CreateNamespacesRequest {
+                process_id: root.id(),
+                children_pid_namespace: Some(PidNamespaceOptions::default()),
+                copy_host_names: true,
+            }),
+            Err(BrokerError::ResourceExhausted),
+        );
+        root.set_host_name(root.id(), HostNameKind::Host, host_name(b"still shared"))
+            .unwrap();
+        assert_eq!(
+            root.get_host_names(child_id).unwrap().host,
+            host_name(b"still shared"),
+        );
+        assert!(Arc::ptr_eq(
+            &root.children_namespace(),
+            root.pid_namespace()
+        ));
+        // A children's PID namespace is only for the caller itself.
+        assert_eq!(
+            root.create_namespaces(CreateNamespacesRequest {
+                process_id: child_id,
+                children_pid_namespace: Some(PidNamespaceOptions::default()),
+                copy_host_names: true,
+            }),
+            Err(BrokerError::UnsupportedOperation),
+        );
+        root.set_host_name(root.id(), HostNameKind::Host, host_name(b"shared again"))
+            .unwrap();
+        assert_eq!(
+            root.get_host_names(child_id).unwrap().host,
+            host_name(b"shared again"),
+        );
+    }
+
+    #[test]
     fn host_names_come_from_the_creator() {
         let root_names = HostNames {
             host: host_name(b"root"),
@@ -4431,7 +4503,12 @@ mod tests {
             root.get_host_names(root_id).unwrap().host,
             host_name(b"shared")
         );
-        root.copy_host_names(child_id).unwrap();
+        root.create_namespaces(CreateNamespacesRequest {
+            process_id: child_id,
+            children_pid_namespace: None,
+            copy_host_names: true,
+        })
+        .unwrap();
         root.set_host_name(child_id, HostNameKind::Host, host_name(b"child"))
             .unwrap();
         assert_eq!(

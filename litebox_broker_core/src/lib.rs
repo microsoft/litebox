@@ -461,7 +461,7 @@ impl BrokerCore {
     /// process is in `pid_namespace` and `job`, opens files through `fs`, and
     /// starts with the host names `host_names`, which no other root shares; its
     /// descendants share `job`, `fs` and those host names (until one takes a
-    /// copy, see [`BrokerProcess::copy_host_names`]), and are in
+    /// copy, see [`BrokerProcess::create_namespaces`]), and are in
     /// `pid_namespace` or in namespaces nested in it.
     ///
     /// If `pid_namespace` has no first process yet, this process becomes it

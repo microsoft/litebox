@@ -38,6 +38,19 @@ pub struct ProcessStartupData {
 }
 
 wire_struct! {
+    /// The namespace changes to apply together to the caller or its pending child.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct CreateNamespacesRequest {
+        /// The caller's process ID, or its pending child's ID in the caller's PID namespace.
+        pub process_id: ProcessId,
+        /// Give the caller's future children a new PID namespace. Only valid for the caller itself.
+        pub children_pid_namespace: Option<PidNamespaceOptions>,
+        /// Give the target a private copy of its host names.
+        pub copy_host_names: bool,
+    }
+}
+
+wire_struct! {
     /// How a PID namespace behaves. A namespace that no process created has the
     /// options its host gives it.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

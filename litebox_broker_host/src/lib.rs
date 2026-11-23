@@ -597,9 +597,9 @@ fn handle_process_request<Memory: SharedMemory>(
         }) => process
             .allocate_child_process(new_pid_namespace, sibling)
             .map(ProcessResponse::AllocateChild),
-        ProcessRequest::CreateChildrenPidNamespace(options) => process
-            .create_children_pid_namespace(options)
-            .map(|()| ProcessResponse::CreateChildrenPidNamespace),
+        ProcessRequest::CreateNamespaces(request) => process
+            .create_namespaces(request)
+            .map(|()| ProcessResponse::CreateNamespaces),
         ProcessRequest::DuplicateObjectsToChild(request) => {
             return duplicate_objects_to_child(process, request, shared_buffers, readiness_sink)
                 .map(|()| ProcessResponse::DuplicateObjectsToChild);
@@ -662,9 +662,6 @@ fn handle_process_request<Memory: SharedMemory>(
                 .set_host_name(process_id, kind, name)
                 .map(|()| ProcessResponse::SetHostName)
         }
-        ProcessRequest::CopyHostNames(process_id) => process
-            .copy_host_names(process_id)
-            .map(|()| ProcessResponse::CopyHostNames),
         ProcessRequest::OpenProcessHandle(request) => process
             .open_process_handle(request.process_id, request.flags, readiness_sink)
             .map(ProcessResponse::OpenProcessHandle),

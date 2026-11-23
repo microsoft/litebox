@@ -32,8 +32,8 @@ use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, PidNamespaceOptions, ProcessExitStatus, ResourceKind, ResourceLimit,
-    ThreadInfo,
+    ChildExit, ChildSelector, CreateNamespacesRequest, PidNamespaceOptions, ProcessExitStatus,
+    ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -1057,7 +1057,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if relation.new_host_names {
             self.global
                 .litebox
-                .copy_host_names(child.identity().process_id)?;
+                .create_namespaces(CreateNamespacesRequest {
+                    process_id: child.identity().process_id,
+                    children_pid_namespace: None,
+                    copy_host_names: true,
+                })?;
         }
         Ok(child)
     }
@@ -1123,7 +1127,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
         self.check_admin()?;
-        if flags.contains(CloneFlags::NEWPID) {
+        let new_pid = flags.contains(CloneFlags::NEWPID);
+        let copy_host_names = flags.contains(CloneFlags::NEWUTS);
+        if new_pid {
             // A `vfork` child makes its requests as its parent, whose children this would change.
             if self.vfork.borrow().is_some() {
                 log_unsupported!("unshare(CLONE_NEWPID) in a vfork child");
@@ -1135,30 +1141,31 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if self.thread.process.nr_threads() > 1 {
                 return Err(Errno::EINVAL);
             }
-            self.global
-                .litebox
-                .create_children_pid_namespace(PidNamespaceOptions::INIT)
-                .map_err(|error| match error {
-                    // The namespace limits, like Linux's nesting and count limits.
-                    ProcessError::ResourceExhausted => Errno::ENOSPC,
-                    error => error.into(),
-                })?;
+        }
+        if !new_pid && !copy_host_names {
+            return Ok(0);
+        }
+        // One request, so that a failure leaves every namespace unchanged.
+        match self
+            .global
+            .litebox
+            .create_namespaces(CreateNamespacesRequest {
+                process_id: ProcessId(self.own_pid_for_requests().cast_unsigned()),
+                children_pid_namespace: new_pid.then_some(PidNamespaceOptions::INIT),
+                copy_host_names,
+            }) {
+            Ok(()) => {}
+            // If LiteBox can't change host names, they are fixed, so there is nothing to copy.
+            Err(ProcessError::Unavailable) if !new_pid => return Ok(0),
+            // The namespace limits, like Linux's nesting and count limits.
+            Err(ProcessError::ResourceExhausted) => return Err(Errno::ENOSPC),
+            Err(error) => return Err(error.into()),
+        }
+        if new_pid {
             self.thread
                 .process
                 .pid_namespace_unshared
                 .store(true, Ordering::Relaxed);
-        }
-        // Last, so that a failure above leaves the host names shared. If LiteBox can't change host
-        // names (`ProcessError::Unavailable`), they are fixed, so there is nothing to copy.
-        if flags.contains(CloneFlags::NEWUTS) {
-            match self
-                .global
-                .litebox
-                .copy_host_names(ProcessId(self.own_pid_for_requests().cast_unsigned()))
-            {
-                Ok(()) | Err(ProcessError::Unavailable) => {}
-                Err(error) => return Err(error.into()),
-            }
         }
         Ok(0)
     }
