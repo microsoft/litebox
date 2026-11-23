@@ -3,19 +3,51 @@
 
 //! System V shared memory.
 //!
-//! Supports keyed and private segments, read-only and read-write attaches, address rounding,
-//! and the `IPC_STAT`, `IPC_SET`, and `IPC_RMID` control operations. Huge pages, executable
-//! attaches, and forced address replacement are not supported. Segments are scoped to the
-//! guest IPC namespace; none are published in the host's System V IPC namespace.
+//! Supports keyed and private segments; read-only, read-write and executable attaches; address
+//! rounding and replacement; and the `IPC_STAT`, `IPC_SET`, `IPC_RMID`, `IPC_INFO`, `SHM_INFO`,
+//! `SHM_STAT` and `SHM_STAT_ANY` control operations. `SHM_HUGETLB` is ignored: segments use
+//! ordinary pages. Segments are scoped to the guest IPC namespace; none are published in the
+//! host's System V IPC namespace.
 
 use crate::{ShimPlatform, Task, UserPtrMut};
 use litebox::segment::{PreparedAttach, SegmentError};
 use litebox_broker_protocol::fs::FileUser;
-use litebox_broker_protocol::segment::{GetSegmentRequest, SegmentId, SetSegmentRequest};
-use litebox_common_linux::{
-    IpcPerm, PAGE_SIZE, SHM_DEST, ShmatFlags, ShmctlCmd, ShmgetFlags, ShmidDs, errno::Errno,
-    vmem::SharedObjectMapping,
+use litebox_broker_protocol::segment::{
+    GetSegmentRequest, PrepareSegmentAttachRequest, SegmentId, SegmentInfo, SegmentStatus,
+    SetSegmentRequest,
 };
+use litebox_common_linux::{
+    IpcPerm, PAGE_SIZE, ProtFlags, SHM_DEST, ShmLimits, ShmUsage, ShmatFlags, ShmctlCmd,
+    ShmgetFlags, ShmidDs, errno::Errno, mm::SysvAddress, vmem::SharedObjectMapping,
+};
+
+/// Builds `shmid_ds` from a segment's metadata.
+fn shmid_ds(status: &SegmentStatus) -> ShmidDs {
+    ShmidDs {
+        shm_perm: IpcPerm {
+            key: status.key,
+            uid: status.owner.user.into(),
+            gid: status.owner.group.into(),
+            cuid: status.creator.user.into(),
+            cgid: status.creator.group.into(),
+            mode: u32::from(status.mode) | if status.removed { SHM_DEST } else { 0 },
+            ..IpcPerm::default()
+        },
+        shm_segsz: status.size,
+        shm_atime: status.attach_time.cast_signed(),
+        shm_dtime: status.detach_time.cast_signed(),
+        shm_ctime: status.change_time.cast_signed(),
+        shm_cpid: status.creator_pid.cast_signed(),
+        shm_lpid: status.last_pid.cast_signed(),
+        shm_nattch: status.attachments,
+        ..ShmidDs::default()
+    }
+}
+
+/// Returns what `IPC_INFO` and `SHM_INFO` return: the highest index in use, or zero if none is.
+fn highest_index(info: &SegmentInfo) -> usize {
+    info.highest_slot.map_or(0, |slot| slot as usize)
+}
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Fails with `EINVAL` in a `vfork` child, which has its parent's address space and broker
@@ -37,9 +69,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: ShmgetFlags,
     ) -> Result<usize, Errno> {
         self.einval_in_vfork_child()?;
-        if flags.contains(ShmgetFlags::SHM_HUGETLB) {
-            return Err(Errno::EOPNOTSUPP);
-        }
         let id = self.global.litebox.get_segment(GetSegmentRequest {
             key,
             size: size as u64,
@@ -58,24 +87,39 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<UserPtrMut<u8>, Errno> {
         self.einval_in_vfork_child()?;
         let id = SegmentId(u32::try_from(shmid).map_err(|_| Errno::EINVAL)?);
-        if flags.contains(ShmatFlags::SHM_REMAP) && addr == 0 {
-            return Err(Errno::EINVAL);
-        }
-        // Refuse rather than replacing an unrelated VMA or permitting execution of data pages.
-        if flags.intersects(ShmatFlags::SHM_REMAP | ShmatFlags::SHM_EXEC) {
-            return Err(Errno::EOPNOTSUPP);
-        }
-        let address = match addr {
-            0 => None,
-            addr if addr.is_multiple_of(PAGE_SIZE) => Some(addr),
-            addr if flags.contains(ShmatFlags::SHM_RND) => match addr & !(PAGE_SIZE - 1) {
-                // Linux maps the rounded address 0, below the lowest address it maps.
+        let remap = flags.contains(ShmatFlags::SHM_REMAP);
+        let address = if addr == 0 {
+            if remap {
+                return Err(Errno::EINVAL);
+            }
+            SysvAddress::Any
+        } else {
+            let addr = if addr.is_multiple_of(PAGE_SIZE) {
+                addr
+            } else if flags.contains(ShmatFlags::SHM_RND) {
+                addr & !(PAGE_SIZE - 1)
+            } else {
+                return Err(Errno::EINVAL);
+            };
+            match addr {
+                // Linux refuses to replace from the rounded address 0, and otherwise fails to map
+                // there, below `mmap_min_addr`.
+                0 if remap => return Err(Errno::EINVAL),
                 0 => return Err(Errno::EPERM),
-                rounded => Some(rounded),
-            },
-            _ => return Err(Errno::EINVAL),
+                addr if remap => SysvAddress::Replace(addr),
+                addr => SysvAddress::Free(addr),
+            }
         };
-        let readonly = flags.contains(ShmatFlags::SHM_RDONLY);
+        let writable = !flags.contains(ShmatFlags::SHM_RDONLY);
+        let executable = flags.contains(ShmatFlags::SHM_EXEC);
+        let mut prot = ProtFlags::PROT_READ;
+        prot.set(ProtFlags::PROT_WRITE, writable);
+        prot.set(ProtFlags::PROT_EXEC, executable);
+        let request = PrepareSegmentAttachRequest {
+            id,
+            writable,
+            executable,
+        };
         let PreparedAttach {
             object,
             size,
@@ -83,17 +127,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } = self
             .global
             .litebox
-            .prepare_segment_attach::<_, PAGE_SIZE>(self.global.platform, id, !readonly)
+            .prepare_segment_attach::<_, PAGE_SIZE>(self.global.platform, request)
             .map_err(|error| match error {
                 // `shmat` reports any lack of resources as ENOMEM; ENOSPC is `shmget`'s.
                 SegmentError::NoSpace => Errno::ENOMEM,
                 error => error.into(),
             })?;
         let len = usize::try_from(size).map_err(|_| Errno::ENOMEM)?;
-        // SAFETY: This only creates a guest VMA at a previously unmapped range. Host code does
-        // not borrow from the new VMA: guest pointer access uses fault-aware copies, and VMA
-        // users under the MM lock cannot see it before confirmation. Other views of the backing
-        // object are independent mappings.
+        // SAFETY: This creates a guest VMA at an unmapped range or, with `SHM_REMAP`, replaces
+        // guest VMAs as `MAP_FIXED` does. Host code does not borrow from guest VMAs: guest
+        // pointer access uses fault-aware copies, and VMA users under the MM lock cannot see the
+        // new one before confirmation. Other views of the backing object are independent
+        // mappings.
         //
         // A mapping that fails, or is never confirmed, drops the reservation, which cancels it
         // without recording an attach or detach.
@@ -101,7 +146,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             self.global.mm.attach_sysv(
                 address,
                 len,
-                readonly,
+                prot,
                 SharedObjectMapping {
                     file: object,
                     offset: 0,
@@ -127,7 +172,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         buf: UserPtrMut<ShmidDs>,
     ) -> Result<usize, Errno> {
         self.einval_in_vfork_child()?;
-        let id = SegmentId(u32::try_from(shmid).map_err(|_| Errno::EINVAL)?);
+        // Linux rejects a negative `shmid` even for commands that ignore it.
+        let number = u32::try_from(shmid).map_err(|_| Errno::EINVAL)?;
+        let id = SegmentId(number);
         let litebox = &self.global.litebox;
         match cmd {
             ShmctlCmd::Remove => litebox.remove_segment(id)?,
@@ -144,28 +191,50 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 })?;
             }
             ShmctlCmd::Stat => {
-                let status = litebox.segment_status(id)?;
-                let ds = ShmidDs {
-                    shm_perm: IpcPerm {
-                        key: status.key,
-                        uid: status.owner.user.into(),
-                        gid: status.owner.group.into(),
-                        cuid: status.creator.user.into(),
-                        cgid: status.creator.group.into(),
-                        mode: u32::from(status.mode) | if status.removed { SHM_DEST } else { 0 },
-                        ..IpcPerm::default()
-                    },
-                    shm_segsz: status.size,
-                    shm_atime: status.attach_time.cast_signed(),
-                    shm_dtime: status.detach_time.cast_signed(),
-                    shm_ctime: status.change_time.cast_signed(),
-                    shm_cpid: status.creator_pid.cast_signed(),
-                    shm_lpid: status.last_pid.cast_signed(),
-                    shm_nattch: status.attachments,
-                    ..ShmidDs::default()
-                };
+                let ds = shmid_ds(&litebox.segment_status(id)?);
                 buf.write_at_offset::<Platform>(0, ds)
                     .ok_or(Errno::EFAULT)?;
+            }
+            // Indexes are the broker's slots, which enumerate the namespace's segments as
+            // Linux's IPC indexes do.
+            ShmctlCmd::StatIndex | ShmctlCmd::StatIndexAny => {
+                let found = litebox.segment_slot_status(number, cmd == ShmctlCmd::StatIndex)?;
+                buf.write_at_offset::<Platform>(0, shmid_ds(&found.status))
+                    .ok_or(Errno::EFAULT)?;
+                return Ok(found.id.0 as usize);
+            }
+            ShmctlCmd::Limits => {
+                let info = litebox.segment_info()?;
+                let segments = u64::from(info.max_segments);
+                let limits = ShmLimits {
+                    shmmax: info.max_segment_size,
+                    shmmin: 1,
+                    shmmni: segments,
+                    // Linux bounds a process's attached segments only by `shmmni`.
+                    shmseg: segments,
+                    shmall: info.max_total_bytes / PAGE_SIZE as u64,
+                    ..ShmLimits::default()
+                };
+                buf.cast::<ShmLimits>()
+                    .write_at_offset::<Platform>(0, limits)
+                    .ok_or(Errno::EFAULT)?;
+                return Ok(highest_index(&info));
+            }
+            ShmctlCmd::Usage => {
+                let info = litebox.segment_info()?;
+                let pages = info.bytes / PAGE_SIZE as u64;
+                let usage = ShmUsage {
+                    used_ids: i32::try_from(info.segments).unwrap_or(i32::MAX),
+                    shm_tot: pages,
+                    // The host doesn't report which pages are resident, so count every page,
+                    // which no swap holds.
+                    shm_rss: pages,
+                    ..ShmUsage::default()
+                };
+                buf.cast::<ShmUsage>()
+                    .write_at_offset::<Platform>(0, usage)
+                    .ok_or(Errno::EFAULT)?;
+                return Ok(highest_index(&info));
             }
         }
         Ok(0)

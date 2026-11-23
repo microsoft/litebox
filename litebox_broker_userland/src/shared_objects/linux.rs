@@ -10,7 +10,7 @@ use rustix::fs::MemfdFlags;
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_storage::{
-    HostHandle, SegmentStorageError, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
+    CreateMemoryError, HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
 };
 use litebox_broker_transport_linux_userland::shared_objects::SharedObjectSender;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -111,38 +111,45 @@ fn memfd(name: &core::ffi::CStr, flags: MemfdFlags) -> IoResult<File> {
 }
 
 impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
-    fn create(&self) -> Result<SharedFileMemory, StorageError> {
+    fn create(&self) -> Result<SharedFileMemory, CreateMemoryError> {
         // Ask for execution support where the host otherwise seals memfds against execution.
         // Older kernels and hosts that forbid it leave a plain memfd as the best available.
         let file = memfd(c"litebox-shared-file", MemfdFlags::EXEC)
             .or_else(|_| memfd(c"litebox-shared-file", MemfdFlags::empty()))
-            .map_err(|error| storage_error::<Memfd>(&error))?;
+            .map_err(|error| create_memory_error(&error))?;
         Ok(create::<Memfd>(file))
     }
 
-    fn create_segment(&self, len: usize) -> Result<Arc<dyn SharedFileObject>, SegmentStorageError> {
+    fn create_segment(&self, len: usize) -> Result<Arc<dyn SharedFileObject>, CreateMemoryError> {
         use rustix::fs::{SealFlags, fcntl_add_seals};
         let length = u64::try_from(len)
             .ok()
             .filter(|length| *length <= Memfd::size_limit())
-            .ok_or(SegmentStorageError::NoSpace)?;
-        let file = memfd(c"litebox-segment", MemfdFlags::ALLOW_SEALING)
-            .map_err(|error| segment_storage_error(&error))?;
+            .ok_or(CreateMemoryError::NoSpace)?;
+        // As for files: executable attaches need a memfd the host does not seal against it.
+        let file = memfd(
+            c"litebox-segment",
+            MemfdFlags::ALLOW_SEALING | MemfdFlags::EXEC,
+        )
+        .or_else(|_| memfd(c"litebox-segment", MemfdFlags::ALLOW_SEALING))
+        .map_err(|error| create_memory_error(&error))?;
         file.set_len(length)
-            .map_err(|error| segment_storage_error(&error))?;
+            .map_err(|error| create_memory_error(&error))?;
         fcntl_add_seals(&file, SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)
-            .map_err(|error| segment_storage_error(&error.into()))?;
+            .map_err(|error| create_memory_error(&error.into()))?;
         Ok(export_only_object::<Memfd>(file))
     }
 }
 
-fn segment_storage_error(error: &IoError) -> SegmentStorageError {
+/// Classifies a failure creating memory, telling the host running out of memory or descriptors
+/// apart from the memory being too large.
+fn create_memory_error(error: &IoError) -> CreateMemoryError {
     if litebox_broker_transport_linux_userland::is_resource_exhaustion(error) {
-        return SegmentStorageError::OutOfMemory;
+        return CreateMemoryError::OutOfMemory;
     }
     match error.raw_os_error() {
-        Some(libc::ENOSPC | libc::EFBIG | libc::EDQUOT) => SegmentStorageError::NoSpace,
-        _ => SegmentStorageError::Io,
+        Some(libc::ENOSPC | libc::EFBIG | libc::EDQUOT) => CreateMemoryError::NoSpace,
+        _ => CreateMemoryError::Io,
     }
 }
 

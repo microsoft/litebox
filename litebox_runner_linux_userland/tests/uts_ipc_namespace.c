@@ -144,6 +144,12 @@ static void segment_namespaces_are_separate(void) {
             if (shmctl(parent, IPC_STAT, &ds) != -1 || errno != EINVAL) {
                 _exit(2);
             }
+            // The new namespace's summary and indexes cover only its own segments.
+            struct shm_info usage;
+            if (shmctl(0, SHM_INFO, (struct shmid_ds *)&usage) != 0 || usage.used_ids != 0 ||
+                usage.shm_tot != 0 || shmctl(0, SHM_STAT_ANY, &ds) != -1 || errno != EINVAL) {
+                _exit(6);
+            }
             // The inherited attachment still belongs to the old namespace's segment.
             if (attached[0] != 's' || shmdt(attached) != 0) {
                 _exit(4);

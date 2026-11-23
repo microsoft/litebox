@@ -452,6 +452,7 @@ impl BrokerCore {
         timer_provider: Arc<dyn TimerProvider>,
         segment_memory_provider: Option<Arc<dyn fs::shared_storage::SharedFileMemoryProvider>>,
     ) -> Result<Arc<Self>> {
+        let segments = segment::SegmentService::new(&limits, segment_memory_provider)?;
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
@@ -460,7 +461,7 @@ impl BrokerCore {
             policy,
             limits,
             next_process_key: AtomicU64::new(1),
-            segments: segment::SegmentService::new(&limits, segment_memory_provider),
+            segments,
             next_pid_namespace_id: AtomicU64::new(1),
             pid_namespaces: Arc::new(AtomicUsize::new(0)),
             live_processes: AtomicUsize::new(0),

@@ -99,12 +99,7 @@ fn test_fork_shared_futex_with_windows_broker() {
 #[test]
 fn test_sysv_shared_memory_segments_with_windows_broker() {
     let (broker, runner) = build_windows_broker();
-    run_progs_with_process_duplication(
-        &broker,
-        &runner,
-        &["shared_memory_segment"],
-        &["/bin/shared_memory_segment.hooked"],
-    );
+    run_progs_with_process_duplication(&broker, &runner, &["shared_memory_segment"], &[]);
 }
 
 /// Runs `vfork_exec_parent`, whose child execs `vfork_exec_child` in a new runner.

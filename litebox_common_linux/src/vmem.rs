@@ -1051,7 +1051,10 @@ where
             identity,
             piece: identity,
         });
-        vma.flags.remove(VmFlags::VM_MAYEXEC);
+        // Only an attachment mapped executable may execute, even after `mprotect`.
+        if !vma.flags.contains(VmFlags::VM_EXEC) {
+            vma.flags.remove(VmFlags::VM_MAYEXEC);
+        }
         if readonly {
             vma.flags.remove(VmFlags::VM_MAYWRITE);
         }
@@ -1148,8 +1151,9 @@ where
         first_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
-    /// Maps `mapping` as one new SysV attachment of `segment`, never replacing another
-    /// mapping, and registers it once `confirm` succeeds. If `confirm` fails, unmaps it again.
+    /// Maps `mapping` as one new SysV attachment of `segment`, placed as `placement.flags`
+    /// request, and registers it once `confirm` succeeds. If `confirm` fails, unmaps it again,
+    /// leaving any pages it replaced unmapped.
     ///
     /// # Panics
     ///
@@ -1158,7 +1162,8 @@ where
     /// # Safety
     ///
     /// The caller must keep host users that require the new mapping to stay mapped, including
-    /// Rust borrows, from it until `confirm` succeeds.
+    /// Rust borrows, from it until `confirm` succeeds. For replacement, the caller must ensure
+    /// overlapping mappings are not in use.
     pub(super) unsafe fn attach_sysv<E>(
         &mut self,
         placement: SysvPlacement<ALIGN>,
@@ -1176,12 +1181,7 @@ where
             flags,
             permissions,
         } = placement;
-        debug_assert!(
-            address.is_none()
-                || flags.contains(CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE),
-            "an attachment never replaces a mapping"
-        );
-        // SAFETY: The mapping goes at an exact free range or a hint, so it replaces nothing.
+        // SAFETY: The caller authorizes replacement and excludes users of replaced mappings.
         let ptr = unsafe {
             self.create_shared_object_mapping(address, length, flags, permissions, None, mapping)
         }
@@ -3131,14 +3131,30 @@ mod tests {
         assert!(vm.has_sysv_attachments());
         // The confirmation counted the attachment, so there is no change to publish.
         assert!(vm.take_sysv_changes().is_empty());
-        // An attachment never replaces a mapping.
+        // A no-replace attachment fails over a mapping.
         assert!(matches!(
             attach(&mut vm, Ok(())),
             Err(SysvAttachError::Map(AllocationError::AddressInUse))
         ));
+        // A replacing one counts the attachment it replaced as gone.
+        let replacing = SysvPlacement {
+            flags: CreatePagesFlags::FIXED_ADDR,
+            ..placement()
+        };
+        // SAFETY: The test owns the mock address space, and nothing uses the replaced pages.
+        let replaced = unsafe {
+            vm.attach_sysv(
+                replacing,
+                shared_object_mapping(2, 0, true),
+                SegmentId(8),
+                || Ok::<(), ()>(()),
+            )
+        };
+        assert!(matches!(replaced, Ok(ptr) if ptr.as_usize() == start));
+        assert_eq!(vm.take_sysv_changes(), [(SegmentId(7), 0)].into());
         // SAFETY: The test owns the mock pages.
         unsafe { vm.detach_sysv(start) }.unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(SegmentId(7), 0)].into());
+        assert_eq!(vm.take_sysv_changes(), [(SegmentId(8), 0)].into());
     }
 
     #[test]

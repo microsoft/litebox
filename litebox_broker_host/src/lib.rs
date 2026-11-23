@@ -2081,8 +2081,10 @@ fn handle_segment_request(
             segment::remove(process, id)?.map(|()| SegmentResponse::Remove)
         }
         SegmentRequest::PrepareAttach(request) => {
-            segment::prepare_attach(process, request, |_, _, _| Err(SegmentError::Unavailable))?
-                .map(SegmentResponse::PrepareAttach)
+            segment::prepare_attach(process, request, |_, _, _, _| {
+                Err(SegmentError::Unavailable)
+            })?
+            .map(SegmentResponse::PrepareAttach)
         }
         SegmentRequest::ConfirmAttach(attachment) => {
             segment::confirm_attach(process, attachment)?.map(|()| SegmentResponse::ConfirmAttach)
@@ -2092,6 +2094,10 @@ fn handle_segment_request(
         }
         SegmentRequest::SetAttachments(counts) => {
             segment::set_attachments(process, counts)?.map(|()| SegmentResponse::SetAttachments)
+        }
+        SegmentRequest::Info => segment::info(process)?.map(SegmentResponse::Info),
+        SegmentRequest::SlotStatus(request) => {
+            segment::slot_status(process, request)?.map(SegmentResponse::SlotStatus)
         }
     };
     Ok(response.unwrap_or_else(SegmentResponse::Failed))

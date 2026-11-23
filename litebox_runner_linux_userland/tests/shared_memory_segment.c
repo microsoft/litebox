@@ -69,6 +69,86 @@ static int permissions(void) {
     return 0;
 }
 
+// Checks the IPC_INFO and SHM_INFO summaries, and SHM_STAT's enumeration by index, which `ipcs`
+// uses. Other processes' segments may share the namespace.
+static int listing(void) {
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    int id = shmget(IPC_PRIVATE, 3 * page, 0600);
+    CHECK(id >= 0);
+    struct shminfo limits;
+    int highest = shmctl(0, IPC_INFO, (struct shmid_ds *)&limits);
+    CHECK(highest >= 0 && limits.shmmin == 1 && limits.shmmax >= 3 * page);
+    CHECK(limits.shmmni > 0 && limits.shmall >= 3);
+    struct shm_info usage;
+    CHECK(shmctl(0, SHM_INFO, (struct shmid_ds *)&usage) == highest);
+    CHECK(usage.used_ids >= 1 && usage.shm_tot >= 3);
+    // Indexes up to the highest one name the segments; SHM_STAT returns the segment's ID.
+    struct shmid_ds ds;
+    int index = -1;
+    for (int i = 0; i <= highest && index < 0; i++) {
+        if (shmctl(i, SHM_STAT, &ds) == id) {
+            index = i;
+        }
+    }
+    CHECK(index >= 0 && ds.shm_segsz == 3 * page);
+    CHECK(shmctl(-1, SHM_STAT, &ds) == -1 && errno == EINVAL);
+    // Linux: SHM_STAT needs read permission, unlike SHM_STAT_ANY.
+    ds.shm_perm.mode = 0;
+    CHECK(shmctl(id, IPC_SET, &ds) == 0);
+    CHECK(shmctl(index, SHM_STAT, &ds) == -1 && errno == EACCES);
+    CHECK(shmctl(index, SHM_STAT_ANY, &ds) == id && (ds.shm_perm.mode & 0777) == 0);
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    CHECK(shmctl(index, SHM_STAT_ANY, &ds) == -1 && errno == EINVAL);
+    return 0;
+}
+
+// Checks that SHM_EXEC needs the execute permission bit and maps executable pages, and that
+// SHM_REMAP replaces what the range maps.
+static int exec_and_remap(void) {
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    int id = shmget(IPC_PRIVATE, page, 0600);
+    CHECK(id >= 0);
+    CHECK(shmat(id, NULL, SHM_EXEC) == (void *)-1 && errno == EACCES);
+    struct shmid_ds ds;
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0);
+    ds.shm_perm.mode = 0700;
+    CHECK(shmctl(id, IPC_SET, &ds) == 0);
+    unsigned char *data = shmat(id, NULL, 0);
+    unsigned char *code = shmat(id, NULL, SHM_EXEC | SHM_RDONLY);
+    CHECK(data != (void *)-1 && code != (void *)-1);
+#if defined(__x86_64__)
+    static const unsigned char ret[] = {0xc3};
+#elif defined(__aarch64__)
+    static const unsigned char ret[] = {0xc0, 0x03, 0x5f, 0xd6};
+#else
+#error "unsupported architecture"
+#endif
+    memcpy(data, ret, sizeof(ret));
+    __builtin___clear_cache((char *)code, (char *)code + sizeof(ret));
+    ((void (*)(void))code)();
+
+    unsigned char *area = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(area != MAP_FAILED);
+    area[0] = 'a';
+    area[2 * page] = 'c';
+    CHECK(shmat(id, area + page, 0) == (void *)-1 && errno == EINVAL);
+    CHECK(shmat(id, NULL, SHM_REMAP) == (void *)-1 && errno == EINVAL);
+    CHECK(shmat(id, (void *)1, SHM_RND | SHM_REMAP) == (void *)-1 && errno == EINVAL);
+    CHECK((unsigned char *)shmat(id, area + page, SHM_REMAP) == area + page);
+    CHECK(area[page] == ret[0] && area[0] == 'a' && area[2 * page] == 'c');
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 3);
+    // Replacing an attachment detaches it.
+    CHECK((unsigned char *)shmat(id, data, SHM_REMAP | SHM_RDONLY) == data);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 3);
+    CHECK(shmdt(area + page) == 0 && shmdt(data) == 0 && shmdt(code) == 0);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 0);
+    CHECK(area[0] == 'a' && area[2 * page] == 'c');
+    CHECK(munmap(area, 3 * page) == 0);
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     // Fail rather than hang if a wait never ends.
     alarm(30);
@@ -88,6 +168,8 @@ int main(int argc, char **argv) {
     CHECK(argc == 1 && self[0] == '/');
     CHECK(split_attachment() == 0);
     CHECK(permissions() == 0);
+    CHECK(listing() == 0);
+    CHECK(exec_and_remap() == 0);
     key_t key = getpid();
     int id = shmget(key, 123, IPC_CREAT | IPC_EXCL | 0600);
     CHECK(id >= 0);

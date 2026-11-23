@@ -6,7 +6,8 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::segment::{
     GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentStatus, SetSegmentRequest,
+    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentInfo, SegmentSlotStatus,
+    SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -48,6 +49,25 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         expect_segment_response!(
             self.request_segment(SegmentRequest::Status(id))?,
             SegmentResponse::Status(status) => status
+        )
+    }
+
+    /// Reads the metadata of the segment in a slot of this process's namespace.
+    pub fn segment_slot_status(
+        &self,
+        request: SegmentSlotStatusRequest,
+    ) -> Result<SegmentResult<SegmentSlotStatus>, Channel::Error> {
+        expect_segment_response!(
+            self.request_segment(SegmentRequest::SlotStatus(request))?,
+            SegmentResponse::SlotStatus(found) => found
+        )
+    }
+
+    /// Summarizes this process's namespace and the segment limits that apply to it.
+    pub fn segment_info(&self) -> Result<SegmentResult<SegmentInfo>, Channel::Error> {
+        expect_segment_response!(
+            self.request_segment(SegmentRequest::Info)?,
+            SegmentResponse::Info(info) => info
         )
     }
 

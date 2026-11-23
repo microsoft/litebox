@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Keyed shared-memory segments, independent of file descriptors and paths.
+//! Keyed shared-memory segments.
 
 use crate::LiteBox;
 use crate::broker::error::BrokerControlError;
@@ -14,8 +14,8 @@ use alloc::sync::Arc;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::segment::{
     GetSegmentRequest, PrepareSegmentAttachRequest, SegmentAttachId, SegmentAttachmentCount,
-    SegmentAttachmentCounts, SegmentError as BrokerSegmentError, SegmentId, SegmentStatus,
-    SetSegmentRequest,
+    SegmentAttachmentCounts, SegmentError as BrokerSegmentError, SegmentId, SegmentInfo,
+    SegmentSlotStatus, SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
 };
 use litebox_platform::time::TimeProvider;
 
@@ -145,6 +145,25 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         segment_result(self.segment_broker()?.segment_status(id))
     }
 
+    /// Reads the metadata of the segment in `slot`, a small index that
+    /// enumerates this process's namespace, requiring read permission if
+    /// `require_read` is set.
+    pub fn segment_slot_status(
+        &self,
+        slot: u32,
+        require_read: bool,
+    ) -> Result<SegmentSlotStatus, SegmentError> {
+        segment_result(
+            self.segment_broker()?
+                .segment_slot_status(SegmentSlotStatusRequest { slot, require_read }),
+        )
+    }
+
+    /// Summarizes this process's namespace and the segment limits that apply to it.
+    pub fn segment_info(&self) -> Result<SegmentInfo, SegmentError> {
+        segment_result(self.segment_broker()?.segment_info())
+    }
+
     /// Changes the segment's owner and permission bits.
     pub fn set_segment(&self, request: SetSegmentRequest) -> Result<(), SegmentError> {
         segment_result(self.segment_broker()?.set_segment(request))
@@ -155,18 +174,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         segment_result(self.segment_broker()?.remove_segment(id))
     }
 
-    /// Reserves an attachment of segment `id` and takes its backing object
+    /// Reserves an attachment of `request.id` and takes its backing object
     /// from `platform`.
     pub fn prepare_segment_attach<Provider: SharedObjectProvider<ALIGN>, const ALIGN: usize>(
         &self,
         platform: &Provider,
-        id: SegmentId,
-        writable: bool,
+        request: PrepareSegmentAttachRequest,
     ) -> Result<PreparedAttach<Provider::SharedObject>, SegmentError> {
         let broker = self.segment_broker()?;
-        let prepared = segment_result(
-            broker.prepare_segment_attach(PrepareSegmentAttachRequest { id, writable }),
-        )?;
+        let prepared = segment_result(broker.prepare_segment_attach(request))?;
         let reservation = AttachReservation {
             broker,
             attachment: Some(prepared.attachment),

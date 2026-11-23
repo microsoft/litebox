@@ -35,7 +35,8 @@ use litebox_broker_protocol::readiness_queue::{
 };
 use litebox_broker_protocol::segment::{
     GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentStatus, SetSegmentRequest,
+    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentInfo, SegmentSlotStatus,
+    SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
 };
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
@@ -67,15 +68,21 @@ mod shared_buffer;
 use error::BrokerControlError;
 use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 
-/// The outcome of a segment request: a guest-visible result, or a failure of the request.
 pub(crate) type SegmentControlResult<T> =
     core::result::Result<core::result::Result<T, SegmentError>, BrokerControlError>;
 
-/// Keyed shared segments, through the negotiated broker control channel.
+/// Keyed shared segments.
 pub(crate) trait SegmentControl: Send + Sync {
     fn get_segment(&self, request: GetSegmentRequest) -> SegmentControlResult<SegmentId>;
 
     fn segment_status(&self, id: SegmentId) -> SegmentControlResult<SegmentStatus>;
+
+    fn segment_slot_status(
+        &self,
+        request: SegmentSlotStatusRequest,
+    ) -> SegmentControlResult<SegmentSlotStatus>;
+
+    fn segment_info(&self) -> SegmentControlResult<SegmentInfo>;
 
     fn set_segment(&self, request: SetSegmentRequest) -> SegmentControlResult<()>;
 
@@ -1019,6 +1026,17 @@ where
 
     fn segment_status(&self, id: SegmentId) -> SegmentControlResult<SegmentStatus> {
         self.request(|local| local.segment_status(id))
+    }
+
+    fn segment_slot_status(
+        &self,
+        request: SegmentSlotStatusRequest,
+    ) -> SegmentControlResult<SegmentSlotStatus> {
+        self.request(|local| local.segment_slot_status(request))
+    }
+
+    fn segment_info(&self) -> SegmentControlResult<SegmentInfo> {
+        self.request(BrokerLocal::segment_info)
     }
 
     fn set_segment(&self, request: SetSegmentRequest) -> SegmentControlResult<()> {

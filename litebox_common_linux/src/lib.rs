@@ -112,6 +112,14 @@ pub enum ShmctlCmd {
     Set = 1,
     /// `IPC_STAT`.
     Stat = 2,
+    /// `IPC_INFO`, which reads [`ShmLimits`].
+    Limits = 3,
+    /// `SHM_STAT`, which takes an index rather than a segment ID.
+    StatIndex = 13,
+    /// `SHM_INFO`, which reads [`ShmUsage`].
+    Usage = 14,
+    /// `SHM_STAT_ANY`, `SHM_STAT` without the read permission check.
+    StatIndexAny = 15,
 }
 
 /// Linux `ipc64_perm` on x86-64 and AArch64.
@@ -142,6 +150,31 @@ pub struct ShmidDs {
     pub shm_lpid: i32,
     pub shm_nattch: u64,
     pub reserved: [u64; 2],
+}
+
+/// Linux `shminfo64`, which `shmctl(IPC_INFO)` writes, on x86-64 and AArch64.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub struct ShmLimits {
+    pub shmmax: u64,
+    pub shmmin: u64,
+    pub shmmni: u64,
+    pub shmseg: u64,
+    pub shmall: u64,
+    pub unused: [u64; 4],
+}
+
+/// Linux `shm_info`, which `shmctl(SHM_INFO)` writes, on x86-64 and AArch64.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub struct ShmUsage {
+    pub used_ids: i32,
+    pub pad: [u8; 4],
+    pub shm_tot: u64,
+    pub shm_rss: u64,
+    pub shm_swp: u64,
+    pub swap_attempts: u64,
+    pub swap_successes: u64,
 }
 
 // linux/futex.h

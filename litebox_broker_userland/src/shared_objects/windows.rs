@@ -8,7 +8,7 @@ use std::os::windows::io::{BorrowedHandle, FromRawHandle as _, OwnedHandle};
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_storage::{
-    HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
+    CreateMemoryError, HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
 };
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_broker_transport_windows_userland::shared_objects::SectionSender;
@@ -182,11 +182,11 @@ impl<T: std::os::windows::io::AsHandle + Send> HostHandle for Exported<T> {
 /// Creates memory for files in the host's temporary directory.
 pub struct TempFileMemoryProvider;
 
-fn temp_file() -> Result<File, StorageError> {
+fn temp_file() -> Result<File, CreateMemoryError> {
     let directory = std::env::temp_dir();
     loop {
         let mut nonce = [0u8; 8];
-        getrandom::fill(&mut nonce).map_err(|_| StorageError::Io)?;
+        getrandom::fill(&mut nonce).map_err(|_| CreateMemoryError::Io)?;
         let path = directory.join(format!(
             "litebox-shared-file-{}-{:016x}",
             std::process::id(),
@@ -207,8 +207,34 @@ fn temp_file() -> Result<File, StorageError> {
                 return Ok(file);
             }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(storage_error::<TempFile>(&error)),
+            Err(error) => return Err(create_memory_error(&error)),
         }
+    }
+}
+
+/// Classifies a failure creating memory, telling the host running out of memory or handles
+/// apart from the disk being full.
+fn create_memory_error(error: &IoError) -> CreateMemoryError {
+    use windows_sys::Win32::Foundation::{
+        ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_NO_SYSTEM_RESOURCES,
+        ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
+        ERROR_TOO_MANY_OPEN_FILES,
+    };
+
+    match error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+    {
+        Some(
+            ERROR_NOT_ENOUGH_MEMORY
+            | ERROR_OUTOFMEMORY
+            | ERROR_COMMITMENT_LIMIT
+            | ERROR_NOT_ENOUGH_QUOTA
+            | ERROR_NO_SYSTEM_RESOURCES
+            | ERROR_TOO_MANY_OPEN_FILES,
+        ) => CreateMemoryError::OutOfMemory,
+        Some(ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL) => CreateMemoryError::NoSpace,
+        _ => CreateMemoryError::Io,
     }
 }
 
@@ -242,7 +268,7 @@ fn set_sparse(file: &File) {
 }
 
 impl SharedFileMemoryProvider for TempFileMemoryProvider {
-    fn create(&self) -> Result<SharedFileMemory, StorageError> {
+    fn create(&self) -> Result<SharedFileMemory, CreateMemoryError> {
         Ok(create::<TempFile>(temp_file()?))
     }
 }
@@ -266,9 +292,10 @@ impl SharedObjectDelivery for SectionDelivery {
         &self,
         object: &dyn SharedFileObject,
         writable: bool,
+        executable: bool,
         end: u64,
     ) -> IoResult<u64> {
-        self.deliver_section(object, writable, end, false)
+        self.deliver_section(object, writable, end, executable)
     }
 }
 
@@ -421,13 +448,17 @@ mod tests {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
         #[test]
-        fn segment_sections_are_non_executable() {
+        fn segment_sections_are_executable_only_for_executable_attaches() {
             // SAFETY: The pseudo-handle names this process and is always valid.
             let process = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
             let delivery = SectionDelivery::new(process).unwrap();
             let object = TempFileMemoryProvider.create_segment(4096).unwrap();
-            for writable in [false, true] {
-                let token = delivery.deliver_segment(&*object, writable, 4096).unwrap();
+            for (writable, executable) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let token = delivery
+                    .deliver_segment(&*object, writable, executable, 4096)
+                    .unwrap();
                 // SAFETY: This test exclusively owns the newly delivered handle.
                 let section = unsafe {
                     OwnedHandle::from_raw_handle(usize::try_from(token).unwrap() as HANDLE)
@@ -445,7 +476,7 @@ mod tests {
                 };
                 assert!(maps(FILE_MAP_READ));
                 assert_eq!(maps(FILE_MAP_READ | FILE_MAP_WRITE), writable);
-                assert!(!maps(FILE_MAP_READ | FILE_MAP_EXECUTE));
+                assert_eq!(maps(FILE_MAP_READ | FILE_MAP_EXECUTE), executable);
             }
         }
 

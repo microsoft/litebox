@@ -11,15 +11,17 @@
 //! selects which of its permission bits apply.
 
 use alloc::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Weak},
 };
+use core::ops::Range;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 
 use crate::{
     BrokerCoreLimits, BrokerError, BrokerProcess, SegmentPrincipal,
-    fs::shared_storage::{SegmentStorageError, SharedFileMemoryProvider, SharedFileObject},
+    fs::shared_storage::{CreateMemoryError, SharedFileMemoryProvider, SharedFileObject},
+    id::{IdAllocator, MAX_ALLOCATED_ID},
     object::ObjectRights,
     pid_namespace::PerNamespaceIds,
     quota,
@@ -28,15 +30,17 @@ use litebox_broker_protocol::{
     fs::MapFileResponse,
     segment::{
         GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-        SegmentAttachmentCount, SegmentAttachmentCounts, SegmentError as E, SegmentId,
-        SegmentStatus, SetSegmentRequest,
+        SegmentAttachmentCount, SegmentAttachmentCounts, SegmentError as E, SegmentId, SegmentInfo,
+        SegmentSlotStatus, SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
     },
     shared_futex::SharedMemoryId,
 };
 
 const PAGE_SIZE: u64 = 4096;
 // Guests see IDs as non-negative `int`s.
-const MAX_ID: u32 = i32::MAX.cast_unsigned();
+const _: () = assert!(MAX_ALLOCATED_ID <= i32::MAX.cast_unsigned());
+// Guests also see slots as non-negative `int`s.
+const MAX_SLOTS: u32 = i32::MAX.cast_unsigned();
 
 /// The outcome of a segment operation: its result, or a guest-visible error.
 pub type SegmentResult<T> = core::result::Result<T, E>;
@@ -55,62 +59,52 @@ impl SegmentService {
     pub(crate) fn new(
         limits: &BrokerCoreLimits,
         provider: Option<Arc<dyn SharedFileMemoryProvider>>,
-    ) -> Self {
-        Self {
-            ids: Arc::new(SegmentIds::new(limits.max_segments)),
+    ) -> crate::Result<Self> {
+        Ok(Self {
+            ids: Arc::new(SegmentIds::new(limits.max_segments)?),
             bytes: Arc::new(AtomicU64::new(0)),
             provider,
-        }
+        })
     }
 }
 
 /// Broker-wide segment IDs.
 ///
 /// IDs are unique across namespaces, so an attachment that outlives a
-/// namespace switch still names one segment. Freed IDs are reused, but only
-/// after every other free ID, so churn neither exhausts them nor quickly
-/// recycles a stale one.
+/// namespace switch still names one segment. The ID range is much wider than
+/// the live-segment cap, and freed IDs are reused only after every other free
+/// ID, so churn neither exhausts them nor quickly recycles a stale one.
 struct SegmentIds {
     max: usize,
-    state: Mutex<IdState>,
-}
-
-struct IdState {
-    next: u32,
-    live: BTreeSet<u32>,
-}
-
-const fn id_after(id: u32) -> u32 {
-    if id >= MAX_ID { 1 } else { id + 1 }
+    allocator: Mutex<IdAllocator>,
 }
 
 impl SegmentIds {
     /// Allows up to `max` live segments; zero disables segments.
-    const fn new(max: usize) -> Self {
-        Self {
-            max,
-            state: Mutex::new(IdState {
-                next: 1,
-                live: BTreeSet::new(),
-            }),
-        }
+    fn new(max: usize) -> crate::Result<Self> {
+        Self::with_id_range(max, MAX_ALLOCATED_ID)
     }
 
-    fn reserve(self: &Arc<Self>) -> SegmentResult<IdLease> {
+    /// Allows up to `max` live segments, with IDs in `1..=last_id`.
+    fn with_id_range(max: usize, last_id: u32) -> crate::Result<Self> {
+        Ok(Self {
+            max,
+            allocator: Mutex::new(IdAllocator::new(last_id)?),
+        })
+    }
+
+    fn reserve(self: &Arc<Self>) -> Outcome<IdLease> {
         if self.max == 0 {
-            return Err(E::Unavailable);
+            return Err(E::Unavailable.into());
         }
-        let mut state = self.state.lock();
-        // Below `MAX_ID` live IDs, the search below always finds a free one.
-        if state.live.len() >= self.max || state.live.len() >= MAX_ID as usize {
-            return Err(E::NoSpace);
+        let mut allocator = self.allocator.lock();
+        if allocator.allocated() >= self.max {
+            return Err(E::NoSpace.into());
         }
-        let mut id = state.next;
-        while state.live.contains(&id) {
-            id = id_after(id);
-        }
-        state.next = id_after(id);
-        state.live.insert(id);
+        let id = allocator.allocate().map_err(|error| match error {
+            BrokerError::ResourceExhausted => Failure::Segment(E::NoSpace),
+            error => Failure::Broker(error),
+        })?;
         Ok(IdLease {
             ids: Arc::clone(self),
             id,
@@ -126,7 +120,7 @@ struct IdLease {
 
 impl Drop for IdLease {
     fn drop(&mut self) {
-        self.ids.state.lock().live.remove(&self.id);
+        self.ids.allocator.lock().release(self.id);
     }
 }
 
@@ -182,6 +176,8 @@ struct Segment {
     pending_attaches: u64,
     /// Page-rounded length of `backing`.
     length: u64,
+    /// Where the segment is in its namespace's slots.
+    slot: u32,
     creator: Arc<PerNamespaceIds>,
     last_operator: Option<Arc<PerNamespaceIds>>,
     memory: SharedMemoryId,
@@ -206,7 +202,7 @@ impl Segment {
     }
 
     /// Fails with `AccessDenied` unless the permission bits grant
-    /// `principal` the `required` read (4) and write (2) bits.
+    /// `principal` the `required` read (4), write (2) and execute (1) bits.
     fn require_access(&self, principal: SegmentPrincipal, required: u16) -> SegmentResult<()> {
         let s = &self.status;
         let user = principal.user;
@@ -251,6 +247,33 @@ type Namespace = Mutex<Registry>;
 struct Registry {
     segments: BTreeMap<SegmentId, Entry>,
     keys: BTreeMap<i32, SegmentId>,
+    /// Small indexes that enumerate the segments, unlike their broker-wide IDs.
+    slots: BTreeMap<u32, SegmentId>,
+    /// Where the search for a free slot starts.
+    next_slot: u32,
+}
+
+impl Registry {
+    /// Takes the first free slot from `next_slot` on, wrapping around within
+    /// `0..count`, so that a freed slot is reused only after the others.
+    fn take_slot(&mut self, count: u32) -> Option<u32> {
+        let slots = &self.slots;
+        let free = |mut range: Range<u32>| range.find(|slot| !slots.contains_key(slot));
+        let start = if self.next_slot < count {
+            self.next_slot
+        } else {
+            0
+        };
+        let slot = free(start..count).or_else(|| free(0..start))?;
+        self.next_slot = slot + 1;
+        Some(slot)
+    }
+
+    /// Frees segment `id`, which occupies `slot`.
+    fn remove(&mut self, id: SegmentId, slot: u32) {
+        self.segments.remove(&id);
+        self.slots.remove(&slot);
+    }
 }
 
 #[derive(Clone)]
@@ -269,7 +292,7 @@ impl SegmentRef {
         if entry.ready_to_free()
             && let Some(registry) = &mut registry
         {
-            registry.segments.remove(&self.id);
+            registry.remove(self.id, entry.slot);
         }
     }
 
@@ -392,6 +415,21 @@ pub fn status(
     finish(Caller::new(process).and_then(|caller| caller.status(id)))
 }
 
+/// Reads the metadata of the segment in a slot of `process`'s namespace, with
+/// process IDs as `process` sees them.
+pub fn slot_status(
+    process: &BrokerProcess,
+    request: SegmentSlotStatusRequest,
+) -> crate::Result<SegmentResult<SegmentSlotStatus>> {
+    finish(Caller::new(process).and_then(|caller| caller.slot_status(request)))
+}
+
+/// Summarizes `process`'s namespace and the segment limits that apply to it:
+/// the tighter of the broker's and its job's.
+pub fn info(process: &BrokerProcess) -> crate::Result<SegmentResult<SegmentInfo>> {
+    finish(Caller::new(process).and_then(|caller| caller.info()))
+}
+
 /// Changes a segment's owner and permission bits.
 pub fn set(
     process: &BrokerProcess,
@@ -408,14 +446,15 @@ pub fn remove(process: &BrokerProcess, id: SegmentId) -> crate::Result<SegmentRe
 
 /// Reserves an attachment and lends `process` the segment's backing object.
 ///
-/// `deliver(object, writable, length)` lends the object to this association
-/// only, attenuated to `writable`, and returns its delivery token. It runs
+/// `deliver(object, writable, executable, length)` lends the object to this
+/// association only, attenuated to `writable` and `executable`, and returns its
+/// delivery token. It runs
 /// without broker locks held. The reservation becomes an attachment only when
 /// the process confirms it ([`confirm_attach`]).
 pub fn prepare_attach(
     process: &BrokerProcess,
     request: PrepareSegmentAttachRequest,
-    deliver: impl FnOnce(&dyn SharedFileObject, bool, u64) -> SegmentResult<u64>,
+    deliver: impl FnOnce(&dyn SharedFileObject, bool, bool, u64) -> SegmentResult<u64>,
 ) -> crate::Result<SegmentResult<PreparedSegmentAttach>> {
     finish(Caller::new(process).and_then(|caller| caller.prepare_attach(request, deliver)))
 }
@@ -603,10 +642,10 @@ impl<'a> Caller<'a> {
         let backing = provider
             .create_segment(usize::try_from(length).map_err(|_| E::InvalidArgument)?)
             .map_err(|error| match error {
-                SegmentStorageError::NoSpace => Failure::Segment(E::NoSpace),
-                SegmentStorageError::OutOfMemory => Failure::Broker(BrokerError::OutOfMemory),
-                SegmentStorageError::Io => Failure::Segment(E::Io),
-                SegmentStorageError::Unsupported => Failure::Segment(E::Unavailable),
+                CreateMemoryError::NoSpace => Failure::Segment(E::NoSpace),
+                CreateMemoryError::OutOfMemory => Failure::Broker(BrokerError::OutOfMemory),
+                CreateMemoryError::Io => Failure::Segment(E::Io),
+                CreateMemoryError::Unsupported => Failure::Segment(E::Unavailable),
             })?;
         let memory = crate::shared_futex::issue_shared_memory_id(self.process)?;
         let mut registry = namespace.lock();
@@ -617,7 +656,16 @@ impl<'a> Caller<'a> {
             return found;
         }
         let number = SegmentId(id.id);
+        // Live segments never outnumber the slots, which `max_segments` IDs bound.
+        let slot = registry
+            .take_slot(
+                u32::try_from(limits.max_segments)
+                    .unwrap_or(MAX_SLOTS)
+                    .min(MAX_SLOTS),
+            )
+            .ok_or(E::NoSpace)?;
         let now = self.now();
+        registry.slots.insert(slot, number);
         registry.segments.insert(
             number,
             Arc::new(Mutex::new(Segment {
@@ -637,6 +685,7 @@ impl<'a> Caller<'a> {
                 },
                 pending_attaches: 0,
                 length,
+                slot,
                 creator: Arc::clone(&self.process.ids),
                 last_operator: None,
                 memory,
@@ -652,8 +701,54 @@ impl<'a> Caller<'a> {
     }
 
     fn status(&self, id: SegmentId) -> Outcome<SegmentStatus> {
-        with_segment(&*self.namespace()?, id, |_, s| {
-            s.require_access(self.principal, 0o4)?;
+        self.status_in(&*self.namespace()?, id, true)
+    }
+
+    fn slot_status(&self, request: SegmentSlotStatusRequest) -> Outcome<SegmentSlotStatus> {
+        let namespace = self.namespace()?;
+        let id = *namespace
+            .lock()
+            .slots
+            .get(&request.slot)
+            .ok_or(E::InvalidArgument)?;
+        let status = self.status_in(&namespace, id, request.require_read)?;
+        Ok(SegmentSlotStatus { id, status })
+    }
+
+    fn info(&self) -> Outcome<SegmentInfo> {
+        let namespace = self.namespace()?;
+        let registry = namespace.lock();
+        let bytes = registry
+            .segments
+            .values()
+            .map(|entry| entry.lock().length)
+            .fold(0, u64::saturating_add);
+        let limits = self.process.core.limits;
+        Ok(SegmentInfo {
+            segments: u32::try_from(registry.segments.len()).unwrap_or(u32::MAX),
+            bytes,
+            highest_slot: registry.slots.last_key_value().map(|(&slot, _)| slot),
+            max_segment_size: limits.max_segment_size,
+            max_segments: u32::try_from(limits.max_segments.min(limits.max_segments_per_job))
+                .unwrap_or(u32::MAX),
+            max_total_bytes: limits
+                .max_total_segment_bytes
+                .min(limits.max_segment_bytes_per_job),
+        })
+    }
+
+    /// Reads segment `id`'s metadata in `namespace`, with process IDs as the
+    /// caller sees them, requiring read permission if `require_read` is set.
+    fn status_in(
+        &self,
+        namespace: &Namespace,
+        id: SegmentId,
+        require_read: bool,
+    ) -> Outcome<SegmentStatus> {
+        with_segment(namespace, id, |_, s| {
+            if require_read {
+                s.require_access(self.principal, 0o4)?;
+            }
             let namespace = self.process.pid_namespace();
             let mut status = s.status;
             status.creator_pid = s.creator.id_in_namespace(namespace).unwrap_or_default();
@@ -690,7 +785,7 @@ impl<'a> Caller<'a> {
         s.status.removed = true;
         s.status.key = 0;
         if s.ready_to_free() {
-            registry.segments.remove(&id);
+            registry.remove(id, s.slot);
         }
         Ok(())
     }
@@ -698,9 +793,13 @@ impl<'a> Caller<'a> {
     fn prepare_attach(
         &self,
         request: PrepareSegmentAttachRequest,
-        deliver: impl FnOnce(&dyn SharedFileObject, bool, u64) -> SegmentResult<u64>,
+        deliver: impl FnOnce(&dyn SharedFileObject, bool, bool, u64) -> SegmentResult<u64>,
     ) -> Outcome<PreparedSegmentAttach> {
-        let PrepareSegmentAttachRequest { id, writable } = request;
+        let PrepareSegmentAttachRequest {
+            id,
+            writable,
+            executable,
+        } = request;
         let max_pending = self.process.core.limits.max_threads_per_process;
         let (namespace, attachment) = {
             let mut local = self.segments()?;
@@ -717,7 +816,8 @@ impl<'a> Caller<'a> {
                 if writable {
                     self.require_write()?;
                 }
-                s.require_access(self.principal, if writable { 0o6 } else { 0o4 })?;
+                let required = 0o4 | u16::from(writable) << 1 | u16::from(executable);
+                s.require_access(self.principal, required)?;
                 s.check_room(1)?;
                 s.pending_attaches += 1;
                 let reservation = SegmentRef {
@@ -735,7 +835,7 @@ impl<'a> Caller<'a> {
             })?;
         // Without broker locks: delivery calls into the host. The reservation
         // keeps the segment alive meanwhile.
-        let token = match deliver(&*backing, writable, length) {
+        let token = match deliver(&*backing, writable, executable, length) {
             Ok(token) => token,
             Err(error) => {
                 reservation.cancel();
@@ -841,7 +941,7 @@ mod tests {
     use crate::{
         CallerCredential, PolicyEngine,
         fs::{
-            errors::{MapSharedError, StorageError},
+            errors::MapSharedError,
             shared_storage::{HostHandle, SharedFileMemory},
             storage::MemoryStorage,
         },
@@ -868,7 +968,7 @@ mod tests {
         }
     }
     impl SharedFileMemoryProvider for Provider {
-        fn create(&self) -> Result<SharedFileMemory, StorageError> {
+        fn create(&self) -> Result<SharedFileMemory, CreateMemoryError> {
             Ok(SharedFileMemory {
                 storage: Box::new(MemoryStorage::new(alloc::borrow::Cow::default())),
                 object: Arc::new(Provider),
@@ -951,12 +1051,12 @@ mod tests {
         writable: bool,
         token: SegmentResult<u64>,
     ) -> SegmentResult<PreparedSegmentAttach> {
-        prepare_attach(
-            p,
-            PrepareSegmentAttachRequest { id, writable },
-            |_, _, _| token,
-        )
-        .unwrap()
+        let request = PrepareSegmentAttachRequest {
+            id,
+            writable,
+            executable: false,
+        };
+        prepare_attach(p, request, |_, _, _, _| token).unwrap()
     }
     fn prepare(p: &BrokerProcess, id: SegmentId, writable: bool) -> PreparedSegmentAttach {
         prepare_with(p, id, writable, Ok(871)).unwrap()
@@ -1092,10 +1192,91 @@ mod tests {
             .unwrap(),
             Err(E::AccessDenied)
         );
+        // Executable attaches need the execute bit, which is delivered with them.
+        let prepare_executable = || {
+            let request = PrepareSegmentAttachRequest {
+                id,
+                writable: false,
+                executable: true,
+            };
+            let mut delivered = None;
+            let prepared = prepare_attach(&p, request, |_, writable, executable, _| {
+                delivered = Some((writable, executable));
+                Ok(1)
+            });
+            (prepared.unwrap().map(drop), delivered)
+        };
+        assert_eq!(prepare_executable(), (Err(E::AccessDenied), None));
+        assert_eq!(set_to(user, 0o500), Ok(()));
+        assert_eq!(prepare_executable(), (Ok(()), Some((false, true))));
         assert_eq!(set_to(user, 0), Ok(()));
         assert_eq!(status(&p, id).unwrap(), Err(E::AccessDenied));
+        let at_slot = |require_read| {
+            slot_status(
+                &p,
+                SegmentSlotStatusRequest {
+                    slot: 0,
+                    require_read,
+                },
+            )
+            .unwrap()
+            .map(|found| found.id)
+        };
+        assert_eq!(at_slot(true), Err(E::AccessDenied));
+        assert_eq!(at_slot(false), Ok(id));
         remove(&p, id).unwrap().unwrap();
         assert_eq!(set_count(&p, id, 0), Ok(()));
+    }
+
+    #[test]
+    fn slots_enumerate_a_namespace_and_are_reused_after_the_others() {
+        let limits = BrokerCoreLimits {
+            max_segments: 3,
+            ..BrokerCoreLimits::DEFAULT
+        };
+        let Setup { root: p, .. } = setup_with(ROOT, limits);
+        let info_of = |p: &BrokerProcess| info(p).unwrap().unwrap();
+        let at_slot = |p: &BrokerProcess, slot| {
+            slot_status(
+                p,
+                SegmentSlotStatusRequest {
+                    slot,
+                    require_read: true,
+                },
+            )
+            .unwrap()
+            .map(|found| (found.id, found.status.size))
+        };
+        let empty = info_of(&p);
+        assert_eq!(
+            (empty.segments, empty.bytes, empty.highest_slot),
+            (0, 0, None)
+        );
+        assert_eq!(empty.max_segments, 3);
+        let first = create(&p, 0);
+        let second = create(&p, 0);
+        let info = info_of(&p);
+        assert_eq!((info.segments, info.bytes), (2, 2 * PAGE_SIZE));
+        assert_eq!(info.highest_slot, Some(1));
+        assert_eq!(at_slot(&p, 0), Ok((first, 123)));
+        assert_eq!(at_slot(&p, 1), Ok((second, 123)));
+        assert_eq!(at_slot(&p, 2), Err(E::InvalidArgument));
+        // A removed segment keeps its slot while attached.
+        attach(&p, first, true);
+        remove(&p, first).unwrap().unwrap();
+        assert_eq!(at_slot(&p, 0).map(|(id, _)| id), Ok(first));
+        assert_eq!(set_count(&p, first, 0), Ok(()));
+        assert_eq!(at_slot(&p, 0), Err(E::InvalidArgument));
+        // Linux: a freed slot is reused only after the others (`idr_alloc_cyclic`).
+        let third = create(&p, 0);
+        assert_eq!(at_slot(&p, 2).map(|(id, _)| id), Ok(third));
+        let fourth = create(&p, 0);
+        assert_eq!(at_slot(&p, 0).map(|(id, _)| id), Ok(fourth));
+        assert_eq!(info_of(&p).highest_slot, Some(2));
+        // Another namespace has slots of its own.
+        new_namespace(&p, p.id()).unwrap();
+        assert_eq!(info_of(&p).highest_slot, None);
+        assert_eq!(at_slot(&p, 0), Err(E::InvalidArgument));
     }
 
     #[test]
@@ -1316,32 +1497,32 @@ mod tests {
 
     #[test]
     fn segment_storage_errors_preserve_classification() {
-        struct FailingProvider(Mutex<SegmentStorageError>);
+        struct FailingProvider(Mutex<CreateMemoryError>);
         impl SharedFileMemoryProvider for FailingProvider {
-            fn create(&self) -> Result<SharedFileMemory, StorageError> {
+            fn create(&self) -> Result<SharedFileMemory, CreateMemoryError> {
                 unreachable!("segment creation uses the fixed-length provider method")
             }
 
             fn create_segment(
                 &self,
                 _: usize,
-            ) -> Result<Arc<dyn SharedFileObject>, SegmentStorageError> {
+            ) -> Result<Arc<dyn SharedFileObject>, CreateMemoryError> {
                 Err(*self.0.lock())
             }
         }
 
-        let provider = Arc::new(FailingProvider(Mutex::new(SegmentStorageError::Io)));
+        let provider = Arc::new(FailingProvider(Mutex::new(CreateMemoryError::Io)));
         let Setup {
             broker, root: p, ..
         } = setup_with_provider(ROOT, BrokerCoreLimits::DEFAULT, provider.clone());
         for (error, expected) in [
-            (SegmentStorageError::NoSpace, Ok(Err(E::NoSpace))),
+            (CreateMemoryError::NoSpace, Ok(Err(E::NoSpace))),
             (
-                SegmentStorageError::OutOfMemory,
+                CreateMemoryError::OutOfMemory,
                 Err(BrokerError::OutOfMemory),
             ),
-            (SegmentStorageError::Io, Ok(Err(E::Io))),
-            (SegmentStorageError::Unsupported, Ok(Err(E::Unavailable))),
+            (CreateMemoryError::Io, Ok(Err(E::Io))),
+            (CreateMemoryError::Unsupported, Ok(Err(E::Unavailable))),
         ] {
             *provider.0.lock() = error;
             assert_eq!(get(&p, request(81, 123, true, true)), expected);
@@ -1350,27 +1531,27 @@ mod tests {
         // Failed creations released their IDs and budgets.
         assert_eq!(broker.job.segments.load(Ordering::Relaxed), 0);
         assert_eq!(broker.core.segments.bytes.load(Ordering::Relaxed), 0);
-        assert!(broker.core.segments.ids.state.lock().live.is_empty());
+        assert_eq!(broker.core.segments.ids.allocator.lock().allocated(), 0);
     }
 
     #[test]
     fn segment_ids_are_bounded_and_reused_after_wrapping() {
-        assert_eq!(
-            Arc::new(SegmentIds::new(0)).reserve().err(),
-            Some(E::Unavailable)
-        );
-        let ids = Arc::new(SegmentIds::new(2));
-        let first = ids.reserve().unwrap();
-        let second = ids.reserve().unwrap();
+        assert!(matches!(
+            Arc::new(SegmentIds::new(0).unwrap()).reserve(),
+            Err(Failure::Segment(E::Unavailable))
+        ));
+        // Two live segments, with IDs 1 to 3.
+        let ids = Arc::new(SegmentIds::with_id_range(2, 3).unwrap());
+        let first = ids.reserve().ok().unwrap();
+        let second = ids.reserve().ok().unwrap();
         assert_eq!((first.id, second.id), (1, 2));
-        assert_eq!(ids.reserve().err(), Some(E::NoSpace));
+        assert!(matches!(ids.reserve(), Err(Failure::Segment(E::NoSpace))));
         drop(first);
         // A freed ID waits until the others have been used, then wraps around.
-        ids.state.lock().next = MAX_ID;
-        let last = ids.reserve().unwrap();
-        assert_eq!(last.id, MAX_ID);
+        let last = ids.reserve().ok().unwrap();
+        assert_eq!(last.id, 3);
         drop(last);
-        assert_eq!(ids.reserve().unwrap().id, 1);
+        assert_eq!(ids.reserve().ok().unwrap().id, 1);
         assert_eq!(second.id, 2);
     }
 }

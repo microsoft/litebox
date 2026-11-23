@@ -53,8 +53,8 @@ use crate::readiness_queue::{
 };
 use crate::segment::{
     GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-    SegmentAttachmentCount, SegmentAttachmentCounts, SegmentError, SegmentId, SegmentStatus,
-    SetSegmentRequest,
+    SegmentAttachmentCount, SegmentAttachmentCounts, SegmentError, SegmentId, SegmentInfo,
+    SegmentSlotStatus, SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
 };
 use crate::shared_buffer::{
     MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
@@ -217,7 +217,13 @@ fn request_codec_round_trips_all_variants() {
         BrokerOperation::Segment(SegmentRequest::Remove(SegmentId(63))),
         BrokerOperation::Segment(SegmentRequest::PrepareAttach(PrepareSegmentAttachRequest {
             id: SegmentId(12),
-            writable: true
+            writable: true,
+            executable: true
+        })),
+        BrokerOperation::Segment(SegmentRequest::Info),
+        BrokerOperation::Segment(SegmentRequest::SlotStatus(SegmentSlotStatusRequest {
+            slot: u32::MAX,
+            require_read: true
         })),
         BrokerOperation::Segment(SegmentRequest::ConfirmAttach(SegmentAttachId(u64::MAX))),
         BrokerOperation::Segment(SegmentRequest::CancelAttach(SegmentAttachId(17))),
@@ -1147,6 +1153,39 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::Segment(SegmentResponse::SetAttachments),
         BrokerResult::Segment(SegmentResponse::Failed(SegmentError::NotOwner)),
         BrokerResult::Segment(SegmentResponse::Failed(SegmentError::Io)),
+        BrokerResult::Segment(SegmentResponse::Info(SegmentInfo {
+            segments: 3,
+            bytes: 12288,
+            highest_slot: Some(7),
+            max_segment_size: u64::MAX,
+            max_segments: 256,
+            max_total_bytes: 1 << 30,
+        })),
+        BrokerResult::Segment(SegmentResponse::Info(SegmentInfo {
+            segments: 0,
+            bytes: 0,
+            highest_slot: None,
+            max_segment_size: 1,
+            max_segments: 1,
+            max_total_bytes: 0,
+        })),
+        BrokerResult::Segment(SegmentResponse::SlotStatus(SegmentSlotStatus {
+            id: SegmentId(19),
+            status: SegmentStatus {
+                key: 0,
+                size: 1,
+                creator: FileUser::ROOT,
+                owner: FileUser::ROOT,
+                mode: 0o700,
+                creator_pid: 0,
+                last_pid: 0,
+                attachments: 0,
+                change_time: 0,
+                attach_time: 0,
+                detach_time: 0,
+                removed: false,
+            },
+        })),
         BrokerResult::Thread(ThreadResponse::Create(thread_id(17))),
         BrokerResult::Thread(ThreadResponse::Exit),
         BrokerResult::ObjectClosed,

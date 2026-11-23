@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Shared broker process and thread ID allocation.
+//! Shared broker ID allocation for processes, threads and shared segments.
 
 use hashbrown::HashMap;
 
@@ -81,6 +81,11 @@ impl IdAllocator {
         if *users == 0 {
             self.occupied.remove(&id);
         }
+    }
+
+    /// Returns how many IDs are allocated.
+    pub(crate) fn allocated(&self) -> usize {
+        self.occupied.len()
     }
 
     /// Returns whether `id` has a user.

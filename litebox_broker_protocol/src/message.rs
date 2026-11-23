@@ -39,7 +39,8 @@ use crate::readiness_queue::{
 };
 use crate::segment::{
     GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentStatus, SetSegmentRequest,
+    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentInfo, SegmentSlotStatus,
+    SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
 };
 use crate::shared_buffer::SharedBufferSequence;
 use crate::shared_futex::{
@@ -420,6 +421,10 @@ wire_enum! {
         /// Replace the caller's attachment counts after splitting or releasing
         /// mapped regions.
         SetAttachments(SegmentAttachmentCounts),
+        /// Summarize the caller's namespace and the limits that apply to it.
+        Info,
+        /// Read the metadata of the segment in a slot.
+        SlotStatus(SegmentSlotStatusRequest),
     }
 }
 
@@ -829,6 +834,10 @@ wire_enum! {
         SetAttachments,
         /// Segment operation failed with a guest-visible error.
         Failed(SegmentError),
+        /// The namespace summary and limits.
+        Info(SegmentInfo),
+        /// The segment in the slot, and its metadata.
+        SlotStatus(SegmentSlotStatus),
     }
 }
 

@@ -53,6 +53,17 @@ impl MmapPlacement {
 }
 
 /// A page manager to support `mmap`, `munmap`, and etc.
+/// Where [`VmemManager::attach_sysv`] places a SysV attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SysvAddress {
+    /// Any free range.
+    Any,
+    /// Exactly this address, which must be free.
+    Free(usize),
+    /// Exactly this address, replacing whatever maps it.
+    Replace(usize),
+}
+
 pub struct VmemManager<Platform, const ALIGN: usize>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
@@ -1144,10 +1155,10 @@ where
         })
     }
 
-    /// Maps one broker-authorized SysV attachment, `len` bytes rounded up to pages, at exactly
-    /// `addr` if it is `Some` and free, and registers it once `confirm` succeeds. `confirm`
-    /// runs under the mapping write lock and must not reenter this manager. A failed
-    /// confirmation unmaps the attachment again.
+    /// Maps one broker-authorized SysV attachment, `len` bytes rounded up to pages, with `prot`,
+    /// placed at `address`, and registers it once `confirm` succeeds. `confirm` runs under the
+    /// mapping write lock and must not reenter this manager. A failed confirmation unmaps the
+    /// attachment again, leaving any pages it replaced unmapped.
     ///
     /// # Panics
     ///
@@ -1156,12 +1167,13 @@ where
     /// # Safety
     ///
     /// The caller must keep host users that require the new mapping to stay mapped, including
-    /// Rust borrows, from it until confirmation succeeds.
+    /// Rust borrows, from it until confirmation succeeds. With [`SysvAddress::Replace`], the
+    /// caller must ensure the replaced mappings are not in use, as for `MAP_FIXED`.
     pub unsafe fn attach_sysv(
         &self,
-        addr: Option<usize>,
+        address: SysvAddress,
         len: usize,
-        readonly: bool,
+        prot: ProtFlags,
         mapping: SharedObjectMapping<
             litebox::platform::page_mgmt::SharedObjectOf<Platform, PAGE_SIZE>,
         >,
@@ -1177,21 +1189,22 @@ where
         let len = len
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::EINVAL)?;
-        let prot = if readonly {
-            ProtFlags::PROT_READ
-        } else {
-            ProtFlags::PROT_READ_WRITE
+        let (addr, flags) = match address {
+            SysvAddress::Any => (None, MapFlags::MAP_SHARED),
+            SysvAddress::Free(addr) => (
+                Some(addr),
+                MapFlags::MAP_SHARED | MapFlags::MAP_FIXED_NOREPLACE,
+            ),
+            SysvAddress::Replace(addr) => (Some(addr), MapFlags::MAP_SHARED | MapFlags::MAP_FIXED),
         };
-        let mut flags = MapFlags::MAP_SHARED;
-        flags.set(MapFlags::MAP_FIXED_NOREPLACE, addr.is_some());
-        let (flags, address, length, permissions) =
+        let (flags, address_arg, length, permissions) =
             Self::mmap_arguments(addr, len, prot, flags, &MmapPlacement::GUEST)?;
         let mut vmem = self.lock_for_update();
         if vmem.sysv_publish.is_none() {
             return Err(Errno::ENOSYS);
         }
         let placement = SysvPlacement {
-            address,
+            address: address_arg,
             length,
             flags,
             permissions,
@@ -1202,7 +1215,7 @@ where
             .map_err(|error| match error {
                 SysvAttachError::Map(
                     AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform,
-                ) if addr.is_some() => Errno::EINVAL,
+                ) if matches!(address, SysvAddress::Free(_)) => Errno::EINVAL,
                 SysvAttachError::Map(AllocationError::UnsupportedByPlatform) => Errno::ENOSYS,
                 SysvAttachError::Map(error) => error.into(),
                 SysvAttachError::Confirm(error) => error,

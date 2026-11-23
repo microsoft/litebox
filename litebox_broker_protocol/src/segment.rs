@@ -108,6 +108,47 @@ wire_struct! {
 }
 
 wire_struct! {
+    /// The caller's namespace and the segment limits that apply to the caller.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SegmentInfo {
+        /// Live segments in the namespace, including removed ones still attached.
+        pub segments: u32,
+        /// Page-rounded bytes of those segments.
+        pub bytes: u64,
+        /// The namespace's highest occupied slot, if any segment lives in it.
+        pub highest_slot: Option<u32>,
+        /// Largest byte length of one segment.
+        pub max_segment_size: u64,
+        /// How many segments may exist at once.
+        pub max_segments: u32,
+        /// Largest total of page-rounded bytes of segments.
+        pub max_total_bytes: u64,
+    }
+}
+
+wire_struct! {
+    /// Reads the metadata of the segment in a slot of the caller's namespace.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SegmentSlotStatusRequest {
+        /// The slot, a small index that enumerates the namespace's segments.
+        pub slot: u32,
+        /// Require read permission, as reading by ID does.
+        pub require_read: bool,
+    }
+}
+
+wire_struct! {
+    /// The segment in a slot, and its metadata.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SegmentSlotStatus {
+        /// The segment.
+        pub id: SegmentId,
+        /// Its metadata.
+        pub status: SegmentStatus,
+    }
+}
+
+wire_struct! {
     /// Reserves an attachment and delivers the segment's backing object.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct PrepareSegmentAttachRequest {
@@ -115,6 +156,8 @@ wire_struct! {
         pub id: SegmentId,
         /// Whether the attachment may write.
         pub writable: bool,
+        /// Whether the attachment may execute.
+        pub executable: bool,
     }
 }
 

@@ -30,13 +30,14 @@ pub trait SharedObjectDelivery: Send + Sync {
     fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64>;
 
     /// Delivers the backing object of a keyed shared segment, as [`Self::deliver`] does a
-    /// file's. Segments are never executable: a deployment whose handles can carry that ceiling
-    /// withholds the right to map them executable, and the runner's memory manager refuses to
-    /// map them executable in any case.
+    /// file's, for an attach that may execute it if `_executable` is set. A deployment whose
+    /// handles can carry that ceiling withholds the right to map the segment executable from
+    /// other attaches.
     fn deliver_segment(
         &self,
         object: &dyn SharedFileObject,
         writable: bool,
+        _executable: bool,
         end: u64,
     ) -> IoResult<u64> {
         self.deliver(object, writable, end)
@@ -83,9 +84,9 @@ pub fn handle_shared_object_request<Delivery: SharedObjectDelivery>(
             let result = litebox_broker_core::segment::prepare_attach(
                 process,
                 request,
-                |object, writable, end| {
+                |object, writable, executable, end| {
                     delivery
-                        .deliver_segment(object, writable, end)
+                        .deliver_segment(object, writable, executable, end)
                         .map_err(|error| report_delivery_failure(error).segment_error())
                 },
             );

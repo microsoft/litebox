@@ -153,6 +153,13 @@ fn sysv_shm_abi_layout() {
     assert_eq!(offset_of!(ShmidDs, shm_lpid), 84);
     assert_eq!(offset_of!(ShmidDs, shm_nattch), 88);
     assert_eq!(offset_of!(ShmidDs, reserved), 96);
+    assert_eq!(size_of::<ShmLimits>(), 72);
+    assert_eq!(offset_of!(ShmLimits, shmmin), 8);
+    assert_eq!(offset_of!(ShmLimits, shmall), 32);
+    assert_eq!(size_of::<ShmUsage>(), 48);
+    assert_eq!(align_of::<ShmUsage>(), 8);
+    assert_eq!(offset_of!(ShmUsage, shm_tot), 8);
+    assert_eq!(offset_of!(ShmUsage, swap_successes), 40);
 }
 
 #[test]
