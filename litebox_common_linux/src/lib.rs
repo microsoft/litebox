@@ -1698,6 +1698,21 @@ pub struct TimeVal {
     pub tv_usec: suseconds_t,
 }
 
+impl TimeVal {
+    /// Linux `select` carries whole seconds out of `tv_usec` before validating
+    /// the timeout. Interval timers instead require an already normalized value.
+    fn select_timeout(self) -> Result<Duration, errno::Errno> {
+        let normalized = Self {
+            tv_sec: self
+                .tv_sec
+                .checked_add(self.tv_usec / 1_000_000)
+                .ok_or(errno::Errno::EINVAL)?,
+            tv_usec: self.tv_usec % 1_000_000,
+        };
+        normalized.try_into()
+    }
+}
+
 /// Linux `struct rusage`.
 ///
 /// Counters use the guest's 64-bit `long`, not the host's `c_long`.
@@ -4455,7 +4470,7 @@ impl TimeParam {
             }
             TimeParam::TimeVal(tv) => {
                 let tv = tv.read_at_offset::<P>(0).ok_or(errno::Errno::EFAULT)?;
-                Duration::try_from(tv).map_err(|_| errno::Errno::EINVAL)?
+                tv.select_timeout()?
             }
             TimeParam::Timespec32(ts) => {
                 let ts = ts.read_at_offset::<P>(0).ok_or(errno::Errno::EFAULT)?;
