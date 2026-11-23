@@ -907,13 +907,15 @@ mod tests {
             sigaction: crate::signal::SIG_DFL,
             flags: crate::signal::SaFlags::empty(),
             __pad: 0,
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             restorer: 0,
             mask: SigSet::empty(),
         }; NSIG];
         signal_actions[0] = SigAction {
             sigaction: 0x1234,
-            flags: crate::signal::SaFlags::RESTORER,
+            flags: crate::signal::SaFlags::RESTART,
             __pad: 0,
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             restorer: 0x5678,
             mask: SigSet::empty().with(Signal::SIGUSR2),
         };
@@ -967,7 +969,9 @@ mod tests {
         };
         assert_eq!(decoded.regions, startup.regions);
         assert_eq!(decoded.comm, startup.comm);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         assert_eq!(decoded.signal_actions[0].restorer, 0x5678);
+        assert!(decoded.signal_actions[0].mask.contains(Signal::SIGUSR2));
         assert_eq!(decoded.resource_limits, startup.resource_limits);
         assert!(!decoded.dumpable && decoded.no_new_privs);
         #[cfg(target_arch = "aarch64")]

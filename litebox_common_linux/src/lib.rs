@@ -106,12 +106,12 @@ bitflags::bitflags! {
         /// `O_CREAT`: if path does not exist, create it as a regular file
         const CREAT = 0x40;
         /// `O_DIRECT`: try to minimize cache effects of I/O
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         const DIRECT = 0x4000;
         #[cfg(target_arch = "aarch64")]
         const DIRECT = 0x10000;
         /// `O_DIRECTORY`: fail if not a directory
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         const DIRECTORY = 0x10000;
         #[cfg(target_arch = "aarch64")]
         const DIRECTORY = 0x4000;
@@ -121,7 +121,7 @@ bitflags::bitflags! {
         /// `O_EXCL`: exclusive use
         const EXCL = 0x80;
         /// `O_LARGEFILE`: allow large file support
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         const LARGEFILE = 0x8000;
         #[cfg(target_arch = "aarch64")]
         const LARGEFILE = 0x20000;
@@ -130,7 +130,7 @@ bitflags::bitflags! {
         /// `O_NOCTTY`: do not assign controlling terminal
         const NOCTTY = 0x100;
         /// `O_NOFOLLOW`: fail if the path does not point to a regular file
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         const NOFOLLOW = 0x20000;
         #[cfg(target_arch = "aarch64")]
         const NOFOLLOW = 0x8000;
@@ -145,10 +145,7 @@ bitflags::bitflags! {
         /// integrity completion provided by `O_DSYNC`.)
         const SYNC = 0x101000;
         /// `O_TMPFILE`: create an unnamed temporary file
-        #[cfg(target_arch = "x86_64")]
-        const TMPFILE = 0x410000;
-        #[cfg(target_arch = "aarch64")]
-        const TMPFILE = 0x404000;
+        const TMPFILE = 0x400000 | Self::DIRECTORY.bits();
         /// `O_TRUNC`: truncate the file to zero length
         const TRUNC = 0x200;
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
@@ -431,9 +428,8 @@ pub struct FileStat {
     pub __unused: [i64; 3],
 }
 
-/// Linux's `stat` struct for aarch64.
-/// Uses the generic `struct stat` layout from <asm-generic/stat.h>.
-#[cfg(target_arch = "aarch64")]
+/// Linux's 64-bit `struct stat` from `asm-generic/stat.h`.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 #[repr(C)]
 #[derive(Clone, Default, PartialEq, Debug, FromBytes, IntoBytes)]
 pub struct FileStat {
@@ -509,11 +505,11 @@ impl TryFrom<FileStatus> for FileStat {
             st_rdev: rdev.map_or(0, core::num::NonZeroU64::get),
             #[cfg(target_arch = "x86_64")]
             st_size: usize::try_from(size).map_err(|_| errno::Errno::EOVERFLOW)?,
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             st_size: size,
             #[cfg(target_arch = "x86_64")]
             st_blksize: usize::try_from(block_size).map_err(|_| errno::Errno::EOVERFLOW)?,
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             st_blksize: i32::try_from(block_size).map_err(|_| errno::Errno::EOVERFLOW)?,
             st_blocks: 0,
             st_atime: times.accessed.seconds,
@@ -691,7 +687,7 @@ impl From<FileStat> for Statx {
             stx_mask: StatxMask::STATX_BASIC_STATS.bits(),
             #[cfg(target_arch = "x86_64")]
             stx_blksize: value.st_blksize.trunc(),
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             stx_blksize: value.st_blksize.reinterpret_as_unsigned(),
             stx_nlink: value.st_nlink.trunc(),
             stx_uid: value.st_uid,
@@ -700,7 +696,7 @@ impl From<FileStat> for Statx {
             stx_ino: value.st_ino,
             #[cfg(target_arch = "x86_64")]
             stx_size: value.st_size as u64,
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             stx_size: value.st_size.reinterpret_as_unsigned(),
             stx_blocks: value.st_blocks.reinterpret_as_unsigned(),
             stx_atime: statx_timestamp(value.st_atime, value.st_atime_nsec),
@@ -1590,14 +1586,11 @@ pub struct Ucred {
     pub gid: u32,
 }
 
-// Following libc's definition of time_t and suseconds_t.
-// They are not same as isize on all architectures, e.g.,
-// `suseconds_t` is i64 on riscv32:
-// https://github.com/rust-lang/libc/blob/151c3a971e423c76e7acb54aa2d21a6e2706c4e6/src/unix/linux_like/linux/gnu/b32/mod.rs#L22
+// Both fields of the Linux UAPI `__kernel_old_timeval` are signed longs on LP64.
 cfg_if::cfg_if! {
-    if #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] {
+    if #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))] {
         pub type time_t = i64;
-        pub type suseconds_t = u64;
+        pub type suseconds_t = i64;
     } else {
         compile_error!("Unsupported architecture");
     }
@@ -1810,7 +1803,7 @@ impl TryFrom<TimeVal> for Duration {
     type Error = errno::Errno;
 
     fn try_from(value: TimeVal) -> Result<Self, Self::Error> {
-        let usec: u32 = value.tv_usec.trunc();
+        let usec = u32::try_from(value.tv_usec).map_err(|_| errno::Errno::EINVAL)?;
         if usec >= 1_000_000 {
             return Err(errno::Errno::EINVAL);
         }
@@ -2025,7 +2018,11 @@ pub struct Utsname {
 }
 
 /// Linux's 64-bit `struct statfs`.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+))]
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, FromBytes, IntoBytes, Immutable)]
 pub struct Statfs {
@@ -2233,11 +2230,11 @@ pub enum EpollOp {
 }
 
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
-#[cfg_attr(target_arch = "x86_64", repr(C, packed))]
-#[cfg_attr(target_arch = "aarch64", repr(C))]
+#[repr(C)]
+#[cfg_attr(target_arch = "x86_64", repr(packed))]
 pub struct EpollEvent {
     pub events: u32,
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     pub padding: u32,
     pub data: u64,
 }
@@ -2246,7 +2243,7 @@ impl EpollEvent {
     pub fn new(events: u32, data: u64) -> Self {
         Self {
             events,
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             padding: 0,
             data,
         }
@@ -4217,6 +4214,8 @@ impl SyscallRequest {
                 dev: ctx.sys_req_arg(2),
             },
             Sysno::renameat2 => sys_req!(Renameat2 { olddirfd,oldpath:*,newdirfd,newpath:*,flags }),
+            // RISC-V omits __ARCH_WANT_RENAMEAT; syscall 38 is unassigned.
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             Sysno::renameat => SyscallRequest::Renameat2 {
                 olddirfd: ctx.sys_req_arg(0),
                 oldpath: ctx.sys_req_ptr(1),
@@ -4270,7 +4269,7 @@ impl SyscallRequest {
             Sysno::futimesat => sys_req!(Futimesat { dirfd, pathname:*, times:* }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             Sysno::fstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::eventfd => SyscallRequest::Eventfd2 {
@@ -4293,9 +4292,8 @@ impl SyscallRequest {
                     // The order of the `child_tid` and `tls` arguments depends on
                     // CONFIG_CLONE_BACKWARDS (see kernel/fork.c): when set, the layout
                     // is (..., tls=arg3, child_tid=arg4); otherwise it is
-                    // (..., child_tid=arg3, tls=arg4). arm64 selects CLONE_BACKWARDS
-                    // (arch/arm64/Kconfig), whereas x86_64 does not (only X86_32 does,
-                    // arch/x86/Kconfig), so the indices are swapped between the arches.
+                    // (..., child_tid=arg3, tls=arg4). Both arm64 and RISC-V select
+                    // CLONE_BACKWARDS; x86_64 does not.
                     child_tid: ctx.sys_req_arg(if cfg!(target_arch = "x86_64") { 3 } else { 4 }),
                     tls: ctx.sys_req_arg(if cfg!(target_arch = "x86_64") { 4 } else { 3 }),
                     pidfd: ctx.sys_req_arg(2), // aliases parent_tid
@@ -4566,6 +4564,54 @@ pub struct PtRegs {
     /* add remaining fields if needed */
 }
 
+/// Saved RV64 guest integer context. Through `t6` this matches the RISC-V Linux
+/// UAPI `user_regs_struct`: the PC followed by x1..x31 (x0 is always zero).
+/// LiteBox appends the original syscall argument, not the kernel's supervisor CSRs.
+#[cfg(target_arch = "riscv64")]
+#[repr(C)]
+#[derive(Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub struct PtRegs {
+    /// Guest resume PC, not the return address inside a rewritten syscall gate.
+    pub pc: usize,
+    pub ra: usize,
+    pub sp: usize,
+    /// Guest-visible `gp`, not the runner's physical gate pointer.
+    pub gp: usize,
+    /// Guest TLS pointer.
+    pub tp: usize,
+    pub t0: usize,
+    pub t1: usize,
+    pub t2: usize,
+    pub s0: usize,
+    pub s1: usize,
+    /// Argument zero on entry; result on return.
+    pub a0: usize,
+    pub a1: usize,
+    pub a2: usize,
+    pub a3: usize,
+    pub a4: usize,
+    pub a5: usize,
+    pub a6: usize,
+    /// Linux syscall number.
+    pub a7: usize,
+    pub s2: usize,
+    pub s3: usize,
+    pub s4: usize,
+    pub s5: usize,
+    pub s6: usize,
+    pub s7: usize,
+    pub s8: usize,
+    pub s9: usize,
+    pub s10: usize,
+    pub s11: usize,
+    pub t3: usize,
+    pub t4: usize,
+    pub t5: usize,
+    pub t6: usize,
+    /// `a0` captured at syscall entry before installing a return value.
+    pub orig_a0: usize,
+}
+
 #[cfg(target_arch = "x86_64")]
 pub mod arch {
     use litebox::arch::x86_64::RFlags;
@@ -4613,12 +4659,14 @@ impl PtRegs {
     pub fn has_user_return_addresses(&self) -> bool {
         #[cfg(target_arch = "aarch64")]
         use litebox::arch::aarch64 as arch;
+        #[cfg(target_arch = "riscv64")]
+        use litebox::arch::riscv64 as arch;
         #[cfg(target_arch = "x86_64")]
         use litebox::arch::x86_64 as arch;
 
         #[cfg(target_arch = "x86_64")]
         let sp = self.rsp;
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         let sp = self.sp;
 
         let user_range = arch::USER_ADDR_MIN..arch::USER_ADDR_END;
@@ -4666,6 +4714,45 @@ impl PtRegs {
         true
     }
 
+    /// RV64GC PCs must be halfword-aligned. The guest frame contains no privileged state.
+    #[cfg(target_arch = "riscv64")]
+    #[must_use]
+    pub fn sanitize_for_user_return(&mut self) -> bool {
+        self.has_user_return_addresses() && self.pc.is_multiple_of(2)
+    }
+
+    /// Returns the Linux syscall number saved at entry.
+    pub fn syscall_number(&self) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.orig_rax
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.syscallno.cast_unsigned() as usize
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.a7
+        }
+    }
+
+    /// Installs a raw Linux return value without changing the saved syscall arguments.
+    pub fn set_syscall_result(&mut self, value: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.rax = value;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.regs[0] = value;
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.a0 = value;
+        }
+    }
+
     /// Get the `idx`th syscall argument.
     ///
     /// # Panics
@@ -4701,6 +4788,24 @@ impl PtRegs {
         }
     }
 
+    /// Returns the syscall argument captured at entry, even after `a0` holds a result.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` is greater than 5.
+    #[cfg(target_arch = "riscv64")]
+    pub fn syscall_arg(&self, idx: usize) -> usize {
+        match idx {
+            0 => self.orig_a0,
+            1 => self.a1,
+            2 => self.a2,
+            3 => self.a3,
+            4 => self.a4,
+            5 => self.a5,
+            _ => panic!("Invalid syscall argument index: {idx}"),
+        }
+    }
+
     // (Private-only, only to be used via `SyscallRequest::try_from_raw`), get the `idx`th syscall
     // argument, reinterpret-truncated to the necessary type.
     fn sys_req_arg<T: ReinterpretTruncatedFromUsize>(&self, idx: usize) -> T {
@@ -4719,7 +4824,7 @@ impl PtRegs {
     }
 
     /// Get the instruction pointer (IP)
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     pub fn get_ip(&self) -> usize {
         self.pc
     }
@@ -4730,7 +4835,7 @@ impl PtRegs {
         {
             self.rsp = sp;
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         {
             self.sp = sp;
         }

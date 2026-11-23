@@ -283,7 +283,7 @@ jobs:
       CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
       CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUNNER: qemu-riscv64 -L /usr/riscv64-linux-gnu
       # Grow this list as each crate gains RV64 support.
-      RISCV64_CRATES: -p litebox -p litebox_platform -p litebox_trampoline
+      RISCV64_CRATES: -p litebox -p litebox_platform -p litebox_trampoline -p litebox_common_linux
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

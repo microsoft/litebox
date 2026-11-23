@@ -919,14 +919,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(v) => v,
             Err(err) => (err.without_restart().as_neg() as isize).reinterpret_as_unsigned(),
         };
-        #[cfg(target_arch = "x86_64")]
-        {
-            ctx.rax = return_value;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            ctx.regs[0] = return_value;
-        }
+        ctx.set_syscall_result(return_value);
         restart
     }
 
@@ -938,11 +931,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        #[cfg(target_arch = "x86_64")]
-        let syscall_number = ctx.orig_rax;
-        // AArch64 syscall ABI: `w8`, mirrored in `pt_regs::syscallno`.
-        #[cfg(target_arch = "aarch64")]
-        let syscall_number = ctx.syscallno.cast_unsigned() as usize;
+        let syscall_number = ctx.syscall_number();
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
         // A vfork child runs in its parent's runner and makes broker requests as the parent, so it
         // may only make syscalls known to behave as they would for the child. Any other request

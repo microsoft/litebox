@@ -2301,6 +2301,9 @@ mod tests {
         const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000;
         #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
         const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000;
+        // Some mock mappings borrow the test process's heap, which can be outside Sv39.
+        #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+        const TASK_ADDR_MAX: usize = (1 << 56) - PAGE_SIZE; // Sv57 user range
         #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
         const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
