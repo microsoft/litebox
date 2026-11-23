@@ -6,6 +6,7 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, vec, vec::Vec};
+use core::mem::DropGuard;
 use core::panic::PanicInfo;
 use litebox::utils::{ReinterpretSignedExt, TruncateExt};
 use litebox_common_linux::errno::Errno;
@@ -515,30 +516,23 @@ unsafe fn switch_to_task_page_table(
     }
 }
 
-/// Enforces the invariant that the core must be on the base (kernel) page
-/// table before returning to VTL0: the guard switches to the TA's task
-/// page table on entry and switches back on drop, covering early-return
-/// and `?` paths.
+/// Switches to a TA's task page table and returns a guard that switches back to
+/// the base page table on drop, covering early-return and `?` paths. This
+/// enforces the invariant that the core must be on the base (kernel) page table
+/// before returning to VTL0.
 ///
 /// `switch_to_base_page_table` is an idempotent CR3 write, so teardown
 /// paths that switch to base internally before deleting the task page
-/// table can run before this guard's `Drop` — the redundant write at
+/// table can run before this guard drops — the redundant write at
 /// drop time is benign.
-struct TaskPageTableGuard {
+fn enter_task_page_table(
     platform: &'static Platform,
-}
-
-impl TaskPageTableGuard {
-    fn enter(platform: &'static Platform, task_pt_id: usize) -> Result<Self, OpteeSmcReturnCode> {
-        unsafe { switch_to_task_page_table(platform, task_pt_id)? };
-        Ok(Self { platform })
-    }
-}
-
-impl Drop for TaskPageTableGuard {
-    fn drop(&mut self) {
-        unsafe { switch_to_base_page_table(self.platform) };
-    }
+    task_pt_id: usize,
+) -> Result<impl Drop, OpteeSmcReturnCode> {
+    unsafe { switch_to_task_page_table(platform, task_pt_id)? };
+    Ok(DropGuard::new(platform, |platform| unsafe {
+        switch_to_base_page_table(platform);
+    }))
 }
 
 /// Switches to base and unregisters the task table.
@@ -1110,7 +1104,7 @@ fn open_session_single_instance(
     );
 
     // Switch to the existing TA's page table
-    let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id)?;
+    let _task_pt_guard = enter_task_page_table(platform, task_pt_id)?;
 
     // Load TA context with parameters for OpenSession - pass actual session_id
     ta_req_info.session = runner_session_id;
@@ -1275,7 +1269,7 @@ fn open_session_new_instance(
             teardown_ta_page_table(platform, task_pt_id);
         })?;
 
-    let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id).inspect_err(|error| {
+    let _task_pt_guard = enter_task_page_table(platform, task_pt_id).inspect_err(|error| {
         debug_serial_println!("Failed to activate task page table: {error:?}");
         teardown_ta_page_table(platform, task_pt_id);
     })?;
@@ -1491,7 +1485,7 @@ fn handle_invoke_command(
         };
         let task_pt_id = instance.task_page_table_id();
 
-        let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id)?;
+        let _task_pt_guard = enter_task_page_table(platform, task_pt_id)?;
 
         debug_serial_println!(
             "InvokeCommand: session_id={}, task_pt_id={}, cmd_id={}",
@@ -1596,7 +1590,7 @@ fn handle_close_session(
         };
         let task_pt_id = instance.task_page_table_id();
 
-        let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id)?;
+        let _task_pt_guard = enter_task_page_table(platform, task_pt_id)?;
 
         // Set up the entry-point parameters for CloseSession. The TA gets no params,
         // whatever the normal world sent.

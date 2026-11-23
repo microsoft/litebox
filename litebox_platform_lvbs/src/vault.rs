@@ -755,13 +755,6 @@ mod tests {
 
     #[test]
     fn retpoline_preserves_kdf_arguments_and_error_returns() {
-        struct Scratch(*mut libc::c_void);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                // Safety: this test owns the mapping.
-                assert_eq!(unsafe { libc::munmap(self.0, PAGE_SIZE) }, 0);
-            }
-        }
         fn check(prk: &[u8], params: KDFParams) {
             assert_eq!(prk, &[0x42u8; PRK_LEN]);
             assert_eq!(params.context, b"context");
@@ -791,7 +784,10 @@ mod tests {
             )
         };
         assert_ne!(page, libc::MAP_FAILED);
-        let _scratch = Scratch(page);
+        let _scratch = core::mem::DropGuard::new(page, |page| {
+            // Safety: this test owns the mapping.
+            assert_eq!(unsafe { libc::munmap(page, PAGE_SIZE) }, 0);
+        });
         assert_eq!(page, VAULT_DISPATCH_VA as *mut libc::c_void);
         let prk = [0x42u8; PRK_LEN];
         let mut output = [0u8; 32];
