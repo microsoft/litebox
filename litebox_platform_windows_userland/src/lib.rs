@@ -212,11 +212,8 @@ unsafe extern "system" fn vectored_exception_handler_inner(
     {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    let Some(tls) = get_tls_ptr() else {
-        // TLS slot not initialized yet; cannot be in guest
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
-    let tls = unsafe { &*tls };
+    // SAFETY: The owning thread keeps an installed `TlsState` alive until it clears the slot.
+    let tls = get_tls_ptr().map(|tls| unsafe { &*tls });
     let (info, exception_record, context);
     unsafe {
         info = *exception_info;
@@ -224,7 +221,9 @@ unsafe extern "system" fn vectored_exception_handler_inner(
         context = &mut *info.ContextRecord;
     }
 
-    if !tls.is_in_guest.get() {
+    // A thread without TLS is outside the guest too: LiteBox can access guest memory before
+    // a thread installs TLS or after it uninstalls it, as when the shim is dropped.
+    let Some(tls) = tls.filter(|tls| tls.is_in_guest.get()) else {
         // This might be a faulting guest memory access in LiteBox code. Try to
         // recover.
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
@@ -234,11 +233,10 @@ unsafe extern "system" fn vectored_exception_handler_inner(
             // Found a matching exception table entry.
             context.Rip = recover as u64;
             return EXCEPTION_CONTINUE_EXECUTION;
-        } else {
-            // Not one of our exceptions; let other handlers process it.
-            return EXCEPTION_CONTINUE_SEARCH;
         }
-    }
+        // Not one of our exceptions; let other handlers process it.
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
     tls.is_in_guest.set(false);
 
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
@@ -2619,6 +2617,28 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn fallible_access_recovers_on_thread_without_tls() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+
+        let _ = crate::WindowsUserland::<PAGE_SIZE>::new();
+        assert!(crate::get_tls_ptr().is_none());
+        // SAFETY: Reserving address space has no preconditions.
+        let reserved =
+            unsafe { VirtualAlloc(core::ptr::null(), PAGE_SIZE, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!reserved.is_null());
+        let _free = litebox::utils::defer(|| {
+            // SAFETY: The reservation is uniquely owned and no longer accessed.
+            assert_ne!(unsafe { VirtualFree(reserved, 0, MEM_RELEASE) }, 0);
+        });
+
+        // SAFETY: `reserved` is non-Rust memory that outlives the read.
+        let result = unsafe { litebox::mm::exception_table::read_u64_fallible(reserved.cast()) };
+        assert!(result.is_err());
     }
 
     #[test]
