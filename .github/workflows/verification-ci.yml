@@ -30,6 +30,8 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v6
       - name: Install Verus tools
-        run: .github/tools/install_verus
+        run: |
+          .github/tools/install_verus
+          echo "RUSTUP_TOOLCHAIN=$(sed -n 's/^VERUS_RUST_VERSION=//p' .github/tools/install_verus)" >> "$GITHUB_ENV"
       - name: Run verification
         run: cargo verus focus -p litebox_platform_lvbs

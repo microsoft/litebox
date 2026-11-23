@@ -136,10 +136,11 @@ default-members = [
 unused_dependencies = "deny"
 
 [workspace.dependencies]
-verus_builtin = { version = "=0.0.0-2026-05-17-0151", default-features = false }
-verus_builtin_macros = { version = "=0.0.0-2026-05-24-0157", features = ["vpanic"], default-features = false }
-verus_state_machines_macros = { version = "=0.0.0-2026-05-24-0157", default-features = false }
-vstd = { version = "=0.0.0-2026-05-24-0157", features = ["alloc", "allow_panic"], default-features = false }
+# Keep these publications compatible with the release in .github/tools/install_verus.
+verus_builtin = { version = "=0.0.0-2026-11-01-0251", default-features = false }
+verus_builtin_macros = { version = "=0.0.0-2026-11-01-0251", features = ["vpanic"], default-features = false }
+verus_state_machines_macros = { version = "=0.0.0-2026-11-01-0251", default-features = false }
+vstd = { version = "=0.0.0-2026-11-01-0251", features = ["alloc", "allow_panic"], default-features = false }
 
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are

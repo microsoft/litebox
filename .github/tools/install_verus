@@ -13,10 +13,10 @@ set -euo pipefail
 trap 'echo "Error at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 # Verus release version and commit hash
-VERUS_VERSION=0.2026.05.24.ecee80a
+VERUS_VERSION=0.2026.11.02.8bf68ee
 VERUS_RELEASE_TAG=release/$VERUS_VERSION
-DEFAULT_VERUS_REV=ecee80a2139923d503338e6989f79fb690ec7847
-VERUS_RUST_VERSION=1.95.0
+DEFAULT_VERUS_REV=8bf68ee741df833ea5d0fe6a2255126fdea87e47
+VERUS_RUST_VERSION=1.99.1
 
 # Verusfmt version
 VERUSFMT_VERSION=v0.6.4
@@ -68,7 +68,7 @@ make_temp_dir() {
     local tmpdir
     tmpdir=$(mktemp -d)
     TMPDIRS+=("$tmpdir")
-    echo "$tmpdir"
+    TMPDIR=$tmpdir
 }
 
 # Parse arguments
@@ -120,28 +120,60 @@ fetch_code() {
     popd > /dev/null
 }
 
-# Install verus toolchain into your ~/.cargo/bin
-install_verus_assets() {
+set_verus_assets() {
     VERUS_ASSETS=(
         "verus"
         "rust_verify"
         "z3"
         "cargo-verus"
-        "verus-root"
+        "libverus_builtin.rlib"
+        "libvstd.rlib"
+        "vstd.vir"
+        "version.json"
     )
+    local extension
+    case "$(uname -s)" in
+        Linux) extension=so ;;
+        Darwin) extension=dylib ;;
+        *) die "unsupported OS: $(uname -s)" ;;
+    esac
+    VERUS_ASSETS+=(
+        "libverus_builtin_macros.$extension"
+        "libverus_state_machines_macros.$extension"
+    )
+}
+
+verus_assets_installed() {
+    local asset
+    for asset in "${VERUS_ASSETS[@]}"; do
+        [ -r "$VERUS_INSTALL_DIR/$asset" ] || return 1
+    done
+    for asset in verus rust_verify z3 cargo-verus; do
+        [ -x "$VERUS_INSTALL_DIR/$asset" ] || return 1
+    done
+}
+
+# Install verus toolchain into your ~/.cargo/bin
+install_verus_assets() {
     local src_dir=$1
     local dst_dir=$2
     mkdir -p "$dst_dir"
     for asset in "${VERUS_ASSETS[@]}"; do
         [ -e "$src_dir/$asset" ] || die "missing Verus asset: $src_dir/$asset"
         echo "Installing $asset to $dst_dir"
-        install "$src_dir/$asset" "$dst_dir"
+        case "$asset" in
+            verus|rust_verify|z3|cargo-verus) install -m 755 "$src_dir/$asset" "$dst_dir" ;;
+            *) install -m 644 "$src_dir/$asset" "$dst_dir" ;;
+        esac
     done
 }
 
 verify_verus_assets() {
     local asset
-    for asset in verus rust_verify z3 cargo-verus verus-root; do
+    for asset in "${VERUS_ASSETS[@]}"; do
+        [ -r "$VERUS_INSTALL_DIR/$asset" ] || die "installed asset is missing or unreadable: $VERUS_INSTALL_DIR/$asset"
+    done
+    for asset in verus rust_verify z3 cargo-verus; do
         [ -x "$VERUS_INSTALL_DIR/$asset" ] || die "installed asset is missing or not executable: $VERUS_INSTALL_DIR/$asset"
     done
     if [ "$VERUS_REV" = "$DEFAULT_VERUS_REV" ]; then
@@ -152,14 +184,15 @@ verify_verus_assets() {
 
 # Ensure the Rust toolchain Verus requires is present before any verus invocation
 # (both prebuilt and from-source paths need it; from-source also installs targets/components below).
-require_commands rustup curl git install mktemp sh
+require_commands rustup curl git install mktemp sh uname
+set_verus_assets
 rustup toolchain install "$VERUS_RUST_VERSION" --profile minimal --no-self-update
 # Install x86_64-unknown-none target for verus-compatible Rust version
 export RUSTUP_TOOLCHAIN=$VERUS_RUST_VERSION
 rustup target add x86_64-unknown-none --toolchain "$RUSTUP_TOOLCHAIN"
 
 # Skip building Verus from source if the correct version is already installed
-if ! $FORCE_INSTALL && command_exists verus && verus --version 2> /dev/null | grep -q "$VERUS_VERSION"; then
+if ! $FORCE_INSTALL && verus_assets_installed && "$VERUS_INSTALL_DIR/verus" --version 2> /dev/null | grep -q "$VERUS_VERSION"; then
     echo "Verus version $VERUS_VERSION already installed, skipping build."
     exit 0
 fi
@@ -183,7 +216,7 @@ install_prebuilt() {
     ZIPFILE="verus-${VERUS_VERSION}-${PLATFORM}.zip"
     VERUS_RELEASE_URL="https://github.com/verus-lang/verus/releases/download/release/${VERUS_VERSION}/${ZIPFILE}"
 
-    TMPDIR=$(make_temp_dir)
+    make_temp_dir
     curl --proto '=https' --tlsv1.2 -LsSf "$VERUS_RELEASE_URL" -o "$TMPDIR/$ZIPFILE"
     unzip -q "$TMPDIR/$ZIPFILE" -d "$TMPDIR"
     install_verus_assets "$TMPDIR/verus-$PLATFORM" "$VERUS_INSTALL_DIR"
