@@ -58,7 +58,7 @@ pub struct Plan {
         all(windows, not(test)),
         expect(
             dead_code,
-            reason = "Windows refuses a network namespace of the container's own"
+            reason = "Windows refuses Linux network namespaces, and sysctls in an HCN one"
         )
     )]
     pub sysctl: Vec<(String, String)>,
@@ -73,13 +73,78 @@ pub struct Plan {
 /// The broker's network namespace, where it opens the guests' host sockets.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Network {
-    /// The daemon's: the spec has no network namespace.
+    /// The daemon's: the spec has no network namespace. A Windows container then has no network.
     Daemon,
     /// The one at this path (CRI's pods, which CRI configured).
     Join(PathBuf),
     /// A new one, its loopback up, as runc creates it, for hooks to set up through the broker's
     /// pid.
     New,
+    /// The HCN namespace `windows.network.networkNamespace` (CRI's pods, `ctr run --cni`'s).
+    #[cfg(windows)]
+    Hcn(Guid),
+}
+
+/// A GUID, `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` as text, in braces or not.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Guid(pub u128);
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseGuidError;
+
+#[cfg(windows)]
+impl std::fmt::Display for ParseGuidError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("not a GUID")
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for ParseGuidError {}
+
+#[cfg(windows)]
+impl FromStr for Guid {
+    type Err = ParseGuidError;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        let bare = (text
+            .strip_prefix('{')
+            .and_then(|text| text.strip_suffix('}')))
+        .unwrap_or(text);
+        let shaped = bare.len() == 36
+            && bare.char_indices().all(|(at, digit)| {
+                if [8, 13, 18, 23].contains(&at) {
+                    digit == '-'
+                } else {
+                    digit.is_ascii_hexdigit()
+                }
+            });
+        if !shaped {
+            return Err(ParseGuidError);
+        }
+        let digits: String = bare.chars().filter(|digit| *digit != '-').collect();
+        u128::from_str_radix(&digits, 16)
+            .map(Self)
+            .map_err(|_| ParseGuidError)
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for Guid {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = self.0;
+        write!(
+            formatter,
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            value >> 96,
+            (value >> 80) & 0xffff,
+            (value >> 64) & 0xffff,
+            (value >> 48) & 0xffff,
+            value & 0xffff_ffff_ffff
+        )
+    }
 }
 
 /// A bind mount: a file is copied into the root archive, a directory is served by the broker.
@@ -398,6 +463,8 @@ pub fn plan(spec: &Spec) -> Result<Plan> {
             Some(path) if !path.as_os_str().is_empty() => Network::Join(path.clone()),
             _ => Network::New,
         });
+    #[cfg(windows)]
+    let network = windows_network(spec, network)?;
     let mut binds = Vec::new();
     for mount in spec.mounts().iter().flatten() {
         let destination = normalize(mount.destination())?;
@@ -472,29 +539,49 @@ fn layer_folders(spec: &Spec) -> Result<Vec<PathBuf>> {
     if windows.hyperv().is_some() {
         return Err(unsupported("Hyper-V isolation is not supported"));
     }
-    // containerd's default spec has one with DNS settings only.
-    if let Some(network) = windows.network() {
-        let named = |name: &Option<String>| name.as_ref().is_some_and(|name| !name.is_empty());
-        if named(network.network_namespace())
-            || named(network.network_shared_container_name())
-            || network
-                .endpoint_list()
-                .as_ref()
-                .is_some_and(|list| !list.is_empty())
-        {
-            return Err(unsupported(
-                "attaching the container to a network is not supported on Windows yet",
-            ));
-        }
-    }
     let folders = windows.layer_folders().iter().flatten();
     Ok(folders.map(PathBuf::from).collect())
+}
+
+/// `network`, unless `windows.network` names a namespace. containerd's default spec has a
+/// `windows.network` with DNS settings only.
+#[cfg(windows)]
+fn windows_network(spec: &Spec, network: Network) -> Result<Network> {
+    fn named(name: Option<&str>) -> Option<&str> {
+        name.filter(|name| !name.is_empty())
+    }
+    let Some(windows) = (spec.windows().as_ref()).and_then(|windows| windows.network().as_ref())
+    else {
+        return Ok(network);
+    };
+    if named(windows.network_shared_container_name().as_deref()).is_some()
+        || (windows.endpoint_list().as_ref()).is_some_and(|list| !list.is_empty())
+    {
+        return Err(unsupported(
+            "attaching endpoints or sharing another container's network is not supported: give \
+             windows.network.networkNamespace",
+        ));
+    }
+    let Some(namespace) = named(windows.network_namespace().as_deref()) else {
+        return Ok(network);
+    };
+    if network != Network::Daemon {
+        return Err(invalid(
+            "the spec gives both a Linux and a Windows network namespace",
+        ));
+    }
+    let namespace = namespace.parse().map_err(|error| {
+        invalid(format!(
+            "windows.network.networkNamespace {namespace:?}: {error}"
+        ))
+    })?;
+    Ok(Network::Hcn(namespace))
 }
 
 /// The spec's `net.*` sysctls as paths under `/proc/sys`, in order, which runc sets in a network
 /// namespace of the container's own; in the daemon's they are ignored rather than set on the
 /// host. The others do not apply. Set before the hooks, they cannot reach an interface a hook
-/// creates.
+/// creates. An HCN namespace has no counterpart, so it refuses them.
 fn sysctl(spec: &Spec, network: &Network) -> Result<Vec<(String, String)>> {
     let sysctl = spec
         .linux()
@@ -518,6 +605,12 @@ fn sysctl(spec: &Spec, network: &Network) -> Result<Vec<(String, String)>> {
         };
         if !path.starts_with("net/") || *network == Network::Daemon {
             continue;
+        }
+        #[cfg(windows)]
+        if let Network::Hcn(_) = network {
+            return Err(unsupported(format!(
+                "the sysctl {key:?} is not supported in an HCN namespace"
+            )));
         }
         if !path.split('/').all(name) || value.contains('\0') {
             return Err(invalid(format!("invalid sysctl {key:?}")));
@@ -699,7 +792,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_hyper_v_and_network_attachments_are_not_supported() {
+    fn windows_networks_are_hcn_namespaces_and_hyper_v_is_not_supported() {
         let plan = |windows: serde_json::Value| {
             super::plan(
                 &serde_json::from_value(json!({
@@ -714,21 +807,28 @@ mod tests {
         let unattached =
             json!({"allowUnqualifiedDNSQuery": true, "endpointList": [], "networkNamespace": ""});
         let accepted =
-            plan(json!({"layerFolders": [r"C:\base", r"C:\scratch"], "network": unattached}));
+            plan(json!({"layerFolders": [r"C:\base", r"C:\scratch"], "network": unattached}))
+                .unwrap();
         let folders = [r"C:\base", r"C:\scratch"].map(PathBuf::from);
-        assert_eq!(accepted.unwrap().layers, folders);
+        assert_eq!(
+            (accepted.layers, accepted.network),
+            (folders.into(), Network::Daemon)
+        );
+        let namespace = |namespace: &str| json!({"network": {"networkNamespace": namespace}});
+        let guid = Guid(0xc3a5_d1e2_0b1c_4d2e_8f30_0123_4567_89ab);
+        let joined = plan(namespace("{C3A5D1E2-0b1C-4d2e-8F30-0123456789aB}"));
+        assert_eq!(joined.unwrap().network, Network::Hcn(guid));
+        assert_eq!(guid.to_string(), "c3a5d1e2-0b1c-4d2e-8f30-0123456789ab");
         let code = |refused: serde_json::Value| match plan(refused) {
             Err(crate::ttrpc::Error::RpcStatus(status)) => status.code(),
-            other => panic!("not refused: {:?}", other.map(|plan| plan.layers)),
+            other => panic!("not refused: {:?}", other.map(|plan| plan.network)),
         };
-        for refused in [
-            json!({"hyperv": {}}),
-            json!({"network": {"networkNamespace": "c3a5d1e2-0000-0000-0000-000000000000"}}),
-            json!({"network": {"networkSharedContainerName": "pause"}}),
-            json!({"network": {"endpointList": ["c3a5d1e2-0000-0000-0000-000000000000"]}}),
-        ] {
-            let code = code(refused.clone());
-            assert_eq!(code, crate::ttrpc::Code::UNIMPLEMENTED, "{refused}");
-        }
+        // `from_str_radix` takes a sign.
+        let signed = namespace("+3a5d1e2-0b1c-4d2e-8f30-0123456789ab");
+        assert_eq!(code(signed), crate::ttrpc::Code::INVALID_ARGUMENT);
+        assert_eq!(
+            code(json!({"hyperv": {}})),
+            crate::ttrpc::Code::UNIMPLEMENTED
+        );
     }
 }

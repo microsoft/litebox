@@ -11,14 +11,16 @@
 
 #![cfg(all(windows, target_arch = "x86_64"))]
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, c_void};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write as _};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::ptr::null_mut;
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -48,8 +50,15 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
 };
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+use windows_sys::Win32::System::HostComputeNetwork::{
+    HcnCloseEndpoint, HcnCloseNamespace, HcnCloseNetwork, HcnCreateEndpoint, HcnCreateNamespace,
+    HcnCreateNetwork, HcnDeleteEndpoint, HcnDeleteNamespace, HcnDeleteNetwork,
+    HcnEnumerateEndpoints, HcnEnumerateNamespaces, HcnEnumerateNetworks, HcnModifyNamespace,
+    HcnOpenNamespace, HcnQueryEndpointProperties, HcnQueryNamespaceProperties,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -59,7 +68,7 @@ use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
-use windows_sys::core::{GUID, HRESULT, PCWSTR};
+use windows_sys::core::{GUID, HRESULT, PCWSTR, PWSTR};
 
 const SHIM: &str = env!("CARGO_BIN_EXE_containerd-shim-litebox-v1");
 
@@ -126,7 +135,7 @@ impl Shim {
                 {"destination": "/proc", "type": "proc", "source": "proc"},
                 {"destination": "/run", "type": "tmpfs", "source": "tmpfs"},
             ],
-            // Networks are not supported on Windows yet.
+            // Windows refuses a Linux network namespace.
             "linux": {"namespaces": [{"type": "pid"}, {"type": "mount"}]},
             "windows": {"layerFolders": layers},
         });
@@ -186,6 +195,13 @@ impl Shim {
 
     fn state_dir(&self) -> PathBuf {
         state_root(self.dir.path()).join(&self.namespace).join("c")
+    }
+
+    fn configure(&self, change: impl FnOnce(&mut serde_json::Value)) {
+        let config = self.bundle.join("config.json");
+        let mut spec = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        change(&mut spec);
+        std::fs::write(&config, serde_json::to_string(&spec).unwrap()).unwrap();
     }
 
     /// The scratch's disk is open while attached.
@@ -613,6 +629,318 @@ fn create_scratch(scratch: &Path, parents: &[PathBuf]) {
     );
 }
 
+/// HCN objects are host-wide and outlive their handles. Their IDs are fixed, and a host-wide lock,
+/// held until they are deleted, lets a run delete a crashed run's without touching a live one's.
+struct TestNetwork {
+    /// The endpoint's, which HNS assigns.
+    address: Ipv4Addr,
+    created: Created,
+    _lock: File,
+}
+
+impl TestNetwork {
+    const NETWORK: u128 = 0x6c697465_626f_7874_6573_740000000001;
+    const ENDPOINT: u128 = 0x6c697465_626f_7874_6573_740000000002;
+    const NAMESPACE: u128 = 0x6c697465_626f_7874_6573_740000000003;
+    const DNS_SERVER: &str = "192.0.2.53";
+    const DNS_SEARCH: &str = "litebox.test";
+
+    fn create() -> Self {
+        let lock = Path::new(&std::env::var_os("ProgramData").expect("ProgramData is set"))
+            .join("litebox-shim-test-network.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock)
+            .unwrap_or_else(|error| panic!("cannot open {}: {error}", lock.display()));
+        lock.lock().unwrap();
+        // A crashed run's. HCN documents no not-found error for namespaces, so they are listed.
+        let ids = [
+            (Self::NETWORK, Kind::Network),
+            (Self::ENDPOINT, Kind::Endpoint),
+            (Self::NAMESPACE, Kind::Namespace),
+        ];
+        Created(
+            ids.into_iter()
+                .filter(|&(id, kind)| kind.exists(id))
+                .collect(),
+        )
+        .delete();
+        let mut created = Created(Vec::new());
+        let schema = serde_json::json!({"Major": 2, "Minor": 0});
+        let network = serde_json::json!({
+            "SchemaVersion": schema,
+            "Name": "litebox-shim-test",
+            "Type": "NAT",
+            "Ipams": [{"Type": "Static", "Subnets": [{
+                "IpAddressPrefix": "192.168.252.0/24",
+                "Routes": [{"NextHop": "192.168.252.1", "DestinationPrefix": "0.0.0.0/0"}],
+            }]}],
+        });
+        let settings = wide(&network.to_string());
+        let mut raw = null_mut();
+        hcn("create the network", |record| {
+            // SAFETY: the ID, the NUL-terminated settings, `raw` and `record` outlive the call.
+            unsafe {
+                HcnCreateNetwork(
+                    &GUID::from_u128(Self::NETWORK),
+                    settings.as_ptr(),
+                    &raw mut raw,
+                    record,
+                )
+            }
+        });
+        created.0.push((Self::NETWORK, Kind::Network));
+        let network = HcnHandle(raw, HcnCloseNetwork);
+        let endpoint = serde_json::json!({
+            "SchemaVersion": schema,
+            "Name": "litebox-shim-test",
+            "HostComputeNetwork": hyphenated(Self::NETWORK),
+            "Dns": {"ServerList": [Self::DNS_SERVER], "Search": [Self::DNS_SEARCH]},
+        });
+        let settings = wide(&endpoint.to_string());
+        hcn("create the endpoint", |record| {
+            // SAFETY: as for the network, which is open.
+            unsafe {
+                HcnCreateEndpoint(
+                    network.0,
+                    &GUID::from_u128(Self::ENDPOINT),
+                    settings.as_ptr(),
+                    &raw mut raw,
+                    record,
+                )
+            }
+        });
+        created.0.push((Self::ENDPOINT, Kind::Endpoint));
+        let endpoint = HcnHandle(raw, HcnCloseEndpoint);
+        let query = wide(HCN_QUERY);
+        let mut properties = null_mut();
+        hcn("query the endpoint", |record| {
+            // SAFETY: the endpoint is open, and the NUL-terminated query, `properties` and `record`
+            // outlive the call.
+            unsafe {
+                HcnQueryEndpointProperties(endpoint.0, query.as_ptr(), &raw mut properties, record)
+            }
+        });
+        // SAFETY: HCN gives the caller its document.
+        let properties: serde_json::Value = serde_json::from_str(&unsafe { take(properties) })
+            .expect("HCN's endpoint document is JSON");
+        let address = field(&field(&properties, "IpConfigurations")[0], "IpAddress");
+        let address = (address.as_str().and_then(|address| address.parse().ok()))
+            .unwrap_or_else(|| panic!("the endpoint has no IPv4 address: {properties}"));
+        let namespace = serde_json::json!({"SchemaVersion": schema});
+        let settings = wide(&namespace.to_string());
+        hcn("create the namespace", |record| {
+            // SAFETY: as for the network.
+            unsafe {
+                HcnCreateNamespace(
+                    &GUID::from_u128(Self::NAMESPACE),
+                    settings.as_ptr(),
+                    &raw mut raw,
+                    record,
+                )
+            }
+        });
+        created.0.push((Self::NAMESPACE, Kind::Namespace));
+        let namespace = HcnHandle(raw, HcnCloseNamespace);
+        let add = serde_json::json!({
+            "ResourceType": "Endpoint",
+            "RequestType": "Add",
+            "Settings": {"EndpointId": hyphenated(Self::ENDPOINT)},
+        });
+        let settings = wide(&add.to_string());
+        hcn("add the endpoint to the namespace", |record| {
+            // SAFETY: the namespace is open, and the NUL-terminated settings and `record` outlive
+            // the call.
+            unsafe { HcnModifyNamespace(namespace.0, settings.as_ptr(), record) }
+        });
+        Self {
+            address,
+            created,
+            _lock: lock,
+        }
+    }
+}
+
+/// Schema 2.0 documents, as hcsshim's `hcn` package asks for them.
+const HCN_QUERY: &str = r#"{"SchemaVersion":{"Major":2,"Minor":0},"Flags":0}"#;
+
+type Enumerate = unsafe extern "system" fn(PCWSTR, *mut PWSTR, *mut PWSTR) -> HRESULT;
+type Delete = unsafe extern "system" fn(*const GUID, *mut PWSTR) -> HRESULT;
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Network,
+    Endpoint,
+    Namespace,
+}
+
+impl Kind {
+    fn calls(self) -> (&'static str, Enumerate, Delete) {
+        match self {
+            Self::Network => ("network", HcnEnumerateNetworks, HcnDeleteNetwork),
+            Self::Endpoint => ("endpoint", HcnEnumerateEndpoints, HcnDeleteEndpoint),
+            Self::Namespace => ("namespace", HcnEnumerateNamespaces, HcnDeleteNamespace),
+        }
+    }
+
+    fn exists(self, id: u128) -> bool {
+        let (name, enumerate, _) = self.calls();
+        let query = wide(HCN_QUERY);
+        let mut ids = null_mut();
+        hcn(&format!("list the {name}s"), |record| {
+            // SAFETY: the NUL-terminated query, `ids` and `record` outlive the call.
+            unsafe { enumerate(query.as_ptr(), &raw mut ids, record) }
+        });
+        // SAFETY: HCN gives the caller its document on success.
+        let ids = unsafe { take(ids) };
+        let listed: Option<Vec<String>> = serde_json::from_str(&ids)
+            .unwrap_or_else(|error| panic!("HCN's {name} list {ids:?} is not JSON: {error}"));
+        let id = hyphenated(id);
+        (listed.into_iter().flatten())
+            .any(|listed| listed.trim_matches(['{', '}']).eq_ignore_ascii_case(&id))
+    }
+}
+
+/// HCN objects, oldest first, which are deleted newest first, as each may use those before it.
+struct Created(Vec<(u128, Kind)>);
+
+impl Created {
+    /// As hcsshim's tests do, a namespace's endpoints are detached first. Panics with HCN's record
+    /// at the first failure, leaving the rest to `drop`.
+    fn delete(&mut self) {
+        while let Some(&(id, kind)) = self.0.last() {
+            if let Kind::Namespace = kind {
+                detach_endpoints(id);
+            }
+            let (name, _, delete) = kind.calls();
+            hcn(&format!("delete the {name} {}", hyphenated(id)), |record| {
+                // SAFETY: the ID and `record` outlive the call.
+                unsafe { delete(&GUID::from_u128(id), record) }
+            });
+            self.0.pop();
+        }
+    }
+}
+
+impl Drop for Created {
+    fn drop(&mut self) {
+        for &(id, kind) in self.0.iter().rev() {
+            let (_, _, delete) = kind.calls();
+            let mut record = null_mut();
+            // SAFETY: the ID and `record` outlive the call.
+            unsafe { delete(&GUID::from_u128(id), &raw mut record) };
+            // SAFETY: HCN gives the caller its error record, if any.
+            unsafe { take(record) };
+        }
+    }
+}
+
+fn detach_endpoints(id: u128) {
+    let mut raw = null_mut();
+    hcn("open the namespace", |record| {
+        // SAFETY: the ID, `raw` and `record` outlive the call.
+        unsafe { HcnOpenNamespace(&GUID::from_u128(id), &raw mut raw, record) }
+    });
+    let namespace = HcnHandle(raw, HcnCloseNamespace);
+    let query = wide(HCN_QUERY);
+    let mut properties = null_mut();
+    hcn("query the namespace", |record| {
+        // SAFETY: the namespace is open, and the NUL-terminated query, `properties` and `record`
+        // outlive the call.
+        unsafe {
+            HcnQueryNamespaceProperties(namespace.0, query.as_ptr(), &raw mut properties, record)
+        }
+    });
+    // SAFETY: HCN gives the caller its document on success.
+    let properties: serde_json::Value = serde_json::from_str(&unsafe { take(properties) })
+        .expect("HCN's namespace document is JSON");
+    let resources = field(&properties, "Resources")
+        .as_array()
+        .into_iter()
+        .flatten();
+    for resource in resources.filter(|resource| field(resource, "Type") == "Endpoint") {
+        let remove = serde_json::json!({
+            "ResourceType": "Endpoint",
+            "RequestType": "Remove",
+            "Settings": {"EndpointId": field(field(resource, "Data"), "ID")},
+        });
+        let settings = wide(&remove.to_string());
+        hcn(&format!("detach the endpoint {resource}"), |record| {
+            // SAFETY: the namespace is open, and the NUL-terminated settings and `record` outlive
+            // the call.
+            unsafe { HcnModifyNamespace(namespace.0, settings.as_ptr(), record) }
+        });
+    }
+}
+
+struct HcnHandle(
+    *mut c_void,
+    unsafe extern "system" fn(*const c_void) -> HRESULT,
+);
+
+impl Drop for HcnHandle {
+    fn drop(&mut self) {
+        // SAFETY: the object is open, and the function is its kind's.
+        unsafe { (self.1)(self.0) };
+    }
+}
+
+fn hcn(what: &str, call: impl FnOnce(*mut PWSTR) -> HRESULT) {
+    let mut record = null_mut();
+    let code = call(&raw mut record);
+    // SAFETY: HCN gives the caller its error record, if any.
+    let record = unsafe { take(record) };
+    assert!(
+        code >= 0 && record.is_empty(),
+        "cannot {what}: {} {record}",
+        io::Error::from_raw_os_error(code)
+    );
+}
+
+/// # Safety
+///
+/// `text` is null, or a NUL-terminated string that HCN allocated for the caller.
+unsafe fn take(text: PWSTR) -> String {
+    if text.is_null() {
+        return String::new();
+    }
+    let mut length = 0;
+    // SAFETY: the caller's.
+    while unsafe { *text.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: `length` units precede the NUL.
+    let string = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+    // SAFETY: the caller's; nothing uses it any longer.
+    unsafe { CoTaskMemFree(text.cast()) };
+    string
+}
+
+/// In any case, as hcsshim's decoder (Go's) reads HCN's documents.
+fn field<'v>(value: &'v serde_json::Value, name: &str) -> &'v serde_json::Value {
+    (value.as_object().into_iter().flatten())
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map_or(&serde_json::Value::Null, |(_, value)| value)
+}
+
+fn hyphenated(id: u128) -> String {
+    let hex = format!("{id:032x}");
+    let parts = [
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..],
+    ];
+    parts.join("-")
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain([0]).collect()
+}
+
 fn build_guest(output: &Path) {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let mut wsl = Command::new("wsl.exe");
@@ -943,4 +1271,40 @@ fn a_broker_that_dies_before_start_stops_the_init() {
             "/tasks/delete c 255"
         ]
     );
+}
+
+#[test]
+#[ignore = "needs administrator rights, the Containers feature and LITEBOX_TEST_WINDOWS_LAYERS"]
+fn a_network_namespace_gives_the_guest_its_dns_and_serves_its_listeners() {
+    let mut network = TestNetwork::create();
+    let mut shim = Shim::launch(&process(&["guest", "serve"]));
+    shim.configure(|spec| {
+        let namespace = hyphenated(TestNetwork::NAMESPACE);
+        spec["windows"]["network"] = serde_json::json!({"networkNamespace": namespace});
+        spec["annotations"] = serde_json::json!({"io.litebox.ingress.tcp": "0.0.0.0/0"});
+    });
+    let pid = shim.create().unwrap();
+    shim.start("").unwrap();
+    shim.exec("e1", &["guest", "read", "/bin", "/etc/resolv.conf"], "")
+        .unwrap();
+    shim.start("e1").unwrap();
+    assert_eq!(shim.wait("e1"), 0);
+    let resolv_conf = format!(
+        "link=usr/bin\nsearch {}\nnameserver {}\n\
+         # Added by the LiteBox shim: IPv4 only, for glibc.\noptions no-aaaa\n",
+        TestNetwork::DNS_SEARCH,
+        TestNetwork::DNS_SERVER
+    );
+    let output = shim.output("e1.out");
+    assert!(output.ends_with(&resolv_conf), "{output}");
+    shim.delete("e1").unwrap();
+    shim.wait_output("c.out", "listening\n");
+    let server = SocketAddr::from((network.address, 80));
+    let stream = TcpStream::connect_timeout(&server, TIMEOUT)
+        .unwrap_or_else(|error| panic!("cannot connect to {server}: {error}"));
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    assert_eq!(io::read_to_string(stream).unwrap(), "hello");
+    assert_eq!(shim.wait(""), 0);
+    shim.finish(pid);
+    network.created.delete();
 }

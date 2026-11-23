@@ -4,7 +4,6 @@
 //! Compute systems and their processes, through the Host Compute Service (`computecore.dll`).
 
 use std::ffi::{OsStr, OsString, c_void};
-use std::fmt;
 use std::io::{self, Read};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
@@ -26,53 +25,15 @@ use windows_sys::Win32::System::HostComputeSystem::{
 };
 use windows_sys::core::{HRESULT, PWSTR};
 
-use super::bridge::{event, overlapped};
-use super::is;
-use super::security::wide;
+use super::super::bridge::{event, overlapped};
+use super::super::is;
+use super::super::security::{from_wide, wide};
+use super::Error;
 
 /// How long an operation may take: hcsshim's default for starting a container.
 const OPERATION_TIMEOUT_MS: u32 = 240_000;
 const QUOTE: char = '"';
 const BACKSLASH: char = '\\';
-
-/// `document` is the HCS's JSON about the failure, if any.
-#[derive(Debug)]
-pub struct Error {
-    code: HRESULT,
-    document: String,
-}
-
-impl Error {
-    fn new(code: HRESULT) -> Self {
-        Self {
-            code,
-            document: String::new(),
-        }
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} ({:#010x})",
-            io::Error::from_raw_os_error(self.code),
-            self.code
-        )?;
-        if !self.document.is_empty() {
-            write!(formatter, ": {}", self.document)?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<Error> for io::Error {
-    fn from(error: Error) -> Self {
-        io::Error::other(error)
-    }
-}
 
 struct Operation(HCS_OPERATION);
 
@@ -109,11 +70,7 @@ impl Operation {
         } else {
             // SAFETY: the HCS returned a NUL-terminated string for the caller to free.
             unsafe {
-                let mut length = 0;
-                while *document.add(length) != 0 {
-                    length += 1;
-                }
-                let text = String::from_utf16_lossy(std::slice::from_raw_parts(document, length));
+                let text = from_wide(document);
                 LocalFree(document.cast());
                 text
             }

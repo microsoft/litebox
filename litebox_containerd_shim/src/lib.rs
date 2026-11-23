@@ -36,11 +36,20 @@
 //!
 //! The shim copies the broker and the runner, with any `vcruntime140.dll` next to them (Nano
 //! Server lacks it), into the container, but nothing else from their directories; they run there
-//! as `ContainerUser`. LiteBox does not sandbox guests on Windows yet. The container has no
-//! network: OCI network namespaces, `windows.network` attachments, and the publish, egress and
-//! ingress annotations are not supported yet. Nor are `binary://` logging programs. A hook gets
-//! its `path` as `args[0]`, so one whose `args[0]` is not that path, its file name or stem is
-//! refused.
+//! as `ContainerUser`. LiteBox does not sandbox guests on Windows yet. `binary://` logging
+//! programs are not supported. A hook gets its `path` as `args[0]`, so one whose `args[0]` is not
+//! that path, its file name or stem is refused.
+//!
+//! The container joins the HCN namespace of `windows.network.networkNamespace` (a CRI pod's).
+//! Linux network namespaces, `endpointList` and `networkSharedContainerName` are refused, as are
+//! `net.*` sysctls with a namespace (without one they are ignored). Guest listeners publish as in
+//! a private Linux namespace.
+//! At Create, the guest's `/etc/resolv.conf` is made from the DNS settings of the
+//! endpoints then in the namespace (`ctr run --cni` attaches its endpoint later), unless a bind
+//! gives one or they name no nameserver the guest can reach: IPv4 only, not reserved or multicast,
+//! and the broker's gateway (10.0.2.1) and guest (10.0.2.15) addresses shadow the network's. The
+//! egress annotations must allow its nameservers. Without a namespace, the container has no
+//! network, and the publish, egress and ingress annotations fail Create.
 
 #![cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 
