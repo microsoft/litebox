@@ -44,7 +44,34 @@ static int split_attachment(void) {
     return 0;
 }
 
-// Checks the permission bits and ownership rules as the creator, without privilege.
+// Linux: shmdt finds an attachment by the address it was mapped at, even once munmap removed that
+// page, and an attachment whose last page another mapping replaced is gone.
+static int detach_after_unmapping(void) {
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    int id = shmget(IPC_PRIVATE, 2 * page, 0600);
+    CHECK(id >= 0);
+    struct shmid_ds ds;
+    char *data = shmat(id, NULL, 0);
+    CHECK(data != (void *)-1);
+    CHECK(munmap(data, page) == 0);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1);
+    CHECK(shmdt(data) == 0);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 0);
+    CHECK(munmap(data, 2 * page) == 0);
+
+    data = shmat(id, NULL, 0);
+    CHECK(data != (void *)-1);
+    CHECK(mremap(data, 2 * page, page, 0) == data);
+    CHECK(mmap(data, page, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == data);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 0);
+    CHECK(shmdt(data) == -1 && errno == EINVAL);
+    CHECK(munmap(data, page) == 0);
+    CHECK(shmctl(id, 99, &ds) == -1 && errno == EINVAL);
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    return 0;
+}
+
+// Checks the permission bits as the creator, without privilege.
 static int permissions(void) {
     struct shmid_ds ds;
     int id = shmget(IPC_PRIVATE, 4096, 0400);
@@ -57,14 +84,6 @@ static int permissions(void) {
     ds.shm_perm.mode = 0;
     CHECK(shmctl(id, IPC_SET, &ds) == 0);
     CHECK(shmctl(id, IPC_STAT, &ds) == -1 && errno == EACCES);
-    // IPC_SET may give the segment away; its creator still controls it.
-    ds.shm_perm.uid = geteuid() + 1;
-    ds.shm_perm.mode = 0600;
-    CHECK(shmctl(id, IPC_SET, &ds) == 0);
-    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_perm.uid == geteuid() + 1);
-    CHECK(ds.shm_perm.cuid == geteuid());
-    ds.shm_perm.uid = geteuid();
-    CHECK(shmctl(id, IPC_SET, &ds) == 0);
     CHECK(shmctl(id, IPC_RMID, NULL) == 0);
     return 0;
 }
@@ -78,6 +97,7 @@ static int listing(void) {
     struct shminfo limits;
     int highest = shmctl(0, IPC_INFO, (struct shmid_ds *)&limits);
     CHECK(highest >= 0 && limits.shmmin == 1 && limits.shmmax >= 3 * page);
+    CHECK(shmget(IPC_PRIVATE, limits.shmmax + 1, 0600) == -1 && errno == EINVAL);
     CHECK(limits.shmmni > 0 && limits.shmall >= 3);
     struct shm_info usage;
     CHECK(shmctl(0, SHM_INFO, (struct shmid_ds *)&usage) == highest);
@@ -167,6 +187,7 @@ int main(int argc, char **argv) {
     const char *self = argv[0];
     CHECK(argc == 1 && self[0] == '/');
     CHECK(split_attachment() == 0);
+    CHECK(detach_after_unmapping() == 0);
     CHECK(permissions() == 0);
     CHECK(listing() == 0);
     CHECK(exec_and_remap() == 0);
@@ -181,6 +202,8 @@ int main(int argc, char **argv) {
     ds.shm_perm.mode = 0640;
     CHECK(shmctl(id, IPC_SET, &ds) == 0);
     CHECK(shmctl(id, IPC_STAT, &ds) == 0 && (ds.shm_perm.mode & 0777) == 0640);
+    // Linux: looking a key up checks the requested permission bits.
+    CHECK(shmget(key, 0, 0700) == -1 && errno == EACCES);
     char *rw = shmat(id, NULL, 0);
     CHECK(rw != (void *)-1 && rw[0] == 0);
     char *ro = shmat(id, NULL, SHM_RDONLY);

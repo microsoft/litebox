@@ -219,7 +219,9 @@ struct SysvView {
 
 type SysvAttachmentKey = (usize, NonZeroU64);
 /// Publishes the number of areas that map each of some segments in this address space.
-pub(super) type SysvPublish = Arc<dyn Fn(&[SegmentAttachmentCount]) + Send + Sync>;
+pub(super) type SysvPublish = Arc<
+    dyn Fn(&[SegmentAttachmentCount]) -> Result<(), litebox::segment::SegmentError> + Send + Sync,
+>;
 
 /// How [`Vmem::attach_sysv`] places one new SysV attachment.
 pub(super) struct SysvPlacement<const ALIGN: usize> {
@@ -227,7 +229,7 @@ pub(super) struct SysvPlacement<const ALIGN: usize> {
     pub(super) address: Option<NonZeroAddress<ALIGN>>,
     pub(super) length: NonZeroPageSize<ALIGN>,
     pub(super) flags: CreatePagesFlags,
-    /// Read, and write unless the attachment is read-only.
+    /// The attachment's access: read, write unless it is read-only, and execute with `SHM_EXEC`.
     pub(super) permissions: MemoryRegionPermissions,
 }
 
@@ -972,6 +974,8 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     pub(super) sysv_publish: Option<SysvPublish>,
     /// Segments whose areas may have changed since their last count.
     sysv_changed: BTreeSet<SegmentId>,
+    /// Segments whose last count failed to publish.
+    sysv_unpublished: BTreeSet<SegmentId>,
 }
 
 struct SysvAttachment {
@@ -1001,6 +1005,7 @@ where
             sysv_generation: 0,
             sysv_publish: None,
             sysv_changed: BTreeSet::new(),
+            sysv_unpublished: BTreeSet::new(),
         }
     }
 
@@ -1033,12 +1038,23 @@ where
     }
 
     /// Returns how many areas map the attachment at `key`, which ends at `end`.
-    fn sysv_pieces(&self, (base, identity): SysvAttachmentKey, end: usize) -> u64 {
-        let pieces = self.vmas.overlapping(base..end).filter(|(_, vma)| {
-            vma.sysv_view()
-                .is_some_and(|(_, view)| view.identity == identity)
-        });
-        pieces.count() as u64
+    fn sysv_pieces(&self, key: SysvAttachmentKey, end: usize) -> u64 {
+        self.sysv_areas(key, end).count() as u64
+    }
+
+    /// Returns the areas that map the attachment at `key`, which ends at `end`: what `shmdt`
+    /// removes, and so what its counts count.
+    fn sysv_areas(
+        &self,
+        (base, identity): SysvAttachmentKey,
+        end: usize,
+    ) -> impl Iterator<Item = &Range<usize>> {
+        (self.vmas.overlapping(base..end))
+            .filter(move |(_, vma)| {
+                vma.sysv_view()
+                    .is_some_and(|(_, view)| view.identity == identity)
+            })
+            .map(|(range, _)| range)
     }
 
     /// Returns how many areas map `segment`.
@@ -1049,40 +1065,50 @@ where
             .sum()
     }
 
-    /// Takes the counts of the segments whose counts changed since they were last reported,
-    /// under a new generation.
+    /// Takes the counts of the segments whose counts changed since they were last reported, or
+    /// whose last count failed to publish, under a new generation.
     pub(super) fn take_sysv_changes(&mut self) -> Vec<SegmentAttachmentCount> {
-        let segments = core::mem::take(&mut self.sysv_changed);
+        let mut segments = core::mem::take(&mut self.sysv_changed);
+        let unpublished = core::mem::take(&mut self.sysv_unpublished);
+        segments.extend(&unpublished);
         let changes: Vec<(SegmentId, u64)> = segments
             .into_iter()
             .map(|segment| (segment, self.sysv_count(segment)))
             .filter(|&(segment, count)| {
-                count != self.sysv_counts.get(&segment).copied().unwrap_or(0)
+                unpublished.contains(&segment)
+                    || count != self.sysv_counts.get(&segment).copied().unwrap_or(0)
             })
             .collect();
         if changes.is_empty() {
             return Vec::new();
         }
         let generation = self.next_sysv_generation();
-        self.report_sysv_counts(changes, generation)
+        self.record_sysv_counts(changes, generation)
     }
 
-    /// Takes the count of every segment this address space maps, under a new generation.
+    /// Takes the count of every segment this address space maps or whose last count failed to
+    /// publish, under a new generation.
     pub(super) fn snapshot_sysv_counts(&mut self) -> (u64, Vec<SegmentAttachmentCount>) {
         self.sysv_changed.clear();
-        let segments: BTreeSet<SegmentId> = (self.sysv_attachments.values())
-            .map(|attachment| attachment.segment)
-            .collect();
+        let mut segments = core::mem::take(&mut self.sysv_unpublished);
+        segments.extend((self.sysv_attachments.values()).map(|attachment| attachment.segment));
         let counts = segments
             .into_iter()
             .map(|segment| (segment, self.sysv_count(segment)))
             .collect();
         let generation = self.next_sysv_generation();
-        (generation, self.report_sysv_counts(counts, generation))
+        (generation, self.record_sysv_counts(counts, generation))
+    }
+
+    /// Marks the segments of `counts`, which failed to publish, for the next change to publish
+    /// again.
+    pub(super) fn unpublish_sysv_counts(&mut self, counts: &[SegmentAttachmentCount]) {
+        self.sysv_unpublished
+            .extend(counts.iter().map(|count| count.id));
     }
 
     /// Records `counts` as reported under `generation`.
-    fn report_sysv_counts(
+    fn record_sysv_counts(
         &mut self,
         counts: Vec<(SegmentId, u64)>,
         generation: u64,
@@ -1105,12 +1131,7 @@ where
 
     /// Marks a just-created, offset-zero shared object mapping as one `shmat`. Only this
     /// mapping's pages get the identity, even when mmap coalesced it with adjacent areas.
-    pub(super) fn register_sysv(
-        &mut self,
-        range: Range<usize>,
-        segment: SegmentId,
-        readonly: bool,
-    ) {
+    fn register_sysv(&mut self, range: Range<usize>, segment: SegmentId, readonly: bool) {
         let identity = self.next_sysv_tag();
         let mut vma = *self.vmas.get(&range.start).unwrap();
         let Sharing::Named(ref mut view) = vma.sharing else {
@@ -1185,13 +1206,8 @@ where
             .next_back()
             .ok_or(crate::errno::Errno::EINVAL)?;
         let pieces: Vec<_> = self
-            .vmas
-            .overlapping(base..a.end)
-            .filter(|(_, vma)| {
-                vma.sysv_view()
-                    .is_some_and(|(_, view)| view.identity == identity)
-            })
-            .map(|(range, _)| PageRange::new(range.start, range.end).unwrap())
+            .sysv_areas((base, identity), a.end)
+            .map(|range| PageRange::new(range.start, range.end).unwrap())
             .collect();
         // Like Linux, detach as many pieces as possible rather than stopping at a failure.
         let mut first_error = None;
@@ -3085,6 +3101,41 @@ mod tests {
                 generation,
             }]
         );
+        assert_eq!(counts(vm.take_sysv_changes()), BTreeMap::new());
+    }
+
+    #[test]
+    fn sysv_counts_that_failed_to_publish_are_taken_again() {
+        let backend = dummy_backend::<true>(None);
+        let mut vm = Vmem::<_, PAGE_SIZE>::new(backend);
+        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
+        // SAFETY: The test owns the mock address space.
+        unsafe {
+            vm.create_shared_object_mapping(
+                NonZeroAddress::new(start),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                CreatePagesFlags::FIXED_ADDR,
+                MemoryRegionPermissions::READ,
+                None,
+                shared_object_mapping(1, 0, true),
+            )
+        }
+        .unwrap();
+        vm.register_sysv(start..start + PAGE_SIZE, SegmentId(3), false);
+        // SAFETY: The test owns the mock pages.
+        unsafe { vm.detach_sysv(start) }.unwrap();
+        // The final count fails to publish after the attachment is gone.
+        let failed = vm.take_sysv_changes();
+        assert_eq!(counts(failed.clone()), [(SegmentId(3), 0)].into());
+        vm.unpublish_sysv_counts(&failed);
+        // Any later change, or a fork's snapshot, takes it again under a newer generation.
+        let retried = vm.take_sysv_changes();
+        assert_eq!(counts(retried.clone()), [(SegmentId(3), 0)].into());
+        assert!(retried[0].generation > failed[0].generation);
+        assert_eq!(counts(vm.take_sysv_changes()), BTreeMap::new());
+        vm.unpublish_sysv_counts(&retried);
+        let (_, snapshot) = vm.snapshot_sysv_counts();
+        assert_eq!(counts(snapshot), [(SegmentId(3), 0)].into());
         assert_eq!(counts(vm.take_sysv_changes()), BTreeMap::new());
     }
 

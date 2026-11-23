@@ -10,6 +10,7 @@ use core::ops::Range;
 
 use alloc::vec::Vec;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
+use litebox::segment::SegmentError;
 use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
@@ -52,7 +53,6 @@ impl MmapPlacement {
     };
 }
 
-/// A page manager to support `mmap`, `munmap`, and etc.
 /// Where [`VmemManager::attach_sysv`] places a SysV attachment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SysvAddress {
@@ -64,6 +64,7 @@ pub enum SysvAddress {
     Replace(usize),
 }
 
+/// A page manager to support `mmap`, `munmap`, and etc.
 pub struct VmemManager<Platform, const ALIGN: usize>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
@@ -72,32 +73,62 @@ where
 }
 
 /// Exclusive access to an address space, which publishes the SysV attachment counts the change
-/// made once it unlocks the address space, before the changing call returns. The counts carry
-/// generations, so the broker keeps the newest even if concurrent changes publish out of order.
+/// made once it unlocks the address space, before the changing call returns.
 struct VmemUpdateGuard<'a, Platform, const ALIGN: usize>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     // Dropped before `publication`, so that publishing happens unlocked.
     vmem: RwLockWriteGuard<'a, Platform, Vmem<Platform, ALIGN>>,
-    publication: SysvPublication,
+    publication: SysvPublication<'a, Platform, ALIGN>,
 }
 
 /// SysV attachment counts to publish when dropped.
-#[derive(Default)]
-struct SysvPublication {
+struct SysvPublication<'a, Platform, const ALIGN: usize>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    vmem: &'a RwLock<Platform, Vmem<Platform, ALIGN>>,
     publish: Option<SysvPublish>,
     counts: Vec<SegmentAttachmentCount>,
 }
 
-impl Drop for SysvPublication {
+impl<Platform, const ALIGN: usize> Drop for SysvPublication<'_, Platform, ALIGN>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
     fn drop(&mut self) {
         if let Some(publish) = &self.publish
             && !self.counts.is_empty()
         {
-            publish(&self.counts);
+            let _ = publish_sysv_counts(self.vmem, publish, &self.counts);
         }
     }
+}
+
+/// Publishes `counts` unlocked. If that fails for a reason a retry may overcome, the next change
+/// of the address space publishes their segments' counts again, even if unchanged: otherwise a
+/// failed final count of zero would leave the broker holding the attachment until exit.
+fn publish_sysv_counts<Platform, const ALIGN: usize>(
+    vmem: &RwLock<Platform, Vmem<Platform, ALIGN>>,
+    publish: &SysvPublish,
+    counts: &[SegmentAttachmentCount],
+) -> Result<(), SegmentError>
+where
+    Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+{
+    publish(counts).inspect_err(|error| {
+        if matches!(
+            error,
+            SegmentError::NoMemory
+                | SegmentError::NoSpace
+                | SegmentError::Io
+                | SegmentError::ServiceFailed
+        ) {
+            // Not `lock_for_update`: marking the counts publishes nothing.
+            vmem.write().unpublish_sysv_counts(counts);
+        }
+    })
 }
 
 impl<Platform, const ALIGN: usize> Drop for VmemUpdateGuard<'_, Platform, ALIGN>
@@ -107,10 +138,8 @@ where
     fn drop(&mut self) {
         let counts = self.vmem.take_sysv_changes();
         if !counts.is_empty() {
-            self.publication = SysvPublication {
-                publish: self.vmem.sysv_publish.clone(),
-                counts,
-            };
+            self.publication.publish = self.vmem.sysv_publish.clone();
+            self.publication.counts = counts;
         }
     }
 }
@@ -144,7 +173,11 @@ where
     fn lock_for_update(&self) -> VmemUpdateGuard<'_, Platform, ALIGN> {
         VmemUpdateGuard {
             vmem: self.vmem.write(),
-            publication: SysvPublication::default(),
+            publication: SysvPublication {
+                vmem: &self.vmem,
+                publish: None,
+                counts: Vec::new(),
+            },
         }
     }
 }
@@ -168,7 +201,9 @@ where
     /// `platform` must be able to manage every inherited mapping and reservation. The copied
     /// parent runtime must never use this manager again.
     pub unsafe fn rebind_platform_after_clone(&self, platform: &'static Platform) {
-        self.lock_for_update().platform = platform;
+        // Not `lock_for_update`: the copied parent's publisher must not run in the child, which
+        // publishes any counts left unpublished once it sets its own.
+        self.vmem.write().platform = platform;
     }
 
     /// Sets how this address space publishes `publish(counts)`: how many areas map each SysV
@@ -177,11 +212,11 @@ where
     ///
     /// It runs once per update, after the update unlocks this manager and before the updating
     /// call returns, so concurrent updates may publish out of order. Each count carries a
-    /// generation that orders it, and a full count, so the next one of a segment also makes up for
-    /// a failed one.
+    /// generation that orders it, and a full count. If publishing fails with an error a retry may
+    /// overcome, the next update publishes those segments' counts again.
     pub fn set_sysv_publisher(
         &self,
-        publish: impl Fn(&[SegmentAttachmentCount]) + Send + Sync + 'static,
+        publish: impl Fn(&[SegmentAttachmentCount]) -> Result<(), SegmentError> + Send + Sync + 'static,
     ) {
         self.lock_for_update().sysv_publish = Some(alloc::sync::Arc::new(publish));
     }
@@ -191,11 +226,16 @@ where
         self.vmem.read().has_sysv_attachments()
     }
 
-    /// Returns how many areas map each SysV segment, under one generation newer than any count
-    /// published or confirmed before, for a child that inherits this address space to copy once
-    /// they are published. The publisher does not publish them.
-    pub fn snapshot_sysv_counts(&self) -> (u64, Vec<SegmentAttachmentCount>) {
-        self.lock_for_update().snapshot_sysv_counts()
+    /// Publishes how many areas map each SysV segment, under one generation newer than any count
+    /// published or confirmed before, and returns it, for a child that inherits this address
+    /// space to copy the counts from.
+    pub fn publish_sysv_counts_for_child(&self) -> Result<u64, SegmentError> {
+        let mut vmem = self.lock_for_update();
+        let publish = vmem.sysv_publish.clone().ok_or(SegmentError::Unavailable)?;
+        let (generation, counts) = vmem.snapshot_sysv_counts();
+        drop(vmem);
+        publish_sysv_counts(&self.vmem, &publish, &counts)?;
+        Ok(generation)
     }
 
     /// Create a mapping with the given flags.

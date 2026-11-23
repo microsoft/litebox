@@ -93,7 +93,6 @@ pub struct PreparedAttach<Object> {
     pub object: SharedFileObject<Object>,
     /// The segment's byte length, before rounding to pages.
     pub size: u64,
-    /// Confirms the attachment or, if dropped first, cancels it.
     pub reservation: AttachReservation,
 }
 
@@ -221,5 +220,76 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Refuses confirmations, and records which attachment it cancelled.
+    #[derive(Default)]
+    struct RefusingBroker {
+        cancelled: AtomicU64,
+    }
+
+    impl SegmentControl for RefusingBroker {
+        fn get_segment(&self, _: GetSegmentRequest) -> SegmentControlResult<SegmentId> {
+            unreachable!()
+        }
+        fn segment_status(&self, _: SegmentId) -> SegmentControlResult<SegmentStatus> {
+            unreachable!()
+        }
+        fn segment_slot_status(
+            &self,
+            _: SegmentSlotStatusRequest,
+        ) -> SegmentControlResult<SegmentSlotStatus> {
+            unreachable!()
+        }
+        fn segment_info(&self) -> SegmentControlResult<SegmentInfo> {
+            unreachable!()
+        }
+        fn set_segment(&self, _: SetSegmentRequest) -> SegmentControlResult<()> {
+            unreachable!()
+        }
+        fn remove_segment(&self, _: SegmentId) -> SegmentControlResult<()> {
+            unreachable!()
+        }
+        fn prepare_segment_attach(
+            &self,
+            _: PrepareSegmentAttachRequest,
+        ) -> SegmentControlResult<litebox_broker_protocol::segment::PreparedSegmentAttach> {
+            unreachable!()
+        }
+        fn confirm_segment_attach(
+            &self,
+            _: ConfirmSegmentAttachRequest,
+        ) -> SegmentControlResult<()> {
+            Ok(Err(BrokerSegmentError::InvalidArgument))
+        }
+        fn cancel_segment_attach(&self, attachment: SegmentAttachId) -> SegmentControlResult<()> {
+            self.cancelled.store(attachment.0, Ordering::Relaxed);
+            Ok(Ok(()))
+        }
+        fn set_segment_attachments(&self, _: SegmentAttachmentCounts) -> SegmentControlResult<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn a_refused_confirmation_cancels_the_reservation() {
+        let broker = Arc::new(RefusingBroker::default());
+        let reservation = AttachReservation {
+            broker: broker.clone(),
+            attachment: Some(SegmentAttachId(9)),
+        };
+        let count = SegmentAttachmentCount {
+            id: SegmentId(1),
+            count: 1,
+            generation: 1,
+        };
+        assert_eq!(reservation.confirm(count), Err(SegmentError::Invalid));
+        assert_eq!(broker.cancelled.load(Ordering::Relaxed), 9);
     }
 }

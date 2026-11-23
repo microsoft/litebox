@@ -103,20 +103,23 @@ impl<T: std::os::fd::AsFd + Send> HostHandle for Exported<T> {
 /// Creates memory for files in memfds, accessed only through positional I/O by the broker.
 pub struct MemfdFileMemoryProvider;
 
-/// Creates a close-on-exec memfd named `name` with `flags`.
-fn memfd(name: &core::ffi::CStr, flags: MemfdFlags) -> IoResult<File> {
-    rustix::fs::memfd_create(name, MemfdFlags::CLOEXEC | flags)
-        .map(File::from)
-        .map_err(IoError::from)
+/// Creates a close-on-exec memfd named `name` with `flags`, asking for execution support where
+/// the host otherwise seals memfds against execution. Older kernels and hosts that forbid it leave
+/// a plain memfd as the best available.
+fn memfd(name: &core::ffi::CStr, flags: MemfdFlags) -> Result<File, CreateMemoryError> {
+    let create = |flags| {
+        rustix::fs::memfd_create(name, MemfdFlags::CLOEXEC | flags)
+            .map(File::from)
+            .map_err(IoError::from)
+    };
+    create(flags | MemfdFlags::EXEC)
+        .or_else(|_| create(flags))
+        .map_err(|error| create_memory_error(&error))
 }
 
 impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
     fn create(&self) -> Result<SharedFileMemory, CreateMemoryError> {
-        // Ask for execution support where the host otherwise seals memfds against execution.
-        // Older kernels and hosts that forbid it leave a plain memfd as the best available.
-        let file = memfd(c"litebox-shared-file", MemfdFlags::EXEC)
-            .or_else(|_| memfd(c"litebox-shared-file", MemfdFlags::empty()))
-            .map_err(|error| create_memory_error(&error))?;
+        let file = memfd(c"litebox-shared-file", MemfdFlags::empty())?;
         Ok(create::<Memfd>(file))
     }
 
@@ -126,13 +129,7 @@ impl SharedFileMemoryProvider for MemfdFileMemoryProvider {
             .ok()
             .filter(|length| *length <= Memfd::size_limit())
             .ok_or(CreateMemoryError::NoSpace)?;
-        // As for files: executable attaches need a memfd the host does not seal against it.
-        let file = memfd(
-            c"litebox-segment",
-            MemfdFlags::ALLOW_SEALING | MemfdFlags::EXEC,
-        )
-        .or_else(|_| memfd(c"litebox-segment", MemfdFlags::ALLOW_SEALING))
-        .map_err(|error| create_memory_error(&error))?;
+        let file = memfd(c"litebox-segment", MemfdFlags::ALLOW_SEALING)?;
         file.set_len(length)
             .map_err(|error| create_memory_error(&error))?;
         fcntl_add_seals(&file, SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)

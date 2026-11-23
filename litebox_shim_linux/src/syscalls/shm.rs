@@ -13,15 +13,17 @@ use crate::{ShimPlatform, Task, UserPtrMut};
 use litebox::segment::{PreparedAttach, SegmentError};
 use litebox_broker_protocol::fs::FileUser;
 use litebox_broker_protocol::segment::{
-    GetSegmentRequest, PrepareSegmentAttachRequest, SegmentId, SegmentInfo, SegmentStatus,
-    SetSegmentRequest,
+    GetSegmentRequest, PrepareSegmentAttachRequest, SEGMENT_PAGE_SIZE, SegmentId, SegmentInfo,
+    SegmentStatus, SetSegmentRequest,
 };
 use litebox_common_linux::{
     IpcPerm, PAGE_SIZE, ProtFlags, SHM_DEST, ShmLimits, ShmUsage, ShmatFlags, ShmctlCmd,
     ShmgetFlags, ShmidDs, errno::Errno, mm::SysvAddress, vmem::SharedObjectMapping,
 };
 
-/// Builds `shmid_ds` from a segment's metadata.
+// The broker bounds attachment counts by segment pages, each of which `shmat` maps as a guest page.
+const _: () = assert!(SEGMENT_PAGE_SIZE == PAGE_SIZE as u64);
+
 fn shmid_ds(status: &SegmentStatus) -> ShmidDs {
     ShmidDs {
         shm_perm: IpcPerm {
@@ -212,7 +214,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     shmmni: segments,
                     // Linux bounds a process's attached segments only by `shmmni`.
                     shmseg: segments,
-                    shmall: info.max_total_bytes / PAGE_SIZE as u64,
+                    shmall: info.max_total_bytes / SEGMENT_PAGE_SIZE,
                     ..ShmLimits::default()
                 };
                 buf.cast::<ShmLimits>()
@@ -222,7 +224,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             ShmctlCmd::Usage => {
                 let info = litebox.segment_info()?;
-                let pages = info.bytes / PAGE_SIZE as u64;
+                let pages = info.bytes / SEGMENT_PAGE_SIZE;
                 let usage = ShmUsage {
                     used_ids: i32::try_from(info.segments).unwrap_or(i32::MAX),
                     shm_tot: pages,

@@ -37,7 +37,8 @@ use litebox_broker_protocol::{
     shared_futex::SharedMemoryId,
 };
 
-const PAGE_SIZE: u64 = 4096;
+use litebox_broker_protocol::segment::SEGMENT_PAGE_SIZE as PAGE_SIZE;
+
 // Guests see IDs as non-negative `int`s.
 const _: () = assert!(MAX_ALLOCATED_ID <= i32::MAX.cast_unsigned());
 // Guests also see slots as non-negative `int`s.
@@ -234,9 +235,15 @@ impl Segment {
         }
     }
 
-    fn record_attach(&mut self, process: &BrokerProcess) {
+    /// Records the time and process of an attach, which callers count themselves.
+    fn stamp_attach(&mut self, process: &BrokerProcess) {
         self.status.attach_time = process.core.timer_provider.unix_seconds();
         self.last_operator = Some(Arc::clone(&process.ids));
+    }
+
+    /// The most areas `attaches` attaches can map: one per page of the segment each.
+    fn max_areas(&self, attaches: u64) -> u64 {
+        attaches.saturating_mul(self.length / PAGE_SIZE)
     }
 }
 
@@ -339,6 +346,15 @@ pub(crate) struct ProcessSegments {
 }
 
 impl ProcessSegments {
+    /// Whether a count of segment `id` with `generation` is newer than the
+    /// last one applied, or than the one that ended the process's attachment.
+    fn is_newer(&self, id: SegmentId, generation: u64) -> bool {
+        match self.attachments.get(&id) {
+            Some(held) => generation > held.generation,
+            None => generation > self.ended_generation,
+        }
+    }
+
     /// Moves the process to a new, empty namespace. Its attachments live on.
     pub(crate) fn reset_namespace(&mut self) {
         self.namespace = Arc::default();
@@ -453,8 +469,8 @@ pub fn remove(process: &BrokerProcess, id: SegmentId) -> crate::Result<SegmentRe
 /// Reserves an attachment and lends `process` the segment's backing object.
 ///
 /// `deliver(object, writable, executable, length)` lends the object to this
-/// association only, attenuated to `writable` and `executable`, and returns its
-/// delivery token. It runs
+/// association only, attenuated to `writable`, and returns its delivery token.
+/// It runs
 /// without broker locks held. The reservation becomes an attachment only when
 /// the process confirms it ([`confirm_attach`]).
 pub fn prepare_attach(
@@ -497,7 +513,7 @@ pub fn set_attachments(
     finish(Caller::new(process).and_then(|caller| {
         let mut first_error = None;
         for &count in counts.as_slice() {
-            match caller.set_attachments(count) {
+            match caller.set_attachment_count(count) {
                 Ok(()) => {}
                 Err(Failure::Segment(error)) => {
                     first_error.get_or_insert(error);
@@ -547,7 +563,7 @@ pub(crate) fn inherit(
     for (id, a, mut s) in inherited {
         s.status.attachments += a.count;
         // Fork's implicit attaches count as the forking process's.
-        s.record_attach(parent);
+        s.stamp_attach(parent);
         dest.attachments.insert(*id, a.clone());
     }
     Ok(())
@@ -901,19 +917,16 @@ impl<'a> Caller<'a> {
         if segment.id != id {
             return Err(E::InvalidArgument.into());
         }
-        let held = local.attachments.get(&id);
         // The confirmation is the process's newest count of the segment.
-        if held.is_some_and(|held| generation <= held.generation)
-            || held.is_none() && generation <= local.ended_generation
-        {
+        if !local.is_newer(id, generation) {
             return Err(E::InvalidArgument.into());
         }
-        let (old_count, attaches) = held.map_or((0, 1), |held| (held.count, held.attaches + 1));
+        let (old_count, attaches) =
+            (local.attachments.get(&id)).map_or((0, 1), |held| (held.count, held.attaches + 1));
         let now = self.now();
         {
             let mut s = segment.entry.lock();
-            // Each attach maps at most one area per page of the segment.
-            if count == 0 || count > attaches.saturating_mul(s.length / PAGE_SIZE) {
+            if count == 0 || count > s.max_areas(attaches) {
                 return Err(E::InvalidArgument.into());
             }
             // The reservation already counts this attachment, so the others
@@ -926,7 +939,7 @@ impl<'a> Caller<'a> {
             if count <= old_count {
                 s.status.detach_time = now;
             }
-            s.record_attach(self.process);
+            s.stamp_attach(self.process);
         }
         let segment = local
             .pending_attaches
@@ -954,36 +967,34 @@ impl<'a> Caller<'a> {
         Ok(())
     }
 
-    fn set_attachments(&self, request: SegmentAttachmentCount) -> Outcome<()> {
+    fn set_attachment_count(&self, request: SegmentAttachmentCount) -> Outcome<()> {
         let SegmentAttachmentCount {
             id,
             count,
             generation,
         } = request;
         let mut local = self.segments()?;
-        let ended_generation = local.ended_generation;
+        if !local.is_newer(id, generation) {
+            return Ok(());
+        }
         let Some(held) = local.attachments.get_mut(&id) else {
-            return if count == 0 || generation <= ended_generation {
+            return if count == 0 {
                 Ok(())
             } else {
                 Err(E::InvalidArgument.into())
             };
         };
-        if generation <= held.generation {
-            return Ok(());
-        }
         match count.cmp(&held.count) {
             core::cmp::Ordering::Equal => {}
             core::cmp::Ordering::Greater => {
                 let mut s = held.segment.entry.lock();
-                // Each attach maps at most one area per page of the segment.
-                if count > held.attaches.saturating_mul(s.length / PAGE_SIZE) {
+                if count > s.max_areas(held.attaches) {
                     return Err(E::InvalidArgument.into());
                 }
                 let added = count - held.count;
                 s.check_room(added)?;
                 s.status.attachments += added;
-                s.record_attach(self.process);
+                s.stamp_attach(self.process);
                 held.count = count;
             }
             core::cmp::Ordering::Less => {
@@ -1412,6 +1423,82 @@ mod tests {
         cancel_attach(&p, attachment).unwrap().unwrap();
         assert_eq!(status(&p, id).unwrap(), Err(E::InvalidArgument));
         assert_eq!(lookup(&p, 51), Ok(replacement));
+    }
+
+    #[test]
+    fn a_read_only_association_changes_no_segments() {
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::WAIT)
+                .with_segment_principal(ROOT),
+        )
+        .with_random_provider(Arc::new(TestRandomProvider))
+        .with_segment_memory_provider(Arc::new(Provider))
+        .build()
+        .unwrap();
+        let p = new_root(&broker);
+        assert_eq!(
+            get(&p, request(64, 123, true, true)).unwrap(),
+            Err(E::AccessDenied)
+        );
+        assert_eq!(lookup(&p, 64), Err(E::Missing));
+        assert!(matches!(
+            new_namespace(&p, p.id()),
+            Err(BrokerError::PolicyDenied)
+        ));
+    }
+
+    #[test]
+    fn pending_attaches_are_bounded_per_process() {
+        let limits = BrokerCoreLimits {
+            max_threads_per_process: 1,
+            ..BrokerCoreLimits::DEFAULT
+        };
+        let Setup { root: p, .. } = setup_with(ROOT, limits);
+        let id = create(&p, 61);
+        let request = PrepareSegmentAttachRequest {
+            id,
+            writable: false,
+            executable: false,
+        };
+        // Another reservation taken while this one delivers fills the bound.
+        let mut inner = None;
+        let outer = prepare_attach(&p, request, |_, _, _, _| {
+            inner = Some(prepare(&p, id, false).attachment);
+            Ok(1)
+        });
+        assert_eq!(outer.unwrap(), Err(E::NoSpace));
+        assert_eq!(prepare_with(&p, id, false, Ok(2)), Err(E::NoSpace));
+        // Neither refused attach left a reservation pinning the removed segment.
+        remove(&p, id).unwrap().unwrap();
+        cancel_attach(&p, inner.unwrap()).unwrap().unwrap();
+        assert_eq!(status(&p, id).unwrap(), Err(E::InvalidArgument));
+    }
+
+    #[test]
+    fn confirmations_must_count_the_reserved_segment_within_its_pages() {
+        let Setup { root: p, .. } = setup(ROOT);
+        // One page, so one attach maps at most one area.
+        let id = create(&p, 62);
+        let other = create(&p, 63);
+        attach(&p, other, true);
+        let attachment = prepare(&p, id, true).attachment;
+        let confirm_as = |id, count| {
+            let count = SegmentAttachmentCount {
+                id,
+                count,
+                generation: next_generation(&p),
+            };
+            confirm_attach(&p, ConfirmSegmentAttachRequest { attachment, count }).unwrap()
+        };
+        assert_eq!(confirm_as(other, 2), Err(E::InvalidArgument));
+        assert_eq!(confirm_as(id, 0), Err(E::InvalidArgument));
+        assert_eq!(confirm_as(id, 2), Err(E::InvalidArgument));
+        assert_eq!(status_of(&p, other).attachments, 1);
+        assert_eq!(status_of(&p, id).attachments, 0);
+        // Each refusal left the reservation to cancel.
+        remove(&p, id).unwrap().unwrap();
+        cancel_attach(&p, attachment).unwrap().unwrap();
+        assert_eq!(status(&p, id).unwrap(), Err(E::InvalidArgument));
     }
 
     #[test]

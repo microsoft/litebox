@@ -476,12 +476,12 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         // it is gone, the broker has released all of this process's attachments.
         let segment_client = Arc::downgrade(&litebox);
         self.memory_manager.set_sysv_publisher(move |counts| {
-            if let Some(litebox) = segment_client.upgrade()
-                && let Err(error) = litebox.set_segment_attachments(counts)
-            {
-                // A segment's next publication, with its full count, makes up for this one.
+            let Some(litebox) = segment_client.upgrade() else {
+                return Ok(());
+            };
+            litebox.set_segment_attachments(counts).inspect_err(|error| {
                 litebox_util_log::warn!(counts:?, error:?; "failed to update shared segment attachment counts");
-            }
+            })
         });
         let global = Arc::new(GlobalState {
             platform: self.platform,

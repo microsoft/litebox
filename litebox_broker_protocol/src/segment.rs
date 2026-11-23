@@ -8,6 +8,9 @@ use thiserror::Error;
 
 use crate::fs::{FileUser, MapFileResponse};
 
+/// The page size that segment lengths, byte totals and attachment counts are in.
+pub const SEGMENT_PAGE_SIZE: u64 = 4096;
+
 /// Names one segment, unique across namespaces while it lives.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SegmentId(pub u32);
@@ -197,8 +200,8 @@ wire_struct! {
         /// The reservation.
         pub attachment: SegmentAttachId,
         /// The caller's total for the reserved segment, including this
-        /// attachment, which replaces the broker's like
-        /// [`SegmentAttachmentCount`].
+        /// attachment, which replaces the broker's. It must be newer than any
+        /// count the caller sent before for the segment.
         pub count: SegmentAttachmentCount,
     }
 }

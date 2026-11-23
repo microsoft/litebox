@@ -164,6 +164,8 @@ fn report_delivery_failure(error: IoError) -> DeliveryFailure {
         _ if litebox_broker_transport_linux_userland::is_resource_exhaustion(&error) => {
             DeliveryFailure::NoSpace
         }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        _ if windows::is_resource_exhaustion(&error) => DeliveryFailure::NoSpace,
         _ => DeliveryFailure::Io,
     }
 }

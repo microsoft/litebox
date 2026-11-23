@@ -1996,14 +1996,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if !self.global.mm.has_sysv_attachments() {
             return Ok(None);
         }
-        let (generation, counts) = self.global.mm.snapshot_sysv_counts();
-        self.global
-            .litebox
-            .set_segment_attachments(&counts)
-            .map_err(|error| match error {
-                litebox::segment::SegmentError::NoMemory => Errno::ENOMEM,
-                _ => Errno::EAGAIN,
-            })?;
+        let generation =
+            self.global
+                .mm
+                .publish_sysv_counts_for_child()
+                .map_err(|error| match error {
+                    litebox::segment::SegmentError::NoMemory => Errno::ENOMEM,
+                    _ => Errno::EAGAIN,
+                })?;
         Ok(Some(generation))
     }
 

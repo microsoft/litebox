@@ -215,27 +215,40 @@ fn temp_file() -> Result<File, CreateMemoryError> {
 /// Classifies a failure creating memory, telling the host running out of memory or handles
 /// apart from the disk being full.
 fn create_memory_error(error: &IoError) -> CreateMemoryError {
-    use windows_sys::Win32::Foundation::{
-        ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_NO_SYSTEM_RESOURCES,
-        ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
-        ERROR_TOO_MANY_OPEN_FILES,
-    };
+    use windows_sys::Win32::Foundation::{ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL};
 
+    if is_resource_exhaustion(error) {
+        return CreateMemoryError::OutOfMemory;
+    }
     match error
         .raw_os_error()
         .and_then(|code| u32::try_from(code).ok())
     {
-        Some(
-            ERROR_NOT_ENOUGH_MEMORY
-            | ERROR_OUTOFMEMORY
-            | ERROR_COMMITMENT_LIMIT
-            | ERROR_NOT_ENOUGH_QUOTA
-            | ERROR_NO_SYSTEM_RESOURCES
-            | ERROR_TOO_MANY_OPEN_FILES,
-        ) => CreateMemoryError::OutOfMemory,
         Some(ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL) => CreateMemoryError::NoSpace,
         _ => CreateMemoryError::Io,
     }
+}
+
+/// Returns whether `error` reports the host running out of memory, quota or handles.
+pub(super) fn is_resource_exhaustion(error: &IoError) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_COMMITMENT_LIMIT, ERROR_NO_SYSTEM_RESOURCES, ERROR_NOT_ENOUGH_MEMORY,
+        ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY, ERROR_TOO_MANY_OPEN_FILES,
+    };
+
+    matches!(
+        error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok()),
+        Some(
+            ERROR_NOT_ENOUGH_MEMORY
+                | ERROR_OUTOFMEMORY
+                | ERROR_COMMITMENT_LIMIT
+                | ERROR_NOT_ENOUGH_QUOTA
+                | ERROR_NO_SYSTEM_RESOURCES
+                | ERROR_TOO_MANY_OPEN_FILES
+        )
+    )
 }
 
 /// Makes `file` sparse, so that sections covering mappings past its end, which extend it, take
@@ -364,6 +377,26 @@ mod tests {
     #[test]
     fn temp_file_memory_stays_within_size_limits() {
         super::super::host_file::tests::check_size_limit::<TempFile>(temp_file().unwrap());
+    }
+
+    #[test]
+    fn failing_to_deliver_for_lack_of_host_resources_is_a_lack_of_space() {
+        use litebox_broker_protocol::segment::SegmentError;
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_COMMITMENT_LIMIT};
+
+        let failure = |code: u32| {
+            super::super::report_delivery_failure(IoError::from_raw_os_error(
+                i32::try_from(code).unwrap(),
+            ))
+        };
+        assert!(matches!(
+            failure(ERROR_COMMITMENT_LIMIT).segment_error(),
+            SegmentError::NoSpace
+        ));
+        assert!(matches!(
+            failure(ERROR_ACCESS_DENIED).segment_error(),
+            SegmentError::Io
+        ));
     }
 
     #[test]

@@ -4,7 +4,8 @@
 // Checks creating UTS and IPC namespaces with `clone`, `clone3`, and `unshare`, and the host and
 // NIS domain names a UTS namespace holds: setting and reading them, that the processes in a
 // namespace share them, and that a new namespace starts with a copy. Runs as guest root, or, with
-// the argument `unprivileged`, as another user, who can't create namespaces or set the names.
+// the argument `unprivileged`, as another user, who can't create namespaces or set the names, but
+// can give away a shared memory segment it created.
 //
 // A new IPC namespace starts without its creator's shared memory segments, though attachments
 // made before the switch stay usable. With the argument `segments`, checks only that, as guest
@@ -552,6 +553,24 @@ static void unprivileged_creates_nothing(void) {
     CHECK(unshare_in_a_vfork_child(CLONE_NEWPID | CLONE_NEWUTS) == EPERM);
 }
 
+// Without root, IPC_SET may give a segment to another user; its creator still controls it.
+static void unprivileged_gives_a_segment_away(void) {
+    int id = shmget(IPC_PRIVATE, 4096, 0600);
+    CHECK(id >= 0);
+    if (id < 0) {
+        return;
+    }
+    struct shmid_ds ds;
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0);
+    ds.shm_perm.uid = geteuid() + 1;
+    CHECK(shmctl(id, IPC_SET, &ds) == 0);
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_perm.uid == geteuid() + 1);
+    CHECK(ds.shm_perm.cuid == geteuid());
+    ds.shm_perm.uid = geteuid();
+    CHECK(shmctl(id, IPC_SET, &ds) == 0);
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+}
+
 int main(int argc, char **argv) {
     // A program a child execs checks that it has the given names, or sets the given host name.
     if (argc == 4 && strcmp(argv[1], "check") == 0) {
@@ -564,6 +583,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "unprivileged") == 0) {
         unprivileged_creates_nothing();
         unprivileged_changes_no_names();
+        unprivileged_gives_a_segment_away();
         printf("uts-ipc-namespace unprivileged failures=%d\n", failures);
         return failures != 0;
     }
