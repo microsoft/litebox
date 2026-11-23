@@ -38,8 +38,5 @@ enforce_singleton_litebox_instance = []
 [dev-dependencies]
 litebox_broker_local = { version = "0.1.0", path = "../litebox_broker_local", features = ["test-support"] }
 
-[target.'cfg(all(target_os = "linux", target_arch = "riscv64"))'.dev-dependencies]
-libc = { version = "0.2.169", default-features = false }
-
 [lints]
 workspace = true
