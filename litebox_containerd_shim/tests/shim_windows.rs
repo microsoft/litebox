@@ -6,7 +6,8 @@
 //! container needs administrator rights, the Containers feature, and a Windows image's layers:
 //! `LITEBOX_TEST_WINDOWS_LAYERS` names their folders, `;`-separated and topmost first, such as
 //! nanoserver:ltsc2025's under containerd's `windows` snapshotter or Docker's `windowsfilter`
-//! driver (as CI gives them). So the tests are ignored by default.
+//! driver (as CI gives them, through `.github/tools/pull_windows_test_layers.ps1`). So the tests
+//! are ignored by default.
 
 #![cfg(all(windows, target_arch = "x86_64"))]
 
