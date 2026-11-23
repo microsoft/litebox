@@ -121,15 +121,13 @@ fn timestamp_readback_uses_signed_live_host_metadata() {
 
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("file");
-    fs::write(&path, b"content").unwrap();
+    // Keep the writer open: a writable close can trigger a host-side access that changes atime.
+    let host_file = fs::File::create(&path).unwrap();
     let local = backend(temp.path());
     let file = local
         .open_file(resolved_file(&local, "file"), OFlags::RDWR)
         .unwrap();
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap()
+    host_file
         .set_times(
             fs::FileTimes::new()
                 .set_accessed(UNIX_EPOCH - Duration::new(1, 123_456_700))
@@ -163,7 +161,8 @@ fn timestamp_readback_uses_signed_live_host_metadata() {
 #[test]
 fn explicit_signed_timestamp_updates_round_trip_for_files_and_directories() {
     let temp = tempfile::tempdir().unwrap();
-    fs::write(temp.path().join("file"), b"content").unwrap();
+    // On hosts such as WSL2, closing the writer can trigger an access that changes atime.
+    let _writer = fs::File::create(temp.path().join("file")).unwrap();
     let local = backend(temp.path());
     let access = FileTimestamp {
         seconds: -1_234_567,
@@ -231,7 +230,8 @@ fn unrepresentable_windows_timestamps_fail_without_updating_the_file() {
 fn now_uses_host_clock_and_omit_preserves_the_other_timestamp() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("file");
-    fs::write(&path, b"content").unwrap();
+    // On hosts such as WSL2, closing the writer can trigger an access that changes atime.
+    let _writer = fs::File::create(&path).unwrap();
     let local = backend(temp.path());
     let target = || ResolvedTarget::File(resolved_file(&local, "file"));
     let explicit = FileTimestamp {
@@ -307,7 +307,8 @@ fn timestamp_updates_do_not_follow_final_symlinks_outside_the_root() {
     let root = temp.path().join("root");
     fs::create_dir(&root).unwrap();
     let outside = temp.path().join("outside");
-    fs::write(&outside, b"untouched").unwrap();
+    // On hosts such as WSL2, closing the writer can trigger an access that changes atime.
+    let _writer = fs::File::create(&outside).unwrap();
     #[cfg(unix)]
     {
         symlink(&outside, root.join("escape")).unwrap();
