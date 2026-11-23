@@ -2,16 +2,16 @@
 // Licensed under the MIT license.
 
 //! A process's standard streams: the host ends that containerd names, `binary://` logging
-//! programs, and the threads that copy between the host ends and the guest service.
+//! programs (Unix only), and the threads that copy between the host ends and the guest service.
 
-use std::borrow::Cow;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read as _, Write as _};
-use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-use std::os::unix::process::CommandExt as _;
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+use std::fs::File;
+use std::io::{self, Read as _};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -22,30 +22,27 @@ use litebox_guest_service_protocol::guest_service::{
     CloseStdinRequest, ReadStreamRequest, WriteStreamRequest,
 };
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
-use rustix::event::{PollFd, PollFlags, Timespec};
 use url::Url;
 
+#[cfg(unix)]
+pub(crate) use self::unix::Logger;
+#[cfg(unix)]
+use self::unix::{Output, create_dirs, open_fifo, open_file, pending, wait_readable};
+#[cfg(windows)]
+pub(crate) use self::windows::Logger;
+#[cfg(windows)]
+use self::windows::{Output, create_dirs, open_fifo, open_file, pending, wait_readable};
 use crate::{Result, internal, unsupported};
 
 /// The most bytes one read carries.
 const CHUNK: u32 = 64 * 1024;
 
+/// How often a waiting input checks whether to end.
+const INPUT_POLL: Duration = Duration::from_millis(100);
+
 /// How long a blocked write to a host end waits before it checks again whether to give up.
-const WRITE_POLL: Timespec = Timespec {
-    tv_sec: 1,
-    tv_nsec: 0,
-};
+const WRITE_POLL: Duration = Duration::from_secs(1);
 
-/// How long a logging program may take to exit once its inputs end, before `SIGTERM`.
-const LOGGER_GRACE: Duration = Duration::from_secs(1);
-/// How long it may take to exit after `SIGTERM`, before `SIGKILL`: containerd's.
-const LOGGER_TERM_TIMEOUT: Duration = Duration::from_secs(12);
-
-/// Opens the host end that `uri` names: a FIFO (a path, or `fifo://`), or for an output a
-/// regular file (`file://`, percent-decoded as containerd does) to append to, whose missing
-/// directories are created as runc's shim creates them; `None` for none. A FIFO is opened
-/// read-write, so that opening it never blocks, and an input ends only with `CloseIO`, as with
-/// runc; and non-blocking, so that a write to it can give up (see [`write_all`]).
 fn open(uri: &str, input: bool) -> Result<Option<File>> {
     let (path, fifo) = match uri.split_once("://") {
         _ if uri.is_empty() => return Ok(None),
@@ -54,28 +51,28 @@ fn open(uri: &str, input: bool) -> Result<Option<File>> {
         Some(("file", _)) if !input => (parse(uri)?.1, false),
         _ => return Err(unsupported(format!("the I/O URI {uri:?}"))),
     };
-    let mut options = OpenOptions::new();
-    if fifo {
-        options
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK);
+    let file = if fifo {
+        open_fifo(&path, input)
     } else {
         if let Some(parent) = path.parent() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o755)
-                .create(parent)
-                .map_err(|error| {
-                    internal(format!("cannot create {}: {error}", parent.display()))
-                })?;
+            create_dirs(parent).map_err(|error| {
+                internal(format!("cannot create {}: {error}", parent.display()))
+            })?;
         }
-        options.append(true).create(true).mode(0o644);
-    }
-    let file = options
-        .open(&path)
-        .map_err(|error| internal(format!("cannot open {}: {error}", path.display())))?;
+        open_file(&path)
+    };
+    let file =
+        file.map_err(|error| internal(format!("cannot open {}: {error}", path.display())))?;
     Ok(Some(file))
+}
+
+fn open_output(uri: &str) -> Result<Option<Output>> {
+    let Some(file) = open(uri, false)? else {
+        return Ok(None);
+    };
+    Output::new(file)
+        .map(Some)
+        .map_err(|error| internal(format!("cannot open {uri}: {error}")))
 }
 
 /// The URI `uri`, which must have no host, and its percent-decoded path.
@@ -86,10 +83,16 @@ fn parse(uri: &str) -> Result<(Url, PathBuf)> {
     Ok((url, path))
 }
 
-/// The host ends of a process's streams: stdin, stdout and stderr.
+#[derive(Default)]
+pub struct Ends {
+    stdin: Option<File>,
+    stdout: Option<Output>,
+    stderr: Option<Output>,
+}
+
 pub struct Host {
-    pub files: [Option<File>; 3],
-    /// After `files`, so that its inputs end before it is reaped.
+    pub ends: Ends,
+    /// After `ends`, so that its inputs end before it is reaped.
     pub logger: Option<Logger>,
 }
 
@@ -101,109 +104,27 @@ impl Host {
         let stdin = open(&io.stdin, true)?;
         if io.stdout.starts_with("binary://") {
             let (logger, stdout, stderr) = Logger::spawn(&io.stdout, id, namespace)?;
+            let ends = Ends {
+                stdin,
+                stdout: Some(stdout),
+                stderr: (!io.terminal).then_some(stderr),
+            };
             return Ok(Self {
-                files: [stdin, Some(stdout), (!io.terminal).then_some(stderr)],
+                ends,
                 logger: Some(logger),
             });
         }
         let stderr = if io.terminal {
             None
         } else {
-            open(&io.stderr, false)?
+            open_output(&io.stderr)?
         };
-        Ok(Self {
-            files: [stdin, open(&io.stdout, false)?, stderr],
-            logger: None,
-        })
-    }
-}
-
-/// A logging program, run as containerd's runc shim runs it: descriptors 3 and 4 read the
-/// process's stdout and stderr, and it closes or writes to 5 once ready. Dropping it reaps it,
-/// as containerd's runc shim ends it: `SIGTERM`, then `SIGKILL`.
-pub struct Logger(Child);
-
-impl Logger {
-    /// Spawns the logging program of the `binary://` URI `uri`; returns it once it is ready, and
-    /// the write ends of its stdout and stderr.
-    fn spawn(uri: &str, id: &str, namespace: &str) -> Result<(Self, File, File)> {
-        let (url, program) = parse(uri)?;
-        let failed = |error: &dyn std::fmt::Display| {
-            internal(format!(
-                "cannot start the logging program {}: {error}",
-                program.display()
-            ))
+        let ends = Ends {
+            stdin,
+            stdout: open_output(&io.stdout)?,
+            stderr,
         };
-        // Each query pair is two arguments, decoded as Go's `url.Query` does.
-        let args = url.query_pairs().flat_map(|(key, value)| [key, value]);
-        let (stdout, stdout_end) = io::pipe().map_err(|error| failed(&error))?;
-        let (stderr, stderr_end) = io::pipe().map_err(|error| failed(&error))?;
-        let (ready, ready_end) = io::pipe().map_err(|error| failed(&error))?;
-        // Above 5, so that `dup2` onto 3 to 5 neither clobbers them nor keeps them close-on-exec.
-        let mut inherited = Vec::new();
-        for fd in [stdout.as_fd(), stderr.as_fd(), ready_end.as_fd()] {
-            let fd = rustix::io::fcntl_dupfd_cloexec(fd, 6).map_err(|error| failed(&error))?;
-            inherited.push(fd);
-        }
-        let mut command = Command::new(&program);
-        command
-            .args(args.map(Cow::into_owned))
-            .env_clear()
-            .env("CONTAINER_ID", id)
-            .env("CONTAINER_NAMESPACE", namespace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        // SAFETY: the hook makes async-signal-safe calls only, on descriptors it owns.
-        unsafe {
-            command.pre_exec(move || {
-                for (fd, target) in inherited.iter().zip(3..) {
-                    if libc::dup2(fd.as_raw_fd(), target) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
-        }
-        let mut logger = Self(command.spawn().map_err(|error| failed(&error))?);
-        drop((command, stdout, stderr, ready_end));
-        // Ready at EOF or a byte, without a time limit, as containerd does.
-        let ready = loop {
-            match (&ready).read(&mut [0]) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                read => break read,
-            }
-        };
-        if let Err(error) = ready {
-            let _ = logger.0.kill();
-            return Err(failed(&error));
-        }
-        Ok((
-            logger,
-            OwnedFd::from(stdout_end).into(),
-            OwnedFd::from(stderr_end).into(),
-        ))
-    }
-}
-
-impl Drop for Logger {
-    fn drop(&mut self) {
-        let pid = rustix::process::Pid::from_child(&self.0);
-        let exited = crate::exits_within(&self.0, LOGGER_GRACE).and_then(|exited| {
-            if !exited {
-                rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
-            }
-            crate::wait_or_kill(&mut self.0, Some(LOGGER_TERM_TIMEOUT))
-        });
-        match exited {
-            Ok(Some(_)) => {}
-            Ok(None) => log::warn!("the logging program did not exit in time; killed it"),
-            Err(error) => {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-                log::warn!("cannot wait for the logging program: {error}; killed it");
-            }
-        }
+        Ok(Self { ends, logger: None })
     }
 }
 
@@ -232,7 +153,11 @@ impl Pumps {
     pub fn start(
         client: &Arc<GuestServiceClient>,
         guest_id: &str,
-        [stdin, stdout, stderr]: [Option<File>; 3],
+        Ends {
+            stdin,
+            stdout,
+            stderr,
+        }: Ends,
         terminal: bool,
         closing: Arc<AtomicBool>,
         deleted: Arc<AtomicBool>,
@@ -329,18 +254,12 @@ fn copy_input(
     // Once closing, what is left of what was readable then.
     let mut left: Option<usize> = None;
     while !stop.load(Ordering::SeqCst) {
-        if closing.load(Ordering::SeqCst) {
-            let pending = rustix::io::ioctl_fionread(fifo).unwrap_or(0);
-            if *left.get_or_insert(usize::try_from(pending).unwrap_or(usize::MAX)) == 0 {
-                break;
-            }
+        if closing.load(Ordering::SeqCst) && *left.get_or_insert_with(|| pending(fifo)) == 0 {
+            break;
         }
-        let mut fds = [PollFd::new(fifo, PollFlags::IN)];
-        let timeout = Timespec {
-            tv_sec: 0,
-            tv_nsec: 100_000_000,
-        };
-        let _ = rustix::event::poll(&mut fds, Some(&timeout));
+        if !wait_readable(fifo) {
+            continue;
+        }
         let limit = left.unwrap_or(buffer.len()).min(buffer.len());
         let read = match (&*fifo).read(&mut buffer[..limit]) {
             Ok(0) => break,
@@ -374,7 +293,7 @@ fn copy_output(
     client: &GuestServiceClient,
     guest_id: String,
     stderr: bool,
-    mut sink: Option<File>,
+    mut sink: Option<Output>,
     activity: &Mutex<Activity>,
     deleted: &AtomicBool,
 ) {
@@ -394,8 +313,8 @@ fn copy_output(
             break;
         }
         activity.lock().expect("not poisoned").copying += 1;
-        if let Some(file) = &sink
-            && write_all(file, &response.data, deleted).is_err()
+        if let Some(output) = &sink
+            && output.write_all(&response.data, deleted).is_err()
         {
             sink = None;
         }
@@ -403,30 +322,6 @@ fn copy_output(
         activity.copying -= 1;
         activity.last = Instant::now();
     }
-}
-
-/// Writes `data` to `file`, waiting without a time limit while a non-blocking `file` is full,
-/// until `deleted` is set (seen within [`WRITE_POLL`]) or its reader hangs up.
-fn write_all(file: &File, mut data: &[u8], deleted: &AtomicBool) -> io::Result<()> {
-    while !data.is_empty() {
-        match (&*file).write(data) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(written) => data = &data[written..],
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if deleted.load(Ordering::SeqCst) {
-                    return Err(error);
-                }
-                let mut fds = [PollFd::new(file, PollFlags::OUT)];
-                let _ = rustix::event::poll(&mut fds, Some(&WRITE_POLL));
-                if fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP) {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -440,41 +335,7 @@ mod tests {
         GuestService, GuestServiceClient, create_guest_service,
     };
 
-    use super::{Logger, Pumps};
-
-    #[test]
-    fn a_child_that_cannot_be_waited_for_is_killed_and_reaped() {
-        // Its process's descriptor limit is lowered: only safe with a process to itself.
-        if std::env::var_os("NEXTEST_EXECUTION_MODE").is_none_or(|mode| mode != "process-per-test")
-        {
-            return;
-        }
-        let spawn = || {
-            std::process::Command::new("sleep")
-                .arg("60")
-                .spawn()
-                .unwrap()
-        };
-        let (mut hook, logger) = (spawn(), spawn());
-        let pids = [hook.id(), logger.id()];
-        // No descriptor is left for a pidfd.
-        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
-        let none = rustix::process::Rlimit {
-            current: Some(0),
-            maximum: limit.maximum,
-        };
-        rustix::process::setrlimit(rustix::process::Resource::Nofile, none).unwrap();
-        let waited = crate::wait_or_kill(&mut hook, Some(Duration::from_secs(60)));
-        drop(Logger(logger));
-        rustix::process::setrlimit(rustix::process::Resource::Nofile, limit).unwrap();
-        assert!(waited.is_err());
-        for pid in pids {
-            assert!(
-                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-                "{pid}"
-            );
-        }
-    }
+    use super::Pumps;
 
     /// A guest service whose `CloseStdin` reports its exec ID, then answers once released.
     struct Gated {
@@ -496,8 +357,14 @@ mod tests {
 
     #[test]
     fn closing_a_missing_stdin_does_not_wait_for_the_answer() {
-        let dir = tempfile::tempdir().unwrap();
-        let address = format!("unix://{}", dir.path().join("socket").display());
+        #[cfg(unix)]
+        let (_dir, address) = {
+            let dir = tempfile::tempdir().unwrap();
+            let address = format!("unix://{}", dir.path().join("socket").display());
+            (dir, address)
+        };
+        #[cfg(windows)]
+        let address = format!(r"\\.\pipe\litebox-shim-stdio-test-{}", std::process::id());
         let (called, calls) = mpsc::channel();
         let (unblock, blocked) = mpsc::channel();
         let gate = Mutex::new(blocked);
@@ -507,14 +374,23 @@ mod tests {
             .unwrap()
             .register_service(create_guest_service(service));
         server.start().unwrap();
-        let client = ttrpc::Client::connect(&address).unwrap();
+        // On Windows, the server creates its pipe once it runs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let client = loop {
+            match ttrpc::Client::connect(&address) {
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                client => break client.unwrap(),
+            }
+        };
         let client = Arc::new(GuestServiceClient::new(client));
         let (done, returned) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             let pumps = Pumps::start(
                 &client,
                 "1",
-                [None, None, None],
+                super::Ends::default(),
                 false,
                 Arc::default(),
                 Arc::default(),

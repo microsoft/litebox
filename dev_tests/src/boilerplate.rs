@@ -111,6 +111,10 @@ const HEADERS_REQUIRED_PREFIX: &[(&str, &str)] = &[
         "// Copyright (c) Microsoft Corporation.\n// Licensed under the MIT license.\n\n",
     ),
     (
+        "ps1",
+        "# Copyright (c) Microsoft Corporation.\n# Licensed under the MIT license.\n\n",
+    ),
+    (
         "py",
         "#!/usr/bin/env python3\n\n# Copyright (c) Microsoft Corporation.\n# Licensed under the MIT license.\n",
     ),

@@ -8,10 +8,12 @@
 //! for `TaskDelete` under the lifecycle's, so that events leave in order.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use containerd_shim::api::{
     CheckpointTaskRequest, CloseIORequest, ConnectRequest, ConnectResponse, CreateTaskRequest,
@@ -41,7 +43,9 @@ use oci_spec::runtime::Spec;
 use crate::Backend;
 use crate::hooks::Hooks;
 use crate::rootfs::RootFs;
-use crate::sandbox::{Broker, RootMount, StateDir};
+#[cfg(unix)]
+use crate::sandbox::RootMount;
+use crate::sandbox::{Broker, StateDir, remove_leftovers};
 use crate::stdio::{Host, Logger, Pumps};
 use crate::{Result, error, internal, invalid, spec, unsupported};
 
@@ -58,6 +62,11 @@ const UNKNOWN_STATUS: u32 = 255;
 const KILLED_STATUS: u32 = 128 + 9;
 /// `SIGSTOP` as the guest numbers signals (Linux's), whatever the host's number.
 const STOP_SIGNAL: u32 = 19;
+/// `<shim> CLEANER_MODE <namespace> <id> <bundle>` runs the `delete` action's cleaner.
+const CLEANER_MODE: &str = "__litebox-cleaner";
+/// How long the `delete` action waits for its cleaner: containerd kills the action after 5 s
+/// (`io.containerd.timeout.shim.cleanup`).
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(4);
 
 fn timestamp(at: SystemTime) -> MessageField<Timestamp> {
     let since_epoch = at
@@ -123,6 +132,82 @@ fn set_home(process: &mut GuestProcess, passwd: &[u8], uid: u32) {
     }
 }
 
+/// Runs the `delete` action's cleaner, and exits, if this executable's `args` ask for it.
+pub fn run_private_mode(args: &[OsString]) {
+    let [_, mode, namespace, id, bundle] = args else {
+        return;
+    };
+    if mode != CLEANER_MODE {
+        return;
+    }
+    let deleted = match (namespace.to_str(), id.to_str(), bundle.to_str()) {
+        (Some(namespace), Some(id), Some(bundle)) => delete(namespace, id, bundle),
+        _ => Err(format!("invalid arguments {args:?}")),
+    };
+    if let Err(error) = &deleted {
+        crate::report(error);
+    }
+    std::process::exit(i32::from(deleted.is_err()));
+}
+
+/// Runs [`delete`] in a cleaner, a copy of the shim that may outlive the action, and relays its
+/// result if it ends within [`CLEANUP_TIMEOUT`]. containerd runs the action once, and kills it
+/// past its own timeout, which stopping a container or running hooks may outlast. Past ours, the
+/// action fails, so that containerd keeps the bundle, and the cleaner goes on alone.
+fn delete_by_cleaner(namespace: &str, id: &str, bundle: &str) -> std::result::Result<(), String> {
+    let failed = |error: std::io::Error| format!("cannot run the cleanup: {error}");
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    let mut command = Command::new(std::env::current_exe().map_err(failed)?);
+    command
+        .args([CLEANER_MODE, namespace, id, bundle])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut cleaner = crate::spawn_detached(&mut command).map_err(failed)?;
+    let mut stderr = cleaner.stderr.take().expect("piped");
+    let (relayed, relaying) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
+        let _ = relayed.send(());
+    });
+    let ended = crate::exits_within(&cleaner, CLEANUP_TIMEOUT)
+        .map_err(|error| format!("cannot wait for the cleanup: {error}"))?;
+    if !ended {
+        return Err(format!("the cleanup goes on in process {}", cleaner.id()));
+    }
+    let status = cleaner.wait().map_err(failed)?;
+    // The hooks' children may keep its stderr open.
+    let _ = relaying.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("the cleanup failed: {status}"))
+    }
+}
+
+/// As runc's shim and `delete --force`, removes what a dead daemon left (see `remove_leftovers`)
+/// and runs the `poststop` hooks of a container whose `Create` began, after removing its state. A
+/// live daemon's locked state is left to its own cleanup.
+fn delete(namespace: &str, id: &str, bundle: &str) -> std::result::Result<(), String> {
+    let mut state_dir = StateDir::new(namespace, id);
+    let dead = state_dir.try_lock();
+    // Read first: should this outlast the action, the next action finds the state locked, and
+    // containerd then removes the bundle.
+    let spec = dead.then(|| Spec::load(Path::new(bundle).join("config.json")));
+    remove_leftovers(&state_dir, Path::new(bundle))?;
+    if let Some(spec) = spec {
+        state_dir.remove();
+        match spec {
+            Ok(spec) => Hooks::new(&spec, id, bundle, 0).poststop(|error| crate::report(error)),
+            Err(error) => crate::report(format!(
+                "cannot run the poststop hooks: {:?}",
+                error.to_string()
+            )),
+        }
+    }
+    Ok(())
+}
+
 pub struct Shim {
     backend: Backend,
     exit: Arc<ExitSignal>,
@@ -130,7 +215,10 @@ pub struct Shim {
     id: String,
     bundle: String,
     /// containerd's umask, while the daemon's socket is bound with its own.
+    #[cfg(unix)]
     umask: OnceLock<rustix::fs::Mode>,
+    #[cfg(windows)]
+    debug: bool,
 }
 
 impl containerd_shim::Shim for Shim {
@@ -144,7 +232,10 @@ impl containerd_shim::Shim for Shim {
             namespace: args.namespace.clone(),
             id: args.id.clone(),
             bundle: args.bundle.clone(),
+            #[cfg(unix)]
             umask: OnceLock::new(),
+            #[cfg(windows)]
+            debug: args.debug,
         }
     }
 
@@ -155,27 +246,12 @@ impl containerd_shim::Shim for Shim {
         Ok(address)
     }
 
-    /// containerd's cleanup after the daemon's death, whose guardian then killed the broker. As
-    /// runc's shim and `delete --force`, it unmounts the root file system (once the daemon's
-    /// mounters are gone: see [`RootMount`]) and runs the `poststop` hooks of a container whose
-    /// `Create` began, after removing its state; a live daemon's locked state is left to its own
-    /// cleanup.
+    /// containerd's cleanup after the daemon's death, whose guardian then killed the broker, and
+    /// after any daemon's exit: see [`delete_by_cleaner`]. A failure fails the action, so that
+    /// containerd keeps the bundle and retries once it reloads.
     fn delete_shim(&mut self) -> containerd_shim::Result<DeleteResponse> {
-        let mut state_dir = StateDir::new(&self.namespace, &self.id);
-        if state_dir.try_lock() {
-            // containerd logs the action's stderr.
-            if let Err(error) = RootMount::unmount_leftovers(Path::new(&self.bundle)) {
-                eprintln!("{error:?}");
-            }
-            state_dir.remove();
-            match Spec::load(Path::new(&self.bundle).join("config.json")) {
-                Ok(spec) => {
-                    let hooks = Hooks::new(&spec, &self.id, &self.bundle, 0);
-                    hooks.poststop(|error| eprintln!("{error}"));
-                }
-                Err(error) => eprintln!("cannot run the poststop hooks: {:?}", error.to_string()),
-            }
-        }
+        delete_by_cleaner(&self.namespace, &self.id, &self.bundle)
+            .map_err(containerd_shim::Error::Other)?;
         Ok(DeleteResponse {
             exit_status: KILLED_STATUS,
             exited_at: timestamp(SystemTime::now()),
@@ -184,6 +260,7 @@ impl containerd_shim::Shim for Shim {
     }
 
     fn wait(&mut self) {
+        #[cfg(unix)]
         if let Some(&umask) = self.umask.get() {
             rustix::process::umask(umask);
         }
@@ -191,9 +268,17 @@ impl containerd_shim::Shim for Shim {
     }
 
     fn create_task_service(&self, publisher: RemotePublisher) -> Service {
+        #[cfg(windows)]
+        if let Err(error) = crate::sandbox::init_log(&self.namespace, &self.id, self.debug) {
+            eprintln!("{}: cannot serve the log: {error}", self.backend.runtime());
+            std::process::exit(1);
+        }
         // The crate binds the daemon's socket next: the daemon's user's only, until `wait`.
-        let owner_only = rustix::fs::Mode::from_raw_mode(0o077);
-        let _ = self.umask.set(rustix::process::umask(owner_only));
+        #[cfg(unix)]
+        {
+            let owner_only = rustix::fs::Mode::from_raw_mode(0o077);
+            let _ = self.umask.set(rustix::process::umask(owner_only));
+        }
         let (events, outgoing) = mpsc::channel();
         let namespace = self.namespace.clone();
         std::thread::spawn(move || publish_events(&publisher, &namespace, &outgoing));
@@ -404,6 +489,11 @@ impl Inner {
         let spec = Spec::load(bundle.join("config.json"))
             .map_err(|failure| invalid(format!("invalid config.json: {failure}")))?;
         let mut plan = spec::plan(&spec)?;
+        // containerd's `windows` snapshotter gives the layers as mounts rather than in the spec.
+        #[cfg(windows)]
+        if !request.rootfs.is_empty() {
+            plan.layers = crate::sandbox::layer_folders(&request.rootfs)?;
+        }
         // Before the root archive, which can take long.
         Broker::check(self.backend, &plan)?;
         if plan.process.terminal != request.terminal {
@@ -427,18 +517,23 @@ impl Inner {
         let mut state_dir = StateDir::new(&self.namespace, &request.id);
         state_dir.create(self.backend)?;
         let built = (|| {
+            // On Windows, the mounts are the container's layers, not the guest's root.
+            #[cfg(unix)]
             let mounted = (!request.rootfs.is_empty())
                 .then(|| RootMount::new(bundle, &request.rootfs))
                 .transpose()?;
-            // TODO: let the broker serve the mounted root, not an archive of it (kept for Windows).
+            #[cfg(unix)]
             let image = mounted
                 .as_ref()
                 .map_or_else(|| bundle.join(&plan.root), |root| root.path().to_owned());
+            #[cfg(windows)]
+            let image = bundle.join(&plan.root);
             let fs = RootFs::build(&image, &guest_service, &plan.binds, &plan.process.cwd)?;
             // The working directory as runc resolves it in the image.
             plan.process.cwd.clone_from(&fs.cwd);
             set_home(&mut plan.process, &fs.passwd, plan.uid);
             let archive = fs.write_archive(&state_dir.archive())?;
+            #[cfg(unix)]
             drop(mounted);
             let inner = Arc::clone(self);
             let exited = move || inner.broker_exited();
@@ -479,7 +574,7 @@ impl Inner {
         init.pumps = Some(Pumps::start(
             &client,
             "",
-            host.files,
+            host.ends,
             request.terminal,
             Arc::clone(&init.closing),
             Arc::clone(&init.deleted),
@@ -566,7 +661,7 @@ impl Inner {
                 // Reaped at its `Delete`, even if it does not start.
                 container(&mut state, &request.id)?.process(exec_id)?.logger = host.logger;
                 startable(&mut state)?;
-                Ok(host.files)
+                Ok(host.ends)
             }));
         }
         let container = container(&mut state, &request.id)?;
@@ -1119,14 +1214,30 @@ mod tests {
 
     #[test]
     fn the_guest_service_s_deadline_exceeded_is_no_answer() {
-        let dir = tempfile::tempdir().unwrap();
-        let address = format!("unix://{}", dir.path().join("socket").display());
+        #[cfg(unix)]
+        let (_dir, address) = {
+            let dir = tempfile::tempdir().unwrap();
+            let address = format!("unix://{}", dir.path().join("socket").display());
+            (dir, address)
+        };
+        #[cfg(windows)]
+        let address = format!(r"\\.\pipe\litebox-shim-service-test-{}", std::process::id());
         let mut server = ttrpc::Server::new()
             .bind(&address)
             .unwrap()
             .register_service(create_guest_service(Arc::new(TimingOut)));
         server.start().unwrap();
-        let client = GuestServiceClient::new(ttrpc::Client::connect(&address).unwrap());
+        // On Windows, the server creates its pipe once it runs.
+        let deadline_at = std::time::Instant::now() + Duration::from_secs(5);
+        let client = loop {
+            match ttrpc::Client::connect(&address) {
+                Err(_) if std::time::Instant::now() < deadline_at => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                client => break client.unwrap(),
+            }
+        };
+        let client = GuestServiceClient::new(client);
         let request = ExecProcessRequest::new();
         let failure = client
             .exec_process(deadline(Duration::from_secs(5)), &request)

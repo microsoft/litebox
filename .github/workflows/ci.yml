@@ -561,6 +561,7 @@ jobs:
         -p litebox_shim_windows
         -p litebox_runner_linux_on_windows_userland
         -p litebox_runner_windows_userland
+        -p litebox_containerd_shim
         -p dev_test_support
     steps:
       - name: Check out repo
@@ -574,7 +575,7 @@ jobs:
           architecture: x64
       - name: Set up Rust
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-pc-windows-msvc,x86_64-unknown-none
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-pc-windows-msvc,x86_64-unknown-none,x86_64-unknown-linux-musl
       - name: Set up Nextest
         uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
@@ -604,7 +605,7 @@ jobs:
             target/tmp/windows_node_rewriter
           key: ${{ steps.fixture-key.outputs.key }}
           restore-keys: ${{ steps.fixture-key.outputs.prefix }}
-      - name: Set up WSL for the Windows loader tests
+      - name: Set up WSL for the Windows loader and containerd-shim tests
         timeout-minutes: 10
         uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4 # v7.2.0
         with:
@@ -612,7 +613,25 @@ jobs:
           use-cache: 'true'
           set-as-default: 'true'
           additional-packages: gcc libc6-dev
+      - name: Build Windows containerd-shim test fixtures
+        env:
+          LITEBOX_SHIM_TEST_FIXTURES: ${{ runner.temp }}\litebox-shim-fixtures
+        run: ./.github/tools/build_windows_shim_fixtures.ps1 $env:LITEBOX_SHIM_TEST_FIXTURES
       - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
+        env:
+          LITEBOX_SHIM_TEST_FIXTURES: ${{ runner.temp }}\litebox-shim-fixtures
+      # The HCS tests need a Windows image's layers: this runner is elevated, with the Containers
+      # feature and Docker.
+      - name: Pull the Windows image of the containerd-shim HCS tests
+        id: windows-layers
+        run: |
+          $layers = ./.github/tools/pull_windows_test_layers.ps1
+          "layers=$layers" >> $env:GITHUB_OUTPUT
+      - name: Run the containerd-shim HCS tests
+        run: cargo nextest run --locked --profile ci -p litebox_containerd_shim --test shim_windows --run-ignored only
+        env:
+          LITEBOX_SHIM_TEST_FIXTURES: ${{ runner.temp }}\litebox-shim-fixtures
+          LITEBOX_TEST_WINDOWS_LAYERS: ${{ steps.windows-layers.outputs.layers }}
       - run: |
           cargo test --locked --verbose --doc ($env:WINDOWS_CRATES -split ' ')
           # We need to run `cargo test --doc` separately because doc tests

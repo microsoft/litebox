@@ -2088,9 +2088,12 @@ dependencies = [
  "oci-spec 0.9.0",
  "rustix 1.1.2",
  "serde_json",
+ "socket2",
+ "tar",
  "tar-core",
  "tempfile",
  "url",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

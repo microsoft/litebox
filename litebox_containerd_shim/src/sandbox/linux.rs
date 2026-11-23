@@ -20,17 +20,15 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
 use self::guardian::{GUARDIAN_MODE, LIFELINE_FD, VM_GUARDIAN_MODE};
 pub(crate) use self::mount::{mount_rootfs, unmount_rootfs};
 use super::{
-    Backend, STOP_TIMEOUT, StateDir, broker_arguments, broker_program, log_lines, program,
-    stable_name,
+    Backend, Broker, Ended, RootMount, STOP_TIMEOUT, StateDir, broker_arguments, broker_program,
+    log_lines, program, stable_name,
 };
 use crate::spec::{Bind, Network, Plan};
 use crate::{Result, internal};
@@ -227,17 +225,34 @@ unsafe fn new_network() -> io::Result<()> {
     Ok(())
 }
 
-/// A running broker, below its guardian.
-pub struct Broker {
-    pid: u32,
+/// The broker's guardian, which ends it and everything below it.
+pub struct Tree {
     guardian: Pid,
     /// The daemon's end of the lifeline: its end makes the guardian kill everything below it.
     lifeline: UnixStream,
-    ended: Arc<(Mutex<bool>, Condvar)>,
     /// Whether connections through the bridge may start (see `vm::VSOCK_STARTED`).
-    pub(super) vsock_started: Arc<AtomicBool>,
-    /// The last line of the guardian's stderr, once that ends.
-    stderr: Mutex<Receiver<Vec<u8>>>,
+    vsock_started: Arc<AtomicBool>,
+}
+
+impl Tree {
+    pub(super) fn bridge_open(&self) -> bool {
+        self.vsock_started.load(Ordering::Relaxed)
+    }
+}
+
+/// Unmounts a dead daemon's root file system. A failure is only reported: without the bundle's
+/// lock, it may follow a successful unmount.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the platforms' contract: Windows' can fail"
+)]
+pub fn remove_leftovers(state: &StateDir, bundle: &Path) -> std::result::Result<(), String> {
+    if state.lock.is_some()
+        && let Err(error) = RootMount::unmount_leftovers(bundle)
+    {
+        crate::report(format!("{error:?}"));
+    }
+    Ok(())
 }
 
 impl Broker {
@@ -313,7 +328,13 @@ impl Broker {
                 // The broker opens the archive by path.
                 grant_read(state, &archive).map_err(failed)?;
                 let runner = program("LITEBOX_RUNNER", RUNNER);
-                broker_arguments(&mut command, state, binds, plan, &runner);
+                command.args(broker_arguments(
+                    &state.bridge(),
+                    &state.archive(),
+                    binds,
+                    plan,
+                    &runner,
+                ));
             }
             Backend::Vm => {
                 command.arg(VM_GUARDIAN_MODE);
@@ -435,7 +456,7 @@ impl Broker {
         );
         let stderr = Mutex::new(log_lines("stderr", stderr, |_| {}));
         let group = Pid::from_child(&guardian);
-        let ended = Arc::new((Mutex::new(false), Condvar::new()));
+        let ended = Arc::new(Ended::default());
         let reaper = Arc::clone(&ended);
         std::thread::spawn(move || {
             // Before the guardian is reaped, its pid names its group alone: whatever it left there
@@ -450,67 +471,43 @@ impl Broker {
             let _ = rustix::process::kill_process_group(group, Signal::KILL);
             let status = guardian.wait();
             log::info!("the broker exited: {status:?}");
-            *reaper.0.lock().expect("not poisoned") = true;
-            reaper.1.notify_all();
+            reaper.set();
             // After `ended`, which callers wait for while they hold the shim's locks.
             exited();
         });
         let mut pid = [0u8; 4];
         let broker = Self {
             pid: 0,
-            guardian: group,
-            lifeline,
             ended,
-            vsock_started,
             stderr,
+            tree: Tree {
+                guardian: group,
+                lifeline,
+                vsock_started,
+            },
         };
-        (&broker.lifeline).read_exact(&mut pid).map_err(|error| {
-            if error.kind() == io::ErrorKind::UnexpectedEof {
-                let why = broker.last_words();
-                internal(format!("the guardian could not start the broker: {why}"))
-            } else {
-                failed(error)
-            }
-        })?;
+        (&broker.tree.lifeline)
+            .read_exact(&mut pid)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    let why = broker.last_words();
+                    internal(format!("the guardian could not start the broker: {why}"))
+                } else {
+                    failed(error)
+                }
+            })?;
         Ok(Self {
             pid: u32::from_le_bytes(pid),
             ..broker
         })
     }
 
-    /// Why the broker ended early: the last line of its guardian's stderr, which ends with it.
-    pub(super) fn last_words(&self) -> String {
-        let stderr = self.stderr.lock().expect("not poisoned");
-        match stderr.recv_timeout(Duration::from_secs(1)) {
-            Ok(last) if !last.is_empty() => {
-                crate::truncated(&String::from_utf8_lossy(&last)).to_owned()
-            }
-            _ => "see the shim's log".to_owned(),
-        }
-    }
-
-    /// The host PID of the broker, or of the VM's VMM, which containerd knows as the pid of every
-    /// process.
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    /// Waits up to `timeout` for the broker to end; returns whether it did.
-    pub fn wait(&self, timeout: Duration) -> bool {
-        let (ended, changed) = &*self.ended;
-        let ended =
-            changed.wait_timeout_while(ended.lock().expect("not poisoned"), timeout, |ended| {
-                !*ended
-            });
-        *ended.expect("not poisoned").0
-    }
-
     /// Ends the broker and everything below it.
     pub fn stop(&self) {
-        let _ = self.lifeline.shutdown(Shutdown::Both);
+        let _ = self.tree.lifeline.shutdown(Shutdown::Both);
         if !self.wait(STOP_TIMEOUT) {
             log::error!("the broker's guardian did not exit in time; killing its group");
-            let _ = rustix::process::kill_process_group(self.guardian, Signal::KILL);
+            let _ = rustix::process::kill_process_group(self.tree.guardian, Signal::KILL);
             self.wait(STOP_TIMEOUT);
         }
     }
