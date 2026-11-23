@@ -38,9 +38,9 @@ use crate::readiness_queue::{
     ReadinessQueueError, RemoveReadinessQueueEntryRequest, TakeReadyRequest, TakeReadyResponse,
 };
 use crate::segment::{
-    GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentInfo, SegmentSlotStatus,
-    SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
+    ConfirmSegmentAttachRequest, GetSegmentRequest, PrepareSegmentAttachRequest,
+    PreparedSegmentAttach, SegmentAttachId, SegmentAttachmentCounts, SegmentError, SegmentId,
+    SegmentInfo, SegmentSlotStatus, SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
 };
 use crate::shared_buffer::SharedBufferSequence;
 use crate::shared_futex::{
@@ -415,7 +415,7 @@ wire_enum! {
         /// changing metadata.
         PrepareAttach(PrepareSegmentAttachRequest),
         /// Record a reserved attachment after the caller mapped the backing object.
-        ConfirmAttach(SegmentAttachId),
+        ConfirmAttach(ConfirmSegmentAttachRequest),
         /// Release an unused reservation without recording an attach or detach.
         CancelAttach(SegmentAttachId),
         /// Replace the caller's attachment counts after splitting or releasing

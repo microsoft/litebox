@@ -183,6 +183,23 @@ wire_struct! {
         /// The caller's new total, which only confirmed attaches and their splits
         /// can raise above zero.
         pub count: u64,
+        /// When the caller counted, in its own increasing order. Counts may
+        /// arrive out of order; the broker ignores one no newer than the last it
+        /// applied for the segment.
+        pub generation: u64,
+    }
+}
+
+wire_struct! {
+    /// Records a reserved attachment once the caller mapped its backing object.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ConfirmSegmentAttachRequest {
+        /// The reservation.
+        pub attachment: SegmentAttachId,
+        /// The caller's total for the reserved segment, including this
+        /// attachment, which replaces the broker's like
+        /// [`SegmentAttachmentCount`].
+        pub count: SegmentAttachmentCount,
     }
 }
 
@@ -195,7 +212,7 @@ pub struct SegmentAttachmentCounts {
 
 impl SegmentAttachmentCounts {
     /// How many counts one request carries; more take further requests.
-    pub const CAPACITY: usize = 6;
+    pub const CAPACITY: usize = 5;
 
     /// Collects `counts`, or returns `None` if there are more than
     /// [`Self::CAPACITY`].

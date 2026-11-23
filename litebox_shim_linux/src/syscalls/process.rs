@@ -1029,12 +1029,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Allocates a pending child of this process, as `relation` describes. With
-    /// `inherit_segment_attachments`, the child, which inherits this address space, starts with
-    /// copies of this process's SysV attachments.
+    /// `inherit_segment_attachments_since`, the child, which inherits this address space, starts
+    /// with copies of this process's SysV attachments counted at or after that generation.
     fn allocate_child_process(
         &self,
         relation: ChildRelation,
-        inherit_segment_attachments: bool,
+        inherit_segment_attachments_since: Option<u64>,
     ) -> Result<PendingChild, Errno> {
         let child = self
             .global
@@ -1044,7 +1044,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .new_pid_namespace
                     .then_some(PidNamespaceOptions::INIT),
                 sibling: relation.sibling,
-                inherit_segment_attachments,
+                inherit_segment_attachments_since,
             })
             .map_err(|error| match error {
                 // The child's namespace ended with its first process, as Linux's `alloc_pid`
@@ -1963,7 +1963,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Dropping the pending child on failure discards it, releasing any attachments it
         // inherited. Only a native child inherits SysV attachments, and copy-based fork refuses
         // shared mappings, so a child with attachments always starts natively or not at all.
-        let child = self.allocate_child_process(relation, self.global.mm.has_sysv_attachments())?;
+        let inherited_segments = self.publish_sysv_counts_for_fork()?;
+        let child = self.allocate_child_process(relation, inherited_segments)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let (cwd, handles) = self.inherit_with_cwd(&child, &mut objects)?;
@@ -1985,6 +1986,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         drop(pause);
         started.map(|()| child_pid.cast_unsigned() as usize)
+    }
+
+    /// Publishes this process's SysV attachment counts for a child that inherits its address
+    /// space, returning the generation from which the child copies them, or `None` without
+    /// attachments. The broker may still hold older counts, whose replacements threads that are
+    /// now paused have yet to publish; the child does not copy those.
+    fn publish_sysv_counts_for_fork(&self) -> Result<Option<u64>, Errno> {
+        if !self.global.mm.has_sysv_attachments() {
+            return Ok(None);
+        }
+        let (generation, counts) = self.global.mm.snapshot_sysv_counts();
+        self.global
+            .litebox
+            .set_segment_attachments(&counts)
+            .map_err(|error| match error {
+                litebox::segment::SegmentError::NoMemory => Errno::ENOMEM,
+                _ => Errno::EAGAIN,
+            })?;
+        Ok(Some(generation))
     }
 
     /// Starts the pending `child` [`Self::fork`] prepared from `startup`, natively if possible,
@@ -2181,7 +2201,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EAGAIN);
         }
         // A vfork child execs a fresh image, so it gets no SysV attachments.
-        let child = self.allocate_child_process(relation, false)?;
+        let child = self.allocate_child_process(relation, None)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let child_own_pid =

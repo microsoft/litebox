@@ -152,7 +152,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     offset: 0,
                 },
                 id,
-                || reservation.confirm().map_err(Errno::from),
+                |count| reservation.confirm(count).map_err(Errno::from),
             )
         }
     }

@@ -34,9 +34,9 @@ use litebox_broker_protocol::readiness_queue::{
     ReadyEvent,
 };
 use litebox_broker_protocol::segment::{
-    GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentInfo, SegmentSlotStatus,
-    SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
+    ConfirmSegmentAttachRequest, GetSegmentRequest, PrepareSegmentAttachRequest,
+    PreparedSegmentAttach, SegmentAttachId, SegmentAttachmentCounts, SegmentError, SegmentId,
+    SegmentInfo, SegmentSlotStatus, SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
 };
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
@@ -93,7 +93,10 @@ pub(crate) trait SegmentControl: Send + Sync {
         request: PrepareSegmentAttachRequest,
     ) -> SegmentControlResult<PreparedSegmentAttach>;
 
-    fn confirm_segment_attach(&self, attachment: SegmentAttachId) -> SegmentControlResult<()>;
+    fn confirm_segment_attach(
+        &self,
+        request: ConfirmSegmentAttachRequest,
+    ) -> SegmentControlResult<()>;
 
     fn cancel_segment_attach(&self, attachment: SegmentAttachId) -> SegmentControlResult<()>;
 
@@ -1054,8 +1057,11 @@ where
         self.request(|local| local.prepare_segment_attach(request))
     }
 
-    fn confirm_segment_attach(&self, attachment: SegmentAttachId) -> SegmentControlResult<()> {
-        self.request(|local| local.confirm_segment_attach(attachment))
+    fn confirm_segment_attach(
+        &self,
+        request: ConfirmSegmentAttachRequest,
+    ) -> SegmentControlResult<()> {
+        self.request(|local| local.confirm_segment_attach(request))
     }
 
     fn cancel_segment_attach(&self, attachment: SegmentAttachId) -> SegmentControlResult<()> {

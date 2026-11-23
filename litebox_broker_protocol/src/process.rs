@@ -94,9 +94,13 @@ wire_struct! {
         /// Whether the child's parent is the caller's parent rather than the
         /// caller. Either way, the caller owns the child until it starts.
         pub sibling: bool,
-        /// Whether the child starts with copies of the caller's segment
-        /// attachments, because it inherits the caller's address space.
-        pub inherit_segment_attachments: bool,
+        /// If set, the child inherits the caller's address space and starts
+        /// with copies of the caller's segment attachments counted at or after
+        /// this generation (see [`SegmentAttachmentCount`]). An older count is
+        /// stale: the caller's newer count of that segment has yet to arrive.
+        ///
+        /// [`SegmentAttachmentCount`]: crate::segment::SegmentAttachmentCount
+        pub inherit_segment_attachments_since: Option<u64>,
     }
 }
 

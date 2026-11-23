@@ -965,16 +965,19 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     /// The last tag issued to a SysV attachment or piece.
     sysv_tags: u64,
     sysv_attachments: BTreeMap<SysvAttachmentKey, SysvAttachment>,
+    /// The last count reported of each segment that this address space maps.
+    sysv_counts: BTreeMap<SegmentId, u64>,
+    /// The generation of the last count reported, which orders this address space's counts.
+    sysv_generation: u64,
     pub(super) sysv_publish: Option<SysvPublish>,
-    /// Segments whose counts changed, to publish while the owner still holds the VMA write lock.
+    /// Segments whose areas may have changed since their last count.
     sysv_changed: BTreeSet<SegmentId>,
 }
 
 struct SysvAttachment {
     segment: SegmentId,
+    /// The end of the attachment as mapped, which bounds the areas left of it.
     end: usize,
-    /// The areas that map it.
-    pieces: u64,
 }
 
 impl<Platform, const ALIGN: usize> Vmem<Platform, ALIGN>
@@ -994,6 +997,8 @@ where
             shared_anonymous_mappings: 0,
             sysv_tags: 0,
             sysv_attachments: BTreeMap::new(),
+            sysv_counts: BTreeMap::new(),
+            sysv_generation: 0,
             sysv_publish: None,
             sysv_changed: BTreeSet::new(),
         }
@@ -1018,17 +1023,82 @@ where
         NonZeroU64::new(self.sysv_tags).unwrap()
     }
 
-    /// Takes the segments whose counts changed since the last call, with their counts now.
-    pub(super) fn take_sysv_changes(&mut self) -> BTreeMap<SegmentId, u64> {
-        let changed = core::mem::take(&mut self.sysv_changed);
-        changed
+    /// Issues the generation of a new count, newer than any reported before.
+    fn next_sysv_generation(&mut self) -> u64 {
+        self.sysv_generation = self
+            .sysv_generation
+            .checked_add(1)
+            .expect("exhausted SysV count generations");
+        self.sysv_generation
+    }
+
+    /// Returns how many areas map the attachment at `key`, which ends at `end`.
+    fn sysv_pieces(&self, (base, identity): SysvAttachmentKey, end: usize) -> u64 {
+        let pieces = self.vmas.overlapping(base..end).filter(|(_, vma)| {
+            vma.sysv_view()
+                .is_some_and(|(_, view)| view.identity == identity)
+        });
+        pieces.count() as u64
+    }
+
+    /// Returns how many areas map `segment`.
+    fn sysv_count(&self, segment: SegmentId) -> u64 {
+        (self.sysv_attachments.iter())
+            .filter(|(_, attachment)| attachment.segment == segment)
+            .map(|(&key, attachment)| self.sysv_pieces(key, attachment.end))
+            .sum()
+    }
+
+    /// Takes the counts of the segments whose counts changed since they were last reported,
+    /// under a new generation.
+    pub(super) fn take_sysv_changes(&mut self) -> Vec<SegmentAttachmentCount> {
+        let segments = core::mem::take(&mut self.sysv_changed);
+        let changes: Vec<(SegmentId, u64)> = segments
             .into_iter()
-            .map(|segment| {
-                let count = (self.sysv_attachments.values())
-                    .filter(|attachment| attachment.segment == segment)
-                    .map(|attachment| attachment.pieces)
-                    .sum();
-                (segment, count)
+            .map(|segment| (segment, self.sysv_count(segment)))
+            .filter(|&(segment, count)| {
+                count != self.sysv_counts.get(&segment).copied().unwrap_or(0)
+            })
+            .collect();
+        if changes.is_empty() {
+            return Vec::new();
+        }
+        let generation = self.next_sysv_generation();
+        self.report_sysv_counts(changes, generation)
+    }
+
+    /// Takes the count of every segment this address space maps, under a new generation.
+    pub(super) fn snapshot_sysv_counts(&mut self) -> (u64, Vec<SegmentAttachmentCount>) {
+        self.sysv_changed.clear();
+        let segments: BTreeSet<SegmentId> = (self.sysv_attachments.values())
+            .map(|attachment| attachment.segment)
+            .collect();
+        let counts = segments
+            .into_iter()
+            .map(|segment| (segment, self.sysv_count(segment)))
+            .collect();
+        let generation = self.next_sysv_generation();
+        (generation, self.report_sysv_counts(counts, generation))
+    }
+
+    /// Records `counts` as reported under `generation`.
+    fn report_sysv_counts(
+        &mut self,
+        counts: Vec<(SegmentId, u64)>,
+        generation: u64,
+    ) -> Vec<SegmentAttachmentCount> {
+        (counts.into_iter())
+            .map(|(id, count)| {
+                if count == 0 {
+                    self.sysv_counts.remove(&id);
+                } else {
+                    self.sysv_counts.insert(id, count);
+                }
+                SegmentAttachmentCount {
+                    id,
+                    count,
+                    generation,
+                }
             })
             .collect()
     }
@@ -1064,52 +1134,35 @@ where
             SysvAttachment {
                 segment,
                 end: range.end,
-                pieces: 1,
             },
         );
+        // The attach's confirmation reported this count.
+        let count = self.sysv_count(segment);
+        self.sysv_counts.insert(segment, count);
     }
 
-    /// Adds `delta` to the count of each attachment's pieces in or next to `changed`. The
-    /// neighbors count fragments just outside it after a split, and areas that may coalesce
-    /// into it before.
-    fn add_sysv_pieces(
-        &self,
-        changed: &Range<usize>,
-        counts: &mut BTreeMap<SysvAttachmentKey, i64>,
-        delta: i64,
-    ) {
-        if self.sysv_attachments.is_empty() {
-            return;
-        }
-        let window = changed.start.saturating_sub(1)..changed.end.saturating_add(1);
-        for (_, vma) in self.vmas.overlapping(window) {
-            if let Some((base, view)) = vma.sysv_view() {
-                *counts.entry((base, view.identity)).or_default() += delta;
-            }
-        }
-    }
-
-    /// Runs `change`, which may change the areas in `changed`, then records how it changed
-    /// SysV attachments, even if it failed: a replacement or teardown can fail after unmapping
-    /// pages. The surviving areas, not the result, are authoritative.
+    /// Runs `change`, which may change the areas in `changed`, then marks the segments of the
+    /// SysV attachments there to recount, and forgets attachments left with no areas, even if
+    /// `change` failed: a replacement or teardown can fail after unmapping pages. The surviving
+    /// areas, not the result, are authoritative.
     fn tracking_sysv<R>(
         &mut self,
         changed: &Range<usize>,
         change: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let mut counts = BTreeMap::new();
-        self.add_sysv_pieces(changed, &mut counts, -1);
-        let result = change(self);
-        if counts.is_empty() {
-            return result;
+        if self.sysv_attachments.is_empty() {
+            return change(self);
         }
-        self.add_sysv_pieces(changed, &mut counts, 1);
-        for (key, delta) in counts.into_iter().filter(|(_, delta)| *delta != 0) {
-            let attachment = self.sysv_attachments.get_mut(&key).unwrap();
-            debug_assert!(attachment.pieces.checked_add_signed(delta).is_some());
-            attachment.pieces = attachment.pieces.saturating_add_signed(delta);
-            self.sysv_changed.insert(attachment.segment);
-            if attachment.pieces == 0 {
+        // An attachment's areas stay within its mapped range.
+        let affected: Vec<(SysvAttachmentKey, SegmentId, usize)> = (self.sysv_attachments)
+            .range(..(changed.end, NonZeroU64::MIN))
+            .filter(|(_, attachment)| attachment.end > changed.start)
+            .map(|(&key, attachment)| (key, attachment.segment, attachment.end))
+            .collect();
+        let result = change(self);
+        for (key, segment, end) in affected {
+            self.sysv_changed.insert(segment);
+            if self.sysv_pieces(key, end) == 0 {
                 self.sysv_attachments.remove(&key);
             }
         }
@@ -1152,8 +1205,9 @@ where
     }
 
     /// Maps `mapping` as one new SysV attachment of `segment`, placed as `placement.flags`
-    /// request, and registers it once `confirm` succeeds. If `confirm` fails, unmaps it again,
-    /// leaving any pages it replaced unmapped.
+    /// request, and registers it once `confirm` succeeds with this address space's count of
+    /// `segment`, the attachment included, under a new generation. If `confirm` fails, unmaps it
+    /// again, leaving any pages it replaced unmapped.
     ///
     /// # Panics
     ///
@@ -1169,7 +1223,7 @@ where
         placement: SysvPlacement<ALIGN>,
         mapping: SharedObjectMapping<SharedObjectOf<Platform, ALIGN>>,
         segment: SegmentId,
-        confirm: impl FnOnce() -> Result<(), E>,
+        confirm: impl FnOnce(SegmentAttachmentCount) -> Result<(), E>,
     ) -> Result<Platform::RawMutPointer<u8>, SysvAttachError<E>>
     where
         Platform: SharedObjectProvider<ALIGN>,
@@ -1187,7 +1241,13 @@ where
         }
         .map_err(SysvAttachError::Map)?;
         let range = ptr.as_usize()..ptr.as_usize() + length.as_usize();
-        if let Err(error) = confirm() {
+        // The new mapping is not registered yet, so it is not among the areas counted.
+        let count = SegmentAttachmentCount {
+            id: segment,
+            count: self.sysv_count(segment) + 1,
+            generation: self.next_sysv_generation(),
+        };
+        if let Err(error) = confirm(count) {
             // SAFETY: The caller excludes host users until confirmation succeeds.
             unsafe { self.remove_mapping(PageRange::new(range.start, range.end).unwrap()) }
                 .expect("failed to roll back an unconfirmed SysV attachment");
@@ -2965,6 +3025,69 @@ mod tests {
         assert!(backend.remap_calls.lock().is_empty());
     }
 
+    /// Returns the counts of `changes` by segment.
+    fn counts(changes: Vec<SegmentAttachmentCount>) -> BTreeMap<SegmentId, u64> {
+        changes
+            .into_iter()
+            .map(|count| (count.id, count.count))
+            .collect()
+    }
+
+    #[test]
+    fn sysv_counts_carry_increasing_generations() {
+        let backend = dummy_backend::<true>(None);
+        let mut vm = Vmem::<_, PAGE_SIZE>::new(backend);
+        let start = DummyVmemBackend::<true>::TASK_ADDR_MIN;
+        let mut confirmed = None;
+        // SAFETY: The test owns the mock address space, and its objects are mock objects.
+        unsafe {
+            vm.attach_sysv(
+                SysvPlacement {
+                    address: NonZeroAddress::new(start),
+                    length: NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
+                    flags: CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+                    permissions: MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                },
+                shared_object_mapping(1, 0, true),
+                SegmentId(7),
+                |count| {
+                    confirmed = Some(count);
+                    Ok::<(), ()>(())
+                },
+            )
+        }
+        .ok()
+        .unwrap();
+        let confirmed = confirmed.unwrap();
+        assert_eq!((confirmed.id, confirmed.count), (SegmentId(7), 1));
+        // Splitting reports the new count, ordered after the confirmation.
+        // SAFETY: The test owns the mock pages.
+        unsafe {
+            vm.protect_mapping(
+                PageRange::new(start, start + PAGE_SIZE).unwrap(),
+                MemoryRegionPermissions::READ,
+            )
+        }
+        .unwrap();
+        let changes = vm.take_sysv_changes();
+        assert_eq!(changes.len(), 1);
+        let split = changes[0];
+        assert_eq!(split.count, 2);
+        assert!(split.generation > confirmed.generation);
+        // A fork's snapshot recounts every segment, newer still, and leaves nothing to report.
+        let (generation, snapshot) = vm.snapshot_sysv_counts();
+        assert!(generation > split.generation);
+        assert_eq!(
+            snapshot,
+            [SegmentAttachmentCount {
+                id: SegmentId(7),
+                count: 2,
+                generation,
+            }]
+        );
+        assert_eq!(counts(vm.take_sysv_changes()), BTreeMap::new());
+    }
+
     #[test]
     fn sysv_detach_preserves_replacements_and_counts_surviving_vmas() {
         let backend = dummy_backend::<true>(None);
@@ -3009,7 +3132,7 @@ mod tests {
         }
         // Splitting the middle adds two VMAs. Restoring the original permissions does
         // not close either of the split VMAs.
-        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 3)].into());
+        assert_eq!(counts(vm.take_sysv_changes()), [(SegmentId(1), 3)].into());
         // Replace the middle page with the *same* shared object at the *same* offset.
         // Futex keys still match, but shmdt must not remove this ordinary shared mapping.
         map(&mut vm, 2, 1, 2 * PAGE_SIZE);
@@ -3018,12 +3141,12 @@ mod tests {
         unsafe { vm.remove_mapping(PageRange::new(page(0), page(1)).unwrap()) }.unwrap();
         map(&mut vm, 0, 1, 0);
         vm.register_sysv(page(0)..page(1), SegmentId(1), false);
-        assert!(vm.take_sysv_changes().is_empty());
+        assert_eq!(counts(vm.take_sysv_changes()), BTreeMap::new());
         detach(&mut vm, page(0)).unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 3)].into());
+        assert_eq!(counts(vm.take_sysv_changes()), [(SegmentId(1), 3)].into());
         assert!(vm.vmas.get(&page(1)).is_some());
         detach(&mut vm, page(0)).unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 0)].into());
+        assert_eq!(counts(vm.take_sysv_changes()), [(SegmentId(1), 0)].into());
         assert_eq!(detach(&mut vm, page(0)), Err(crate::errno::Errno::EINVAL));
         assert!(
             vm.iter()
@@ -3060,7 +3183,7 @@ mod tests {
         // SAFETY: the test is done using all mock mappings.
         unsafe { vm.release_all() }.unwrap();
         assert_eq!(
-            vm.take_sysv_changes(),
+            counts(vm.take_sysv_changes()),
             [(SegmentId(2), 0), (SegmentId(3), 0), (SegmentId(4), 0)].into()
         );
 
@@ -3069,9 +3192,9 @@ mod tests {
         vm.take_sysv_changes();
         // SAFETY: the test owns the pages; no one else uses them.
         unsafe { vm.remove_mapping(PageRange::new(page(1), page(2)).unwrap()) }.unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 2)].into());
+        assert_eq!(counts(vm.take_sysv_changes()), [(SegmentId(1), 2)].into());
         detach(&mut vm, page(0)).unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 0)].into());
+        assert_eq!(counts(vm.take_sysv_changes()), [(SegmentId(1), 0)].into());
 
         map(&mut vm, 0, 4, 0);
         vm.register_sysv(page(0)..page(4), SegmentId(1), false);
@@ -3091,9 +3214,9 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 2)].into());
+        assert_eq!(counts(vm.take_sysv_changes()), [(SegmentId(1), 2)].into());
         detach(&mut vm, page(0)).unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(SegmentId(1), 0)].into());
+        assert_eq!(counts(vm.take_sysv_changes()), [(SegmentId(1), 0)].into());
     }
 
     #[test]
@@ -3115,7 +3238,7 @@ mod tests {
                     placement(),
                     shared_object_mapping(1, 0, true),
                     SegmentId(7),
-                    || confirmed,
+                    |_| confirmed,
                 )
             }
             .map(|ptr| ptr.as_usize())
@@ -3126,11 +3249,11 @@ mod tests {
         ));
         assert_eq!(vm.iter().count(), 0);
         assert!(!vm.has_sysv_attachments());
-        assert!(vm.take_sysv_changes().is_empty());
+        assert_eq!(counts(vm.take_sysv_changes()), BTreeMap::new());
         assert!(matches!(attach(&mut vm, Ok(())), Ok(address) if address == start));
         assert!(vm.has_sysv_attachments());
         // The confirmation counted the attachment, so there is no change to publish.
-        assert!(vm.take_sysv_changes().is_empty());
+        assert_eq!(counts(vm.take_sysv_changes()), BTreeMap::new());
         // A no-replace attachment fails over a mapping.
         assert!(matches!(
             attach(&mut vm, Ok(())),
@@ -3147,14 +3270,17 @@ mod tests {
                 replacing,
                 shared_object_mapping(2, 0, true),
                 SegmentId(8),
-                || Ok::<(), ()>(()),
+                |count| {
+                    assert_eq!((count.id, count.count), (SegmentId(8), 1));
+                    Ok::<(), ()>(())
+                },
             )
         };
         assert!(matches!(replaced, Ok(ptr) if ptr.as_usize() == start));
-        assert_eq!(vm.take_sysv_changes(), [(SegmentId(7), 0)].into());
+        assert_eq!(counts(vm.take_sysv_changes()), [(SegmentId(7), 0)].into());
         // SAFETY: The test owns the mock pages.
         unsafe { vm.detach_sysv(start) }.unwrap();
-        assert_eq!(vm.take_sysv_changes(), [(SegmentId(8), 0)].into());
+        assert_eq!(counts(vm.take_sysv_changes()), [(SegmentId(8), 0)].into());
     }
 
     #[test]

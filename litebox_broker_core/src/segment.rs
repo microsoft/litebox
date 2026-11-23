@@ -29,9 +29,10 @@ use crate::{
 use litebox_broker_protocol::{
     fs::MapFileResponse,
     segment::{
-        GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-        SegmentAttachmentCount, SegmentAttachmentCounts, SegmentError as E, SegmentId, SegmentInfo,
-        SegmentSlotStatus, SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
+        ConfirmSegmentAttachRequest, GetSegmentRequest, PrepareSegmentAttachRequest,
+        PreparedSegmentAttach, SegmentAttachId, SegmentAttachmentCount, SegmentAttachmentCounts,
+        SegmentError as E, SegmentId, SegmentInfo, SegmentSlotStatus, SegmentSlotStatusRequest,
+        SegmentStatus, SetSegmentRequest,
     },
     shared_futex::SharedMemoryId,
 };
@@ -317,6 +318,8 @@ struct Attachment {
     /// At most the confirmed and inherited attaches that still have an area,
     /// which bound `count`.
     attaches: u64,
+    /// The generation of the process's count that `count` last applied.
+    generation: u64,
 }
 
 /// A process's segment namespace, attachments and reservations.
@@ -329,6 +332,9 @@ pub(crate) struct ProcessSegments {
     attachments: BTreeMap<SegmentId, Attachment>,
     pending_attaches: BTreeMap<SegmentAttachId, SegmentRef>,
     last_attach_id: u64,
+    /// The newest generation of a count that ended an attachment. A count
+    /// no newer for a segment the process no longer holds is stale.
+    ended_generation: u64,
     closed: bool,
 }
 
@@ -459,12 +465,13 @@ pub fn prepare_attach(
     finish(Caller::new(process).and_then(|caller| caller.prepare_attach(request, deliver)))
 }
 
-/// Records a reserved attachment once the process mapped its backing object.
+/// Records a reserved attachment once the process mapped its backing object,
+/// replacing the process's count of the segment with `request.count`.
 pub fn confirm_attach(
     process: &BrokerProcess,
-    attachment: SegmentAttachId,
+    request: ConfirmSegmentAttachRequest,
 ) -> crate::Result<SegmentResult<()>> {
-    finish(Caller::new(process).and_then(|caller| caller.confirm_attach(attachment)))
+    finish(Caller::new(process).and_then(|caller| caller.confirm_attach(request)))
 }
 
 /// Releases a reservation without recording an attach or detach.
@@ -479,9 +486,10 @@ pub fn cancel_attach(
 /// as splitting or releasing its mapped areas changed them.
 ///
 /// Raising a count requires a confirmed attach and records an attach;
-/// lowering it records a detach. Setting zero for a segment the process does
-/// not hold succeeds. Each count is applied even if another fails; this
-/// returns the first failure.
+/// lowering it records a detach. A count no newer than the last one applied
+/// for its segment is ignored, as is a stale one for a segment the process no
+/// longer holds. Each count is applied even if another fails; this returns the
+/// first failure.
 pub fn set_attachments(
     process: &BrokerProcess,
     counts: SegmentAttachmentCounts,
@@ -501,11 +509,17 @@ pub fn set_attachments(
     }))
 }
 
-/// Copies `parent`'s attachments to its new `child`, which inherits its address
-/// space, or fails and copies none.
+/// Copies `parent`'s attachments that it counted at or after `generation` to
+/// its new `child`, which inherits its address space, or fails and copies
+/// none. Older counts are stale: `parent`'s address space no longer maps those
+/// segments.
 ///
 /// Callers hold `parent`'s state lock, which keeps `child` pending.
-pub(crate) fn inherit(parent: &BrokerProcess, child: &BrokerProcess) -> crate::Result<()> {
+pub(crate) fn inherit(
+    parent: &BrokerProcess,
+    child: &BrokerProcess,
+    generation: u64,
+) -> crate::Result<()> {
     let parent_segments = parent.segments.lock();
     let mut dest = child.segments.lock();
     if parent_segments.closed || dest.closed {
@@ -520,7 +534,11 @@ pub(crate) fn inherit(parent: &BrokerProcess, child: &BrokerProcess) -> crate::R
     inherited
         .try_reserve_exact(parent_segments.attachments.len())
         .map_err(|_| BrokerError::OutOfMemory)?;
-    for (id, a) in &parent_segments.attachments {
+    let current = parent_segments
+        .attachments
+        .iter()
+        .filter(|(_, a)| a.generation >= generation);
+    for (id, a) in current {
         let s = a.segment.entry.lock();
         s.check_room(a.count)
             .map_err(|_| BrokerError::ResourceExhausted)?;
@@ -865,26 +883,65 @@ impl<'a> Caller<'a> {
         })
     }
 
-    fn confirm_attach(&self, attachment: SegmentAttachId) -> Outcome<()> {
+    fn confirm_attach(&self, request: ConfirmSegmentAttachRequest) -> Outcome<()> {
+        let ConfirmSegmentAttachRequest {
+            attachment,
+            count:
+                SegmentAttachmentCount {
+                    id,
+                    count,
+                    generation,
+                },
+        } = request;
         let mut local = self.segments()?;
+        let segment = local
+            .pending_attaches
+            .get(&attachment)
+            .ok_or(E::InvalidArgument)?;
+        if segment.id != id {
+            return Err(E::InvalidArgument.into());
+        }
+        let held = local.attachments.get(&id);
+        // The confirmation is the process's newest count of the segment.
+        if held.is_some_and(|held| generation <= held.generation)
+            || held.is_none() && generation <= local.ended_generation
+        {
+            return Err(E::InvalidArgument.into());
+        }
+        let (old_count, attaches) = held.map_or((0, 1), |held| (held.count, held.attaches + 1));
+        let now = self.now();
+        {
+            let mut s = segment.entry.lock();
+            // Each attach maps at most one area per page of the segment.
+            if count == 0 || count > attaches.saturating_mul(s.length / PAGE_SIZE) {
+                return Err(E::InvalidArgument.into());
+            }
+            // The reservation already counts this attachment, so the others
+            // can only have lost areas since their last count.
+            let attachments = (s.status.attachments - old_count)
+                .checked_add(count)
+                .ok_or(E::NoSpace)?;
+            s.pending_attaches -= 1;
+            s.status.attachments = attachments;
+            if count <= old_count {
+                s.status.detach_time = now;
+            }
+            s.record_attach(self.process);
+        }
         let segment = local
             .pending_attaches
             .remove(&attachment)
             .ok_or(E::InvalidArgument)?;
-        {
-            let mut s = segment.entry.lock();
-            // The reservation already made room for the attachment.
-            s.pending_attaches -= 1;
-            s.status.attachments += 1;
-            s.record_attach(self.process);
-        }
-        let held = local.attachments.entry(segment.id).or_insert(Attachment {
-            segment,
-            count: 0,
-            attaches: 0,
-        });
-        held.count += 1;
-        held.attaches += 1;
+        local.attachments.insert(
+            id,
+            Attachment {
+                segment,
+                count,
+                // Each attach that keeps an area keeps at least one.
+                attaches: attaches.min(count),
+                generation,
+            },
+        );
         Ok(())
     }
 
@@ -898,15 +955,23 @@ impl<'a> Caller<'a> {
     }
 
     fn set_attachments(&self, request: SegmentAttachmentCount) -> Outcome<()> {
-        let SegmentAttachmentCount { id, count } = request;
+        let SegmentAttachmentCount {
+            id,
+            count,
+            generation,
+        } = request;
         let mut local = self.segments()?;
+        let ended_generation = local.ended_generation;
         let Some(held) = local.attachments.get_mut(&id) else {
-            return if count == 0 {
+            return if count == 0 || generation <= ended_generation {
                 Ok(())
             } else {
                 Err(E::InvalidArgument.into())
             };
         };
+        if generation <= held.generation {
+            return Ok(());
+        }
         match count.cmp(&held.count) {
             core::cmp::Ordering::Equal => {}
             core::cmp::Ordering::Greater => {
@@ -928,9 +993,12 @@ impl<'a> Caller<'a> {
                 held.attaches = held.attaches.min(count);
                 if count == 0 {
                     local.attachments.remove(&id);
+                    local.ended_generation = local.ended_generation.max(generation);
+                    return Ok(());
                 }
             }
         }
+        held.generation = generation;
         Ok(())
     }
 }
@@ -1061,15 +1129,45 @@ mod tests {
     fn prepare(p: &BrokerProcess, id: SegmentId, writable: bool) -> PreparedSegmentAttach {
         prepare_with(p, id, writable, Ok(871)).unwrap()
     }
+    /// Returns a generation newer than any of `p`'s counts so far.
+    fn next_generation(p: &BrokerProcess) -> u64 {
+        let segments = p.segments.lock();
+        let held = segments.attachments.values().map(|a| a.generation);
+        held.fold(segments.ended_generation, u64::max) + 1
+    }
+    fn held_count(p: &BrokerProcess, id: SegmentId) -> u64 {
+        p.segments
+            .lock()
+            .attachments
+            .get(&id)
+            .map_or(0, |a| a.count)
+    }
+    /// Confirms `attachment`, counting it on top of `p`'s other attachments of its segment.
+    fn confirm(p: &BrokerProcess, attachment: SegmentAttachId) -> SegmentResult<()> {
+        let id =
+            (p.segments.lock().pending_attaches.get(&attachment)).map_or(SegmentId(0), |r| r.id);
+        let count = SegmentAttachmentCount {
+            id,
+            count: held_count(p, id) + 1,
+            generation: next_generation(p),
+        };
+        confirm_attach(p, ConfirmSegmentAttachRequest { attachment, count }).unwrap()
+    }
     fn attach(p: &BrokerProcess, id: SegmentId, writable: bool) -> PreparedSegmentAttach {
         let prepared = prepare(p, id, writable);
-        confirm_attach(p, prepared.attachment).unwrap().unwrap();
+        confirm(p, prepared.attachment).unwrap();
         prepared
     }
+    /// Publishes `counts`, each newer than the last.
     fn set_counts(p: &BrokerProcess, counts: &[(SegmentId, u64)]) -> SegmentResult<()> {
-        let counts: alloc::vec::Vec<_> = counts
-            .iter()
-            .map(|&(id, count)| SegmentAttachmentCount { id, count })
+        let first = next_generation(p);
+        let counts: alloc::vec::Vec<_> = (first..)
+            .zip(counts)
+            .map(|(generation, &(id, count))| SegmentAttachmentCount {
+                id,
+                count,
+                generation,
+            })
             .collect();
         set_attachments(p, SegmentAttachmentCounts::new(&counts).unwrap()).unwrap()
     }
@@ -1080,7 +1178,7 @@ mod tests {
     fn allocate_inheriting(parent: &BrokerProcess) -> ProcessId {
         parent
             .allocate_child(AllocateChildRequest {
-                inherit_segment_attachments: true,
+                inherit_segment_attachments_since: Some(0),
                 ..AllocateChildRequest::default()
             })
             .unwrap()
@@ -1293,8 +1391,8 @@ mod tests {
         assert_eq!(status_of(&p, id), before);
         cancel_attach(&p, first).unwrap().unwrap();
         assert_eq!(status_of(&p, id), before);
-        assert_eq!(confirm_attach(&p, first).unwrap(), Err(E::InvalidArgument));
-        confirm_attach(&p, second).unwrap().unwrap();
+        assert_eq!(confirm(&p, first), Err(E::InvalidArgument));
+        confirm(&p, second).unwrap();
         let after = status_of(&p, id);
         assert_eq!(after.attachments, 1);
         assert_eq!(after.last_pid, p.id().0);
@@ -1322,10 +1420,7 @@ mod tests {
         let id = create(&parent, 53);
         let attachment = prepare(&parent, id, true).attachment;
         let child = fork(&parent);
-        assert_eq!(
-            confirm_attach(&child, attachment).unwrap(),
-            Err(E::InvalidArgument)
-        );
+        assert_eq!(confirm(&child, attachment), Err(E::InvalidArgument));
         remove(&parent, id).unwrap().unwrap();
         assert_eq!(status_of(&child, id).attachments, 0);
         parent.cleanup(true);
@@ -1379,6 +1474,73 @@ mod tests {
         // Zero is idempotent; only an attach makes a nonzero count valid.
         assert_eq!(set_count(&parent, id, 0), Ok(()));
         assert_eq!(set_count(&parent, id, 1), Err(E::InvalidArgument));
+    }
+
+    #[test]
+    fn late_counts_never_override_newer_ones() {
+        let Setup { root: p, .. } = setup(ROOT);
+        let publish = |id, count, generation| {
+            let count = SegmentAttachmentCount {
+                id,
+                count,
+                generation,
+            };
+            set_attachments(&p, SegmentAttachmentCounts::new(&[count]).unwrap()).unwrap()
+        };
+        // Two pages, so one attach can split into at most two areas.
+        let id = get(&p, request(75, 4097, true, true)).unwrap().unwrap();
+        let other = get(&p, request(76, 4097, true, true)).unwrap().unwrap();
+        attach(&p, id, true);
+        attach(&p, other, true);
+        let base = next_generation(&p);
+        // A split counted after an unmap that ended the attachment arrives
+        // first; the unmap's count, though older, still ends it.
+        assert_eq!(publish(id, 2, base + 1), Ok(()));
+        assert_eq!(publish(id, 0, base + 2), Ok(()));
+        assert_eq!(publish(id, 2, base + 1), Ok(()));
+        assert_eq!(held_count(&p, id), 0);
+        assert_eq!(status_of(&p, id).attachments, 0);
+
+        // A reattach confirms the full count, so an older count that arrives
+        // afterwards changes nothing.
+        let prepared = prepare(&p, id, true);
+        let confirmed = SegmentAttachmentCount {
+            id,
+            count: 1,
+            generation: base + 4,
+        };
+        let request = ConfirmSegmentAttachRequest {
+            attachment: prepared.attachment,
+            count: confirmed,
+        };
+        assert_eq!(confirm_attach(&p, request).unwrap(), Ok(()));
+        assert_eq!(publish(id, 2, base + 3), Ok(()));
+        assert_eq!(status_of(&p, id).attachments, 1);
+
+        // A count of `other` older than a fork's snapshot was superseded, so
+        // the child does not inherit it.
+        assert_eq!(publish(other, 0, base + 5), Ok(()));
+        let prepared = prepare(&p, other, true);
+        let request = ConfirmSegmentAttachRequest {
+            attachment: prepared.attachment,
+            count: SegmentAttachmentCount {
+                id: other,
+                count: 1,
+                generation: base + 6,
+            },
+        };
+        confirm_attach(&p, request).unwrap().unwrap();
+        assert_eq!(publish(id, 1, base + 7), Ok(()));
+        let child_id = p
+            .allocate_child(AllocateChildRequest {
+                inherit_segment_attachments_since: Some(base + 7),
+                ..AllocateChildRequest::default()
+            })
+            .unwrap()
+            .process_id;
+        let child = p.take_child_process(child_id).unwrap();
+        assert_eq!((held_count(&child, id), held_count(&child, other)), (1, 0));
+        assert_eq!(status_of(&p, other).attachments, 1);
     }
 
     #[test]

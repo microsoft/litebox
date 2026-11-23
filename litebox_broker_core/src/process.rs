@@ -956,7 +956,7 @@ impl BrokerProcess {
         self.allocate_child(AllocateChildRequest {
             new_pid_namespace,
             sibling,
-            inherit_segment_attachments: false,
+            inherit_segment_attachments_since: None,
         })
     }
 
@@ -972,8 +972,9 @@ impl BrokerProcess {
     /// is this process, or with `sibling` this process's parent, and this
     /// returns `PolicyDenied` if it has none. Its job, file service,
     /// credential, group, session, limits and host names are this process's
-    /// either way. With `inherit_segment_attachments`, it starts with copies of
-    /// this process's segment attachments, and this returns
+    /// either way. With `inherit_segment_attachments_since`, it starts with
+    /// copies of this process's segment attachments counted at or after that
+    /// generation, and this returns
     /// `ResourceExhausted` if a segment cannot count them.
     /// The returned IDs are in this process's namespace, plus the child's
     /// process ID in its own namespace.
@@ -981,7 +982,7 @@ impl BrokerProcess {
         let AllocateChildRequest {
             new_pid_namespace,
             sibling,
-            inherit_segment_attachments,
+            inherit_segment_attachments_since,
         } = request;
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
@@ -1023,8 +1024,8 @@ impl BrokerProcess {
                         })
                         .ok_or(BrokerError::Internal)
                         .and_then(|identity| {
-                            if inherit_segment_attachments {
-                                crate::segment::inherit(self, &child)?;
+                            if let Some(generation) = inherit_segment_attachments_since {
+                                crate::segment::inherit(self, &child, generation)?;
                             }
                             Ok(identity)
                         });

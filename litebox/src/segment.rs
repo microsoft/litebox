@@ -13,9 +13,9 @@ use crate::sync::RawSyncPrimitivesProvider;
 use alloc::sync::Arc;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::segment::{
-    GetSegmentRequest, PrepareSegmentAttachRequest, SegmentAttachId, SegmentAttachmentCount,
-    SegmentAttachmentCounts, SegmentError as BrokerSegmentError, SegmentId, SegmentInfo,
-    SegmentSlotStatus, SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
+    ConfirmSegmentAttachRequest, GetSegmentRequest, PrepareSegmentAttachRequest, SegmentAttachId,
+    SegmentAttachmentCount, SegmentAttachmentCounts, SegmentError as BrokerSegmentError, SegmentId,
+    SegmentInfo, SegmentSlotStatus, SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
 };
 use litebox_platform::time::TimeProvider;
 
@@ -105,11 +105,15 @@ pub struct AttachReservation {
 }
 
 impl AttachReservation {
-    /// Records the attachment, once its backing object is mapped. On failure,
-    /// the reservation is cancelled.
-    pub fn confirm(mut self) -> Result<(), SegmentError> {
+    /// Records the attachment, once its backing object is mapped, with `count`
+    /// as this process's total for the segment, this attachment included. On
+    /// failure, the reservation is cancelled.
+    pub fn confirm(mut self, count: SegmentAttachmentCount) -> Result<(), SegmentError> {
         let attachment = self.attachment.take().ok_or(SegmentError::Invalid)?;
-        let result = segment_result(self.broker.confirm_segment_attach(attachment));
+        let result = segment_result(
+            self.broker
+                .confirm_segment_attach(ConfirmSegmentAttachRequest { attachment, count }),
+        );
         if result.is_err() {
             self.attachment = Some(attachment);
         }

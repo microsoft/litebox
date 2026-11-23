@@ -2086,8 +2086,8 @@ fn handle_segment_request(
             })?
             .map(SegmentResponse::PrepareAttach)
         }
-        SegmentRequest::ConfirmAttach(attachment) => {
-            segment::confirm_attach(process, attachment)?.map(|()| SegmentResponse::ConfirmAttach)
+        SegmentRequest::ConfirmAttach(request) => {
+            segment::confirm_attach(process, request)?.map(|()| SegmentResponse::ConfirmAttach)
         }
         SegmentRequest::CancelAttach(attachment) => {
             segment::cancel_attach(process, attachment)?.map(|()| SegmentResponse::CancelAttach)

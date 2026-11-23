@@ -271,8 +271,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// the first process of a new namespace with those options, nested in
     /// this process's. The child's parent is this process, or this process's
     /// parent if `request.sibling` is set. With
-    /// `request.inherit_segment_attachments`, it starts with copies of this
-    /// process's segment attachments.
+    /// `request.inherit_segment_attachments_since`, it starts with copies of
+    /// this process's segment attachments counted at or after that generation.
     ///
     /// # Panics
     ///

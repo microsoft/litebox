@@ -30,8 +30,8 @@ use crate::{
     errno::Errno,
     vmem::{
         self, CreatePagesFlags, LinuxReservationStore, MappingError, PageFaultError,
-        SharedObjectMapping, SysvAttachError, SysvPlacement, VmFlags, Vmem, VmemPageFaultHandler,
-        VmemProtectError, VmemResetError, VmemUnmapError,
+        SharedObjectMapping, SysvAttachError, SysvPlacement, SysvPublish, VmFlags, Vmem,
+        VmemPageFaultHandler, VmemProtectError, VmemResetError, VmemUnmapError,
     },
 };
 
@@ -72,12 +72,32 @@ where
 }
 
 /// Exclusive access to an address space, which publishes the SysV attachment counts the change
-/// made before unlocking it, so that a fork never inherits stale broker counts.
+/// made once it unlocks the address space, before the changing call returns. The counts carry
+/// generations, so the broker keeps the newest even if concurrent changes publish out of order.
 struct VmemUpdateGuard<'a, Platform, const ALIGN: usize>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
+    // Dropped before `publication`, so that publishing happens unlocked.
     vmem: RwLockWriteGuard<'a, Platform, Vmem<Platform, ALIGN>>,
+    publication: SysvPublication,
+}
+
+/// SysV attachment counts to publish when dropped.
+#[derive(Default)]
+struct SysvPublication {
+    publish: Option<SysvPublish>,
+    counts: Vec<SegmentAttachmentCount>,
+}
+
+impl Drop for SysvPublication {
+    fn drop(&mut self) {
+        if let Some(publish) = &self.publish
+            && !self.counts.is_empty()
+        {
+            publish(&self.counts);
+        }
+    }
 }
 
 impl<Platform, const ALIGN: usize> Drop for VmemUpdateGuard<'_, Platform, ALIGN>
@@ -85,15 +105,12 @@ where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
     fn drop(&mut self) {
-        let changes = self.vmem.take_sysv_changes();
-        if let Some(publish) = &self.vmem.sysv_publish
-            && !changes.is_empty()
-        {
-            let counts: Vec<_> = changes
-                .into_iter()
-                .map(|(id, count)| SegmentAttachmentCount { id, count })
-                .collect();
-            publish(&counts);
+        let counts = self.vmem.take_sysv_changes();
+        if !counts.is_empty() {
+            self.publication = SysvPublication {
+                publish: self.vmem.sysv_publish.clone(),
+                counts,
+            };
         }
     }
 }
@@ -127,6 +144,7 @@ where
     fn lock_for_update(&self) -> VmemUpdateGuard<'_, Platform, ALIGN> {
         VmemUpdateGuard {
             vmem: self.vmem.write(),
+            publication: SysvPublication::default(),
         }
     }
 }
@@ -157,9 +175,10 @@ where
     /// segment whose areas one update changed. A native clone must set its own process's before
     /// changing inherited mappings.
     ///
-    /// It runs synchronously, once per update, under the VMA write lock, and must not reenter
-    /// this manager. Each publication carries full counts, so the next one of a segment makes up
-    /// for a failed one.
+    /// It runs once per update, after the update unlocks this manager and before the updating
+    /// call returns, so concurrent updates may publish out of order. Each count carries a
+    /// generation that orders it, and a full count, so the next one of a segment also makes up for
+    /// a failed one.
     pub fn set_sysv_publisher(
         &self,
         publish: impl Fn(&[SegmentAttachmentCount]) + Send + Sync + 'static,
@@ -170,6 +189,13 @@ where
     /// Whether this address space has any live SysV attachments.
     pub fn has_sysv_attachments(&self) -> bool {
         self.vmem.read().has_sysv_attachments()
+    }
+
+    /// Returns how many areas map each SysV segment, under one generation newer than any count
+    /// published or confirmed before, for a child that inherits this address space to copy once
+    /// they are published. The publisher does not publish them.
+    pub fn snapshot_sysv_counts(&self) -> (u64, Vec<SegmentAttachmentCount>) {
+        self.lock_for_update().snapshot_sysv_counts()
     }
 
     /// Create a mapping with the given flags.
@@ -1156,8 +1182,9 @@ where
     }
 
     /// Maps one broker-authorized SysV attachment, `len` bytes rounded up to pages, with `prot`,
-    /// placed at `address`, and registers it once `confirm` succeeds. `confirm` runs under the
-    /// mapping write lock and must not reenter this manager. A failed confirmation unmaps the
+    /// placed at `address`, and registers it once `confirm(count)` succeeds, where `count` is how
+    /// many areas map segment `id` with the attachment, under a new generation. `confirm` runs
+    /// under the mapping write lock and must not reenter this manager. A failed confirmation unmaps the
     /// attachment again, leaving any pages it replaced unmapped.
     ///
     /// # Panics
@@ -1178,7 +1205,7 @@ where
             litebox::platform::page_mgmt::SharedObjectOf<Platform, PAGE_SIZE>,
         >,
         id: SegmentId,
-        confirm: impl FnOnce() -> Result<(), Errno>,
+        confirm: impl FnOnce(SegmentAttachmentCount) -> Result<(), Errno>,
     ) -> Result<UserPtrMut<u8>, Errno>
     where
         Platform: litebox::platform::SharedObjectProvider<PAGE_SIZE>,

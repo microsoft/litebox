@@ -84,9 +84,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// gives options, in which case it is the first process of a new
     /// namespace with those options, nested in this process's. The child's
     /// parent is this process, or this process's parent if `request.sibling`
-    /// is set. With `request.inherit_segment_attachments`, the child, which
-    /// inherits this process's address space, starts with copies of its
-    /// segment attachments.
+    /// is set. With `request.inherit_segment_attachments_since`, the child,
+    /// which inherits this process's address space, starts with copies of its
+    /// segment attachments counted at or after that generation.
     ///
     /// Fails with [`ProcessError::InvalidChild`] if the child's namespace has
     /// ended, and with [`ProcessError::ResourceExhausted`] at a process limit,

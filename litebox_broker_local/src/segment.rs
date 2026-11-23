@@ -5,9 +5,9 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, SegmentRequest, SegmentResponse,
 };
 use litebox_broker_protocol::segment::{
-    GetSegmentRequest, PrepareSegmentAttachRequest, PreparedSegmentAttach, SegmentAttachId,
-    SegmentAttachmentCounts, SegmentError, SegmentId, SegmentInfo, SegmentSlotStatus,
-    SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
+    ConfirmSegmentAttachRequest, GetSegmentRequest, PrepareSegmentAttachRequest,
+    PreparedSegmentAttach, SegmentAttachId, SegmentAttachmentCounts, SegmentError, SegmentId,
+    SegmentInfo, SegmentSlotStatus, SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -102,13 +102,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         )
     }
 
-    /// Records a reserved attachment once its backing object is mapped.
+    /// Records a reserved attachment once its backing object is mapped,
+    /// replacing this process's count of the segment.
     pub fn confirm_segment_attach(
         &self,
-        attachment: SegmentAttachId,
+        request: ConfirmSegmentAttachRequest,
     ) -> Result<SegmentResult<()>, Channel::Error> {
         expect_segment_response!(
-            self.request_segment(SegmentRequest::ConfirmAttach(attachment))?,
+            self.request_segment(SegmentRequest::ConfirmAttach(request))?,
             SegmentResponse::ConfirmAttach => ()
         )
     }
