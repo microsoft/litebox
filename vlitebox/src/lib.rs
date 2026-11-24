@@ -15,6 +15,7 @@ pub mod trusted;
 
 mod shared_memory_id_callers;
 
+pub use properties::channel_proof;
 pub use properties::error_proof;
 pub use properties::event_proof;
 pub use properties::file_projection_proof;
@@ -25,6 +26,7 @@ pub use properties::shared_futex_proof;
 pub use properties::shared_memory_id_proof;
 pub use properties::timer_proof;
 pub use properties::transfer_proof;
+pub use trusted::channel_spec;
 pub use trusted::error_spec;
 pub use trusted::event_spec;
 pub use trusted::file_projection_spec;

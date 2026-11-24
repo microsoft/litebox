@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+pub mod channel_spec;
 pub mod error_spec;
 pub mod event_spec;
 pub mod file_projection_spec;

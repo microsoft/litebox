@@ -386,6 +386,9 @@ static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(verus_keep_ghost)]
 pub mod verification {
+    pub use crate::channel::{
+        channel_accounting_policy, check_saturated_room, prove_channel_accounting,
+    };
     pub use crate::error::verification::{
         check_blocking_error, check_fault_translation, error_category_policy, protocol_error_code,
         prove_error_categories,

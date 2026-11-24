@@ -13,8 +13,15 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use spin::{Mutex, MutexGuard};
+use vstd::prelude::{verus_spec, verus_verify};
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::{SpecAdd, SpecOrd, SpecSub, old};
 
 use crate::{BrokerError, Result};
+
+#[cfg(verus_keep_ghost)]
+include!("channel_spec.rs");
 
 /// A writer that can wait for a channel to change.
 pub(crate) trait Waiter: Send + Sync {
@@ -48,6 +55,7 @@ impl<Q, W> Channel<Q, W> {
 }
 
 /// The state of a [`Channel`], which its lock guards.
+#[verus_verify]
 pub(crate) struct ChannelState<Q, W> {
     /// The queued data.
     pub(crate) queue: Q,
@@ -61,16 +69,30 @@ pub(crate) struct ChannelState<Q, W> {
 
 impl<Q, W> ChannelState<Q, W> {
     /// Returns the bytes the queued data counts against the capacity.
+    #[verus_spec(result => ensures result == channel_count(self))]
     pub(crate) fn queued(&self) -> usize {
         self.queued
     }
 
     /// Returns how many more bytes fit before the channel is full.
+    #[verus_spec(result => ensures
+        result == if channel_count(self) <= channel_capacity(self) {
+            channel_capacity(self) - channel_count(self)
+        } else {
+            0
+        },
+    )]
     pub(crate) fn room(&self) -> usize {
         self.capacity.saturating_sub(self.queued)
     }
 
     /// Records that data counting `bytes` joined the queue.
+    #[verus_spec(
+        requires bytes <= usize::MAX - channel_count(old(self)),
+        ensures
+            channel_count(final(self)) == channel_count(old(self)) + bytes,
+            same_count_frame(*old(self), *final(self)),
+    )]
     pub(crate) fn add(&mut self, bytes: usize) {
         self.queued = self
             .queued
@@ -79,6 +101,12 @@ impl<Q, W> ChannelState<Q, W> {
     }
 
     /// Records that data counting `bytes` left the queue.
+    #[verus_spec(
+        requires bytes <= channel_count(old(self)),
+        ensures
+            channel_count(final(self)) == channel_count(old(self)) - bytes,
+            same_count_frame(*old(self), *final(self)),
+    )]
     pub(crate) fn remove(&mut self, bytes: usize) {
         self.queued = self
             .queued
@@ -87,12 +115,14 @@ impl<Q, W> ChannelState<Q, W> {
     }
 
     /// Returns whether data stopped flowing.
+    #[verus_spec(result => ensures result == channel_is_shut(self))]
     pub(crate) fn is_shut(&self) -> bool {
         self.shut
     }
 
     /// Stops data from flowing: writers fail, and the reader reaches the end
     /// of the data once the queue drains.
+    #[verus_spec(ensures shut_state(*old(self), *final(self)))]
     pub(crate) fn shut(&mut self) {
         self.shut = true;
     }
