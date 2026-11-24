@@ -74,3 +74,7 @@ path = "src/negative/channel_saturation_negative.rs"
 [[example]]
 name = "channel_wakeups_negative"
 path = "src/negative/channel_wakeups_negative.rs"
+
+[[example]]
+name = "channel_extraction_negative"
+path = "src/negative/channel_extraction_negative.rs"

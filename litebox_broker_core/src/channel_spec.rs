@@ -49,6 +49,48 @@ pub closed spec fn empty_wakeups<W>(wakeups: Wakeups<W>) -> bool {
     wakeups.0@.len() == 0
 }
 
+// Conditional on the unproved std mem::take contract, not waiter delivery.
+pub(crate) closed spec fn take_waiters<Q, W>(
+    prev: ChannelState<Q, W>,
+    cur: ChannelState<Q, W>,
+    wakeups: Wakeups<W>,
+) -> bool {
+    &&& wakeups.0 == prev.waiters
+    &&& cur.waiters@.len() == 0
+    &&& cur.queue == prev.queue
+    &&& cur.queued == prev.queued
+    &&& cur.capacity == prev.capacity
+    &&& cur.shut == prev.shut
+}
+
+pub closed spec fn waiter_extraction_policy<Q, W>() -> bool {
+    forall|prev: ChannelState<Q, W>, cur: ChannelState<Q, W>, wakeups: Wakeups<W>|
+        #[trigger] channel_wake_transition(prev, cur, wakeups)
+            ==> take_waiters(prev, cur, wakeups)
+}
+
+pub proof fn prove_waiter_extraction<Q, W>()
+    ensures waiter_extraction_policy::<Q, W>(),
+{
+}
+
+pub fn check_waiter_extraction<W>(
+    waiters: Vec<Weak<W>>,
+) -> (result: (Vec<Weak<W>>, usize))
+    ensures result.0 == waiters, result.1 == 0,
+{
+    let mut state = ChannelState {
+        queue: (),
+        queued: 0,
+        capacity: 0,
+        shut: false,
+        waiters,
+    };
+    let taken = state.wake();
+
+    (taken.0, state.waiters.len())
+}
+
 pub closed spec fn channel_accounting_policy<Q, W>() -> bool {
     &&& (forall|prev: ChannelState<Q, W>, result: usize|
         #[trigger] ChannelState::queued.ensures((&prev,), result)
@@ -205,6 +247,28 @@ pub(crate) closed spec fn channel_shut_transition<Q, W>(
     cur: ChannelState<Q, W>,
 ) -> bool {
     apply_channel_shut.ensures((prev,), cur)
+}
+
+
+pub(crate) fn apply_channel_wake<Q, W>(
+    prev: ChannelState<Q, W>,
+) -> (result: (ChannelState<Q, W>, Wakeups<W>))
+    ensures take_waiters(prev, result.0, result.1),
+{
+    let mut cur = prev;
+
+    let wakeups = cur.wake();
+
+    (cur, wakeups)
+}
+
+
+pub(crate) closed spec fn channel_wake_transition<Q, W>(
+    prev: ChannelState<Q, W>,
+    cur: ChannelState<Q, W>,
+    wakeups: Wakeups<W>,
+) -> bool {
+    apply_channel_wake.ensures((prev,), (cur, wakeups))
 }
 
 }

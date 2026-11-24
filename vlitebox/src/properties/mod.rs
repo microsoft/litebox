@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 pub mod channel_proof;
+pub mod channel_waiters_proof;
 pub mod error_proof;
 pub mod event_proof;
 pub mod file_projection_proof;

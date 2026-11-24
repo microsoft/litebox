@@ -150,6 +150,7 @@ impl<Q, W> ChannelState<Q, W> {
     /// Callers take them after any change that may let a writer proceed:
     /// draining the queue, shutting the channel, or changing which writers it
     /// accepts.
+    #[verus_spec(result => ensures take_waiters(*old(self), *final(self), result))]
     pub(crate) fn wake(&mut self) -> Wakeups<W> {
         Wakeups(core::mem::take(&mut self.waiters))
     }

@@ -11,3 +11,6 @@ pub mod spin_spec;
 
 #[cfg(verus_keep_ghost)]
 pub mod alloc_spec;
+
+#[cfg(verus_keep_ghost)]
+pub mod mem_spec;
