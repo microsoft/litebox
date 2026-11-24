@@ -23,6 +23,7 @@ use crate::ObjectHandle;
 use crate::fs::FileOpenFlags;
 use crate::shared_buffer::SharedBufferSequence;
 use crate::socket::SocketType;
+use vstd::prelude::verus_verify;
 
 /// Vsock context ID, naming a VM or the host.
 #[repr(transparent)]
@@ -39,6 +40,7 @@ impl VsockCid {
 /// Vsock port.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[verus_verify]
 pub struct VsockPort(pub u32);
 
 impl VsockPort {

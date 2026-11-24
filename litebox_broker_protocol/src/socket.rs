@@ -16,6 +16,7 @@ use crate::ObjectHandle;
 use crate::fs::FileOpenFlags;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use thiserror::Error;
+use vstd::prelude::verus_verify;
 
 /// Maximum socket bytes transferred by one broker request.
 ///
@@ -156,11 +157,13 @@ impl SocketOptionValue {
 /// IPv4 address in network byte order.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[verus_verify]
 pub struct Ipv4Address(pub [u8; 4]);
 
 /// Transport port in host byte order.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[verus_verify]
 pub struct Port(pub u16);
 
 /// Flags for a send operation.
