@@ -3,9 +3,9 @@
 
 //! The shim's `containerd.task.v2.Task` service. A daemon serves one container, whose processes
 //! the guest service runs: the init process (exec ID "") and exec processes, which the guest
-//! service knows by IDs the shim never reuses. Every process's pid is the broker's host pid
-//! (the VMM's for the VM). Each event is queued at the change it reports, under the state's lock, or
-//! for `TaskDelete` under the lifecycle's, so that events leave in order.
+//! service knows by the container's ID and IDs the shim never reuses. Every process's pid is the
+//! broker's host pid (the VMM's for the VM). Each event is queued at the change it reports, under
+//! the state's lock, or for `TaskDelete` under the lifecycle's, so that events leave in order.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -33,8 +33,8 @@ use containerd_shim::protos::types::task::ProcessInfo;
 use containerd_shim::publisher::RemotePublisher;
 use containerd_shim::{Config, ExitSignal, Flags, StartOpts, Task, TtrpcContext, TtrpcResult};
 use litebox_guest_service_protocol::guest_service::{
-    CreateContainerRequest, Empty as GuestEmpty, ExecProcessRequest as GuestExecRequest,
-    Process as GuestProcess, ReleaseProcessRequest, SignalProcessRequest, TtyWinResizeRequest,
+    CreateContainerRequest, ExecProcessRequest as GuestExecRequest, Process as GuestProcess,
+    ReleaseProcessRequest, SignalProcessRequest, StartContainerRequest, TtyWinResizeRequest,
     WaitProcessRequest,
 };
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
@@ -46,7 +46,7 @@ use crate::rootfs::RootFs;
 #[cfg(unix)]
 use crate::sandbox::RootMount;
 use crate::sandbox::{Broker, StateDir, remove_leftovers};
-use crate::stdio::{Host, Logger, Pumps};
+use crate::stdio::{GuestId, Host, Logger, Pumps};
 use crate::{Result, error, internal, invalid, spec, unsupported};
 
 /// How long an exit waits for the process's output to reach its host ends, which a child that
@@ -360,8 +360,7 @@ struct Container {
 }
 
 struct Process {
-    /// Its ID in the guest service, never reused, unlike containerd's exec IDs.
-    guest_id: String,
+    guest: GuestId,
     io: TaskIO,
     /// What an exec process runs, until it starts.
     spec: Option<GuestProcess>,
@@ -411,9 +410,9 @@ fn task_io(stdin: &str, stdout: &str, stderr: &str, terminal: bool) -> TaskIO {
 }
 
 impl Process {
-    fn new(guest_id: String, io: TaskIO, spec: Option<GuestProcess>) -> Self {
+    fn new(guest: GuestId, io: TaskIO, spec: Option<GuestProcess>) -> Self {
         Self {
-            guest_id,
+            guest,
             io,
             spec,
             started: false,
@@ -550,6 +549,7 @@ impl Inner {
                 .create_container(
                     deadline(CONTROL_TIMEOUT),
                     &CreateContainerRequest {
+                        container_id: request.id.clone(),
                         process: MessageField::some(plan.process),
                         ..Default::default()
                     },
@@ -570,10 +570,14 @@ impl Inner {
             }
         };
         let pid = broker.pid();
-        let mut init = Process::new(String::new(), io.clone(), None);
+        let guest = GuestId {
+            container_id: request.id.clone(),
+            exec_id: String::new(),
+        };
+        let mut init = Process::new(guest, io.clone(), None);
         init.pumps = Some(Pumps::start(
             &client,
-            "",
+            &init.guest,
             host.ends,
             request.terminal,
             Arc::clone(&init.closing),
@@ -671,21 +675,28 @@ impl Inner {
         container.process(exec_id)?;
         let broker = &container.broker;
         let process = container.processes.get_mut(exec_id).expect("found above");
-        let guest_id = process.guest_id.clone();
+        let guest = process.guest.clone();
         let started = match files {
             None => client
-                .start_container(deadline(CONTROL_TIMEOUT), &GuestEmpty::new())
+                .start_container(
+                    deadline(CONTROL_TIMEOUT),
+                    &StartContainerRequest {
+                        container_id: guest.container_id.clone(),
+                        ..Default::default()
+                    },
+                )
                 .map(drop)
                 .map_err(guest_error("cannot start the container")),
             Some(files) => files.and_then(|files| {
-                let guest = process
+                let spec = process
                     .spec
                     .take()
                     .expect("a created exec process has a spec");
-                let terminal = guest.terminal;
+                let terminal = spec.terminal;
                 let exec = GuestExecRequest {
-                    exec_id: guest_id.clone(),
-                    process: MessageField::some(guest),
+                    container_id: guest.container_id.clone(),
+                    exec_id: guest.exec_id.clone(),
+                    process: MessageField::some(spec),
                     ..Default::default()
                 };
                 let execed = client.exec_process(deadline(CONTROL_TIMEOUT), &exec);
@@ -694,7 +705,7 @@ impl Inner {
                 let closing = Arc::clone(&process.closing);
                 let deleted = Arc::clone(&process.deleted);
                 process.pumps = Some(Pumps::start(
-                    &client, &guest_id, files, terminal, closing, deleted,
+                    &client, &guest, files, terminal, closing, deleted,
                 ));
                 Ok(())
             }),
@@ -722,7 +733,7 @@ impl Inner {
         let pumps = process.pumps.take().expect("a started process has pumps");
         let deleted = Arc::clone(&process.deleted);
         let (inner, watched) = (Arc::clone(self), exec_id.to_owned());
-        std::thread::spawn(move || inner.watch(&client, &watched, guest_id, &pumps, &deleted));
+        std::thread::spawn(move || inner.watch(&client, &watched, guest, &pumps, &deleted));
         let event: (_, Box<dyn MessageDyn>) = if exec_id.is_empty() {
             let event = TaskStart {
                 container_id: request.id.clone(),
@@ -750,7 +761,7 @@ impl Inner {
         })
     }
 
-    /// Waits for the exit of the process `exec_id`, `guest_id` in the guest service, and publishes
+    /// Waits for the exit of the process `exec_id`, `guest` in the guest service, and publishes
     /// it once its output reached its host ends, or after [`DRAIN_TIMEOUT`]; the init's comes
     /// last. Then waits for the output's copiers to end (see [`Pumps::finish`]), or for the
     /// process's `Delete` (`deleted`), releases the process in the guest service, which ends what
@@ -761,12 +772,13 @@ impl Inner {
         &self,
         client: &Arc<GuestServiceClient>,
         exec_id: &str,
-        guest_id: String,
+        guest: GuestId,
         pumps: &Pumps,
         deleted: &AtomicBool,
     ) {
         let request = WaitProcessRequest {
-            exec_id: guest_id.clone(),
+            container_id: guest.container_id.clone(),
+            exec_id: guest.exec_id.clone(),
             ..Default::default()
         };
         let exit = client.wait_process(context::Context::default(), &request);
@@ -809,7 +821,8 @@ impl Inner {
                 log::warn!("the output of process {exec_id:?} did not end; releasing the process");
             }
             let release = ReleaseProcessRequest {
-                exec_id: guest_id,
+                container_id: guest.container_id,
+                exec_id: guest.exec_id,
                 ..Default::default()
             };
             let released = client.release_process(deadline(CONTROL_TIMEOUT), &release);
@@ -855,7 +868,11 @@ impl Inner {
         );
         container.last_guest_id += 1;
         set_home(&mut guest, &container.passwd, uid);
-        let process = Process::new(container.last_guest_id.to_string(), io, Some(guest));
+        let id = GuestId {
+            container_id: container.id.clone(),
+            exec_id: container.last_guest_id.to_string(),
+        };
+        let process = Process::new(id, io, Some(guest));
         container.processes.insert(request.exec_id.clone(), process);
         let event = TaskExecAdded {
             container_id: request.id.clone(),
@@ -889,7 +906,8 @@ impl Inner {
             return Ok(());
         }
         let signal = SignalProcessRequest {
-            exec_id: process.guest_id.clone(),
+            container_id: process.guest.container_id.clone(),
+            exec_id: process.guest.exec_id.clone(),
             signal: request.signal,
             all: request.all && request.exec_id.is_empty(),
             ..Default::default()
@@ -1043,7 +1061,8 @@ impl Inner {
             return Ok(());
         }
         let resize = TtyWinResizeRequest {
-            exec_id: process.guest_id.clone(),
+            container_id: process.guest.container_id.clone(),
+            exec_id: process.guest.exec_id.clone(),
             row: request.height,
             column: request.width,
             ..Default::default()

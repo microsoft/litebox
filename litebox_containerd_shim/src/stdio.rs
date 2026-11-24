@@ -83,6 +83,14 @@ fn parse(uri: &str) -> Result<(Url, PathBuf)> {
     Ok((url, path))
 }
 
+/// A process as the guest service names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuestId {
+    pub container_id: String,
+    /// Never reused in the container, unlike containerd's exec IDs.
+    pub exec_id: String,
+}
+
 #[derive(Default)]
 pub struct Ends {
     stdin: Option<File>,
@@ -146,13 +154,13 @@ struct Activity {
 
 impl Pumps {
     /// Starts copying between the host ends and the streams of the guest service's process
-    /// `guest_id`; an output without a host end is drained. The input ends once `closing` is set
+    /// `guest`; an output without a host end is drained. The input ends once `closing` is set
     /// and what was readable then is forwarded, and is closed in the guest service at its end,
     /// or at once without a host end (but a terminal's, which would hang the terminal up). An
     /// output stops writing to its host end once `deleted` is set.
     pub fn start(
         client: &Arc<GuestServiceClient>,
-        guest_id: &str,
+        guest: &GuestId,
         Ends {
             stdin,
             stdout,
@@ -168,15 +176,14 @@ impl Pumps {
             copying: 0,
             last: Instant::now(),
         }));
-        let (client, guest_id) = (Arc::clone(client), guest_id.to_owned());
+        let client = Arc::clone(client);
         if let Some(fifo) = stdin {
-            let (client, guest_id, stop) =
-                (Arc::clone(&client), guest_id.clone(), Arc::clone(&stop));
-            std::thread::spawn(move || copy_input(&client, guest_id, &fifo, &closing, &stop));
+            let (client, guest, stop) = (Arc::clone(&client), guest.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || copy_input(&client, &guest, &fifo, &closing, &stop));
         } else if !terminal {
             // From a thread, as the caller holds the shim's locks.
-            let (client, guest_id) = (Arc::clone(&client), guest_id.clone());
-            std::thread::spawn(move || close_stdin(&client, guest_id));
+            let (client, guest) = (Arc::clone(&client), guest.clone());
+            std::thread::spawn(move || close_stdin(&client, &guest));
         }
         let outputs_of_process = if terminal {
             vec![(false, stdout)]
@@ -184,10 +191,10 @@ impl Pumps {
             vec![(false, stdout), (true, stderr)]
         };
         for (is_stderr, sink) in outputs_of_process {
-            let (client, guest_id, done) = (Arc::clone(&client), guest_id.clone(), done.clone());
+            let (client, guest, done) = (Arc::clone(&client), guest.clone(), done.clone());
             let (activity, deleted) = (Arc::clone(&activity), Arc::clone(&deleted));
             std::thread::spawn(move || {
-                copy_output(&client, guest_id, is_stderr, sink, &activity, &deleted);
+                copy_output(&client, &guest, is_stderr, sink, &activity, &deleted);
                 drop(done);
             });
         }
@@ -233,9 +240,10 @@ impl Pumps {
     }
 }
 
-fn close_stdin(client: &GuestServiceClient, guest_id: String) {
+fn close_stdin(client: &GuestServiceClient, guest: &GuestId) {
     let request = CloseStdinRequest {
-        exec_id: guest_id,
+        container_id: guest.container_id.clone(),
+        exec_id: guest.exec_id.clone(),
         ..Default::default()
     };
     // A terminal whose process has not started refuses, and stays open, as runc keeps a terminal
@@ -245,7 +253,7 @@ fn close_stdin(client: &GuestServiceClient, guest_id: String) {
 
 fn copy_input(
     client: &GuestServiceClient,
-    guest_id: String,
+    guest: &GuestId,
     fifo: &File,
     closing: &AtomicBool,
     stop: &AtomicBool,
@@ -272,7 +280,8 @@ fn copy_input(
             *left -= read;
         }
         let request = WriteStreamRequest {
-            exec_id: guest_id.clone(),
+            container_id: guest.container_id.clone(),
+            exec_id: guest.exec_id.clone(),
             data: buffer[..read].to_vec(),
             ..Default::default()
         };
@@ -282,7 +291,7 @@ fn copy_input(
     }
     // Once stopped, the process was released with its streams.
     if !stop.load(Ordering::SeqCst) {
-        close_stdin(client, guest_id);
+        close_stdin(client, guest);
     }
 }
 
@@ -291,14 +300,15 @@ fn copy_input(
 /// block.
 fn copy_output(
     client: &GuestServiceClient,
-    guest_id: String,
+    guest: &GuestId,
     stderr: bool,
     mut sink: Option<Output>,
     activity: &Mutex<Activity>,
     deleted: &AtomicBool,
 ) {
     let request = ReadStreamRequest {
-        exec_id: guest_id,
+        container_id: guest.container_id.clone(),
+        exec_id: guest.exec_id.clone(),
         len: CHUNK,
         ..Default::default()
     };
@@ -335,11 +345,11 @@ mod tests {
         GuestService, GuestServiceClient, create_guest_service,
     };
 
-    use super::Pumps;
+    use super::{GuestId, Pumps};
 
-    /// A guest service whose `CloseStdin` reports its exec ID, then answers once released.
+    /// A guest service whose `CloseStdin` reports its process, then answers once released.
     struct Gated {
-        called: mpsc::Sender<String>,
+        called: mpsc::Sender<GuestId>,
         gate: Mutex<mpsc::Receiver<()>>,
     }
 
@@ -349,7 +359,10 @@ mod tests {
             _: &TtrpcContext,
             request: CloseStdinRequest,
         ) -> ttrpc::Result<Empty> {
-            let _ = self.called.send(request.exec_id);
+            let _ = self.called.send(GuestId {
+                container_id: request.container_id,
+                exec_id: request.exec_id,
+            });
             let _ = self.gate.lock().unwrap().recv();
             Ok(Empty::new())
         }
@@ -386,10 +399,15 @@ mod tests {
         };
         let client = Arc::new(GuestServiceClient::new(client));
         let (done, returned) = mpsc::channel();
+        let guest = GuestId {
+            container_id: "c".to_owned(),
+            exec_id: "1".to_owned(),
+        };
+        let started = guest.clone();
         let thread = std::thread::spawn(move || {
             let pumps = Pumps::start(
                 &client,
-                "1",
+                &started,
                 super::Ends::default(),
                 false,
                 Arc::default(),
@@ -406,6 +424,6 @@ mod tests {
         assert!(pumps.drain(Duration::from_secs(5)));
         server.shutdown();
         assert_eq!(returned, Ok(()), "`Pumps::start` waited for `CloseStdin`");
-        assert_eq!(call.as_deref(), Ok("1"));
+        assert_eq!(call, Ok(guest));
     }
 }
