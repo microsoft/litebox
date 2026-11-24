@@ -19,10 +19,10 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildProcessFlags, ChildSelector, CpuTime, CreateNamespacesRequest, HostName,
-    HostNameKind, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_HOST_NAME_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, PidNamespaceOptions, ProcessExitStatus,
-    ProcessIdentity, ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
+    ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind, HostNames,
+    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
+    MAX_PROCESS_BOOTSTRAP_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
@@ -100,7 +100,7 @@ pub(crate) trait BrokerControl: SegmentControl {
     fn allocate_child_process(
         &self,
         new_pid_namespace: Option<PidNamespaceOptions>,
-        flags: ChildProcessFlags,
+        sibling: bool,
     ) -> core::result::Result<ProcessIdentity, BrokerControlError>;
 
     fn create_namespaces(
@@ -1084,9 +1084,9 @@ where
     fn allocate_child_process(
         &self,
         new_pid_namespace: Option<PidNamespaceOptions>,
-        flags: ChildProcessFlags,
+        sibling: bool,
     ) -> core::result::Result<ProcessIdentity, BrokerControlError> {
-        self.request(|local| local.allocate_child_process(new_pid_namespace, flags))
+        self.request(|local| local.allocate_child_process(new_pid_namespace, sibling))
     }
 
     fn create_namespaces(

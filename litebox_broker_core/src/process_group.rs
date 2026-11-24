@@ -628,9 +628,7 @@ mod tests {
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileUser,
     };
-    use litebox_broker_protocol::process::{
-        ChildProcessFlags, ChildSelector, CpuTime, ProcessExitStatus,
-    };
+    use litebox_broker_protocol::process::{ChildSelector, CpuTime, ProcessExitStatus};
     use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::SignalEvent;
@@ -667,7 +665,7 @@ mod tests {
     /// `broker`.
     fn process(broker: &TestBroker, parent: Option<&BrokerProcess>) -> Arc<BrokerProcess> {
         match parent {
-            Some(parent) => parent.create_child(parent.pid_namespace(), ChildProcessFlags::empty()),
+            Some(parent) => parent.create_child(parent.pid_namespace(), false),
             None => broker.create_process(CallerCredential::Unauthenticated),
         }
         .unwrap()
@@ -760,10 +758,7 @@ mod tests {
             super::create_session(&root, child.id()),
             Err(BrokerError::UnknownObject)
         );
-        let pending = root
-            .allocate_child_process(None, ChildProcessFlags::empty())
-            .unwrap()
-            .process_id;
+        let pending = root.allocate_child_process(None, false).unwrap().process_id;
         super::create_session(&root, pending).unwrap();
         assert_eq!(
             get(&root, pending),
@@ -791,7 +786,7 @@ mod tests {
         let broker = broker();
         *broker.pid_namespace.id_allocator.lock() = IdAllocator::new(6).unwrap();
         let allocate = |parent: Option<&BrokerProcess>| match parent {
-            Some(parent) => parent.create_child(parent.pid_namespace(), ChildProcessFlags::empty()),
+            Some(parent) => parent.create_child(parent.pid_namespace(), false),
             None => broker.create_process(CallerCredential::Unauthenticated),
         };
         let leader = allocate(None).unwrap();
@@ -1030,7 +1025,7 @@ mod tests {
         let (broker, stdio) = terminal_broker();
         *broker.pid_namespace.id_allocator.lock() = IdAllocator::new(6).unwrap();
         let allocate = |parent: Option<&BrokerProcess>| match parent {
-            Some(parent) => parent.create_child(parent.pid_namespace(), ChildProcessFlags::empty()),
+            Some(parent) => parent.create_child(parent.pid_namespace(), false),
             None => broker.create_process(CallerCredential::Unauthenticated),
         };
         let root = allocate(None).unwrap();
@@ -1192,10 +1187,7 @@ mod tests {
         // A pending child that leads a session can acquire a terminal before
         // it starts, here through a pseudo-terminal manager.
         let manager = open(&root, "/dev/ptmx", FileOpenFlags::NONE);
-        let pending = root
-            .allocate_child_process(None, ChildProcessFlags::empty())
-            .unwrap()
-            .process_id;
+        let pending = root.allocate_child_process(None, false).unwrap().process_id;
         assert_eq!(
             super::set_controlling_terminal(&root, pending, manager),
             Err(BrokerError::PolicyDenied)

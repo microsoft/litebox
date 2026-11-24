@@ -680,6 +680,7 @@ mod tests {
             children_pid_namespace: None,
             new_segment_namespace: true,
             copy_host_names: false,
+            copy_mount_view: false,
         })
     }
 
@@ -867,6 +868,7 @@ mod tests {
                 children_pid_namespace: Some(PidNamespaceOptions::default()),
                 new_segment_namespace: false,
                 copy_host_names: false,
+                copy_mount_view: false,
             })
             .unwrap();
         let child = new_child(&parent);

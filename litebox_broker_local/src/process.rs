@@ -9,9 +9,9 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessRequest, ProcessResponse,
 };
 use litebox_broker_protocol::process::{
-    AllocateChildRequest, ChildExit, ChildProcessFlags, ChildSelector, CpuTime,
-    CreateNamespacesRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    GetHostNamesRequest, GetResourceLimitRequest, HostName, HostNameKind, HostNameSizes, HostNames,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostName, HostNameKind, HostNameSizes, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
     MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, OpenProcessHandleRequest,
     PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
@@ -265,8 +265,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// unless `new_pid_namespace` gives options, in which case it is the first
     /// process of a new namespace with those options, nested in this
     /// process's. The child's parent is this process, or this process's
-    /// parent with [`ChildProcessFlags::SIBLING`]. With [`ChildProcessFlags::PRIVATE_MOUNT_VIEW`]
-    /// it gets its own copy of this process's mount layout.
+    /// parent if `sibling` is set.
     ///
     /// # Panics
     ///
@@ -274,11 +273,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn allocate_child_process(
         &self,
         new_pid_namespace: Option<PidNamespaceOptions>,
-        flags: ChildProcessFlags,
+        sibling: bool,
     ) -> Result<ProcessIdentity, Channel::Error> {
         match self.request_process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace,
-            flags,
+            sibling,
         }))? {
             ProcessResponse::AllocateChild(child) => Ok(child),
             response => panic!("broker returned unexpected process response: {response:?}"),

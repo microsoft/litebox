@@ -34,13 +34,12 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    AllocateChildRequest, ChildExit, ChildProcessFlags, ChildSelector, CpuTime,
-    CreateNamespacesRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-    GetHostNamesRequest, GetResourceLimitRequest, HostNameKind, HostNameSizes, MAX_HOST_NAME_SIZE,
-    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    ResourceKind, ResourceLimit, SetHostNameRequest, SetResourceLimitRequest,
-    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
-    WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostNameKind, HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind,
+    ResourceLimit, SetHostNameRequest, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -610,33 +609,36 @@ fn request_codec_round_trips_all_variants() {
         BrokerOperation::Thread(ThreadRequest::Exit(thread_id(u32::MAX))),
         BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: None,
-            flags: ChildProcessFlags::empty(),
+            sibling: false,
         })),
         BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
-            flags: ChildProcessFlags::SIBLING | ChildProcessFlags::PRIVATE_MOUNT_VIEW,
+            sibling: true,
         })),
         BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: Some(PidNamespaceOptions::new(false, true)),
-            flags: ChildProcessFlags::PRIVATE_MOUNT_VIEW,
+            sibling: false,
         })),
         BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
             process_id: process_id(7),
             children_pid_namespace: Some(PidNamespaceOptions::new(true, true)),
             new_segment_namespace: false,
             copy_host_names: false,
+            copy_mount_view: true,
         })),
         BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
             process_id: process_id(u32::MAX),
             children_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
             new_segment_namespace: true,
             copy_host_names: true,
+            copy_mount_view: false,
         })),
         BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
             process_id: process_id(1),
             children_pid_namespace: None,
             new_segment_namespace: false,
             copy_host_names: true,
+            copy_mount_view: true,
         })),
         BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(
             DuplicateObjectsToChildRequest {
@@ -1917,16 +1919,16 @@ fn decode_rejects_malformed_request_frames() {
         decode_request(&invalid_orphan_adoption),
         Err(WireError::InvalidTag)
     );
-    // The old sibling encoding is unchanged. Check invalid tags and unknown flag bits.
+    // The option tag and all three bool fields reject non-boolean values.
     let allocate_child = encode_request(&BrokerRequest {
         request_id: TEST_REQUEST_ID,
         operation: BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: Some(PidNamespaceOptions::new(true, true)),
-            flags: ChildProcessFlags::SIBLING,
+            sibling: true,
         })),
     });
     assert_eq!(allocate_child[10..], [0, 1, 1, 1, 1]);
-    for (index, value) in [(11, 2), (12, 0b100), (12, 0x80), (13, 2), (14, 4)] {
+    for (index, value) in [(11, 2), (12, 0b100), (12, 0x80), (13, 2), (14, 2)] {
         let mut invalid_allocate_child = allocate_child.clone();
         invalid_allocate_child[index] = value;
         assert_eq!(
@@ -1942,6 +1944,7 @@ fn decode_rejects_malformed_request_frames() {
                 children_pid_namespace: Some(PidNamespaceOptions::default()),
                 new_segment_namespace: false,
                 copy_host_names: false,
+                copy_mount_view: false,
             },
         )),
     });

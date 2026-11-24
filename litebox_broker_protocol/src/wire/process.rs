@@ -1,12 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::process::{ChildProcessFlags, ResourceLimit};
+use crate::process::ResourceLimit;
 
 use super::primitive::{Decoder, Encoder};
 use super::{Wire, WireError};
-
-wire_flags!(ChildProcessFlags: u8);
 
 impl Wire for ResourceLimit {
     const MAX_SIZE: usize = u64::MAX_SIZE + u64::MAX_SIZE;

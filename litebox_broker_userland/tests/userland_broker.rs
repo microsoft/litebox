@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::fs::FileOpenFlags;
-use litebox_broker_protocol::process::{ChildProcessFlags, ProcessStartupData};
+use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferSequence, SharedBufferSlotIndex,
@@ -335,9 +335,7 @@ fn run_fake_runner(args: &[OsString]) {
         assert_eq!(args.len(), 5, "unexpected runner arguments: {args:?}");
         let marker = Path::new(&args[4]);
         let bootstrap = marker.to_str().unwrap().as_bytes();
-        let failed = local
-            .allocate_child_process(None, ChildProcessFlags::empty())
-            .unwrap();
+        let failed = local.allocate_child_process(None, false).unwrap();
         local
             .start_child_process(
                 failed.process_id,
@@ -346,9 +344,7 @@ fn run_fake_runner(args: &[OsString]) {
             )
             .unwrap();
         assert_ne!(failed.process_id.0, failed.initial_thread_id.0);
-        let started = local
-            .allocate_child_process(None, ChildProcessFlags::empty())
-            .unwrap();
+        let started = local.allocate_child_process(None, false).unwrap();
         local
             .start_child_process(
                 started.process_id,

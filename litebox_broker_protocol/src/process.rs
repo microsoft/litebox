@@ -49,6 +49,8 @@ wire_struct! {
         pub new_segment_namespace: bool,
         /// Give the target a private copy of its host names.
         pub copy_host_names: bool,
+        /// Give the target a private copy of its mount view.
+        pub copy_mount_view: bool,
     }
 }
 
@@ -83,19 +85,6 @@ impl PidNamespaceOptions {
     }
 }
 
-bitflags::bitflags! {
-    /// Choices about how a child process relates to its creator.
-    #[repr(transparent)]
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct ChildProcessFlags: u8 {
-        /// Make the creator's parent the child's parent. The creator still owns the child
-        /// until it starts. Bit zero preserves the wire encoding of the former sibling bool.
-        const SIBLING = 1 << 0;
-        /// Give the child a private copy of the creator's mount layout instead of sharing it.
-        const PRIVATE_MOUNT_VIEW = 1 << 1;
-    }
-}
-
 wire_struct! {
     /// Creates a pending child process and its initial thread.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,8 +93,9 @@ wire_struct! {
         /// these options, nested in the caller's. Otherwise, the child goes into
         /// the PID namespace for the caller's children.
         pub new_pid_namespace: Option<PidNamespaceOptions>,
-        /// How the child relates to its creator.
-        pub flags: ChildProcessFlags,
+        /// Whether the child's parent is the caller's parent rather than the
+        /// caller. Either way, the caller owns the child until it starts.
+        pub sibling: bool,
     }
 }
 
