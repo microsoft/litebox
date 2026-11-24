@@ -46,3 +46,11 @@ path = "src/negative/shared_futex_alignment_negative.rs"
 [[example]]
 name = "ipc_projection_negative"
 path = "src/negative/ipc_projection_negative.rs"
+
+[[example]]
+name = "error_translation_negative"
+path = "src/negative/error_translation_negative.rs"
+
+[[example]]
+name = "blocking_error_negative"
+path = "src/negative/blocking_error_negative.rs"

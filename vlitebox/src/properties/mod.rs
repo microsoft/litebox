@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+pub mod error_proof;
 pub mod event_proof;
 pub mod ipc_projection_proof;
 pub mod object_proof;

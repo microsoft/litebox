@@ -2,10 +2,14 @@
 // Licensed under the MIT license.
 
 use thiserror::Error;
-use vstd::prelude::verus_verify;
+use vstd::prelude::{verus_spec, verus_verify};
 
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_platform::buffer::Fault;
+
+#[cfg(verus_keep_ghost)]
+#[path = "error_spec.rs"]
+pub(crate) mod verification;
 
 /// Broker authority error category.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]
@@ -37,11 +41,13 @@ pub enum BrokerError {
     UnsupportedOperation,
 }
 
+#[verus_verify]
 impl BrokerError {
     /// Returns the error for an operation that would block on an object whose
     /// [`FileOpenFlags::NONBLOCKING`] status flag is `nonblocking`.
     ///
     /// [`FileOpenFlags::NONBLOCKING`]: litebox_broker_protocol::fs::FileOpenFlags::NONBLOCKING
+    #[verus_spec(result => ensures verification::would_block_error(nonblocking, result))]
     pub(crate) const fn would_block(nonblocking: bool) -> Self {
         if nonblocking {
             Self::NonBlockingWouldBlock
@@ -58,7 +64,9 @@ impl From<Fault> for BrokerError {
     }
 }
 
+#[verus_verify]
 impl From<BrokerError> for ErrorCode {
+    #[verus_spec(result => ensures verification::error_code_matches(error, result))]
     fn from(error: BrokerError) -> Self {
         match error {
             BrokerError::PolicyDenied => Self::PolicyDenied,

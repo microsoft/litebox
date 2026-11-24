@@ -2,11 +2,14 @@
 // Licensed under the MIT license.
 
 use thiserror::Error;
+use vstd::prelude::verus_verify;
 
 wire_enum! {
     /// ABI-neutral broker error category.
     #[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]
     #[non_exhaustive]
+    // In progress: derived formatting is outside error-category verification.
+    #[verus_verify(external_derive)]
     pub enum ErrorCode {
         #[error("unsupported broker protocol version")]
         UnsupportedVersion,
