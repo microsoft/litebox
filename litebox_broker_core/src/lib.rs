@@ -91,7 +91,7 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 ///
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-// In progress: derives, other builders and live quota enforcement remain unverified.
+// In progress: derives, defaults/constructors and live quota enforcement remain unverified.
 #[vstd::prelude::verus_verify(external_derive)]
 pub struct BrokerCoreLimits {
     /// Maximum broker processes, across every PID namespace, that have not
@@ -252,6 +252,9 @@ impl BrokerCoreLimits {
     /// A per-process quota above the broker-wide limit is accepted; the
     /// broker-wide limit still applies.
     #[must_use]
+    #[vstd::prelude::verus_spec(result => ensures
+        limits_spec::unix_socket_limit_transition(self, result, max_total_unix_socket_bytes, max_unix_socket_bytes_per_process)
+    )]
     pub const fn with_unix_socket_limits(
         self,
         max_total_unix_socket_bytes: usize,
@@ -270,6 +273,9 @@ impl BrokerCoreLimits {
     /// A per-process quota above the broker-wide limit is accepted; the
     /// broker-wide limit still applies.
     #[must_use]
+    #[vstd::prelude::verus_spec(result => ensures
+        limits_spec::readiness_limit_transition(self, result, max_readiness_queue_entries, max_readiness_queue_entries_per_process)
+    )]
     pub const fn with_readiness_queue_limits(
         self,
         max_readiness_queue_entries: usize,
@@ -299,6 +305,9 @@ impl BrokerCoreLimits {
     /// A per-process quota above the broker-wide limit is accepted; the
     /// broker-wide limit still applies.
     #[must_use]
+    #[vstd::prelude::verus_spec(result => ensures
+        limits_spec::thread_limit_transition(self, result, max_threads, max_threads_per_process)
+    )]
     pub const fn with_thread_quotas(
         self,
         max_threads: usize,
@@ -317,6 +326,9 @@ impl BrokerCoreLimits {
     /// A per-child limit above the broker-wide limit is accepted; the
     /// broker-wide limit still applies.
     #[must_use]
+    #[vstd::prelude::verus_spec(result => ensures
+        limits_spec::child_image_limit_transition(self, result, max_child_image_size, max_total_child_image_size)
+    )]
     pub const fn with_child_image_size_limits(
         self,
         max_child_image_size: u64,
@@ -331,6 +343,9 @@ impl BrokerCoreLimits {
 
     /// Returns these limits with an explicit limit on files in host shared memory.
     #[must_use]
+    #[vstd::prelude::verus_spec(result => ensures
+        limits_spec::shared_file_limit_transition(self, result, max_shared_files)
+    )]
     pub const fn with_shared_file_limit(self, max_shared_files: usize) -> Self {
         Self {
             max_shared_files,

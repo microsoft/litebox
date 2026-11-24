@@ -52,4 +52,44 @@ pub fn check_independent_limit_updates_commute(
     (quota_first, process_first)
 }
 
+pub fn check_other_limit_updates_commute(
+    prev: BrokerCoreLimits,
+    updates: BrokerCoreLimits,
+) -> (result: (BrokerCoreLimits, BrokerCoreLimits))
+    ensures {
+        &&& limits_spec::other_limit_updates_transition(prev, result.0, updates)
+        &&& result.0 == result.1
+    },
+{
+    let forward = prev
+        .with_unix_socket_limits(updates.max_total_unix_socket_bytes, updates.max_unix_socket_bytes_per_process)
+        .with_readiness_queue_limits(updates.max_readiness_queue_entries, updates.max_readiness_queue_entries_per_process)
+        .with_thread_quotas(updates.max_threads, updates.max_threads_per_process)
+        .with_child_image_size_limits(updates.max_child_image_size, updates.max_total_child_image_size)
+        .with_shared_file_limit(updates.max_shared_files);
+
+    let reverse = prev
+        .with_shared_file_limit(updates.max_shared_files)
+        .with_child_image_size_limits(updates.max_child_image_size, updates.max_total_child_image_size)
+        .with_thread_quotas(updates.max_threads, updates.max_threads_per_process)
+        .with_readiness_queue_limits(updates.max_readiness_queue_entries, updates.max_readiness_queue_entries_per_process)
+        .with_unix_socket_limits(updates.max_total_unix_socket_bytes, updates.max_unix_socket_bytes_per_process);
+
+    (forward, reverse)
+}
+
+pub fn check_oversized_child_image_limit(
+    prev: BrokerCoreLimits,
+    per_child: u64,
+    total: u64,
+) -> (cur: BrokerCoreLimits)
+    requires per_child > total,
+    ensures {
+        &&& limits_spec::child_image_limit_transition(prev, cur, per_child, total)
+        &&& cur.max_child_image_size > cur.max_total_child_image_size
+    },
+{
+    prev.with_child_image_size_limits(per_child, total)
+}
+
 }
