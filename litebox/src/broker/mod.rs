@@ -21,7 +21,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, HostName, HostNameKind, HostNames,
+    ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
     MAX_PROCESS_BOOTSTRAP_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
@@ -79,9 +79,9 @@ pub(crate) trait BrokerControl: Send + Sync {
         sibling: bool,
     ) -> core::result::Result<ProcessIdentity, BrokerControlError>;
 
-    fn create_children_pid_namespace(
+    fn create_namespaces(
         &self,
-        options: PidNamespaceOptions,
+        request: CreateNamespacesRequest,
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn cancel_child_process(
@@ -184,11 +184,6 @@ pub(crate) trait BrokerControl: Send + Sync {
         process_id: litebox_broker_protocol::ProcessId,
         kind: HostNameKind,
         name: &HostName,
-    ) -> core::result::Result<(), BrokerControlError>;
-
-    fn copy_host_names(
-        &self,
-        process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn get_parent_exit_signal(
@@ -997,11 +992,11 @@ where
         self.request(|local| local.allocate_child_process(new_pid_namespace, sibling))
     }
 
-    fn create_children_pid_namespace(
+    fn create_namespaces(
         &self,
-        options: PidNamespaceOptions,
+        request: CreateNamespacesRequest,
     ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.create_children_pid_namespace(options))
+        self.request(|local| local.create_namespaces(request))
     }
 
     fn cancel_child_process(
@@ -1179,13 +1174,6 @@ where
     ) -> core::result::Result<(), BrokerControlError> {
         let lease = self.acquire_shared_buffer(name.as_bytes().len())?;
         self.request(|local| local.set_host_name(process_id, kind, lease.sequence(), name))
-    }
-
-    fn copy_host_names(
-        &self,
-        process_id: litebox_broker_protocol::ProcessId,
-    ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.copy_host_names(process_id))
     }
 
     fn get_parent_exit_signal(

@@ -21,12 +21,12 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, GetHostNamesRequest, GetResourceLimitRequest, HostNameSizes,
-    OpenProcessHandleRequest, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
-    ProcessStartupDescriptor, ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
+    GetResourceLimitRequest, HostNameSizes, OpenProcessHandleRequest, ProcessExitStatus,
+    ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceLimit, SetHostNameRequest,
+    SetParentExitSignalRequest, SetResourceLimitRequest, StartChildProcessRequest,
+    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -205,7 +205,7 @@ impl BrokerOperation {
             | Self::SharedFutex(_)
             | Self::Process(
                 ProcessRequest::AllocateChild(_)
-                | ProcessRequest::CreateChildrenPidNamespace(_)
+                | ProcessRequest::CreateNamespaces(_)
                 | ProcessRequest::ExitChild(_)
                 | ProcessRequest::CancelChild(_)
                 | ProcessRequest::ReportExitStatus(_)
@@ -218,7 +218,6 @@ impl BrokerOperation {
                 | ProcessRequest::GetChildrenCpuTime
                 | ProcessRequest::GetResourceLimit(_)
                 | ProcessRequest::SetResourceLimit(_)
-                | ProcessRequest::CopyHostNames(_)
                 | ProcessRequest::OpenProcessHandle(_)
                 | ProcessRequest::GetParentExitSignal(_)
                 | ProcessRequest::SetParentExitSignal(_),
@@ -478,14 +477,6 @@ wire_enum! {
         /// The broker returns `UnknownObject` if the process is neither, and
         /// `PolicyDenied` if the new hard limit exceeds the current one.
         SetResourceLimit(SetResourceLimitRequest),
-        /// Make the children the caller creates from now on go into a new PID
-        /// namespace with these options, nested in the caller's. The first of
-        /// them becomes the namespace's first process.
-        ///
-        /// The broker returns `UnsupportedOperation` if the caller's children
-        /// already go to another PID namespace, and `ResourceExhausted` at a
-        /// namespace count or nesting limit.
-        CreateChildrenPidNamespace(PidNamespaceOptions),
         /// Read the host names of the caller or of its pending child, both from
         /// one moment.
         ///
@@ -496,11 +487,6 @@ wire_enum! {
         ///
         /// The broker returns `UnknownObject` if the process is neither.
         SetHostName(SetHostNameRequest),
-        /// Replace the host names of the caller or of its pending child with a
-        /// copy that no other process shares.
-        ///
-        /// The broker returns `UnknownObject` if the process is neither.
-        CopyHostNames(ProcessId),
         /// Open a handle to a process in the caller's PID namespace.
         ///
         /// The broker returns `UnknownObject` if no such process exists, and
@@ -515,6 +501,9 @@ wire_enum! {
         /// The broker returns `UnknownObject` if the process is neither, and
         /// `UnsupportedOperation` for a signal number above [`crate::signal::MAX_SIGNAL`].
         SetParentExitSignal(SetParentExitSignalRequest),
+        /// Apply the requested namespace changes to the caller or its pending
+        /// child together, or leave all its namespaces unchanged.
+        CreateNamespaces(CreateNamespacesRequest),
     }
 }
 
@@ -831,21 +820,18 @@ wire_enum! {
         GetResourceLimit(ResourceLimit),
         /// The limit was replaced; this is the previous one.
         SetResourceLimit(ResourceLimit),
-        /// The children the caller creates from now on go into the new PID
-        /// namespace.
-        CreateChildrenPidNamespace,
         /// The host names were written to the request's buffer, with these sizes.
         GetHostNames(HostNameSizes),
         /// The name was replaced.
         SetHostName,
-        /// The process has its own copy of the host names.
-        CopyHostNames,
         /// A handle to the process was opened.
         OpenProcessHandle(ObjectHandle),
         /// The process's parent-exit signal, or zero for none.
         GetParentExitSignal(u32),
         /// The parent-exit signal was set.
         SetParentExitSignal,
+        /// All the requested namespace changes were applied.
+        CreateNamespaces,
     }
 }
 
