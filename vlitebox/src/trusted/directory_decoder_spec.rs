@@ -10,6 +10,9 @@
 //! The original compatibility conversion preserves both payload errors exactly;
 //! allocation failure becomes TooLarge. This does not establish error provenance,
 //! allocation safety, or correctness of the unverified whole-codec callers.
+//! The original file-type helpers encode RegularFile/Directory/CharacterDevice/
+//! SymbolicLink as 0/1/2/3, invert those tags, and reject every other u8.
+//! Both actual-call compositions are checked; full entry serialization is not.
 //! No custom assumptions. Full wire decoding, directory semantics, external
 //! concurrent memory snapshots, ownership, and authorization remain unverified.
 
@@ -23,6 +26,10 @@ pub open spec fn directory_decoder_policy() -> bool {
 
 pub open spec fn directory_transfer_error_policy() -> bool {
     litebox_broker_protocol::fs::directory_transfer_error_policy()
+}
+
+pub open spec fn directory_file_type_policy() -> bool {
+    litebox_broker_protocol::fs::directory_file_type_policy()
 }
 
 }

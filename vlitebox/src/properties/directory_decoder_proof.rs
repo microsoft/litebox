@@ -3,14 +3,47 @@
 
 //! Implementation-linked; independently check the original protocol body.
 
-use crate::directory_decoder_spec::{directory_decoder_policy, directory_transfer_error_policy};
+use crate::directory_decoder_spec::{
+    directory_decoder_policy, directory_file_type_policy, directory_transfer_error_policy,
+};
 use litebox_broker_protocol::fs::{
-    DirectoryPayloadError, DirectoryTransferError, directory_pair_outcome, directory_take_outcome,
+    DirectoryPayloadError, DirectoryTransferError, FileType, directory_file_type_decoding,
+    directory_file_type_encoding, directory_pair_outcome, directory_take_outcome,
     directory_transfer_error_outcome, directory_u8_outcome,
 };
 use vstd::prelude::*;
 
 verus! {
+
+pub proof fn directory_file_type_tags_match_original_conversions()
+    ensures directory_file_type_policy(),
+{
+    litebox_broker_protocol::fs::prove_directory_file_type();
+}
+
+pub fn check_directory_kind_encoding(file_type: FileType) -> (raw: u8)
+    ensures raw == directory_file_type_encoding(file_type),
+{
+    litebox_broker_protocol::fs::check_directory_file_type_encoding(file_type)
+}
+
+pub fn check_directory_kind_decoding(raw: u8) -> (file_type: Option<FileType>)
+    ensures file_type == directory_file_type_decoding(raw),
+{
+    litebox_broker_protocol::fs::check_directory_file_type_decoding(raw)
+}
+
+pub fn check_directory_kind_roundtrip(file_type: FileType) -> (result: Option<FileType>)
+    ensures result == Some(file_type),
+{
+    litebox_broker_protocol::fs::check_directory_file_type_roundtrip(file_type)
+}
+
+pub fn check_directory_kind_reencoding(raw: u8) -> (result: Option<u8>)
+    ensures result == if raw <= 3 { Some(raw) } else { None },
+{
+    litebox_broker_protocol::fs::check_directory_file_type_reencoding(raw)
+}
 
 pub proof fn directory_compatibility_conversion_preserves_payload_errors()
     ensures directory_transfer_error_policy(),

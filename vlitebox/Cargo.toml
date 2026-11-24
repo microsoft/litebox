@@ -134,3 +134,11 @@ path = "src/negative/directory_allocation_error_negative.rs"
 [[example]]
 name = "directory_payload_error_negative"
 path = "src/negative/directory_payload_error_negative.rs"
+
+[[example]]
+name = "directory_kind_encoding_negative"
+path = "src/negative/directory_kind_encoding_negative.rs"
+
+[[example]]
+name = "directory_kind_invalid_tag_negative"
+path = "src/negative/directory_kind_invalid_tag_negative.rs"

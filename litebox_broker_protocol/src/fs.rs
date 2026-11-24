@@ -51,6 +51,8 @@ wire_enum! {
     /// File object kind.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[non_exhaustive]
+    // In progress: generated wire and derived implementations remain unverified.
+    #[verus_verify(external_derive)]
     pub enum FileType {
         /// Regular file.
         RegularFile,
@@ -943,6 +945,7 @@ pub fn try_decode_directory_entries(
     Ok(entries)
 }
 
+#[verus_spec(result => ensures result == directory_file_type_encoding(file_type))]
 pub(crate) const fn file_type_raw(file_type: FileType) -> u8 {
     match file_type {
         FileType::RegularFile => 0,
@@ -952,6 +955,7 @@ pub(crate) const fn file_type_raw(file_type: FileType) -> u8 {
     }
 }
 
+#[verus_spec(result => ensures result == directory_file_type_decoding(raw))]
 pub(crate) const fn file_type_from_raw(raw: u8) -> Option<FileType> {
     match raw {
         0 => Some(FileType::RegularFile),

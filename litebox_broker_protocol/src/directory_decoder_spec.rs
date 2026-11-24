@@ -9,10 +9,79 @@
 // This is not a full directory codec proof.
 // The original compatibility error conversion preserves payload errors and maps
 // allocation failure to TooLarge, without proving the source of those errors.
+// Original file-type tag conversions round-trip all four kinds and reject every
+// other u8 tag. This does not establish the surrounding entry codec.
 
 use vstd::prelude::*;
 
 verus! {
+
+pub open spec fn directory_file_type_encoding(file_type: FileType) -> u8 {
+    match file_type {
+        FileType::RegularFile => 0,
+        FileType::Directory => 1,
+        FileType::CharacterDevice => 2,
+        FileType::SymbolicLink => 3,
+    }
+}
+
+pub open spec fn directory_file_type_decoding(raw: u8) -> Option<FileType> {
+    match raw {
+        0 => Some(FileType::RegularFile),
+        1 => Some(FileType::Directory),
+        2 => Some(FileType::CharacterDevice),
+        3 => Some(FileType::SymbolicLink),
+        _ => None,
+    }
+}
+
+pub closed spec fn directory_file_type_policy() -> bool {
+    &&& (forall|file_type: FileType, raw: u8|
+        #[trigger] file_type_raw.ensures((file_type,), raw)
+            ==> raw == directory_file_type_encoding(file_type))
+    &&& (forall|raw: u8, file_type: Option<FileType>|
+        #[trigger] file_type_from_raw.ensures((raw,), file_type)
+            ==> file_type == directory_file_type_decoding(raw))
+    &&& (forall|file_type: FileType|
+        #[trigger] directory_file_type_decoding(directory_file_type_encoding(file_type))
+            == Some(file_type))
+    &&& (forall|raw: u8|
+        #[trigger] directory_file_type_decoding(raw).is_some() <==> raw <= 3)
+}
+
+pub proof fn prove_directory_file_type()
+    ensures directory_file_type_policy(),
+{
+}
+
+pub fn check_directory_file_type_encoding(file_type: FileType) -> (raw: u8)
+    ensures raw == directory_file_type_encoding(file_type),
+{
+    file_type_raw(file_type)
+}
+
+pub fn check_directory_file_type_decoding(raw: u8) -> (file_type: Option<FileType>)
+    ensures file_type == directory_file_type_decoding(raw),
+{
+    file_type_from_raw(raw)
+}
+
+pub fn check_directory_file_type_roundtrip(file_type: FileType) -> (result: Option<FileType>)
+    ensures result == Some(file_type),
+{
+    let raw = file_type_raw(file_type);
+
+    file_type_from_raw(raw)
+}
+
+pub fn check_directory_file_type_reencoding(raw: u8) -> (result: Option<u8>)
+    ensures result == if raw <= 3 { Some(raw) } else { None },
+{
+    match file_type_from_raw(raw) {
+        Some(file_type) => Some(file_type_raw(file_type)),
+        None => None,
+    }
+}
 
 pub open spec fn directory_transfer_error_outcome(
     prev: DirectoryTransferError,
