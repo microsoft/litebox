@@ -14,7 +14,7 @@ pub(crate) mod verification;
 /// Broker authority error category.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-// In progress: derived formatting is outside the error-kind proof slice.
+// In progress: derived implementations, including formatting, are unverified.
 #[verus_verify(external_derive)]
 pub enum BrokerError {
     #[error("broker policy denied the operation")]
@@ -58,7 +58,9 @@ impl BrokerError {
 }
 
 /// A copy to or from a caller's buffer faulted, which fails the operation.
+#[verus_verify]
 impl From<Fault> for BrokerError {
+    #[verus_spec(result => ensures result == Self::Internal)]
     fn from(Fault: Fault) -> Self {
         Self::Internal
     }

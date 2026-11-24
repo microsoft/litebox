@@ -35,6 +35,8 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=$(sed -n 's/^VERUS_RUST_VERSION=//p' .github/tools/install_verus)" >> "$GITHUB_ENV"
       - name: Run verification
         run: cargo verus focus -p litebox_platform_lvbs
+      - name: Verify annotated broker buffer primitives
+        run: cargo verus focus -p litebox_platform -- --no-cheating
       - name: Verify broker protocol primitives
         run: cargo verus focus -p litebox_broker_protocol -- --no-cheating
       - name: Verify broker implementation
@@ -53,7 +55,8 @@ jobs:
             shared_futex_alignment_negative \
             ipc_projection_negative \
             error_translation_negative \
-            blocking_error_negative; do
+            blocking_error_negative \
+            fault_error_negative; do
             log="$RUNNER_TEMP/$target.log"
             if cargo verus focus -p vlitebox --example "$target" -- --no-cheating > "$log" 2>&1; then
               cat "$log"

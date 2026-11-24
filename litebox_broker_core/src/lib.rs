@@ -386,7 +386,8 @@ static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 #[cfg(verus_keep_ghost)]
 pub mod verification {
     pub use crate::error::verification::{
-        check_blocking_error, error_category_policy, protocol_error_code, prove_error_categories,
+        check_blocking_error, check_fault_translation, error_category_policy, protocol_error_code,
+        prove_error_categories,
     };
     pub use crate::event::verification::{event_projection_policy, prove_event_projection};
     pub use crate::object::verification::{duplication_policy, prove_duplication_policy};

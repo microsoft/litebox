@@ -2,10 +2,11 @@
 // Licensed under the MIT license.
 
 //! Exact error-category helpers, not operation success or authorization.
-//! Derived formatting and buffer-fault conversion remain outside this slice.
+//! Derived formatting and fallible memory operations remain outside this slice.
 
 use super::BrokerError;
 use litebox_broker_protocol::error::ErrorCode;
+use litebox_platform::buffer::Fault;
 use vstd::prelude::*;
 use vstd::std_specs::convert::FromSpecImpl;
 
@@ -49,6 +50,16 @@ impl FromSpecImpl<BrokerError> for ErrorCode {
     }
 }
 
+impl FromSpecImpl<Fault> for BrokerError {
+    open spec fn obeys_from_spec() -> bool {
+        true
+    }
+
+    open spec fn from_spec(_fault: Fault) -> Self {
+        BrokerError::Internal
+    }
+}
+
 pub closed spec fn error_category_policy() -> bool {
     &&& (forall|nonblocking: bool, error: BrokerError|
         #[trigger] BrokerError::would_block.ensures((nonblocking,), error)
@@ -56,6 +67,9 @@ pub closed spec fn error_category_policy() -> bool {
     &&& (forall|error: BrokerError, code: ErrorCode|
         #[trigger] <ErrorCode as From<BrokerError>>::from.ensures((error,), code)
             ==> error_code_matches(error, code))
+    &&& (forall|fault: Fault, error: BrokerError|
+        #[trigger] <BrokerError as From<Fault>>::from.ensures((fault,), error)
+            ==> error == BrokerError::Internal)
 }
 
 pub proof fn prove_error_categories()
@@ -74,6 +88,12 @@ pub fn check_error_into(error: BrokerError) -> (code: ErrorCode)
     ensures error_code_matches(error, code),
 {
     error.into()
+}
+
+pub fn check_fault_translation() -> (error: BrokerError)
+    ensures error == BrokerError::Internal,
+{
+    BrokerError::from(Fault)
 }
 
 }

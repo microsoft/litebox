@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Verify the original protocol and broker crates as well as this target.
+//! Verify the original platform, protocol, and broker crates as well as this target.
 //! No custom assumptions are used.
 
 use crate::error_spec::error_category_policy;

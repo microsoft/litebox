@@ -32,11 +32,13 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::ops::Range;
 use core::ptr::NonNull;
+use vstd::prelude::verus_verify;
 
 use crate::peer_memory;
 
 /// Represents a fault during a fallible memory operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[verus_verify]
 pub struct Fault;
 
 /// Bytes that a buffer copies to or from but never references, such as

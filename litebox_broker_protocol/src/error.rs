@@ -8,7 +8,7 @@ wire_enum! {
     /// ABI-neutral broker error category.
     #[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]
     #[non_exhaustive]
-    // In progress: derived formatting is outside error-category verification.
+    // In progress: derived implementations, including formatting, are unverified.
     #[verus_verify(external_derive)]
     pub enum ErrorCode {
         #[error("unsupported broker protocol version")]

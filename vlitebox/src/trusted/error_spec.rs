@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Must-read with both original enum declarations, the two original helper
-//! annotations, and `litebox_broker_core/src/error_spec.rs`. Internal and
+//! Must-read with both original enum declarations, the native Fault type,
+//! all three helper annotations, and `litebox_broker_core/src/error_spec.rs`. Internal and
 //! BrokerCoreAlreadyExists deliberately share the Internal protocol category.
 //! This says nothing about whether an operation should have failed.
 

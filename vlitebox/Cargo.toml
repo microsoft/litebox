@@ -54,3 +54,7 @@ path = "src/negative/error_translation_negative.rs"
 [[example]]
 name = "blocking_error_negative"
 path = "src/negative/blocking_error_negative.rs"
+
+[[example]]
+name = "fault_error_negative"
+path = "src/negative/fault_error_negative.rs"
