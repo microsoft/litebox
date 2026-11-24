@@ -44,4 +44,16 @@ pub proof fn prove_process_id_clone()
 {
 }
 
+pub closed spec fn role_id_clone_policy() -> bool {
+    &&& forall|prev: ProcessGroupId, cur: ProcessGroupId|
+        #[trigger] ProcessGroupId::clone.ensures((&prev,), cur) ==> cur == prev
+    &&& forall|prev: SessionId, cur: SessionId|
+        #[trigger] SessionId::clone.ensures((&prev,), cur) ==> cur == prev
+}
+
+pub proof fn prove_role_id_clones()
+    ensures role_id_clone_policy(),
+{
+}
+
 }

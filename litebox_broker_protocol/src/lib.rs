@@ -67,8 +67,8 @@ pub struct ThreadId(pub u32);
 /// A process group is identified by the ID of the process that created it.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-// In progress: derived implementations and namespace authority are unverified.
-#[verus_verify(external_derive)]
+// In progress: other derived implementations and namespace authority are unverified.
+#[verus_verify]
 pub struct ProcessGroupId(pub u32);
 
 #[verus_verify]
@@ -84,8 +84,8 @@ impl From<ProcessId> for ProcessGroupId {
 /// A session is identified by the ID of the process that created it.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-// In progress: derived implementations and namespace authority are unverified.
-#[verus_verify(external_derive)]
+// In progress: other derived implementations and namespace authority are unverified.
+#[verus_verify]
 pub struct SessionId(pub u32);
 
 #[verus_verify]

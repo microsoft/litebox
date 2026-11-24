@@ -16,6 +16,10 @@ workspace = true
 verify = true
 
 [[example]]
+name = "role_clone_creator_negative"
+path = "src/negative/role_clone_creator_negative.rs"
+
+[[example]]
 name = "creator_clone_number_negative"
 path = "src/negative/creator_clone_number_negative.rs"
 

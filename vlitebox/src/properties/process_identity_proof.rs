@@ -5,6 +5,7 @@
 
 use crate::process_identity_spec::{
     ProcessGroupId, ProcessId, SessionId, process_id_clone_policy, process_identity_policy,
+    role_id_clone_policy,
 };
 use vstd::prelude::*;
 
@@ -51,6 +52,26 @@ pub fn check_cloned_creator_group_and_session(creator: ProcessId)
     let session: SessionId = cloned.into();
 
     (cloned, group, session)
+}
+
+pub proof fn original_derived_role_clones_preserve_complete_values()
+    ensures role_id_clone_policy(),
+{
+    litebox_broker_protocol::process_identity_spec::prove_role_id_clones();
+}
+
+pub fn check_creator_role_clones(creator: ProcessId)
+    -> (result: (ProcessGroupId, SessionId))
+    ensures {
+        &&& result.0.0 == creator.0
+        &&& result.1.0 == creator.0
+    },
+{
+    let group: ProcessGroupId = creator.into();
+
+    let session: SessionId = creator.into();
+
+    (group.clone(), session.clone())
 }
 
 }
