@@ -101,6 +101,8 @@ impl From<Fault> for WriteError {
 
 /// Possible errors from [`super::resolver::Resolver::seek`]
 #[derive(Error, Debug)]
+// In progress: derived implementations remain unverified.
+#[verus_verify(external_derive)]
 pub enum SeekError {
     #[error("fd has been closed already")]
     ClosedFd,

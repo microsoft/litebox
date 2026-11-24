@@ -1078,6 +1078,7 @@ fn file_write_error(error: WriteError) -> FileError {
     }
 }
 
+#[verus_spec(result => ensures result == verification::file_seek_error_value(error))]
 fn file_seek_error(error: SeekError) -> FileError {
     match error {
         SeekError::NotAFile => FileError::NotFile,

@@ -5,7 +5,7 @@
 //! policy, actual file-position bounds or native authority.
 //! The file payload remains opaque and explicitly in progress in object_spec.
 
-use super::{File, FileResult, MapSharedError, ReadError, TruncateError, WriteError};
+use super::{File, FileResult, MapSharedError, ReadError, SeekError, TruncateError, WriteError};
 use crate::object::ObjectEntry;
 use crate::{BrokerError, Result};
 use litebox_broker_protocol::fs::FileError;
@@ -68,6 +68,25 @@ pub closed spec fn file_service_error_policy() -> bool {
     &&& forall|error: TruncateError, result: FileError|
         #[trigger] super::file_truncate_error.ensures((error,), result)
             ==> result == file_truncate_error_value(error)
+    &&& forall|error: SeekError, result: FileError|
+        #[trigger] super::file_seek_error.ensures((error,), result)
+            ==> result == file_seek_error_value(error)
+}
+
+pub open spec fn file_seek_error_value(error: SeekError) -> FileError {
+    match error {
+        SeekError::NotAFile => FileError::NotFile,
+        SeekError::InvalidOffset => FileError::InvalidOffset,
+        SeekError::NonSeekable => FileError::NonSeekable,
+        SeekError::NotOpenForSeeking => FileError::PathOnly,
+        SeekError::ClosedFd | SeekError::Io => FileError::Io,
+    }
+}
+
+pub fn check_file_seek_error(error: SeekError) -> (result: FileError)
+    ensures result == file_seek_error_value(error),
+{
+    super::file_seek_error(error)
 }
 
 pub proof fn prove_file_service_error_translations()
