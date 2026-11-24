@@ -94,3 +94,11 @@ path = "src/negative/readonly_backend_marker_negative.rs"
 [[example]]
 name = "readonly_clear_marker_negative"
 path = "src/negative/readonly_clear_marker_negative.rs"
+
+[[example]]
+name = "shared_buffer_empty_layout_negative"
+path = "src/negative/shared_buffer_empty_layout_negative.rs"
+
+[[example]]
+name = "shared_buffer_slot_error_negative"
+path = "src/negative/shared_buffer_slot_error_negative.rs"

@@ -12,6 +12,10 @@
 use core::ops::Range;
 
 use thiserror::Error;
+use vstd::prelude::{verus_spec, verus_verify};
+
+#[cfg(verus_keep_ghost)]
+include!("shared_buffer_spec.rs");
 
 /// Size of each association shared-buffer slot.
 pub const SHARED_BUFFER_SLOT_SIZE: u32 = 64 * 1024;
@@ -37,6 +41,8 @@ pub const SHARED_BUFFER_POOL_SIZE: usize = SHARED_BUFFER_LAYOUT.total_len();
 /// Error validating a fixed-slot shared-buffer layout or one of its ranges.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
+// In progress: derived implementations remain unverified.
+#[verus_verify(external_derive)]
 pub enum SharedBufferLayoutError {
     /// The layout has no slots, has empty slots, or exceeds the addressable range.
     #[error("invalid shared-buffer layout")]
@@ -54,14 +60,18 @@ pub enum SharedBufferLayoutError {
 
 /// Immutable fixed-slot layout for an association shared-buffer pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// In progress: derived implementations remain unverified.
+#[verus_verify(external_derive)]
 pub struct SharedBufferLayout {
     slot_size: u32,
     slot_count: u32,
     total_len: usize,
 }
 
+#[verus_verify]
 impl SharedBufferLayout {
     /// Creates a checked fixed-slot layout.
+    #[verus_spec(result => ensures layout_creation(slot_size, slot_count, result))]
     pub const fn new(slot_size: u32, slot_count: u32) -> Result<Self, SharedBufferLayoutError> {
         if slot_size == 0 || slot_count == 0 {
             return Err(SharedBufferLayoutError::InvalidLayout);
@@ -80,21 +90,25 @@ impl SharedBufferLayout {
     }
 
     /// Returns the size of each slot in bytes.
+    #[verus_spec(result => ensures result == layout_slot_size(self))]
     pub const fn slot_size(self) -> u32 {
         self.slot_size
     }
 
     /// Returns the number of slots.
+    #[verus_spec(result => ensures result == layout_slot_count(self))]
     pub const fn slot_count(self) -> u32 {
         self.slot_count
     }
 
     /// Returns the exact backing-memory length required by this layout.
+    #[verus_spec(result => ensures result == layout_length(self))]
     pub const fn total_len(self) -> usize {
         self.total_len
     }
 
     /// Returns the shared-memory range for a prefix of one slot.
+    #[verus_spec(result => ensures slot_range(self, slot, length, result))]
     pub fn range(
         self,
         slot: SharedBufferSlotIndex,
@@ -119,6 +133,8 @@ impl SharedBufferLayout {
 /// Index of one fixed shared-buffer slot.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// In progress: derived implementations and sequence validation remain unverified.
+#[verus_verify(external_derive)]
 pub struct SharedBufferSlotIndex(pub u32);
 
 /// Identifies one slot segment within an operation-scoped shared-buffer sequence.

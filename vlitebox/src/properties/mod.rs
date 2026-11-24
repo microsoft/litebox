@@ -11,6 +11,7 @@ pub mod ipc_projection_proof;
 pub mod object_proof;
 pub mod pipe_proof;
 pub mod readonly_metadata_proof;
+pub mod shared_buffer_layout_proof;
 pub mod shared_futex_proof;
 pub mod shared_memory_id_proof;
 pub mod timer_proof;
