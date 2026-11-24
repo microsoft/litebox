@@ -4,7 +4,7 @@
 //! Verify the original protocol implementation as well as this target.
 //! These are encoding guarantees, not uniqueness of broker-issued IDs.
 
-use crate::shared_memory_id_spec::shared_memory_id_encodes;
+use crate::spec::shared_memory_id_spec::shared_memory_id_encodes;
 use litebox_broker_protocol::shared_futex::SharedMemoryId;
 use vstd::prelude::*;
 

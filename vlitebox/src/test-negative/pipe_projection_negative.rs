@@ -9,7 +9,7 @@ use vstd::prelude::*;
 verus! {
 
 proof fn reject_negated_pipe_projection()
-    ensures !vlitebox::pipe_spec::pipe_kind_projection_policy(),
+    ensures !vlitebox::spec::pipe_spec::pipe_kind_projection_policy(),
 {
     vlitebox::pipe_proof::pipe_projection_checks_kind_and_value();
 }

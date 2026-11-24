@@ -4,7 +4,7 @@
 //! Implementation-linked layout/range proof. Independently check the protocol
 //! crate; this target does not verify imported bodies or prove transport safety.
 
-use crate::shared_buffer_layout_spec::{ranges_separated, shared_buffer_layout_policy};
+use crate::spec::shared_buffer_layout_spec::{ranges_separated, shared_buffer_layout_policy};
 use litebox_broker_protocol::shared_buffer::{
     SharedBufferLayout, SharedBufferLayoutError, SharedBufferSlotIndex, slot_range,
 };

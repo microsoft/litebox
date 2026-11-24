@@ -4,7 +4,7 @@
 //! CONDITIONAL on the explicit, unproved third-party std mem::take contract.
 //! Check the original core body as well as this composition target.
 
-use crate::channel_waiters_spec::channel_waiter_extraction_policy;
+use crate::spec::channel_waiters_spec::channel_waiter_extraction_policy;
 use vstd::prelude::*;
 
 verus! {

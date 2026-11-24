@@ -9,7 +9,7 @@ use vstd::prelude::*;
 verus! {
 
 proof fn reject_negated_timer_projection()
-    ensures !vlitebox::timer_spec::timer_kind_projection_policy(),
+    ensures !vlitebox::spec::timer_spec::timer_kind_projection_policy(),
 {
     vlitebox::timer_proof::timer_projections_preserve_kind_value_and_borrowed_state();
 }

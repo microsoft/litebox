@@ -4,7 +4,7 @@
 //! Implementation-linked property; requires the original core body to be
 //! verified as well as this composition target. No custom assumptions used.
 
-use crate::object_spec::object_kind_duplication_policy;
+use crate::spec::object_spec::object_kind_duplication_policy;
 use vstd::prelude::*;
 
 verus! {

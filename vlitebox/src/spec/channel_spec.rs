@@ -3,7 +3,7 @@
 
 //! Must-read with native `ChannelState` and its six method annotations,
 //! `litebox_broker_core/src/channel_spec.rs`, and the type-only opaque Weak
-//! registration in `vlitebox-thirdparty/src/alloc_spec.rs`.
+//! registration in `vlitebox-thirdparty/src/opaque/alloc.rs`.
 //!
 //! Proves scalar queries, saturating room, arithmetic under explicit
 //! no-overflow/underflow conditions, and exact non-counter/shutdown framing.

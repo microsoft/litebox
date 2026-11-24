@@ -4,7 +4,7 @@
 //! Verify the original platform, protocol, and broker crates as well as this target.
 //! No custom assumptions are used.
 
-use crate::error_spec::error_category_policy;
+use crate::spec::error_spec::error_category_policy;
 use vstd::prelude::*;
 
 verus! {

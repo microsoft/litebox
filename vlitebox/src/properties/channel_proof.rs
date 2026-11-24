@@ -4,7 +4,7 @@
 //! Check the original core as well as this composition target.
 //! Existing vstd arithmetic/Option contracts; no custom behavioral assumptions.
 
-use crate::channel_spec::{channel_accounting_policy, default_wakeup_policy};
+use crate::spec::channel_spec::{channel_accounting_policy, default_wakeup_policy};
 use vstd::prelude::*;
 
 verus! {

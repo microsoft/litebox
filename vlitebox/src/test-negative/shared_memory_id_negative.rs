@@ -9,7 +9,7 @@ use vstd::prelude::*;
 verus! {
 
 pub fn reject_swapped_id_fields(serial: u64, tag: u64) -> (id: SharedMemoryId)
-    ensures vlitebox::shared_memory_id_spec::shared_memory_id_encodes(id, tag, serial),
+    ensures vlitebox::spec::shared_memory_id_spec::shared_memory_id_encodes(id, tag, serial),
 {
     let id = SharedMemoryId::new(serial, tag);
     proof {

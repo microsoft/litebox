@@ -9,7 +9,7 @@ use vstd::prelude::*;
 verus! {
 
 proof fn reject_negated_event_projection()
-    ensures !vlitebox::event_spec::event_kind_projection_policy(),
+    ensures !vlitebox::spec::event_spec::event_kind_projection_policy(),
 {
     vlitebox::event_proof::event_projection_preserves_kind_and_borrowed_state();
 }

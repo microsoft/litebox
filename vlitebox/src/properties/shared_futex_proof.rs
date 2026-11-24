@@ -4,7 +4,7 @@
 //! Verify the original protocol and broker crates as well as this target.
 //! No custom assumptions are used.
 
-use crate::shared_futex_spec::shared_futex_leaf_policy;
+use crate::spec::shared_futex_spec::shared_futex_leaf_policy;
 use vstd::prelude::*;
 
 verus! {

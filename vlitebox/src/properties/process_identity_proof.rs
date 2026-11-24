@@ -3,7 +3,7 @@
 
 //! Actual Into calls consume the checked original creator conversions.
 
-use crate::process_identity_spec::{
+use crate::spec::process_identity_spec::{
     ProcessGroupId, ProcessId, SessionId, process_id_clone_policy, process_identity_policy,
     role_id_clone_policy,
 };

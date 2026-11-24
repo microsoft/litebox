@@ -9,7 +9,7 @@ use vstd::prelude::*;
 verus! {
 
 proof fn reject_negated_object_policy()
-    ensures !vlitebox::object_spec::object_kind_duplication_policy(),
+    ensures !vlitebox::spec::object_spec::object_kind_duplication_policy(),
 {
     vlitebox::object_proof::object_kind_duplication_is_enforced();
 }

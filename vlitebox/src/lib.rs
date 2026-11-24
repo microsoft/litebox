@@ -11,7 +11,7 @@ use litebox_broker_core as _;
 use vstd as _;
 
 pub mod properties;
-pub mod trusted;
+pub mod spec;
 
 mod shared_memory_id_callers;
 
@@ -35,21 +35,3 @@ pub use properties::shared_futex_proof;
 pub use properties::shared_memory_id_proof;
 pub use properties::timer_proof;
 pub use properties::transfer_proof;
-pub use trusted::channel_spec;
-pub use trusted::channel_waiters_spec;
-pub use trusted::directory_decoder_spec;
-pub use trusted::error_spec;
-pub use trusted::event_spec;
-pub use trusted::file_offset_spec;
-pub use trusted::file_projection_spec;
-pub use trusted::filesystem_errors_spec;
-pub use trusted::ipc_projection_spec;
-pub use trusted::object_spec;
-pub use trusted::pipe_spec;
-pub use trusted::process_identity_spec;
-pub use trusted::readonly_metadata_spec;
-pub use trusted::shared_buffer_layout_spec;
-pub use trusted::shared_futex_spec;
-pub use trusted::shared_memory_id_spec;
-pub use trusted::timer_spec;
-pub use trusted::transfer_spec;

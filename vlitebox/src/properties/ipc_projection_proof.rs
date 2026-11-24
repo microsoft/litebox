@@ -4,7 +4,7 @@
 //! Verify the original executable crate as well as this composition target.
 //! No custom assumptions are used.
 
-use crate::ipc_projection_spec::unix_socket_and_signals_projection_policy;
+use crate::spec::ipc_projection_spec::unix_socket_and_signals_projection_policy;
 use vstd::prelude::*;
 
 verus! {

@@ -5,7 +5,7 @@
 //! Independently check the original protocol and core; no custom behavioral
 //! assumption is added by this slice.
 
-use crate::readonly_metadata_spec::readonly_metadata_policy;
+use crate::spec::readonly_metadata_spec::readonly_metadata_policy;
 use vstd::prelude::*;
 
 verus! {

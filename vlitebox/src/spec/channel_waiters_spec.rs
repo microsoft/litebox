@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 //! CONDITIONAL implementation proof: requires the UNPROVED std mem::take
-//! contract in `vlitebox-thirdparty/src/mem_spec.rs`. Also must read the opaque
-//! Weak registration there in `alloc_spec.rs`, the original ChannelState::wake
+//! contract in `vlitebox-thirdparty/src/assumptions/mem.rs`. Also read the opaque
+//! Weak registration in `opaque/alloc.rs`, the original ChannelState::wake
 //! annotation, and `litebox_broker_core/src/channel_spec.rs`.
 //!
 //! The returned list is exactly the previous list of logical Weak values; the

@@ -29,6 +29,10 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v6
+      - name: Audit explicit broker verification trust
+        run: |
+          python3 -m unittest discover -s dev_tools/verus_trust -p 'test_*.py'
+          python3 dev_tools/verus_trust/inventory.py --check-layout
       - name: Install Verus tools
         run: |
           .github/tools/install_verus

@@ -3,7 +3,7 @@
 
 //! Actual calls to the original optional-offset guard.
 
-use crate::file_offset_spec::{file_offset_outcome, file_offset_policy};
+use crate::spec::file_offset_spec::{file_offset_outcome, file_offset_policy};
 use litebox_broker_protocol::fs::FileError;
 use vstd::prelude::*;
 

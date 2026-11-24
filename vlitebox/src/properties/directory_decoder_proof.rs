@@ -3,7 +3,7 @@
 
 //! Implementation-linked; independently check the original protocol body.
 
-use crate::directory_decoder_spec::{
+use crate::spec::directory_decoder_spec::{
     directory_decoder_policy, directory_file_type_policy, directory_transfer_error_policy,
 };
 use litebox_broker_protocol::fs::{

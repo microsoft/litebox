@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+//! Property definitions and interfaces to checked native contracts.
+//! These are not assumed executable guarantees. Local unproved contracts live
+//! in vlitebox-thirdparty/src/assumptions; see vlitebox/README.md for the boundary.
+
 pub mod channel_spec;
 pub mod channel_waiters_spec;
 pub mod directory_decoder_spec;

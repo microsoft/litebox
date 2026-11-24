@@ -3,7 +3,7 @@
 
 //! Deliberately replaces a nonzero creator number with zero.
 
-use vlitebox::process_identity_spec::{ProcessGroupId, ProcessId, SessionId};
+use vlitebox::spec::process_identity_spec::{ProcessGroupId, ProcessId, SessionId};
 use vstd::prelude::*;
 
 verus! {

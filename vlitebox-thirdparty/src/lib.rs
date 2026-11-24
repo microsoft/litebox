@@ -7,10 +7,7 @@
 #[cfg(verus_keep_ghost)]
 extern crate alloc;
 
-pub mod spin_spec;
+pub mod opaque;
 
 #[cfg(verus_keep_ghost)]
-pub mod alloc_spec;
-
-#[cfg(verus_keep_ghost)]
-pub mod mem_spec;
+pub mod assumptions;

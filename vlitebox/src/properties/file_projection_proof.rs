@@ -4,7 +4,7 @@
 //! Verify the original executable crate as well as this composition target.
 //! No custom assumptions are used.
 
-use crate::file_projection_spec::file_kind_projection_policy;
+use crate::spec::file_projection_spec::file_kind_projection_policy;
 use vstd::prelude::*;
 
 verus! {
