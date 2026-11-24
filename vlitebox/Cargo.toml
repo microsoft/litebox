@@ -70,3 +70,7 @@ path = "src/negative/transfer_zeroing_negative.rs"
 [[example]]
 name = "channel_saturation_negative"
 path = "src/negative/channel_saturation_negative.rs"
+
+[[example]]
+name = "channel_wakeups_negative"
+path = "src/negative/channel_wakeups_negative.rs"

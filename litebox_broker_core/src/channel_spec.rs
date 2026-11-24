@@ -45,6 +45,10 @@ pub(crate) closed spec fn shut_state<Q, W>(
     &&& cur.waiters == prev.waiters
 }
 
+pub closed spec fn empty_wakeups<W>(wakeups: Wakeups<W>) -> bool {
+    wakeups.0@.len() == 0
+}
+
 pub closed spec fn channel_accounting_policy<Q, W>() -> bool {
     &&& (forall|prev: ChannelState<Q, W>, result: usize|
         #[trigger] ChannelState::queued.ensures((&prev,), result)
@@ -85,6 +89,24 @@ pub closed spec fn channel_accounting_policy<Q, W>() -> bool {
 pub proof fn prove_channel_accounting<Q, W>()
     ensures channel_accounting_policy::<Q, W>(),
 {
+}
+
+pub closed spec fn empty_wakeup_policy<W>() -> bool {
+    forall|wakeups: Wakeups<W>|
+        #[trigger] Wakeups::default.ensures((), wakeups) ==> empty_wakeups(wakeups)
+}
+
+pub proof fn prove_empty_wakeups<W>()
+    ensures empty_wakeup_policy::<W>(),
+{
+}
+
+pub fn check_empty_wakeups() -> (count: usize)
+    ensures count == 0,
+{
+    let wakeups = Wakeups::<()>::default();
+
+    wakeups.0.len()
 }
 
 // Verification-only callers exercise the original bodies' exported contracts.

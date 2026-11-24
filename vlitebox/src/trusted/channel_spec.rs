@@ -9,6 +9,8 @@
 //! no-overflow/underflow conditions, and exact non-counter/shutdown framing.
 //! No invariant equates the count to queued data or bounds it by capacity.
 //! Locking, waiter liveness/wakeup, resource quotas and transfers are unproved.
+//! The separate default-wakeup guarantee covers only an initially empty list,
+//! not extraction of registered waiters or delivery.
 
 use vstd::prelude::*;
 
@@ -16,6 +18,10 @@ verus! {
 
 pub open spec fn channel_accounting_policy<Q, W>() -> bool {
     litebox_broker_core::verification::channel_accounting_policy::<Q, W>()
+}
+
+pub open spec fn default_wakeup_policy<W>() -> bool {
+    litebox_broker_core::verification::empty_wakeup_policy::<W>()
 }
 
 }

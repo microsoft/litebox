@@ -157,9 +157,12 @@ impl<Q, W> ChannelState<Q, W> {
 
 /// Writers to wake once every lock is released.
 #[must_use = "waiting writers must be woken"]
+#[verus_verify]
 pub(crate) struct Wakeups<W>(Vec<Weak<W>>);
 
+#[verus_verify]
 impl<W> Default for Wakeups<W> {
+    #[verus_spec(result => ensures empty_wakeups(result))]
     fn default() -> Self {
         Self(Vec::new())
     }
