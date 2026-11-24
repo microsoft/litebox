@@ -20,6 +20,9 @@
 
 use crate::ObjectHandle;
 use crate::readiness::ReadinessFlags;
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::{SpecBitAnd, SpecBitOr, SpecShl, SpecShr};
+use vstd::prelude::{verus_spec, verus_verify};
 
 /// Readiness of a futex waiter that a wake selected and that has not been disarmed since.
 pub const FUTEX_WAITER_WOKEN: ReadinessFlags = ReadinessFlags::READ;
@@ -32,6 +35,8 @@ pub const FUTEX_WORD_SIZE: u64 = 4;
 /// Only the broker issues IDs, as [`IssueMemoryIdResponse`] describes, and no two of its IDs
 /// are equal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// Representation only; issuance and authentication remain unverified.
+#[verus_verify]
 pub struct SharedMemoryId(
     /// The ID's value:
     /// | ---------------- | ------------- |
@@ -42,24 +47,30 @@ pub struct SharedMemoryId(
     pub u128,
 );
 
+#[verus_verify]
 impl SharedMemoryId {
     /// Mask of the ID's tag.
     const TAG_MASK: u128 = u64::MAX as u128;
 
     /// Returns the ID made of `serial` and its `tag`.
     #[must_use]
+    #[verus_spec(result => ensures
+        result.0 == (((serial as u128) << 64) | tag as u128),
+    )]
     pub const fn new(serial: u64, tag: u64) -> Self {
         Self((serial as u128) << 64 | tag as u128)
     }
 
     /// Returns the serial of the ID.
     #[must_use]
+    #[verus_spec(result => ensures result == (self.0 >> 64) as u64)]
     pub const fn serial(self) -> u64 {
         (self.0 >> 64) as u64
     }
 
     /// Returns the tag of the ID.
     #[must_use]
+    #[verus_spec(result => ensures result == (self.0 & (u64::MAX as u128)) as u64)]
     pub const fn tag(self) -> u64 {
         (self.0 & Self::TAG_MASK) as u64
     }
@@ -77,6 +88,7 @@ wire_struct! {
 wire_struct! {
     /// A futex word in shared memory.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[verus_verify]
     pub struct SharedFutexKey {
         /// Memory holding the futex word.
         pub memory: SharedMemoryId,

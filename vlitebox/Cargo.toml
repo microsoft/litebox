@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 litebox_broker_core = { path = "../litebox_broker_core" }
+litebox_broker_protocol = { path = "../litebox_broker_protocol" }
 vstd.workspace = true
 
 [lints]
@@ -29,3 +30,7 @@ path = "src/negative/event_projection_negative.rs"
 [[example]]
 name = "timer_projection_negative"
 path = "src/negative/timer_projection_negative.rs"
+
+[[example]]
+name = "shared_memory_id_negative"
+path = "src/negative/shared_memory_id_negative.rs"

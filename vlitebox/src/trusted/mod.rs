@@ -4,4 +4,5 @@
 pub mod event_spec;
 pub mod object_spec;
 pub mod pipe_spec;
+pub mod shared_memory_id_spec;
 pub mod timer_spec;
