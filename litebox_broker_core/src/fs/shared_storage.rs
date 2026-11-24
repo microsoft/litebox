@@ -10,11 +10,16 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use litebox_broker_protocol::shared_futex::SharedMemoryId;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::Once;
+use vstd::prelude::{verus_spec, verus_verify};
 
 use super::errors::{MapSharedError, StorageError};
 use super::storage::{FileStorage, FileStorageMut};
 
+#[verus_verify]
 impl From<StorageError> for MapSharedError {
+    #[verus_spec(result => ensures
+        result == super::errors::verification::storage_mapping_error(error),
+    )]
     fn from(error: StorageError) -> Self {
         match error {
             StorageError::NoSpace => Self::NoMemory,

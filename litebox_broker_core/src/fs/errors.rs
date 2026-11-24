@@ -142,6 +142,8 @@ pub enum TruncateError {
 /// Possible errors from [`super::resolver::Resolver::map_shared`] and
 /// [`super::backend::Backend::map_shared`]
 #[derive(Error, Debug)]
+// In progress: derived implementations remain unverified.
+#[verus_verify(external_derive)]
 pub enum MapSharedError {
     #[error("file descriptor points to a directory")]
     IsDirectory,

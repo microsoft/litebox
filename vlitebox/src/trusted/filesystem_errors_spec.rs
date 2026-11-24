@@ -1,9 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Must-read with the seven original conversion annotations and semantic/From
-//! definitions in litebox_broker_core/src/fs/{errors,errors_spec}.rs, plus the
-//! native Fault and BrokerError conversion. No custom assumptions are added.
+//! Must-read with the eight original conversion annotations and semantic/From
+//! definitions in litebox_broker_core/src/fs/{errors,errors_spec,shared_storage}.rs,
+//! plus the native Fault and BrokerError conversion. No custom assumptions are added.
+//! Shared mapping translates NoSpace to NoMemory and Fault/Busy/Io to Io.
 //! This proves error translation, not I/O, authorization, or correct failure.
 
 use vstd::prelude::*;

@@ -5,7 +5,7 @@
 //! These are checked conversion laws, not assumptions about operation failure.
 //! Derived implementations, filesystem effects and fault occurrence are unverified.
 
-use super::{FileStatusError, ReadError, StorageError, TruncateError, WriteError};
+use super::{FileStatusError, MapSharedError, ReadError, StorageError, TruncateError, WriteError};
 use crate::BrokerError;
 use litebox_platform::buffer::Fault;
 use vstd::prelude::*;
@@ -33,6 +33,13 @@ pub open spec fn storage_truncate_error(error: StorageError) -> TruncateError {
         StorageError::NoSpace => TruncateError::NoSpace,
         StorageError::Busy => TruncateError::Busy,
         StorageError::Fault | StorageError::Io => TruncateError::Io,
+    }
+}
+
+pub open spec fn storage_mapping_error(error: StorageError) -> MapSharedError {
+    match error {
+        StorageError::NoSpace => MapSharedError::NoMemory,
+        StorageError::Fault | StorageError::Busy | StorageError::Io => MapSharedError::Io,
     }
 }
 
@@ -76,6 +83,11 @@ impl FromSpecImpl<StorageError> for FileStatusError {
     open spec fn from_spec(_error: StorageError) -> Self { FileStatusError::Io }
 }
 
+impl FromSpecImpl<StorageError> for MapSharedError {
+    open spec fn obeys_from_spec() -> bool { true }
+    open spec fn from_spec(error: StorageError) -> Self { storage_mapping_error(error) }
+}
+
 pub closed spec fn filesystem_error_policy() -> bool {
     &&& (forall|fault: Fault, error: StorageError|
         #[trigger] <StorageError as From<Fault>>::from.ensures((fault,), error)
@@ -98,6 +110,9 @@ pub closed spec fn filesystem_error_policy() -> bool {
     &&& (forall|source: StorageError, error: FileStatusError|
         #[trigger] <FileStatusError as From<StorageError>>::from.ensures((source,), error)
             ==> error == FileStatusError::Io)
+    &&& (forall|source: StorageError, error: MapSharedError|
+        #[trigger] <MapSharedError as From<StorageError>>::from.ensures((source,), error)
+            ==> error == storage_mapping_error(source))
 }
 
 pub proof fn prove_filesystem_error_conversions()
@@ -114,6 +129,14 @@ pub fn check_storage_into_read(error: StorageError) -> (result: ReadError)
 
 pub fn check_fault_into_write() -> (result: WriteError)
     ensures result == WriteError::Broker(BrokerError::Internal),
+{
+    let storage: StorageError = Fault.into();
+
+    storage.into()
+}
+
+pub fn check_fault_into_mapping() -> (result: MapSharedError)
+    ensures result == MapSharedError::Io,
 {
     let storage: StorageError = Fault.into();
 
