@@ -58,8 +58,8 @@ message Process {
 }
 
 message CreateContainerRequest {
-    string container_id = 2;
-    Process process = 1;
+    string container_id = 1;
+    Process process = 2;
 }
 
 message StartContainerRequest {
@@ -71,22 +71,22 @@ message RemoveContainerRequest {
 }
 
 message ExecProcessRequest {
-    string container_id = 3;
-    string exec_id = 1;
-    Process process = 2;
+    string container_id = 1;
+    string exec_id = 2;
+    Process process = 3;
 }
 
 message SignalProcessRequest {
-    string container_id = 4;
-    string exec_id = 1;
-    uint32 signal = 2;
+    string container_id = 1;
+    string exec_id = 2;
+    uint32 signal = 3;
     // Signals every guest process but the guest service instead.
-    bool all = 3;
+    bool all = 4;
 }
 
 message WaitProcessRequest {
-    string container_id = 2;
-    string exec_id = 1;
+    string container_id = 1;
+    string exec_id = 2;
 }
 
 message WaitProcessResponse {
@@ -99,14 +99,14 @@ message WaitProcessResponse {
 
 // Fails with `FAILED_PRECONDITION` while the process runs.
 message ReleaseProcessRequest {
-    string container_id = 2;
-    string exec_id = 1;
+    string container_id = 1;
+    string exec_id = 2;
 }
 
 message WriteStreamRequest {
-    string container_id = 3;
-    string exec_id = 1;
-    bytes data = 2;
+    string container_id = 1;
+    string exec_id = 2;
+    bytes data = 3;
 }
 
 message WriteStreamResponse {
@@ -114,10 +114,10 @@ message WriteStreamResponse {
 }
 
 message ReadStreamRequest {
-    string container_id = 3;
-    string exec_id = 1;
+    string container_id = 1;
+    string exec_id = 2;
     // The most bytes to read: at least 1; a read returns at most 64 KiB.
-    uint32 len = 2;
+    uint32 len = 3;
 }
 
 message ReadStreamResponse {
@@ -128,13 +128,13 @@ message ReadStreamResponse {
 // For a terminal, this hangs the terminal up and ends its output stream; it fails with
 // `FAILED_PRECONDITION` until the terminal's process started.
 message CloseStdinRequest {
-    string container_id = 2;
-    string exec_id = 1;
+    string container_id = 1;
+    string exec_id = 2;
 }
 
 message TtyWinResizeRequest {
-    string container_id = 4;
-    string exec_id = 1;
-    uint32 row = 2;
-    uint32 column = 3;
+    string container_id = 1;
+    string exec_id = 2;
+    uint32 row = 3;
+    uint32 column = 4;
 }
