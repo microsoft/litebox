@@ -10,3 +10,4 @@ pub mod pipe_spec;
 pub mod shared_futex_spec;
 pub mod shared_memory_id_spec;
 pub mod timer_spec;
+pub mod transfer_spec;

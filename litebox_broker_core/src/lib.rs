@@ -12,6 +12,7 @@
 //! other channel implementation.
 
 #![no_std]
+#![cfg_attr(verus_keep_ghost, feature(proc_macro_hygiene))]
 
 extern crate alloc;
 

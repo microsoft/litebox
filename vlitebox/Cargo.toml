@@ -62,3 +62,7 @@ path = "src/negative/fault_error_negative.rs"
 [[example]]
 name = "file_projection_negative"
 path = "src/negative/file_projection_negative.rs"
+
+[[example]]
+name = "transfer_zeroing_negative"
+path = "src/negative/transfer_zeroing_negative.rs"

@@ -5,6 +5,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 use litebox_broker_core as _;
 use vstd as _;
 
@@ -22,6 +24,7 @@ pub use properties::pipe_proof;
 pub use properties::shared_futex_proof;
 pub use properties::shared_memory_id_proof;
 pub use properties::timer_proof;
+pub use properties::transfer_proof;
 pub use trusted::error_spec;
 pub use trusted::event_spec;
 pub use trusted::file_projection_spec;
@@ -31,3 +34,4 @@ pub use trusted::pipe_spec;
 pub use trusted::shared_futex_spec;
 pub use trusted::shared_memory_id_spec;
 pub use trusted::timer_spec;
+pub use trusted::transfer_spec;

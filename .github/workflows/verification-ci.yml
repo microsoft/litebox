@@ -57,7 +57,8 @@ jobs:
             error_translation_negative \
             blocking_error_negative \
             fault_error_negative \
-            file_projection_negative; do
+            file_projection_negative \
+            transfer_zeroing_negative; do
             log="$RUNNER_TEMP/$target.log"
             if cargo verus focus -p vlitebox --example "$target" -- --no-cheating > "$log" 2>&1; then
               cat "$log"

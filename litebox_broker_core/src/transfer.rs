@@ -17,6 +17,10 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use vstd::prelude::verus_spec;
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
 
 use crate::{BrokerError, Result};
 
@@ -24,11 +28,23 @@ use crate::{BrokerError, Result};
 /// such as a host file, that cannot copy directly between its storage and a
 /// caller's buffer. Fails with [`BrokerError::OutOfMemory`] if they cannot be
 /// allocated.
+#[verus_spec(result => ensures
+    match result {
+        Ok(buffer) => buffer@.len() == length
+            && forall|index: int| 0 <= index < length ==> buffer@[index] == 0u8,
+        Err(error) => error == BrokerError::OutOfMemory,
+    },
+)]
 pub fn bounce_buffer(length: usize) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
-    buffer
-        .try_reserve_exact(length)
-        .map_err(|_| BrokerError::OutOfMemory)?;
+    buffer.try_reserve_exact(length).map_err(
+        // The annotation rewriter needs a typed pattern for an ignored argument.
+        #[cfg_attr(
+            verus_keep_ghost,
+            verus_spec(error: BrokerError => ensures error == BrokerError::OutOfMemory)
+        )]
+        |_: _| BrokerError::OutOfMemory,
+    )?;
     buffer.resize(length, 0);
     Ok(buffer)
 }
