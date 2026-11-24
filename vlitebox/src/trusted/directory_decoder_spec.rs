@@ -7,6 +7,9 @@
 //! advances only the offset; overflow/out-of-bounds leave both fields unchanged.
 //! The original u8 reader returns the byte at that offset. Two reads retain
 //! first-byte progress when the second read fails; no compound rollback is claimed.
+//! The original compatibility conversion preserves both payload errors exactly;
+//! allocation failure becomes TooLarge. This does not establish error provenance,
+//! allocation safety, or correctness of the unverified whole-codec callers.
 //! No custom assumptions. Full wire decoding, directory semantics, external
 //! concurrent memory snapshots, ownership, and authorization remain unverified.
 
@@ -16,6 +19,10 @@ verus! {
 
 pub open spec fn directory_decoder_policy() -> bool {
     litebox_broker_protocol::fs::directory_decoder_policy()
+}
+
+pub open spec fn directory_transfer_error_policy() -> bool {
+    litebox_broker_protocol::fs::directory_transfer_error_policy()
 }
 
 }

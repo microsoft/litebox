@@ -126,3 +126,11 @@ path = "src/negative/directory_subrange_negative.rs"
 [[example]]
 name = "directory_pair_rollback_negative"
 path = "src/negative/directory_pair_rollback_negative.rs"
+
+[[example]]
+name = "directory_allocation_error_negative"
+path = "src/negative/directory_allocation_error_negative.rs"
+
+[[example]]
+name = "directory_payload_error_negative"
+path = "src/negative/directory_payload_error_negative.rs"

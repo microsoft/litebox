@@ -813,6 +813,8 @@ pub enum DirectoryPayloadError {
 /// Error while processing a directory payload for an fs transfer.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
+// In progress: derived implementations remain unverified.
+#[verus_verify(external_derive)]
 pub enum DirectoryTransferError {
     #[error(transparent)]
     Payload(#[from] DirectoryPayloadError),
@@ -821,6 +823,7 @@ pub enum DirectoryTransferError {
 }
 
 impl DirectoryTransferError {
+    #[verus_spec(result => ensures directory_transfer_error_outcome(self, result))]
     fn into_payload_error(self) -> DirectoryPayloadError {
         match self {
             Self::Payload(error) => error,

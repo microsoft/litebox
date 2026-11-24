@@ -7,10 +7,40 @@
 // returns the exact borrowed subrange. The original u8 reader composes extraction
 // with indexing. A failed second byte read retains successful first-byte progress.
 // This is not a full directory codec proof.
+// The original compatibility error conversion preserves payload errors and maps
+// allocation failure to TooLarge, without proving the source of those errors.
 
 use vstd::prelude::*;
 
 verus! {
+
+pub open spec fn directory_transfer_error_outcome(
+    prev: DirectoryTransferError,
+    cur: DirectoryPayloadError,
+) -> bool {
+    match prev {
+        DirectoryTransferError::Payload(error) => cur == error,
+        DirectoryTransferError::OutOfMemory => cur == DirectoryPayloadError::TooLarge,
+    }
+}
+
+pub closed spec fn directory_transfer_error_policy() -> bool {
+    forall|prev: DirectoryTransferError, cur: DirectoryPayloadError|
+        #[trigger] DirectoryTransferError::into_payload_error.ensures((prev,), cur)
+            ==> directory_transfer_error_outcome(prev, cur)
+}
+
+pub proof fn prove_directory_transfer_error()
+    ensures directory_transfer_error_policy(),
+{
+}
+
+pub fn check_directory_transfer_error(prev: DirectoryTransferError)
+    -> (cur: DirectoryPayloadError)
+    ensures directory_transfer_error_outcome(prev, cur),
+{
+    prev.into_payload_error()
+}
 
 pub open spec fn directory_take_outcome(
     payload: Seq<u8>,

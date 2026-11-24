@@ -3,13 +3,26 @@
 
 //! Implementation-linked; independently check the original protocol body.
 
-use crate::directory_decoder_spec::directory_decoder_policy;
+use crate::directory_decoder_spec::{directory_decoder_policy, directory_transfer_error_policy};
 use litebox_broker_protocol::fs::{
-    DirectoryPayloadError, directory_pair_outcome, directory_take_outcome, directory_u8_outcome,
+    DirectoryPayloadError, DirectoryTransferError, directory_pair_outcome, directory_take_outcome,
+    directory_transfer_error_outcome, directory_u8_outcome,
 };
 use vstd::prelude::*;
 
 verus! {
+
+pub proof fn directory_compatibility_conversion_preserves_payload_errors()
+    ensures directory_transfer_error_policy(),
+{
+    litebox_broker_protocol::fs::prove_directory_transfer_error();
+}
+
+pub fn check_directory_error(prev: DirectoryTransferError) -> (cur: DirectoryPayloadError)
+    ensures directory_transfer_error_outcome(prev, cur),
+{
+    litebox_broker_protocol::fs::check_directory_transfer_error(prev)
+}
 
 pub proof fn directory_byte_extraction_preserves_its_checked_transition()
     ensures directory_decoder_policy(),
