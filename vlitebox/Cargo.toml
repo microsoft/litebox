@@ -16,6 +16,10 @@ workspace = true
 verify = true
 
 [[example]]
+name = "native_default_constructor_equality_negative"
+path = "src/negative/native_default_constructor_equality_negative.rs"
+
+[[example]]
 name = "limit_constructor_default_quota_negative"
 path = "src/negative/limit_constructor_default_quota_negative.rs"
 

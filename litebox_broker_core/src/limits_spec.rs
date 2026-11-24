@@ -186,4 +186,15 @@ pub proof fn prove_limit_constructor_frames()
 {
 }
 
+pub closed spec fn limit_default_policy() -> bool {
+    forall|cur: BrokerCoreLimits|
+        #[trigger] BrokerCoreLimits::default.ensures((), cur)
+            ==> cur == BrokerCoreLimits::DEFAULT
+}
+
+pub proof fn prove_limit_default()
+    ensures limit_default_policy(),
+{
+}
+
 }

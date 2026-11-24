@@ -132,4 +132,28 @@ pub fn check_constructor_accepts_above_broker_socket_quota(
     BrokerCoreLimits::new_with_all_limits(0, 0, sockets, per_process)
 }
 
+pub proof fn original_default_returns_the_registered_native_value()
+    ensures limits_spec::limit_default_policy(),
+{
+    limits_spec::prove_limit_default();
+}
+
+pub fn check_default_and_new_differ_in_local_quotas()
+    -> (result: (BrokerCoreLimits, BrokerCoreLimits))
+    ensures {
+        &&& result.0 == BrokerCoreLimits::DEFAULT
+        &&& limits_spec::reference_pipe_limit_transition(
+            result.0, result.1, result.0.max_references, result.0.max_total_pipe_capacity,
+        )
+        &&& result.1.max_references_per_process > result.0.max_references_per_process
+        &&& result.1.max_pipe_capacity_per_process > result.0.max_pipe_capacity_per_process
+    },
+{
+    let prev = BrokerCoreLimits::default();
+
+    let cur = BrokerCoreLimits::new(prev.max_references, prev.max_total_pipe_capacity);
+
+    (prev, cur)
+}
+
 }

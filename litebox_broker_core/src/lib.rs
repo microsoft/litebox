@@ -92,7 +92,7 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 ///
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-// In progress: derives, the Default trait implementation and live enforcement remain unverified.
+// In progress: derives and live quota enforcement remain unverified.
 #[vstd::prelude::verus_verify(external_derive)]
 pub struct BrokerCoreLimits {
     /// Maximum broker processes, across every PID namespace, that have not
@@ -363,7 +363,9 @@ impl BrokerCoreLimits {
     }
 }
 
+#[vstd::prelude::verus_verify]
 impl Default for BrokerCoreLimits {
+    #[verus_spec(result => ensures result == Self::DEFAULT)]
     fn default() -> Self {
         Self::DEFAULT
     }
