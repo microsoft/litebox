@@ -21,15 +21,15 @@ use vlitebox_thirdparty as _;
 #[cfg(any(test, feature = "test-std-platform"))]
 extern crate std;
 
-mod channel;
-mod error;
+pub mod channel;
+pub mod error;
 pub mod event;
 pub mod fs;
 mod id;
 pub mod job;
 #[cfg(verus_keep_ghost)]
 pub mod limits_spec;
-mod object;
+pub mod object;
 pub mod pid_namespace;
 pub mod pipe;
 mod policy;
@@ -419,40 +419,6 @@ pub struct BrokerCore {
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(verus_keep_ghost)]
-pub mod verification {
-    pub use crate::channel::{
-        channel_accounting_policy, check_empty_wakeups, check_saturated_room,
-        check_waiter_extraction, empty_wakeup_policy, prove_channel_accounting,
-        prove_empty_wakeups, prove_waiter_extraction, waiter_extraction_policy,
-    };
-    pub use crate::error::verification::{
-        check_blocking_error, check_fault_translation, error_category_policy, protocol_error_code,
-        prove_error_categories,
-    };
-    pub use crate::event::verification::{event_projection_policy, prove_event_projection};
-    pub use crate::fs::devices::verification::{
-        check_pts_device_number, prove_pts_device_number_policy, pts_device_bits, pts_device_major,
-        pts_device_minor, pts_device_number_policy,
-    };
-    pub use crate::fs::{file_projection_policy, prove_file_projection};
-    pub use crate::object::verification::{duplication_policy, prove_duplication_policy};
-    pub use crate::pipe::verification::{pipe_projection_policy, prove_pipe_projection};
-    pub use crate::shared_futex::verification::{
-        check_key_validation, prove_shared_futex_leaves, shared_futex_leaf_policy,
-        well_formed_futex_request,
-    };
-    pub use crate::signal::verification::{
-        check_cloned_pending_sender_array, check_pending_sender_array, pending_sender_clone_policy,
-        pending_sender_empty_policy, prove_pending_sender_clone, prove_pending_sender_empty_query,
-        prove_signals_projection, signals_projection_policy,
-    };
-    pub use crate::timer::verification::{prove_timer_projection, timer_projection_policy};
-    pub use crate::unix_socket::verification::{
-        prove_unix_socket_projection, unix_socket_projection_policy,
-    };
-}
 
 impl BrokerCore {
     /// Creates the broker core with broker-wide limits and service providers.

@@ -11,7 +11,7 @@ verus! {
 pub fn reject_fault_as_unknown_object() -> (error: BrokerError)
     ensures error == BrokerError::UnknownObject,
 {
-    litebox_broker_core::verification::check_fault_translation()
+    litebox_broker_core::error::verification::check_fault_translation()
 }
 
 }

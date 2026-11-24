@@ -12,7 +12,7 @@ verus! {
 pub proof fn object_kind_duplication_is_enforced()
     ensures object_kind_duplication_policy(),
 {
-    litebox_broker_core::verification::prove_duplication_policy();
+    litebox_broker_core::object::verification::prove_duplication_policy();
 }
 
 }

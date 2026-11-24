@@ -10,7 +10,7 @@ verus! {
 pub fn reject_nonempty_default_wakeups() -> (count: usize)
     ensures count > 0,
 {
-    litebox_broker_core::verification::check_empty_wakeups()
+    litebox_broker_core::channel::check_empty_wakeups()
 }
 
 }

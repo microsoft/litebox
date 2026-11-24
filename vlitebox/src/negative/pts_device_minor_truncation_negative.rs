@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_core::verification;
+use litebox_broker_core::fs::devices::verification;
 use vstd::prelude::*;
 
 verus! {

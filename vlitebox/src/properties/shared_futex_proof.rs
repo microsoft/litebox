@@ -12,7 +12,7 @@ verus! {
 pub proof fn shared_futex_validation_and_waiter_projection_are_exact()
     ensures shared_futex_leaf_policy(),
 {
-    litebox_broker_core::verification::prove_shared_futex_leaves();
+    litebox_broker_core::shared_futex::verification::prove_shared_futex_leaves();
 }
 
 }

@@ -17,7 +17,7 @@ use vstd::prelude::verus_spec;
 
 #[cfg(verus_keep_ghost)]
 #[path = "event_spec.rs"]
-pub(crate) mod verification;
+pub mod verification;
 
 pub(crate) const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
 

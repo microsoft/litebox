@@ -11,7 +11,7 @@ verus! {
 pub fn reject_empty_bitset_acceptance(key: SharedFutexKey) -> (accepted: bool)
     ensures accepted,
 {
-    litebox_broker_core::verification::check_key_validation(key, 0)
+    litebox_broker_core::shared_futex::verification::check_key_validation(key, 0)
 }
 
 }

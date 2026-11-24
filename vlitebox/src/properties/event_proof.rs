@@ -12,7 +12,7 @@ verus! {
 pub proof fn event_projection_preserves_kind_and_borrowed_state()
     ensures event_kind_projection_policy(),
 {
-    litebox_broker_core::verification::prove_event_projection();
+    litebox_broker_core::event::verification::prove_event_projection();
 }
 
 }

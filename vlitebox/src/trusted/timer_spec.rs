@@ -10,7 +10,7 @@ use vstd::prelude::*;
 verus! {
 
 pub open spec fn timer_kind_projection_policy() -> bool {
-    litebox_broker_core::verification::timer_projection_policy()
+    litebox_broker_core::timer::verification::timer_projection_policy()
 }
 
 }

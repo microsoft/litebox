@@ -11,7 +11,7 @@ verus! {
 pub fn reject_unaligned_word_acceptance(memory: SharedMemoryId) -> (accepted: bool)
     ensures accepted,
 {
-    litebox_broker_core::verification::check_key_validation(
+    litebox_broker_core::shared_futex::verification::check_key_validation(
         SharedFutexKey { memory, offset: 1 },
         1,
     )

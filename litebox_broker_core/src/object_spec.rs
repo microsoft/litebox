@@ -10,7 +10,7 @@ use vstd::prelude::*;
 
 verus! {
 
-pub open spec fn permitted_by_kind(entry: &ObjectEntry) -> bool {
+pub(crate) open spec fn permitted_by_kind(entry: &ObjectEntry) -> bool {
     ||| entry is Event
     ||| entry is File
     ||| entry is UnixSocket

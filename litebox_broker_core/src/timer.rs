@@ -25,7 +25,7 @@ use crate::{BrokerError, BrokerProcess, Result};
 
 #[cfg(verus_keep_ghost)]
 #[path = "timer_spec.rs"]
-pub(crate) mod verification;
+pub mod verification;
 
 /// Trusted provider of the broker's monotonic clock and timer alarms.
 pub trait TimerProvider: Send + Sync {

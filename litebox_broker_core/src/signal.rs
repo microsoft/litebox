@@ -32,7 +32,7 @@ use crate::{BrokerError, BrokerProcess, Result};
 
 #[cfg(verus_keep_ghost)]
 #[path = "signal_spec.rs"]
-pub(crate) mod verification;
+pub mod verification;
 
 /// Opens the caller's signals, returning a handle that becomes readable while
 /// any event is pending.

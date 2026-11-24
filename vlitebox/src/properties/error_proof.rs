@@ -12,7 +12,7 @@ verus! {
 pub proof fn blocking_and_protocol_error_categories_are_exact()
     ensures error_category_policy(),
 {
-    litebox_broker_core::verification::prove_error_categories();
+    litebox_broker_core::error::verification::prove_error_categories();
 }
 
 }

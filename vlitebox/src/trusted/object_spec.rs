@@ -10,7 +10,7 @@ use vstd::prelude::*;
 verus! {
 
 pub open spec fn object_kind_duplication_policy() -> bool {
-    litebox_broker_core::verification::duplication_policy()
+    litebox_broker_core::object::verification::duplication_policy()
 }
 
 }

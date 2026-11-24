@@ -27,7 +27,7 @@ use crate::{BrokerError, ProcessKey, Result};
 
 #[cfg(verus_keep_ghost)]
 #[path = "object_spec.rs"]
-pub(crate) mod verification;
+pub mod verification;
 
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.

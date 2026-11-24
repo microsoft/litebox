@@ -3,7 +3,7 @@
 
 //! Actual encoder/getter calls preserve full indices, not terminal authority.
 
-use litebox_broker_core::verification;
+use litebox_broker_core::fs::devices::verification;
 use vstd::prelude::*;
 
 verus! {

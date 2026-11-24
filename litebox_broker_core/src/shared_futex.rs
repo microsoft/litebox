@@ -40,7 +40,7 @@ use crate::{BrokerError, BrokerProcess, Result};
 
 #[cfg(verus_keep_ghost)]
 #[path = "shared_futex_spec.rs"]
-pub(crate) mod verification;
+pub mod verification;
 
 /// Base-two logarithm of the number of wait queue buckets.
 const BUCKET_BITS: u32 = 8;

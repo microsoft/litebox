@@ -11,7 +11,7 @@ verus! {
 pub fn reject_blocking_as_nonblocking() -> (error: BrokerError)
     ensures error == BrokerError::NonBlockingWouldBlock,
 {
-    litebox_broker_core::verification::check_blocking_error(false)
+    litebox_broker_core::error::verification::check_blocking_error(false)
 }
 
 }

@@ -21,7 +21,7 @@ use crate::{BrokerError, BrokerProcess, Result};
 
 #[cfg(verus_keep_ghost)]
 #[path = "pipe_spec.rs"]
-pub(crate) mod verification;
+pub mod verification;
 
 /// Maximum capacity accepted by the control-path pipe prototype.
 pub const MAX_PIPE_CAPACITY: usize = 1024 * 1024;

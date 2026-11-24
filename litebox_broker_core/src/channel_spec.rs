@@ -45,6 +45,8 @@ pub(crate) closed spec fn shut_state<Q, W>(
     &&& cur.waiters == prev.waiters
 }
 
+// The Default trait contract requires pub; Wakeups remains crate-private.
+#[allow(private_interfaces)]
 pub closed spec fn empty_wakeups<W>(wakeups: Wakeups<W>) -> bool {
     wakeups.0@.len() == 0
 }

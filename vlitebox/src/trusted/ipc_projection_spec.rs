@@ -10,8 +10,8 @@ use vstd::prelude::*;
 verus! {
 
 pub open spec fn unix_socket_and_signals_projection_policy() -> bool {
-    &&& litebox_broker_core::verification::unix_socket_projection_policy()
-    &&& litebox_broker_core::verification::signals_projection_policy()
+    &&& litebox_broker_core::unix_socket::verification::unix_socket_projection_policy()
+    &&& litebox_broker_core::signal::verification::signals_projection_policy()
 }
 
 }

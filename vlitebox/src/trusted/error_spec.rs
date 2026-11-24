@@ -13,11 +13,11 @@ use vstd::prelude::*;
 verus! {
 
 pub open spec fn expected_protocol_error(error: BrokerError) -> ErrorCode {
-    litebox_broker_core::verification::protocol_error_code(error)
+    litebox_broker_core::error::verification::protocol_error_code(error)
 }
 
 pub open spec fn error_category_policy() -> bool {
-    litebox_broker_core::verification::error_category_policy()
+    litebox_broker_core::error::verification::error_category_policy()
 }
 
 }

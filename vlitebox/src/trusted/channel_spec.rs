@@ -17,11 +17,11 @@ use vstd::prelude::*;
 verus! {
 
 pub open spec fn channel_accounting_policy<Q, W>() -> bool {
-    litebox_broker_core::verification::channel_accounting_policy::<Q, W>()
+    litebox_broker_core::channel::channel_accounting_policy::<Q, W>()
 }
 
 pub open spec fn default_wakeup_policy<W>() -> bool {
-    litebox_broker_core::verification::empty_wakeup_policy::<W>()
+    litebox_broker_core::channel::empty_wakeup_policy::<W>()
 }
 
 }

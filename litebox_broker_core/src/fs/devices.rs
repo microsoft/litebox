@@ -20,7 +20,7 @@ use vstd::prelude::*;
 
 #[cfg(verus_keep_ghost)]
 #[path = "devices_spec.rs"]
-pub(crate) mod verification;
+pub mod verification;
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, FileTerminal, HandleRef,

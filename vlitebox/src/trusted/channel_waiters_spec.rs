@@ -15,7 +15,7 @@ use vstd::prelude::*;
 verus! {
 
 pub open spec fn channel_waiter_extraction_policy<Q, W>() -> bool {
-    litebox_broker_core::verification::waiter_extraction_policy::<Q, W>()
+    litebox_broker_core::channel::waiter_extraction_policy::<Q, W>()
 }
 
 }

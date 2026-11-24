@@ -3,7 +3,7 @@
 
 //! The original immutable sender query, not mutation, coalescing or delivery.
 
-use litebox_broker_core::verification;
+use litebox_broker_core::signal::verification;
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::signal::MAX_SIGNAL;
 use vstd::prelude::*;

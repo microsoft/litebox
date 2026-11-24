@@ -59,7 +59,7 @@ use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
 
 #[cfg(verus_keep_ghost)]
 #[path = "unix_socket_spec.rs"]
-pub(crate) mod verification;
+pub mod verification;
 
 /// Guest-visible result of a Unix socket operation.
 pub type UnixSocketResult<T> = core::result::Result<T, UnixSocketError>;

@@ -9,7 +9,7 @@ use vstd::prelude::*;
 verus! {
 
 pub open spec fn pipe_kind_projection_policy() -> bool {
-    litebox_broker_core::verification::pipe_projection_policy()
+    litebox_broker_core::pipe::verification::pipe_projection_policy()
 }
 
 }

@@ -11,11 +11,11 @@ use vstd::prelude::*;
 verus! {
 
 pub open spec fn shared_futex_input_shape(key: SharedFutexKey, bitset: u32) -> bool {
-    litebox_broker_core::verification::well_formed_futex_request(key, bitset)
+    litebox_broker_core::shared_futex::verification::well_formed_futex_request(key, bitset)
 }
 
 pub open spec fn shared_futex_leaf_policy() -> bool {
-    litebox_broker_core::verification::shared_futex_leaf_policy()
+    litebox_broker_core::shared_futex::verification::shared_futex_leaf_policy()
 }
 
 }

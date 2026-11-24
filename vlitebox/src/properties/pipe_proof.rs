@@ -12,7 +12,7 @@ verus! {
 pub proof fn pipe_projection_checks_kind_and_value()
     ensures pipe_kind_projection_policy(),
 {
-    litebox_broker_core::verification::prove_pipe_projection();
+    litebox_broker_core::pipe::verification::prove_pipe_projection();
 }
 
 }

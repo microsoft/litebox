@@ -10,7 +10,7 @@ verus! {
 pub fn reject_over_capacity_room() -> (room: usize)
     ensures room > 0,
 {
-    litebox_broker_core::verification::check_saturated_room(2, 3)
+    litebox_broker_core::channel::check_saturated_room(2, 3)
 }
 
 }

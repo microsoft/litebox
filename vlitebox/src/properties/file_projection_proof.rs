@@ -12,7 +12,7 @@ verus! {
 pub proof fn file_projection_checks_kind_and_value()
     ensures file_kind_projection_policy(),
 {
-    litebox_broker_core::verification::prove_file_projection();
+    litebox_broker_core::fs::prove_file_projection();
 }
 
 }

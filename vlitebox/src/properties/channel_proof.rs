@@ -12,13 +12,13 @@ verus! {
 pub proof fn channel_scalar_operations_preserve_their_frames<Q, W>()
     ensures channel_accounting_policy::<Q, W>(),
 {
-    litebox_broker_core::verification::prove_channel_accounting::<Q, W>();
+    litebox_broker_core::channel::prove_channel_accounting::<Q, W>();
 }
 
 pub proof fn default_wakeups_have_no_waiters<W>()
     ensures default_wakeup_policy::<W>(),
 {
-    litebox_broker_core::verification::prove_empty_wakeups::<W>();
+    litebox_broker_core::channel::prove_empty_wakeups::<W>();
 }
 
 }

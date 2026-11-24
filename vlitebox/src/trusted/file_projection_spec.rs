@@ -10,7 +10,7 @@ use vstd::prelude::*;
 verus! {
 
 pub open spec fn file_kind_projection_policy() -> bool {
-    litebox_broker_core::verification::file_projection_policy()
+    litebox_broker_core::fs::file_projection_policy()
 }
 
 }

@@ -10,7 +10,7 @@ use vstd::prelude::*;
 verus! {
 
 pub open spec fn event_kind_projection_policy() -> bool {
-    litebox_broker_core::verification::event_projection_policy()
+    litebox_broker_core::event::verification::event_projection_policy()
 }
 
 }
