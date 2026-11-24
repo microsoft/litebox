@@ -32,7 +32,10 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::ops::Range;
 use core::ptr::NonNull;
-use vstd::prelude::verus_verify;
+use vstd::prelude::{verus_spec, verus_verify};
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::View;
 
 use crate::peer_memory;
 
@@ -149,6 +152,8 @@ impl<'a> From<&'a mut [u8]> for RawBytes<'a> {
 /// and writes from if it is a [`WriteBuffer`].
 pub trait Buffer {
     /// Returns the buffer's length in bytes.
+    // In progress: trait-level export/default verification is not complete.
+    #[verus_spec]
     fn len(&self) -> usize;
 
     /// Returns whether the buffer is empty.
@@ -333,7 +338,10 @@ fn assert_within(offset: usize, length: usize, limit: usize, what: &str) {
     );
 }
 
+#[verus_verify]
 impl Buffer for [u8] {
+    // Body-checked; cross-crate trait-contract composition is still in progress.
+    #[verus_spec(result => ensures result == self@.len())]
     fn len(&self) -> usize {
         <[u8]>::len(self)
     }
