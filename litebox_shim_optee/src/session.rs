@@ -513,7 +513,7 @@ impl<Platform: crate::OpteeShimPlatform> SessionManager<Platform> {
     /// # Drop-order requirement
     ///
     /// On the OpenSession path the runner activates a TA page table
-    /// (`TaskPageTableGuard`) inside the same scope. The token *must* be
+    /// (`enter_task_page_table`) inside the same scope. The token *must* be
     /// declared **before** that guard so it drops **after** it — the
     /// marker must outlive the CR3 switch back to base, otherwise a
     /// forged Close on the freshly-registered session can win the

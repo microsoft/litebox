@@ -3,6 +3,7 @@
 
 use crate::syscalls::Cleanup;
 use crate::{TaBin, Task, UserMutPtr};
+use core::mem::DropGuard;
 use litebox::platform::page_mgmt::PageManagementProvider;
 use litebox::platform::{RawConstPointer, RawMutPointer};
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
@@ -26,35 +27,6 @@ fn tee_result_from_errno(err: Errno) -> TeeResult {
 fn align_down(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     addr & !(align - 1)
-}
-
-/// Calls `sys_munmap(addr, len)` when dropped, unless `disarm()` has been called first.
-///
-/// Used to ensure a mapping created by `sys_mmap` is released on every error
-/// path of `sys_map_zi` / `sys_map_bin`. After the syscall has fully succeeded
-/// and ownership of the mapping has been transferred to the caller, call
-/// `disarm()` to suppress the unmap.
-#[must_use = "MmapGuard unmaps on drop unless disarm() is called; bind it"]
-struct MmapGuard<'a, Platform: crate::OpteeShimPlatform> {
-    task: &'a Task<Platform>,
-    addr: UserMutPtr<Platform, u8>,
-    len: usize,
-}
-
-impl<'a, Platform: crate::OpteeShimPlatform> MmapGuard<'a, Platform> {
-    fn new(task: &'a Task<Platform>, addr: UserMutPtr<Platform, u8>, len: usize) -> Self {
-        Self { task, addr, len }
-    }
-
-    fn disarm(self) {
-        core::mem::forget(self);
-    }
-}
-
-impl<Platform: crate::OpteeShimPlatform> Drop for MmapGuard<'_, Platform> {
-    fn drop(&mut self) {
-        let _ = self.task.sys_munmap(self.addr, self.len);
-    }
 }
 
 impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
@@ -221,7 +193,10 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         let addr = self
             .sys_mmap(va, map_len, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
             .map_err(tee_result_from_errno)?;
-        let guard = MmapGuard::new(self, addr, map_len);
+        // Release the mapping on every error path; dismissed once it is handed to the caller.
+        let guard = DropGuard::new((addr, map_len), |(addr, len)| {
+            let _ = self.sys_munmap(addr, len);
+        });
 
         let usable_start_addr = addr
             .as_usize()
@@ -248,7 +223,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             );
         }
 
-        guard.disarm();
+        DropGuard::dismiss(guard);
         let cleanup = Cleanup::Unmap {
             addr: usable_start_addr,
             len: pad_end_start_addr - usable_start_addr,
@@ -442,7 +417,10 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
                 0,
             )
             .map_err(tee_result_from_errno)?;
-        let guard = MmapGuard::new(self, map_base_addr, alloc_len);
+        // Release the mapping on every error path; dismissed once it is handed to the caller.
+        let guard = DropGuard::new((map_base_addr, alloc_len), |(addr, len)| {
+            let _ = self.sys_munmap(addr, len);
+        });
 
         let usable_start_addr = map_base_addr
             .as_usize()
@@ -525,7 +503,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         if va.write_at_offset(0, usable_start_addr).is_none() {
             return Err(TeeResult::AccessDenied);
         }
-        guard.disarm();
+        DropGuard::dismiss(guard);
         // Record the trampoline pages so the padding checks treat them as unmapped.
         if let Some(range) = trampoline_page_range {
             self.ta_trampoline_page_range

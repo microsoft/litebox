@@ -8,6 +8,7 @@ use crate::msg_handler::{ParamOutputs, ShmInfo, TaRequestInfo, client_pta_params
 use crate::{Task, UserConstPtr, UserMutPtr, idk::IdksPta, syscalls::Cleanup};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::mem::DropGuard;
 use hmac::{Hmac, Mac};
 use litebox::platform::{DerivedKeyError, KDFParams, RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt;
@@ -181,17 +182,6 @@ pub(crate) fn open_default_pta_session(params: &UteeParams) -> Result<u32, TeeRe
     crate::SessionIdPool::allocate().ok_or(TeeResult::Busy)
 }
 
-struct PtaBusyGuard<'a, Platform: crate::OpteeShimPlatform> {
-    task: &'a Task<Platform>,
-    pta: PseudoTa,
-}
-
-impl<Platform: crate::OpteeShimPlatform> Drop for PtaBusyGuard<'_, Platform> {
-    fn drop(&mut self) {
-        self.task.global.pta_busy.lock().remove(&self.pta);
-    }
-}
-
 const PTA_SYSTEM_ADD_RNG_ENTROPY: u32 = 0;
 const PTA_SYSTEM_DERIVE_TA_UNIQUE_KEY: u32 = 1;
 const PTA_SYSTEM_MAP_ZI: u32 = 2;
@@ -243,7 +233,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     ///
     /// Returns `Ok(None)` for PTAs flagged `TaFlags::CONCURRENT` (no gating).
     /// For a non-concurrent PTA that is busy, returns `Err(Busy)` immediately.
-    fn try_set_busy(&self, pta: PseudoTa) -> Result<Option<PtaBusyGuard<'_, Platform>>, TeeResult> {
+    fn try_set_busy(&self, pta: PseudoTa) -> Result<Option<impl Drop>, TeeResult> {
         if pta.flags().contains(TaFlags::CONCURRENT) {
             return Ok(None);
         }
@@ -254,7 +244,9 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         }
 
         busy.insert(pta);
-        Ok(Some(PtaBusyGuard { task: self, pta }))
+        Ok(Some(DropGuard::new(pta, move |pta| {
+            self.global.pta_busy.lock().remove(&pta);
+        })))
     }
 
     pub(crate) fn open_pta_session(

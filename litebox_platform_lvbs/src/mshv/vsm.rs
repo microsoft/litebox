@@ -23,6 +23,7 @@ use crate::{
     },
 };
 use alloc::vec::Vec;
+use core::mem::DropGuard;
 use core::ops::Range;
 use litebox::mm::vmap::{PhysPageAddr, PhysPageAddrArray, PhysPointerError};
 use litebox::utils::TruncateExt;
@@ -274,27 +275,30 @@ pub(crate) fn protect_vtl1_physical_memory_range(
 // readers which is unaware of HEKI (e.g., OP-TEE shim's normal-world pointers).
 // Also, this is used by `protect_physical_memory_range` which invokes a hypercall.
 
-/// RAII reservation over VTL0 physical frames. On drop without `commit`, every
-/// newly reserved range is restored to VTL0 read/write, non-executable access.
+/// Reservation over VTL0 physical frames that rolls back unless committed:
+/// [`Self::new`] returns it armed in a [`DropGuard`] that runs
+/// [`Self::rollback`], and [`DropGuard::dismiss`] commits it.
 ///
 /// VTL1 has to record this itself because there is no Hyper-V hypercall to get
 /// a frame's current VTL protection mask. The reservation remembers which ranges
 /// it changed, enabling reliable rollback.
-pub(crate) struct FrameReservation<'a> {
+struct FrameReservation<'a> {
     platform: &'a crate::host::LvbsLinuxKernel,
     owned_ranges: Vec<PhysFrameRange<Size4KiB>>,
     owned_frames: RangeSet<u64>,
-    committed: bool,
 }
 
 impl<'a> FrameReservation<'a> {
-    pub(crate) fn new(platform: &'a crate::host::LvbsLinuxKernel) -> Self {
-        Self {
-            platform,
-            owned_ranges: Vec::new(),
-            owned_frames: RangeSet::new(),
-            committed: false,
-        }
+    /// Starts an empty reservation, armed to roll back on drop.
+    fn new(platform: &'a crate::host::LvbsLinuxKernel) -> DropGuard<Self, fn(Self)> {
+        DropGuard::new(
+            Self {
+                platform,
+                owned_ranges: Vec::new(),
+                owned_frames: RangeSet::new(),
+            },
+            Self::rollback,
+        )
     }
 
     fn classify(
@@ -318,7 +322,7 @@ impl<'a> FrameReservation<'a> {
     ///
     /// Validation and insertion are atomic under exclusive registry access. On rejection, only
     /// claims added by this call are rolled back.
-    pub(crate) fn reserve(
+    fn reserve(
         &mut self,
         frames: impl IntoIterator<Item = PhysFrameRange<Size4KiB>>,
     ) -> Result<Vec<ReservationStatus>, VsmError> {
@@ -375,19 +379,11 @@ impl<'a> FrameReservation<'a> {
         })
     }
 
-    /// Mark the reserved frames as committed; drop becomes a no-op.
-    pub(crate) fn commit(&mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for FrameReservation<'_> {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        // Rollback: restore every newly reserved range to VTL0 read/write, non-executable access.
-        // Drop cannot report failure, so debug builds assert it.
+    /// Restore every newly reserved range to the default VTL0 read/write
+    /// permissions (see [`unprotect_physical_memory_range`]). Runs from the drop
+    /// guard armed by [`Self::new`] and cannot report failure, so debug builds
+    /// assert it.
+    fn rollback(self) {
         for &phys_frame_range in &self.owned_ranges {
             let result = unprotect_physical_memory_range(self.platform, phys_frame_range);
             debug_assert!(
@@ -646,10 +642,10 @@ pub(crate) fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
 }
 
 /// Restricted transaction handle for a `protect_frames_transactionally` closure.
-/// Wraps the private platform [`FrameReservation`] guard so the service can
-/// never hold or leak a reservation across the trait boundary.
+/// Wraps the private platform [`FrameReservation`] so the service can never
+/// hold or leak a reservation across the trait boundary.
 struct PlatformFrameTxn<'a, 'r> {
-    guard: &'a mut FrameReservation<'r>,
+    reservation: &'a mut FrameReservation<'r>,
 }
 
 impl FrameTxn for PlatformFrameTxn<'_, '_> {
@@ -657,12 +653,12 @@ impl FrameTxn for PlatformFrameTxn<'_, '_> {
         &mut self,
         ranges: &[PhysFrameRange<Size4KiB>],
     ) -> Result<Vec<ReservationStatus>, VsmError> {
-        self.guard.reserve(ranges.iter().copied())
+        self.reservation.reserve(ranges.iter().copied())
     }
 
     fn protect(&mut self, range: PhysFrameRange<Size4KiB>, attr: MemAttr) -> Result<(), VsmError> {
         protect_physical_memory_range(
-            self.guard.platform,
+            self.reservation.platform,
             range,
             mem_attr_to_hv_page_prot_flags(attr),
         )
@@ -699,14 +695,16 @@ impl Vtl0Gate for LvbsVtl0Gate {
         initial: &[PhysFrameRange<Size4KiB>],
         f: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
     ) -> Result<(), VsmError> {
-        let mut guard = FrameReservation::new(self.platform);
-        guard.reserve(initial.iter().copied())?;
-        let mut txn = PlatformFrameTxn { guard: &mut guard };
-        let result = f(&mut txn);
+        let mut reservation = FrameReservation::new(self.platform);
+        reservation.reserve(initial.iter().copied())?;
+        let result = f(&mut PlatformFrameTxn {
+            reservation: &mut reservation,
+        });
         if result.is_ok() {
-            txn.guard.commit();
+            // Commit: keep the reserved frames.
+            DropGuard::dismiss(reservation);
         }
-        // On `Err`, `guard` drops uncommitted, rolling back every reserved range.
+        // On `Err`, `reservation` drops, rolling back every reserved range.
         result
     }
 
