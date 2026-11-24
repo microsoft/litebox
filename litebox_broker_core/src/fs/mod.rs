@@ -33,7 +33,10 @@ pub mod tar_ro;
 mod tests;
 
 #[cfg(verus_keep_ghost)]
-pub use service::verification::{file_projection_policy, prove_file_projection};
+pub use service::verification::{
+    check_file_offset, file_offset_outcome, file_offset_policy, file_projection_policy,
+    prove_file_offset_validation, prove_file_projection,
+};
 
 pub use litebox_broker_protocol::fs::{
     FileDirectoryEntry as DirEntry, FileMode as Mode, FileNodeInfo as NodeInfo,

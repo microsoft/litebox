@@ -14,7 +14,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
-use vstd::prelude::verus_spec;
+use vstd::prelude::{verus_exec_expr, verus_spec};
 
 use super::OFlags;
 use super::errors::{
@@ -963,11 +963,17 @@ fn validate_path(path: &str) -> FileResult<()> {
     }
 }
 
+#[verus_spec(result => ensures verification::file_offset_outcome(offset, length, result))]
 fn checked_offset(offset: Option<u64>, length: usize) -> FileResult<Option<usize>> {
     let Some(offset) = offset else {
         return Ok(None);
     };
-    let offset = usize::try_from(offset).map_err(|_| FileError::InvalidOffset)?;
+    // Erased annotation; the original conversion and error callback are unchanged.
+    let offset = usize::try_from(offset).map_err(verus_exec_expr! {
+        |_| -> (error: FileError)
+            ensures error == FileError::InvalidOffset,
+        { FileError::InvalidOffset }
+    })?;
     offset.checked_add(length).ok_or(FileError::InvalidOffset)?;
     Ok(Some(offset))
 }

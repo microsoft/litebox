@@ -6,6 +6,7 @@ pub mod channel_waiters_spec;
 pub mod directory_decoder_spec;
 pub mod error_spec;
 pub mod event_spec;
+pub mod file_offset_spec;
 pub mod file_projection_spec;
 pub mod filesystem_errors_spec;
 pub mod ipc_projection_spec;

@@ -142,3 +142,11 @@ path = "src/negative/directory_kind_encoding_negative.rs"
 [[example]]
 name = "directory_kind_invalid_tag_negative"
 path = "src/negative/directory_kind_invalid_tag_negative.rs"
+
+[[example]]
+name = "file_offset_overflow_negative"
+path = "src/negative/file_offset_overflow_negative.rs"
+
+[[example]]
+name = "file_offset_implicit_negative"
+path = "src/negative/file_offset_implicit_negative.rs"

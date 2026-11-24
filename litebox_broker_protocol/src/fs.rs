@@ -163,6 +163,8 @@ wire_enum! {
     /// File operation failure that is meaningful to the guest ABI.
     #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
     #[non_exhaustive]
+    // In progress: derived implementations and wire codecs remain unverified.
+    #[verus_verify(external_derive)]
     pub enum FileError {
         #[error("requested access is not allowed")]
         AccessNotAllowed,
