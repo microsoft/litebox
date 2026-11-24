@@ -34,4 +34,14 @@ pub proof fn prove_process_identity_conversions()
 {
 }
 
+pub closed spec fn process_id_clone_policy() -> bool {
+    forall|prev: ProcessId, cur: ProcessId|
+        #[trigger] ProcessId::clone.ensures((&prev,), cur) ==> cur == prev
+}
+
+pub proof fn prove_process_id_clone()
+    ensures process_id_clone_policy(),
+{
+}
+
 }

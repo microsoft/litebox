@@ -16,6 +16,10 @@ workspace = true
 verify = true
 
 [[example]]
+name = "creator_clone_number_negative"
+path = "src/negative/creator_clone_number_negative.rs"
+
+[[example]]
 name = "native_default_constructor_equality_negative"
 path = "src/negative/native_default_constructor_equality_negative.rs"
 

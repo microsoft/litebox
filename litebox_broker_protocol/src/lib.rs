@@ -50,8 +50,8 @@ pub mod process_identity_spec;
 /// the numeric value without applying semantic checks.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-// In progress: derived implementations and allocation validity are unverified.
-#[verus_verify(external_derive)]
+// In progress: other derived implementations and allocation validity are unverified.
+#[verus_verify]
 pub struct ProcessId(pub u32);
 
 /// Guest thread ID carried by broker protocol messages.
