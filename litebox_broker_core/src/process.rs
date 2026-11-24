@@ -144,6 +144,7 @@ type ChildWithConnection<Connection> = (Arc<BrokerProcess>, Option<Connection>);
 /// servers or hosts can plumb identity through the same process-creation seam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
+#[verus_verify]
 pub enum CallerCredential {
     /// The trusted broker entry layer authenticated and bound the caller.
     HostGuaranteed,
