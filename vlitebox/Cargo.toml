@@ -34,3 +34,11 @@ path = "src/negative/timer_projection_negative.rs"
 [[example]]
 name = "shared_memory_id_negative"
 path = "src/negative/shared_memory_id_negative.rs"
+
+[[example]]
+name = "shared_futex_empty_bitset_negative"
+path = "src/negative/shared_futex_empty_bitset_negative.rs"
+
+[[example]]
+name = "shared_futex_alignment_negative"
+path = "src/negative/shared_futex_alignment_negative.rs"

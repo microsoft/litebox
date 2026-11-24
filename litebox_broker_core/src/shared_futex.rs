@@ -32,10 +32,15 @@ use litebox_broker_protocol::shared_futex::{
 };
 use sha2::Sha256;
 use spin::{Mutex, Once};
+use vstd::prelude::verus_spec;
 
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::{BrokerError, BrokerProcess, Result};
+
+#[cfg(verus_keep_ghost)]
+#[path = "shared_futex_spec.rs"]
+pub(crate) mod verification;
 
 /// Base-two logarithm of the number of wait queue buckets.
 const BUCKET_BITS: u32 = 8;
@@ -235,6 +240,7 @@ pub fn futex_disarm(process: &BrokerProcess, request: FutexDisarmRequest) -> Res
 
 /// Fails with `UnsupportedOperation` if `key` names an unaligned futex word or `bitset` is
 /// empty, which well-behaved clients never ask for.
+#[verus_spec(result => ensures verification::key_validation(key, bitset, result))]
 fn validate_key_and_bitset(key: SharedFutexKey, bitset: u32) -> Result<()> {
     if !key.offset.is_multiple_of(FUTEX_WORD_SIZE) || bitset == 0 {
         return Err(BrokerError::UnsupportedOperation);
@@ -243,6 +249,7 @@ fn validate_key_and_bitset(key: SharedFutexKey, bitset: u32) -> Result<()> {
 }
 
 impl ObjectEntry {
+    #[verus_spec(result => ensures verification::waiter_projection(self, result))]
     fn as_futex_waiter(&self) -> Result<&FutexWaiterObject> {
         match self {
             Self::FutexWaiter(waiter) => Ok(waiter),

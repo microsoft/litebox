@@ -388,6 +388,10 @@ pub mod verification {
     pub use crate::event::verification::{event_projection_policy, prove_event_projection};
     pub use crate::object::verification::{duplication_policy, prove_duplication_policy};
     pub use crate::pipe::verification::{pipe_projection_policy, prove_pipe_projection};
+    pub use crate::shared_futex::verification::{
+        check_key_validation, prove_shared_futex_leaves, shared_futex_leaf_policy,
+        well_formed_futex_request,
+    };
     pub use crate::timer::verification::{prove_timer_projection, timer_projection_policy};
 }
 

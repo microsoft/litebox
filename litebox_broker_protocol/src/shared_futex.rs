@@ -28,6 +28,7 @@ use vstd::prelude::{verus_spec, verus_verify};
 pub const FUTEX_WAITER_WOKEN: ReadinessFlags = ReadinessFlags::READ;
 
 /// Size of a futex word in bytes, which its offset must be a multiple of.
+#[verus_verify]
 pub const FUTEX_WORD_SIZE: u64 = 4;
 
 /// Names memory shared by several processes.

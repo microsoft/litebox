@@ -4,5 +4,6 @@
 pub mod event_proof;
 pub mod object_proof;
 pub mod pipe_proof;
+pub mod shared_futex_proof;
 pub mod shared_memory_id_proof;
 pub mod timer_proof;
