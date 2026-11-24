@@ -17,224 +17,224 @@ verify = true
 
 [[example]]
 name = "pts_device_minor_truncation_negative"
-path = "src/negative/pts_device_minor_truncation_negative.rs"
+path = "src/test-negative/pts_device_minor_truncation_negative.rs"
 
 [[example]]
 name = "pending_sender_clone_query_negative"
-path = "src/negative/pending_sender_clone_query_negative.rs"
+path = "src/test-negative/pending_sender_clone_query_negative.rs"
 
 [[example]]
 name = "pending_sender_empty_negative"
-path = "src/negative/pending_sender_empty_negative.rs"
+path = "src/test-negative/pending_sender_empty_negative.rs"
 
 [[example]]
 name = "limit_clone_shared_file_negative"
-path = "src/negative/limit_clone_shared_file_negative.rs"
+path = "src/test-negative/limit_clone_shared_file_negative.rs"
 
 [[example]]
 name = "role_clone_creator_negative"
-path = "src/negative/role_clone_creator_negative.rs"
+path = "src/test-negative/role_clone_creator_negative.rs"
 
 [[example]]
 name = "creator_clone_number_negative"
-path = "src/negative/creator_clone_number_negative.rs"
+path = "src/test-negative/creator_clone_number_negative.rs"
 
 [[example]]
 name = "native_default_constructor_equality_negative"
-path = "src/negative/native_default_constructor_equality_negative.rs"
+path = "src/test-negative/native_default_constructor_equality_negative.rs"
 
 [[example]]
 name = "limit_constructor_default_quota_negative"
-path = "src/negative/limit_constructor_default_quota_negative.rs"
+path = "src/test-negative/limit_constructor_default_quota_negative.rs"
 
 [[example]]
 name = "constructor_socket_clamping_negative"
-path = "src/negative/constructor_socket_clamping_negative.rs"
+path = "src/test-negative/constructor_socket_clamping_negative.rs"
 
 [[example]]
 name = "shared_file_thread_frame_negative"
-path = "src/negative/shared_file_thread_frame_negative.rs"
+path = "src/test-negative/shared_file_thread_frame_negative.rs"
 
 [[example]]
 name = "child_image_clamping_negative"
-path = "src/negative/child_image_clamping_negative.rs"
+path = "src/test-negative/child_image_clamping_negative.rs"
 
 [[example]]
 name = "process_quota_broker_frame_negative"
-path = "src/negative/process_quota_broker_frame_negative.rs"
+path = "src/test-negative/process_quota_broker_frame_negative.rs"
 
 [[example]]
 name = "process_quota_clamping_negative"
-path = "src/negative/process_quota_clamping_negative.rs"
+path = "src/test-negative/process_quota_clamping_negative.rs"
 
 [[example]]
 name = "object_policy_negative"
-path = "src/negative/object_policy_negative.rs"
+path = "src/test-negative/object_policy_negative.rs"
 
 [[example]]
 name = "pipe_projection_negative"
-path = "src/negative/pipe_projection_negative.rs"
+path = "src/test-negative/pipe_projection_negative.rs"
 
 [[example]]
 name = "event_projection_negative"
-path = "src/negative/event_projection_negative.rs"
+path = "src/test-negative/event_projection_negative.rs"
 
 [[example]]
 name = "timer_projection_negative"
-path = "src/negative/timer_projection_negative.rs"
+path = "src/test-negative/timer_projection_negative.rs"
 
 [[example]]
 name = "shared_memory_id_negative"
-path = "src/negative/shared_memory_id_negative.rs"
+path = "src/test-negative/shared_memory_id_negative.rs"
 
 [[example]]
 name = "shared_futex_empty_bitset_negative"
-path = "src/negative/shared_futex_empty_bitset_negative.rs"
+path = "src/test-negative/shared_futex_empty_bitset_negative.rs"
 
 [[example]]
 name = "shared_futex_alignment_negative"
-path = "src/negative/shared_futex_alignment_negative.rs"
+path = "src/test-negative/shared_futex_alignment_negative.rs"
 
 [[example]]
 name = "ipc_projection_negative"
-path = "src/negative/ipc_projection_negative.rs"
+path = "src/test-negative/ipc_projection_negative.rs"
 
 [[example]]
 name = "error_translation_negative"
-path = "src/negative/error_translation_negative.rs"
+path = "src/test-negative/error_translation_negative.rs"
 
 [[example]]
 name = "blocking_error_negative"
-path = "src/negative/blocking_error_negative.rs"
+path = "src/test-negative/blocking_error_negative.rs"
 
 [[example]]
 name = "fault_error_negative"
-path = "src/negative/fault_error_negative.rs"
+path = "src/test-negative/fault_error_negative.rs"
 
 [[example]]
 name = "file_projection_negative"
-path = "src/negative/file_projection_negative.rs"
+path = "src/test-negative/file_projection_negative.rs"
 
 [[example]]
 name = "transfer_zeroing_negative"
-path = "src/negative/transfer_zeroing_negative.rs"
+path = "src/test-negative/transfer_zeroing_negative.rs"
 
 [[example]]
 name = "channel_saturation_negative"
-path = "src/negative/channel_saturation_negative.rs"
+path = "src/test-negative/channel_saturation_negative.rs"
 
 [[example]]
 name = "channel_wakeups_negative"
-path = "src/negative/channel_wakeups_negative.rs"
+path = "src/test-negative/channel_wakeups_negative.rs"
 
 [[example]]
 name = "channel_extraction_negative"
-path = "src/negative/channel_extraction_negative.rs"
+path = "src/test-negative/channel_extraction_negative.rs"
 
 [[example]]
 name = "filesystem_busy_read_negative"
-path = "src/negative/filesystem_busy_read_negative.rs"
+path = "src/test-negative/filesystem_busy_read_negative.rs"
 
 [[example]]
 name = "filesystem_fault_write_negative"
-path = "src/negative/filesystem_fault_write_negative.rs"
+path = "src/test-negative/filesystem_fault_write_negative.rs"
 
 [[example]]
 name = "readonly_backend_marker_negative"
-path = "src/negative/readonly_backend_marker_negative.rs"
+path = "src/test-negative/readonly_backend_marker_negative.rs"
 
 [[example]]
 name = "readonly_clear_marker_negative"
-path = "src/negative/readonly_clear_marker_negative.rs"
+path = "src/test-negative/readonly_clear_marker_negative.rs"
 
 [[example]]
 name = "shared_buffer_empty_layout_negative"
-path = "src/negative/shared_buffer_empty_layout_negative.rs"
+path = "src/test-negative/shared_buffer_empty_layout_negative.rs"
 
 [[example]]
 name = "shared_buffer_slot_error_negative"
-path = "src/negative/shared_buffer_slot_error_negative.rs"
+path = "src/test-negative/shared_buffer_slot_error_negative.rs"
 
 [[example]]
 name = "shared_buffer_slot_overlap_negative"
-path = "src/negative/shared_buffer_slot_overlap_negative.rs"
+path = "src/test-negative/shared_buffer_slot_overlap_negative.rs"
 
 [[example]]
 name = "shared_mapping_no_space_negative"
-path = "src/negative/shared_mapping_no_space_negative.rs"
+path = "src/test-negative/shared_mapping_no_space_negative.rs"
 
 [[example]]
 name = "shared_mapping_fault_negative"
-path = "src/negative/shared_mapping_fault_negative.rs"
+path = "src/test-negative/shared_mapping_fault_negative.rs"
 
 [[example]]
 name = "directory_overflow_frame_negative"
-path = "src/negative/directory_overflow_frame_negative.rs"
+path = "src/test-negative/directory_overflow_frame_negative.rs"
 
 [[example]]
 name = "directory_subrange_negative"
-path = "src/negative/directory_subrange_negative.rs"
+path = "src/test-negative/directory_subrange_negative.rs"
 
 [[example]]
 name = "directory_pair_rollback_negative"
-path = "src/negative/directory_pair_rollback_negative.rs"
+path = "src/test-negative/directory_pair_rollback_negative.rs"
 
 [[example]]
 name = "directory_allocation_error_negative"
-path = "src/negative/directory_allocation_error_negative.rs"
+path = "src/test-negative/directory_allocation_error_negative.rs"
 
 [[example]]
 name = "directory_payload_error_negative"
-path = "src/negative/directory_payload_error_negative.rs"
+path = "src/test-negative/directory_payload_error_negative.rs"
 
 [[example]]
 name = "directory_kind_encoding_negative"
-path = "src/negative/directory_kind_encoding_negative.rs"
+path = "src/test-negative/directory_kind_encoding_negative.rs"
 
 [[example]]
 name = "directory_kind_invalid_tag_negative"
-path = "src/negative/directory_kind_invalid_tag_negative.rs"
+path = "src/test-negative/directory_kind_invalid_tag_negative.rs"
 
 [[example]]
 name = "file_offset_overflow_negative"
-path = "src/negative/file_offset_overflow_negative.rs"
+path = "src/test-negative/file_offset_overflow_negative.rs"
 
 [[example]]
 name = "file_offset_implicit_negative"
-path = "src/negative/file_offset_implicit_negative.rs"
+path = "src/test-negative/file_offset_implicit_negative.rs"
 
 [[example]]
 name = "file_service_mapping_space_negative"
-path = "src/negative/file_service_mapping_space_negative.rs"
+path = "src/test-negative/file_service_mapping_space_negative.rs"
 
 [[example]]
 name = "file_service_read_blocking_negative"
-path = "src/negative/file_service_read_blocking_negative.rs"
+path = "src/test-negative/file_service_read_blocking_negative.rs"
 
 [[example]]
 name = "file_service_truncate_mode_negative"
-path = "src/negative/file_service_truncate_mode_negative.rs"
+path = "src/test-negative/file_service_truncate_mode_negative.rs"
 
 [[example]]
 name = "file_service_truncate_busy_negative"
-path = "src/negative/file_service_truncate_busy_negative.rs"
+path = "src/test-negative/file_service_truncate_busy_negative.rs"
 
 [[example]]
 name = "file_service_seek_mode_negative"
-path = "src/negative/file_service_seek_mode_negative.rs"
+path = "src/test-negative/file_service_seek_mode_negative.rs"
 
 [[example]]
 name = "file_service_seek_offset_negative"
-path = "src/negative/file_service_seek_offset_negative.rs"
+path = "src/test-negative/file_service_seek_offset_negative.rs"
 
 [[example]]
 name = "file_service_directory_mode_negative"
-path = "src/negative/file_service_directory_mode_negative.rs"
+path = "src/test-negative/file_service_directory_mode_negative.rs"
 
 [[example]]
 name = "file_service_directory_kind_negative"
-path = "src/negative/file_service_directory_kind_negative.rs"
+path = "src/test-negative/file_service_directory_kind_negative.rs"
 
 [[example]]
 name = "process_creator_identity_negative"
-path = "src/negative/process_creator_identity_negative.rs"
+path = "src/test-negative/process_creator_identity_negative.rs"
