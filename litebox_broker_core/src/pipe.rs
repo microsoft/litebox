@@ -12,11 +12,16 @@ use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::rwlock::RwLock;
+use vstd::prelude::verus_spec;
 
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
 use crate::transfer::{append_to_queue, take_from_queue};
 use crate::{BrokerError, BrokerProcess, Result};
+
+#[cfg(verus_keep_ghost)]
+#[path = "pipe_spec.rs"]
+pub(crate) mod verification;
 
 /// Maximum capacity accepted by the control-path pipe prototype.
 pub const MAX_PIPE_CAPACITY: usize = 1024 * 1024;
@@ -98,6 +103,7 @@ pub fn write(
 }
 
 impl ObjectEntry {
+    #[verus_spec(result => ensures verification::pipe_projection(self, result))]
     fn as_pipe(&self) -> Result<&PipeObject> {
         match self {
             Self::Pipe(pipe) => Ok(pipe),

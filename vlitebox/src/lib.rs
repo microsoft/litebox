@@ -12,4 +12,6 @@ pub mod properties;
 pub mod trusted;
 
 pub use properties::object_proof;
+pub use properties::pipe_proof;
 pub use trusted::object_spec;
+pub use trusted::pipe_spec;

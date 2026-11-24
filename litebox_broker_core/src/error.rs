@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use thiserror::Error;
+use vstd::prelude::verus_verify;
 
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_platform::buffer::Fault;
@@ -9,6 +10,8 @@ use litebox_platform::buffer::Fault;
 /// Broker authority error category.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]
 #[non_exhaustive]
+// In progress: derived formatting is outside the error-kind proof slice.
+#[verus_verify(external_derive)]
 pub enum BrokerError {
     #[error("broker policy denied the operation")]
     PolicyDenied,

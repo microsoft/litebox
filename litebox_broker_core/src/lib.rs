@@ -386,6 +386,7 @@ static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 #[cfg(verus_keep_ghost)]
 pub mod verification {
     pub use crate::object::verification::{duplication_policy, prove_duplication_policy};
+    pub use crate::pipe::verification::{pipe_projection_policy, prove_pipe_projection};
 }
 
 impl BrokerCore {

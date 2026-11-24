@@ -39,13 +39,15 @@ jobs:
         run: cargo verus focus -p litebox_broker_core -- --no-cheating
       - name: Verify top-level broker properties
         run: cargo verus focus -p vlitebox -- --no-cheating
-      - name: Reject deliberately false broker property
+      - name: Reject deliberately false broker properties
         run: |
-          log="$RUNNER_TEMP/object-policy-negative.log"
-          if cargo verus focus -p vlitebox --example object_policy_negative -- --no-cheating > "$log" 2>&1; then
+          for target in object_policy_negative pipe_projection_negative; do
+            log="$RUNNER_TEMP/$target.log"
+            if cargo verus focus -p vlitebox --example "$target" -- --no-cheating > "$log" 2>&1; then
+              cat "$log"
+              echo "Deliberately false property $target unexpectedly verified"
+              exit 1
+            fi
             cat "$log"
-            echo "Deliberately false object policy unexpectedly verified"
-            exit 1
-          fi
-          cat "$log"
-          grep -q "postcondition not satisfied" "$log"
+            grep -q "postcondition not satisfied" "$log"
+          done
