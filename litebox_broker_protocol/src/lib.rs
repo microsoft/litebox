@@ -97,8 +97,13 @@ impl From<ProcessId> for SessionId {
 }
 
 /// Opaque broker object reference handle.
+///
+/// The protocol preserves its numeric representation; allocation validity,
+/// freshness, and authority are broker-core obligations.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// In progress: other derived implementations and live allocation remain unverified.
+#[verus_verify]
 pub struct ObjectHandle(pub u64);
 
 /// Association-scoped broker request identifier.
