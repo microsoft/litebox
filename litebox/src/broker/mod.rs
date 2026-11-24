@@ -21,9 +21,9 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind, HostNames,
-    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
-    MAX_PROCESS_BOOTSTRAP_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName,
+    HostNameKind, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_HOST_NAME_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
@@ -32,6 +32,11 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::readiness_queue::{
     MAX_READINESS_QUEUE_EVENTS, READY_EVENT_SIZE, ReadinessQueueError, ReadinessQueueInterest,
     ReadyEvent,
+};
+use litebox_broker_protocol::segment::{
+    ConfirmSegmentAttachRequest, GetSegmentRequest, PrepareSegmentAttachRequest,
+    PreparedSegmentAttach, SegmentAttachId, SegmentAttachmentCounts, SegmentError, SegmentId,
+    SegmentInfo, SegmentSlotStatus, SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
 };
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use litebox_broker_protocol::shared_futex::{SharedFutexKey, SharedMemoryId};
@@ -63,6 +68,41 @@ mod shared_buffer;
 use error::BrokerControlError;
 use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 
+pub(crate) type SegmentControlResult<T> =
+    core::result::Result<core::result::Result<T, SegmentError>, BrokerControlError>;
+
+/// Keyed shared segments.
+pub(crate) trait SegmentControl: Send + Sync {
+    fn get_segment(&self, request: GetSegmentRequest) -> SegmentControlResult<SegmentId>;
+
+    fn segment_status(&self, id: SegmentId) -> SegmentControlResult<SegmentStatus>;
+
+    fn segment_slot_status(
+        &self,
+        request: SegmentSlotStatusRequest,
+    ) -> SegmentControlResult<SegmentSlotStatus>;
+
+    fn segment_info(&self) -> SegmentControlResult<SegmentInfo>;
+
+    fn set_segment(&self, request: SetSegmentRequest) -> SegmentControlResult<()>;
+
+    fn remove_segment(&self, id: SegmentId) -> SegmentControlResult<()>;
+
+    fn prepare_segment_attach(
+        &self,
+        request: PrepareSegmentAttachRequest,
+    ) -> SegmentControlResult<PreparedSegmentAttach>;
+
+    fn confirm_segment_attach(
+        &self,
+        request: ConfirmSegmentAttachRequest,
+    ) -> SegmentControlResult<()>;
+
+    fn cancel_segment_attach(&self, attachment: SegmentAttachId) -> SegmentControlResult<()>;
+
+    fn set_segment_attachments(&self, counts: SegmentAttachmentCounts) -> SegmentControlResult<()>;
+}
+
 /// Local-core access to the negotiated broker control channel.
 ///
 /// LiteBox owns broker-backed local objects and constructs broker protocol
@@ -72,11 +112,10 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// The current interface is intentionally blocking for the initial broker POC.
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
-pub(crate) trait BrokerControl: Send + Sync {
+pub(crate) trait BrokerControl: SegmentControl {
     fn allocate_child_process(
         &self,
-        new_pid_namespace: Option<PidNamespaceOptions>,
-        sibling: bool,
+        request: AllocateChildRequest,
     ) -> core::result::Result<ProcessIdentity, BrokerControlError>;
 
     fn create_namespaces(
@@ -979,6 +1018,61 @@ where
     }
 }
 
+impl<Platform, Channel> SegmentControl for BrokerLocalControl<Platform, Channel>
+where
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
+    Channel: LocalCallChannel + Send + Sync,
+{
+    fn get_segment(&self, request: GetSegmentRequest) -> SegmentControlResult<SegmentId> {
+        self.request(|local| local.get_segment(request))
+    }
+
+    fn segment_status(&self, id: SegmentId) -> SegmentControlResult<SegmentStatus> {
+        self.request(|local| local.segment_status(id))
+    }
+
+    fn segment_slot_status(
+        &self,
+        request: SegmentSlotStatusRequest,
+    ) -> SegmentControlResult<SegmentSlotStatus> {
+        self.request(|local| local.segment_slot_status(request))
+    }
+
+    fn segment_info(&self) -> SegmentControlResult<SegmentInfo> {
+        self.request(BrokerLocal::segment_info)
+    }
+
+    fn set_segment(&self, request: SetSegmentRequest) -> SegmentControlResult<()> {
+        self.request(|local| local.set_segment(request))
+    }
+
+    fn remove_segment(&self, id: SegmentId) -> SegmentControlResult<()> {
+        self.request(|local| local.remove_segment(id))
+    }
+
+    fn prepare_segment_attach(
+        &self,
+        request: PrepareSegmentAttachRequest,
+    ) -> SegmentControlResult<PreparedSegmentAttach> {
+        self.request(|local| local.prepare_segment_attach(request))
+    }
+
+    fn confirm_segment_attach(
+        &self,
+        request: ConfirmSegmentAttachRequest,
+    ) -> SegmentControlResult<()> {
+        self.request(|local| local.confirm_segment_attach(request))
+    }
+
+    fn cancel_segment_attach(&self, attachment: SegmentAttachId) -> SegmentControlResult<()> {
+        self.request(|local| local.cancel_segment_attach(attachment))
+    }
+
+    fn set_segment_attachments(&self, counts: SegmentAttachmentCounts) -> SegmentControlResult<()> {
+        self.request(|local| local.set_segment_attachments(counts))
+    }
+}
+
 impl<Platform, Channel> BrokerControl for BrokerLocalControl<Platform, Channel>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
@@ -986,10 +1080,9 @@ where
 {
     fn allocate_child_process(
         &self,
-        new_pid_namespace: Option<PidNamespaceOptions>,
-        sibling: bool,
+        request: AllocateChildRequest,
     ) -> core::result::Result<ProcessIdentity, BrokerControlError> {
-        self.request(|local| local.allocate_child_process(new_pid_namespace, sibling))
+        self.request(|local| local.allocate_child_process(request))
     }
 
     fn create_namespaces(

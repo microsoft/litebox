@@ -40,7 +40,7 @@ use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPoo
 
 use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 use crate::readiness::ReadinessPublisherRuntime;
-use crate::shared_objects::{SharedObjectDelivery, handle_map_file};
+use crate::shared_objects::{SharedObjectDelivery, handle_shared_object_request};
 
 pub(crate) struct AssociationOutcome {
     pub(crate) result: IoResult<()>,
@@ -631,7 +631,9 @@ where
                     request,
                     |process, operation, shared_buffers| {
                         self.shared_objects
-                            .and_then(|delivery| handle_map_file(delivery, process, operation))
+                            .and_then(|delivery| {
+                                handle_shared_object_request(delivery, process, operation)
+                            })
                             .or_else(|| {
                                 self.launcher.and_then(|launcher| {
                                     handle_process_operation(

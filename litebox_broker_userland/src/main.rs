@@ -175,6 +175,16 @@ struct CliArgs {
     /// Allow using unstable options.
     #[arg(short = 'Z', long = "unstable")]
     unstable: bool,
+    /// Guest user ID for shared-memory permissions; also passed to the Linux runner.
+    // Not gated on `--unstable`: launches already pass this runner option through the broker,
+    // which supplies the runner's `--unstable` itself.
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_name = "UID")]
+    guest_uid: Option<u16>,
+    /// Guest group ID for shared-memory permissions; also passed to the Linux runner.
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_name = "GID")]
+    guest_gid: Option<u16>,
     /// Run the runner library for this platform as a thread in this broker process.
     ///
     /// This mode does not provide a security boundary between the runner and
@@ -204,6 +214,10 @@ struct CliArgs {
         conflicts_with = "in_process_runner"
     )]
     runner: Option<PathBuf>,
+    /// Argument and credential contract for the configured runner, independent of its path.
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_enum, default_value_t = RunnerKind::Linux, conflicts_with = "in_process_runner")]
+    runner_kind: RunnerKind,
     /// Run the runners and the egress proxy as this host user (the GID defaults to the UID; neither
     /// may be 0 or 4294967295), who must be able to traverse `TMPDIR`, where the runners' control
     /// sockets go.
@@ -295,6 +309,20 @@ fn build_broker(
     let vsock = (args.vsock_uds.as_deref())
         .map(|path| start_vsock_bridge(path, VsockCid(args.vsock_guest_cid)))
         .transpose()?;
+    #[cfg(target_os = "linux")]
+    let guest = args.segment_user()?;
+    // The Windows-hosted Linux runner always runs guests with the default credentials.
+    #[cfg(windows)]
+    let guest = litebox_broker_protocol::fs::FileUser {
+        user: litebox_common_linux::DEFAULT_GUEST_UID,
+        group: litebox_common_linux::DEFAULT_GUEST_GID,
+    };
+    // The guest's segment requests act with its launch credentials. Linux guests have the
+    // privilege of `CAP_IPC_OWNER` and `CAP_SYS_ADMIN` as root.
+    let policy = policy.with_segment_principal(litebox_broker_core::SegmentPrincipal {
+        user: guest,
+        privileged: guest.user == 0,
+    });
     let mut builder = BrokerCoreBuilder::new(policy)
         .with_limits(limits)
         .with_publishing(Publishing {
@@ -369,26 +397,16 @@ where
         .mount_nestable("/", |allocators| {
             let in_mem = InMem::<Platform>::new_initialized(entries, allocators.next());
             // One limit (`BrokerCoreLimits::max_shared_files`) bounds the host resources of every
-            // guest. Mapped files keep their slots until deleted, so one guest can use them all up and
-            // make other guests' mappings fail as out of memory (see `InMem::with_shared_memory`).
-            // Zero keeps every file in broker memory.
-            #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-            let in_mem = if max_shared_files == 0 {
-                in_mem
-            } else {
-                #[cfg(target_os = "linux")]
-                let provider =
-                    litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider;
-                #[cfg(all(windows, target_arch = "x86_64"))]
-                let provider =
-                    litebox_broker_userland::shared_objects::windows::TempFileMemoryProvider;
-                in_mem.with_shared_memory(
-                    Arc::new(provider),
-                    Arc::new(SharedFileLimit::new(max_shared_files)),
-                )
+            // guest's files. Mapped files keep their slots until deleted, so one guest can use them
+            // all up and make other guests' mappings fail as out of memory (see
+            // `InMem::with_shared_memory`). Zero keeps every file in broker memory.
+            let provider = litebox_broker_userland::shared_objects::host_memory_provider()
+                .filter(|_| max_shared_files != 0);
+            let in_mem = match provider {
+                Some(provider) => in_mem
+                    .with_shared_memory(provider, Arc::new(SharedFileLimit::new(max_shared_files))),
+                None => in_mem,
             };
-            #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
-            let _ = max_shared_files;
             Overlay::<Platform>::new(
                 in_mem,
                 TarRo::new(tar_data, allocators.next()),
@@ -432,6 +450,63 @@ where
     Ok(Arc::new(Resolver::<Platform, _>::new(backend)))
 }
 
+impl CliArgs {
+    #[cfg(target_os = "linux")]
+    fn segment_user(&self) -> Result<litebox_broker_protocol::fs::FileUser, clap::Error> {
+        // Existing launches may specify --guest-uid/gid among the Linux runner options. Use
+        // the runner's parser on the broker's trusted launch arguments, never on a request.
+        // In particular, a --guest-uid *after* the guest executable is just guest argv.
+        let (user, group) = if self.runs_linux_runner() {
+            let args = litebox_runner_linux_userland::CliArgs::try_parse_from(
+                [OsString::from("runner")]
+                    .into_iter()
+                    .chain(runner_command_arguments(self, OsStr::new("control"), None)),
+            )?;
+            (args.guest_uid, args.guest_gid)
+        } else {
+            (
+                self.guest_uid
+                    .unwrap_or(litebox_common_linux::DEFAULT_GUEST_UID),
+                self.guest_gid
+                    .unwrap_or(litebox_common_linux::DEFAULT_GUEST_GID),
+            )
+        };
+        Ok(litebox_broker_protocol::fs::FileUser { user, group })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runs_linux_runner(&self) -> bool {
+        self.runner_kind == RunnerKind::Linux
+    }
+
+    fn configured_runner_arguments(&self) -> Vec<OsString> {
+        let mut arguments = Vec::new();
+        #[cfg(target_os = "linux")]
+        if self.runs_linux_runner() {
+            for (flag, id) in [
+                ("--guest-uid", self.guest_uid),
+                ("--guest-gid", self.guest_gid),
+            ] {
+                if let Some(id) = id {
+                    arguments.push(OsString::from(flag));
+                    arguments.push(id.to_string().into());
+                }
+            }
+        }
+        arguments.extend(self.runner_arguments.iter().cloned());
+        arguments
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum RunnerKind {
+    /// Use the Linux runner's CLI and derive broker-side credentials from it.
+    Linux,
+    /// Forward opaque runner arguments; broker credential options configure the broker only.
+    Custom,
+}
+
 fn runner_command_arguments(
     args: &CliArgs,
     control_channel: &OsStr,
@@ -446,7 +521,7 @@ fn runner_command_arguments(
         runner_arguments.push(OsString::from("--broker-proxy-url"));
         runner_arguments.push(OsString::from(proxy_url));
     }
-    runner_arguments.extend(args.runner_arguments.iter().cloned());
+    runner_arguments.extend(args.configured_runner_arguments());
     runner_arguments
 }
 
@@ -467,7 +542,7 @@ fn run_runner_instance(
     })?;
     let mut config = litebox_broker_userland::runner::RunnerConfig::new(
         runner_path.clone(),
-        args.runner_arguments.clone(),
+        args.configured_runner_arguments(),
     );
     if let Some(proxy_url) = proxy_url {
         config = config.with_proxy_url(proxy_url.to_owned());
@@ -662,6 +737,72 @@ fn raise_open_file_limit() {
 mod cli_tests {
     use super::*;
     use litebox_broker_protocol::socket::Ipv4Address;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn segment_credentials_do_not_come_from_guest_argv() {
+        let args = CliArgs::try_parse_from([
+            "broker",
+            "--runner",
+            "/bin/litebox_runner_linux_userland",
+            "--unstable",
+            "--guest-uid",
+            "123",
+            "--env",
+            "HOME=/",
+            "--guest-gid",
+            "456",
+            "/guest",
+            "--guest-uid",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.segment_user().unwrap(),
+            litebox_broker_protocol::fs::FileUser {
+                user: 123,
+                group: 456
+            }
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leading_guest_credentials_reach_the_runner_without_broker_unstable() {
+        let args = CliArgs::try_parse_from([
+            "broker",
+            "--runner",
+            "/bin/renamed-litebox",
+            "--guest-uid",
+            "0",
+            "/guest",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.segment_user().unwrap(),
+            litebox_broker_protocol::fs::FileUser {
+                user: 0,
+                group: litebox_common_linux::DEFAULT_GUEST_GID
+            }
+        );
+        let other = CliArgs::try_parse_from([
+            "broker",
+            "--runner",
+            "/bin/other_runner",
+            "--runner-kind",
+            "custom",
+            "--guest-uid",
+            "5",
+            "/guest",
+        ])
+        .unwrap();
+        assert!(
+            !other
+                .configured_runner_arguments()
+                .contains(&OsString::from("--guest-uid"))
+        );
+        assert_eq!(other.segment_user().unwrap().user, 5);
+    }
 
     #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[test]

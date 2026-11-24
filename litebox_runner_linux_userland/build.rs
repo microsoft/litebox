@@ -56,6 +56,7 @@ const DUPLICATING_C_TESTS: &[&str] = &[
     "process_tree_parent.c",
     "rlimit_parent.c",
     "shared_file_mapping.c",
+    "shared_memory_segment.c",
     "sigtimedwait_fork_parent.c",
     "thread_kill_process_parent.c",
     "vfork_exit_parent.c",

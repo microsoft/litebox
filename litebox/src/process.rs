@@ -11,8 +11,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind, HostNames,
-    MAX_CHILD_MEMORY_WRITE_SIZE, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName,
+    HostNameKind, HostNames, MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus, ProcessIdentity,
     ProcessInfo, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::{ProcessGroupError, ProcessGroupMembership};
@@ -80,21 +80,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Allocates one pending child process.
     ///
     /// The child goes into the PID namespace for this process's children (see
-    /// [`Self::create_namespaces`]), unless `new_pid_namespace`
+    /// [`Self::create_namespaces`]), unless `request.new_pid_namespace`
     /// gives options, in which case it is the first process of a new
     /// namespace with those options, nested in this process's. The child's
-    /// parent is this process, or this process's parent if `sibling` is set.
+    /// parent is this process, or this process's parent if `request.sibling`
+    /// is set. With `request.inherit_segment_attachments_since`, the child,
+    /// which inherits this process's address space, starts with copies of its
+    /// segment attachments counted at or after that generation.
     ///
     /// Fails with [`ProcessError::InvalidChild`] if the child's namespace has
-    /// ended, and with [`ProcessError::ResourceExhausted`] at a process limit
-    /// or a namespace count or nesting limit.
+    /// ended, and with [`ProcessError::ResourceExhausted`] at a process limit,
+    /// a namespace count or nesting limit, or if a segment cannot count the
+    /// inherited attachments.
     pub fn allocate_child_process(
         &self,
-        new_pid_namespace: Option<PidNamespaceOptions>,
-        sibling: bool,
+        request: AllocateChildRequest,
     ) -> Result<PendingChild, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        let identity = broker.allocate_child_process(new_pid_namespace, sibling)?;
+        let identity = broker.allocate_child_process(request)?;
         Ok(PendingChild {
             broker,
             identity,
@@ -109,9 +112,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     ///
     /// Fails with [`ProcessError::InvalidChild`] if the target is neither,
     /// with [`ProcessError::Unavailable`] if this process's children already
-    /// go to another PID namespace, and with
-    /// [`ProcessError::ResourceExhausted`] at a namespace count or nesting
-    /// limit.
+    /// go to another PID namespace, with [`ProcessError::ResourceExhausted`]
+    /// at a namespace count or nesting limit, and with
+    /// [`ProcessError::PolicyDenied`] if this process may not create a segment
+    /// namespace.
     pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.create_namespaces(request)?)
@@ -820,10 +824,16 @@ mod tests {
             test_broker_local(ChildChannel(cancels.clone()), test_shared_memory()),
         );
 
-        drop(litebox.allocate_child_process(None, false).unwrap());
+        drop(
+            litebox
+                .allocate_child_process(AllocateChildRequest::default())
+                .unwrap(),
+        );
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
 
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child = litebox
+            .allocate_child_process(AllocateChildRequest::default())
+            .unwrap();
         child.exit(ProcessExitStatus::Exited { code: 0 }).unwrap();
         drop(child);
         assert_eq!(cancels.load(Ordering::SeqCst), 1);

@@ -9,7 +9,8 @@
 //! so each program runs in a user and PID namespace of its own, as the second process of a
 //! namespace whose first process only waits for it. The program keeps the user's ID, which the
 //! namespace maps to itself. When the program exits, the namespace ends with its first process,
-//! which kills anything the program left running.
+//! which kills anything the program left running. An IPC namespace of its own likewise keeps the
+//! program's SysV IPC objects apart from other runs' and frees them when it ends.
 
 use std::ffi::{CStr, OsStr};
 use std::io::{self, Read as _, Write as _};
@@ -79,9 +80,9 @@ impl Native {
     }
 }
 
-/// Returns whether the host lets unprivileged users create the user and PID namespaces a program
-/// runs in, after reporting why not if it doesn't. Panics if it doesn't under CI, which must, or if
-/// running a program fails for any other reason.
+/// Returns whether the host lets unprivileged users create the user, PID and IPC namespaces a
+/// program runs in, after reporting why not if it doesn't. Panics if it doesn't under CI, which
+/// must, or if running a program fails for any other reason.
 fn namespaces_available() -> bool {
     let error = match isolated("true").status() {
         Ok(status) if status.success() => return true,
@@ -99,9 +100,9 @@ fn namespaces_available() -> bool {
     );
     assert!(
         std::env::var_os("CI").is_none(),
-        "CI runner must let unprivileged users create user and PID namespaces: {error}"
+        "CI runner must let unprivileged users create user, PID and IPC namespaces: {error}"
     );
-    eprintln!("skipped: no unprivileged user and PID namespaces: {error}");
+    eprintln!("skipped: no unprivileged user, PID and IPC namespaces: {error}");
     false
 }
 
@@ -123,7 +124,7 @@ fn isolated(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
-/// Forks the first process of new user and PID namespaces, mapping the user and group IDs in
+/// Forks the first process of new user, PID and IPC namespaces, mapping the user and group IDs in
 /// `uid_map` and `gid_map` in them, and has it fork the process that returns to run the program.
 /// PID 1 relays the wait status to the outer supervisor, which exits as the program does.
 ///
@@ -139,7 +140,7 @@ fn isolate(parent: u32, uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
     }
     let (mut mapper, mut init) = UnixStream::pair()?;
     let [status_reader, status_writer] = pipe()?;
-    let first = fork(libc::CLONE_NEWUSER | libc::CLONE_NEWPID)?;
+    let first = fork(libc::CLONE_NEWUSER | libc::CLONE_NEWPID | libc::CLONE_NEWIPC)?;
     if first != 0 {
         drop(init);
         // SAFETY: this process no longer needs the descriptors.

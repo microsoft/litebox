@@ -730,6 +730,22 @@ fn pid_namespaces_number_and_end_with_their_first_process() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn sysv_namespace_detach_before_exit() {
+    let program = common::compile(
+        "./tests/uts_ipc_namespace.c",
+        "sysv_namespace_detach",
+        true,
+        false,
+    );
+    Runner::new(&program, "sysv_namespace_detach")
+        .allow_process_duplication()
+        .guest_uid(0)
+        .arg("segments")
+        .run();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn only_root_creates_uts_and_ipc_namespaces() {
     let program = common::compile(
         "./tests/uts_ipc_namespace.c",
@@ -1341,7 +1357,7 @@ fn run_test_broker_connection(
                                 .execute_request_with(
                                     request,
                                     |process, operation, _| {
-                                        litebox_broker_userland::shared_objects::handle_map_file(
+                                        litebox_broker_userland::shared_objects::handle_shared_object_request(
                                             shared_objects,
                                             process,
                                             operation,

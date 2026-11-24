@@ -319,10 +319,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
-                    uid: 1000,
-                    gid: 1000,
-                    euid: 1000,
-                    egid: 1000,
+                    uid: litebox_common_linux::DEFAULT_GUEST_UID.into(),
+                    gid: litebox_common_linux::DEFAULT_GUEST_GID.into(),
+                    euid: litebox_common_linux::DEFAULT_GUEST_UID.into(),
+                    egid: litebox_common_linux::DEFAULT_GUEST_GID.into(),
                     blocked_signals: litebox_common_linux::signal::SigSet::empty(),
                     ignored_signals: litebox_common_linux::signal::SigSet::empty(),
                     pending_signals:

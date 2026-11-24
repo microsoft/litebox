@@ -35,6 +35,7 @@ mod quota;
 pub mod random;
 pub mod readiness;
 pub mod readiness_queue;
+pub mod segment;
 pub mod shared_futex;
 pub mod signal;
 pub mod socket;
@@ -67,7 +68,7 @@ pub use object::ObjectRights;
 use pid_namespace::{PerNamespaceIds, PidNamespace};
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
-    PolicyProfile, SocketPolicy, SocketPolicyError, VsockPolicy, VsockPortRange,
+    PolicyProfile, SegmentPrincipal, SocketPolicy, SocketPolicyError, VsockPolicy, VsockPortRange,
 };
 use process::SharedHostNames;
 pub use process::{
@@ -124,6 +125,19 @@ pub struct BrokerCoreLimits {
     /// Each such file holds a broker descriptor or handle until it is deleted,
     /// so the limit is broker-wide only. Zero keeps every file in broker memory.
     pub max_shared_files: usize,
+    /// Maximum live keyed shared segments, across all jobs. Zero disables
+    /// segments.
+    pub max_segments: usize,
+    /// Maximum live keyed shared segments created by the processes of one job.
+    pub max_segments_per_job: usize,
+    /// Maximum size in bytes of one keyed shared segment.
+    pub max_segment_size: u64,
+    /// Maximum total page-rounded bytes of live keyed shared segments, across
+    /// all jobs.
+    pub max_total_segment_bytes: u64,
+    /// Maximum total page-rounded bytes of live keyed shared segments created
+    /// by the processes of one job.
+    pub max_segment_bytes_per_job: u64,
     /// Maximum PID namespaces that processes have created, across all jobs.
     pub max_pid_namespaces: usize,
     /// Maximum PID namespaces created by the processes of one job.
@@ -151,6 +165,11 @@ impl BrokerCoreLimits {
         max_child_image_size: 1024 * 1024 * 1024,
         max_total_child_image_size: 4 * 1024 * 1024 * 1024,
         max_shared_files: fs::shared_storage::DEFAULT_MAX_SHARED_FILES,
+        max_segments: 256,
+        max_segments_per_job: 128,
+        max_segment_size: 64 * 1024 * 1024,
+        max_total_segment_bytes: 4 * 1024 * 1024 * 1024,
+        max_segment_bytes_per_job: 1024 * 1024 * 1024,
         max_pid_namespaces: 1024,
         max_pid_namespaces_per_job: 256,
         max_pid_namespaces_per_process: 64,
@@ -179,6 +198,11 @@ impl BrokerCoreLimits {
             max_child_image_size: Self::DEFAULT.max_child_image_size,
             max_total_child_image_size: Self::DEFAULT.max_total_child_image_size,
             max_shared_files: Self::DEFAULT.max_shared_files,
+            max_segments: Self::DEFAULT.max_segments,
+            max_segments_per_job: Self::DEFAULT.max_segments_per_job,
+            max_segment_size: Self::DEFAULT.max_segment_size,
+            max_total_segment_bytes: Self::DEFAULT.max_total_segment_bytes,
+            max_segment_bytes_per_job: Self::DEFAULT.max_segment_bytes_per_job,
             max_pid_namespaces: Self::DEFAULT.max_pid_namespaces,
             max_pid_namespaces_per_job: Self::DEFAULT.max_pid_namespaces_per_job,
             max_pid_namespaces_per_process: Self::DEFAULT.max_pid_namespaces_per_process,
@@ -213,6 +237,11 @@ impl BrokerCoreLimits {
             max_child_image_size: Self::DEFAULT.max_child_image_size,
             max_total_child_image_size: Self::DEFAULT.max_total_child_image_size,
             max_shared_files: Self::DEFAULT.max_shared_files,
+            max_segments: Self::DEFAULT.max_segments,
+            max_segments_per_job: Self::DEFAULT.max_segments_per_job,
+            max_segment_size: Self::DEFAULT.max_segment_size,
+            max_total_segment_bytes: Self::DEFAULT.max_total_segment_bytes,
+            max_segment_bytes_per_job: Self::DEFAULT.max_segment_bytes_per_job,
             max_pid_namespaces: Self::DEFAULT.max_pid_namespaces,
             max_pid_namespaces_per_job: Self::DEFAULT.max_pid_namespaces_per_job,
             max_pid_namespaces_per_process: Self::DEFAULT.max_pid_namespaces_per_process,
@@ -324,6 +353,29 @@ impl BrokerCoreLimits {
             ..self
         }
     }
+
+    /// Returns these limits with explicit broker-wide and per-job limits on
+    /// keyed shared segments: their number and their page-rounded bytes, and
+    /// the size of one.
+    ///
+    /// A per-job limit above its broker-wide limit is accepted; the
+    /// broker-wide limit still applies.
+    #[must_use]
+    pub const fn with_segment_limits(
+        self,
+        (max_segments, max_segments_per_job): (usize, usize),
+        (max_total_segment_bytes, max_segment_bytes_per_job): (u64, u64),
+        max_segment_size: u64,
+    ) -> Self {
+        Self {
+            max_segments,
+            max_segments_per_job,
+            max_segment_size,
+            max_total_segment_bytes,
+            max_segment_bytes_per_job,
+            ..self
+        }
+    }
 }
 
 impl Default for BrokerCoreLimits {
@@ -345,6 +397,8 @@ pub struct BrokerCore {
     pub(crate) limits: BrokerCoreLimits,
     /// The next [`ProcessKey`] to allocate.
     pub(crate) next_process_key: AtomicU64,
+    /// Keyed shared segment IDs, byte usage and storage.
+    pub(crate) segments: segment::SegmentService,
     /// The next [`PidNamespaceId`](pid_namespace::PidNamespaceId) to allocate.
     pub(crate) next_pid_namespace_id: AtomicU64,
     /// PID namespaces that processes have created and that still exist.
@@ -387,6 +441,8 @@ impl BrokerCore {
     /// Without a `vsock_provider`, creating a vsock socket fails as unsupported
     /// before the policy is checked, so it reports `EAFNOSUPPORT` as Linux
     /// without vsock does (a stand-in provider would report `EACCES` first).
+    /// Without a `segment_memory_provider`, keyed shared segments cannot be
+    /// created.
     pub fn new(
         policy: PolicyEngine,
         limits: BrokerCoreLimits,
@@ -394,7 +450,9 @@ impl BrokerCore {
         vsock_provider: Option<Arc<dyn VsockProvider>>,
         random_provider: Arc<dyn RandomProvider>,
         timer_provider: Arc<dyn TimerProvider>,
+        segment_memory_provider: Option<Arc<dyn fs::shared_storage::SharedFileMemoryProvider>>,
     ) -> Result<Arc<Self>> {
+        let segments = segment::SegmentService::new(&limits, segment_memory_provider)?;
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
@@ -403,6 +461,7 @@ impl BrokerCore {
             policy,
             limits,
             next_process_key: AtomicU64::new(1),
+            segments,
             next_pid_namespace_id: AtomicU64::new(1),
             pid_namespaces: Arc::new(AtomicUsize::new(0)),
             live_processes: AtomicUsize::new(0),

@@ -23,9 +23,9 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest,
 };
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName, HostNameKind, HostNames,
-    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ResourceKind,
-    ResourceLimit, ThreadInfo,
+    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest, HostName,
+    HostNameKind, HostNames, PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo,
+    ResourceKind, ResourceLimit, ThreadInfo,
 };
 
 use crate::pid_namespace::PerNamespaceIds;
@@ -249,6 +249,7 @@ impl ProcessKey {
 /// the caller, then [`BrokerCore`] creates and registers this object before
 /// serving its association.
 pub struct BrokerProcess {
+    pub(crate) segments: Mutex<crate::segment::ProcessSegments>,
     pub(crate) core: Arc<BrokerCore>,
     /// The PID namespace this process's later children get their IDs in, if
     /// not its own (see [`Self::create_namespaces`]).
@@ -640,6 +641,11 @@ impl BrokerProcess {
         let socket_account = Arc::new(SocketAccount::new(&core, key));
         Self {
             core,
+            segments: Mutex::new(
+                creator.map_or_else(crate::segment::ProcessSegments::default, |p| {
+                    p.segments.lock().child()
+                }),
+            ),
             children_namespace: Mutex::new(None),
             fs,
             job,
@@ -864,8 +870,15 @@ impl BrokerProcess {
     /// `UnsupportedOperation` if the request asks for a children's PID
     /// namespace for a pending child or while this process's children already
     /// go to another one. Returns `ResourceExhausted` if that namespace can't
-    /// be created.
+    /// be created, and `PolicyDenied` for a new segment namespace unless the
+    /// segment principal is privileged and the process may write.
     pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<()> {
+        if request.new_segment_namespace {
+            self.require_object_rights(ObjectRights::WAIT | ObjectRights::WRITE)?;
+            if !self.core.policy.segment_principal.privileged {
+                return Err(BrokerError::PolicyDenied);
+            }
+        }
         if request.children_pid_namespace.is_some() && request.process_id != self.id() {
             return Err(BrokerError::UnsupportedOperation);
         }
@@ -903,6 +916,9 @@ impl BrokerProcess {
             drop(shared);
             drop(previous);
         }
+        if request.new_segment_namespace {
+            target.segments.lock().reset_namespace();
+        }
         Ok(())
     }
 
@@ -930,6 +946,20 @@ impl BrokerProcess {
             .is_some_and(|creator| Arc::ptr_eq(creator, &process.ids))
     }
 
+    /// Allocates one pending child, like [`Self::allocate_child`], that
+    /// inherits no segment attachments.
+    pub fn allocate_child_process(
+        &self,
+        new_pid_namespace: Option<PidNamespaceOptions>,
+        sibling: bool,
+    ) -> Result<ProcessIdentity> {
+        self.allocate_child(AllocateChildRequest {
+            new_pid_namespace,
+            sibling,
+            inherit_segment_attachments_since: None,
+        })
+    }
+
     /// Allocates and retains one pending child process. The child is its
     /// parent's child from the start, so its exit is reported to the parent
     /// even if it exits before starting its own runner.
@@ -942,14 +972,18 @@ impl BrokerProcess {
     /// is this process, or with `sibling` this process's parent, and this
     /// returns `PolicyDenied` if it has none. Its job, file service,
     /// credential, group, session, limits and host names are this process's
-    /// either way.
+    /// either way. With `inherit_segment_attachments_since`, it starts with
+    /// copies of this process's segment attachments counted at or after that
+    /// generation, and this returns
+    /// `ResourceExhausted` if a segment cannot count them.
     /// The returned IDs are in this process's namespace, plus the child's
     /// process ID in its own namespace.
-    pub fn allocate_child_process(
-        &self,
-        new_pid_namespace: Option<PidNamespaceOptions>,
-        sibling: bool,
-    ) -> Result<ProcessIdentity> {
+    pub fn allocate_child(&self, request: AllocateChildRequest) -> Result<ProcessIdentity> {
+        let AllocateChildRequest {
+            new_pid_namespace,
+            sibling,
+            inherit_segment_attachments_since,
+        } = request;
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
         }
@@ -988,7 +1022,13 @@ impl BrokerProcess {
                             initial_thread_id,
                             own_process_id: child.id(),
                         })
-                        .ok_or(BrokerError::Internal);
+                        .ok_or(BrokerError::Internal)
+                        .and_then(|identity| {
+                            if let Some(generation) = inherit_segment_attachments_since {
+                                crate::segment::inherit(self, &child, generation)?;
+                            }
+                            Ok(identity)
+                        });
                     if identity.is_ok() {
                         state.pending_child_process = Some(PendingChild {
                             process: Arc::clone(&child),
@@ -2301,8 +2341,10 @@ impl BrokerProcess {
                 }
             }
         }
-        // Like a failed start, a failed child's threads end.
+        // Like a failed start, a failed child releases inherited attachments
+        // and its threads end.
         for child in &failed_children {
+            child.segments.lock().close(child);
             child.end_threads(false);
         }
         if !failed_children.is_empty() {
@@ -3042,6 +3084,7 @@ impl BrokerProcess {
     ///
     /// Calling this method more than once is harmless.
     fn release_references(&self) -> bool {
+        self.segments.lock().close(self);
         let mut invariant_fault = self.references.lock().pending_handles != 0;
         loop {
             let Some(handle) = self.references.lock().handles.pop() else {
@@ -4423,10 +4466,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_pid_namespace_reservation_keeps_host_names_shared() {
+    fn failed_pid_namespace_reservation_keeps_other_namespaces_shared() {
         let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
+                .with_process_duplication_enabled(true)
+                .with_segment_principal(crate::SegmentPrincipal {
+                    user: ROOT,
+                    privileged: true,
+                }),
         )
         .with_limits(BrokerCoreLimits {
             max_pid_namespaces_per_process: 0,
@@ -4443,6 +4490,7 @@ mod tests {
             root.create_namespaces(CreateNamespacesRequest {
                 process_id: root.id(),
                 children_pid_namespace: Some(PidNamespaceOptions::default()),
+                new_segment_namespace: true,
                 copy_host_names: true,
             }),
             Err(BrokerError::ResourceExhausted),
@@ -4457,6 +4505,26 @@ mod tests {
             &root.children_namespace(),
             root.pid_namespace()
         ));
+        let child = root.take_child_process(child_id).unwrap();
+        assert!(
+            root.segments
+                .lock()
+                .shares_namespace_with(&child.segments.lock())
+        );
+        // Without the PID namespace, the same request succeeds.
+        root.create_namespaces(CreateNamespacesRequest {
+            process_id: root.id(),
+            children_pid_namespace: None,
+            new_segment_namespace: true,
+            copy_host_names: true,
+        })
+        .unwrap();
+        assert!(
+            !root
+                .segments
+                .lock()
+                .shares_namespace_with(&child.segments.lock())
+        );
     }
 
     #[test]
@@ -4491,6 +4559,7 @@ mod tests {
         root.create_namespaces(CreateNamespacesRequest {
             process_id: child_id,
             children_pid_namespace: None,
+            new_segment_namespace: false,
             copy_host_names: true,
         })
         .unwrap();

@@ -45,6 +45,8 @@ wire_struct! {
         pub process_id: ProcessId,
         /// Give the caller's future children a new PID namespace. Only valid for the caller itself.
         pub children_pid_namespace: Option<PidNamespaceOptions>,
+        /// Move the target into a new, empty shared-segment namespace.
+        pub new_segment_namespace: bool,
         /// Give the target a private copy of its host names.
         pub copy_host_names: bool,
     }
@@ -83,7 +85,7 @@ impl PidNamespaceOptions {
 
 wire_struct! {
     /// Creates a pending child process and its initial thread.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct AllocateChildRequest {
         /// If set, the child is the first process of a new PID namespace with
         /// these options, nested in the caller's. Otherwise, the child goes into
@@ -92,6 +94,13 @@ wire_struct! {
         /// Whether the child's parent is the caller's parent rather than the
         /// caller. Either way, the caller owns the child until it starts.
         pub sibling: bool,
+        /// If set, the child inherits the caller's address space and starts
+        /// with copies of the caller's segment attachments counted at or after
+        /// this generation (see [`SegmentAttachmentCount`]). An older count is
+        /// stale: the caller's newer count of that segment has yet to arrive.
+        ///
+        /// [`SegmentAttachmentCount`]: crate::segment::SegmentAttachmentCount
+        pub inherit_segment_attachments_since: Option<u64>,
     }
 }
 

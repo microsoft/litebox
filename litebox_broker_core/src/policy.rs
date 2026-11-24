@@ -435,9 +435,33 @@ pub enum PolicyProfile {
     },
 }
 
+/// The identity every association's keyed shared segment requests act as,
+/// which the deployment chooses and requests cannot supply or override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentPrincipal {
+    /// Owns the segments it creates and is checked against their permission bits.
+    pub user: litebox_broker_protocol::fs::FileUser,
+    /// Bypasses segment permission and ownership checks, and may move processes
+    /// to new segment namespaces.
+    pub privileged: bool,
+}
+
+impl SegmentPrincipal {
+    /// An unprivileged principal with the overflow user and group, which
+    /// owns no other object.
+    pub const NOBODY: Self = Self {
+        user: litebox_broker_protocol::fs::FileUser {
+            user: crate::fs::tar_ro::OVERFLOW_ID,
+            group: crate::fs::tar_ro::OVERFLOW_ID,
+        },
+        privileged: false,
+    };
+}
+
 /// Broker policy decision and audit component.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyEngine {
+    pub(crate) segment_principal: SegmentPrincipal,
     profile: PolicyProfile,
     socket_policy: SocketPolicy,
     vsock_policy: VsockPolicy,
@@ -449,6 +473,7 @@ impl PolicyEngine {
     pub const fn new(profile: PolicyProfile) -> Self {
         Self {
             profile,
+            segment_principal: SegmentPrincipal::NOBODY,
             socket_policy: SocketPolicy::deny(),
             vsock_policy: VsockPolicy::deny(),
             process_duplication_enabled: false,
@@ -458,6 +483,14 @@ impl PolicyEngine {
     /// Creates a policy engine that denies every operation.
     pub const fn default_deny() -> Self {
         Self::new(PolicyProfile::DefaultDeny)
+    }
+
+    /// Sets the principal of keyed shared segment requests, which is
+    /// [`SegmentPrincipal::NOBODY`] by default.
+    #[must_use]
+    pub const fn with_segment_principal(mut self, principal: SegmentPrincipal) -> Self {
+        self.segment_principal = principal;
+        self
     }
 
     /// Creates a policy engine with rights for the unauthenticated principal.

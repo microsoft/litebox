@@ -8,7 +8,7 @@ use std::os::windows::io::{BorrowedHandle, FromRawHandle as _, OwnedHandle};
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_storage::{
-    HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
+    CreateMemoryError, HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
 };
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_broker_transport_windows_userland::shared_objects::SectionSender;
@@ -17,7 +17,9 @@ use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRIT
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
 };
-use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_EXECUTE_READWRITE};
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+};
 
 use super::SharedObjectDelivery;
 use super::host_file::{
@@ -180,11 +182,11 @@ impl<T: std::os::windows::io::AsHandle + Send> HostHandle for Exported<T> {
 /// Creates memory for files in the host's temporary directory.
 pub struct TempFileMemoryProvider;
 
-fn temp_file() -> Result<File, StorageError> {
+fn temp_file() -> Result<File, CreateMemoryError> {
     let directory = std::env::temp_dir();
     loop {
         let mut nonce = [0u8; 8];
-        getrandom::fill(&mut nonce).map_err(|_| StorageError::Io)?;
+        getrandom::fill(&mut nonce).map_err(|_| CreateMemoryError::Io)?;
         let path = directory.join(format!(
             "litebox-shared-file-{}-{:016x}",
             std::process::id(),
@@ -205,9 +207,48 @@ fn temp_file() -> Result<File, StorageError> {
                 return Ok(file);
             }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(storage_error::<TempFile>(&error)),
+            Err(error) => return Err(create_memory_error(&error)),
         }
     }
+}
+
+/// Classifies a failure creating memory, telling the host running out of memory or handles
+/// apart from the disk being full.
+fn create_memory_error(error: &IoError) -> CreateMemoryError {
+    use windows_sys::Win32::Foundation::{ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL};
+
+    if is_resource_exhaustion(error) {
+        return CreateMemoryError::OutOfMemory;
+    }
+    match error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+    {
+        Some(ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL) => CreateMemoryError::NoSpace,
+        _ => CreateMemoryError::Io,
+    }
+}
+
+/// Returns whether `error` reports the host running out of memory, quota or handles.
+pub(super) fn is_resource_exhaustion(error: &IoError) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_COMMITMENT_LIMIT, ERROR_NO_SYSTEM_RESOURCES, ERROR_NOT_ENOUGH_MEMORY,
+        ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY, ERROR_TOO_MANY_OPEN_FILES,
+    };
+
+    matches!(
+        error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok()),
+        Some(
+            ERROR_NOT_ENOUGH_MEMORY
+                | ERROR_OUTOFMEMORY
+                | ERROR_COMMITMENT_LIMIT
+                | ERROR_NOT_ENOUGH_QUOTA
+                | ERROR_NO_SYSTEM_RESOURCES
+                | ERROR_TOO_MANY_OPEN_FILES
+        )
+    )
 }
 
 /// Makes `file` sparse, so that sections covering mappings past its end, which extend it, take
@@ -240,7 +281,7 @@ fn set_sparse(file: &File) {
 }
 
 impl SharedFileMemoryProvider for TempFileMemoryProvider {
-    fn create(&self) -> Result<SharedFileMemory, StorageError> {
+    fn create(&self) -> Result<SharedFileMemory, CreateMemoryError> {
         Ok(create::<TempFile>(temp_file()?))
     }
 }
@@ -257,6 +298,28 @@ impl SectionDelivery {
 
 impl SharedObjectDelivery for SectionDelivery {
     fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64> {
+        self.deliver_section(object, writable, end, true)
+    }
+
+    fn deliver_segment(
+        &self,
+        object: &dyn SharedFileObject,
+        writable: bool,
+        executable: bool,
+        end: u64,
+    ) -> IoResult<u64> {
+        self.deliver_section(object, writable, end, executable)
+    }
+}
+
+impl SectionDelivery {
+    fn deliver_section(
+        &self,
+        object: &dyn SharedFileObject,
+        writable: bool,
+        end: u64,
+        executable: bool,
+    ) -> IoResult<u64> {
         // The object lends the file's handle, from which the section derives the rights.
         let file = super::host_handle(object, writable)?;
         let file = usize::try_from(file.raw())
@@ -264,14 +327,18 @@ impl SharedObjectDelivery for SectionDelivery {
             as windows_sys::Win32::Foundation::HANDLE;
         // Only a writable section can extend the file to cover `end`. A runner that may only read
         // the file still cannot map it writable: it receives no right to.
-        let section = section(file, end)?;
-        self.0.send(section, writable)
+        let section = section(file, end, executable)?;
+        self.0.send(section, writable, executable)
     }
 }
 
 /// Creates a writable section of the file `file`, `size` bytes long, extending the file if it
-/// is shorter.
-fn section(file: windows_sys::Win32::Foundation::HANDLE, size: u64) -> IoResult<OwnedHandle> {
+/// is shorter. Only an `executable` section can back executable views.
+fn section(
+    file: windows_sys::Win32::Foundation::HANDLE,
+    size: u64,
+    executable: bool,
+) -> IoResult<OwnedHandle> {
     let high = u32::try_from(size >> 32).map_err(IoError::other)?;
     let low = u32::try_from(size & u64::from(u32::MAX)).map_err(IoError::other)?;
     // SAFETY: `file` is a live file handle that the caller borrows for the call. The section is
@@ -280,7 +347,11 @@ fn section(file: windows_sys::Win32::Foundation::HANDLE, size: u64) -> IoResult<
         CreateFileMappingW(
             file,
             std::ptr::null(),
-            PAGE_EXECUTE_READWRITE,
+            if executable {
+                PAGE_EXECUTE_READWRITE
+            } else {
+                PAGE_READWRITE
+            },
             high,
             low,
             std::ptr::null(),
@@ -306,6 +377,26 @@ mod tests {
     #[test]
     fn temp_file_memory_stays_within_size_limits() {
         super::super::host_file::tests::check_size_limit::<TempFile>(temp_file().unwrap());
+    }
+
+    #[test]
+    fn failing_to_deliver_for_lack_of_host_resources_is_a_lack_of_space() {
+        use litebox_broker_protocol::segment::SegmentError;
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_COMMITMENT_LIMIT};
+
+        let failure = |code: u32| {
+            super::super::report_delivery_failure(IoError::from_raw_os_error(
+                i32::try_from(code).unwrap(),
+            ))
+        };
+        assert!(matches!(
+            failure(ERROR_COMMITMENT_LIMIT).segment_error(),
+            SegmentError::NoSpace
+        ));
+        assert!(matches!(
+            failure(ERROR_ACCESS_DENIED).segment_error(),
+            SegmentError::Io
+        ));
     }
 
     #[test]
@@ -384,10 +475,43 @@ mod tests {
         use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::System::Memory::{
-            FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-            UnmapViewOfFile,
+            FILE_MAP_EXECUTE, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS,
+            MapViewOfFile, UnmapViewOfFile,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        #[test]
+        fn segment_sections_are_executable_only_for_executable_attaches() {
+            // SAFETY: The pseudo-handle names this process and is always valid.
+            let process = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
+            let delivery = SectionDelivery::new(process).unwrap();
+            let object = TempFileMemoryProvider.create_segment(4096).unwrap();
+            for (writable, executable) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let token = delivery
+                    .deliver_segment(&*object, writable, executable, 4096)
+                    .unwrap();
+                // SAFETY: This test exclusively owns the newly delivered handle.
+                let section = unsafe {
+                    OwnedHandle::from_raw_handle(usize::try_from(token).unwrap() as HANDLE)
+                };
+                let maps = |access| {
+                    // SAFETY: Maps a view of the live section, which nothing else uses.
+                    let view =
+                        unsafe { MapViewOfFile(section.as_raw_handle(), access, 0, 0, 4096) };
+                    if view.Value.is_null() {
+                        return false;
+                    }
+                    // SAFETY: Unmaps the view just mapped, which nothing borrows.
+                    assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
+                    true
+                };
+                assert!(maps(FILE_MAP_READ));
+                assert_eq!(maps(FILE_MAP_READ | FILE_MAP_WRITE), writable);
+                assert_eq!(maps(FILE_MAP_READ | FILE_MAP_EXECUTE), executable);
+            }
+        }
 
         #[test]
         fn delivered_sections_share_pages_and_keep_read_only_rights() {

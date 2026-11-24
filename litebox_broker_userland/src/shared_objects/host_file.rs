@@ -74,6 +74,13 @@ pub(super) fn create<H: HostFile>(file: File) -> SharedFileMemory {
     }
 }
 
+/// Wraps an already initialized host file as an object that is only exported to runners,
+/// never read or written as storage.
+#[cfg(target_os = "linux")]
+pub(super) fn export_only_object<H: HostFile>(file: File) -> Arc<dyn SharedFileObject> {
+    Arc::new(HostFileObject::<H>(Arc::new(file), PhantomData))
+}
+
 /// A file's contents in a host file of kind `H`, as the file system reads and writes them.
 ///
 /// The file owns its storage, so each change has the storage to itself.

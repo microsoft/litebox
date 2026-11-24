@@ -37,6 +37,11 @@ use crate::readiness_queue::{
     AddReadinessQueueEntryRequest, CreateReadinessQueueResponse, ModifyReadinessQueueEntryRequest,
     ReadinessQueueError, RemoveReadinessQueueEntryRequest, TakeReadyRequest, TakeReadyResponse,
 };
+use crate::segment::{
+    ConfirmSegmentAttachRequest, GetSegmentRequest, PrepareSegmentAttachRequest,
+    PreparedSegmentAttach, SegmentAttachId, SegmentAttachmentCounts, SegmentError, SegmentId,
+    SegmentInfo, SegmentSlotStatus, SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
+};
 use crate::shared_buffer::SharedBufferSequence;
 use crate::shared_futex::{
     CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
@@ -121,6 +126,8 @@ wire_enum! {
         SharedFutex(SharedFutexRequest),
         /// Vsock socket request family.
         VsockSocket(VsockSocketRequest),
+        /// Keyed shared segment request family.
+        Segment(SegmentRequest),
     }
 }
 
@@ -203,6 +210,7 @@ impl BrokerOperation {
             | Self::Timer(_)
             | Self::Signal(_)
             | Self::SharedFutex(_)
+            | Self::Segment(_)
             | Self::Process(
                 ProcessRequest::AllocateChild(_)
                 | ProcessRequest::CreateNamespaces(_)
@@ -384,6 +392,39 @@ wire_enum! {
         Wake(FutexWakeRequest),
         /// Disarm a futex waiter, reporting whether it was woken.
         Disarm(FutexDisarmRequest),
+    }
+}
+
+wire_enum! {
+    /// Request about keyed shared segments in the caller's namespace, or about
+    /// the caller's attachments, which outlive a move to another namespace.
+    ///
+    /// Ordinary guest-visible failures are [`SegmentResponse::Failed`].
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SegmentRequest {
+        /// Look up a key, optionally creating a segment.
+        Get(GetSegmentRequest),
+        /// Read a segment's metadata.
+        Status(SegmentId),
+        /// Change a segment's owner and permission bits.
+        Set(SetSegmentRequest),
+        /// Unpublish a segment's key; it is freed once no attachments or
+        /// reservations remain.
+        Remove(SegmentId),
+        /// Reserve an attachment and deliver the backing object, without
+        /// changing metadata.
+        PrepareAttach(PrepareSegmentAttachRequest),
+        /// Record a reserved attachment after the caller mapped the backing object.
+        ConfirmAttach(ConfirmSegmentAttachRequest),
+        /// Release an unused reservation without recording an attach or detach.
+        CancelAttach(SegmentAttachId),
+        /// Replace the caller's attachment counts after splitting or releasing
+        /// mapped regions.
+        SetAttachments(SegmentAttachmentCounts),
+        /// Summarize the caller's namespace and the limits that apply to it.
+        Info,
+        /// Read the metadata of the segment in a slot.
+        SlotStatus(SegmentSlotStatusRequest),
     }
 }
 
@@ -688,6 +729,8 @@ wire_enum! {
         VsockSocket(VsockSocketResponse),
         /// Operation failed with an ABI-neutral broker error.
         Error(ErrorCode),
+        /// Keyed shared segment response family.
+        Segment(SegmentResponse),
     }
 }
 
@@ -766,6 +809,35 @@ wire_enum! {
         /// Waiting, resource, and request-validation failures use
         /// [`BrokerResult::Error`] instead.
         Failed(ReadinessQueueError),
+    }
+}
+
+wire_enum! {
+    /// Response about keyed shared segments.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SegmentResponse {
+        /// The segment's ID.
+        Get(SegmentId),
+        /// The segment's metadata.
+        Status(SegmentStatus),
+        /// The owner and permission bits were changed.
+        Set,
+        /// The key was unpublished.
+        Remove,
+        /// The attachment was reserved and its backing object delivered.
+        PrepareAttach(PreparedSegmentAttach),
+        /// The attachment was recorded.
+        ConfirmAttach,
+        /// The reservation was released.
+        CancelAttach,
+        /// The attachment counts were replaced.
+        SetAttachments,
+        /// Segment operation failed with a guest-visible error.
+        Failed(SegmentError),
+        /// The namespace summary and limits.
+        Info(SegmentInfo),
+        /// The segment in the slot, and its metadata.
+        SlotStatus(SegmentSlotStatus),
     }
 }
 

@@ -47,6 +47,30 @@ pub struct SharedFileObject<Object> {
     pub may_write: bool,
 }
 
+impl<Object> SharedFileObject<Object> {
+    /// Takes the host shared object that the broker delivered as `delivery` from `platform`.
+    ///
+    /// # Safety
+    ///
+    /// The broker must have delivered `delivery.token` to this process, and nothing else may take
+    /// it.
+    pub(crate) unsafe fn take<Provider, const ALIGN: usize>(
+        platform: &Provider,
+        delivery: litebox_broker_protocol::fs::MapFileResponse,
+    ) -> Result<Self, crate::platform::page_mgmt::SharedObjectReceiveError>
+    where
+        Provider: crate::platform::SharedObjectProvider<ALIGN, SharedObject = Object>,
+    {
+        // SAFETY: The caller guarantees the token was delivered to this process, untaken.
+        let object = unsafe { platform.take_shared_object(delivery.token) }?;
+        Ok(Self {
+            memory: delivery.memory,
+            object,
+            may_write: delivery.writable,
+        })
+    }
+}
+
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// The handle a relative `path` resolves from. Rejects an empty path, a relative path without
     /// `dir`, and a `dir` from another broker connection.
@@ -488,12 +512,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         let response = self.broker.map_file(self.handle, end)??;
         // SAFETY: The broker delivered the object under this token before answering, and the
         // token goes nowhere else.
-        let object = unsafe { platform.take_shared_object(response.token) }?;
-        Ok(SharedFileObject {
-            memory: response.memory,
-            object,
-            may_write: response.writable,
-        })
+        Ok(unsafe { SharedFileObject::take(platform, response) }?)
     }
 
     /// Lists the entries of the directory this file opens without changing its position.

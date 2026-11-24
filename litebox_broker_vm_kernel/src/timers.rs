@@ -88,6 +88,11 @@ impl KernelTimers {
 }
 
 impl TimerProvider for KernelTimers {
+    /// The kernel has no wall clock (no RTC driver).
+    fn unix_seconds(&self) -> u64 {
+        0
+    }
+
     /// The kernel clock, since its origin.
     fn now(&self) -> Duration {
         Duration::from_nanos(self.platform.now().as_nanos())

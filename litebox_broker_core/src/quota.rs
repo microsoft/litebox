@@ -4,7 +4,7 @@
 //! Resource usage counted broker-wide, per process and optionally per job.
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::{BrokerError, Result};
 
@@ -82,6 +82,15 @@ pub(crate) fn try_increment(counter: &AtomicUsize, limit: usize) -> bool {
     counter
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
             reserved.checked_add(1).filter(|next| *next <= limit)
+        })
+        .is_ok()
+}
+
+/// Adds `amount` to `counter` unless that would take it past `limit`, returning whether it did.
+pub(crate) fn try_add(counter: &AtomicU64, amount: u64, limit: u64) -> bool {
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+            reserved.checked_add(amount).filter(|next| *next <= limit)
         })
         .is_ok()
 }

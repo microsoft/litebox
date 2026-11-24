@@ -46,10 +46,51 @@ pub struct SharedFileMemory {
     pub object: Arc<dyn SharedFileObject>,
 }
 
+/// Failures creating host shared memory, for a file or a fixed-length segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreateMemoryError {
+    /// The backing store cannot hold memory of this size.
+    NoSpace,
+    /// The host could not allocate memory or a handle for the memory.
+    OutOfMemory,
+    /// A backing-store operation failed.
+    Io,
+    /// The provider does not support this kind of memory.
+    Unsupported,
+}
+
+impl From<StorageError> for CreateMemoryError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::NoSpace => Self::NoSpace,
+            StorageError::Fault | StorageError::Busy | StorageError::Io => Self::Io,
+        }
+    }
+}
+
+impl From<CreateMemoryError> for MapSharedError {
+    fn from(error: CreateMemoryError) -> Self {
+        match error {
+            CreateMemoryError::NoSpace | CreateMemoryError::OutOfMemory => Self::NoMemory,
+            CreateMemoryError::Io => Self::Io,
+            CreateMemoryError::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
 /// Platform provider that creates [`SharedFileMemory`].
 pub trait SharedFileMemoryProvider: Send + Sync {
     /// Creates empty memory.
-    fn create(&self) -> Result<SharedFileMemory, StorageError>;
+    fn create(&self) -> Result<SharedFileMemory, CreateMemoryError>;
+
+    /// Creates a zero-filled, fixed-length segment, to be exported as a
+    /// mapping only. Providers exporting resizable file handles must also
+    /// prevent recipients from changing the length through those handles.
+    fn create_segment(&self, len: usize) -> Result<Arc<dyn SharedFileObject>, CreateMemoryError> {
+        let mut memory = self.create()?;
+        memory.storage.set_len(len)?;
+        Ok(memory.object)
+    }
 }
 
 /// The default for how many files may keep their contents in host shared memory at once.
@@ -231,7 +272,9 @@ impl FileStorageMut for SharedStorage {
 pub(crate) mod test_memory {
     //! [`SharedFileMemory`] in an ordinary vector, for tests.
 
-    use super::{HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject};
+    use super::{
+        CreateMemoryError, HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
+    };
     use crate::fs::errors::{MapSharedError, StorageError};
     use crate::fs::storage::{FileStorage, FileStorageMut};
     use alloc::boxed::Box;
@@ -380,7 +423,7 @@ pub(crate) mod test_memory {
     }
 
     impl SharedFileMemoryProvider for VecMemoryProvider {
-        fn create(&self) -> Result<SharedFileMemory, StorageError> {
+        fn create(&self) -> Result<SharedFileMemory, CreateMemoryError> {
             let memory = Arc::new(VecMemory {
                 data: Mutex::new(Vec::new()),
                 refuse_shrink: self.refuse_shrink,

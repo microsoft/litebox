@@ -49,16 +49,15 @@ impl SectionSender {
         Ok(Self { process })
     }
 
-    /// Moves `section` into the runner, where it may be queried and mapped readable and
-    /// executable, and also writable if `writable` is set, returning the token the runner takes
-    /// it with.
+    /// Moves `section` into the runner, where it may be queried and mapped readable, returning
+    /// the token the runner takes it with.
     ///
-    /// The runner gets no right to extend the section, nor to write it unless `writable` is set,
-    /// whatever rights `section` has here.
-    pub fn send(&self, section: OwnedHandle, writable: bool) -> IoResult<u64> {
+    /// The runner gets no right to extend the section, and receives mapping rights for writes
+    /// and execution only when `writable` and `executable`, respectively, are set.
+    pub fn send(&self, section: OwnedHandle, writable: bool, executable: bool) -> IoResult<u64> {
         let access = SECTION_QUERY
             | SECTION_MAP_READ
-            | SECTION_MAP_EXECUTE
+            | if executable { SECTION_MAP_EXECUTE } else { 0 }
             | if writable { SECTION_MAP_WRITE } else { 0 };
         let delivered = duplicate_handle_to_process(
             section.as_raw_handle(),
@@ -74,8 +73,8 @@ mod tests {
     use super::*;
     use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Memory::{
-        CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
-        UnmapViewOfFile,
+        CreateFileMappingW, FILE_MAP_EXECUTE, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile,
+        PAGE_EXECUTE_READWRITE, UnmapViewOfFile,
     };
 
     #[test]
@@ -89,7 +88,7 @@ mod tests {
                 CreateFileMappingW(
                     INVALID_HANDLE_VALUE,
                     std::ptr::null(),
-                    PAGE_READWRITE,
+                    PAGE_EXECUTE_READWRITE,
                     0,
                     4096,
                     std::ptr::null(),
@@ -111,11 +110,15 @@ mod tests {
             }
             !view.Value.is_null()
         };
-        let read_only = sender.send(section(), false).unwrap();
+        let read_only = sender.send(section(), false, false).unwrap();
         assert!(!maps(read_only, FILE_MAP_READ | FILE_MAP_WRITE));
-        let read_only = sender.send(section(), false).unwrap();
+        let read_only = sender.send(section(), false, false).unwrap();
         assert!(maps(read_only, FILE_MAP_READ));
-        let writable = sender.send(section(), true).unwrap();
+        let writable = sender.send(section(), true, false).unwrap();
         assert!(maps(writable, FILE_MAP_READ | FILE_MAP_WRITE));
+        let writable = sender.send(section(), true, false).unwrap();
+        assert!(!maps(writable, FILE_MAP_READ | FILE_MAP_EXECUTE));
+        let executable = sender.send(section(), false, true).unwrap();
+        assert!(maps(executable, FILE_MAP_READ | FILE_MAP_EXECUTE));
     }
 }

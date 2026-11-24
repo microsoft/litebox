@@ -5,12 +5,19 @@
 
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 
+use std::sync::Arc;
+
 use litebox_broker_core::BrokerProcess;
 use litebox_broker_core::fs::errors::MapSharedError;
-use litebox_broker_core::fs::shared_storage::{HostHandle, SharedFileObject};
+use litebox_broker_core::fs::shared_storage::{
+    HostHandle, SharedFileMemoryProvider, SharedFileObject,
+};
 use litebox_broker_host::RequestFailure;
 use litebox_broker_protocol::fs::{FileError, MapFileRequest, MapFileResponse};
-use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
+use litebox_broker_protocol::message::{
+    BrokerOperation, BrokerResult, FileRequest, FileResponse, SegmentRequest, SegmentResponse,
+};
+use litebox_broker_protocol::segment::SegmentError;
 
 /// Delivers host shared objects to the runner of one association.
 pub trait SharedObjectDelivery: Send + Sync {
@@ -21,6 +28,32 @@ pub trait SharedObjectDelivery: Send + Sync {
     /// Fails with [`ErrorKind::Unsupported`] if this deployment cannot deliver `object` at all,
     /// which the runner sees as a file it cannot share.
     fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64>;
+
+    /// Delivers the backing object of a keyed shared segment, as [`Self::deliver`] does a
+    /// file's, for an attach that may execute it if `_executable` is set. A deployment whose
+    /// handles can carry that ceiling withholds the right to map the segment executable from
+    /// other attaches.
+    fn deliver_segment(
+        &self,
+        object: &dyn SharedFileObject,
+        writable: bool,
+        _executable: bool,
+        end: u64,
+    ) -> IoResult<u64> {
+        self.deliver(object, writable, end)
+    }
+}
+
+/// Returns this platform's provider of host shared memory, which holds the contents of shared
+/// files and keyed shared segments, if it has one.
+#[must_use]
+pub fn host_memory_provider() -> Option<Arc<dyn SharedFileMemoryProvider>> {
+    #[cfg(target_os = "linux")]
+    return Some(Arc::new(linux::MemfdFileMemoryProvider));
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    return Some(Arc::new(windows::TempFileMemoryProvider));
+    #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+    None
 }
 
 /// Returns `object`'s host handle for delivering it with `writable` rights.
@@ -34,46 +67,107 @@ fn host_handle(
 ) -> IoResult<Box<dyn HostHandle + '_>> {
     object.host_handle(writable).map_err(|error| match error {
         MapSharedError::Unsupported => IoError::new(ErrorKind::Unsupported, error),
+        MapSharedError::NoMemory => IoError::new(ErrorKind::OutOfMemory, error),
         error => IoError::other(error),
     })
 }
 
-/// Handles a request to map a file, delivering its shared memory through `delivery`, or returns
-/// `None` for other operations.
-///
-/// Associations without a delivery leave the request to the broker host, which refuses it.
-pub fn handle_map_file<Delivery: SharedObjectDelivery>(
+/// Handles the requests that deliver host shared objects: file mappings and segment attaches,
+/// delivering them through `delivery`. Returns `None` for other operations.
+pub fn handle_shared_object_request<Delivery: SharedObjectDelivery>(
     delivery: &Delivery,
     process: &BrokerProcess,
     operation: &BrokerOperation,
 ) -> Option<Result<BrokerResult, RequestFailure>> {
-    let BrokerOperation::File(FileRequest::Map(MapFileRequest { handle, end })) = *operation else {
-        return None;
-    };
-    let response = match litebox_broker_core::fs::map_shared(process, handle) {
-        Err(error) => return Some(Err(RequestFailure::from(error))),
-        Ok(Err(error)) => FileResponse::Failed(error),
-        Ok(Ok(mapping)) => match delivery.deliver(&*mapping.object, mapping.writable, end) {
-            Ok(token) => FileResponse::Map(MapFileResponse {
-                memory: mapping.memory_id,
-                token,
-                writable: mapping.writable,
-            }),
-            Err(error) => {
-                litebox_util_log::warn!(error:% = error; "failed to deliver a shared file");
-                // A deployment that cannot deliver this kind of object, such as a broker
-                // without `/proc` to reopen a memfd read-only, cannot share the file, so a
-                // runner falls back as for any file it cannot share. Other failures, such as
-                // a runner leaving too many deliveries untaken, are a lack of resources.
-                FileResponse::Failed(if error.kind() == ErrorKind::Unsupported {
-                    FileError::NoSuchDevice
-                } else {
-                    FileError::NoSpace
-                })
-            }
-        },
-    };
-    Some(Ok(BrokerResult::File(response)))
+    match *operation {
+        BrokerOperation::Segment(SegmentRequest::PrepareAttach(request)) => {
+            let result = litebox_broker_core::segment::prepare_attach(
+                process,
+                request,
+                |object, writable, executable, end| {
+                    delivery
+                        .deliver_segment(object, writable, executable, end)
+                        .map_err(|error| report_delivery_failure(error).segment_error())
+                },
+            );
+            Some(
+                result
+                    .map(|prepared| {
+                        BrokerResult::Segment(
+                            prepared.map_or_else(
+                                SegmentResponse::Failed,
+                                SegmentResponse::PrepareAttach,
+                            ),
+                        )
+                    })
+                    .map_err(RequestFailure::from),
+            )
+        }
+        BrokerOperation::File(FileRequest::Map(MapFileRequest { handle, end })) => {
+            let response = match litebox_broker_core::fs::map_shared(process, handle) {
+                Err(error) => return Some(Err(RequestFailure::from(error))),
+                Ok(Err(error)) => FileResponse::Failed(error),
+                Ok(Ok(mapping)) => {
+                    match delivery.deliver(&*mapping.object, mapping.writable, end) {
+                        Ok(token) => FileResponse::Map(MapFileResponse {
+                            memory: mapping.memory_id,
+                            token,
+                            writable: mapping.writable,
+                        }),
+                        Err(error) => {
+                            FileResponse::Failed(report_delivery_failure(error).file_error())
+                        }
+                    }
+                }
+            };
+            Some(Ok(BrokerResult::File(response)))
+        }
+        _ => None,
+    }
+}
+
+/// Why a shared object could not be delivered to the runner.
+#[derive(Clone, Copy, Debug)]
+enum DeliveryFailure {
+    Unsupported,
+    NoSpace,
+    Io,
+}
+
+impl DeliveryFailure {
+    /// Unsupported delivery allows ordinary file mappings to fall back.
+    fn file_error(self) -> FileError {
+        match self {
+            Self::Unsupported => FileError::NoSuchDevice,
+            Self::NoSpace => FileError::NoSpace,
+            Self::Io => FileError::Io,
+        }
+    }
+
+    /// Unsupported delivery fails segment attaches.
+    fn segment_error(self) -> SegmentError {
+        match self {
+            Self::Unsupported => SegmentError::Unavailable,
+            Self::NoSpace => SegmentError::NoSpace,
+            Self::Io => SegmentError::Io,
+        }
+    }
+}
+
+/// Logs a failure to deliver a shared object to the runner and classifies it.
+fn report_delivery_failure(error: IoError) -> DeliveryFailure {
+    litebox_util_log::warn!(error:% = error; "failed to deliver a shared object");
+    match error.kind() {
+        ErrorKind::Unsupported => DeliveryFailure::Unsupported,
+        ErrorKind::OutOfMemory | ErrorKind::WouldBlock => DeliveryFailure::NoSpace,
+        #[cfg(target_os = "linux")]
+        _ if litebox_broker_transport_linux_userland::is_resource_exhaustion(&error) => {
+            DeliveryFailure::NoSpace
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        _ if windows::is_resource_exhaustion(&error) => DeliveryFailure::NoSpace,
+        _ => DeliveryFailure::Io,
+    }
 }
 
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]

@@ -14,10 +14,10 @@ use litebox_broker_protocol::process::{
     GetResourceLimitRequest, HostName, HostNameKind, HostNameSizes, HostNames,
     MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_HOST_NAME_SIZE,
     MAX_PROCESS_BOOTSTRAP_SIZE, MAX_RUNNER_DESCRIPTOR_SIZE, OpenProcessHandleRequest,
-    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    ResourceKind, ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest,
-    SetResourceLimitRequest, StartChildProcessRequest, StartChildWithExistingRunnerRequest,
-    ThreadInfo, WriteChildMemoryRequest,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind,
+    ResourceLimit, SetHostNameRequest, SetParentExitSignalRequest, SetResourceLimitRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+    WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, SharedObjectToken, ThreadId};
@@ -267,23 +267,21 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Allocates one pending child process of this process.
     ///
     /// The child goes into the PID namespace for this process's children,
-    /// unless `new_pid_namespace` gives options, in which case it is the first
-    /// process of a new namespace with those options, nested in this
-    /// process's. The child's parent is this process, or this process's
-    /// parent if `sibling` is set.
+    /// unless `request.new_pid_namespace` gives options, in which case it is
+    /// the first process of a new namespace with those options, nested in
+    /// this process's. The child's parent is this process, or this process's
+    /// parent if `request.sibling` is set. With
+    /// `request.inherit_segment_attachments_since`, it starts with copies of
+    /// this process's segment attachments counted at or after that generation.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
     pub fn allocate_child_process(
         &self,
-        new_pid_namespace: Option<PidNamespaceOptions>,
-        sibling: bool,
+        request: AllocateChildRequest,
     ) -> Result<ProcessIdentity, Channel::Error> {
-        match self.request_process(ProcessRequest::AllocateChild(AllocateChildRequest {
-            new_pid_namespace,
-            sibling,
-        }))? {
+        match self.request_process(ProcessRequest::AllocateChild(request))? {
             ProcessResponse::AllocateChild(child) => Ok(child),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
