@@ -7,10 +7,10 @@
 //! (smss, lsass, CExecSvc, ...) that its programs need. The shim then starts the broker in it, as
 //! `ContainerUser`, and maps into it, read-only, copies of the broker and the runner, the state
 //! directory (the root archive) and the binds, and, writable, the bridge's directory. The
-//! container has no network yet.
+//! container joins the HCN namespace that its spec names, if any; without one it has no network.
 
 mod bridge;
-mod hcs;
+mod host_compute;
 mod layers;
 mod logger;
 mod security;
@@ -35,6 +35,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::core::HRESULT;
 
 pub(crate) use self::bridge::{client, connect_bridge};
+use self::host_compute::{hcn, hcs};
 pub(crate) use self::layers::folders as layer_folders;
 pub(crate) use self::logger::init_log;
 pub(crate) use self::security::private_root;
@@ -42,7 +43,8 @@ use super::{
     Broker, Ended, STOP_TIMEOUT, StateDir, broker_arguments, broker_program, log_lines, program,
     stable_name,
 };
-use crate::spec::{Bind, Network, Plan};
+use crate::rootfs::{Dns, DnsSource};
+use crate::spec::{Bind, Guid, Network, Plan};
 use crate::{Backend, Result, internal};
 
 const RUNNER: &str = "litebox_runner_linux_on_windows_userland.exe";
@@ -176,12 +178,17 @@ impl Silo {
         folders: &[PathBuf],
         record: layers::Record,
         mapped: Vec<Value>,
+        namespace: Option<Guid>,
     ) -> io::Result<Self> {
         let layers = layers::mount(folders, record)?;
+        let mut container = json!({"Storage": layers.storage(), "MappedDirectories": mapped});
+        if let Some(namespace) = namespace {
+            container["Networking"] = json!({"Namespace": namespace.to_string()});
+        }
         let document = json!({
             "Owner": OWNER,
             "SchemaVersion": {"Major": 2, "Minor": 1},
-            "Container": {"Storage": layers.storage(), "MappedDirectories": mapped},
+            "Container": container,
             "ShouldTerminateOnLastHandleClosed": true,
         });
         let system = hcs::System::create(id, &document.to_string())?;
@@ -392,6 +399,21 @@ fn grant_read(file: &File) -> io::Result<()> {
     security::share_file(file, &format!("(A;;{READ:#x};;;{CONTAINER_USER_SID})"))
 }
 
+/// From the DNS settings of the endpoints in the namespace now; those attached later are not seen.
+impl DnsSource for Network {
+    fn dns(&self) -> Result<Option<Dns>> {
+        let Network::Hcn(namespace) = *self else {
+            return Ok(None);
+        };
+        let dns = hcn::dns(namespace).map_err(|error| {
+            internal(format!(
+                "cannot read the DNS settings of the network namespace {namespace}: {error}"
+            ))
+        })?;
+        Ok(Some(dns))
+    }
+}
+
 impl Broker {
     pub fn check(_: Backend, plan: &Plan) -> Result<()> {
         let networked = !(plan.publish.is_empty()
@@ -399,18 +421,21 @@ impl Broker {
             && plan.egress.udp.is_empty()
             && plan.ingress.tcp.is_empty()
             && plan.ingress.udp.is_empty());
-        let refused = match &plan.network {
-            Network::Join(_) => Some("joining a network namespace"),
-            Network::New => Some("a network namespace"),
-            Network::Daemon if networked => {
-                Some("publishing ports or allowing destinations or sources")
+        match &plan.network {
+            Network::Join(_) | Network::New => {
+                return Err(crate::unsupported(
+                    "Linux network namespaces are not supported on Windows: give \
+                     windows.network.networkNamespace",
+                ));
             }
-            Network::Daemon => None,
-        };
-        if let Some(refused) = refused {
-            return Err(crate::unsupported(format!(
-                "{refused} is not supported on Windows yet"
-            )));
+            Network::Daemon if networked => {
+                return Err(crate::error(
+                    crate::ttrpc::Code::FAILED_PRECONDITION,
+                    "publishing ports or allowing destinations or sources needs a network \
+                     namespace: give windows.network.networkNamespace",
+                ));
+            }
+            Network::Daemon | Network::Hcn(_) => {}
         }
         layers::check(&plan.layers)
     }
@@ -430,8 +455,22 @@ impl Broker {
         grant_read(&archive).map_err(failed)?;
         let id = system_id(state);
         let view = View::new(state, binds).map_err(failed)?;
-        let arguments =
-            broker_arguments(&view.bridge, &view.archive, &view.binds, plan, &view.runner);
+        let namespace = match plan.network {
+            Network::Hcn(namespace) => Some(namespace),
+            _ => None,
+        };
+        let mut arguments = Vec::new();
+        if namespace.is_some() {
+            // The namespace's port mappings (WinNAT's) then reach the guest's servers.
+            arguments.extend(["--publish-listener-ip", "0.0.0.0"].map(OsString::from));
+        }
+        arguments.extend(broker_arguments(
+            &view.bridge,
+            &view.archive,
+            &view.binds,
+            plan,
+            &view.runner,
+        ));
         let parameters = json!({
             "CommandLine": hcs::command_line(&view.broker, &arguments).map_err(failed)?,
             "WorkingDirectory": r"C:\",
@@ -440,7 +479,7 @@ impl Broker {
             "CreateStdOutPipe": true,
             "CreateStdErrPipe": true,
         });
-        let silo = Silo::start(&id, &plan.layers, record, view.mapped);
+        let silo = Silo::start(&id, &plan.layers, record, view.mapped, namespace);
         let silo = Arc::new(silo.map_err(failed)?);
         let spawned = (silo.system)
             .create_process(&parameters.to_string())

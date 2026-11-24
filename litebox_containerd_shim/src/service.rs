@@ -528,7 +528,13 @@ impl Inner {
                 .map_or_else(|| bundle.join(&plan.root), |root| root.path().to_owned());
             #[cfg(windows)]
             let image = bundle.join(&plan.root);
-            let fs = RootFs::build(&image, &guest_service, &plan.binds, &plan.process.cwd)?;
+            let fs = RootFs::build(
+                &image,
+                &guest_service,
+                &plan.binds,
+                &plan.process.cwd,
+                &plan.network,
+            )?;
             // The working directory as runc resolves it in the image.
             plan.process.cwd.clone_from(&fs.cwd);
             set_home(&mut plan.process, &fs.passwd, plan.uid);

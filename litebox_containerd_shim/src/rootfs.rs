@@ -11,9 +11,12 @@ mod host;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
+use litebox_broker_core::socket::{
+    GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS, normalize_socket_destination,
+};
 use tar_core::EntryType;
 use tar_core::builder::EntryBuilder;
 
@@ -263,8 +266,15 @@ impl Read for Slice<'_> {
 }
 
 impl RootFs {
-    /// `cwd` is created as runc creates it.
-    pub fn build(image: &Path, guest_service: &Path, binds: &[Bind], cwd: &str) -> Result<Self> {
+    /// `cwd` is created as runc creates it. `dns` gives the guest's `/etc/resolv.conf` unless a
+    /// bind supplies one, when it is not looked up (see [`Dns::resolv_conf`]).
+    pub fn build(
+        image: &Path,
+        guest_service: &Path,
+        binds: &[Bind],
+        cwd: &str,
+        dns: &impl DnsSource,
+    ) -> Result<Self> {
         let mut nodes = BTreeMap::new();
         let image = open_image(image, &mut nodes)?;
         let mut fs = Self {
@@ -284,9 +294,11 @@ impl RootFs {
                 mode: 0o755,
             },
         );
+        let mut bound = Vec::with_capacity(binds.len());
         for bind in binds {
-            fs.bind(bind)?;
+            bound.push(fs.bind(bind)?);
         }
+        fs.set_resolv_conf(&bound, dns)?;
         fs.cwd = fs.resolve(cwd, true)?;
         if fs.bind_above(&fs.cwd).is_none()
             && let Err(error) = fs.create_directories(&fs.cwd.clone())
@@ -372,12 +384,38 @@ impl RootFs {
         self.nodes.retain(|key, _| !is_at_or_below(key, path));
     }
 
+    /// Like a file bind, `dns`'s file replaces a symlink there, but a bind covering the path or the
+    /// symlink's target wins, even over an image's directory there.
+    fn set_resolv_conf(&mut self, bound: &[String], dns: &impl DnsSource) -> Result<()> {
+        let target = self.resolve("/etc/resolv.conf", true);
+        if (target.as_ref()).is_ok_and(|target| bound.iter().any(|at| is_at_or_below(target, at))) {
+            return Ok(());
+        }
+        let Some(content) = dns.dns()?.and_then(|dns| dns.resolv_conf()) else {
+            return Ok(());
+        };
+        let path = self.resolve("/etc/resolv.conf", false)?;
+        if matches!(self.nodes.get(&path), Some(Node::Directory { .. })) {
+            return Err(invalid("the image's /etc/resolv.conf is a directory"));
+        }
+        self.create_directories(parent(&path))?;
+        let source = Source::Data(content);
+        self.nodes.insert(
+            path,
+            Node::File {
+                source,
+                mode: 0o644,
+            },
+        );
+        Ok(())
+    }
+
     /// Applies `bind`: a directory is served by the broker over what the image has there; a
     /// file is copied, `/etc/resolv.conf` rewritten (see [`rewrite_resolv_conf`]). A directory
     /// bind follows a symlink at its destination, as runc does; a file bind replaces it instead,
     /// deliberately: the image does not choose where a host file lands, and reading the old path
-    /// still gives the bound content.
-    fn bind(&mut self, bind: &Bind) -> Result<()> {
+    /// still gives the bound content. Returns where it lands, relative to `/`.
+    fn bind(&mut self, bind: &Bind) -> Result<String> {
         let at = &bind.destination;
         let metadata = host::metadata(&bind.source).map_err(|error| {
             invalid(format!(
@@ -419,7 +457,7 @@ impl RootFs {
             self.remove_below(&resolved);
             self.nodes.insert(resolved.clone(), NEW_DIRECTORY);
             self.binds.push(Bind {
-                destination: resolved,
+                destination: resolved.clone(),
                 ..bind.clone()
             });
         } else if metadata.is_file() {
@@ -445,13 +483,14 @@ impl RootFs {
             };
             // A read-only bind's copy has no write permission.
             let mode = host::mode(&metadata) & if bind.read_only { 0o555 } else { 0o777 };
-            self.nodes.insert(resolved, Node::File { source, mode });
+            self.nodes
+                .insert(resolved.clone(), Node::File { source, mode });
         } else {
             return Err(unsupported(format!(
                 "the source of the bind at {at} is no directory nor regular file"
             )));
         }
-        Ok(())
+        Ok(resolved)
     }
 
     /// Opens `source` if it is a regular file, with its size.
@@ -579,17 +618,73 @@ pub fn home(passwd: &[u8], uid: u32) -> String {
         )
 }
 
-/// The guest's copy of a bound `resolv.conf`: without the loopback and unspecified nameservers,
-/// which would be the broker's own, and the IPv6 ones, which guests cannot reach yet; with those
-/// of `fallback` (systemd-resolved's list) if none is left; and with glibc's option for no IPv6.
-// TODO: drop the option once LiteBox's guest sockets have IPv6.
+/// Appended to the guest's `resolv.conf`, for glibc: guests have no IPv6 yet.
+// TODO: drop it once LiteBox's guest sockets have IPv6.
+const IPV4_ONLY: &str = "# Added by the LiteBox shim: IPv4 only, for glibc.\noptions no-aaaa";
+
+/// A network's DNS settings, each word without whitespace.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Dns {
+    pub search: Vec<String>,
+    pub servers: Vec<IpAddr>,
+    pub options: Vec<String>,
+}
+
+/// Where the guest's DNS settings come from, when no bind supplies its `/etc/resolv.conf`.
+pub trait DnsSource {
+    /// `None` keeps the image's `/etc/resolv.conf`.
+    fn dns(&self) -> Result<Option<Dns>>;
+}
+
+impl Dns {
+    /// The guest's `/etc/resolv.conf`, with the servers it can reach; `None` if there are none.
+    fn resolv_conf(&self) -> Option<Vec<u8>> {
+        // The broker answers at these itself, so a network's nameserver there is unreachable.
+        let shadowed = [HOST_GATEWAY_IPV4_ADDRESS, GUEST_IPV4_ADDRESS].map(IpAddr::V4);
+        // The broker refuses reserved, multicast and broadcast destinations, whatever the egress
+        // policy.
+        let routable = |server: IpAddr| match server {
+            IpAddr::V4(ip) => normalize_socket_destination(SocketAddrV4::new(ip, 53)).is_ok(),
+            IpAddr::V6(_) => false,
+        };
+        let servers: Vec<&IpAddr> = (self.servers.iter())
+            .filter(|server| {
+                reachable(**server) && !shadowed.contains(server) && routable(**server)
+            })
+            .collect();
+        if servers.is_empty() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        if !self.search.is_empty() {
+            lines.push(format!("search {}", self.search.join(" ")));
+        }
+        lines.extend(servers.iter().map(|server| format!("nameserver {server}")));
+        if !self.options.is_empty() {
+            lines.push(format!("options {}", self.options.join(" ")));
+        }
+        lines.push(IPV4_ONLY.to_owned());
+        Some((lines.join("\n") + "\n").into_bytes())
+    }
+}
+
+/// Neither loopback nor unspecified, which would be the broker's own, nor IPv6, which guests cannot
+/// reach yet.
+fn reachable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// The guest's copy of a bound `resolv.conf`: with only the [`reachable`] nameservers, those of
+/// `fallback` (systemd-resolved's list) if none is left, and [`IPV4_ONLY`].
 fn rewrite_resolv_conf(content: &[u8], fallback: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
     let nameserver = |line: &str| -> Option<IpAddr> {
         let mut words = line.split_whitespace();
         (words.next()? == "nameserver").then_some(())?;
         words.next()?.split('%').next()?.parse().ok()
     };
-    let reachable = |ip: IpAddr| ip.is_ipv4() && !ip.is_loopback() && !ip.is_unspecified();
     let mut rewritten = String::new();
     let mut kept = 0;
     for line in String::from_utf8_lossy(content).lines() {
@@ -611,7 +706,8 @@ fn rewrite_resolv_conf(content: &[u8], fallback: impl FnOnce() -> Vec<u8>) -> Ve
             }
         }
     }
-    rewritten.push_str("# Added by the LiteBox shim: IPv4 only, for glibc.\noptions no-aaaa\n");
+    rewritten.push_str(IPV4_ONLY);
+    rewritten.push('\n');
     rewritten.into_bytes()
 }
 
@@ -620,6 +716,7 @@ mod tests {
     use tar_core::parse::{Limits, ParseEvent, Parser};
 
     use super::*;
+    use crate::spec::Network;
 
     pub(super) fn code<T: std::fmt::Debug>(result: Result<T>) -> crate::ttrpc::Code {
         match result {
@@ -698,7 +795,7 @@ mod tests {
         std::fs::write(&image, archive(&image_entries)).unwrap();
         let guest = dir.path().join("guest");
         std::fs::write(&guest, "guest").unwrap();
-        let fs = RootFs::build(&image, &guest, &[], "/bin/work").unwrap();
+        let fs = RootFs::build(&image, &guest, &[], "/bin/work", &Network::Daemon).unwrap();
         assert_eq!(fs.cwd, "/usr/bin/work");
         assert_eq!(home(&fs.passwd, 0), "/root");
         let output = dir.path().join("rootfs.tar");
@@ -736,11 +833,11 @@ mod tests {
         let data = archive(&[entry("file", EntryType::Regular, 0o644, &[1; 1000])]);
         // Without its end-of-archive marker, it is whole.
         std::fs::write(&image, &data[..512 + 1024]).unwrap();
-        RootFs::build(&image, &guest, &[], "/").unwrap();
+        RootFs::build(&image, &guest, &[], "/", &Network::Daemon).unwrap();
         // Without some of its content, or of its header, it is not.
         for length in [512 + 100, 300] {
             std::fs::write(&image, &data[..length]).unwrap();
-            let built = RootFs::build(&image, &guest, &[], "/");
+            let built = RootFs::build(&image, &guest, &[], "/", &Network::Daemon);
             assert_eq!(code(built), crate::ttrpc::Code::INTERNAL, "{length}");
         }
     }
@@ -760,7 +857,7 @@ mod tests {
         };
         let guest = dir.path().join("guest");
         File::create(&guest).unwrap();
-        let fs = RootFs::build(&image, &guest, &[bind], "/").unwrap();
+        let fs = RootFs::build(&image, &guest, &[bind], "/", &Network::Daemon).unwrap();
         std::fs::remove_file(&source).unwrap();
         let Err(crate::ttrpc::Error::RpcStatus(status)) =
             fs.write_archive(&dir.path().join("rootfs.tar"))
@@ -792,9 +889,77 @@ mod tests {
                 destination: at.to_owned(),
                 read_only: true,
             };
-            let built = RootFs::build(&image, &file, &[bind], "/");
+            let built = RootFs::build(&image, &file, &[bind], "/", &Network::Daemon);
             assert_eq!(code(built), crate::ttrpc::Code::UNIMPLEMENTED, "{at}");
         }
+    }
+
+    /// A network's DNS settings, or a lookup that must not happen.
+    enum Lookup {
+        Given(Dns),
+        Refused,
+    }
+
+    impl DnsSource for Lookup {
+        fn dns(&self) -> Result<Option<Dns>> {
+            match self {
+                Self::Given(dns) => Ok(Some(dns.clone())),
+                Self::Refused => Err(internal("looked up")),
+            }
+        }
+    }
+
+    #[test]
+    fn a_networks_dns_replaces_the_images_resolv_conf_unless_a_bind_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let (image, guest) = (dir.path().join("image.tar"), dir.path().join("guest"));
+        std::fs::write(&guest, "guest").unwrap();
+        let image_entries = [
+            entry("etc/", EntryType::Directory, 0o755, b""),
+            link(
+                "etc/resolv.conf",
+                EntryType::Symlink,
+                "/run/stub-resolv.conf",
+            ),
+        ];
+        std::fs::write(&image, archive(&image_entries)).unwrap();
+        let resolv_conf = |binds: &[Bind], lookup: Lookup, output: &str| {
+            let fs = RootFs::build(&image, &guest, binds, "/", &lookup).unwrap();
+            let output = dir.path().join(output);
+            fs.write_archive(&output).unwrap();
+            let entries = entries(&std::fs::read(&output).unwrap());
+            let entry = (entries.into_iter()).find(|entry| entry.0 == "etc/resolv.conf");
+            let (_, entry_type, mode, _, content) = entry.expect("no /etc/resolv.conf");
+            (entry_type, mode, String::from_utf8(content).unwrap())
+        };
+        let options = "# Added by the LiteBox shim: IPv4 only, for glibc.\noptions no-aaaa\n";
+        let dns = |servers: &[&str]| Dns {
+            search: vec!["s.example".to_owned()],
+            servers: (servers.iter()).map(|ip| ip.parse().unwrap()).collect(),
+            options: vec!["ndots:5".to_owned()],
+        };
+        // The broker answers at 10.0.2.1 and 10.0.2.15 itself.
+        let given = dns(&["127.0.0.53", "10.0.2.1", "192.0.2.1", "10.0.2.15"]);
+        assert_eq!(
+            resolv_conf(&[], Lookup::Given(given), "given.tar"),
+            (
+                EntryType::Regular,
+                0o644,
+                format!("search s.example\nnameserver 192.0.2.1\noptions ndots:5\n{options}")
+            )
+        );
+        let unreachable = dns(&["2001:db8::1", "10.0.2.1", "10.0.2.15", "240.0.0.1"]);
+        let (kept, ..) = resolv_conf(&[], Lookup::Given(unreachable), "unreachable.tar");
+        assert_eq!(kept, EntryType::Symlink);
+        let source = dir.path().join("resolv.conf");
+        std::fs::write(&source, "nameserver 192.0.2.9\n").unwrap();
+        let bind = Bind {
+            source,
+            destination: "/etc/resolv.conf".to_owned(),
+            read_only: true,
+        };
+        let (_, _, bound) = resolv_conf(&[bind], Lookup::Refused, "bound.tar");
+        assert_eq!(bound, format!("nameserver 192.0.2.9\n{options}"));
     }
 
     #[test]

@@ -291,11 +291,7 @@ impl User {
         }
         // SAFETY: the call returned a NUL-terminated string for the caller to free.
         let sid = unsafe {
-            let mut length = 0;
-            while *string.add(length) != 0 {
-                length += 1;
-            }
-            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(string, length));
+            let sid = from_wide(string);
             LocalFree(string.cast());
             sid
         };
@@ -358,6 +354,20 @@ impl Drop for SecurityDescriptor {
 
 pub(super) fn wide(text: &OsStr) -> Vec<u16> {
     text.encode_wide().chain([0]).collect()
+}
+
+/// # Safety
+///
+/// `text` is a NUL-terminated string.
+pub(super) unsafe fn from_wide(text: *const u16) -> String {
+    let mut length = 0;
+    // SAFETY: the caller's: every unit up to the NUL is readable.
+    unsafe {
+        while *text.add(length) != 0 {
+            length += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, length))
+    }
 }
 
 #[cfg(test)]

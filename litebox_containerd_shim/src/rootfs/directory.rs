@@ -130,7 +130,7 @@ mod tests {
 
     use crate::rootfs::tests::code;
     use crate::rootfs::{MAX_IMAGE_DEPTH, RootFs};
-    use crate::spec::Bind;
+    use crate::spec::{Bind, Network};
 
     fn files(root: &Path, paths: &[&str]) {
         for path in paths {
@@ -185,7 +185,7 @@ mod tests {
         ];
         let guest = dir.path().join("guest");
         File::create(&guest).unwrap();
-        let fs = RootFs::build(&image, &guest, &binds, "/bin/../new").unwrap();
+        let fs = RootFs::build(&image, &guest, &binds, "/bin/../new", &Network::Daemon).unwrap();
         // `..` is physical, in the image.
         assert_eq!(fs.cwd, "/usr/new");
         assert_eq!(fs.binds[0].destination, "/usr/bin/data");
@@ -242,9 +242,9 @@ mod tests {
         let image = dir.path().join("rootfs");
         let deepest = image.join("d/".repeat(MAX_IMAGE_DEPTH));
         std::fs::create_dir_all(&deepest).unwrap();
-        RootFs::build(&image, Path::new("/dev/null"), &[], "/").unwrap();
+        RootFs::build(&image, Path::new("/dev/null"), &[], "/", &Network::Daemon).unwrap();
         std::fs::create_dir(deepest.join("d")).unwrap();
-        let built = RootFs::build(&image, Path::new("/dev/null"), &[], "/");
+        let built = RootFs::build(&image, Path::new("/dev/null"), &[], "/", &Network::Daemon);
         assert_eq!(code(built), crate::ttrpc::Code::UNIMPLEMENTED);
     }
 }

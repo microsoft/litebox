@@ -30,6 +30,7 @@ use super::{
     Backend, Broker, Ended, RootMount, STOP_TIMEOUT, StateDir, broker_arguments, broker_program,
     log_lines, program, stable_name,
 };
+use crate::rootfs::{Dns, DnsSource};
 use crate::spec::{Bind, Network, Plan};
 use crate::{Result, internal};
 
@@ -253,6 +254,13 @@ pub fn remove_leftovers(state: &StateDir, bundle: &Path) -> std::result::Result<
         crate::report(format!("{error:?}"));
     }
     Ok(())
+}
+
+/// None: the guest keeps its image's `/etc/resolv.conf`, or a bind's (CRI binds the pod's).
+impl DnsSource for Network {
+    fn dns(&self) -> Result<Option<Dns>> {
+        Ok(None)
+    }
 }
 
 impl Broker {
