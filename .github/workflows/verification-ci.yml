@@ -34,15 +34,27 @@ jobs:
           .github/tools/install_verus
           echo "RUSTUP_TOOLCHAIN=$(sed -n 's/^VERUS_RUST_VERSION=//p' .github/tools/install_verus)" >> "$GITHUB_ENV"
       - name: Run verification
-        run: cargo verus focus -p litebox_platform_lvbs
+        run: |
+          cargo clean -p litebox_platform_lvbs --target-dir target/verus-partial
+          cargo verus focus -p litebox_platform_lvbs --target-dir target
+      # focus can reuse an artifact previously built as an unchecked dependency.
+      # Clear only the selected crate's verification artifacts before checking it.
       - name: Verify annotated broker buffer primitives
-        run: cargo verus focus -p litebox_platform -- --no-cheating
+        run: |
+          cargo clean -p litebox_platform --target-dir target/verus-partial
+          cargo verus focus -p litebox_platform --target-dir target -- --no-cheating
       - name: Verify broker protocol primitives
-        run: cargo verus focus -p litebox_broker_protocol -- --no-cheating
+        run: |
+          cargo clean -p litebox_broker_protocol --target-dir target/verus-partial
+          cargo verus focus -p litebox_broker_protocol --target-dir target -- --no-cheating
       - name: Verify broker implementation
-        run: cargo verus focus -p litebox_broker_core -- --no-cheating
+        run: |
+          cargo clean -p litebox_broker_core --target-dir target/verus-partial
+          cargo verus focus -p litebox_broker_core --target-dir target -- --no-cheating
       - name: Verify top-level broker properties
-        run: cargo verus focus -p vlitebox -- --no-cheating
+        run: |
+          cargo clean -p vlitebox --target-dir target/verus-partial
+          cargo verus focus -p vlitebox --target-dir target -- --no-cheating
       - name: Reject deliberately false broker properties
         run: |
           for target in \
@@ -63,7 +75,7 @@ jobs:
             channel_wakeups_negative \
             channel_extraction_negative; do
             log="$RUNNER_TEMP/$target.log"
-            if cargo verus focus -p vlitebox --example "$target" -- --no-cheating > "$log" 2>&1; then
+            if cargo verus focus -p vlitebox --target-dir target --example "$target" -- --no-cheating > "$log" 2>&1; then
               cat "$log"
               echo "Deliberately false property $target unexpectedly verified"
               exit 1
