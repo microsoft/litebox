@@ -1088,6 +1088,7 @@ fn file_seek_error(error: SeekError) -> FileError {
     }
 }
 
+#[verus_spec(result => ensures result == verification::file_truncate_error_value(error))]
 fn file_truncate_error(error: TruncateError) -> FileError {
     match error {
         TruncateError::IsDirectory => FileError::IsDirectory,

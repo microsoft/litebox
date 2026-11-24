@@ -5,7 +5,7 @@
 //! policy, actual file-position bounds or native authority.
 //! The file payload remains opaque and explicitly in progress in object_spec.
 
-use super::{File, FileResult, MapSharedError, ReadError, WriteError};
+use super::{File, FileResult, MapSharedError, ReadError, TruncateError, WriteError};
 use crate::object::ObjectEntry;
 use crate::{BrokerError, Result};
 use litebox_broker_protocol::fs::FileError;
@@ -43,6 +43,18 @@ pub open spec fn file_map_shared_error_value(error: MapSharedError) -> FileError
     }
 }
 
+pub open spec fn file_truncate_error_value(error: TruncateError) -> FileError {
+    match error {
+        TruncateError::IsDirectory => FileError::IsDirectory,
+        TruncateError::NotForWriting => FileError::NotForWriting,
+        TruncateError::NotOpenForWriting => FileError::PathOnly,
+        TruncateError::IsTerminalDevice => FileError::IsTerminalDevice,
+        TruncateError::Busy => FileError::Busy,
+        TruncateError::NoSpace => FileError::NoSpace,
+        TruncateError::ClosedFd | TruncateError::Io => FileError::Io,
+    }
+}
+
 pub closed spec fn file_service_error_policy() -> bool {
     &&& forall|error: ReadError, result: FileError|
         #[trigger] super::file_read_error.ensures((error,), result)
@@ -53,6 +65,9 @@ pub closed spec fn file_service_error_policy() -> bool {
     &&& forall|error: MapSharedError, result: FileError|
         #[trigger] super::file_map_shared_error.ensures((error,), result)
             ==> result == file_map_shared_error_value(error)
+    &&& forall|error: TruncateError, result: FileError|
+        #[trigger] super::file_truncate_error.ensures((error,), result)
+            ==> result == file_truncate_error_value(error)
 }
 
 pub proof fn prove_file_service_error_translations()
@@ -84,6 +99,12 @@ pub fn check_file_fault_read_error() -> (result: FileError)
     let read_error: ReadError = litebox_platform::buffer::Fault.into();
 
     super::file_read_error(read_error)
+}
+
+pub fn check_file_truncate_error(error: TruncateError) -> (result: FileError)
+    ensures result == file_truncate_error_value(error),
+{
+    super::file_truncate_error(error)
 }
 
 pub open spec fn file_offset_outcome(

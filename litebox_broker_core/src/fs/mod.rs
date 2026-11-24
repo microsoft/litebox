@@ -35,10 +35,11 @@ mod tests;
 #[cfg(verus_keep_ghost)]
 pub use service::verification::{
     check_file_fault_read_error, check_file_map_shared_error, check_file_offset,
-    check_file_read_error, check_file_write_error, file_map_shared_error_value,
-    file_offset_outcome, file_offset_policy, file_projection_policy, file_read_error_value,
-    file_service_error_policy, file_write_error_value, prove_file_offset_validation,
-    prove_file_projection, prove_file_service_error_translations,
+    check_file_read_error, check_file_truncate_error, check_file_write_error,
+    file_map_shared_error_value, file_offset_outcome, file_offset_policy, file_projection_policy,
+    file_read_error_value, file_service_error_policy, file_truncate_error_value,
+    file_write_error_value, prove_file_offset_validation, prove_file_projection,
+    prove_file_service_error_translations,
 };
 
 pub use litebox_broker_protocol::fs::{

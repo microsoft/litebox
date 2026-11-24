@@ -158,3 +158,11 @@ path = "src/negative/file_service_mapping_space_negative.rs"
 [[example]]
 name = "file_service_read_blocking_negative"
 path = "src/negative/file_service_read_blocking_negative.rs"
+
+[[example]]
+name = "file_service_truncate_mode_negative"
+path = "src/negative/file_service_truncate_mode_negative.rs"
+
+[[example]]
+name = "file_service_truncate_busy_negative"
+path = "src/negative/file_service_truncate_busy_negative.rs"
