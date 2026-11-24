@@ -5,6 +5,8 @@
 //! directory_take_outcome/decoder_take relations in the protocol crate.
 //! Successful extraction returns exactly the requested payload subrange and
 //! advances only the offset; overflow/out-of-bounds leave both fields unchanged.
+//! The original u8 reader returns the byte at that offset. Two reads retain
+//! first-byte progress when the second read fails; no compound rollback is claimed.
 //! No custom assumptions. Full wire decoding, directory semantics, external
 //! concurrent memory snapshots, ownership, and authorization remain unverified.
 

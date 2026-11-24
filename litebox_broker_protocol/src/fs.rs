@@ -1042,6 +1042,7 @@ struct DirectoryPayloadDecoder<'a> {
 }
 
 impl<'a> DirectoryPayloadDecoder<'a> {
+    #[verus_spec(result => ensures decoder_u8(*old(self), *final(self), result))]
     fn u8(&mut self) -> Result<u8, DirectoryPayloadError> {
         Ok(self.take(1)?[0])
     }

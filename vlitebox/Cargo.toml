@@ -122,3 +122,7 @@ path = "src/negative/directory_overflow_frame_negative.rs"
 [[example]]
 name = "directory_subrange_negative"
 path = "src/negative/directory_subrange_negative.rs"
+
+[[example]]
+name = "directory_pair_rollback_negative"
+path = "src/negative/directory_pair_rollback_negative.rs"
