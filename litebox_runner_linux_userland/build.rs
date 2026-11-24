@@ -15,6 +15,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "fork_shared_futex_parent.c",
     "gate_signals.c",
     "held_lower_dir.c",
+    "mount_namespace_clone.c",
     "native_tp.c",
     "inherited_ignored_signals.c",
     "mount.c",

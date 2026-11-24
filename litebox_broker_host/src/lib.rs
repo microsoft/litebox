@@ -597,9 +597,9 @@ fn handle_process_request<Memory: SharedMemory>(
     let response = match request {
         ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace,
-            sibling,
+            flags,
         }) => process
-            .allocate_child_process(new_pid_namespace, sibling)
+            .allocate_child_process(new_pid_namespace, flags)
             .map(ProcessResponse::AllocateChild),
         ProcessRequest::CreateNamespaces(request) => process
             .create_namespaces(request)
@@ -2448,6 +2448,7 @@ mod tests {
     };
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
+    use litebox_broker_protocol::process::ChildProcessFlags;
     use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
@@ -5139,7 +5140,7 @@ mod tests {
                 launched: Mutex::new(Vec::new()),
             });
             let child = parent
-                .allocate_child_process(None, false)
+                .allocate_child_process(None, ChildProcessFlags::empty())
                 .unwrap()
                 .process_id;
             assert_eq!(

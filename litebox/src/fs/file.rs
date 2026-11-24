@@ -133,8 +133,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
 
     /// Opens a file. A relative `path` resolves from `dir`; an absolute path ignores `dir`.
     ///
-    /// A relative `path` requires `dir`, which must be a directory opened through this same
-    /// `LiteBox`; otherwise the call fails. The other path-taking methods share these rules.
+    /// A relative `path` requires a directory handle belonging to this `LiteBox`, including one
+    /// adopted with [`Self::adopt_inherited_file`]. An inherited directory on a shared mount
+    /// resolves paths in the caller's mount view. A directory on a mount private to the sender
+    /// cannot be used for relative lookup. The other path-taking methods share these rules.
     ///
     /// `access` and `flags` use the architecture-independent broker contract.
     /// The `mode` is only significant when creating a file.

@@ -188,6 +188,7 @@ impl UserlandProcessLauncher {
                 terminal,
             )
             .map_err(broker_io_error)?;
+        drop(fs);
         let association = PendingRunnerAssociation::new(Arc::clone(&process), None, None);
         let (completion_sender, completion_receiver) = sync_channel(1);
         let startup =

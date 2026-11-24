@@ -9,6 +9,7 @@ use crate::readiness::tests::TestReadinessSink;
 use crate::test_platform::TestPlatform;
 use crate::test_support::TestBrokerBuilder;
 use crate::{CallerCredential, PolicyEngine};
+use litebox_broker_protocol::process::ChildProcessFlags;
 use std::vec;
 
 const USER: FileUser = FileUser::ROOT;
@@ -1104,7 +1105,7 @@ fn duplicated_references_share_one_socket() {
     let fixture = Fixture::new();
     let child = fixture
         .process
-        .create_child(fixture.process.pid_namespace(), false)
+        .create_child(fixture.process.pid_namespace(), ChildProcessFlags::empty())
         .unwrap();
     let (first, second) = fixture.pair(SocketType::Stream);
     let duplicated = fixture

@@ -34,12 +34,13 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    AllocateChildRequest, ChildExit, ChildSelector, CpuTime, CreateNamespacesRequest,
-    DuplicateObjectsToChildRequest, ExitChildProcessRequest, GetHostNamesRequest,
-    GetResourceLimitRequest, HostNameKind, HostNameSizes, MAX_HOST_NAME_SIZE, PidNamespaceOptions,
-    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor, ResourceKind,
-    ResourceLimit, SetHostNameRequest, SetResourceLimitRequest, StartChildProcessRequest,
-    StartChildWithExistingRunnerRequest, ThreadInfo, WriteChildMemoryRequest,
+    AllocateChildRequest, ChildExit, ChildProcessFlags, ChildSelector, CpuTime,
+    CreateNamespacesRequest, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
+    GetHostNamesRequest, GetResourceLimitRequest, HostNameKind, HostNameSizes, MAX_HOST_NAME_SIZE,
+    PidNamespaceOptions, ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
+    ResourceKind, ResourceLimit, SetHostNameRequest, SetResourceLimitRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+    WriteChildMemoryRequest,
 };
 use crate::process_group::{
     ProcessGroupError, ProcessGroupMembership, SetControllingTerminalRequest,
@@ -609,15 +610,15 @@ fn request_codec_round_trips_all_variants() {
         BrokerOperation::Thread(ThreadRequest::Exit(thread_id(u32::MAX))),
         BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: None,
-            sibling: false,
+            flags: ChildProcessFlags::empty(),
         })),
         BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
-            sibling: true,
+            flags: ChildProcessFlags::SIBLING | ChildProcessFlags::PRIVATE_MOUNT_VIEW,
         })),
         BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: Some(PidNamespaceOptions::new(false, true)),
-            sibling: false,
+            flags: ChildProcessFlags::PRIVATE_MOUNT_VIEW,
         })),
         BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
             process_id: process_id(7),
@@ -1916,16 +1917,16 @@ fn decode_rejects_malformed_request_frames() {
         decode_request(&invalid_orphan_adoption),
         Err(WireError::InvalidTag)
     );
-    // The option tag and all three bool fields reject non-boolean values.
+    // The old sibling encoding is unchanged. Check invalid tags and unknown flag bits.
     let allocate_child = encode_request(&BrokerRequest {
         request_id: TEST_REQUEST_ID,
         operation: BrokerOperation::Process(ProcessRequest::AllocateChild(AllocateChildRequest {
             new_pid_namespace: Some(PidNamespaceOptions::new(true, true)),
-            sibling: true,
+            flags: ChildProcessFlags::SIBLING,
         })),
     });
     assert_eq!(allocate_child[10..], [0, 1, 1, 1, 1]);
-    for (index, value) in [(11, 2), (12, 0b100), (12, 0x80), (13, 2), (14, 2)] {
+    for (index, value) in [(11, 2), (12, 0b100), (12, 0x80), (13, 2), (14, 4)] {
         let mut invalid_allocate_child = allocate_child.clone();
         invalid_allocate_child[index] = value;
         assert_eq!(

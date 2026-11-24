@@ -32,8 +32,8 @@ use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CreateNamespacesRequest, PidNamespaceOptions, ProcessExitStatus,
-    ResourceKind, ResourceLimit, ThreadInfo,
+    ChildExit, ChildProcessFlags, ChildSelector, CreateNamespacesRequest, PidNamespaceOptions,
+    ProcessExitStatus, ResourceKind, ResourceLimit, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
@@ -308,8 +308,8 @@ struct ChildRelation {
     /// Whether the child is the first process of a new PID namespace, with
     /// `PidNamespaceOptions::INIT`.
     new_pid_namespace: bool,
-    /// Whether the child's parent is the creating process's parent.
-    sibling: bool,
+    /// The child's parent and whether it shares its creator's mount layout.
+    flags: ChildProcessFlags,
     /// Whether the child is in a new UTS namespace, with its own copy of the creating process's
     /// host names rather than sharing them.
     new_host_names: bool,
@@ -320,7 +320,7 @@ impl ChildRelation {
     /// names.
     const CHILD: Self = Self {
         new_pid_namespace: false,
-        sibling: false,
+        flags: ChildProcessFlags::empty(),
         new_host_names: false,
     };
 }
@@ -1041,7 +1041,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 relation
                     .new_pid_namespace
                     .then_some(PidNamespaceOptions::INIT),
-                relation.sibling,
+                relation.flags,
             )
             .map_err(|error| match error {
                 // The child's namespace ended with its first process, as Linux's `alloc_pid`
@@ -2234,8 +2234,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `CLONE_VM | CLONE_VFORK`.
     ///
     /// Among other flags, a child process supports `CLONE_PARENT` and the namespace flags
-    /// `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWIPC`, and a `vfork` child supports
-    /// `CLONE_CLEAR_SIGHAND` and the same namespace flags. Both support `CLONE_PIDFD`, but threads
+    /// `CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWIPC`. A `vfork` child supports
+    /// `CLONE_CLEAR_SIGHAND` and the same namespace flags except `CLONE_NEWNS`: until exec,
+    /// its path operations use its parent's file service. Both support `CLONE_PIDFD`, but threads
     /// don't, since thread pidfds are unsupported. Both support only `SIGCHLD` as the exit
     /// signal, as `posix_spawn` uses, except that, like Linux, a sibling (`CLONE_PARENT`) gets this
     /// process's exit signal instead. Other process creation is unsupported.
@@ -2324,6 +2325,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 | CloneFlags::PARENT
                 | CloneFlags::PIDFD
                 | CloneFlags::NEWPID
+                | CloneFlags::NEWNS
                 | UTS_AND_IPC_NAMESPACE_FLAGS;
             if flags.intersects(!supported_fork_flags) {
                 log_unsupported!("fork clone with flags: {:?}", flags);
@@ -2346,12 +2348,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if sibling && self.is_first_process() {
                 return Err(Errno::EINVAL);
             }
-            if flags.intersects(UTS_AND_IPC_NAMESPACE_FLAGS) {
+            if flags.intersects(UTS_AND_IPC_NAMESPACE_FLAGS | CloneFlags::NEWNS) {
                 self.check_admin()?;
             }
+            let mut child_flags = ChildProcessFlags::empty();
+            child_flags.set(ChildProcessFlags::SIBLING, sibling);
+            child_flags.set(
+                ChildProcessFlags::PRIVATE_MOUNT_VIEW,
+                flags.contains(CloneFlags::NEWNS),
+            );
             let relation = ChildRelation {
                 new_pid_namespace: self.clone_creates_pid_namespace(flags)?,
-                sibling,
+                flags: child_flags,
                 new_host_names: flags.contains(CloneFlags::NEWUTS),
             };
             let child_tid: usize = child_tid.trunc();
@@ -2394,7 +2402,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             let relation = ChildRelation {
                 new_pid_namespace: self.clone_creates_pid_namespace(flags)?,
-                sibling: false,
+                flags: ChildProcessFlags::empty(),
                 new_host_names: flags.contains(CloneFlags::NEWUTS),
             };
             return self.begin_vfork(
@@ -4298,6 +4306,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 #[cfg(test)]
 mod tests {
     use crate::{UserPtr, UserPtrMut};
+    use litebox_broker_protocol::process::ChildProcessFlags;
 
     extern crate std;
 
@@ -4867,7 +4876,7 @@ mod tests {
             let child = task
                 .global
                 .litebox
-                .allocate_child_process(None, false)
+                .allocate_child_process(None, ChildProcessFlags::empty())
                 .unwrap();
             child.exit(ProcessExitStatus::Exited { code: 11 }).unwrap();
             forget_signal_notification(task);
@@ -4918,7 +4927,9 @@ mod tests {
 
         let platform = crate::syscalls::tests::test_platform();
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child = litebox
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap();
         let child_id = child.identity().process_id;
         let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let observer = Arc::new(RecordedEvents::new());
@@ -4986,7 +4997,9 @@ mod tests {
 
         let platform = crate::syscalls::tests::test_platform();
         let (litebox, _) = crate::syscalls::test_broker::litebox(platform);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child = litebox
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap();
         let child_id = child.identity().process_id;
         let process = litebox.open_process(child_id, FileOpenFlags::NONE).unwrap();
         let queue = ReadinessQueue::new(&litebox).unwrap();
@@ -6813,7 +6826,9 @@ mod fork_tests {
         );
         let (litebox, _) =
             crate::syscalls::test_broker::litebox_with_channel(platform, limits, StartChannel);
-        let child = litebox.allocate_child_process(None, false).unwrap();
+        let child = litebox
+            .allocate_child_process(None, ChildProcessFlags::empty())
+            .unwrap();
         let launcher = launcher();
         // SAFETY: No native child is created and no guest threads or guest startup state exist.
         let result = unsafe { launcher.start(&child, b"startup") };

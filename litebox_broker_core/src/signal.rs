@@ -402,7 +402,9 @@ mod tests {
     use alloc::vec::Vec;
 
     use litebox_broker_protocol::fs::FileOpenFlags;
-    use litebox_broker_protocol::process::{ChildExit, CpuTime, ProcessExitStatus};
+    use litebox_broker_protocol::process::{
+        ChildExit, ChildProcessFlags, CpuTime, ProcessExitStatus,
+    };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::{PendingSignal, SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId, ThreadId};
@@ -612,7 +614,9 @@ mod tests {
     fn threads_of_an_ended_process_drop_their_signals() {
         let broker = broker();
         let sender = process(&broker);
-        let target = sender.create_child(sender.pid_namespace(), false).unwrap();
+        let target = sender
+            .create_child(sender.pid_namespace(), ChildProcessFlags::empty())
+            .unwrap();
         target.complete_start().unwrap();
         let initial = target.initial_thread_id();
         let to_initial = SignalTarget::Thread {
@@ -648,8 +652,12 @@ mod tests {
             super::send(&other, SignalTarget::All, 0),
             Err(BrokerError::UnknownObject)
         );
-        let first = root.create_child(root.pid_namespace(), false).unwrap();
-        let second = root.create_child(root.pid_namespace(), false).unwrap();
+        let first = root
+            .create_child(root.pid_namespace(), ChildProcessFlags::empty())
+            .unwrap();
+        let second = root
+            .create_child(root.pid_namespace(), ChildProcessFlags::empty())
+            .unwrap();
         crate::process_group::set(&root, second.id(), second.id().into()).unwrap();
         let sink = Arc::new(TestReadinessSink::default());
         let handles = [&root, &other, &first, &second]

@@ -152,6 +152,11 @@ mod private {
             Err(BrokerError::InvalidRights)
         }
 
+        /// Copy the mount layout without duplicating the filesystems or their locks.
+        fn copy_mount_view(&self) -> crate::Result<Arc<dyn super::FileService>> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
         /// Opens `path`, binding a file that refers to the opener's controlling terminal to
         /// `controlling_terminal()`.
         #[expect(
@@ -292,20 +297,23 @@ where
     // the same file). No open-description lock is held during the pathname walk.
     fn directory_anchor(&self, directory: Option<&File>) -> Result<Option<DirAnchor>> {
         directory
-            .map(|file| Ok(self.open_in_this_resolver(file)?.entry.read().anchor()))
+            .map(|file| {
+                let state = file
+                    .state
+                    .as_any()
+                    .downcast_ref::<ResolverFile<Platform, Backend>>()
+                    .ok_or(BrokerError::InvalidRights)?;
+                let entry = state.entry.read();
+                if core::ptr::eq(Arc::as_ptr(&state.resolver), self) {
+                    return Ok(entry.anchor());
+                }
+                // A handle transferred from a process with another filesystem names nothing here.
+                // One inherited from a related mount view is usable only on an object both views
+                // share, and later lookups from it see this view's mounts.
+                self.related_view_anchor(&state.resolver, &entry)
+                    .ok_or(BrokerError::InvalidRights)
+            })
             .transpose()
-    }
-
-    fn open_in_this_resolver<'a>(
-        &self,
-        file: &'a File,
-    ) -> Result<&'a ResolverFile<Platform, Backend>> {
-        // A handle transferred from a process with another filesystem names nothing here.
-        file.state
-            .as_any()
-            .downcast_ref::<ResolverFile<Platform, Backend>>()
-            .filter(|state| core::ptr::eq(Arc::as_ptr(&state.resolver), self))
-            .ok_or(BrokerError::InvalidRights)
     }
 }
 
@@ -315,7 +323,12 @@ where
     Platform: RawSyncPrimitivesProvider,
 {
     fn check_anchor(&self, file: &File) -> Result<()> {
-        self.open_in_this_resolver(file).map(|_| ())
+        self.directory_anchor(Some(file)).map(|_| ())
+    }
+
+    fn copy_mount_view(&self) -> Result<Arc<dyn FileService>> {
+        let view = Resolver::copy_mount_view(self).ok_or(BrokerError::UnsupportedOperation)?;
+        Ok(Arc::new(view))
     }
 
     fn open(
@@ -826,7 +839,7 @@ pub fn open(
     let rights = process.require_object_rights(open_required_rights(access, flags)?)?;
     with_path_anchor(process, directory, path, |directory| {
         let reference = process.reserve_object_reference(rights)?;
-        let file = match Arc::clone(&process.fs).open(
+        let file = match process.file_service()?.open(
             directory,
             path,
             Context::new(user, Caller::new(process)),
@@ -872,7 +885,7 @@ pub(crate) fn open_without_reference(
     process.require_object_rights(open_required_rights(access, flags)?)?;
     with_path_anchor(process, anchor, path, |dir| {
         let caller = Caller::new(process);
-        let file = match Arc::clone(&process.fs).open(
+        let file = match process.file_service()?.open(
             dir,
             path,
             Context::new(user, caller),
@@ -1054,7 +1067,7 @@ pub fn fchdir(
     user: FileUser,
 ) -> ServiceResult<()> {
     let dir = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    process.fs.check_anchor(&dir)?;
+    process.file_service()?.check_anchor(&dir)?;
     let status = match dir.state.handle_status(Caller::new(process))? {
         Ok(status) => status,
         Err(error) => return Ok(Err(error)),
@@ -1116,9 +1129,12 @@ pub fn cwd_status(
     let caller = Caller::new(process);
     match dir {
         Some(dir) => dir.state.handle_status(caller),
-        None => process
-            .fs
-            .path_status(None, "/", Context::new(FileUser::ROOT, caller), true),
+        None => process.file_service()?.path_status(
+            None,
+            "/",
+            Context::new(FileUser::ROOT, caller),
+            true,
+        ),
     }
 }
 
@@ -1224,7 +1240,7 @@ pub fn path_status(
 ) -> Result<FileResult<FileStatus>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     with_path_anchor(process, directory, path, |dir| {
-        process.fs.path_status(
+        process.file_service()?.path_status(
             dir,
             path,
             Context::new(user, Caller::new(process)),
@@ -1244,7 +1260,7 @@ pub fn read_link(
     process.require_object_rights(ObjectRights::WAIT)?;
     with_path_anchor(process, directory, path, |dir| {
         process
-            .fs
+            .file_service()?
             .read_link(dir, path, Context::new(user, Caller::new(process)))
     })
 }
@@ -1274,7 +1290,7 @@ pub fn chmod(
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, path, |dir| {
         process
-            .fs
+            .file_service()?
             .chmod(dir, path, Context::new(user, Caller::new(process)), mode)
     })
 }
@@ -1291,7 +1307,7 @@ pub fn chown(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, path, |dir| {
-        process.fs.chown(
+        process.file_service()?.chown(
             dir,
             path,
             Context::new(acting_user, Caller::new(process)),
@@ -1312,7 +1328,7 @@ pub fn unlink(
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, path, |dir| {
         process
-            .fs
+            .file_service()?
             .unlink(dir, path, Context::new(user, Caller::new(process)))
     })
 }
@@ -1330,7 +1346,7 @@ pub fn rename(
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, old_directory, old_path, |old_dir| {
         with_path_anchor(process, new_directory, new_path, |new_dir| {
-            process.fs.rename(
+            process.file_service()?.rename(
                 old_dir,
                 old_path,
                 new_dir,
@@ -1353,7 +1369,7 @@ pub fn mkdir(
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, path, |dir| {
         process
-            .fs
+            .file_service()?
             .mkdir(dir, path, Context::new(user, Caller::new(process)), mode)
     })
 }
@@ -1365,7 +1381,7 @@ pub fn mount_in_mem(process: &BrokerProcess, path: &str, user: FileUser) -> Resu
         return Ok(Err(error));
     }
     process
-        .fs
+        .file_service()?
         .mount_in_mem(path, Context::new(user, Caller::new(process)))
 }
 
@@ -1380,7 +1396,7 @@ pub fn symlink(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, linkpath, |dir| {
-        process.fs.symlink(
+        process.file_service()?.symlink(
             target,
             dir,
             linkpath,
@@ -1400,7 +1416,7 @@ pub fn rmdir(
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, path, |dir| {
         process
-            .fs
+            .file_service()?
             .rmdir(dir, path, Context::new(user, Caller::new(process)))
     })
 }
@@ -2021,6 +2037,200 @@ mod tests {
             path_status(&owner, None, "/x", user, true),
             Ok(Err(FileError::NoSuchFileOrDirectory))
         );
+    }
+
+    fn composed_file_system() -> Arc<dyn FileService> {
+        Arc::new(Resolver::<TestPlatform, _>::new(
+            crate::fs::composer::Composer::<TestPlatform>::builder()
+                .mount("/", InMem::<TestPlatform>::new)
+                .build()
+                .unwrap(),
+        ))
+    }
+
+    /// A process of `broker` resolving paths in a private copy of `fs`'s mount layout.
+    fn process_with_copied_view(
+        broker: &TestBroker,
+        fs: &Arc<dyn FileService>,
+    ) -> Arc<BrokerProcess> {
+        broker
+            .core
+            .create_process(
+                CallerCredential::Unauthenticated,
+                &broker.pid_namespace,
+                &fs.copy_mount_view().unwrap(),
+                &broker.job,
+                broker.host_names.clone(),
+                None,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn inherited_relative_handles_walk_the_receivers_mount_view() {
+        let fs = composed_file_system();
+        let (broker, owner, root, sink) = broker_with_root_anchor(Arc::clone(&fs));
+        let user = FileUser::ROOT;
+        assert_eq!(
+            mkdir(&owner, None, "/work", user, FileMode::RWXU),
+            Ok(Ok(()))
+        );
+        assert_eq!(mount_in_mem(&owner, "/work", user), Ok(Ok(())));
+        assert_eq!(
+            mkdir(&owner, None, "/work/m", user, FileMode::RWXU),
+            Ok(Ok(()))
+        );
+        let work = open(
+            &owner,
+            None,
+            "/work",
+            user,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::PATH,
+            FileMode::default(),
+            &sink,
+        )
+        .unwrap()
+        .unwrap();
+        let file = open(
+            &owner,
+            None,
+            "/work/file",
+            user,
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::CREATE,
+            FileMode::RWXU,
+            &sink,
+        )
+        .unwrap()
+        .unwrap();
+        let child = process_with_copied_view(&broker, &fs);
+        let [child_root, child_work, child_file] = [root, work, file].map(|handle| {
+            owner
+                .duplicate_object_reference_to(handle, &child, ObjectRights::WAIT)
+                .unwrap()
+        });
+        assert_eq!(mount_in_mem(&child, "/work/m", user), Ok(Ok(())));
+        let node = |process: &BrokerProcess, directory, path| {
+            path_status(process, directory, path, user, true)
+                .unwrap()
+                .unwrap()
+                .node_info
+        };
+
+        // Lookups through inherited handles see the receiver's later mount, not the sender's.
+        let private_mount = node(&child, None, "/work/m");
+        assert_ne!(node(&owner, Some(work), "m"), private_mount);
+        for (directory, path) in [
+            (child_work, "m"),
+            (child_work, "../work/m"),
+            (child_root, "work/m"),
+        ] {
+            assert_eq!(node(&child, Some(directory), path), private_mount);
+        }
+        let created = open(
+            &child,
+            Some(child_work),
+            "m/f",
+            user,
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::CREATE,
+            FileMode::RWXU,
+            &sink,
+        )
+        .unwrap()
+        .unwrap();
+        child.close_object_reference(created).unwrap();
+        assert!(matches!(
+            path_status(&child, None, "/work/m/f", user, true),
+            Ok(Ok(_))
+        ));
+        assert_eq!(
+            path_status(&owner, None, "/work/m/f", user, true),
+            Ok(Err(FileError::NoSuchFileOrDirectory))
+        );
+
+        // The shared mount itself is one filesystem in both views.
+        assert_eq!(
+            mkdir(&child, Some(child_work), "both", user, FileMode::RWXU),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            node(&owner, None, "/work/both"),
+            node(&child, None, "/work/both")
+        );
+        assert_eq!(
+            path_status(&child, Some(child_file), ".", user, true),
+            Ok(Err(FileError::ComponentNotDirectory))
+        );
+    }
+
+    #[test]
+    fn inherited_relative_handles_need_a_mount_both_views_share() {
+        let fs = composed_file_system();
+        let (broker, owner, _root, sink) = broker_with_root_anchor(Arc::clone(&fs));
+        let user = FileUser::ROOT;
+        for path in ["/a", "/b"] {
+            assert_eq!(mkdir(&owner, None, path, user, FileMode::RWXU), Ok(Ok(())));
+        }
+        let child = process_with_copied_view(&broker, &fs);
+        // Each view's first private mount takes the same index.
+        assert_eq!(mount_in_mem(&owner, "/a", user), Ok(Ok(())));
+        assert_eq!(mount_in_mem(&child, "/b", user), Ok(Ok(())));
+        let open_at = |process: &BrokerProcess, path, access, flags| {
+            open(
+                process,
+                None,
+                path,
+                user,
+                access,
+                flags,
+                FileMode::RWXU,
+                &sink,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let a = open_at(&owner, "/a", FileAccessMode::ReadOnly, FileOpenFlags::PATH);
+        let a_file = open_at(
+            &owner,
+            "/a/file",
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::CREATE,
+        );
+        let b = open_at(&child, "/b", FileAccessMode::ReadOnly, FileOpenFlags::PATH);
+
+        for (sender, receiver, handle) in [
+            (&owner, &child, a),
+            (&owner, &child, a_file),
+            (&child, &owner, b),
+        ] {
+            let transferred = sender
+                .duplicate_object_reference_to(handle, receiver, ObjectRights::WAIT)
+                .unwrap();
+            assert_eq!(
+                path_status(receiver, Some(transferred), ".", user, true),
+                Err(BrokerError::InvalidRights)
+            );
+            assert_eq!(
+                mkdir(receiver, Some(transferred), "x", user, FileMode::RWXU),
+                Err(BrokerError::InvalidRights)
+            );
+        }
+        assert_eq!(
+            mkdir(&owner, Some(a), "x", user, FileMode::RWXU),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            mkdir(&child, Some(b), "x", user, FileMode::RWXU),
+            Ok(Ok(()))
+        );
+        for (process, path) in [(&owner, "/b/x"), (&child, "/a/x")] {
+            assert_eq!(
+                path_status(process, None, path, user, true),
+                Ok(Err(FileError::NoSuchFileOrDirectory))
+            );
+        }
     }
 
     #[test]
