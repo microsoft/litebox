@@ -27,8 +27,8 @@ use litebox_broker_protocol::{
 };
 use litebox_common_linux::{
     AddressFamily, FileDescriptorFlags, IoReadVec, IoWriteVec, ReceiveFlags, SendFlags,
-    ShutdownHow, SockFlags, SockType, SocketOption, SocketOptionName, UserMmsgHdr, UserMsgHdr,
-    errno::Errno,
+    ShutdownHow, SockFlags, SockType, SocketControlMessageType, SocketOption, SocketOptionName,
+    UserMmsgHdr, UserMsgHdr, errno::Errno,
 };
 use litebox_common_linux::{PAGE_SIZE, mm::VmemManager};
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
@@ -263,6 +263,69 @@ pub(super) fn shutdown_mode(how: ShutdownHow) -> ShutdownMode {
         ShutdownHow::Write => ShutdownMode::Write,
         ShutdownHow::Both => ShutdownMode::Both,
     }
+}
+
+/// Copies the `length` control bytes at `control` that `sendmsg` passes, as Linux does for every
+/// socket before the socket parses them, even when they are too few for a message.
+///
+/// Fails with `ENOBUFS` for at least Linux's default `optmem_max` bytes, and with `EFAULT` if the
+/// bytes are not readable.
+fn copy_send_control<Platform: ShimPlatform>(
+    control: UserPtr<u8>,
+    length: usize,
+) -> Result<alloc::boxed::Box<[u8]>, Errno> {
+    /// Linux's default `optmem_max`, which the control bytes it copies stay below.
+    const MAX_CONTROL_LENGTH: usize = 128 * 1024;
+
+    if length == 0 {
+        return Ok(alloc::boxed::Box::default());
+    }
+    if length >= MAX_CONTROL_LENGTH {
+        return Err(Errno::ENOBUFS);
+    }
+    control
+        .to_owned_slice::<Platform>(length)
+        .ok_or(Errno::EFAULT)
+}
+
+/// A control message that `sendmsg` passes.
+pub(super) struct ControlMessage<'a> {
+    /// The message's level, such as `SOL_SOCKET`.
+    pub(super) level: i32,
+    /// The message's type within its level.
+    pub(super) kind: i32,
+    /// The message's data.
+    pub(super) data: &'a [u8],
+}
+
+/// Returns the control messages in `control` in order, as Linux's `for_each_cmsghdr` walks them:
+/// trailing bytes too few for a header are ignored, and a message whose length is shorter than
+/// its header or runs past `control` ends the walk with `EINVAL`.
+pub(super) fn control_messages(
+    control: &[u8],
+) -> impl Iterator<Item = Result<ControlMessage<'_>, Errno>> {
+    let mut next = Some(0);
+    core::iter::from_fn(move || {
+        let offset = next.filter(|&offset| control.len() - offset >= unix::CMSG_HEADER_SIZE)?;
+        next = None;
+        let header = litebox_common_linux::CmsgHdr::read_from_prefix(&control[offset..])
+            .ok()
+            .map(|(header, _)| header)
+            .filter(|header| {
+                (unix::CMSG_HEADER_SIZE..=control.len() - offset).contains(&header.cmsg_len)
+            });
+        let Some(header) = header else {
+            return Some(Err(Errno::EINVAL));
+        };
+        next = offset
+            .checked_add(unix::cmsg_align(header.cmsg_len))
+            .filter(|&next| next <= control.len());
+        Some(Ok(ControlMessage {
+            level: header.cmsg_level,
+            kind: header.cmsg_type,
+            data: &control[offset + unix::CMSG_HEADER_SIZE..offset + header.cmsg_len],
+        }))
+    })
 }
 
 impl<Platform: ShimPlatform> GlobalState<Platform> {
@@ -846,14 +909,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             None
         };
-        let objects = if matches!(socket, AnyTypedFd::Unix(_)) {
-            self.passed_objects(msg.msg_control, msg.msg_controllen)?
-        } else if msg.msg_controllen != 0 {
-            log_unsupported!("ancillary data is not supported");
-            return Err(Errno::EINVAL);
-        } else {
-            alloc::vec::Vec::new()
-        };
         if msg.msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
         }
@@ -868,6 +923,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             )
         };
         let data = GuestWriteBuffer::<Platform>::new(iovs.as_deref().unwrap_or_default())?;
+        // Like Linux, every socket copies the control bytes, then parses them its own way: a vsock
+        // socket ignores them.
+        let control = copy_send_control::<Platform>(msg.msg_control, msg.msg_controllen)?;
+        let objects = if matches!(socket, AnyTypedFd::Unix(_)) {
+            self.passed_objects(&control)?
+        } else {
+            alloc::vec::Vec::new()
+        };
         let is_message_oriented = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
@@ -878,6 +941,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
+                // Linux parses the messages only after checking a UDP datagram's size and
+                // destination and a TCP socket's connection, which come later here; that only
+                // changes which error a send failing both ways reports.
+                inet::check_send_control(&control, socket.is_stream())?;
                 socket.sendto(&self.wait_cx(), &data, flags, sock_addr)
             },
             |file| {
@@ -894,71 +961,38 @@ impl<Platform: ShimPlatform> Task<Platform> {
         res
     }
 
-    /// Returns the objects of the descriptors that the `SCM_RIGHTS` control messages in the
-    /// `length` control bytes at `control` pass, as Linux's `__scm_send`.
+    /// Returns the objects of the descriptors that the `SCM_RIGHTS` messages among a Unix socket's
+    /// `control` messages pass, as Linux's `__scm_send`.
     ///
     /// Like Linux, this ignores control messages of levels other than `SOL_SOCKET`, and fails with
-    /// `EINVAL` for a malformed message or one passing more than `SCM_MAX_FD` descriptors, and
-    /// with `EBADF` for a descriptor that is not open.
+    /// `EINVAL` for a malformed message, an unknown type, or more than `SCM_MAX_FD` descriptors,
+    /// and with `EBADF` for a descriptor that is not open.
     fn passed_objects(
         &self,
-        control: UserPtr<u8>,
-        length: usize,
+        control: &[u8],
     ) -> Result<alloc::vec::Vec<litebox::process::InheritableFd<Platform>>, Errno> {
-        /// Linux's default `optmem_max`, which bounds the control bytes it copies.
-        const MAX_CONTROL_LENGTH: usize = 128 * 1024;
-        /// `SCM_CREDENTIALS`, which passes credentials.
-        const SCM_CREDENTIALS: i32 = 2;
-
         let mut objects = alloc::vec::Vec::new();
-        if length < unix::CMSG_HEADER_SIZE {
-            return Ok(objects);
-        }
-        if length > MAX_CONTROL_LENGTH {
-            return Err(Errno::ENOBUFS);
-        }
-        let control = control
-            .to_owned_slice::<Platform>(length)
-            .ok_or(Errno::EFAULT)?;
-        let int_at = |offset: usize| {
-            i32::from_ne_bytes(
-                control[offset..offset + size_of::<i32>()]
-                    .try_into()
-                    .unwrap(),
-            )
-        };
-        let mut offset = 0;
-        while length - offset >= unix::CMSG_HEADER_SIZE {
-            let (header, _) = litebox_common_linux::CmsgHdr::read_from_prefix(&control[offset..])
-                .map_err(|_| Errno::EINVAL)?;
-            let message_length = header.cmsg_len;
-            if message_length < unix::CMSG_HEADER_SIZE || message_length > length - offset {
-                return Err(Errno::EINVAL);
+        for message in control_messages(control) {
+            let message = message?;
+            if message.level != unix::SOL_SOCKET {
+                continue;
             }
-            if header.cmsg_level == unix::SOL_SOCKET {
-                match header.cmsg_type {
-                    litebox_common_linux::SCM_RIGHTS => {
-                        let count = (message_length - unix::CMSG_HEADER_SIZE) / size_of::<i32>();
-                        if objects.len() + count > unix::SCM_MAX_FD {
-                            return Err(Errno::EINVAL);
-                        }
-                        for index in 0..count {
-                            let fd =
-                                int_at(offset + unix::CMSG_HEADER_SIZE + index * size_of::<i32>());
-                            let fd = self.files.borrow().typed_fd(fd)?;
-                            objects.push(self.global.shareable_object(&fd)?.1);
-                        }
-                    }
-                    SCM_CREDENTIALS => {
-                        log_unsupported!("SCM_CREDENTIALS control messages");
+            match SocketControlMessageType::try_from(message.kind) {
+                Ok(SocketControlMessageType::Rights) => {
+                    let (fds, _) = message.data.as_chunks::<{ size_of::<i32>() }>();
+                    if objects.len() + fds.len() > unix::SCM_MAX_FD {
                         return Err(Errno::EINVAL);
                     }
-                    _ => return Err(Errno::EINVAL),
+                    for &fd in fds {
+                        let fd = self.files.borrow().typed_fd(i32::from_ne_bytes(fd))?;
+                        objects.push(self.global.shareable_object(&fd)?.1);
+                    }
                 }
-            }
-            match offset.checked_add(unix::cmsg_align(message_length)) {
-                Some(next) if next <= length => offset = next,
-                _ => break,
+                Ok(SocketControlMessageType::Credentials) => {
+                    log_unsupported!("SCM_CREDENTIALS control messages");
+                    return Err(Errno::EINVAL);
+                }
+                Err(_) => return Err(Errno::EINVAL),
             }
         }
         Ok(objects)

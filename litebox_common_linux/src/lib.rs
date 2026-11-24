@@ -2858,12 +2858,20 @@ pub struct CmsgHdr {
     pub cmsg_len: usize,
     /// Level of the message, such as [`SocketOptionLevel::SOCKET`].
     pub cmsg_level: i32,
-    /// Type of the message within its level, such as [`SCM_RIGHTS`].
+    /// Type of the message within its level, such as a [`SocketControlMessageType`] for
+    /// [`SocketOptionLevel::SOCKET`].
     pub cmsg_type: i32,
 }
 
-/// `SCM_RIGHTS`, the type of a `SOL_SOCKET` control message that passes descriptors.
-pub const SCM_RIGHTS: i32 = 1;
+/// Type of a `SOL_SOCKET` control message.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, IntEnum)]
+pub enum SocketControlMessageType {
+    /// `SCM_RIGHTS`, which passes descriptors.
+    Rights = 1,
+    /// `SCM_CREDENTIALS`, which passes credentials.
+    Credentials = 2,
+}
 
 /// Linux's `struct mmsghdr`: a `msghdr` paired with the number of bytes
 /// transmitted, used by `sendmmsg`/`recvmmsg`.

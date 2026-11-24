@@ -35,7 +35,8 @@ use litebox_broker_protocol::{
 };
 use litebox_common_linux::{
     AddressFamily, IPProtocol, IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags,
-    SockType, SocketOption, SocketOptionName, TcpOption, errno::Errno,
+    SockType, SocketControlMessageType, SocketOption, SocketOptionLevel, SocketOptionName,
+    TcpOption, errno::Errno,
 };
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -44,7 +45,7 @@ use crate::{
     GlobalState, ShimPlatform, UserPtr, UserPtrMut,
     syscalls::{
         file::{linux_status_flags, status_flags_change},
-        net::{ReceivePlan, open_flags, shutdown_mode},
+        net::{ReceivePlan, control_messages, open_flags, shutdown_mode},
     },
     wait::wait_errno,
 };
@@ -144,6 +145,38 @@ pub(super) fn write_sockaddr<Platform: ShimPlatform>(
     dst.write_slice_at_offset::<Platform>(0, &bytes[..capacity.min(bytes.len())])
         .ok_or(Errno::EFAULT)?;
     Ok(bytes.len())
+}
+
+/// Checks the `control` messages that `sendmsg` passes to a TCP socket if `stream` is set, or to a
+/// UDP one, as Linux's `sock_cmsg_send` and, for UDP, `udp_cmsg_send` and `ip_cmsg_send` do.
+///
+/// Like Linux, this ignores the descriptors and credentials that only Unix sockets pass, and the
+/// levels the socket doesn't parse: all but `SOL_SOCKET` and, for UDP, `SOL_IP` and `SOL_UDP`.
+/// It fails with `EINVAL` for every other message: Linux does too for malformed
+/// messages and unknown types, but LiteBox supports none of the types Linux acts on, such as
+/// `SO_MARK` or `IP_PKTINFO`.
+pub(super) fn check_send_control(control: &[u8], stream: bool) -> Result<(), Errno> {
+    const SOL_IP: i32 = SocketOptionLevel::IP as i32;
+    const SOL_SOCKET: i32 = SocketOptionLevel::SOCKET as i32;
+    const SOL_UDP: i32 = SocketOptionLevel::UDP as i32;
+
+    for message in control_messages(control) {
+        let message = message?;
+        let parsed = match message.level {
+            SOL_SOCKET => SocketControlMessageType::try_from(message.kind).is_err(),
+            SOL_IP | SOL_UDP => !stream,
+            _ => false,
+        };
+        if parsed {
+            log_unsupported!(
+                "control message of level {} and type {}",
+                message.level,
+                message.kind
+            );
+            return Err(Errno::EINVAL);
+        }
+    }
+    Ok(())
 }
 
 impl<Platform: ShimPlatform> InetSocket<Platform> {

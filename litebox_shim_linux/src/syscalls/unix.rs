@@ -29,9 +29,9 @@ use litebox_broker_protocol::{
     },
 };
 use litebox_common_linux::{
-    AddressFamily, CmsgHdr, FileDescriptorFlags, OFlags, ReceiveFlags, SCM_RIGHTS, SendFlags,
-    ShutdownHow, SockFlags, SockType, SocketOption, SocketOptionLevel, SocketOptionName,
-    UnixProtocol, errno::Errno, program_startup::InheritedFdKind,
+    AddressFamily, CmsgHdr, FileDescriptorFlags, OFlags, ReceiveFlags, SendFlags, ShutdownHow,
+    SockFlags, SockType, SocketControlMessageType, SocketOption, SocketOptionLevel,
+    SocketOptionName, UnixProtocol, errno::Errno, program_startup::InheritedFdKind,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use zerocopy::IntoBytes as _;
@@ -576,7 +576,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let header = CmsgHdr {
             cmsg_len: length,
             cmsg_level: SOL_SOCKET,
-            cmsg_type: SCM_RIGHTS,
+            cmsg_type: SocketControlMessageType::Rights.into(),
         };
         let mut message = Vec::with_capacity(length);
         message.extend_from_slice(header.as_bytes());
