@@ -150,3 +150,11 @@ path = "src/negative/file_offset_overflow_negative.rs"
 [[example]]
 name = "file_offset_implicit_negative"
 path = "src/negative/file_offset_implicit_negative.rs"
+
+[[example]]
+name = "file_service_mapping_space_negative"
+path = "src/negative/file_service_mapping_space_negative.rs"
+
+[[example]]
+name = "file_service_read_blocking_negative"
+path = "src/negative/file_service_read_blocking_negative.rs"

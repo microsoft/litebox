@@ -1055,6 +1055,7 @@ fn file_open_error(error: OpenError) -> FileError {
     }
 }
 
+#[verus_spec(result => ensures result == verification::file_read_error_value(error))]
 fn file_read_error(error: ReadError) -> FileError {
     match error {
         ReadError::NotAFile => FileError::NotFile,
@@ -1065,6 +1066,7 @@ fn file_read_error(error: ReadError) -> FileError {
     }
 }
 
+#[verus_spec(result => ensures result == verification::file_write_error_value(error))]
 fn file_write_error(error: WriteError) -> FileError {
     match error {
         WriteError::NotAFile => FileError::NotFile,
@@ -1109,6 +1111,7 @@ fn file_set_times_error(error: SetTimesError) -> FileError {
     }
 }
 
+#[verus_spec(result => ensures result == verification::file_map_shared_error_value(error))]
 fn file_map_shared_error(error: MapSharedError) -> FileError {
     match error {
         MapSharedError::IsDirectory => FileError::IsDirectory,

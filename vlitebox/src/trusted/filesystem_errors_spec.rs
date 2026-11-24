@@ -6,6 +6,15 @@
 //! plus the native Fault and BrokerError conversion. No custom assumptions are added.
 //! Shared mapping translates NoSpace to NoMemory and Fault/Busy/Io to Io.
 //! This proves error translation, not I/O, authorization, or correct failure.
+//! The original file-service read/write/shared-mapping compatibility helpers
+//! are also checked. Shared NoMemory becomes guest NoSpace; compatibility
+//! read/write WouldBlock and Broker(_) become Io. Full service methods may
+//! handle broker errors separately; no whole-syscall disposition is inferred.
+
+pub use litebox_broker_core::fs::{
+    file_map_shared_error_value, file_read_error_value, file_service_error_policy,
+    file_write_error_value,
+};
 
 use vstd::prelude::*;
 
