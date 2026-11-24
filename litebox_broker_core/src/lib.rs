@@ -388,6 +388,7 @@ pub mod verification {
     pub use crate::event::verification::{event_projection_policy, prove_event_projection};
     pub use crate::object::verification::{duplication_policy, prove_duplication_policy};
     pub use crate::pipe::verification::{pipe_projection_policy, prove_pipe_projection};
+    pub use crate::timer::verification::{prove_timer_projection, timer_projection_policy};
 }
 
 impl BrokerCore {

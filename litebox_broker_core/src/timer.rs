@@ -10,6 +10,9 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::time::Duration;
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::old;
+use vstd::prelude::verus_spec;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
@@ -19,6 +22,10 @@ use litebox_broker_protocol::timer::{TimerClock, TimerSetting, TimerSpec};
 use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
 use crate::{BrokerError, BrokerProcess, Result};
+
+#[cfg(verus_keep_ghost)]
+#[path = "timer_spec.rs"]
+pub(crate) mod verification;
 
 /// Trusted provider of the broker's monotonic clock and timer alarms.
 pub trait TimerProvider: Send + Sync {
@@ -124,6 +131,7 @@ pub fn read(process: &BrokerProcess, handle: ObjectHandle) -> Result<u64> {
 }
 
 impl ObjectEntry {
+    #[verus_spec(result => ensures verification::timer_projection(self, result))]
     fn as_timer(&self) -> Result<&TimerObject> {
         match self {
             Self::Timer(timer) => Ok(timer),
@@ -131,6 +139,12 @@ impl ObjectEntry {
         }
     }
 
+    #[verus_spec(result => ensures
+        verification::timer_mut_projection(*old(self), *final(self), match result {
+            Ok(value) => Ok((*value, *final(value))),
+            Err(error) => Err(error),
+        }),
+    )]
     fn as_timer_mut(&mut self) -> Result<&mut TimerObject> {
         match self {
             Self::Timer(timer) => Ok(timer),

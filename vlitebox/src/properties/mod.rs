@@ -4,3 +4,4 @@
 pub mod event_proof;
 pub mod object_proof;
 pub mod pipe_proof;
+pub mod timer_proof;

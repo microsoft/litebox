@@ -14,6 +14,8 @@ pub mod trusted;
 pub use properties::event_proof;
 pub use properties::object_proof;
 pub use properties::pipe_proof;
+pub use properties::timer_proof;
 pub use trusted::event_spec;
 pub use trusted::object_spec;
 pub use trusted::pipe_spec;
+pub use trusted::timer_spec;

@@ -41,7 +41,7 @@ jobs:
         run: cargo verus focus -p vlitebox -- --no-cheating
       - name: Reject deliberately false broker properties
         run: |
-          for target in object_policy_negative pipe_projection_negative event_projection_negative; do
+          for target in object_policy_negative pipe_projection_negative event_projection_negative timer_projection_negative; do
             log="$RUNNER_TEMP/$target.log"
             if cargo verus focus -p vlitebox --example "$target" -- --no-cheating > "$log" 2>&1; then
               cat "$log"

@@ -25,3 +25,7 @@ path = "src/negative/pipe_projection_negative.rs"
 [[example]]
 name = "event_projection_negative"
 path = "src/negative/event_projection_negative.rs"
+
+[[example]]
+name = "timer_projection_negative"
+path = "src/negative/timer_projection_negative.rs"
