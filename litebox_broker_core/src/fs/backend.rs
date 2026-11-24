@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
+use vstd::prelude::verus_verify;
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
@@ -565,6 +566,8 @@ pub struct CreationMetadata {
 /// Whether a resolved component should be permission-checked by the resolver.
 #[derive(Clone, Debug)]
 #[must_use]
+// In progress: derived implementations remain unverified.
+#[verus_verify(external_derive)]
 pub enum PermissionCheck {
     /// The backend is self-enforcing permissions for this item.
     ByBackend,
@@ -574,6 +577,8 @@ pub enum PermissionCheck {
 
 /// Permission information for a particular component of the walk.
 #[derive(Clone, Debug)]
+// In progress: derived implementations and opaque mode operations remain unverified.
+#[verus_verify(external_derive)]
 pub struct PermissionInfo {
     /// Permission bits for the component.
     pub mode: Mode,

@@ -9,6 +9,7 @@ use core::num::NonZeroU64;
 
 use bitflags::bitflags;
 use thiserror::Error;
+use vstd::prelude::verus_verify;
 
 use crate::ObjectHandle;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -28,6 +29,8 @@ const _: () = assert!(
 wire_struct! {
     /// File user identity used for permission checks.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    // In progress: generated wire and derived implementations remain unverified.
+    #[verus_verify(external_derive)]
     pub struct FileUser {
         /// Effective user ID.
         pub user: u16,
@@ -250,6 +253,9 @@ bitflags! {
     /// ABI-neutral fs permission and special mode bits.
     #[repr(transparent)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    // In progress: opaque mode value only; generated bit operations are unverified.
+    #[verus_verify(external_derive)]
+    #[cfg_attr(verus_keep_ghost, verifier::external_body)]
     pub struct FileMode: u16 {
         /// User (file owner) has read, write, and execute permission.
         const RWXU = 0o00700;

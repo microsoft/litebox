@@ -17,6 +17,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use vstd::prelude::verus_spec;
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::old;
+
+#[cfg(verus_keep_ghost)]
+#[path = "read_only_spec.rs"]
+pub mod verification;
 
 use super::backend::{
     Backend, CreationMetadata, DirHandle, FileHandle, FileTerminal, HandleRef, PermissionCheck,
@@ -44,6 +52,9 @@ impl<B: Backend> ReadOnly<B> {
     }
 }
 
+#[verus_spec(ensures
+    *final(permissions) == verification::readonly_metadata(*old(permissions)),
+)]
 fn mark_read_only(permissions: &mut PermissionCheck) {
     match permissions {
         PermissionCheck::ByResolver(permissions) => permissions.on_read_only_fs = true,

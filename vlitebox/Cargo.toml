@@ -86,3 +86,11 @@ path = "src/negative/filesystem_busy_read_negative.rs"
 [[example]]
 name = "filesystem_fault_write_negative"
 path = "src/negative/filesystem_fault_write_negative.rs"
+
+[[example]]
+name = "readonly_backend_marker_negative"
+path = "src/negative/readonly_backend_marker_negative.rs"
+
+[[example]]
+name = "readonly_clear_marker_negative"
+path = "src/negative/readonly_clear_marker_negative.rs"
