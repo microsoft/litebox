@@ -1103,6 +1103,7 @@ fn test_file_service(
                     ),
                 )
         })
+        .mount("/proc", litebox_broker_core::fs::procfs::ProcFs::new)
         .mount("/dev", |allocator| {
             litebox_broker_core::fs::devices::Devices::new(
                 allocator,

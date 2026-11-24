@@ -395,6 +395,7 @@ where
                 allocators.next(),
             )
         })
+        .mount("/proc", litebox_broker_core::fs::procfs::ProcFs::new)
         .mount("/dev", |allocator| {
             litebox_broker_core::fs::devices::Devices::new(
                 allocator,
@@ -695,11 +696,11 @@ mod cli_tests {
         .unwrap();
 
         assert!(matches!(
-            fs.mkdir(None, "/rw/new", UserInfo::ROOT, Mode::RWXU),
+            fs.mkdir(None, "/rw/new", UserInfo::ROOT.into(), Mode::RWXU),
             Ok(Ok(()))
         ));
         assert!(matches!(
-            fs.mkdir(None, "/ro/new", UserInfo::ROOT, Mode::RWXU),
+            fs.mkdir(None, "/ro/new", UserInfo::ROOT.into(), Mode::RWXU),
             Ok(Err(FileError::ReadOnlyFs))
         ));
         assert!(writable.path().join("new").is_dir());

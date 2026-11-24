@@ -12,6 +12,7 @@ use hashbrown::HashMap;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
 
+use super::backend::Caller;
 use super::backend::{
     PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
 };
@@ -367,7 +368,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::BackendHandles f
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMem<Platform> {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root(&self, _caller: Caller<'_>) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(Self::resolved_dir(InMemDirHandle {
             dir: self.root.clone(),
             flags: super::OFlags::PATH,
@@ -376,6 +377,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn resolve<'a>(
         &'a self,
+        _caller: Caller<'_>,
         from: ResolvedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -431,7 +433,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         Ok(Resolution::Found(ResolvedTarget::Dir(current)))
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at(
+        &self,
+        _caller: Caller<'_>,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         let dir = dir.get_typed::<Self>().dir.read();
         let file = match dir.children.get(name) {
             Some(Node::File(file)) => file.read(),
@@ -468,7 +475,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }))
     }
 
-    fn dir_path(&self, dir: &super::backend::DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+    fn dir_path(
+        &self,
+        _caller: Caller<'_>,
+        dir: &super::backend::DirHandle,
+    ) -> Result<Option<Vec<String>>, WalkError> {
         let _rename = self.rename_lock.lock();
         super::backend::name_by_walking_up(dir.get_typed::<Self>().dir.clone(), |child| {
             if Arc::ptr_eq(child, &self.root) {
@@ -495,6 +506,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn parent_dir(
         &self,
+        _caller: Caller<'_>,
         dir: &super::backend::DirHandle,
     ) -> Result<Option<super::backend::DirHandle>, WalkError> {
         let dir = dir.get_typed::<Self>().dir.read();
@@ -538,6 +550,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn list_dir_at(
         &self,
+        _caller: Caller<'_>,
         handle: super::backend::DirHandle,
     ) -> Result<Vec<DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
@@ -606,7 +619,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         super::backend::SeekBehavior::PositionBased
     }
 
-    fn status(&self, h: super::backend::HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+    fn status(
+        &self,
+        _caller: Caller<'_>,
+        h: super::backend::HandleRef<'_>,
+    ) -> Result<FileStatus, FileStatusError> {
         match h {
             super::backend::HandleRef::File(h) => {
                 let file = h.get_typed::<Self>().file.read();
@@ -635,14 +652,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
     }
 
-    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+    fn resolved_status(
+        &self,
+        caller: Caller<'_>,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<FileStatus, FileStatusError> {
         match target {
-            ResolvedTarget::File(h) => self.status(super::backend::HandleRef::File(
-                &super::backend::FileHandle::from_typed::<Self>(h.get_typed::<Self>().clone()),
-            )),
-            ResolvedTarget::Dir(h) => self.status(super::backend::HandleRef::Dir(
-                &super::backend::DirHandle::from_typed::<Self>(h.get_typed::<Self>().clone()),
-            )),
+            ResolvedTarget::File(h) => self.status(
+                caller,
+                super::backend::HandleRef::File(&super::backend::FileHandle::from_typed::<Self>(
+                    h.get_typed::<Self>().clone(),
+                )),
+            ),
+            ResolvedTarget::Dir(h) => self.status(
+                caller,
+                super::backend::HandleRef::Dir(&super::backend::DirHandle::from_typed::<Self>(
+                    h.get_typed::<Self>().clone(),
+                )),
+            ),
         }
     }
 
@@ -1204,7 +1231,12 @@ mod tests {
             .build()
             .unwrap();
         assert!(matches!(
-            composer.resolve(composer.root().unwrap(), &["a"], &|_| Ok(())),
+            composer.resolve(
+                Caller::default(),
+                composer.root(Caller::default()).unwrap(),
+                &["a"],
+                &|_| Ok(())
+            ),
             Err(ResolutionError {
                 component: Some(0),
                 error: WalkError::PathError(PathError::NoSuchFileOrDirectory),
@@ -1303,7 +1335,7 @@ mod tests {
                 Mode::empty(),
             )
             .unwrap();
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 10);
+        assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 10);
         drop(fd);
         assert!(upper_root.read().children.is_empty());
         let mut fd = fs
@@ -1329,7 +1361,7 @@ mod tests {
                 Mode::empty(),
             )
             .unwrap();
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 0);
+        assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 0);
         drop(fd);
         assert!(upper_root.read().children.contains_key("a"));
     }
@@ -1417,16 +1449,21 @@ mod tests {
             &["dir", "file", "child"],
         ] {
             let calls = RefCell::new(Vec::new());
-            let result = backend.resolve(backend.root().unwrap(), components, &|permissions| {
-                calls
-                    .borrow_mut()
-                    .push((permissions.mode, permissions.owner));
-                if permissions.owner == OWNER {
-                    Err(PathError::NoSearchPerms.into())
-                } else {
-                    Ok(())
-                }
-            });
+            let result = backend.resolve(
+                Caller::default(),
+                backend.root(Caller::default()).unwrap(),
+                components,
+                &|permissions| {
+                    calls
+                        .borrow_mut()
+                        .push((permissions.mode, permissions.owner));
+                    if permissions.owner == OWNER {
+                        Err(PathError::NoSearchPerms.into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
             assert!(matches!(
                 result,
                 Err(ResolutionError {
@@ -1439,12 +1476,18 @@ mod tests {
         }
 
         assert!(matches!(
-            backend.resolve(backend.root().unwrap(), &["dir", "missing"], &|_| Ok(())),
+            backend.resolve(
+                Caller::default(),
+                backend.root(Caller::default()).unwrap(),
+                &["dir", "missing"],
+                &|_| Ok(())
+            ),
             Ok(Resolution::MissingFinal { .. })
         ));
         assert!(matches!(
             backend.resolve(
-                backend.root().unwrap(),
+                Caller::default(),
+                backend.root(Caller::default()).unwrap(),
                 &["dir", "missing", "child"],
                 &|_| Ok(())
             ),
@@ -1454,9 +1497,12 @@ mod tests {
             })
         ));
         assert!(matches!(
-            backend.resolve(backend.root().unwrap(), &["dir", "file", "child"], &|_| Ok(
-                ()
-            )),
+            backend.resolve(
+                Caller::default(),
+                backend.root(Caller::default()).unwrap(),
+                &["dir", "file", "child"],
+                &|_| Ok(())
+            ),
             Err(ResolutionError {
                 component: Some(2),
                 error: WalkError::PathError(PathError::ComponentNotADirectory),

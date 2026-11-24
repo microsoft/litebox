@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use litebox_platform::buffer::RawBytes;
 
+use crate::fs::backend::Caller;
 use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, SeekError,
     SymlinkError, TruncateError, WalkError, WriteError,
@@ -920,7 +921,7 @@ fn read_all(fs: &FuseFs, path: &str) -> Vec<u8> {
 /// The directory's entries but `.` and `..`, by name: names, types, and inode numbers.
 fn list(fs: &FuseFs, path: &str) -> Result<Vec<(String, FileType, u64)>, ReadDirError> {
     let mut entries: Vec<_> = fs
-        .read_dir(&open_dir(fs, path))?
+        .read_dir(Caller::default(), &open_dir(fs, path))?
         .into_iter()
         .filter(|entry| !matches!(entry.name.as_str(), "." | ".."))
         .map(|entry| (entry.name, entry.file_type, entry.ino_info.unwrap().ino))
@@ -1124,7 +1125,7 @@ fn test_fuse_special_files_are_hidden() {
     let fd = fs
         .open(USER, None, "/file", OFlags::PATH, Mode::empty())
         .unwrap();
-    assert_eq!(fs.handle_status(&fd).unwrap().size, 4);
+    assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 4);
     drop(fd);
     assert_eq!(h.requests(Opcode::Open), 0);
     h.finish();
@@ -1195,10 +1196,10 @@ fn test_fuse_held_directories() {
     let root = fs
         .open(USER, None, "/", OFlags::PATH, Mode::empty())
         .unwrap();
-    assert_eq!(fs.handle_path(&root).unwrap(), "/");
+    assert_eq!(fs.handle_path(Caller::default(), &root).unwrap(), "/");
     let sub = open_dir(fs, "/d/sub");
     fs.rename(USER, None, "/d", None, "/e").unwrap();
-    assert_eq!(fs.handle_path(&sub).unwrap(), "/d/sub");
+    assert_eq!(fs.handle_path(Caller::default(), &sub).unwrap(), "/d/sub");
     let flags = OFlags::CREAT | OFlags::WRONLY;
     drop(
         fs.open(USER, Some(sub.anchor()), "f", flags, Mode::RWXU)
@@ -1214,7 +1215,12 @@ fn test_fuse_held_directories() {
             OFlags::PATH,
             Mode::empty(),
         );
-        assert_eq!(fs.handle_status(&parent.unwrap()).unwrap().node_info, e);
+        assert_eq!(
+            fs.handle_status(Caller::default(), &parent.unwrap())
+                .unwrap()
+                .node_info,
+            e
+        );
     }
 
     let permissions = |mode| std::fs::Permissions::from_mode(mode);
@@ -1231,9 +1237,9 @@ fn test_fuse_held_directories() {
 
     std::fs::remove_file(h.host_path("e/sub/f")).unwrap();
     std::fs::remove_dir(h.host_path("e/sub")).unwrap();
-    assert_err!(fs.read_dir(&sub), ReadDirError::Removed);
+    assert_err!(fs.read_dir(Caller::default(), &sub), ReadDirError::Removed);
     assert_err!(
-        fs.handle_path(&sub),
+        fs.handle_path(Caller::default(), &sub),
         WalkError::PathError(PathError::NoSuchFileOrDirectory)
     );
     drop((root, sub));
@@ -1335,10 +1341,16 @@ fn test_fuse_rejects_bad_replies() {
         let mut fd = fs
             .open(USER, None, "/file", OFlags::RDWR, Mode::empty())
             .unwrap();
-        assert_err!(fs.handle_status(&fd), FileStatusError::Io);
+        assert_err!(
+            fs.handle_status(Caller::default(), &fd),
+            FileStatusError::Io
+        );
         assert_err!(fs.truncate(&mut fd, 0, true), TruncateError::Io);
         drop(fd);
-        assert_err!(fs.handle_status(&open_dir(fs, "/")), FileStatusError::Io);
+        assert_err!(
+            fs.handle_status(Caller::default(), &open_dir(fs, "/")),
+            FileStatusError::Io
+        );
         assert_err!(fs.file_status(USER, None, "/", true), FileStatusError::Io);
     }
     fn permissions_are_taken(h: &Harness) {
@@ -1346,7 +1358,7 @@ fn test_fuse_rejects_bad_replies() {
         std::fs::set_permissions(h.host_path("file"), permissions).unwrap();
         let fd =
             h.fs.open(USER, None, "/file", OFlags::RDONLY, Mode::empty());
-        let status = h.fs.handle_status(&fd.unwrap()).unwrap();
+        let status = h.fs.handle_status(Caller::default(), &fd.unwrap()).unwrap();
         assert_eq!(status.mode.bits() & 0o777, 0o647);
     }
     fn creations_fail(h: &Harness) {

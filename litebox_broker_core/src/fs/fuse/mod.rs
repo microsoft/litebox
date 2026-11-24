@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use thiserror::Error;
 
 use super::OFlags;
+use super::backend::Caller;
 use super::backend::{
     DirHandle, FileHandle, HandleRef, PermissionCheck, PermissionInfo, Resolution, ResolvedDir,
     ResolvedFile, ResolvedTarget, SeekBehavior,
@@ -314,7 +315,7 @@ where
     Platform: sync::RawSyncPrimitivesProvider + 'static,
     T: transport::Transport + 'static,
 {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root(&self, _caller: Caller<'_>) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(Self::resolved_dir(FuseResolvedDir {
             node: Arc::clone(&self.root),
             attr: None,
@@ -323,6 +324,7 @@ where
 
     fn resolve<'a>(
         &'a self,
+        _caller: Caller<'_>,
         from: ResolvedDir<'a>,
         components: &[&str],
         _authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -381,7 +383,12 @@ where
         ))))
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at(
+        &self,
+        _caller: Caller<'_>,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         let entry = self.client.lookup(dir.get_typed::<Self>().node.id, name)?;
         let node = self.own(&entry);
         if entry.attr.file_type() != abi::S_IFLNK {
@@ -413,7 +420,11 @@ where
     }
 
     /// FUSE cannot ask for a node's name, so only the root's is known, as for 9P.
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+    fn dir_path(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<Vec<String>>, WalkError> {
         let node = &dir.get_typed::<Self>().node;
         if node.id == abi::ROOT_ID {
             return Ok(Some(Vec::new()));
@@ -424,7 +435,11 @@ where
         Ok(None)
     }
 
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+    fn parent_dir(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<DirHandle>, WalkError> {
         let node = &dir.get_typed::<Self>().node;
         if node.id == abi::ROOT_ID {
             return Ok(None);
@@ -485,7 +500,11 @@ where
         }))
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<super::DirEntry>, ReadDirError> {
+    fn list_dir_at(
+        &self,
+        _caller: Caller<'_>,
+        handle: DirHandle,
+    ) -> Result<Vec<super::DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         let open = match handle.open {
             Some(open) => open,
@@ -605,7 +624,11 @@ where
         }
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<super::FileStatus, FileStatusError> {
+    fn status(
+        &self,
+        _caller: Caller<'_>,
+        h: HandleRef<'_>,
+    ) -> Result<super::FileStatus, FileStatusError> {
         let (node, fh) = Self::handle_parts(h);
         // Only a file's handle goes with `FUSE_GETATTR_FH`, as on Linux: directory handles are
         // another namespace on some servers.
@@ -620,6 +643,7 @@ where
     /// Reuses the lookup's attributes when present.
     fn resolved_status(
         &self,
+        _caller: Caller<'_>,
         target: &ResolvedTarget<'_>,
     ) -> Result<super::FileStatus, FileStatusError> {
         let (node, attr) = match target {

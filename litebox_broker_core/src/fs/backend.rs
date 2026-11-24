@@ -83,10 +83,24 @@ pub(super) fn name_by_walking_up<D>(
     Ok(path)
 }
 
+/// Opaque identity of the process making a filesystem request. The default has no broker caller.
+#[derive(Clone, Copy, Default)]
+pub struct Caller<'a>(Option<&'a crate::BrokerProcess>);
+
+impl<'a> Caller<'a> {
+    pub(super) fn new(process: &'a crate::BrokerProcess) -> Self {
+        Self(Some(process))
+    }
+
+    pub(super) const fn process(self) -> Option<&'a crate::BrokerProcess> {
+        self.0
+    }
+}
+
 /// A backend that can be used to support a (full or subset of) a LiteBox filesystem.
 pub trait Backend: Send + Sync + Any {
     /// Resolve the root directory.
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError>;
+    fn root(&self, caller: Caller<'_>) -> Result<ResolvedDir<'_>, WalkError>;
 
     /// Resolve `components` without opening the target.
     ///
@@ -105,13 +119,19 @@ pub trait Backend: Send + Sync + Any {
     /// [`super::errors::PathError::NoSuchFileOrDirectory`] at its own index.
     fn resolve<'a>(
         &'a self,
+        caller: Caller<'_>,
         from: ResolvedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError>;
 
     /// Read the unexpanded target of the symlink `name` in `dir`.
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError>;
+    fn read_link_at(
+        &self,
+        caller: Caller<'_>,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError>;
 
     /// Open the already-resolved directory after resolver authorization, validating `flags`.
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError>;
@@ -131,7 +151,7 @@ pub trait Backend: Send + Sync + Any {
         &'a self,
         dir: &DirHandle,
     ) -> Result<(ResolvedDir<'a>, DirPathResult), WalkError> {
-        let path = self.dir_path(dir);
+        let path = self.dir_path(Caller::default(), dir);
         Ok((self.walking_dir_at(dir)?, path))
     }
 
@@ -142,11 +162,19 @@ pub trait Backend: Send + Sync + Any {
     /// longer walk (see [`Self::walking_dir_at`]), such as a moved directory on a backend that
     /// reaches directories by path. Returns `Ok(None)` if the backend cannot determine the current
     /// name of a live directory.
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError>;
+    fn dir_path(
+        &self,
+        caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<Vec<String>>, WalkError>;
 
     /// Walk up from an owned directory, returning `None` at this backend's root.
     /// Implementations must not follow `..` beyond their exported subtree.
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError>;
+    fn parent_dir(
+        &self,
+        caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<DirHandle>, WalkError>;
 
     /// Check search permission on `dir` with the backend's own credentials. The resolver calls
     /// this only for directories reporting [`PermissionCheck::ByBackend`].
@@ -156,7 +184,11 @@ pub trait Backend: Send + Sync + Any {
     fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError>;
 
     /// Read directory entries at `dir`.
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError>;
+    fn list_dir_at(
+        &self,
+        caller: Caller<'_>,
+        handle: DirHandle,
+    ) -> Result<Vec<DirEntry>, ReadDirError>;
 
     /// Look up the single entry `name` at `dir`, as [`Self::list_dir_at`] would report it.
     ///
@@ -164,7 +196,7 @@ pub trait Backend: Send + Sync + Any {
     /// cheaply should override it.
     fn lookup_at(&self, dir: &DirHandle, name: &str) -> Result<Option<DirEntry>, ReadDirError> {
         Ok(self
-            .list_dir_at(dir.clone())?
+            .list_dir_at(Caller::default(), dir.clone())?
             .into_iter()
             .find(|entry| entry.name == name))
     }
@@ -231,10 +263,14 @@ pub trait Backend: Send + Sync + Any {
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior;
 
     /// Status of an open file or directory handle.
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
+    fn status(&self, caller: Caller<'_>, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
 
     /// Query metadata without consuming or opening the resolved target.
-    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError>;
+    fn resolved_status(
+        &self,
+        caller: Caller<'_>,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<FileStatus, FileStatusError>;
 
     /// The terminal that an open file handle refers to. A file is a terminal
     /// exactly when it refers to one.

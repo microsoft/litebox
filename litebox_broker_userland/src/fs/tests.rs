@@ -7,7 +7,12 @@ use std::os::unix::fs::symlink;
 
 fn open_path_dir(local: &LocalFs, components: &[&str]) -> DirHandle {
     let Resolution::Found(ResolvedTarget::Dir(dir)) = local
-        .resolve(local.root().unwrap(), components, &|_| unreachable!())
+        .resolve(
+            Caller::default(),
+            local.root(Caller::default()).unwrap(),
+            components,
+            &|_| unreachable!(),
+        )
         .unwrap()
     else {
         panic!("expected directory")
@@ -26,12 +31,12 @@ fn directory_path_uses_fd_without_searching_or_listing_ancestors() {
     fs::rename(root.join("old"), root.join("new")).unwrap();
     fs::create_dir_all(root.join("old/sub (deleted)")).unwrap();
     fs::set_permissions(root.join("new"), fs::Permissions::from_mode(0o000)).unwrap();
-    let path = local.dir_path(&held);
+    let path = local.dir_path(Caller::default(), &held);
     fs::set_permissions(root.join("new"), fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(path.unwrap().unwrap(), ["new", "sub (deleted)"]);
     fs::remove_dir(root.join("new/sub (deleted)")).unwrap();
     assert!(matches!(
-        local.dir_path(&held),
+        local.dir_path(Caller::default(), &held),
         Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
     ));
 }
@@ -48,7 +53,7 @@ fn dot_walk_checks_search_on_start_not_on_parent() {
     let walk = local.walking_dir_at(&held).unwrap();
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
     // Looking up the child *name* again would require search on parent. `child/..` doesn't.
-    let up = local.parent_dir(&held);
+    let up = local.parent_dir(Caller::default(), &held);
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(up.unwrap().is_some());
 
@@ -56,7 +61,7 @@ fn dot_walk_checks_search_on_start_not_on_parent() {
     // Privileged hosts can bypass DAC; compare against the host's actual `.` lookup.
     let host_search = fs::metadata(child.join(".")).is_ok();
     let search = local.check_search_permission(&walk);
-    let up = local.parent_dir(&held);
+    let up = local.parent_dir(Caller::default(), &held);
     fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(search.is_ok(), host_search);
     assert_eq!(up.is_ok(), host_search);
@@ -71,13 +76,22 @@ fn ancestor_replacement_preserves_directory_and_live_parent() {
     fs::write(root.join("ancestor/sub/original"), b"original").unwrap();
     let local = LocalFs::new(root, InodeAllocators::new().next()).unwrap();
     let dir = open_path_dir(&local, &["ancestor", "sub"]);
-    let id = local.status(HandleRef::Dir(&dir)).unwrap().node_info;
+    let id = local
+        .status(Caller::default(), HandleRef::Dir(&dir))
+        .unwrap()
+        .node_info;
 
     fs::rename(root.join("ancestor"), root.join("destination/moved")).unwrap();
     fs::create_dir_all(root.join("ancestor/sub")).unwrap();
     fs::write(root.join("ancestor/sub/replacement"), b"replacement").unwrap();
-    assert_eq!(local.status(HandleRef::Dir(&dir)).unwrap().node_info, id);
-    let entries = local.list_dir_at(dir.clone()).unwrap();
+    assert_eq!(
+        local
+            .status(Caller::default(), HandleRef::Dir(&dir))
+            .unwrap()
+            .node_info,
+        id
+    );
+    let entries = local.list_dir_at(Caller::default(), dir.clone()).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "original");
 
@@ -85,7 +99,9 @@ fn ancestor_replacement_preserves_directory_and_live_parent() {
     symlink(target, root.join("destination/moved/sub/link")).unwrap();
     let walking = local.walking_dir_at(&dir).unwrap();
     assert_eq!(
-        local.read_link_at(&walking, "link").unwrap(),
+        local
+            .read_link_at(Caller::default(), &walking, "link")
+            .unwrap(),
         "../../../ancestor/sub/replacement"
     );
     local.unlink_at(walking, "original").unwrap();
@@ -94,14 +110,25 @@ fn ancestor_replacement_preserves_directory_and_live_parent() {
 
     let mut walk = dir;
     for parts in [&["destination", "moved"][..], &["destination"], &[]] {
-        walk = local.parent_dir(&walk).unwrap().unwrap();
+        walk = local.parent_dir(Caller::default(), &walk).unwrap().unwrap();
         let expected = open_path_dir(&local, parts);
         assert_eq!(
-            local.status(HandleRef::Dir(&walk)).unwrap().node_info,
-            local.status(HandleRef::Dir(&expected)).unwrap().node_info
+            local
+                .status(Caller::default(), HandleRef::Dir(&walk))
+                .unwrap()
+                .node_info,
+            local
+                .status(Caller::default(), HandleRef::Dir(&expected))
+                .unwrap()
+                .node_info
         );
     }
-    assert!(local.parent_dir(&walk).unwrap().is_none());
+    assert!(
+        local
+            .parent_dir(Caller::default(), &walk)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -122,9 +149,13 @@ fn moved_out_of_export_fails_closed_even_after_replacement() {
         )
     };
     assert!(local.walking_dir_at(&child).is_err_and(missing));
-    assert!(local.parent_dir(&child).is_err_and(missing));
+    assert!(
+        local
+            .parent_dir(Caller::default(), &child)
+            .is_err_and(missing)
+    );
     assert!(matches!(
-        local.list_dir_at(child),
+        local.list_dir_at(Caller::default(), child),
         Err(ReadDirError::Removed)
     ));
 }
@@ -137,7 +168,12 @@ fn root_and_resolved_children_are_not_reopened_by_name() {
     fs::write(root.join("file"), b"old").unwrap();
     let local = LocalFs::new(&root, InodeAllocators::new().next()).unwrap();
     let Resolution::Found(ResolvedTarget::File(file)) = local
-        .resolve(local.root().unwrap(), &["file"], &|_| unreachable!())
+        .resolve(
+            Caller::default(),
+            local.root(Caller::default()).unwrap(),
+            &["file"],
+            &|_| unreachable!(),
+        )
         .unwrap()
     else {
         panic!("expected file")
@@ -158,10 +194,18 @@ fn root_and_resolved_children_are_not_reopened_by_name() {
         local.read(&file, &mut [0; 1], 0),
         Err(ReadError::NotForReading)
     ));
-    assert!(local.read_link_at(&local.root().unwrap(), "file").is_err());
     assert!(
         local
-            .list_dir_at(open_path_dir(&local, &[]))
+            .read_link_at(
+                Caller::default(),
+                &local.root(Caller::default()).unwrap(),
+                "file"
+            )
+            .is_err()
+    );
+    assert!(
+        local
+            .list_dir_at(Caller::default(), open_path_dir(&local, &[]))
             .unwrap()
             .iter()
             .any(|e| e.name == "saved")
@@ -226,7 +270,16 @@ fn absolute_link_targets_cannot_climb_out_of_the_root() {
     symlink(canonical.join("../x"), root.join("escape")).unwrap();
     symlink(canonical.join("x"), root.join("inside")).unwrap();
     let local = LocalFs::new(&root, InodeAllocators::new().next()).unwrap();
-    let dir = local.root().unwrap();
-    assert!(local.read_link_at(&dir, "escape").is_err());
-    assert_eq!(local.read_link_at(&dir, "inside").unwrap(), "x");
+    let dir = local.root(Caller::default()).unwrap();
+    assert!(
+        local
+            .read_link_at(Caller::default(), &dir, "escape")
+            .is_err()
+    );
+    assert_eq!(
+        local
+            .read_link_at(Caller::default(), &dir, "inside")
+            .unwrap(),
+        "x"
+    );
 }

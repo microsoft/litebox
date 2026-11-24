@@ -18,12 +18,13 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
+use super::backend::Caller;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RenameError, RmdirError, SeekError, SetTimesError, SymlinkError,
     TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::resolver::{DirAnchor, Resolver, ResolverEntry};
+use super::resolver::{Context, DirAnchor, Resolver, ResolverEntry};
 use super::shared_storage::{SharedFileMapping, SharedMapping};
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
@@ -121,14 +122,15 @@ trait OpenFile: Send + Sync {
     fn lock(self: Arc<Self>, operation: FileLockOperation) -> ServiceResult<()>;
     fn read_directory(
         &self,
+        caller: Caller<'_>,
         output: &mut dyn ReadBuffer,
         mode: DirectoryReadMode,
     ) -> ServiceResult<ReadDirectoryResponse>;
-    fn handle_status(&self) -> ServiceResult<FileStatus>;
-    fn handle_path(&self) -> ServiceResult<String>;
+    fn handle_status(&self, caller: Caller<'_>) -> ServiceResult<FileStatus>;
+    fn handle_path(&self, caller: Caller<'_>) -> ServiceResult<String>;
     fn get_status_flags(&self) -> FileStatusFlags;
     fn set_status_flags(&self, mask: FileOpenFlags, flags: FileOpenFlags) -> Result<()>;
-    fn set_times(&self, user: FileUser, times: &SetFileTimes) -> ServiceResult<()>;
+    fn set_times(&self, context: Context<'_>, times: &SetFileTimes) -> ServiceResult<()>;
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -140,7 +142,7 @@ struct ResolverFile<Platform: RawSyncPrimitivesProvider, Backend: super::backend
 
 mod private {
     use super::{
-        Arc, BrokerError, File, FileAccessMode, FileMode, FileOpenFlags, FileStatus, FileUser,
+        Arc, BrokerError, Context, File, FileAccessMode, FileMode, FileOpenFlags, FileStatus,
         ServiceResult, String, TerminalEndpoint,
     };
 
@@ -155,7 +157,7 @@ mod private {
             self: Arc<Self>,
             _directory: Option<&File>,
             _path: &str,
-            _user: FileUser,
+            _context: Context<'_>,
             _access: FileAccessMode,
             _flags: FileOpenFlags,
             _mode: FileMode,
@@ -168,7 +170,7 @@ mod private {
             &self,
             _directory: Option<&File>,
             _path: &str,
-            _user: FileUser,
+            _context: Context<'_>,
             _follow_symlinks: bool,
         ) -> ServiceResult<FileStatus> {
             Err(BrokerError::UnsupportedOperation)
@@ -178,7 +180,7 @@ mod private {
             &self,
             _directory: Option<&File>,
             _path: &str,
-            _user: FileUser,
+            _context: Context<'_>,
         ) -> ServiceResult<String> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -187,7 +189,7 @@ mod private {
             &self,
             _directory: Option<&File>,
             _path: &str,
-            _user: FileUser,
+            _context: Context<'_>,
             _mode: FileMode,
         ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
@@ -197,7 +199,7 @@ mod private {
             &self,
             _directory: Option<&File>,
             _path: &str,
-            _acting_user: FileUser,
+            _context: Context<'_>,
             _user: Option<u16>,
             _group: Option<u16>,
         ) -> ServiceResult<()> {
@@ -208,7 +210,7 @@ mod private {
             &self,
             _directory: Option<&File>,
             _path: &str,
-            _user: FileUser,
+            _context: Context<'_>,
         ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -219,7 +221,7 @@ mod private {
             _old_path: &str,
             _new_directory: Option<&File>,
             _new_path: &str,
-            _user: FileUser,
+            _context: Context<'_>,
         ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -228,13 +230,13 @@ mod private {
             &self,
             _directory: Option<&File>,
             _path: &str,
-            _user: FileUser,
+            _context: Context<'_>,
             _mode: FileMode,
         ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn mount_in_mem(&self, _path: &str, _user: FileUser) -> ServiceResult<()> {
+        fn mount_in_mem(&self, _path: &str, _context: Context<'_>) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -243,7 +245,7 @@ mod private {
             _target: &str,
             _directory: Option<&File>,
             _linkpath: &str,
-            _user: FileUser,
+            _context: Context<'_>,
         ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -252,7 +254,7 @@ mod private {
             &self,
             _directory: Option<&File>,
             _path: &str,
-            _user: FileUser,
+            _context: Context<'_>,
         ) -> ServiceResult<()> {
             Err(BrokerError::UnsupportedOperation)
         }
@@ -310,7 +312,7 @@ where
         self: Arc<Self>,
         directory: Option<&File>,
         path: &str,
-        user: FileUser,
+        context: Context<'_>,
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: FileMode,
@@ -318,7 +320,7 @@ where
     ) -> ServiceResult<File> {
         let flags = open_flags(access, flags)?;
         let entry = match self.open_with_controlling_terminal(
-            user,
+            context,
             self.directory_anchor(directory)?,
             path,
             flags,
@@ -344,12 +346,12 @@ where
         &self,
         directory: Option<&File>,
         path: &str,
-        user: FileUser,
+        context: Context<'_>,
         follow_symlinks: bool,
     ) -> ServiceResult<FileStatus> {
         let mut status = match Resolver::file_status(
             self,
-            user,
+            context,
             self.directory_anchor(directory)?,
             path,
             follow_symlinks,
@@ -365,10 +367,10 @@ where
         &self,
         directory: Option<&File>,
         path: &str,
-        user: FileUser,
+        context: Context<'_>,
     ) -> ServiceResult<String> {
         Ok(
-            Resolver::read_link(self, user, self.directory_anchor(directory)?, path)
+            Resolver::read_link(self, context, self.directory_anchor(directory)?, path)
                 .map_err(file_walk_error),
         )
     }
@@ -377,12 +379,12 @@ where
         &self,
         directory: Option<&File>,
         path: &str,
-        user: FileUser,
+        context: Context<'_>,
         mode: FileMode,
     ) -> ServiceResult<()> {
         Ok(Resolver::chmod(
             self,
-            user,
+            context,
             self.directory_anchor(directory)?,
             path,
             mode & FileMode::SUPPORTED,
@@ -394,13 +396,13 @@ where
         &self,
         directory: Option<&File>,
         path: &str,
-        acting_user: FileUser,
+        context: Context<'_>,
         user: Option<u16>,
         group: Option<u16>,
     ) -> ServiceResult<()> {
         Ok(Resolver::chown(
             self,
-            acting_user,
+            context,
             self.directory_anchor(directory)?,
             path,
             user,
@@ -409,9 +411,14 @@ where
         .map_err(file_chown_error))
     }
 
-    fn unlink(&self, directory: Option<&File>, path: &str, user: FileUser) -> ServiceResult<()> {
+    fn unlink(
+        &self,
+        directory: Option<&File>,
+        path: &str,
+        context: Context<'_>,
+    ) -> ServiceResult<()> {
         Ok(
-            Resolver::unlink(self, user, self.directory_anchor(directory)?, path)
+            Resolver::unlink(self, context, self.directory_anchor(directory)?, path)
                 .map_err(file_unlink_error),
         )
     }
@@ -422,11 +429,11 @@ where
         old_path: &str,
         new_directory: Option<&File>,
         new_path: &str,
-        user: FileUser,
+        context: Context<'_>,
     ) -> ServiceResult<()> {
         Ok(Resolver::rename(
             self,
-            user,
+            context,
             self.directory_anchor(old_directory)?,
             old_path,
             self.directory_anchor(new_directory)?,
@@ -439,12 +446,12 @@ where
         &self,
         directory: Option<&File>,
         path: &str,
-        user: FileUser,
+        context: Context<'_>,
         mode: FileMode,
     ) -> ServiceResult<()> {
         Ok(Resolver::mkdir(
             self,
-            user,
+            context,
             self.directory_anchor(directory)?,
             path,
             mode & FileMode::SUPPORTED,
@@ -452,8 +459,8 @@ where
         .map_err(file_mkdir_error))
     }
 
-    fn mount_in_mem(&self, path: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(Resolver::mount_in_mem(self, user, path))
+    fn mount_in_mem(&self, path: &str, context: Context<'_>) -> ServiceResult<()> {
+        Ok(Resolver::mount_in_mem(self, context, path))
     }
 
     fn symlink(
@@ -461,11 +468,11 @@ where
         target: &str,
         directory: Option<&File>,
         linkpath: &str,
-        user: FileUser,
+        context: Context<'_>,
     ) -> ServiceResult<()> {
         Ok(Resolver::symlink(
             self,
-            user,
+            context,
             target,
             self.directory_anchor(directory)?,
             linkpath,
@@ -473,9 +480,14 @@ where
         .map_err(file_symlink_error))
     }
 
-    fn rmdir(&self, directory: Option<&File>, path: &str, user: FileUser) -> ServiceResult<()> {
+    fn rmdir(
+        &self,
+        directory: Option<&File>,
+        path: &str,
+        context: Context<'_>,
+    ) -> ServiceResult<()> {
         Ok(
-            Resolver::rmdir(self, user, self.directory_anchor(directory)?, path)
+            Resolver::rmdir(self, context, self.directory_anchor(directory)?, path)
                 .map_err(file_rmdir_error),
         )
     }
@@ -621,6 +633,7 @@ where
 
     fn read_directory(
         &self,
+        caller: Caller<'_>,
         output: &mut dyn ReadBuffer,
         mode: DirectoryReadMode,
     ) -> ServiceResult<ReadDirectoryResponse> {
@@ -641,7 +654,7 @@ where
         if !entry.allows_read() {
             return Ok(Err(FileError::NotForReading));
         }
-        let mut entries = match self.resolver.read_dir(entry) {
+        let mut entries = match self.resolver.read_dir(caller, entry) {
             Ok(entries) => entries,
             Err(error) => return Ok(Err(file_read_directory_error(error))),
         };
@@ -712,9 +725,9 @@ where
         }))
     }
 
-    fn handle_status(&self) -> ServiceResult<FileStatus> {
+    fn handle_status(&self, caller: Caller<'_>) -> ServiceResult<FileStatus> {
         let entry = self.entry.read();
-        let mut status = match self.resolver.handle_status(&entry) {
+        let mut status = match self.resolver.handle_status(caller, &entry) {
             Ok(status) => status,
             Err(error) => return Ok(Err(file_status_error(error))),
         };
@@ -722,9 +735,12 @@ where
         Ok(Ok(status))
     }
 
-    fn handle_path(&self) -> ServiceResult<String> {
+    fn handle_path(&self, caller: Caller<'_>) -> ServiceResult<String> {
         let entry = self.entry.read();
-        Ok(self.resolver.handle_path(&entry).map_err(file_walk_error))
+        Ok(self
+            .resolver
+            .handle_path(caller, &entry)
+            .map_err(file_walk_error))
     }
 
     fn get_status_flags(&self) -> FileStatusFlags {
@@ -761,11 +777,11 @@ where
         Ok(())
     }
 
-    fn set_times(&self, user: FileUser, times: &SetFileTimes) -> ServiceResult<()> {
+    fn set_times(&self, context: Context<'_>, times: &SetFileTimes) -> ServiceResult<()> {
         let entry = self.entry.read();
         Ok(self
             .resolver
-            .set_times(user, &entry, times)
+            .set_times(context, &entry, times)
             .map_err(file_set_times_error))
     }
 
@@ -803,7 +819,7 @@ pub fn open(
         let file = match Arc::clone(&process.fs).open(
             directory,
             path,
-            user,
+            Context::new(user, Caller::new(process)),
             access,
             flags,
             mode,
@@ -846,13 +862,20 @@ pub(crate) fn open_without_reference(
     if let Err(error) = validate_path(None, path) {
         return Ok(Err(error));
     }
-    let file = match Arc::clone(&process.fs).open(None, path, user, access, flags, mode, &|| {
-        crate::process_group::controlling_terminal(process)
-    })? {
+    let caller = Caller::new(process);
+    let file = match Arc::clone(&process.fs).open(
+        None,
+        path,
+        Context::new(user, caller),
+        access,
+        flags,
+        mode,
+        &|| crate::process_group::controlling_terminal(process),
+    )? {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
-    let status = match file.state.handle_status()? {
+    let status = match file.state.handle_status(caller)? {
         Ok(status) => status,
         Err(error) => return Ok(Err(error)),
     };
@@ -962,7 +985,8 @@ pub fn read_directory(
     mode: DirectoryReadMode,
 ) -> ServiceResult<ReadDirectoryResponse> {
     let file = file(process, handle, ObjectRights::WAIT)?;
-    file.state.read_directory(output, mode)
+    file.state
+        .read_directory(Caller::new(process), output, mode)
 }
 
 /// Returns status for a broker-owned open object.
@@ -971,14 +995,14 @@ pub fn handle_status(
     handle: ObjectHandle,
 ) -> Result<FileResult<FileStatus>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    file.state.handle_status()
+    file.state.handle_status(Caller::new(process))
 }
 
 /// Returns the name of an open file; see
 /// [`HandleFilePathRequest`](litebox_broker_protocol::fs::HandleFilePathRequest).
 pub fn handle_path(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<String>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    file.state.handle_path()
+    file.state.handle_path(Caller::new(process))
 }
 
 /// Returns whether a broker-owned open object refers to a terminal, which it does exactly when it
@@ -1046,7 +1070,12 @@ pub fn path_status(
 ) -> Result<FileResult<FileStatus>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     with_path_anchor(process, directory, path, |dir| {
-        process.fs.path_status(dir, path, user, follow_symlinks)
+        process.fs.path_status(
+            dir,
+            path,
+            Context::new(user, Caller::new(process)),
+            follow_symlinks,
+        )
     })
 }
 
@@ -1060,7 +1089,9 @@ pub fn read_link(
 ) -> Result<FileResult<String>> {
     process.require_object_rights(ObjectRights::WAIT)?;
     with_path_anchor(process, directory, path, |dir| {
-        process.fs.read_link(dir, path, user)
+        process
+            .fs
+            .read_link(dir, path, Context::new(user, Caller::new(process)))
     })
 }
 
@@ -1073,7 +1104,8 @@ pub fn set_times(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    file.state.set_times(user, times)
+    file.state
+        .set_times(Context::new(user, Caller::new(process)), times)
 }
 
 /// Changes mode bits, resolving a relative `path` from `directory`.
@@ -1087,7 +1119,9 @@ pub fn chmod(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, path, |dir| {
-        process.fs.chmod(dir, path, user, mode)
+        process
+            .fs
+            .chmod(dir, path, Context::new(user, Caller::new(process)), mode)
     })
 }
 
@@ -1103,7 +1137,13 @@ pub fn chown(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, path, |dir| {
-        process.fs.chown(dir, path, acting_user, user, group)
+        process.fs.chown(
+            dir,
+            path,
+            Context::new(acting_user, Caller::new(process)),
+            user,
+            group,
+        )
     })
 }
 
@@ -1117,7 +1157,9 @@ pub fn unlink(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, path, |dir| {
-        process.fs.unlink(dir, path, user)
+        process
+            .fs
+            .unlink(dir, path, Context::new(user, Caller::new(process)))
     })
 }
 
@@ -1134,9 +1176,13 @@ pub fn rename(
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, old_directory, old_path, |old_dir| {
         with_path_anchor(process, new_directory, new_path, |new_dir| {
-            process
-                .fs
-                .rename(old_dir, old_path, new_dir, new_path, user)
+            process.fs.rename(
+                old_dir,
+                old_path,
+                new_dir,
+                new_path,
+                Context::new(user, Caller::new(process)),
+            )
         })
     })
 }
@@ -1152,7 +1198,9 @@ pub fn mkdir(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, path, |dir| {
-        process.fs.mkdir(dir, path, user, mode)
+        process
+            .fs
+            .mkdir(dir, path, Context::new(user, Caller::new(process)), mode)
     })
 }
 
@@ -1162,7 +1210,9 @@ pub fn mount_in_mem(process: &BrokerProcess, path: &str, user: FileUser) -> Resu
     if let Err(error) = validate_path(None, path) {
         return Ok(Err(error));
     }
-    process.fs.mount_in_mem(path, user)
+    process
+        .fs
+        .mount_in_mem(path, Context::new(user, Caller::new(process)))
 }
 
 /// Creates a symbolic link storing `target` without resolving it, resolving a relative
@@ -1176,7 +1226,12 @@ pub fn symlink(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, linkpath, |dir| {
-        process.fs.symlink(target, dir, linkpath, user)
+        process.fs.symlink(
+            target,
+            dir,
+            linkpath,
+            Context::new(user, Caller::new(process)),
+        )
     })
 }
 
@@ -1190,7 +1245,9 @@ pub fn rmdir(
 ) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
     with_path_anchor(process, directory, path, |dir| {
-        process.fs.rmdir(dir, path, user)
+        process
+            .fs
+            .rmdir(dir, path, Context::new(user, Caller::new(process)))
     })
 }
 

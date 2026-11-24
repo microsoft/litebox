@@ -17,6 +17,7 @@ use litebox_broker_core::{
         devices::Devices,
         in_mem::{InMem, InitialNode},
         overlay::Overlay,
+        procfs::ProcFs,
         resolver::Resolver,
         tar_ro::TarRo,
     },
@@ -62,7 +63,9 @@ fn file_service(
             )
         });
     }
-    composer = composer.mount("/dev", |allocator| Devices::new(allocator, stdio, random));
+    composer = composer
+        .mount("/proc", ProcFs::new)
+        .mount("/dev", |allocator| Devices::new(allocator, stdio, random));
     for Share { path, server } in shares {
         let mounted = match server {
             Server::NineP(transport) => composer

@@ -105,8 +105,9 @@ use io_errors::{
 };
 
 use litebox_broker_core::fs::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+    Backend, BackendHandles, Caller, CreationMetadata, DirHandle, FileHandle, HandleRef,
+    PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
+    SeekBehavior,
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -638,7 +639,7 @@ impl LocalFs {
 }
 
 impl Backend for LocalFs {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root(&self, _caller: Caller<'_>) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(ResolvedDir::from_typed::<Self>(
             self.root_dir(),
             PermissionCheck::ByBackend,
@@ -647,6 +648,7 @@ impl Backend for LocalFs {
 
     fn resolve<'a>(
         &'a self,
+        _caller: Caller<'_>,
         from: ResolvedDir<'a>,
         components: &[&str],
         _authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -742,7 +744,12 @@ impl Backend for LocalFs {
         )))
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at(
+        &self,
+        _caller: Caller<'_>,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         guard_path_operations!(self, Err(WalkError::Io));
         validate_name(name)?;
         let dir = dir.get_typed::<Self>();
@@ -896,7 +903,11 @@ impl Backend for LocalFs {
         ))
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+    fn dir_path(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<Vec<String>>, WalkError> {
         guard_path_operations!(self, Err(WalkError::Io));
         let dir = dir.get_typed::<Self>();
         if !self.valid_dir(dir) {
@@ -907,7 +918,11 @@ impl Backend for LocalFs {
         components_under(&root, &name).map(Some)
     }
 
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+    fn parent_dir(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<DirHandle>, WalkError> {
         guard_path_operations!(self, Err(WalkError::Io));
         let dir = dir.get_typed::<Self>();
         // On Linux, `parent_under` checks containment itself; checking here too would repeat its
@@ -1005,7 +1020,11 @@ impl Backend for LocalFs {
         }))
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+    fn list_dir_at(
+        &self,
+        _caller: Caller<'_>,
+        handle: DirHandle,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
         guard_path_operations!(self, Err(ReadDirError::Io));
         let dir = handle.into_typed::<Self>();
         // Like Linux, listing a removed directory fails with ENOENT.
@@ -1128,7 +1147,7 @@ impl Backend for LocalFs {
         }
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+    fn status(&self, _caller: Caller<'_>, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         guard_path_operations!(self, Err(FileStatusError::Io));
         match h {
             HandleRef::Dir(dir) => {
@@ -1153,7 +1172,11 @@ impl Backend for LocalFs {
         }
     }
 
-    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+    fn resolved_status(
+        &self,
+        _caller: Caller<'_>,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<FileStatus, FileStatusError> {
         guard_path_operations!(self, Err(FileStatusError::Io));
         let (location, file_type) = match target {
             ResolvedTarget::Dir(dir) => {

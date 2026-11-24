@@ -19,9 +19,9 @@ use alloc::vec::Vec;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
-    Backend, CreationMetadata, DirHandle, DirPathResult, FileHandle, FileTerminal, HandleRef,
-    PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
-    SeekBehavior,
+    Backend, Caller, CreationMetadata, DirHandle, DirPathResult, FileHandle, FileTerminal,
+    HandleRef, PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile,
+    ResolvedTarget, SeekBehavior,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, ReadDirError,
@@ -63,19 +63,22 @@ fn read_only_flags(flags: OFlags) -> Result<OFlags, OpenError> {
 }
 
 impl<B: Backend> Backend for ReadOnly<B> {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        let mut dir = self.inner.root()?;
+    fn root(&self, caller: Caller<'_>) -> Result<ResolvedDir<'_>, WalkError> {
+        let mut dir = self.inner.root(caller)?;
         mark_read_only(&mut dir.permissions);
         Ok(dir)
     }
 
     fn resolve<'a>(
         &'a self,
+        caller: Caller<'_>,
         from: ResolvedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError> {
-        let mut resolution = self.inner.resolve(from, components, authorize_dir_lookup)?;
+        let mut resolution = self
+            .inner
+            .resolve(caller, from, components, authorize_dir_lookup)?;
         match &mut resolution {
             Resolution::Found(ResolvedTarget::Dir(dir))
             | Resolution::MissingFinal { parent: dir } => mark_read_only(&mut dir.permissions),
@@ -86,8 +89,13 @@ impl<B: Backend> Backend for ReadOnly<B> {
         Ok(resolution)
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
-        self.inner.read_link_at(dir, name)
+    fn read_link_at(
+        &self,
+        caller: Caller<'_>,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
+        self.inner.read_link_at(caller, dir, name)
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
@@ -109,12 +117,20 @@ impl<B: Backend> Backend for ReadOnly<B> {
         Ok((dir, path))
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
-        self.inner.dir_path(dir)
+    fn dir_path(
+        &self,
+        caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<Vec<String>>, WalkError> {
+        self.inner.dir_path(caller, dir)
     }
 
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
-        self.inner.parent_dir(dir)
+    fn parent_dir(
+        &self,
+        caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<DirHandle>, WalkError> {
+        self.inner.parent_dir(caller, dir)
     }
 
     fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
@@ -130,8 +146,12 @@ impl<B: Backend> Backend for ReadOnly<B> {
         self.inner.open_file(file, read_only_flags(flags)?)
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        self.inner.list_dir_at(handle)
+    fn list_dir_at(
+        &self,
+        caller: Caller<'_>,
+        handle: DirHandle,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
+        self.inner.list_dir_at(caller, handle)
     }
 
     fn lookup_at(&self, dir: &DirHandle, name: &str) -> Result<Option<DirEntry>, ReadDirError> {
@@ -172,12 +192,16 @@ impl<B: Backend> Backend for ReadOnly<B> {
         self.inner.seek_behavior(h)
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
-        self.inner.status(h)
+    fn status(&self, caller: Caller<'_>, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+        self.inner.status(caller, h)
     }
 
-    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
-        self.inner.resolved_status(target)
+    fn resolved_status(
+        &self,
+        caller: Caller<'_>,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<FileStatus, FileStatusError> {
+        self.inner.resolved_status(caller, target)
     }
 
     fn terminal(&self, h: &FileHandle) -> Option<FileTerminal> {

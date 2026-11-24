@@ -6,7 +6,9 @@
 // with the argument `unprivileged`, as another user, who can't create namespaces.
 //
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/sched.h>
 #include <poll.h>
 #include <pthread.h>
@@ -16,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -126,15 +129,78 @@ static pid_t vfork_identity_check(unsigned long flags) {
                  CLONE_VM | CLONE_VFORK | flags | SIGCHLD, NULL);
 }
 
+// The inherited root dirfd must use the caller's view, not the opener's view.
+static void check_procfs_in_child(int proc) {
+    char path[64] = {0};
+    CHECK(readlinkat(proc, "self", path, sizeof path) == 1 && strcmp(path, "1") == 0);
+    struct stat status;
+    CHECK(fstatat(proc, "self", &status, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(status.st_mode));
+    CHECK(fstatat(proc, "self", &status, 0) == 0 && S_ISDIR(status.st_mode));
+    CHECK(mkdirat(proc, "new", 0755) == -1 && errno == EROFS);
+
+    int own = openat(proc, "self", O_RDONLY | O_DIRECTORY);
+    CHECK(own >= 0);
+    if (own < 0) {
+        return;
+    }
+    CHECK(fchdir(own) == 0);
+    CHECK(getcwd(path, sizeof path) && strcmp(path, "/proc/1") == 0);
+    CHECK(readlinkat(own, "../self", path, sizeof path) == 1 && path[0] == '1');
+    CHECK(fstatat(own, "fd", &status, 0) == -1 && errno == ENOENT);
+    close(own);
+    CHECK(chdir("..") == 0);
+    CHECK(getcwd(path, sizeof path) && strcmp(path, "/proc") == 0);
+
+    DIR *listing = opendir(".");
+    CHECK(listing != NULL);
+    if (listing != NULL) {
+        unsigned seen = 0;
+        struct dirent *entry;
+        while ((entry = readdir(listing)) != NULL) {
+            if (strcmp(entry->d_name, "self") == 0) {
+                CHECK(entry->d_type == DT_LNK);
+                seen |= 1;
+            } else if (strcmp(entry->d_name, "1") == 0) {
+                CHECK(entry->d_type == DT_DIR);
+                seen |= 2;
+            } else {
+                CHECK(strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0);
+            }
+        }
+        CHECK(seen == 3);
+        closedir(listing);
+    }
+
+    pid_t peer = fork();
+    if (peer == 0) {
+        memset(path, 0, sizeof path);
+        _exit(readlinkat(proc, "self", path, sizeof path - 1) > 0 && atoi(path) == getpid() ? 0 : 1);
+    }
+    CHECK(peer > 1 && exited_with(peer, 0));
+}
+
 // A child created in a new namespace is its first process, 1, and sees no parent; its parent sees
 // it under another ID and collects it.
 static void clone_makes_a_first_process(void) {
+    int proc = open("/proc", O_RDONLY | O_DIRECTORY);
+    CHECK(proc >= 0);
     pid_t child = clone_child(CLONE_NEWPID);
     if (child == 0) {
-        _exit(getpid() == 1 && getppid() == 0 ? 0 : 1);
+        CHECK(getpid() == 1 && getppid() == 0);
+        check_procfs_in_child(proc);
+        _exit(failures != 0);
     }
     CHECK(child > 1);
+    char name[16];
+    snprintf(name, sizeof name, "%d", (int)child);
+    int child_dir = openat(proc, name, O_RDONLY | O_DIRECTORY);
+    CHECK(child_dir >= 0);
     CHECK(exited_with(child, 0));
+    struct stat status;
+    CHECK(fstatat(proc, name, &status, 0) == -1 && errno == ENOENT);
+    CHECK(fstatat(child_dir, ".", &status, 0) == -1 && errno == ENOENT);
+    close(child_dir);
+    close(proc);
 }
 
 // After `unshare`, the caller keeps its ID, its next child is the new namespace's first process,

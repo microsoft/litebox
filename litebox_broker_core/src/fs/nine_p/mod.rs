@@ -18,6 +18,7 @@ use thiserror::Error;
 
 use self::fcall::Rlerror;
 use super::OFlags;
+use super::backend::Caller;
 use super::backend::{
     DirHandle, DirPathResult, FileHandle, HandleRef, PermissionCheck, PermissionInfo, Resolution,
     ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
@@ -336,7 +337,7 @@ where
     Platform: sync::RawSyncPrimitivesProvider + 'static,
     T: transport::Read + transport::Write + Send + 'static,
 {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root(&self, _caller: Caller<'_>) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(ResolvedDir::from_typed::<Self>(
             NinePWalkingDirHandle {
                 fid: Arc::clone(&self.root),
@@ -348,6 +349,7 @@ where
 
     fn resolve<'a>(
         &'a self,
+        _caller: Caller<'_>,
         from: ResolvedDir<'a>,
         components: &[&str],
         _authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -435,7 +437,12 @@ where
         )))
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at(
+        &self,
+        _caller: Caller<'_>,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         let dir = dir.get_typed::<Self>();
         let fid = self.own(
             self.client
@@ -488,13 +495,21 @@ where
         ))
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+    fn dir_path(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<Vec<String>>, WalkError> {
         let dir = dir.get_typed::<Self>();
         let attr = self.verified_held_dir_attr(dir, fcall::GetattrMask::NLINK)?;
         self.path_of_held_dir(dir, &attr)
     }
 
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+    fn parent_dir(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<DirHandle>, WalkError> {
         let dir = dir.get_typed::<Self>();
         self.verified_held_dir_attr(dir, fcall::GetattrMask::NLINK)?;
         Ok(self
@@ -540,7 +555,11 @@ where
         Ok(FileHandle::from_typed::<Self>(NinePFileHandle { fid }))
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<super::DirEntry>, ReadDirError> {
+    fn list_dir_at(
+        &self,
+        _caller: Caller<'_>,
+        handle: DirHandle,
+    ) -> Result<Vec<super::DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         let entries = self
             .client
@@ -621,7 +640,11 @@ where
         SeekBehavior::PositionBased
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<super::FileStatus, FileStatusError> {
+    fn status(
+        &self,
+        _caller: Caller<'_>,
+        h: HandleRef<'_>,
+    ) -> Result<super::FileStatus, FileStatusError> {
         let attr = match h {
             HandleRef::File(h) => self
                 .client
@@ -635,6 +658,7 @@ where
 
     fn resolved_status(
         &self,
+        _caller: Caller<'_>,
         target: &ResolvedTarget<'_>,
     ) -> Result<super::FileStatus, FileStatusError> {
         let fid = match target {
