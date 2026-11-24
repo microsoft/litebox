@@ -16,6 +16,14 @@ workspace = true
 verify = true
 
 [[example]]
+name = "process_quota_broker_frame_negative"
+path = "src/negative/process_quota_broker_frame_negative.rs"
+
+[[example]]
+name = "process_quota_clamping_negative"
+path = "src/negative/process_quota_clamping_negative.rs"
+
+[[example]]
 name = "object_policy_negative"
 path = "src/negative/object_policy_negative.rs"
 

@@ -27,6 +27,8 @@ pub mod event;
 pub mod fs;
 mod id;
 pub mod job;
+#[cfg(verus_keep_ghost)]
+pub mod limits_spec;
 mod object;
 pub mod pid_namespace;
 pub mod pipe;
@@ -89,6 +91,8 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 ///
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
+// In progress: derives, other builders and live quota enforcement remain unverified.
+#[vstd::prelude::verus_verify(external_derive)]
 pub struct BrokerCoreLimits {
     /// Maximum broker processes, across every PID namespace, that have not
     /// completed core teardown.
@@ -227,6 +231,9 @@ impl BrokerCoreLimits {
     /// A quota above its broker-wide limit is accepted; the broker-wide limit
     /// still applies, so the effective limit is the smaller value.
     #[must_use]
+    #[vstd::prelude::verus_spec(result => ensures
+        limits_spec::process_quota_transition(self, result, max_references_per_process, max_pipe_capacity_per_process)
+    )]
     pub const fn with_process_quotas(
         self,
         max_references_per_process: usize,
@@ -277,6 +284,9 @@ impl BrokerCoreLimits {
 
     /// Returns these limits with an explicit broker process limit.
     #[must_use]
+    #[vstd::prelude::verus_spec(result => ensures
+        limits_spec::process_limit_transition(self, result, max_processes)
+    )]
     pub const fn with_process_limit(self, max_processes: usize) -> Self {
         Self {
             max_processes,
