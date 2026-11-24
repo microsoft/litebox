@@ -174,3 +174,11 @@ path = "src/negative/file_service_seek_mode_negative.rs"
 [[example]]
 name = "file_service_seek_offset_negative"
 path = "src/negative/file_service_seek_offset_negative.rs"
+
+[[example]]
+name = "file_service_directory_mode_negative"
+path = "src/negative/file_service_directory_mode_negative.rs"
+
+[[example]]
+name = "file_service_directory_kind_negative"
+path = "src/negative/file_service_directory_kind_negative.rs"

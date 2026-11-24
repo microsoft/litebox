@@ -1203,6 +1203,7 @@ fn file_rmdir_error(error: RmdirError) -> FileError {
     }
 }
 
+#[verus_spec(result => ensures result == verification::file_read_directory_error_value(error))]
 fn file_read_directory_error(error: ReadDirError) -> FileError {
     match error {
         ReadDirError::NotADirectory => FileError::NotDirectory,

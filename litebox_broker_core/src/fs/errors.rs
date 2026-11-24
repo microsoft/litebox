@@ -309,6 +309,8 @@ pub enum RmdirError {
 
 /// Possible errors from [`super::resolver::Resolver::read_dir`]
 #[derive(Error, Debug)]
+// In progress: derived implementations remain unverified.
+#[verus_verify(external_derive)]
 pub enum ReadDirError {
     #[error("fd has been closed already")]
     ClosedFd,

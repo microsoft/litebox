@@ -14,10 +14,13 @@
 //! from NotForWriting; original storage-to-truncate composition is checked.
 //! The original seek helper preserves InvalidOffset and NonSeekable separately
 //! from PathOnly. Actual seek arithmetic, positions and authority remain open.
+//! Original directory-read compatibility distinguishes NotDirectory and
+//! PathOnly; closed descriptors/I/O become Io. No enumeration or codec claim.
 
 pub use litebox_broker_core::fs::{
-    file_map_shared_error_value, file_read_error_value, file_seek_error_value,
-    file_service_error_policy, file_truncate_error_value, file_write_error_value,
+    file_map_shared_error_value, file_read_directory_error_value, file_read_error_value,
+    file_seek_error_value, file_service_error_policy, file_truncate_error_value,
+    file_write_error_value,
 };
 
 use vstd::prelude::*;
