@@ -12,6 +12,7 @@ pub mod filesystem_errors_proof;
 pub mod ipc_projection_proof;
 pub mod object_proof;
 pub mod pipe_proof;
+pub mod process_identity_proof;
 pub mod readonly_metadata_proof;
 pub mod shared_buffer_layout_proof;
 pub mod shared_futex_proof;

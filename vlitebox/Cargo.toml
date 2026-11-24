@@ -182,3 +182,7 @@ path = "src/negative/file_service_directory_mode_negative.rs"
 [[example]]
 name = "file_service_directory_kind_negative"
 path = "src/negative/file_service_directory_kind_negative.rs"
+
+[[example]]
+name = "process_creator_identity_negative"
+path = "src/negative/process_creator_identity_negative.rs"

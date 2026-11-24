@@ -13,6 +13,8 @@
 
 extern crate alloc;
 
+use vstd::prelude::{verus_spec, verus_verify};
+
 #[cfg(test)]
 extern crate std;
 
@@ -39,12 +41,17 @@ pub mod unix_socket;
 pub mod vsock_socket;
 pub mod wire;
 
+#[cfg(verus_keep_ghost)]
+pub mod process_identity_spec;
+
 /// Guest process ID carried by broker protocol messages.
 ///
 /// The broker core owns allocation and validity rules; the protocol preserves
 /// the numeric value without applying semantic checks.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// In progress: derived implementations and allocation validity are unverified.
+#[verus_verify(external_derive)]
 pub struct ProcessId(pub u32);
 
 /// Guest thread ID carried by broker protocol messages.
@@ -60,9 +67,13 @@ pub struct ThreadId(pub u32);
 /// A process group is identified by the ID of the process that created it.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// In progress: derived implementations and namespace authority are unverified.
+#[verus_verify(external_derive)]
 pub struct ProcessGroupId(pub u32);
 
+#[verus_verify]
 impl From<ProcessId> for ProcessGroupId {
+    #[verus_spec(result => ensures result.0 == creator.0)]
     fn from(creator: ProcessId) -> Self {
         Self(creator.0)
     }
@@ -73,9 +84,13 @@ impl From<ProcessId> for ProcessGroupId {
 /// A session is identified by the ID of the process that created it.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// In progress: derived implementations and namespace authority are unverified.
+#[verus_verify(external_derive)]
 pub struct SessionId(pub u32);
 
+#[verus_verify]
 impl From<ProcessId> for SessionId {
+    #[verus_spec(result => ensures result.0 == creator.0)]
     fn from(creator: ProcessId) -> Self {
         Self(creator.0)
     }
