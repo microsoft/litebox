@@ -16,8 +16,13 @@
 
 use crate::process::ChildExit;
 use crate::{ObjectHandle, ProcessGroupId, ProcessId, ThreadId};
+use vstd::prelude::verus_verify;
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::verus_spec;
 
 /// Largest signal number the broker delivers.
+#[verus_verify]
 pub const MAX_SIGNAL: u32 = 64;
 
 wire_enum! {

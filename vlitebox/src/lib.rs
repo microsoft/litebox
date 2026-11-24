@@ -25,6 +25,7 @@ pub use properties::file_projection_proof;
 pub use properties::filesystem_errors_proof;
 pub use properties::ipc_projection_proof;
 pub use properties::object_proof;
+pub use properties::pending_sender_proof;
 pub use properties::pipe_proof;
 pub use properties::process_identity_proof;
 pub use properties::readonly_metadata_proof;

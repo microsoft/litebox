@@ -1,14 +1,34 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Original signals-kind projection, not send, delivery, or ownership policy.
+//! Original signals-kind projection and immutable pending-sender query.
+//! Not send, coalescing, delivery, or ownership policy.
 
-use super::SignalsObject;
+use super::{MAX_SIGNAL, PendingSenders, ProcessId, SignalsObject};
 use crate::object::ObjectEntry;
 use crate::{BrokerError, Result};
 use vstd::prelude::*;
 
 verus! {
+
+pub closed spec fn pending_sender_empty_policy() -> bool {
+    forall|prev: PendingSenders, result: bool|
+        #[trigger] PendingSenders::is_empty.ensures((&prev,), result)
+            ==> result == (forall|i: int| 0 <= i < MAX_SIGNAL as int ==> prev.0[i].is_none())
+}
+
+pub proof fn prove_pending_sender_empty_query()
+    ensures pending_sender_empty_policy(),
+{
+}
+
+// An erased consumer of the original query, not the add/coalescing algorithm.
+pub fn check_pending_sender_array(senders: [Option<ProcessId>; MAX_SIGNAL as usize])
+    -> (result: bool)
+    ensures result == (forall|i: int| 0 <= i < MAX_SIGNAL as int ==> senders[i].is_none()),
+{
+    PendingSenders(senders).is_empty()
+}
 
 pub(crate) open spec fn signals_projection(entry: &ObjectEntry, result: Result<&SignalsObject>) -> bool {
     match entry {

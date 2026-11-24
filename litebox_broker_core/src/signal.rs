@@ -23,6 +23,9 @@ use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::Mutex;
 use vstd::prelude::verus_spec;
 
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::{BrokerError, BrokerProcess, Result};
@@ -333,6 +336,8 @@ impl ProcessSignals {
 /// The process that first sent each pending signal, indexed by signal number
 /// minus one.
 #[derive(Clone, Copy)]
+// In progress: derives, EMPTY initialization and mutating sender operations are unverified.
+#[vstd::prelude::verus_verify(external_derive)]
 struct PendingSenders([Option<ProcessId>; MAX_SIGNAL as usize]);
 
 impl PendingSenders {
@@ -366,6 +371,9 @@ impl PendingSenders {
             .find_map(|(sender, signal)| Some((signal, sender.take()?)))
     }
 
+    #[verus_spec(result =>
+        ensures result == (forall|i: int| 0 <= i < MAX_SIGNAL as int ==> self.0[i].is_none())
+    )]
     fn is_empty(&self) -> bool {
         self.0.iter().all(Option::is_none)
     }
