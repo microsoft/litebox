@@ -1,5 +1,5 @@
 [
-  {"argv": ["/share", "virtiofs"], "expect_stdout": "hello from the host\nlink.txt -> greeting.txt\nhello from the host\nhello from the host\nabs.txt -> /mnt/host/greeting.txt\nhello from the host\ndeep\nbig.bin: 3158073 bytes\nmtime 1700000000\nfifo hidden\nmany: 3000 entries\nread-only\n"},
-  {"argv": ["/share-dyn", "virtiofs"], "expect_stdout": "hello from the host\nlink.txt -> greeting.txt\nhello from the host\nhello from the host\nabs.txt -> /mnt/host/greeting.txt\nhello from the host\ndeep\nbig.bin: 3158073 bytes\nmtime 1700000000\nfifo hidden\nmany: 3000 entries\nread-only\n"},
+  {"argv": ["/share", "virtiofs"], "expect_stdout": "hello from the host\nlink.txt -> greeting.txt\nhello from the host\nhello from the host\nabs.txt -> /mnt/host/greeting.txt\nhello from the host\ndeep\nparent\nbig.bin: 3158073 bytes\nmtime 1700000000\nfifo hidden\nmany: 3000 entries\nread-only\n"},
+  {"argv": ["/share-dyn", "virtiofs"], "expect_stdout": "hello from the host\nlink.txt -> greeting.txt\nhello from the host\nhello from the host\nabs.txt -> /mnt/host/greeting.txt\nhello from the host\ndeep\nparent\nbig.bin: 3158073 bytes\nmtime 1700000000\nfifo hidden\nmany: 3000 entries\nread-only\n"},
   {"argv": ["/mnt/host/hello"], "expect_stdout": "hello, world\n", "expect_stderr": ""}
 ]

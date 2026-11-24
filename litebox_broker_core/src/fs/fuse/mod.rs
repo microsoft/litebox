@@ -9,10 +9,16 @@
 //! in the guest's namespace. As the userland broker's host files, special files are hidden: the
 //! broker has no use for them, and their server-side opens would block (FIFOs) or reach the host's
 //! drivers (devices).
+//!
+//! As with Linux's dentries, a directory's `..` is where the client last found it, never asked of
+//! the server (`virtiofsd` resolves `..` within the directory itself): the host's moves show once a
+//! lookup or a listing finds them.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
@@ -29,6 +35,7 @@ use super::errors::{
 };
 use litebox_platform::buffer::{Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::sync;
+use litebox_platform::sync::{Mutex, MutexGuard};
 
 use crate::BrokerError;
 
@@ -51,7 +58,23 @@ pub mod transport;
 pub struct Fuse<Platform: sync::RawSyncPrimitivesProvider, T: transport::Transport> {
     client: Arc<client::Client<Platform, T>>,
     root: Arc<Node<Platform, T>>,
+    /// Held across each request that finds or changes names and the parents it updates, and while
+    /// reading a parent: with one request at a time, parents change in the server's order.
+    namespace: Mutex<Platform, ()>,
+    dirs: Arc<Dirs<Platform, T>>,
     device_id: u64,
+}
+
+/// The live directories' nodes, one per node id, as Linux keeps one dentry per directory.
+type Dirs<Platform, T> = Mutex<Platform, BTreeMap<u64, Weak<Node<Platform, T>>>>;
+
+/// The namespace lock, held.
+type Namespace<'a, Platform> = MutexGuard<'a, Platform, ()>;
+
+enum Found<Platform: sync::RawSyncPrimitivesProvider, T: transport::Transport> {
+    Dir(Arc<Node<Platform, T>>, abi::Attr),
+    /// Counted, for the caller to own or forget.
+    Other(abi::EntryOut),
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Transport> Fuse<Platform, T> {
@@ -64,23 +87,128 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Transport> Fuse<Pl
         Ok(Self {
             root: Arc::new(Node {
                 id: abi::ROOT_ID,
-                lookups: 0,
+                lookups: AtomicU64::new(0),
                 file_type: abi::S_IFDIR,
+                parent: Mutex::new(None),
+                dirs: None,
                 client: Arc::clone(&client),
             }),
+            namespace: Mutex::new(()),
+            dirs: Arc::new(Mutex::new(BTreeMap::new())),
             client,
             device_id: inode_allocator.device_id(),
         })
     }
 
-    /// A node the server just counted a lookup of.
-    fn own(&self, entry: &abi::EntryOut) -> Arc<Node<Platform, T>> {
+    /// The node of the non-directory `entry`, whose lookup the server just counted.
+    fn own_file(&self, entry: &abi::EntryOut) -> Arc<Node<Platform, T>> {
         Arc::new(Node {
             id: entry.nodeid,
-            lookups: 1,
+            lookups: AtomicU64::new(1),
             file_type: entry.attr.file_type(),
+            parent: Mutex::new(None),
+            dirs: None,
             client: Arc::clone(&self.client),
         })
+    }
+
+    /// `name` in `dir`; a directory through [`Self::dir_node`].
+    fn lookup(
+        &self,
+        namespace: &Namespace<'_, Platform>,
+        dir: &Arc<Node<Platform, T>>,
+        name: &str,
+    ) -> Result<Found<Platform, T>, Error> {
+        let entry = self.client.lookup(dir.id, name)?;
+        if entry.attr.is_dir() {
+            let node = self.dir_node(namespace, &entry, dir)?;
+            Ok(Found::Dir(node, entry.attr))
+        } else {
+            Ok(Found::Other(entry))
+        }
+    }
+
+    /// The directory `name` in `dir`; none if it is no directory.
+    fn dir_at(
+        &self,
+        namespace: &Namespace<'_, Platform>,
+        dir: &Arc<Node<Platform, T>>,
+        name: &str,
+    ) -> Result<Option<Arc<Node<Platform, T>>>, Error> {
+        match self.lookup(namespace, dir, name)? {
+            Found::Dir(node, _) => Ok(Some(node)),
+            Found::Other(entry) => {
+                self.client.forget(entry.nodeid, 1);
+                Ok(None)
+            }
+        }
+    }
+
+    /// The node of the directory `entry`, whose lookup in `parent` the server just counted: the live
+    /// one, moved there, else a new one.
+    fn dir_node(
+        &self,
+        namespace: &Namespace<'_, Platform>,
+        entry: &abi::EntryOut,
+        parent: &Arc<Node<Platform, T>>,
+    ) -> Result<Arc<Node<Platform, T>>, Error> {
+        let mut dirs = self.dirs.lock();
+        if let Some(node) = dirs.get(&entry.nodeid).and_then(Weak::upgrade) {
+            // A last reference's drop takes the lock.
+            drop(dirs);
+            node.lookups.fetch_add(1, Ordering::Relaxed);
+            Self::reparent(namespace, &node, parent)?;
+            return Ok(node);
+        }
+        let node = Arc::new(Node {
+            id: entry.nodeid,
+            lookups: AtomicU64::new(1),
+            file_type: abi::S_IFDIR,
+            parent: Mutex::new(Some(Arc::clone(parent))),
+            dirs: Some(Arc::clone(&self.dirs)),
+            client: Arc::clone(&self.client),
+        });
+        dirs.insert(entry.nodeid, Arc::downgrade(&node));
+        Ok(node)
+    }
+
+    /// Moves the directory `node` to `parent`; fails with `ELOOP` on a loop, as Linux does.
+    fn reparent(
+        namespace: &Namespace<'_, Platform>,
+        node: &Arc<Node<Platform, T>>,
+        parent: &Arc<Node<Platform, T>>,
+    ) -> Result<(), Error> {
+        let current = node.parent.lock().clone();
+        if current.is_some_and(|current| Arc::ptr_eq(&current, parent)) {
+            return Ok(());
+        }
+        if Self::is_ancestor(namespace, node, parent) {
+            return Err(Error::Remote(ELOOP));
+        }
+        Self::set_parent(namespace, node, parent);
+        Ok(())
+    }
+
+    fn set_parent(
+        _namespace: &Namespace<'_, Platform>,
+        node: &Node<Platform, T>,
+        parent: &Arc<Node<Platform, T>>,
+    ) {
+        let old = node.parent.lock().replace(Arc::clone(parent));
+        // After the lock: a last reference's drop forgets.
+        drop(old);
+    }
+
+    /// Whether `dir` is `descendant` or above it.
+    fn is_ancestor(
+        _namespace: &Namespace<'_, Platform>,
+        dir: &Arc<Node<Platform, T>>,
+        descendant: &Arc<Node<Platform, T>>,
+    ) -> bool {
+        core::iter::successors(Some(Arc::clone(descendant)), |above| {
+            above.parent.lock().clone()
+        })
+        .any(|above| Arc::ptr_eq(&above, dir))
     }
 
     fn getattr(&self, node: &Node<Platform, T>, fh: Option<u64>) -> Result<abi::Attr, Error> {
@@ -137,21 +265,55 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Transport> Fuse<Pl
         }
     }
 
-    /// A listed name's attributes, by its lookup.
-    fn lookup_attr(&self, dir: u64, name: &str) -> Result<abi::Attr, Error> {
-        let entry = self.client.lookup(dir, name)?;
-        self.client.forget(entry.nodeid, 1);
+    /// A listed name's attributes, by a lookup that also moves a directory found there, loops aside:
+    /// as on Linux, only walks fail on them.
+    fn lookup_attr(&self, dir: &Arc<Node<Platform, T>>, name: &str) -> Result<abi::Attr, Error> {
+        let namespace = self.namespace.lock();
+        let entry = self.client.lookup(dir.id, name)?;
+        if entry.attr.is_dir() {
+            drop(self.dir_node(&namespace, &entry, dir));
+        } else {
+            self.client.forget(entry.nodeid, 1);
+        }
         Ok(entry.attr)
+    }
+
+    /// Fails unless the server's user may write and search `dir`: Linux checks it before a removed
+    /// name's type.
+    fn check_removal(&self, dir: &Node<Platform, T>) -> Result<(), Error> {
+        const W_OK: u32 = 2;
+        const X_OK: u32 = 1;
+        self.client.access(dir.id, W_OK | X_OK)
+    }
+
+    /// Looks the new name `name` in `dir` up, as Linux does before creating it: a directory there
+    /// moves, and an existing name fails with `EEXIST` without the server.
+    fn look_before_creating(
+        &self,
+        namespace: &Namespace<'_, Platform>,
+        dir: &Arc<Node<Platform, T>>,
+        name: &str,
+    ) -> Result<(), Error> {
+        match self.dir_at(namespace, dir, name) {
+            Err(Error::Remote(ENOENT)) => Ok(()),
+            Ok(_) => Err(Error::Remote(EEXIST)),
+            Err(error) => Err(error),
+        }
     }
 }
 
 /// Forgotten with its last reference.
 struct Node<Platform: sync::RawSyncPrimitivesProvider, T: transport::Transport> {
     id: u64,
-    /// Zero for the root, which is never forgotten.
-    lookups: u64,
+    /// The server's count; zero for the root, which is never forgotten.
+    lookups: AtomicU64,
     /// `S_IFMT` bits.
     file_type: u32,
+    /// A directory's `..` (see the module's docs); none for the root and non-directories. Changes
+    /// under the namespace lock.
+    parent: Mutex<Platform, Option<Arc<Node<Platform, T>>>>,
+    /// A directory's table, which it leaves with its last reference; none for the root.
+    dirs: Option<Arc<Dirs<Platform, T>>>,
     client: Arc<client::Client<Platform, T>>,
 }
 
@@ -169,8 +331,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Transport> Drop
     for Node<Platform, T>
 {
     fn drop(&mut self) {
-        if self.lookups > 0 {
-            self.client.forget(self.id, self.lookups);
+        if let Some(dirs) = &self.dirs {
+            let mut dirs = dirs.lock();
+            // Unless a lookup replaced it meanwhile.
+            if dirs
+                .get(&self.id)
+                .is_some_and(|node| node.strong_count() == 0)
+            {
+                dirs.remove(&self.id);
+            }
+        }
+        let lookups = *self.lookups.get_mut();
+        if lookups > 0 {
+            self.client.forget(self.id, lookups);
+        }
+        // The ancestors it alone kept, here rather than by nested drops: a chain can be deeper
+        // than the stack.
+        let mut parent = self.parent.get_mut().take();
+        while let Some(mut node) = parent.and_then(Arc::into_inner) {
+            parent = node.parent.get_mut().take();
+            drop(node);
         }
     }
 }
@@ -332,8 +512,19 @@ where
         let mut current = from.into_typed::<Self>();
         for (index, name) in components.iter().enumerate() {
             let last = index + 1 == components.len();
-            let entry = match self.client.lookup(current.node.id, name) {
-                Ok(entry) => entry,
+            let found = {
+                let namespace = self.namespace.lock();
+                self.lookup(&namespace, &current.node, name)
+            };
+            let entry = match found {
+                Ok(Found::Dir(node, attr)) => {
+                    current = FuseResolvedDir {
+                        node,
+                        attr: Some(attr),
+                    };
+                    continue;
+                }
+                Ok(Found::Other(entry)) => entry,
                 Err(Error::Remote(ENOENT)) if last => {
                     return Ok(Resolution::MissingFinal {
                         parent: Self::resolved_dir(current),
@@ -346,7 +537,7 @@ where
                     });
                 }
             };
-            let node = self.own(&entry);
+            let node = self.own_file(&entry);
             let Some(file_type) = mode_to_file_type(entry.attr.mode) else {
                 // Hidden, as in listings; `EINVAL`, as for the userland broker's host files.
                 return Err(ResolutionError {
@@ -354,13 +545,6 @@ where
                     error: PathError::InvalidPathname.into(),
                 });
             };
-            if entry.attr.is_dir() {
-                current = FuseResolvedDir {
-                    node,
-                    attr: Some(entry.attr),
-                };
-                continue;
-            }
             if !last {
                 return Err(ResolutionError {
                     component: Some(index + 1),
@@ -389,8 +573,14 @@ where
         dir: &ResolvedDir<'_>,
         name: &str,
     ) -> Result<String, WalkError> {
-        let entry = self.client.lookup(dir.get_typed::<Self>().node.id, name)?;
-        let node = self.own(&entry);
+        let found = {
+            let namespace = self.namespace.lock();
+            self.lookup(&namespace, &dir.get_typed::<Self>().node, name)?
+        };
+        let Found::Other(entry) = found else {
+            return Err(PathError::InvalidPathname.into());
+        };
+        let node = self.own_file(&entry);
         if entry.attr.file_type() != abi::S_IFLNK {
             return Err(PathError::InvalidPathname.into());
         }
@@ -440,22 +630,11 @@ where
         _caller: Caller<'_>,
         dir: &DirHandle,
     ) -> Result<Option<DirHandle>, WalkError> {
-        let node = &dir.get_typed::<Self>().node;
-        if node.id == abi::ROOT_ID {
-            return Ok(None);
-        }
-        let entry = self.client.lookup_parent(node.id)?;
-        let parent = if entry.nodeid == abi::ROOT_ID {
-            // The root's lookups are not counted.
-            self.client.forget(abi::ROOT_ID, 1);
-            Arc::clone(&self.root)
-        } else {
-            self.own(&entry)
+        let parent = {
+            let _namespace = self.namespace.lock();
+            dir.get_typed::<Self>().node.parent.lock().clone()
         };
-        Ok(Some(DirHandle::from_typed::<Self>(FuseDirHandle {
-            node: parent,
-            open: None,
-        })))
+        Ok(parent.map(|node| DirHandle::from_typed::<Self>(FuseDirHandle { node, open: None })))
     }
 
     fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
@@ -527,7 +706,7 @@ where
             let (file_type, ino) = if entry.typ == DT_UNKNOWN {
                 // An entry removed since, or that the server's user may not look up, is not
                 // listed; other failures would leave the listing incomplete.
-                match self.lookup_attr(open.node.id, &name) {
+                match self.lookup_attr(&open.node, &name) {
                     Ok(attr) => (mode_to_file_type(attr.mode), attr.ino),
                     Err(Error::Remote(ENOENT | EACCES | EPERM)) => continue,
                     Err(error) => return Err(error.into()),
@@ -672,13 +851,12 @@ where
         let dir = dir.into_typed::<Self>();
         // As with 9P, the server needs an access mode; the resolver enforces the caller's.
         let flags = (OFlags::RDWR | OFlags::CREAT | OFlags::EXCL).bits();
-        let (entry, open) = self.client.create(
-            dir.node.id,
-            name,
-            flags,
-            abi::S_IFREG | host_mode(metadata.mode),
-        )?;
-        let node = self.own(&entry);
+        let (entry, open) = {
+            let _namespace = self.namespace.lock();
+            let mode = abi::S_IFREG | host_mode(metadata.mode);
+            self.client.create(dir.node.id, name, flags, mode)?
+        };
+        let node = self.own_file(&entry);
         let open = Arc::new(Open::new(Arc::clone(&node), open, flags, false));
         Ok(FileHandle::from_typed::<Self>(FuseFileHandle {
             node,
@@ -694,7 +872,11 @@ where
         _metadata: super::backend::CreationMetadata,
     ) -> Result<(), SymlinkError> {
         let dir = dir.into_typed::<Self>();
-        let entry = self.client.symlink(dir.node.id, name, target)?;
+        let entry = {
+            let namespace = self.namespace.lock();
+            self.look_before_creating(&namespace, &dir.node, name)?;
+            self.client.symlink(dir.node.id, name, target)?
+        };
         // The creation counted a lookup.
         self.client.forget(entry.nodeid, 1);
         Ok(())
@@ -707,22 +889,34 @@ where
         metadata: super::backend::CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
         let dir = dir.into_typed::<Self>();
-        let entry = self
-            .client
-            .mkdir(dir.node.id, name, host_mode(metadata.mode))?;
+        let namespace = self.namespace.lock();
+        self.look_before_creating(&namespace, &dir.node, name)?;
+        let entry = (self.client).mkdir(dir.node.id, name, host_mode(metadata.mode))?;
         Ok(DirHandle::from_typed::<Self>(FuseDirHandle {
-            node: self.own(&entry),
+            node: self.dir_node(&namespace, &entry, &dir.node)?,
             open: None,
         }))
     }
 
     fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
         let dir = dir.into_typed::<Self>();
+        let namespace = self.namespace.lock();
+        // As Linux, by the name's lookup, which moves a directory there.
+        if self.dir_at(&namespace, &dir.node, name)?.is_some() {
+            self.check_removal(&dir.node)?;
+            return Err(UnlinkError::IsADirectory);
+        }
         Ok(self.client.remove(dir.node.id, name, false)?)
     }
 
     fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
         let dir = dir.into_typed::<Self>();
+        let namespace = self.namespace.lock();
+        // As Linux, by the name's lookup: a removed directory keeps its parent at its removal.
+        let Some(_removed) = self.dir_at(&namespace, &dir.node, name)? else {
+            self.check_removal(&dir.node)?;
+            return Err(RmdirError::NotADirectory);
+        };
         Ok(self.client.remove(dir.node.id, name, true)?)
     }
 
@@ -736,9 +930,34 @@ where
     ) -> Result<(), RenameError> {
         let old_dir = old_dir.into_typed::<Self>();
         let new_dir = new_dir.into_typed::<Self>();
-        Ok(self
-            .client
-            .rename(old_dir.node.id, old_name, new_dir.node.id, new_name)?)
+        let namespace = self.namespace.lock();
+        // As Linux moves the source's dentry, the directory found at the old name moves, whatever the
+        // host does meanwhile; the new name's lookup, at the end, finds what the server moved.
+        let moved = self.dir_at(&namespace, &old_dir.node, old_name)?;
+        // A replaced directory keeps its parent at its removal.
+        let replaced = match self.dir_at(&namespace, &new_dir.node, new_name) {
+            Err(Error::Remote(ENOENT)) => None,
+            found => found?,
+        };
+        // As Linux checks its dentries.
+        if let Some(moved) = &moved
+            && Self::is_ancestor(&namespace, moved, &new_dir.node)
+        {
+            return Err(RenameError::InvalidArgument);
+        }
+        if let Some(replaced) = &replaced
+            && Self::is_ancestor(&namespace, replaced, &old_dir.node)
+        {
+            return Err(RenameError::NotEmpty);
+        }
+        (self.client).rename(old_dir.node.id, old_name, new_dir.node.id, new_name)?;
+        if let Some(moved) = &moved {
+            // No loop: checked above, under the lock.
+            Self::set_parent(&namespace, moved, &new_dir.node);
+        }
+        // Best effort: the rename is done.
+        drop(self.dir_at(&namespace, &new_dir.node, new_name));
+        Ok(())
     }
 
     fn set_times(
