@@ -114,19 +114,15 @@ fn test_utimensat_through_broker_mount() {
     use std::os::unix::fs::MetadataExt as _;
 
     let target = common::compile("./tests/utimensat.c", "utimensat_broker_mount", true, false);
-    let host = Path::new(env!("CARGO_TARGET_TMPDIR")).join("utimensat_broker_mount_dir");
-    if host.exists() {
-        std::fs::remove_dir_all(&host).unwrap();
-    }
-    std::fs::create_dir(&host).unwrap();
+    let host = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     // LocalFs does not support guest-created symlinks.
-    std::os::unix::fs::symlink("file", host.join("link")).unwrap();
+    std::os::unix::fs::symlink("file", host.path().join("link")).unwrap();
     let output = Runner::new(&target, "utimensat_broker_mount")
-        .mount(&host, "/timestamps")
+        .mount(host.path(), "/timestamps")
         .arg("/timestamps")
         .output();
     assert!(String::from_utf8_lossy(&output).contains("utimensat ok"));
-    let metadata = std::fs::metadata(host.join("file")).unwrap();
+    let metadata = std::fs::metadata(host.path().join("file")).unwrap();
     assert_eq!(
         (metadata.atime(), metadata.atime_nsec()),
         (4_000_000_000, 123_456_789)
@@ -135,7 +131,6 @@ fn test_utimensat_through_broker_mount() {
         (metadata.mtime(), metadata.mtime_nsec()),
         (987_654_321, 987_654_321)
     );
-    std::fs::remove_dir_all(host).unwrap();
 }
 
 /// Runs a directory rename test with its working directory on a host mount, so held directories

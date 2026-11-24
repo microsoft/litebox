@@ -40,7 +40,7 @@ pub(crate) struct Runner {
     #[cfg(target_os = "linux")]
     host_stack_limit: Option<libc::rlim_t>,
     has_run: bool,
-    rootfs_ready: bool,
+    staging_lock: Option<std::fs::File>,
 }
 
 #[allow(
@@ -68,9 +68,20 @@ impl Runner {
     ) -> Self {
         let dir_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
 
+        // Keep this inode separate from Python's cache lock and never unlink it.
+        let staging_lock = (!rootfs_ready).then(|| {
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir_path.join(format!("rootfs_{unique_name}.staging.lock")))
+                .unwrap();
+            lock.lock().unwrap();
+            lock
+        });
         let tar_dir = dir_path.join(format!("tar_files_{unique_name}"));
         let target_guest_path = std::path::absolute(target).unwrap();
-        if !rootfs_ready {
+        if staging_lock.is_some() {
             match std::fs::remove_dir_all(&tar_dir) {
                 Ok(()) => (),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -143,13 +154,16 @@ impl Runner {
             #[cfg(target_os = "linux")]
             host_stack_limit: None,
             has_run: false,
-            rootfs_ready,
+            staging_lock,
             unique_name: unique_name.to_owned(),
         }
     }
 
     pub(crate) fn tar_dir(&self) -> &Path {
-        assert!(!self.rootfs_ready, "rootfs staging has already finished");
+        assert!(
+            self.staging_lock.is_some(),
+            "rootfs staging has already finished"
+        );
         &self.tar_dir
     }
 
@@ -285,11 +299,11 @@ impl Runner {
         let tar_file = self
             .dir_path
             .join(format!("rootfs_{}.tar", self.unique_name));
-        if !self.rootfs_ready {
+        if self.staging_lock.is_some() {
             let tar_success =
                 super::create_tar_with_cache(&self.tar_dir, &tar_file, &self.unique_name);
             assert!(tar_success, "failed to create tar file");
-            self.rootfs_ready = true;
+            drop(self.staging_lock.take());
         }
         tar_file
     }
