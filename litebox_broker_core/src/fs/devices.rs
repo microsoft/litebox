@@ -13,6 +13,14 @@ use alloc::vec::Vec;
 
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
+use vstd::prelude::{verus_spec, verus_verify};
+
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
+#[cfg(verus_keep_ghost)]
+#[path = "devices_spec.rs"]
+pub(crate) mod verification;
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, FileTerminal, HandleRef,
@@ -54,13 +62,29 @@ const PTMX_RDEV: Option<core::num::NonZeroU64> = core::num::NonZeroU64::new(0x50
 /// Name of the directory of pseudo-terminal subsidiaries.
 const PTS_DIR_NAME: &str = "pts";
 /// Major device number of pseudo-terminal subsidiaries, whose minors are their indices.
+#[verus_verify]
 const PTS_MAJOR: u64 = 136;
 
 /// The device number of the subsidiary with index `index`, encoded as `makedev` does.
+#[verus_spec(result =>
+    ensures
+        result.get() == (((index as u64) & 0xff) | (PTS_MAJOR << 8) | (((index as u64) & !0xffu64) << 12)),
+        result.get() != 0
+)]
 fn pts_rdev(index: u32) -> core::num::NonZeroU64 {
     let minor = u64::from(index);
-    core::num::NonZeroU64::new((minor & 0xff) | (PTS_MAJOR << 8) | ((minor & !0xff) << 12))
-        .expect("the major number is nonzero")
+
+    // Erased proof annotation; the device-number expression is unchanged.
+    vstd::prelude::verus_exec_expr!({
+        proof {
+            assert(PTS_MAJOR == 136);
+
+            assert(((minor & 0xff) | (PTS_MAJOR << 8) | ((minor & !0xffu64) << 12)) != 0)
+                by(bit_vector);
+        }
+        core::num::NonZeroU64::new((minor & 0xff) | (PTS_MAJOR << 8) | ((minor & !0xff) << 12))
+            .expect("the major number is nonzero")
+    })
 }
 
 /// The index that `name` spells in canonical decimal, if any.

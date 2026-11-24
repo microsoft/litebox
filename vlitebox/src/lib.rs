@@ -17,6 +17,7 @@ mod shared_memory_id_callers;
 
 pub use properties::channel_proof;
 pub use properties::channel_waiters_proof;
+pub use properties::device_number_proof;
 pub use properties::directory_decoder_proof;
 pub use properties::error_proof;
 pub use properties::event_proof;

@@ -3,6 +3,7 @@
 
 pub mod channel_proof;
 pub mod channel_waiters_proof;
+pub mod device_number_proof;
 pub mod directory_decoder_proof;
 pub mod error_proof;
 pub mod event_proof;
