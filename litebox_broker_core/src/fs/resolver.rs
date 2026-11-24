@@ -23,7 +23,7 @@ use super::errors::{
 use super::{
     FileTimeUpdate, FileType, Mode, OFlags, SetFileTimes,
     backend::{
-        CreationMetadata, DirHandle, FileTerminal, Handle, HandleRef, PermissionCheck,
+        Caller, CreationMetadata, DirHandle, FileTerminal, Handle, HandleRef, PermissionCheck,
         PermissionInfo, Resolution, ResolvedDir, ResolvedTarget, SeekBehavior,
     },
 };
@@ -58,13 +58,17 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 }
 
-struct Context {
+/// Credentials and caller identity for a pathname operation. Standalone resolvers may use
+/// [`UserInfo`] alone when there is no broker process.
+#[derive(Clone, Copy)]
+pub struct Context<'a> {
     user_info: UserInfo,
+    caller: Caller<'a>,
 }
 
-impl Context {
-    fn new(user_info: UserInfo) -> Self {
-        Self { user_info }
+impl<'a> Context<'a> {
+    pub(super) fn new(user_info: UserInfo, caller: Caller<'a>) -> Self {
+        Self { user_info, caller }
     }
 
     fn acting_user(&self) -> UserInfo {
@@ -99,6 +103,12 @@ impl Context {
         } else {
             permissions.mode.contains(Mode::WOTH)
         }
+    }
+}
+
+impl From<UserInfo> for Context<'_> {
+    fn from(user: UserInfo) -> Self {
+        Self::new(user, Caller::default())
     }
 }
 
@@ -158,9 +168,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// Mount a fresh in-memory filesystem on an existing directory.
     // XXX(jayb): Once guests can request other mount kinds, replace this with a mount taking the
     // requested kind; the permission checks here are backend-independent.
-    pub fn mount_in_mem(
+    pub fn mount_in_mem<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         path: &str,
     ) -> Result<(), litebox_broker_protocol::fs::FileError> {
         use super::composer::{Composer, MountError};
@@ -168,7 +178,8 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         use super::service::file_walk_error;
         use litebox_broker_protocol::fs::FileError;
 
-        let context = Context::new(user);
+        let context = context.into();
+        let user = context.acting_user();
         let (path, walked) = self
             .resolve_path(&context, None, path, true, false)
             .map_err(file_walk_error)?;
@@ -274,7 +285,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     // resolution of no components is the start itself, so keep it rather than
                     // walking it again.
                     if resolved.is_empty() && pending.is_empty() {
-                        let start = self.walk_start(anchor.as_ref())?;
+                        let start = self.walk_start(context, anchor.as_ref())?;
                         self.check_dir_search(context, &start)?;
                         walked = Some(Resolution::Found(ResolvedTarget::Dir(start)));
                     }
@@ -290,7 +301,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                             // re-resolves the parent through every layer, and each 9P step is a
                             // server round trip), a run of leading `..` re-walks once per step.
                             // Consider caching parents per namespace generation.
-                            match self.backend.parent_dir(&base.dir)? {
+                            match self.backend.parent_dir(context.caller, &base.dir)? {
                                 Some(parent) => {
                                     base.dir = parent;
                                     base.hint.truncate(base.hint.rfind('/').unwrap_or(0));
@@ -361,7 +372,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                     else {
                         return Err(PathError::MissingComponent.into());
                     };
-                    let target = self.backend.read_link_at(&parent, &name)?;
+                    let target = self.backend.read_link_at(context.caller, &parent, &name)?;
                     if target.starts_with('/') {
                         resolved.clear();
                         anchor = None;
@@ -462,7 +473,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     ) -> Result<bool, WalkError> {
         let resolution = self
             .backend
-            .resolve(parent, &[name], &|permissions| {
+            .resolve(context.caller, parent, &[name], &|permissions| {
                 Self::check_search_permission(context, permissions)
             })
             .map_err(|error| error.error)?;
@@ -470,13 +481,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 
     /// Read a symbolic link's stored target, without following the final link.
-    pub fn read_link(
+    pub fn read_link<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         anchor: Option<DirAnchor>,
         path: &str,
     ) -> Result<String, WalkError> {
-        let context = Context::new(user);
+        let context = context.into();
         let (path, walked) = self.resolve_path(&context, anchor, path, false, false)?;
         let Some((components, name)) = path.parent_and_name() else {
             return Err(PathError::InvalidPathname.into());
@@ -496,7 +507,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         else {
             return Err(PathError::MissingComponent.into());
         };
-        self.backend.read_link_at(&parent, name)
+        self.backend.read_link_at(context.caller, &parent, name)
     }
 
     /// Check that `context` may add or remove entries in `dir`: `read_only` if `dir` is on a
@@ -542,9 +553,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         Ok(())
     }
 
-    fn walk_start(&self, anchor: Option<&WalkAnchor>) -> Result<ResolvedDir<'_>, WalkError> {
+    fn walk_start(
+        &self,
+        context: &Context<'_>,
+        anchor: Option<&WalkAnchor>,
+    ) -> Result<ResolvedDir<'_>, WalkError> {
         match anchor {
-            None => self.backend.root(),
+            None => self.backend.root(context.caller),
             Some(anchor) => self.backend.walking_dir_at(&anchor.dir),
         }
     }
@@ -554,7 +569,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         context: &Context,
         anchor: Option<&WalkAnchor>,
     ) -> Result<(), WalkError> {
-        self.check_dir_search(context, &self.walk_start(anchor)?)
+        self.check_dir_search(context, &self.walk_start(context, anchor)?)
     }
 
     fn check_dir_search(&self, context: &Context, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
@@ -570,12 +585,14 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         anchor: Option<&WalkAnchor>,
         components: &[&str],
     ) -> Result<Resolution<'_>, ResolutionError> {
-        let start = self.walk_start(anchor).map_err(|error| ResolutionError {
-            component: None,
-            error,
-        })?;
+        let start = self
+            .walk_start(context, anchor)
+            .map_err(|error| ResolutionError {
+                component: None,
+                error,
+            })?;
         self.backend
-            .resolve(start, components, &|permissions| {
+            .resolve(context.caller, start, components, &|permissions| {
                 Self::check_search_permission(context, permissions)
             })
             .map_err(|mut error| {
@@ -612,15 +629,15 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// that refers to the opener's controlling terminal for I/O fails with
     /// [`OpenError::NoSuchDevice`], as if the opener had none (see
     /// [`open_with_controlling_terminal`](Self::open_with_controlling_terminal)).
-    pub fn open(
+    pub fn open<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         anchor: Option<DirAnchor>,
         path: &str,
         flags: OFlags,
         mode: Mode,
     ) -> Result<ResolverEntry<Backend>, OpenError> {
-        self.open_with_controlling_terminal(user, anchor, path, flags, mode, &|| None)
+        self.open_with_controlling_terminal(context, anchor, path, flags, mode, &|| None)
     }
 
     /// Opens a file like [`open`](Self::open), binding a file that refers to
@@ -631,16 +648,16 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// Like Linux, opening such a file for I/O fails with
     /// [`OpenError::NoSuchDevice`] if the opener has no controlling terminal,
     /// while opening it only for path-based operations does not.
-    pub fn open_with_controlling_terminal(
+    pub fn open_with_controlling_terminal<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         anchor: Option<DirAnchor>,
         path: &str,
         flags: OFlags,
         mode: Mode,
         controlling_terminal: &dyn Fn() -> Option<Arc<dyn TerminalEndpoint>>,
     ) -> Result<ResolverEntry<Backend>, OpenError> {
-        let mut entry = self.open_entry(user, anchor, path, flags, mode)?;
+        let mut entry = self.open_entry(context.into(), anchor, path, flags, mode)?;
         if let Handle::File(file) = &entry.handle
             && !entry.path_only
             && matches!(
@@ -659,7 +676,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
     fn open_entry(
         &self,
-        user: UserInfo,
+        context: Context<'_>,
         anchor: Option<DirAnchor>,
         path: &str,
         mut flags: OFlags,
@@ -689,7 +706,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         }
 
-        let context = Context::new(user);
         let trailing_create = flags.contains(OFlags::CREAT) && path.ends_with('/');
         if trailing_create
             && !matches!(
@@ -902,7 +918,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             {
                 usize::try_from(
                     self.backend
-                        .status(HandleRef::File(file))
+                        .status(Caller::default(), HandleRef::File(file))
                         .map_err(|_| WriteError::Io)?
                         .size,
                 )
@@ -976,7 +992,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             SeekBehavior::PositionBased => {
                 let file_len = self
                     .backend
-                    .status(HandleRef::File(file))
+                    .status(Caller::default(), HandleRef::File(file))
                     .map_err(|_| SeekError::Io)?
                     .size;
                 let file_len = usize::try_from(file_len).map_err(|_| SeekError::InvalidOffset)?;
@@ -1107,13 +1123,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 
     /// Change timestamps of the object identified by an open entry.
-    pub fn set_times(
+    pub fn set_times<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         entry: &ResolverEntry<Backend>,
         times: &SetFileTimes,
     ) -> Result<(), SetTimesError> {
-        let context = Context::new(user);
+        let context = context.into();
         let target = match &entry.handle {
             // A directory handle is walkable by its identity, which renames cannot redirect.
             // XXX: a removed directory fails with EIO, like a stale file below, where Linux
@@ -1149,14 +1165,14 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         // namespace) that querying the open handle would take again.
         let opened = self
             .backend
-            .status(entry.handle.as_ref())
+            .status(context.caller, entry.handle.as_ref())
             .map_err(|_| SetTimesError::Io)?;
         let target = self
             .resolve_target(context, &entry.name, None)
             .map_err(set_times_walk_error)?;
         let resolved = self
             .backend
-            .resolved_status(&target)
+            .resolved_status(context.caller, &target)
             .map_err(|_| SetTimesError::Io)?;
         if (opened.node_info.dev, opened.node_info.ino)
             != (resolved.node_info.dev, resolved.node_info.ino)
@@ -1167,14 +1183,14 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 
     /// Change the permissions of a file.
-    pub fn chmod(
+    pub fn chmod<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         anchor: Option<DirAnchor>,
         path: &str,
         mode: Mode,
     ) -> Result<(), ChmodError> {
-        let context = Context::new(user);
+        let context = context.into();
         let (path, walked) = self
             .resolve_path(&context, anchor, path, true, false)
             .map_err(walk_error_or(ChmodError::Io))?;
@@ -1188,15 +1204,15 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 
     /// Change the owner of a file.
-    pub fn chown(
+    pub fn chown<'a>(
         &self,
-        acting_user: UserInfo,
+        context: impl Into<Context<'a>>,
         anchor: Option<DirAnchor>,
         path: &str,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let context = Context::new(acting_user);
+        let context = context.into();
         let (path, walked) = self
             .resolve_path(&context, anchor, path, true, false)
             .map_err(walk_error_or(ChownError::Io))?;
@@ -1210,13 +1226,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 
     /// Unlink a file.
-    pub fn unlink(
+    pub fn unlink<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         anchor: Option<DirAnchor>,
         path: &str,
     ) -> Result<(), UnlinkError> {
-        let context = Context::new(user);
+        let context = context.into();
         let trailing_slash = path.ends_with('/');
         let Some((parent, name)) = self
             .parent_dir_and_name(&context, anchor, path)
@@ -1240,9 +1256,11 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         if trailing_slash {
             // Only a directory may be named with a trailing slash, and unlink cannot remove one.
             return Err(
-                match self.backend.resolve(parent, &[&name], &|permissions| {
-                    Self::check_search_permission(&context, permissions)
-                }) {
+                match self
+                    .backend
+                    .resolve(context.caller, parent, &[&name], &|permissions| {
+                        Self::check_search_permission(&context, permissions)
+                    }) {
                     Ok(Resolution::Found(ResolvedTarget::Dir(_))) => UnlinkError::IsADirectory,
                     Ok(Resolution::Found(ResolvedTarget::File(_))) => {
                         PathError::ComponentNotADirectory.into()
@@ -1266,9 +1284,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
 
     /// Create a symbolic link at `linkpath`; `target` is stored verbatim, without resolving it.
     /// A relative `linkpath` is resolved from `anchor`, or from the root without one.
-    pub fn symlink(
+    pub fn symlink<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         target: &str,
         anchor: Option<DirAnchor>,
         linkpath: &str,
@@ -1279,7 +1297,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         if target.as_bytes().contains(&0) || linkpath.as_bytes().contains(&0) {
             return Err(PathError::InvalidPathname.into());
         }
-        let context = Context::new(user);
+        let context = context.into();
         let Some((parent, name)) = self
             .parent_dir_and_name(&context, anchor.clone(), linkpath)
             .map_err(walk_error_or(SymlinkError::Io))?
@@ -1338,15 +1356,15 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     ///
     /// Parent symbolic links are resolved, but final symbolic links are moved themselves.
     /// Each path is resolved from its own anchor.
-    pub fn rename(
+    pub fn rename<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         old_anchor: Option<DirAnchor>,
         old_path: &str,
         new_anchor: Option<DirAnchor>,
         new_path: &str,
     ) -> Result<(), RenameError> {
-        let context = Context::new(user);
+        let context = context.into();
         let map_walk_error = |error| walk_error_or(RenameError::Io)(error);
         let parent = |anchor, path: &str| {
             if path.is_empty() {
@@ -1414,7 +1432,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
                 .map_err(map_walk_error)?;
             match self
                 .backend
-                .resolve(walking, &[&old_name], &|permissions| {
+                .resolve(context.caller, walking, &[&old_name], &|permissions| {
                     Self::check_search_permission(&context, permissions)
                 })
                 .map_err(|error| map_walk_error(error.error))?
@@ -1436,14 +1454,14 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 
     /// Create a new directory.
-    pub fn mkdir(
+    pub fn mkdir<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         anchor: Option<DirAnchor>,
         path: &str,
         mode: Mode,
     ) -> Result<(), MkdirError> {
-        let context = Context::new(user);
+        let context = context.into();
         let Some((parent, name)) = self
             .parent_dir_and_name(&context, anchor.clone(), path)
             .map_err(walk_error_or(MkdirError::Io))?
@@ -1489,13 +1507,13 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     }
 
     /// Remove a directory.
-    pub fn rmdir(
+    pub fn rmdir<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         anchor: Option<DirAnchor>,
         path: &str,
     ) -> Result<(), RmdirError> {
-        let context = Context::new(user);
+        let context = context.into();
         let Some((parent, name)) = self
             .parent_dir_and_name(&context, anchor, path)
             .map_err(walk_error_or(RmdirError::Io))?
@@ -1534,6 +1552,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// Returns a list of file/directory names including synthesized `.` and `..` entries.
     pub fn read_dir(
         &self,
+        caller: Caller<'_>,
         entry: &ResolverEntry<Backend>,
     ) -> Result<Vec<super::DirEntry>, ReadDirError> {
         if entry.path_only {
@@ -1556,21 +1575,21 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             file_type: FileType::Directory,
             ino_info: None,
         });
-        entries.extend(self.backend.list_dir_at(dir.clone())?);
+        entries.extend(self.backend.list_dir_at(caller, dir.clone())?);
         Ok(entries)
     }
 
     /// Obtain the status of a file/directory/... on the file-system.
     ///
     /// If `follow_symlinks` is false, a final symbolic link is described itself.
-    pub fn file_status(
+    pub fn file_status<'a>(
         &self,
-        user: UserInfo,
+        context: impl Into<Context<'a>>,
         anchor: Option<DirAnchor>,
         path: &str,
         follow_symlinks: bool,
     ) -> Result<super::FileStatus, FileStatusError> {
-        let context = Context::new(user);
+        let context = context.into();
         let (path, walked) = self
             .resolve_path(&context, anchor, path, follow_symlinks, false)
             .map_err(walk_error_or(FileStatusError::Io))?;
@@ -1578,7 +1597,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
             .resolve_target(&context, &path, walked)
             .map_err(walk_error_or(FileStatusError::Io))?;
         // Unlike an O_PATH open, this must not trigger backend open hooks.
-        self.backend.resolved_status(&target)
+        self.backend.resolved_status(context.caller, &target)
     }
 
     /// Returns the current physical name of a directory (or, where the backend cannot name it,
@@ -1586,25 +1605,30 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     ///
     /// A file opened relative to a directory is named under that directory's current name. An
     /// unlinked directory has no name.
-    pub(super) fn handle_path(&self, entry: &ResolverEntry<Backend>) -> Result<String, WalkError> {
+    pub(super) fn handle_path(
+        &self,
+        caller: Caller<'_>,
+        entry: &ResolverEntry<Backend>,
+    ) -> Result<String, WalkError> {
         match &entry.handle {
-            Handle::Dir(dir) => match self.backend.dir_path(dir)? {
+            Handle::Dir(dir) => match self.backend.dir_path(caller, dir)? {
                 Some(components) => Ok(ResolvedPath::join(String::new(), &components)),
-                None => self.name_under_current_anchor(entry),
+                None => self.name_under_current_anchor(caller, entry),
             },
-            Handle::File(_) => self.name_under_current_anchor(entry),
+            Handle::File(_) => self.name_under_current_anchor(caller, entry),
         }
     }
 
     /// The name an entry was opened by, following renames of the directory it was opened from.
     fn name_under_current_anchor(
         &self,
+        caller: Caller<'_>,
         entry: &ResolverEntry<Backend>,
     ) -> Result<String, WalkError> {
         let Some(anchor) = &entry.name.anchor else {
             return Ok(entry.name.to_absolute());
         };
-        match self.backend.dir_path(&anchor.dir) {
+        match self.backend.dir_path(caller, &anchor.dir) {
             Ok(Some(mut components)) => {
                 components.extend(entry.name.components.iter().cloned());
                 Ok(ResolvedPath::join(String::new(), &components))
@@ -1619,9 +1643,10 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// Equivalent to [`Self::file_status`], but on an open entry instead.
     pub fn handle_status(
         &self,
+        caller: Caller<'_>,
         entry: &ResolverEntry<Backend>,
     ) -> Result<super::FileStatus, FileStatusError> {
-        self.backend.status(entry.handle.as_ref())
+        self.backend.status(caller, entry.handle.as_ref())
     }
 
     /// Applies, or fails without blocking, an advisory whole-file lock held by the open
@@ -1637,7 +1662,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     ) -> crate::Result<Result<(), FileStatusError>> {
         let request = match operation {
             FileLockOperation::Shared | FileLockOperation::Exclusive => {
-                let status = match self.handle_status(entry) {
+                let status = match self.handle_status(Caller::default(), entry) {
                     Ok(status) => status,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -1840,7 +1865,10 @@ mod tests {
         let mode = Mode::RWXU;
         let open = |path| fs.open(user, None, path, OFlags::PATH, mode).unwrap();
         for path in ["/", "/bridge", "/bridge/fs", "/bridge/fs/nested"] {
-            assert_eq!(fs.handle_path(&open(path)).unwrap(), path);
+            assert_eq!(
+                fs.handle_path(Caller::default(), &open(path)).unwrap(),
+                path
+            );
         }
         fs.mkdir(user, None, "/bridge/fs/old", mode).unwrap();
         fs.mkdir(user, None, "/bridge/fs/old/child", mode).unwrap();
@@ -1857,10 +1885,13 @@ mod tests {
         fs.rename(user, None, "/bridge/fs/old", None, "/bridge/fs/moved")
             .unwrap();
         fs.mkdir(user, None, "/bridge/fs/old", mode).unwrap();
-        assert_eq!(fs.handle_path(&dir).unwrap(), "/bridge/fs/moved/child");
+        assert_eq!(
+            fs.handle_path(Caller::default(), &dir).unwrap(),
+            "/bridge/fs/moved/child"
+        );
         // A file opened relative to a directory is named under the directory's current name.
         assert_eq!(
-            fs.handle_path(&anchored).unwrap(),
+            fs.handle_path(Caller::default(), &anchored).unwrap(),
             "/bridge/fs/moved/anchored"
         );
 
@@ -1876,15 +1907,17 @@ mod tests {
             .open(user, Some(dir.anchor()), "../nested", OFlags::PATH, mode)
             .unwrap();
         assert_eq!(
-            fs.handle_status(&nested).unwrap().node_info,
-            fs.handle_status(&open("/bridge/fs/nested"))
+            fs.handle_status(Caller::default(), &nested)
+                .unwrap()
+                .node_info,
+            fs.handle_status(Caller::default(), &open("/bridge/fs/nested"))
                 .unwrap()
                 .node_info
         );
         fs.rmdir(user, None, "/bridge/fs/promoted").unwrap();
         fs.mkdir(user, None, "/bridge/fs/promoted", mode).unwrap();
         assert!(matches!(
-            fs.handle_path(&dir),
+            fs.handle_path(Caller::default(), &dir),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
@@ -1905,7 +1938,7 @@ mod tests {
         let dir = fs.open(user, None, "/mnt/dir", OFlags::PATH, mode).unwrap();
         fs.mount_in_mem(user, "/mnt").unwrap();
         // The shadowed directory is still linked, so it must not be reported as removed.
-        assert_eq!(fs.handle_path(&dir).unwrap(), "/mnt/dir");
+        assert_eq!(fs.handle_path(Caller::default(), &dir).unwrap(), "/mnt/dir");
     }
 
     #[test]
@@ -1928,7 +1961,9 @@ mod tests {
             .open(user, Some(sub.anchor()), "..", OFlags::PATH, mode)
             .unwrap();
         assert_eq!(
-            fs.handle_status(&parent).unwrap().node_info,
+            fs.handle_status(Caller::default(), &parent)
+                .unwrap()
+                .node_info,
             fs.file_status(user, None, "/dir", true).unwrap().node_info
         );
         assert!(
@@ -1960,7 +1995,7 @@ mod tests {
             .open(user, Some(child.anchor()), "..", OFlags::PATH, mode)
             .unwrap();
         assert!(matches!(
-            fs.handle_path(&parent),
+            fs.handle_path(Caller::default(), &parent),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(
@@ -1970,7 +2005,10 @@ mod tests {
         let nested = fs
             .open(user, Some(parent.anchor()), "../nested", OFlags::PATH, mode)
             .unwrap();
-        assert_eq!(fs.handle_path(&nested).unwrap(), "/nested");
+        assert_eq!(
+            fs.handle_path(Caller::default(), &nested).unwrap(),
+            "/nested"
+        );
     }
 
     #[test]
@@ -1991,7 +2029,7 @@ mod tests {
         let decoy = fs
             .open(user, None, "/dir/child", OFlags::CREAT, Mode::RWXU)
             .unwrap();
-        let before = fs.handle_status(&decoy).unwrap().times;
+        let before = fs.handle_status(Caller::default(), &decoy).unwrap().times;
         let mtime = crate::fs::FileTimestamp {
             seconds: 123,
             nanoseconds: 456,
@@ -2002,10 +2040,17 @@ mod tests {
         };
         fs.set_times(user, &child, &change).unwrap();
         assert_eq!(
-            fs.handle_status(&child).unwrap().times.unwrap().modified,
+            fs.handle_status(Caller::default(), &child)
+                .unwrap()
+                .times
+                .unwrap()
+                .modified,
             mtime
         );
-        assert_eq!(fs.handle_status(&decoy).unwrap().times, before);
+        assert_eq!(
+            fs.handle_status(Caller::default(), &decoy).unwrap().times,
+            before
+        );
     }
 
     #[test]
@@ -2030,7 +2075,11 @@ mod tests {
         let file = fs
             .open(user, Some(src.anchor()), "sub/f", OFlags::CREAT, mode)
             .unwrap();
-        let ino = fs.handle_status(&file).unwrap().node_info.ino;
+        let ino = fs
+            .handle_status(Caller::default(), &file)
+            .unwrap()
+            .node_info
+            .ino;
         fs.symlink(user, "sub/../sub/f", Some(src.anchor()), "relative")
             .unwrap();
         assert_eq!(
@@ -2140,8 +2189,14 @@ mod tests {
             .unwrap();
         let mounted = fs.open(user, None, "/z/t", OFlags::PATH, mode).unwrap();
         assert_eq!(
-            fs.handle_status(&created).unwrap().node_info.dev,
-            fs.handle_status(&mounted).unwrap().node_info.dev
+            fs.handle_status(Caller::default(), &created)
+                .unwrap()
+                .node_info
+                .dev,
+            fs.handle_status(Caller::default(), &mounted)
+                .unwrap()
+                .node_info
+                .dev
         );
         assert!(fs.file_status(user, None, "/z/t/x", true).is_ok());
     }
@@ -2163,12 +2218,14 @@ mod tests {
         let up = fs
             .open(user, Some(m.anchor()), "..", OFlags::PATH, mode)
             .unwrap();
-        assert_eq!(fs.handle_path(&up).unwrap(), "/");
+        assert_eq!(fs.handle_path(Caller::default(), &up).unwrap(), "/");
         let outer = fs
             .open(user, Some(m.anchor()), "../outer", OFlags::PATH, mode)
             .unwrap();
         assert_eq!(
-            fs.handle_status(&outer).unwrap().node_info,
+            fs.handle_status(Caller::default(), &outer)
+                .unwrap()
+                .node_info,
             fs.file_status(user, None, "/outer", true)
                 .unwrap()
                 .node_info
@@ -2176,7 +2233,7 @@ mod tests {
         let top = fs
             .open(user, Some(m.anchor()), "../../..", OFlags::PATH, mode)
             .unwrap();
-        assert_eq!(fs.handle_path(&top).unwrap(), "/");
+        assert_eq!(fs.handle_path(Caller::default(), &top).unwrap(), "/");
     }
 
     #[test]
@@ -2208,7 +2265,10 @@ mod tests {
             fs.rename(user, None, "/e", Some(d.anchor()), "e"),
             Err(RenameError::PathError(PathError::NoSuchFileOrDirectory))
         ));
-        assert!(matches!(fs.read_dir(&d), Err(ReadDirError::Removed)));
+        assert!(matches!(
+            fs.read_dir(Caller::default(), &d),
+            Err(ReadDirError::Removed)
+        ));
         assert!(fs.file_status(user, None, "/e", true).is_ok());
     }
 }

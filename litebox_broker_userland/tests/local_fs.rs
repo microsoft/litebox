@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 use litebox_broker_core::fs::SeekWhence;
 use litebox_broker_core::fs::backend::{
-    Backend, DirHandle, HandleRef, Resolution, ResolvedFile, ResolvedTarget,
+    Backend, Caller, DirHandle, HandleRef, Resolution, ResolvedFile, ResolvedTarget,
 };
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::errors::{
@@ -53,9 +53,12 @@ fn backend(root: &Path) -> LocalFs {
 
 fn resolved_file<'a>(local: &'a LocalFs, name: &str) -> ResolvedFile<'a> {
     match local
-        .resolve(local.root().unwrap(), &[name], &|_| {
-            panic!("LocalFs must enforce host permissions itself")
-        })
+        .resolve(
+            Caller::default(),
+            local.root(Caller::default()).unwrap(),
+            &[name],
+            &|_| panic!("LocalFs must enforce host permissions itself"),
+        )
         .unwrap()
     {
         Resolution::Found(ResolvedTarget::File(file)) => file,
@@ -66,9 +69,12 @@ fn resolved_file<'a>(local: &'a LocalFs, name: &str) -> ResolvedFile<'a> {
 /// Opens the directory at `components` with `O_PATH`.
 fn open_path_dir(local: &LocalFs, components: &[&str]) -> DirHandle {
     let Resolution::Found(ResolvedTarget::Dir(dir)) = local
-        .resolve(local.root().unwrap(), components, &|_| {
-            panic!("LocalFs must enforce host permissions itself")
-        })
+        .resolve(
+            Caller::default(),
+            local.root(Caller::default()).unwrap(),
+            components,
+            &|_| panic!("LocalFs must enforce host permissions itself"),
+        )
         .unwrap()
     else {
         panic!("expected a directory");
@@ -140,19 +146,30 @@ fn timestamp_readback_uses_signed_live_host_metadata() {
     assert_eq!(host.modified.seconds, -1);
     assert_eq!(host.modified.nanoseconds, 234_567_900);
     assert_eq!(
-        local.status(HandleRef::File(&file)).unwrap().times,
-        Some(host)
-    );
-    assert_eq!(
         local
-            .resolved_status(&ResolvedTarget::File(resolved_file(&local, "file")))
+            .status(Caller::default(), HandleRef::File(&file))
             .unwrap()
             .times,
         Some(host)
     );
-    let root = local.open_dir(local.root().unwrap(), OFlags::PATH).unwrap();
     assert_eq!(
-        local.status(HandleRef::Dir(&root)).unwrap().times,
+        local
+            .resolved_status(
+                Caller::default(),
+                &ResolvedTarget::File(resolved_file(&local, "file"))
+            )
+            .unwrap()
+            .times,
+        Some(host)
+    );
+    let root = local
+        .open_dir(local.root(Caller::default()).unwrap(), OFlags::PATH)
+        .unwrap();
+    assert_eq!(
+        local
+            .status(Caller::default(), HandleRef::Dir(&root))
+            .unwrap()
+            .times,
         Some(host_timestamps(&fs::metadata(temp.path()).unwrap()))
     );
 }
@@ -179,13 +196,17 @@ fn explicit_signed_timestamp_updates_round_trip_for_files_and_directories() {
     for directory in [false, true] {
         let target = || {
             if directory {
-                ResolvedTarget::Dir(local.root().unwrap())
+                ResolvedTarget::Dir(local.root(Caller::default()).unwrap())
             } else {
                 ResolvedTarget::File(resolved_file(&local, "file"))
             }
         };
         local.set_times(target(), &updates).unwrap();
-        let status = local.resolved_status(&target()).unwrap().times.unwrap();
+        let status = local
+            .resolved_status(Caller::default(), &target())
+            .unwrap()
+            .times
+            .unwrap();
         assert_eq!(status.accessed, access);
         assert_eq!(status.modified, modify);
         let host_path = if directory {
@@ -248,7 +269,11 @@ fn now_uses_host_clock_and_omit_preserves_the_other_timestamp() {
         )
         .unwrap();
 
-    let mut previous = local.resolved_status(&target()).unwrap().times.unwrap();
+    let mut previous = local
+        .resolved_status(Caller::default(), &target())
+        .unwrap()
+        .times
+        .unwrap();
     for access in [false, true] {
         let before = std::time::SystemTime::now();
         local
@@ -270,7 +295,11 @@ fn now_uses_host_clock_and_omit_preserves_the_other_timestamp() {
             .unwrap();
         let after = std::time::SystemTime::now();
         let metadata = fs::metadata(&path).unwrap();
-        let current = local.resolved_status(&target()).unwrap().times.unwrap();
+        let current = local
+            .resolved_status(Caller::default(), &target())
+            .unwrap()
+            .times
+            .unwrap();
         assert_eq!(current, host_timestamps(&metadata));
         let host_now = if access {
             assert_eq!(current.modified, previous.modified);
@@ -293,7 +322,11 @@ fn now_uses_host_clock_and_omit_preserves_the_other_timestamp() {
             },
         )
         .unwrap();
-    let omitted = local.resolved_status(&target()).unwrap().times.unwrap();
+    let omitted = local
+        .resolved_status(Caller::default(), &target())
+        .unwrap()
+        .times
+        .unwrap();
     assert_eq!(omitted.accessed, previous.accessed);
     assert_eq!(omitted.modified, previous.modified);
     #[cfg(target_os = "linux")]
@@ -337,7 +370,10 @@ fn timestamp_updates_do_not_follow_final_symlinks_outside_the_root() {
             )
             .unwrap();
         let status = local
-            .resolved_status(&ResolvedTarget::File(resolved_file(&local, name)))
+            .resolved_status(
+                Caller::default(),
+                &ResolvedTarget::File(resolved_file(&local, name)),
+            )
             .unwrap();
         assert_eq!(status.file_type, FileType::SymbolicLink);
         let times = status.times.unwrap();
@@ -363,7 +399,11 @@ fn canonical_root_live_io_and_open_file_handles() {
     let local = backend(&temp.path().join("root_link"));
     assert_eq!(
         local
-            .read_link_at(&local.root().unwrap(), "absolute")
+            .read_link_at(
+                Caller::default(),
+                &local.root(Caller::default()).unwrap(),
+                "absolute"
+            )
             .unwrap(),
         "file"
     );
@@ -382,7 +422,7 @@ fn canonical_root_live_io_and_open_file_handles() {
         Err(TruncateError::NotForWriting)
     ));
 
-    let dir = local.root().unwrap();
+    let dir = local.root(Caller::default()).unwrap();
     let file = local
         .open_file(resolved_file(&local, "file"), OFlags::RDWR)
         .unwrap();
@@ -394,7 +434,13 @@ fn canonical_root_live_io_and_open_file_handles() {
     local.unlink_at(dir, "file").unwrap();
     assert_eq!(local.read(&file, &mut buf, 0).unwrap(), 7);
     local.truncate(&file, 3).unwrap();
-    assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 3);
+    assert_eq!(
+        local
+            .status(Caller::default(), HandleRef::File(&file))
+            .unwrap()
+            .size,
+        3
+    );
     local
         .chmod(
             ResolvedTarget::File(resolved_file(&local, "moved_file")),
@@ -402,7 +448,10 @@ fn canonical_root_live_io_and_open_file_handles() {
         )
         .unwrap();
     assert_eq!(
-        local.status(HandleRef::File(&file)).unwrap().mode,
+        local
+            .status(Caller::default(), HandleRef::File(&file))
+            .unwrap()
+            .mode,
         Mode::RUSR
     );
 }
@@ -500,17 +549,24 @@ fn native_identity_and_listing_agree_even_for_hard_links() {
     let two = local
         .open_file(resolved_file(&local, "two"), OFlags::PATH)
         .unwrap();
-    let expected = local.status(HandleRef::File(&one)).unwrap().node_info;
+    let expected = local
+        .status(Caller::default(), HandleRef::File(&one))
+        .unwrap()
+        .node_info;
     assert_eq!(
         expected,
-        local.status(HandleRef::File(&two)).unwrap().node_info
+        local
+            .status(Caller::default(), HandleRef::File(&two))
+            .unwrap()
+            .node_info
     );
     let bad_name = std::ffi::OsStr::from_bytes(b"bad\xffname");
     fs::write(temp.path().join(bad_name), b"hidden").unwrap();
     let entries = local
         .list_dir_at(
+            Caller::default(),
             local
-                .open_dir(local.root().unwrap(), OFlags::RDONLY)
+                .open_dir(local.root(Caller::default()).unwrap(), OFlags::RDONLY)
                 .unwrap(),
         )
         .unwrap();
@@ -549,7 +605,12 @@ fn invalid_components_are_rejected() {
     for &bad in rejected {
         assert!(
             matches!(
-                local.resolve(local.root().unwrap(), &[bad], &|_| unreachable!()),
+                local.resolve(
+                    Caller::default(),
+                    local.root(Caller::default()).unwrap(),
+                    &[bad],
+                    &|_| unreachable!()
+                ),
                 Err(ResolutionError {
                     component: Some(0),
                     error: WalkError::PathError(PathError::InvalidPathname),
@@ -558,11 +619,15 @@ fn invalid_components_are_rejected() {
             "{bad:?}"
         );
         assert!(
-            local.unlink_at(local.root().unwrap(), bad).is_err(),
+            local
+                .unlink_at(local.root(Caller::default()).unwrap(), bad)
+                .is_err(),
             "{bad:?}"
         );
         assert!(
-            local.rmdir_at(local.root().unwrap(), bad).is_err(),
+            local
+                .rmdir_at(local.root(Caller::default()).unwrap(), bad)
+                .is_err(),
             "{bad:?}"
         );
     }
@@ -575,8 +640,9 @@ fn invalid_components_are_rejected() {
         }
         let entries = local
             .list_dir_at(
+                Caller::default(),
                 local
-                    .open_dir(local.root().unwrap(), OFlags::RDONLY)
+                    .open_dir(local.root(Caller::default()).unwrap(), OFlags::RDONLY)
                     .unwrap(),
             )
             .unwrap();
@@ -600,19 +666,39 @@ fn resolution_is_unopened_and_reports_component_failures() {
     fs::write(temp.path().join("file"), b"intact").unwrap();
     let local = backend(temp.path());
     assert!(matches!(
-        local.resolve(local.root().unwrap(), &[], &|_| unreachable!()),
+        local.resolve(
+            Caller::default(),
+            local.root(Caller::default()).unwrap(),
+            &[],
+            &|_| unreachable!()
+        ),
         Ok(Resolution::Found(ResolvedTarget::Dir(_)))
     ));
     let target = ResolvedTarget::File(resolved_file(&local, "file"));
-    assert_eq!(local.resolved_status(&target).unwrap().size, 6);
     assert_eq!(
-        local.resolved_status(&target).unwrap().file_type,
+        local
+            .resolved_status(Caller::default(), &target)
+            .unwrap()
+            .size,
+        6
+    );
+    assert_eq!(
+        local
+            .resolved_status(Caller::default(), &target)
+            .unwrap()
+            .file_type,
         FileType::RegularFile
     );
     #[cfg(unix)]
     {
         fs::set_permissions(temp.path().join("file"), fs::Permissions::from_mode(0o000)).unwrap();
-        assert_eq!(local.resolved_status(&target).unwrap().mode, Mode::empty());
+        assert_eq!(
+            local
+                .resolved_status(Caller::default(), &target)
+                .unwrap()
+                .mode,
+            Mode::empty()
+        );
         local.chmod(target, Mode::RUSR | Mode::WUSR).unwrap();
     }
     assert_eq!(fs::read(temp.path().join("file")).unwrap(), b"intact");
@@ -621,7 +707,12 @@ fn resolution_is_unopened_and_reports_component_failures() {
         (["file", "child"], 1, true),
     ] {
         let error = local
-            .resolve(local.root().unwrap(), &components, &|_| unreachable!())
+            .resolve(
+                Caller::default(),
+                local.root(Caller::default()).unwrap(),
+                &components,
+                &|_| unreachable!(),
+            )
             .err()
             .expect("an intermediate component must fail");
         assert_eq!(error.component, Some(component));
@@ -638,7 +729,8 @@ fn resolution_is_unopened_and_reports_component_failures() {
     }
     let Resolution::MissingFinal { parent } = local
         .resolve(
-            local.root().unwrap(),
+            Caller::default(),
+            local.root(Caller::default()).unwrap(),
             &["dir", "missing"],
             &|_| unreachable!(),
         )
@@ -647,7 +739,10 @@ fn resolution_is_unopened_and_reports_component_failures() {
         panic!("only the final component is missing");
     };
     let parent = local.open_dir(parent, OFlags::RDONLY).unwrap();
-    assert_eq!(local.list_dir_at(parent).unwrap().len(), 0);
+    assert_eq!(
+        local.list_dir_at(Caller::default(), parent).unwrap().len(),
+        0
+    );
     assert!(!temp.path().join("dir/missing").exists());
 }
 
@@ -674,9 +769,21 @@ fn path_handles_report_live_files() {
     let file = local
         .open_file(resolved_file(&local, "file"), OFlags::PATH)
         .unwrap();
-    assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 7);
+    assert_eq!(
+        local
+            .status(Caller::default(), HandleRef::File(&file))
+            .unwrap()
+            .size,
+        7
+    );
     fs::write(temp.path().join("file"), b"longer content").unwrap();
-    assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 14);
+    assert_eq!(
+        local
+            .status(Caller::default(), HandleRef::File(&file))
+            .unwrap()
+            .size,
+        14
+    );
 }
 
 /// Every host entry below `root`, with its permissions and any file contents.
@@ -820,9 +927,21 @@ fn direct_backend_mutations_and_flags() {
     let mut hole = [1; 4];
     assert_eq!(local.read(&file, &mut hole, 64).unwrap(), 4);
     assert_eq!(hole, [0; 4]);
-    assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 4097);
+    assert_eq!(
+        local
+            .status(Caller::default(), HandleRef::File(&file))
+            .unwrap()
+            .size,
+        4097
+    );
     local.truncate(&file, 8192).unwrap();
-    assert_eq!(local.status(HandleRef::File(&file)).unwrap().size, 8192);
+    assert_eq!(
+        local
+            .status(Caller::default(), HandleRef::File(&file))
+            .unwrap()
+            .size,
+        8192
+    );
     local.truncate(&file, 4097).unwrap();
     assert!(
         local
@@ -835,10 +954,18 @@ fn direct_backend_mutations_and_flags() {
     assert_eq!(fs::metadata(temp.path().join("new")).unwrap().len(), 4097);
     fs::create_dir(temp.path().join("dir")).unwrap();
     let dir = open_path_dir(&local, &["dir"]);
-    assert!(local.status(HandleRef::Dir(&dir)).is_ok());
+    assert!(
+        local
+            .status(Caller::default(), HandleRef::Dir(&dir))
+            .is_ok()
+    );
     assert!(local.walking_dir_at(&dir).is_ok());
-    local.unlink_at(local.root().unwrap(), "new").unwrap();
-    local.rmdir_at(local.root().unwrap(), "dir").unwrap();
+    local
+        .unlink_at(local.root(Caller::default()).unwrap(), "new")
+        .unwrap();
+    local
+        .rmdir_at(local.root(Caller::default()).unwrap(), "dir")
+        .unwrap();
     assert!(!temp.path().join("new").exists());
     assert!(!temp.path().join("dir").exists());
 }
@@ -949,6 +1076,7 @@ fn host_symlinks_stay_bounded_and_special_files_are_not_opened() {
     let local: Resolver<TestPlatform, _> = Resolver::new(backend(&root));
     let listed = local
         .read_dir(
+            Caller::default(),
             &local
                 .open(USER, None, "/", OFlags::RDONLY, Mode::empty())
                 .unwrap(),
@@ -1028,9 +1156,11 @@ fn unreadable_directory_is_not_an_empty_listing() {
     }
     fs::write(temp.path().join("entry"), b"data").unwrap();
     let local = backend(temp.path());
-    let dir = local.open_dir(local.root().unwrap(), OFlags::PATH).unwrap();
+    let dir = local
+        .open_dir(local.root(Caller::default()).unwrap(), OFlags::PATH)
+        .unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o000)).unwrap();
-    assert!(local.list_dir_at(dir).is_err());
+    assert!(local.list_dir_at(Caller::default(), dir).is_err());
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
 }
 
@@ -1043,7 +1173,11 @@ fn final_symlink_removal_does_not_follow_the_link() {
     symlink("missing", temp.path().join("file_link")).unwrap();
     let local = backend(temp.path());
 
-    assert!(local.rmdir_at(local.root().unwrap(), "dir_link").is_err());
+    assert!(
+        local
+            .rmdir_at(local.root(Caller::default()).unwrap(), "dir_link")
+            .is_err()
+    );
     assert!(temp.path().join("directory").is_dir());
     assert!(
         fs::symlink_metadata(temp.path().join("dir_link"))
@@ -1052,7 +1186,9 @@ fn final_symlink_removal_does_not_follow_the_link() {
             .is_symlink()
     );
 
-    local.unlink_at(local.root().unwrap(), "file_link").unwrap();
+    local
+        .unlink_at(local.root(Caller::default()).unwrap(), "file_link")
+        .unwrap();
     assert!(fs::symlink_metadata(temp.path().join("file_link")).is_err());
 }
 
@@ -1112,11 +1248,18 @@ fn resolver_and_composer_use_host_permissions_and_live_positions() {
         )
         .unwrap();
     assert_eq!(
-        resolver.handle_status(&created).unwrap().file_type,
+        resolver
+            .handle_status(Caller::default(), &created)
+            .unwrap()
+            .file_type,
         litebox_broker_core::fs::FileType::RegularFile
     );
     assert_eq!(
-        resolver.handle_status(&created).unwrap().mode & (Mode::SUID | Mode::SGID),
+        resolver
+            .handle_status(Caller::default(), &created)
+            .unwrap()
+            .mode
+            & (Mode::SUID | Mode::SGID),
         Mode::empty()
     );
     resolver.unlink(USER, None, "/host/creat_dir").unwrap();
@@ -1134,18 +1277,37 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
     let second = LocalFs::new(b.path(), allocators.next()).unwrap();
     assert!(
         second
-            .resolve(first.root().unwrap(), &["f"], &|_| unreachable!())
+            .resolve(
+                Caller::default(),
+                first.root(Caller::default()).unwrap(),
+                &["f"],
+                &|_| unreachable!()
+            )
             .is_err()
     );
-    let foreign = first.open_dir(first.root().unwrap(), OFlags::PATH).unwrap();
-    assert!(second.list_dir_at(foreign.clone()).is_err());
+    let foreign = first
+        .open_dir(first.root(Caller::default()).unwrap(), OFlags::PATH)
+        .unwrap();
+    assert!(
+        second
+            .list_dir_at(Caller::default(), foreign.clone())
+            .is_err()
+    );
     assert!(second.walking_dir_at(&foreign).is_err());
-    assert!(second.unlink_at(first.root().unwrap(), "f").is_err());
+    assert!(
+        second
+            .unlink_at(first.root(Caller::default()).unwrap(), "f")
+            .is_err()
+    );
     assert_eq!(fs::read(a.path().join("f")).unwrap(), b"one");
     let file = first
         .open_file(resolved_file(&first, "f"), OFlags::RDONLY)
         .unwrap();
-    assert!(second.status(HandleRef::File(&file)).is_err());
+    assert!(
+        second
+            .status(Caller::default(), HandleRef::File(&file))
+            .is_err()
+    );
     assert!(
         second
             .open_file(resolved_file(&first, "f"), OFlags::PATH)
@@ -1153,7 +1315,10 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
     );
     assert!(
         second
-            .resolved_status(&ResolvedTarget::File(resolved_file(&first, "f")))
+            .resolved_status(
+                Caller::default(),
+                &ResolvedTarget::File(resolved_file(&first, "f"))
+            )
             .is_err()
     );
     assert!(
@@ -1174,7 +1339,7 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
         modify: FileTimeUpdate::Omit,
     };
     for foreign in [
-        ResolvedTarget::Dir(first.root().unwrap()),
+        ResolvedTarget::Dir(first.root(Caller::default()).unwrap()),
         ResolvedTarget::File(resolved_file(&first, "f")),
     ] {
         assert!(matches!(
@@ -1184,7 +1349,12 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
     }
     fs::set_permissions(a.path().join("f"), fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(
-        first.status(HandleRef::File(&file)).unwrap().mode.bits() & 0o777,
+        first
+            .status(Caller::default(), HandleRef::File(&file))
+            .unwrap()
+            .mode
+            .bits()
+            & 0o777,
         0o600
     );
     first
@@ -1194,7 +1364,11 @@ fn foreign_handles_are_not_usable_and_host_modes_are_live() {
         )
         .unwrap();
     assert_eq!(
-        first.status(HandleRef::File(&file)).unwrap().mode & (Mode::SUID | Mode::SGID),
+        first
+            .status(Caller::default(), HandleRef::File(&file))
+            .unwrap()
+            .mode
+            & (Mode::SUID | Mode::SGID),
         Mode::empty()
     );
     assert_eq!(
@@ -1254,11 +1428,17 @@ fn live_io_creation_listing_and_removal() {
             Mode::RUSR | Mode::WUSR,
         )
         .unwrap();
-    assert_eq!(local.handle_status(&created).unwrap().size, 0);
+    assert_eq!(
+        local
+            .handle_status(Caller::default(), &created)
+            .unwrap()
+            .size,
+        0
+    );
     let root = local
         .open(USER, None, "/", OFlags::RDONLY, Mode::empty())
         .unwrap();
-    let entries = local.read_dir(&root).unwrap();
+    let entries = local.read_dir(Caller::default(), &root).unwrap();
     assert!(entries.iter().any(|entry| entry.name == "existing"));
     assert!(entries.iter().any(|entry| entry.name == "created"));
     assert!(entries.iter().any(|entry| entry.name == "directory"));
@@ -1359,12 +1539,15 @@ fn held_directories_name_themselves_and_walk_up_to_the_root() {
     let local = backend(&root);
     let mut dir = open_path_dir(&local, &["a", "b"]);
     for expected in [&["a", "b"][..], &["a"], &[]] {
-        assert_eq!(local.dir_path(&dir).unwrap().unwrap(), expected);
-        let Some(parent) = local.parent_dir(&dir).unwrap() else {
+        assert_eq!(
+            local.dir_path(Caller::default(), &dir).unwrap().unwrap(),
+            expected
+        );
+        let Some(parent) = local.parent_dir(Caller::default(), &dir).unwrap() else {
             assert!(expected.is_empty(), "only the root has no parent");
             break;
         };
         dir = parent;
     }
-    assert!(local.parent_dir(&dir).unwrap().is_none());
+    assert!(local.parent_dir(Caller::default(), &dir).unwrap().is_none());
 }

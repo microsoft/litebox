@@ -25,6 +25,7 @@ pub mod in_mem;
 pub mod inode_allocator;
 pub mod nine_p;
 pub mod overlay;
+pub mod procfs;
 pub mod read_only;
 pub mod resolver;
 mod service;

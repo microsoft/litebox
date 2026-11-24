@@ -16,9 +16,9 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, DirPathResult, FileHandle, HandleRef,
-    PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
-    SeekBehavior,
+    Backend, BackendHandles, Caller, CreationMetadata, DirHandle, DirPathResult, FileHandle,
+    HandleRef, PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile,
+    ResolvedTarget, SeekBehavior,
 };
 use super::errors::open_to_walk_error;
 use super::errors::{
@@ -27,6 +27,7 @@ use super::errors::{
     UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
+use super::procfs::ProcFs;
 use super::shared_storage::SharedFile;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::readiness::ReadinessSource;
@@ -66,6 +67,20 @@ pub struct ComposerBuilder<Platform: RawSyncPrimitivesProvider> {
 struct Mount {
     path: Vec<String>,
     backend: Box<dyn Backend>,
+}
+
+impl Mount {
+    fn has_caller_relative_ancestor(&self, descendant: &[String]) -> bool {
+        // XXX: Path-keyed mounts can't follow a procfs PID across namespaces or PID reuse; reject
+        // until mounts bind to identity.
+        descendant
+            .strip_prefix(self.path.as_slice())
+            .and_then(|suffix| suffix.first())
+            .is_some_and(|name| {
+                ProcFs::caller_relative_name(name)
+                    && (&*self.backend as &dyn core::any::Any).is::<ProcFs>()
+            })
+    }
 }
 
 /// Synthetic directory needed to connect mount points.
@@ -144,15 +159,24 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         if state.mounts.len() >= state.limit {
             return Err(MountError::NoSpace);
         }
-        let backend = Box::new(make(state.allocators.next()));
+        let mount = Mount {
+            path,
+            backend: Box::new(make(state.allocators.next())),
+        };
+        if state.mounts.iter().any(|other| {
+            other.has_caller_relative_ancestor(&mount.path)
+                || mount.has_caller_relative_ancestor(&other.path)
+        }) {
+            return Err(MountError::InvalidMountPath);
+        }
         let MountState {
             mounts,
             virtual_dirs,
             virtual_dir_allocator,
             ..
         } = &mut *state;
-        for len in 0..path.len() {
-            let ancestor = &path[..len];
+        for len in 0..mount.path.len() {
+            let ancestor = &mount.path[..len];
             if virtual_dirs.iter().any(|dir| dir.path == ancestor) {
                 continue;
             }
@@ -164,7 +188,7 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         // Publish fallback metadata first: a host ancestor can disappear after validation.
         // XXX(jayb): Mounts are keyed by path, not dentry; renaming an ancestor doesn't move the
         // mount as on Linux.
-        mounts.push(Box::new(Mount { path, backend }));
+        mounts.push(Box::new(mount));
         Ok(())
     }
 
@@ -246,6 +270,13 @@ impl<Platform: RawSyncPrimitivesProvider> ComposerBuilder<Platform> {
         };
         if sorted_paths.array_windows().any(|[a, b]| a == b) {
             return Err(BuildError::DuplicateMountPath);
+        }
+        if mounts.iter().any(|mount| {
+            paths
+                .iter()
+                .any(|path| mount.has_caller_relative_ancestor(path))
+        }) {
+            return Err(BuildError::InvalidMountPath);
         }
 
         // TODO(jayb): Decide whether mounting a deep path should implicitly synthesize
@@ -342,13 +373,14 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
     /// stale.
     fn current_route(
         &self,
+        caller: Caller<'_>,
         mount: &Mount,
         dir: &DirHandle,
     ) -> Result<Option<Vec<String>>, WalkError> {
         if !self.has_nested_mount(mount) {
             return Ok(None);
         }
-        Self::route_from_backend_path(mount, mount.backend.dir_path(dir))
+        Self::route_from_backend_path(mount, mount.backend.dir_path(caller, dir))
     }
 
     fn has_nested_mount(&self, mount: &Mount) -> bool {
@@ -444,11 +476,12 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
 
     fn exact_mount_root(
         &self,
+        caller: Caller<'_>,
         path: &[String],
     ) -> Result<Option<(usize, ResolvedDir<'_>)>, WalkError> {
         self.initialized_mounts()
             .find(|(_, mount)| mount.path == path)
-            .map(|(index, mount)| mount.backend.root().map(|root| (index, root)))
+            .map(|(index, mount)| mount.backend.root(caller).map(|root| (index, root)))
             .transpose()
     }
 
@@ -602,8 +635,8 @@ impl<Platform: RawSyncPrimitivesProvider> BackendHandles for Composer<Platform> 
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        let inner = match self.exact_mount_root(&[])? {
+    fn root(&self, caller: Caller<'_>) -> Result<ResolvedDir<'_>, WalkError> {
+        let inner = match self.exact_mount_root(caller, &[])? {
             Some((mount_index, handle)) => ComposerWalkingDirHandleInner::Mounted {
                 path: vec![],
                 mount_index,
@@ -616,6 +649,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
 
     fn resolve<'a>(
         &'a self,
+        caller: Caller<'_>,
         from: ResolvedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -640,7 +674,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     }
                     let child_path = append_components(path.clone(), &[component]);
                     let inner = if let Some((mount_index, handle)) =
-                        self.exact_mount_root(&child_path).map_err(fail)?
+                        self.exact_mount_root(caller, &child_path).map_err(fail)?
                     {
                         ComposerWalkingDirHandleInner::Mounted {
                             path: child_path,
@@ -683,12 +717,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                             // A server-authorized parent must still be searched before crossing a mount.
                             PermissionCheck::ByBackend => {
                                 let _ = backend
-                                    .resolve(handle, &[component], authorize_dir_lookup)
+                                    .resolve(caller, handle, &[component], authorize_dir_lookup)
                                     .map_err(shift)?;
                             }
                         }
-                        let (mount_index, handle) =
-                            self.exact_mount_root(&child_path).map_err(fail)?.unwrap();
+                        let (mount_index, handle) = self
+                            .exact_mount_root(caller, &child_path)
+                            .map_err(fail)?
+                            .unwrap();
                         current = self.resolved_dir(
                             ComposerWalkingDirHandleInner::Mounted {
                                 path: child_path,
@@ -710,7 +746,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     };
                     let end = index + prefix_len;
                     match backend
-                        .resolve(handle, &components[index..end], authorize_dir_lookup)
+                        .resolve(
+                            caller,
+                            handle,
+                            &components[index..end],
+                            authorize_dir_lookup,
+                        )
                         .map_err(shift)?
                     {
                         Resolution::Found(ResolvedTarget::Dir(handle)) => {
@@ -842,7 +883,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         }
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+    fn dir_path(
+        &self,
+        caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<Vec<String>>, WalkError> {
         match &dir.get_typed::<Self>().inner {
             ComposerDirHandleInner::Virtual { path } => Ok(Some(path.clone())),
             ComposerDirHandleInner::Mounted {
@@ -851,7 +896,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 ..
             } => {
                 let mount = self.initialized_mount(*mount_index);
-                let Some(suffix) = mount.backend.dir_path(handle)? else {
+                let Some(suffix) = mount.backend.dir_path(caller, handle)? else {
                     return Ok(None);
                 };
                 let mut path = mount.path.clone();
@@ -870,7 +915,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         }
     }
 
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+    fn parent_dir(
+        &self,
+        caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<DirHandle>, WalkError> {
         let mount_path = match &dir.get_typed::<Self>().inner {
             ComposerDirHandleInner::Virtual { path } => path,
             ComposerDirHandleInner::Mounted {
@@ -879,14 +928,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 handle,
             } => {
                 let mount = self.initialized_mount(*mount_index);
-                if let Some(parent) = mount.backend.parent_dir(handle)? {
-                    let named = self.current_route(mount, &parent)?;
+                if let Some(parent) = mount.backend.parent_dir(caller, handle)? {
+                    let named = self.current_route(caller, mount, &parent)?;
                     // Like Linux, `..` onto a covered directory lands on the mount covering it.
                     // Only a route the backend named can identify that directory; an approximated
                     // one may be stale.
                     if let Some(route) = &named
                         && let Some((covering, root)) = self
-                            .exact_mount_root(route)?
+                            .exact_mount_root(caller, route)?
                             .filter(|(index, _)| index != mount_index)
                     {
                         let route = route.clone();
@@ -925,7 +974,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         };
         let parts: Vec<_> = parent.iter().map(String::as_str).collect();
         let Resolution::Found(ResolvedTarget::Dir(parent)) = self
-            .resolve(self.root()?, &parts, &|_| Ok(()))
+            .resolve(caller, self.root(caller)?, &parts, &|_| Ok(()))
             .map_err(|e| e.error)?
         else {
             return Err(PathError::NoSuchFileOrDirectory.into());
@@ -949,7 +998,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         }
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at(
+        &self,
+        caller: Caller<'_>,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         match &dir.get_typed::<Self>().inner {
             ComposerWalkingDirHandleInner::Virtual { .. } => {
                 Err(PathError::NoSuchFileOrDirectory.into())
@@ -962,7 +1016,8 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 let ResolvedTarget::Dir(handle) = target else {
                     unreachable!()
                 };
-                self.backend(*mount_index).read_link_at(handle, name)
+                self.backend(*mount_index)
+                    .read_link_at(caller, handle, name)
             }
         }
     }
@@ -982,7 +1037,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         }))
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+    fn list_dir_at(
+        &self,
+        caller: Caller<'_>,
+        handle: DirHandle,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         match handle.inner {
             ComposerDirHandleInner::Virtual { path } => Ok(self.list_mount_children(&path)),
@@ -994,10 +1053,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 let mount = self.initialized_mount(mount_index);
                 // The route only places nested mount points; without it, use the recorded path.
                 let path = self
-                    .current_route(mount, &handle)
+                    .current_route(caller, mount, &handle)
                     .map_err(|_| ReadDirError::Io)?
                     .unwrap_or(path);
-                let entries = mount.backend.list_dir_at(handle)?;
+                let entries = mount.backend.list_dir_at(caller, handle)?;
                 Ok(self.merge_mount_children(entries, &path))
             }
         }
@@ -1044,12 +1103,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         self.backend(h.mount_index).seek_behavior(&h.handle)
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+    fn status(&self, caller: Caller<'_>, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
             HandleRef::File(h) => {
                 let h = h.get_typed::<Self>();
                 self.backend(h.mount_index)
-                    .status(HandleRef::File(&h.handle))
+                    .status(caller, HandleRef::File(&h.handle))
             }
             HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
                 ComposerDirHandleInner::Virtual { path } => Ok(self.virtual_dir_status(path)),
@@ -1057,7 +1116,9 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     mount_index,
                     handle,
                     ..
-                } => self.backend(*mount_index).status(HandleRef::Dir(handle)),
+                } => self
+                    .backend(*mount_index)
+                    .status(caller, HandleRef::Dir(handle)),
             },
         }
     }
@@ -1072,11 +1133,16 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         self.backend(h.mount_index).readiness_source(&h.handle)
     }
 
-    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+    fn resolved_status(
+        &self,
+        caller: Caller<'_>,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<FileStatus, FileStatusError> {
         match target {
             ResolvedTarget::File(h) => {
                 let h = h.get_typed::<Self>();
-                self.backend(h.mount_index).resolved_status(&h.target)
+                self.backend(h.mount_index)
+                    .resolved_status(caller, &h.target)
             }
             ResolvedTarget::Dir(h) => match &h.get_typed::<Self>().inner {
                 ComposerWalkingDirHandleInner::Virtual { path } => {
@@ -1086,7 +1152,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     mount_index,
                     target,
                     ..
-                } => self.backend(*mount_index).resolved_status(target),
+                } => self.backend(*mount_index).resolved_status(caller, target),
             },
         }
     }
@@ -1360,7 +1426,12 @@ mod tests {
             .unwrap();
         let open_file = || {
             let Resolution::Found(ResolvedTarget::File(file)) = composer
-                .resolve(composer.root().unwrap(), &["mnt", "file"], &|_| Ok(()))
+                .resolve(
+                    Caller::default(),
+                    composer.root(Caller::default()).unwrap(),
+                    &["mnt", "file"],
+                    &|_| Ok(()),
+                )
                 .unwrap()
             else {
                 panic!("expected mounted file");
@@ -1369,14 +1440,24 @@ mod tests {
         };
         let old_file = open_file();
         let Resolution::Found(ResolvedTarget::Dir(dir)) = composer
-            .resolve(composer.root().unwrap(), &["mnt"], &|_| Ok(()))
+            .resolve(
+                Caller::default(),
+                composer.root(Caller::default()).unwrap(),
+                &["mnt"],
+                &|_| Ok(()),
+            )
             .unwrap()
         else {
             panic!("expected original directory");
         };
         let old_dir = composer.open_dir(dir, OFlags::RDONLY).unwrap();
         let Resolution::Found(ResolvedTarget::File(unopened)) = composer
-            .resolve(composer.root().unwrap(), &["mnt", "file"], &|_| Ok(()))
+            .resolve(
+                Caller::default(),
+                composer.root(Caller::default()).unwrap(),
+                &["mnt", "file"],
+                &|_| Ok(()),
+            )
             .unwrap()
         else {
             panic!("expected original file");
@@ -1391,6 +1472,7 @@ mod tests {
         let late_open = composer.open_file(unopened, OFlags::RDONLY).unwrap();
         let Resolution::Found(ResolvedTarget::File(from_old_dir)) = composer
             .resolve(
+                Caller::default(),
                 composer.walking_dir_at(&old_dir).unwrap(),
                 &["file"],
                 &|_| Ok(()),
@@ -1412,12 +1494,12 @@ mod tests {
         }
         assert_ne!(
             composer
-                .status(HandleRef::File(&old_file))
+                .status(Caller::default(), HandleRef::File(&old_file))
                 .unwrap()
                 .node_info
                 .dev,
             composer
-                .status(HandleRef::File(&new_file))
+                .status(Caller::default(), HandleRef::File(&new_file))
                 .unwrap()
                 .node_info
                 .dev,
@@ -1450,7 +1532,12 @@ mod tests {
         );
         assert!(matches!(
             composer
-                .resolve(composer.root().unwrap(), &["overflow"], &|_| Ok(()))
+                .resolve(
+                    Caller::default(),
+                    composer.root(Caller::default()).unwrap(),
+                    &["overflow"],
+                    &|_| Ok(())
+                )
                 .unwrap(),
             Resolution::MissingFinal { .. },
         ));
@@ -1502,16 +1589,24 @@ mod tests {
             .mount("/host/child", InMem::<TestPlatform>::new)
             .unwrap();
         let host = composer.backend(0);
-        host.rmdir_at(host.root().unwrap(), "host").unwrap();
+        host.rmdir_at(host.root(Caller::default()).unwrap(), "host")
+            .unwrap();
 
         let virtual_status = || {
             let Resolution::Found(target) = composer
-                .resolve(composer.root().unwrap(), &["host"], &|_| Ok(()))
+                .resolve(
+                    Caller::default(),
+                    composer.root(Caller::default()).unwrap(),
+                    &["host"],
+                    &|_| Ok(()),
+                )
                 .unwrap()
             else {
                 panic!("expected synthesized ancestor");
             };
-            composer.resolved_status(&target).unwrap()
+            composer
+                .resolved_status(Caller::default(), &target)
+                .unwrap()
         };
         let status = virtual_status();
         assert_eq!(status.file_type, FileType::Directory);
@@ -1520,13 +1615,21 @@ mod tests {
             .unwrap();
         assert_eq!(virtual_status().node_info, status.node_info);
         let Resolution::Found(ResolvedTarget::Dir(dir)) = composer
-            .resolve(composer.root().unwrap(), &["host"], &|_| Ok(()))
+            .resolve(
+                Caller::default(),
+                composer.root(Caller::default()).unwrap(),
+                &["host"],
+                &|_| Ok(()),
+            )
             .unwrap()
         else {
             panic!("expected synthesized ancestor");
         };
         let entries = composer
-            .list_dir_at(composer.open_dir(dir, OFlags::RDONLY).unwrap())
+            .list_dir_at(
+                Caller::default(),
+                composer.open_dir(dir, OFlags::RDONLY).unwrap(),
+            )
             .unwrap();
         assert_eq!(
             entries
@@ -1536,7 +1639,12 @@ mod tests {
             ["child", "sibling"],
         );
         assert!(matches!(
-            composer.resolve(composer.root().unwrap(), &["host", "child"], &|_| Ok(())),
+            composer.resolve(
+                Caller::default(),
+                composer.root(Caller::default()).unwrap(),
+                &["host", "child"],
+                &|_| Ok(())
+            ),
             Ok(Resolution::Found(ResolvedTarget::Dir(_))),
         ));
     }
@@ -1562,9 +1670,9 @@ mod tests {
             }
             start.wait();
             for _ in 0..128 {
-                original.root().unwrap();
+                original.root(Caller::default()).unwrap();
                 for (_, mount) in composer.initialized_mounts() {
-                    mount.backend.root().unwrap();
+                    mount.backend.root(Caller::default()).unwrap();
                 }
             }
         });
@@ -1575,7 +1683,8 @@ mod tests {
         for index in 0..RUNTIME_MOUNT_CAPACITY {
             assert!(matches!(
                 composer.resolve(
-                    composer.root().unwrap(),
+                    Caller::default(),
+                    composer.root(Caller::default()).unwrap(),
                     &["runtime", &index.to_string()],
                     &|_| Ok(())
                 ),
@@ -1651,7 +1760,12 @@ mod tests {
             .unwrap();
 
         let Resolution::Found(ResolvedTarget::File(target)) = composer
-            .resolve(composer.root().unwrap(), &["a", "file"], &|_| Ok(()))
+            .resolve(
+                Caller::default(),
+                composer.root(Caller::default()).unwrap(),
+                &["a", "file"],
+                &|_| Ok(()),
+            )
             .unwrap()
         else {
             panic!("expected mounted file");
@@ -1663,12 +1777,23 @@ mod tests {
         for (index, components, expected) in [(0, &["a", "file"][..], 8), (2, &["file"][..], 0)] {
             let backend = composer.backend(index);
             let Resolution::Found(target) = backend
-                .resolve(backend.root().unwrap(), components, &|_| Ok(()))
+                .resolve(
+                    Caller::default(),
+                    backend.root(Caller::default()).unwrap(),
+                    components,
+                    &|_| Ok(()),
+                )
                 .unwrap()
             else {
                 panic!("expected existing file");
             };
-            assert_eq!(backend.resolved_status(&target).unwrap().size, expected);
+            assert_eq!(
+                backend
+                    .resolved_status(Caller::default(), &target)
+                    .unwrap()
+                    .size,
+                expected
+            );
         }
     }
 }

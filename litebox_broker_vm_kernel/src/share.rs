@@ -13,8 +13,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use litebox_broker_core::fs::backend::{
-    Backend, CreationMetadata, DirHandle, DirPathResult, FileHandle, FileTerminal, HandleRef,
-    PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
+    Backend, Caller, CreationMetadata, DirHandle, DirPathResult, FileHandle, FileTerminal,
+    HandleRef, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use litebox_broker_core::fs::errors::{
     ChmodError, ChownError, FileStatusError, MapSharedError, MkdirError, OpenError, ReadDirError,
@@ -206,21 +206,28 @@ impl<B: Backend> ShareFs<B> {
 }
 
 impl<B: Backend> Backend for ShareFs<B> {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
-        self.inner.root()
+    fn root(&self, caller: Caller<'_>) -> Result<ResolvedDir<'_>, WalkError> {
+        self.inner.root(caller)
     }
 
     fn resolve<'a>(
         &'a self,
+        caller: Caller<'_>,
         from: ResolvedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
     ) -> Result<Resolution<'a>, ResolutionError> {
-        self.inner.resolve(from, components, authorize_dir_lookup)
+        self.inner
+            .resolve(caller, from, components, authorize_dir_lookup)
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
-        self.inner.read_link_at(dir, name)
+    fn read_link_at(
+        &self,
+        caller: Caller<'_>,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
+        self.inner.read_link_at(caller, dir, name)
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
@@ -238,12 +245,20 @@ impl<B: Backend> Backend for ShareFs<B> {
         self.inner.walking_dir_with_path(dir)
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
-        self.inner.dir_path(dir)
+    fn dir_path(
+        &self,
+        caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<Vec<String>>, WalkError> {
+        self.inner.dir_path(caller, dir)
     }
 
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
-        self.inner.parent_dir(dir)
+    fn parent_dir(
+        &self,
+        caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<DirHandle>, WalkError> {
+        self.inner.parent_dir(caller, dir)
     }
 
     fn check_search_permission(&self, dir: &ResolvedDir<'_>) -> Result<(), WalkError> {
@@ -254,8 +269,12 @@ impl<B: Backend> Backend for ShareFs<B> {
         self.inner.open_file(file, flags)
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
-        self.inner.list_dir_at(handle)
+    fn list_dir_at(
+        &self,
+        caller: Caller<'_>,
+        handle: DirHandle,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
+        self.inner.list_dir_at(caller, handle)
     }
 
     fn lookup_at(&self, dir: &DirHandle, name: &str) -> Result<Option<DirEntry>, ReadDirError> {
@@ -296,13 +315,19 @@ impl<B: Backend> Backend for ShareFs<B> {
         self.inner.seek_behavior(h)
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
-        self.inner.status(h).map(|status| self.timed(status))
+    fn status(&self, caller: Caller<'_>, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+        self.inner
+            .status(caller, h)
+            .map(|status| self.timed(status))
     }
 
-    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+    fn resolved_status(
+        &self,
+        caller: Caller<'_>,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<FileStatus, FileStatusError> {
         self.inner
-            .resolved_status(target)
+            .resolved_status(caller, target)
             .map(|status| self.timed(status))
     }
 

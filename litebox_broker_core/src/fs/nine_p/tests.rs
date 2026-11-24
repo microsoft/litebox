@@ -12,6 +12,7 @@ use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+use crate::fs::backend::Caller;
 use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError,
     SeekError, TruncateError, UnlinkError, WriteError,
@@ -284,7 +285,7 @@ fn overlay_authorizes_logical_targets_even_with_a_self_enforcing_lower() {
     let fd = fs
         .open(user, None, "/private-file", OFlags::PATH, Mode::empty())
         .unwrap();
-    assert_eq!(fs.handle_status(&fd).unwrap().size, 17);
+    assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 17);
     drop(fd);
     assert_eq!(std::fs::read(&file).unwrap(), b"server-owned data");
 }
@@ -367,7 +368,9 @@ fn test_nine_p_mkdir_and_readdir() {
             Mode::empty(),
         )
         .expect("failed to open root dir");
-    let entries = fs.read_dir(&fd).expect("failed to readdir root");
+    let entries = fs
+        .read_dir(Caller::default(), &fd)
+        .expect("failed to readdir root");
     drop(fd);
 
     let names: alloc::vec::Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -386,7 +389,9 @@ fn test_nine_p_mkdir_and_readdir() {
             Mode::empty(),
         )
         .expect("failed to open subdir");
-    let entries = fs.read_dir(&fd).expect("failed to readdir subdir");
+    let entries = fs
+        .read_dir(Caller::default(), &fd)
+        .expect("failed to readdir subdir");
     drop(fd);
 
     let names: alloc::vec::Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -538,7 +543,7 @@ fn test_nine_p_host_files_visible() {
             Mode::empty(),
         )
         .expect("failed to open host dir via 9P");
-    let entries = fs.read_dir(&fd).unwrap();
+    let entries = fs.read_dir(Caller::default(), &fd).unwrap();
     drop(fd);
 
     let names: alloc::vec::Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -602,7 +607,7 @@ fn test_nine_p_host_symlinks() {
             Mode::empty(),
         )
         .unwrap();
-    let entries = fs.read_dir(&fd).unwrap();
+    let entries = fs.read_dir(Caller::default(), &fd).unwrap();
     let rel = entries.iter().find(|entry| entry.name == "rel").unwrap();
     assert_eq!(rel.file_type, FileType::SymbolicLink);
 }
@@ -824,7 +829,7 @@ fn test_nine_p_broken_readdir() {
         )
         .expect("open dir should succeed before break");
 
-    let result = fs.read_dir(&fd);
+    let result = fs.read_dir(Caller::default(), &fd);
     assert!(matches!(result, Err(ReadDirError::Io)));
 }
 
@@ -1057,7 +1062,9 @@ fn test_nine_p_handle_status() {
         )
         .expect("failed to open file");
 
-    let status = fs.handle_status(&fd).expect("handle status failed");
+    let status = fs
+        .handle_status(Caller::default(), &fd)
+        .expect("handle status failed");
     assert_eq!(status.file_type, FileType::RegularFile);
     assert_eq!(status.size, 13, "file size should be 13 bytes");
 
@@ -1073,7 +1080,9 @@ fn test_nine_p_handle_status() {
             Mode::empty(),
         )
         .expect("failed to open root dir");
-    let status = fs.handle_status(&fd).expect("handle status on dir failed");
+    let status = fs
+        .handle_status(Caller::default(), &fd)
+        .expect("handle status on dir failed");
     assert_eq!(status.file_type, FileType::Directory);
     drop(fd);
 }
@@ -1230,7 +1239,7 @@ fn nine_p_held_directories_name_and_walk() {
     let root = fs
         .open(USER, None, "/", OFlags::PATH, Mode::empty())
         .unwrap();
-    assert_eq!(fs.handle_path(&root).unwrap(), "/");
+    assert_eq!(fs.handle_path(Caller::default(), &root).unwrap(), "/");
     // 9P cannot name other directories, so they report the name they were opened by.
     let sub = fs
         .open(
@@ -1241,7 +1250,7 @@ fn nine_p_held_directories_name_and_walk() {
             Mode::empty(),
         )
         .unwrap();
-    assert_eq!(fs.handle_path(&sub).unwrap(), "/d/sub");
+    assert_eq!(fs.handle_path(Caller::default(), &sub).unwrap(), "/d/sub");
     // A directory opened for reading still walks relative paths and lists afterwards.
     drop(
         fs.open(
@@ -1254,7 +1263,7 @@ fn nine_p_held_directories_name_and_walk() {
         .unwrap(),
     );
     assert!(
-        fs.read_dir(&sub)
+        fs.read_dir(Caller::default(), &sub)
             .unwrap()
             .iter()
             .any(|entry| entry.name == "f")
@@ -1263,7 +1272,9 @@ fn nine_p_held_directories_name_and_walk() {
         .open(USER, Some(sub.anchor()), "..", OFlags::PATH, Mode::empty())
         .unwrap();
     assert_eq!(
-        fs.handle_status(&parent).unwrap().node_info,
+        fs.handle_status(Caller::default(), &parent)
+            .unwrap()
+            .node_info,
         fs.file_status(USER, None, "/d", true).unwrap().node_info
     );
     let above_root = fs
@@ -1276,7 +1287,9 @@ fn nine_p_held_directories_name_and_walk() {
         )
         .unwrap();
     assert_eq!(
-        fs.handle_status(&above_root).unwrap().node_info,
+        fs.handle_status(Caller::default(), &above_root)
+            .unwrap()
+            .node_info,
         fs.file_status(USER, None, "/d", true).unwrap().node_info
     );
 }
@@ -1327,7 +1340,7 @@ fn nine_p_held_directory_search_is_checked_by_the_server() {
     let parent = fs
         .open(USER, Some(d.anchor()), "..", OFlags::PATH, Mode::empty())
         .unwrap();
-    assert_eq!(fs.handle_path(&parent).unwrap(), "/");
+    assert_eq!(fs.handle_path(Caller::default(), &parent).unwrap(), "/");
 }
 
 #[test]
@@ -1348,7 +1361,7 @@ fn nine_p_removed_held_directory_has_no_name() {
         .unwrap()
     });
     for gone in &held {
-        assert_eq!(fs.handle_path(gone).unwrap(), "/gone");
+        assert_eq!(fs.handle_path(Caller::default(), gone).unwrap(), "/gone");
     }
 
     fs.rmdir(USER, None, "/gone").unwrap();
@@ -1356,12 +1369,15 @@ fn nine_p_removed_held_directory_has_no_name() {
     // Like Linux, an unlinked directory has no name, rather than the name it was opened by.
     for gone in &held {
         assert!(matches!(
-            fs.handle_path(gone),
+            fs.handle_path(Caller::default(), gone),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
     // Linux: getdents64 on a removed directory fails with ENOENT (probed natively).
-    assert!(matches!(fs.read_dir(&held[0]), Err(ReadDirError::Removed)));
+    assert!(matches!(
+        fs.read_dir(Caller::default(), &held[0]),
+        Err(ReadDirError::Removed)
+    ));
 }
 
 #[test]

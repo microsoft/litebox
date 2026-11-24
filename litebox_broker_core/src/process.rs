@@ -5878,7 +5878,7 @@ mod tests {
             .open(
                 None,
                 "/dev/urandom",
-                ROOT,
+                ROOT.into(),
                 FileAccessMode::WriteOnly,
                 FileOpenFlags::NONE,
                 FileMode::default(),
@@ -5895,7 +5895,7 @@ mod tests {
             .open(
                 None,
                 "/dev/null",
-                ROOT,
+                ROOT.into(),
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::NONE,
                 FileMode::default(),

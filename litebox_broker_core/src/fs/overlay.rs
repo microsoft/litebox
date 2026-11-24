@@ -27,8 +27,8 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, DirPathResult, FileHandle, HandleRef,
-    PermissionCheck, PermissionInfo, Resolution, ResolvedDir as ScopedDir, ResolvedFile,
+    Backend, BackendHandles, Caller, CreationMetadata, DirHandle, DirPathResult, FileHandle,
+    HandleRef, PermissionCheck, PermissionInfo, Resolution, ResolvedDir as ScopedDir, ResolvedFile,
     ResolvedTarget, SeekBehavior,
 };
 use super::errors::{
@@ -360,15 +360,21 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     }
 
     fn resolve_root(&self) -> Result<ResolvedDir, OpenError> {
-        let upper = self
-            .upper
-            .open_dir(self.upper.root().map_err(OpenError::from)?, OFlags::PATH)?;
+        let upper = self.upper.open_dir(
+            self.upper
+                .root(Caller::default())
+                .map_err(OpenError::from)?,
+            OFlags::PATH,
+        )?;
         let lowers = self
             .lowers
             .iter()
             .map(|lower| {
                 lower
-                    .open_dir(lower.root().map_err(OpenError::from)?, OFlags::PATH)
+                    .open_dir(
+                        lower.root(Caller::default()).map_err(OpenError::from)?,
+                        OFlags::PATH,
+                    )
                     .map(Some)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -392,7 +398,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         ) -> Result<DirHandle, OpenError> {
             let walking = backend.walking_dir_at(parent).map_err(OpenError::from)?;
             match backend
-                .resolve(walking, &[dir_name], &|_| Ok(()))
+                .resolve(Caller::default(), walking, &[dir_name], &|_| Ok(()))
                 .map_err(|error| OpenError::from(error.error))?
             {
                 Resolution::Found(ResolvedTarget::Dir(dir)) => backend.open_dir(dir, OFlags::PATH),
@@ -445,9 +451,10 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     ) -> Result<ScopedDir<'a>, OpenError> {
         let (_, backend, handle) = self.owning_dir(&resolved).ok_or(OpenError::Io)?;
         let status = backend
-            .resolved_status(&ResolvedTarget::Dir(
-                backend.walking_dir_at(handle).map_err(OpenError::from)?,
-            ))
+            .resolved_status(
+                Caller::default(),
+                &ResolvedTarget::Dir(backend.walking_dir_at(handle).map_err(OpenError::from)?),
+            )
             .map_err(file_status_to_open_error)?;
         Ok(ScopedDir::from_typed::<Self>(
             OverlayWalkingDir {
@@ -525,14 +532,14 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 .map_err(OpenError::from)?;
             let Resolution::Found(target) = self
                 .upper
-                .resolve(parent, &[name], &|_| Ok(()))
+                .resolve(Caller::default(), parent, &[name], &|_| Ok(()))
                 .map_err(|error| OpenError::from(error.error))?
             else {
                 return Err(OpenError::Io);
             };
             let upper_status = self
                 .upper
-                .resolved_status(&target)
+                .resolved_status(Caller::default(), &target)
                 .map_err(file_status_to_open_error)?;
             // Best effort: clockless lowers keep the upper's creation times. Like Linux overlayfs,
             // ctime is not preserved.
@@ -578,7 +585,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             .walking_dir_at(lower_dir.lowers[layer].as_ref().ok_or(OpenError::Io)?)
             .map_err(OpenError::from)?;
         let link = self.lowers[layer]
-            .read_link_at(&lower_dir, name)
+            .read_link_at(Caller::default(), &lower_dir, name)
             .map_err(OpenError::from)?;
         drop(lower_dir);
         let upper_dir = self.ensure_upper_dir(locked, parent)?;
@@ -609,7 +616,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 .map_err(OpenError::from)?;
             match self
                 .upper
-                .resolve(parent, &[name], &|_| Ok(()))
+                .resolve(Caller::default(), parent, &[name], &|_| Ok(()))
                 .map_err(|error| OpenError::from(error.error))?
             {
                 Resolution::Found(ResolvedTarget::File(file)) => {
@@ -698,7 +705,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                     return Ok(f(target));
                 };
                 let status = self.lowers[layer]
-                    .resolved_status(&target)
+                    .resolved_status(Caller::default(), &target)
                     .map_err(file_status_to_open_error)?;
                 let upper_dir = match status.file_type {
                     FileType::RegularFile => {
@@ -730,7 +737,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                     .map_err(OpenError::from)?;
                 match self
                     .upper
-                    .resolve(parent, &[&name], &|_| Ok(()))
+                    .resolve(Caller::default(), parent, &[&name], &|_| Ok(()))
                     .map_err(|error| OpenError::from(error.error))?
                 {
                     Resolution::Found(target @ ResolvedTarget::File(_)) => Ok(f(target)),
@@ -822,9 +829,12 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         locked: &NamespaceGuard<'_, Platform>,
         path: &[String],
     ) -> Result<DirHandle, OpenError> {
-        let mut upper = self
-            .upper
-            .open_dir(self.upper.root().map_err(OpenError::from)?, OFlags::PATH)?;
+        let mut upper = self.upper.open_dir(
+            self.upper
+                .root(Caller::default())
+                .map_err(OpenError::from)?,
+            OFlags::PATH,
+        )?;
         for index in 0..path.len() {
             // Re-resolve after each materialisation, since it changed the upper namespace.
             let resolved = self.resolve_dir(&path[..=index])?;
@@ -850,7 +860,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             return Err(OpenError::Io);
         };
         let status = backend
-            .status(HandleRef::Dir(handle))
+            .status(Caller::default(), HandleRef::Dir(handle))
             .map_err(file_status_to_open_error)?;
         let child = self
             .upper
@@ -1160,7 +1170,7 @@ fn list_layer_dir(backend: &dyn Backend, dir: &DirHandle) -> Result<Vec<DirEntry
     let dir = backend
         .open_dir(dir, OFlags::RDONLY)
         .map_err(|_| ReadDirError::Io)?;
-    backend.list_dir_at(dir)
+    backend.list_dir_at(Caller::default(), dir)
 }
 
 fn unlink_to_open_error(error: UnlinkError) -> OpenError {
@@ -1187,7 +1197,7 @@ impl<Platform: RawSyncPrimitivesProvider> BackendHandles for Overlay<Platform> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
-    fn root(&self) -> Result<ScopedDir<'_>, WalkError> {
+    fn root(&self, _caller: Caller<'_>) -> Result<ScopedDir<'_>, WalkError> {
         let locked = self.namespace.lock();
         let resolved = self.resolve_root().map_err(open_to_walk_error)?;
         self.scoped_dir(Ok(Vec::new()), resolved, locked)
@@ -1196,6 +1206,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
 
     fn resolve<'a>(
         &'a self,
+        _caller: Caller<'_>,
         from: ScopedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -1254,7 +1265,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             let file_type = entry.entry.file_type;
             let (layer, backend, parent) = self.entry_layer(&resolved, &entry).map_err(fail)?;
             let Resolution::Found(target @ ResolvedTarget::File(_)) = backend
-                .resolve(parent, &[name], &|_| Ok(()))
+                .resolve(Caller::default(), parent, &[name], &|_| Ok(()))
                 .map_err(|mut error| {
                     error.component = error.component.map(|component| component + index);
                     error
@@ -1263,7 +1274,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 return Err(fail(WalkError::Io));
             };
             let status = backend
-                .resolved_status(&target)
+                .resolved_status(Caller::default(), &target)
                 .map_err(file_status_to_open_error)
                 .map_err(open_to_walk_error)
                 .map_err(fail)?;
@@ -1289,14 +1300,19 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         Ok(Resolution::Found(ResolvedTarget::Dir(current)))
     }
 
-    fn read_link_at(&self, dir: &ScopedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at(
+        &self,
+        _caller: Caller<'_>,
+        dir: &ScopedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         let OverlayWalkingDir { resolved, .. } = dir.get_typed::<Self>();
         let entry = self
             .entry(resolved, name)
             .map_err(open_to_walk_error)?
             .ok_or(PathError::NoSuchFileOrDirectory)?;
         let (_, backend, parent) = self.entry_layer(resolved, &entry)?;
-        backend.read_link_at(&parent, name)
+        backend.read_link_at(Caller::default(), &parent, name)
     }
 
     fn open_dir(&self, dir: ScopedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
@@ -1330,12 +1346,20 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         self.held_walking_dir(dir, true)
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+    fn dir_path(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<Vec<String>>, WalkError> {
         let _namespace = self.namespace.lock();
         Ok(Some(dir.get_typed::<Self>().linked_path()?))
     }
 
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+    fn parent_dir(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<DirHandle>, WalkError> {
         let locked = self.namespace.lock();
         let mut path = match dir.get_typed::<Self>().location.lock().path.clone() {
             Ok(path) => path,
@@ -1371,7 +1395,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         } = file.into_typed::<Self>();
         let layer = if let Some(layer) = layer {
             let status = self.lowers[layer]
-                .resolved_status(&target)
+                .resolved_status(Caller::default(), &target)
                 .map_err(file_status_to_open_error)?;
             let ResolvedTarget::File(file) = target else {
                 unreachable!()
@@ -1415,7 +1439,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         Ok(FileHandle::from_typed::<Self>(OverlayFile { layer }))
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+    fn list_dir_at(
+        &self,
+        _caller: Caller<'_>,
+        handle: DirHandle,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
         let locked = self.namespace.lock();
         let Ok((_, resolved)) = self
             .resolve_held_dir(&locked, handle.get_typed::<Self>())
@@ -1495,11 +1523,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+    fn status(&self, _caller: Caller<'_>, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
             HandleRef::File(handle) => {
                 self.with_file(handle.get_typed::<Self>(), |layer, backend, handle| {
-                    let status = backend.status(HandleRef::File(handle))?;
+                    let status = backend.status(Caller::default(), HandleRef::File(handle))?;
                     Ok(self.map_status(status, layer))
                 })
             }
@@ -1511,34 +1539,46 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                     .map_err(|_| FileStatusError::Io)?
                 else {
                     let (layer, handle) = &dir.backing;
-                    let status = self.layer_backend(*layer).status(HandleRef::Dir(handle))?;
+                    let status = self
+                        .layer_backend(*layer)
+                        .status(Caller::default(), HandleRef::Dir(handle))?;
                     return Ok(self.map_status(status, *layer));
                 };
                 let (layer, backend, handle) =
                     self.owning_dir(&resolved).ok_or(FileStatusError::Io)?;
-                let status = backend.status(HandleRef::Dir(handle))?;
+                let status = backend.status(Caller::default(), HandleRef::Dir(handle))?;
                 Ok(self.map_status(status, layer))
             }
         }
     }
 
-    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+    fn resolved_status(
+        &self,
+        _caller: Caller<'_>,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<FileStatus, FileStatusError> {
         match target {
             ResolvedTarget::Dir(dir) => {
                 let dir = dir.get_typed::<Self>();
                 let (layer, backend, handle) =
                     self.owning_dir(&dir.resolved).ok_or(FileStatusError::Io)?;
-                let status = backend.resolved_status(&ResolvedTarget::Dir(
-                    backend
-                        .walking_dir_at(handle)
-                        .map_err(walk_error_or(FileStatusError::Io))?,
-                ))?;
+                let status = backend.resolved_status(
+                    Caller::default(),
+                    &ResolvedTarget::Dir(
+                        backend
+                            .walking_dir_at(handle)
+                            .map_err(walk_error_or(FileStatusError::Io))?,
+                    ),
+                )?;
                 Ok(self.map_status(status, layer))
             }
             ResolvedTarget::File(file) => {
                 let file = file.get_typed::<Self>();
                 let backend = self.layer_backend(file.layer);
-                Ok(self.map_status(backend.resolved_status(&file.target)?, file.layer))
+                Ok(self.map_status(
+                    backend.resolved_status(Caller::default(), &file.target)?,
+                    file.layer,
+                ))
             }
         }
     }
@@ -1921,7 +1961,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                     if let Some(upper) = &child.upper
                         && self
                             .upper
-                            .list_dir_at(upper.clone())
+                            .list_dir_at(Caller::default(), upper.clone())
                             .map_err(|_| RenameError::Io)?
                             .iter()
                             .any(|entry| !valid(&entry.name))

@@ -9,6 +9,7 @@
 
 use alloc::borrow::Cow;
 
+use super::backend::Caller;
 use super::in_mem::InMem;
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::overlay::Overlay;
@@ -289,7 +290,12 @@ mod timestamps {
         );
         for components in [&["dir"][..], &["dir", "file"], &["dir", "link"]] {
             let Resolution::Found(target) = lower
-                .resolve(lower.root().unwrap(), components, &|_| Ok(()))
+                .resolve(
+                    Caller::default(),
+                    lower.root(Caller::default()).unwrap(),
+                    components,
+                    &|_| Ok(()),
+                )
                 .unwrap()
             else {
                 panic!("missing lower fixture entry")
@@ -414,7 +420,10 @@ mod timestamps {
                 changed: UNSET
             })
         );
-        assert_eq!(fs.handle_status(&entry).unwrap().times, None);
+        assert_eq!(
+            fs.handle_status(Caller::default(), &entry).unwrap().times,
+            None
+        );
         fs.set_times_at(ROOT, "/dir/link", true, &explicit).unwrap();
         fs.set_times(
             ROOT,
@@ -427,7 +436,10 @@ mod timestamps {
             modified: LATER,
             changed: UNSET,
         });
-        assert_eq!(fs.handle_status(&entry).unwrap().times, expected);
+        assert_eq!(
+            fs.handle_status(Caller::default(), &entry).unwrap().times,
+            expected
+        );
         fs.set_times_at(
             ROOT,
             "/dir/file",
@@ -435,13 +447,16 @@ mod timestamps {
             &update(FileTimeUpdate::Omit, FileTimeUpdate::Omit),
         )
         .unwrap();
-        assert_eq!(fs.handle_status(&entry).unwrap().times, expected);
+        assert_eq!(
+            fs.handle_status(Caller::default(), &entry).unwrap().times,
+            expected
+        );
         let path_only = fs
             .open(ROOT, None, "/dir/file", OFlags::PATH, Mode::empty())
             .unwrap();
         fs.set_times(ROOT, &path_only, &explicit).unwrap();
         assert_eq!(
-            fs.handle_status(&path_only)
+            fs.handle_status(Caller::default(), &path_only)
                 .unwrap()
                 .times
                 .unwrap()
@@ -528,7 +543,12 @@ mod timestamps {
             fs.set_times(ROOT, &entry, &times),
             Err(SetTimesError::Io)
         ));
-        assert_eq!(fs.handle_status(&replacement).unwrap().times, None);
+        assert_eq!(
+            fs.handle_status(Caller::default(), &replacement)
+                .unwrap()
+                .times,
+            None
+        );
         fs.unlink(ROOT, None, "/file").unwrap();
         assert!(matches!(
             fs.set_times(ROOT, &replacement, &times),
@@ -581,7 +601,12 @@ mod timestamps {
             allocators.next(),
         );
         let Resolution::Found(target) = lower
-            .resolve(lower.root().unwrap(), &["file"], &|_| Ok(()))
+            .resolve(
+                Caller::default(),
+                lower.root(Caller::default()).unwrap(),
+                &["file"],
+                &|_| Ok(()),
+            )
             .unwrap()
         else {
             panic!("missing lower file")
@@ -618,7 +643,10 @@ mod timestamps {
             fs.file_status(ROOT, None, "/file", true).unwrap().times,
             expected
         );
-        assert_eq!(fs.handle_status(&entry).unwrap().times, expected);
+        assert_eq!(
+            fs.handle_status(Caller::default(), &entry).unwrap().times,
+            expected
+        );
         fs.set_times(
             ROOT,
             &entry,
@@ -626,7 +654,11 @@ mod timestamps {
         )
         .unwrap();
         assert_eq!(
-            fs.handle_status(&entry).unwrap().times.unwrap().modified,
+            fs.handle_status(Caller::default(), &entry)
+                .unwrap()
+                .times
+                .unwrap()
+                .modified,
             BEFORE_EPOCH
         );
     }
@@ -639,12 +671,17 @@ mod timestamps {
             let original = fs
                 .open(ROOT, None, "/dir/file", OFlags::RDONLY, Mode::empty())
                 .unwrap();
-            let inode = fs.handle_status(&original).unwrap().node_info;
+            let inode = fs
+                .handle_status(Caller::default(), &original)
+                .unwrap()
+                .node_info;
             let writable = fs
                 .open(ROOT, None, "/dir/file", flags, Mode::empty())
                 .unwrap();
             assert_eq!(
-                fs.handle_status(&writable).unwrap().times,
+                fs.handle_status(Caller::default(), &writable)
+                    .unwrap()
+                    .times,
                 Some(LOWER_TIMES)
             );
             let expected: &[u8] = if flags.contains(OFlags::TRUNC) {
@@ -654,7 +691,7 @@ mod timestamps {
             };
             assert_eq!(read_path(&fs, "/dir/file").1, expected);
             for entry in [&original, &writable] {
-                let status = fs.handle_status(entry).unwrap();
+                let status = fs.handle_status(Caller::default(), entry).unwrap();
                 assert_eq!(status.times, Some(LOWER_TIMES));
                 assert_eq!(status.node_info, inode);
             }
@@ -714,7 +751,10 @@ mod timestamps {
                 Mode::empty(),
             )
             .unwrap();
-        let inode = fs.handle_status(&link).unwrap().node_info;
+        let inode = fs
+            .handle_status(Caller::default(), &link)
+            .unwrap()
+            .node_info;
         fs.set_times(
             ROOT,
             &link,
@@ -726,7 +766,7 @@ mod timestamps {
             ..LOWER_TIMES
         });
         for status in [
-            fs.handle_status(&link).unwrap(),
+            fs.handle_status(Caller::default(), &link).unwrap(),
             fs.file_status(ROOT, None, "/dir/link", false).unwrap(),
         ] {
             assert_eq!(status.file_type, FileType::SymbolicLink);
@@ -745,6 +785,7 @@ mod timestamps {
 }
 
 mod in_mem {
+    use super::Caller;
     use super::{
         FileType, InMem, InodeAllocators, Mode, OFlags, ROOT, Resolver, ResolverEntry, SeekWhence,
         TestPlatform, USER, UserInfo, in_mem_fs,
@@ -897,7 +938,7 @@ mod in_mem {
             .expect("Failed to write to file with offset");
         // Like `pwrite`, writing nothing past the end leaves the size alone.
         assert_eq!(fs.write(&mut fd, b"", Some(20)).unwrap(), 0);
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 13);
+        assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 13);
         drop(fd);
 
         // Read from the file
@@ -969,7 +1010,9 @@ mod in_mem {
         let fd = fs
             .open(ROOT, None, "/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
-        let entries = fs.read_dir(&fd).expect("Failed to read directory");
+        let entries = fs
+            .read_dir(Caller::default(), &fd)
+            .expect("Failed to read directory");
         drop(fd);
 
         // Should have 5 entries: ., .., testdir, testfile1, testfile2
@@ -1002,7 +1045,9 @@ mod in_mem {
         let fd = fs
             .open(ROOT, None, "/testdir", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open subdirectory");
-        let entries = fs.read_dir(&fd).expect("Failed to read subdirectory");
+        let entries = fs
+            .read_dir(Caller::default(), &fd)
+            .expect("Failed to read subdirectory");
         assert_eq!(
             entries
                 .iter()
@@ -1032,7 +1077,10 @@ mod in_mem {
         let fd = fs
             .open(ROOT, None, "/testfile", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
-        assert!(matches!(fs.read_dir(&fd), Err(ReadDirError::NotADirectory)));
+        assert!(matches!(
+            fs.read_dir(Caller::default(), &fd),
+            Err(ReadDirError::NotADirectory)
+        ));
     }
 
     #[test]
@@ -1815,6 +1863,7 @@ mod in_mem {
 }
 
 mod tar_ro {
+    use super::Caller;
     use super::{
         ArchiveEntry, FileType, InodeAllocators, Mode, OFlags, ROOT, Resolver, TEST_TAR_FILE,
         TarRo, TestPlatform, USER, build_tar, read_path, tar_ro_fs,
@@ -1992,7 +2041,9 @@ mod tar_ro {
         let fd = fs
             .open(USER, None, "/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
-        let entries = fs.read_dir(&fd).expect("Failed to read root directory");
+        let entries = fs
+            .read_dir(Caller::default(), &fd)
+            .expect("Failed to read root directory");
         drop(fd);
 
         // Should have 4 entries: ., .., bar, foo
@@ -2023,7 +2074,9 @@ mod tar_ro {
         let fd = fs
             .open(USER, None, "bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar directory");
-        let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
+        let entries = fs
+            .read_dir(Caller::default(), &fd)
+            .expect("Failed to read bar directory");
 
         // Should have 3 entries: ., .., baz (file)
         assert_eq!(entries.len(), 3);
@@ -2038,7 +2091,10 @@ mod tar_ro {
         let fd = fs
             .open(USER, None, "foo", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open foo file");
-        assert!(matches!(fs.read_dir(&fd), Err(ReadDirError::NotADirectory)));
+        assert!(matches!(
+            fs.read_dir(Caller::default(), &fd),
+            Err(ReadDirError::NotADirectory)
+        ));
     }
 
     #[test]
@@ -2109,7 +2165,7 @@ mod tar_ro {
             )
             .unwrap();
         assert_eq!(fd.recorded_name(), "/bin/sh");
-        assert_eq!(fs.handle_status(&fd).unwrap(), link);
+        assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap(), link);
         drop(fd);
         assert!(matches!(
             fs.open(
@@ -2143,7 +2199,7 @@ mod tar_ro {
         let fd = fs
             .open(USER, None, "/", OFlags::RDONLY, Mode::empty())
             .unwrap();
-        let entries = fs.read_dir(&fd).unwrap();
+        let entries = fs.read_dir(Caller::default(), &fd).unwrap();
         let lib = entries.iter().find(|entry| entry.name == "lib").unwrap();
         assert_eq!(lib.file_type, FileType::SymbolicLink);
     }
@@ -2560,7 +2616,7 @@ mod tar_ro {
                 Mode::empty(),
             )
             .unwrap();
-        assert_eq!(fs.handle_path(&bar).unwrap(), "/bar");
+        assert_eq!(fs.handle_path(Caller::default(), &bar).unwrap(), "/bar");
         let up = fs
             .open(
                 USER,
@@ -2570,7 +2626,7 @@ mod tar_ro {
                 Mode::empty(),
             )
             .unwrap();
-        assert_eq!(fs.handle_path(&up).unwrap(), "/");
+        assert_eq!(fs.handle_path(Caller::default(), &up).unwrap(), "/");
         assert!(
             fs.file_status(USER, Some(bar.anchor()), "baz", true)
                 .is_ok()
@@ -2579,6 +2635,7 @@ mod tar_ro {
 }
 
 mod overlay {
+    use super::Caller;
     use super::{
         FileType, InodeAllocator, Mode, OFlags, Overlay, Resolver, SeekWhence, TEST_TAR_FILE,
         TestPlatform, USER, UserInfo,
@@ -2633,7 +2690,9 @@ mod overlay {
             .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
-        let stat = fs.handle_status(&fd).expect("Failed to handle stat");
+        let stat = fs
+            .handle_status(Caller::default(), &fd)
+            .expect("Failed to handle stat");
         assert_eq!(stat.file_type, FileType::RegularFile);
         assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
         drop(fd);
@@ -2652,7 +2711,9 @@ mod overlay {
             .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
-        let stat = fs.handle_status(&fd).expect("Failed to handle stat");
+        let stat = fs
+            .handle_status(Caller::default(), &fd)
+            .expect("Failed to handle stat");
         assert_eq!(stat.file_type, FileType::RegularFile);
         assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
     }
@@ -2861,7 +2922,9 @@ mod overlay {
         let fd = fs
             .open(USER, None, "bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar directory");
-        let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
+        let entries = fs
+            .read_dir(Caller::default(), &fd)
+            .expect("Failed to read bar directory");
 
         // Should have 3 entries: ., .., baz (file)
         assert_eq!(entries.len(), 3);
@@ -2897,7 +2960,9 @@ mod overlay {
         let fd = fs
             .open(USER, None, "/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
-        let entries = fs.read_dir(&fd).expect("Failed to read root directory");
+        let entries = fs
+            .read_dir(Caller::default(), &fd)
+            .expect("Failed to read root directory");
         drop(fd);
 
         // Should have 6 entries: ., .., bar, foo (from lower), upperdir, upperfile (from upper)
@@ -2933,7 +2998,9 @@ mod overlay {
         let fd = fs
             .open(USER, None, "/upperdir", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open upperdir");
-        let entries = fs.read_dir(&fd).expect("Failed to read upperdir");
+        let entries = fs
+            .read_dir(Caller::default(), &fd)
+            .expect("Failed to read upperdir");
 
         // only . and ..
         assert_eq!(entries.len(), 2);
@@ -3079,7 +3146,7 @@ mod overlay {
             .open(USER, None, "/bar/test", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /bar/test directory");
         let entries = fs
-            .read_dir(&fd)
+            .read_dir(Caller::default(), &fd)
             .expect("Failed to read /bar/test directory");
 
         // Should contain only . and .. entries
@@ -3565,13 +3632,13 @@ mod overlay {
         ));
         assert!(fs.file_status(user, Some(bar.anchor()), ".", true).is_ok());
         assert!(matches!(
-            fs.handle_path(&bar),
+            fs.handle_path(Caller::default(), &bar),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         let parent = fs
             .open(user, Some(bar.anchor()), "..", OFlags::PATH, Mode::empty())
             .unwrap();
-        assert_eq!(fs.handle_path(&parent).unwrap(), "/");
+        assert_eq!(fs.handle_path(Caller::default(), &parent).unwrap(), "/");
     }
 
     #[test]
@@ -3620,26 +3687,40 @@ mod overlay {
             )
             .unwrap()
         });
-        let old_b_node = fs.handle_status(&old_b).unwrap().node_info;
+        let old_b_node = fs
+            .handle_status(Caller::default(), &old_b)
+            .unwrap()
+            .node_info;
 
         fs.rename(USER, None, "/a", None, "/b").unwrap();
 
         // Like Linux, held directories (and their descendants) move with the rename.
-        assert_eq!(fs.handle_path(&a).unwrap(), "/b");
-        assert_eq!(fs.handle_path(&sub).unwrap(), "/b/sub");
+        assert_eq!(fs.handle_path(Caller::default(), &a).unwrap(), "/b");
+        assert_eq!(fs.handle_path(Caller::default(), &sub).unwrap(), "/b/sub");
         let b_node = fs.file_status(USER, None, "/b", true).unwrap().node_info;
-        assert_eq!(fs.handle_status(&a).unwrap().node_info, b_node);
+        assert_eq!(
+            fs.handle_status(Caller::default(), &a).unwrap().node_info,
+            b_node
+        );
         assert_ne!(b_node, old_b_node);
         let sub_parent = fs
             .open(USER, Some(sub.anchor()), "..", OFlags::PATH, Mode::empty())
             .unwrap();
-        assert_eq!(fs.handle_status(&sub_parent).unwrap().node_info, b_node);
-        assert_eq!(fs.handle_path(&sub_parent).unwrap(), "/b");
+        assert_eq!(
+            fs.handle_status(Caller::default(), &sub_parent)
+                .unwrap()
+                .node_info,
+            b_node
+        );
+        assert_eq!(
+            fs.handle_path(Caller::default(), &sub_parent).unwrap(),
+            "/b"
+        );
 
         // The replaced directory is unlinked: it has no name, but `..` still reaches its former
         // parent rather than the directory that took its name.
         assert!(matches!(
-            fs.handle_path(&old_b),
+            fs.handle_path(Caller::default(), &old_b),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(matches!(
@@ -3655,9 +3736,14 @@ mod overlay {
                 Mode::empty(),
             )
             .unwrap();
-        assert_eq!(fs.handle_path(&old_b_parent).unwrap(), "/");
         assert_eq!(
-            fs.handle_status(&old_b_parent).unwrap().node_info,
+            fs.handle_path(Caller::default(), &old_b_parent).unwrap(),
+            "/"
+        );
+        assert_eq!(
+            fs.handle_status(Caller::default(), &old_b_parent)
+                .unwrap()
+                .node_info,
             fs.file_status(USER, None, "/", true).unwrap().node_info
         );
     }
@@ -3675,13 +3761,13 @@ mod overlay {
                 Mode::empty(),
             )
             .unwrap();
-        let before = fs.handle_status(&d).unwrap();
+        let before = fs.handle_status(Caller::default(), &d).unwrap();
         assert_eq!(before.file_type, FileType::Directory);
 
         fs.rmdir(USER, None, "/d").unwrap();
 
         // As with fstat on Linux, the held directory still describes itself once unlinked.
-        let after = fs.handle_status(&d).unwrap();
+        let after = fs.handle_status(Caller::default(), &d).unwrap();
         assert_eq!(after.node_info, before.node_info);
         assert_eq!(after.file_type, FileType::Directory);
         // A new directory taking the name must not be confused with the held one.
@@ -3690,12 +3776,15 @@ mod overlay {
             fs.file_status(USER, None, "/d", true).unwrap().node_info,
             before.node_info
         );
-        assert_eq!(fs.handle_status(&d).unwrap().node_info, before.node_info);
+        assert_eq!(
+            fs.handle_status(Caller::default(), &d).unwrap().node_info,
+            before.node_info
+        );
     }
 }
 
 mod devices {
-    use super::{FileType, Mode, OFlags, Resolver, TestPlatform, USER};
+    use super::{Caller, FileType, Mode, OFlags, Resolver, TestPlatform, USER};
     use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
     use crate::fs::errors::{OpenError, PathError};
@@ -3728,12 +3817,15 @@ mod devices {
         let pts = fs
             .open(USER, None, "/dev/pts", OFlags::PATH, Mode::empty())
             .unwrap();
-        assert_eq!(fs.handle_path(&pts).unwrap(), "/dev/pts");
+        assert_eq!(fs.handle_path(Caller::default(), &pts).unwrap(), "/dev/pts");
         for (path, expected) in [("..", "/dev"), ("../..", "/")] {
             let parent = fs
                 .open(USER, Some(pts.anchor()), path, OFlags::PATH, Mode::empty())
                 .unwrap();
-            assert_eq!(fs.handle_path(&parent).unwrap(), expected);
+            assert_eq!(
+                fs.handle_path(Caller::default(), &parent).unwrap(),
+                expected
+            );
         }
         let dev = fs
             .open(USER, Some(pts.anchor()), "..", OFlags::PATH, Mode::empty())
@@ -3909,7 +4001,9 @@ mod devices {
                 Mode::empty(),
             )
             .expect("Failed to open /dev");
-        let entries = fs.read_dir(&dev).expect("Failed to read /dev");
+        let entries = fs
+            .read_dir(Caller::default(), &dev)
+            .expect("Failed to read /dev");
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert!(names.contains(&"tty"));
     }
@@ -3935,7 +4029,9 @@ mod devices {
                 Mode::empty(),
             )
             .expect("Failed to open directory");
-        let entries = fs.read_dir(&dir).expect("Failed to read directory");
+        let entries = fs
+            .read_dir(Caller::default(), &dir)
+            .expect("Failed to read directory");
         entries.into_iter().map(|entry| entry.name).collect()
     }
 
@@ -3953,7 +4049,7 @@ mod devices {
             Ok(Ok(TerminalResponse::SubsidiaryIndex(0)))
         );
         assert!(fs.readiness_source(&manager).is_some());
-        let status = fs.handle_status(&manager).unwrap();
+        let status = fs.handle_status(Caller::default(), &manager).unwrap();
         assert_eq!(
             status.node_info.rdev.map(core::num::NonZeroU64::get),
             Some(0x502)
@@ -4023,7 +4119,12 @@ mod devices {
             .open(USER, None, "/dev/pts/1", OFlags::PATH, Mode::empty())
             .unwrap();
         assert!(fs.terminal(&path).is_none());
-        assert_eq!(fs.handle_status(&path).unwrap().node_info, status.node_info);
+        assert_eq!(
+            fs.handle_status(Caller::default(), &path)
+                .unwrap()
+                .node_info,
+            status.node_info
+        );
 
         for missing in ["/dev/pts/2", "/dev/pts/01", "/dev/pts/+1", "/dev/pts/x"] {
             assert!(
@@ -4184,7 +4285,7 @@ mod composed {
 }
 
 mod shared_mapping {
-    use super::{InMem, InodeAllocators, Mode, OFlags, ROOT, Resolver, TestPlatform, USER};
+    use super::{Caller, InMem, InodeAllocators, Mode, OFlags, ROOT, Resolver, TestPlatform, USER};
     use crate::fs::errors::{MapSharedError, OpenError, StorageError, TruncateError, WriteError};
     use crate::fs::in_mem::InitialNode;
     use crate::fs::shared_storage::test_memory::VecMemoryProvider;
@@ -4234,7 +4335,7 @@ mod shared_mapping {
 
         fs.write(&mut fd, b"!!", Some(6)).unwrap();
         assert_eq!(memory.contents(), b"hello\0!!");
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 8);
+        assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 8);
 
         memory.write_at(0, &b"J".as_slice()).unwrap();
         let mut read = vec![0; 8];
@@ -4242,10 +4343,10 @@ mod shared_mapping {
         assert_eq!(&read, b"Jello\0!!");
 
         memory.set_len(10).unwrap();
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 10);
+        assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 10);
         fs.truncate(&mut fd, 2, false).unwrap();
         assert_eq!(memory.contents(), b"Je");
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 2);
+        assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 2);
 
         let mut append = fs
             .open(
@@ -4281,7 +4382,7 @@ mod shared_mapping {
             )
             .unwrap();
         assert_eq!(memory.contents(), b"");
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 0);
+        assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 0);
         assert!(Arc::ptr_eq(&fs.map_shared(&fd).unwrap().file, &mapping));
     }
 
@@ -4536,7 +4637,7 @@ mod shared_mapping {
             fs.write(&mut fd, &FaultingBuffer::new(4, 0), Some(10)),
             Err(WriteError::Broker(_))
         ));
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 8);
+        assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 8);
         assert_eq!(
             fs.write(&mut fd, &FaultingBuffer::new(4, 3), Some(8))
                 .unwrap(),
@@ -4572,6 +4673,6 @@ mod shared_mapping {
             Err(OpenError::TruncateError(TruncateError::Busy))
         ));
         assert_eq!(memory.contents(), b"testfoo\n\0\0ab");
-        assert_eq!(fs.handle_status(&fd).unwrap().size, 12);
+        assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 12);
     }
 }

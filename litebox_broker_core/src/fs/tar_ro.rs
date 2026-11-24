@@ -37,8 +37,8 @@ use super::{DirEntry, FileType};
 use super::{
     Mode, NodeInfo, OFlags, UserInfo,
     backend::{
-        CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck, PermissionInfo,
-        Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
+        Caller, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
+        PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
     },
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
@@ -107,12 +107,13 @@ impl super::backend::BackendHandles for TarRo {
 }
 
 impl super::backend::Backend for TarRo {
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root(&self, _caller: Caller<'_>) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(self.resolved_dir(TarRoDirHandle { idx: 0 }))
     }
 
     fn resolve<'a>(
         &'a self,
+        _caller: Caller<'_>,
         from: ResolvedDir<'a>,
         components: &[&str],
         authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -163,7 +164,12 @@ impl super::backend::Backend for TarRo {
         Ok(Resolution::Found(ResolvedTarget::Dir(current)))
     }
 
-    fn read_link_at(&self, dir: &ResolvedDir<'_>, name: &str) -> Result<String, WalkError> {
+    fn read_link_at(
+        &self,
+        _caller: Caller<'_>,
+        dir: &ResolvedDir<'_>,
+        name: &str,
+    ) -> Result<String, WalkError> {
         let dir = dir.get_typed::<Self>();
         match self.tar_index.dirs[dir.idx].children.get(name) {
             Some(IndexedChild::File(idx)) => match &self.tar_index.files[*idx].content {
@@ -186,7 +192,11 @@ impl super::backend::Backend for TarRo {
         Ok(self.resolved_dir(dir.get_typed::<Self>().clone()))
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+    fn dir_path(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<Vec<String>>, WalkError> {
         let dirs = &self.tar_index.dirs;
         super::backend::name_by_walking_up(dir.get_typed::<Self>().idx, |&child| {
             let Some(parent) = dirs[child].parent else {
@@ -204,7 +214,11 @@ impl super::backend::Backend for TarRo {
         .map(Some)
     }
 
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+    fn parent_dir(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<DirHandle>, WalkError> {
         Ok(self.tar_index.dirs[dir.get_typed::<Self>().idx]
             .parent
             .map(|idx| DirHandle::from_typed::<Self>(TarRoDirHandle { idx })))
@@ -230,7 +244,11 @@ impl super::backend::Backend for TarRo {
         Ok(FileHandle::from_typed::<Self>(file.into_typed::<Self>()))
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+    fn list_dir_at(
+        &self,
+        _caller: Caller<'_>,
+        handle: DirHandle,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         Ok(self.tar_index.dirs[handle.idx]
             .children
@@ -280,6 +298,7 @@ impl super::backend::Backend for TarRo {
 
     fn status(
         &self,
+        _caller: Caller<'_>,
         h: HandleRef<'_>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         match h {
@@ -314,15 +333,22 @@ impl super::backend::Backend for TarRo {
 
     fn resolved_status(
         &self,
+        caller: Caller<'_>,
         target: &ResolvedTarget<'_>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         match target {
-            ResolvedTarget::File(h) => self.status(HandleRef::File(
-                &FileHandle::from_typed::<Self>(h.get_typed::<Self>().clone()),
-            )),
-            ResolvedTarget::Dir(h) => self.status(HandleRef::Dir(&DirHandle::from_typed::<Self>(
-                h.get_typed::<Self>().clone(),
-            ))),
+            ResolvedTarget::File(h) => self.status(
+                caller,
+                HandleRef::File(&FileHandle::from_typed::<Self>(
+                    h.get_typed::<Self>().clone(),
+                )),
+            ),
+            ResolvedTarget::Dir(h) => self.status(
+                caller,
+                HandleRef::Dir(&DirHandle::from_typed::<Self>(
+                    h.get_typed::<Self>().clone(),
+                )),
+            ),
         }
     }
 

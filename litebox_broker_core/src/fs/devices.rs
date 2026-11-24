@@ -15,9 +15,9 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, FileTerminal, HandleRef,
-    PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
-    SeekBehavior,
+    Backend, BackendHandles, Caller, CreationMetadata, DirHandle, FileHandle, FileTerminal,
+    HandleRef, PermissionCheck, PermissionInfo, Resolution, ResolvedDir, ResolvedFile,
+    ResolvedTarget, SeekBehavior,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -348,7 +348,7 @@ impl Backend for Devices {
         }
     }
 
-    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+    fn root(&self, _caller: Caller<'_>) -> Result<ResolvedDir<'_>, WalkError> {
         Ok(ResolvedDir::from_typed::<Self>(
             DeviceDirHandle::Root,
             PermissionCheck::ByBackend,
@@ -357,6 +357,7 @@ impl Backend for Devices {
 
     fn resolve<'a>(
         &'a self,
+        _caller: Caller<'_>,
         from: ResolvedDir<'a>,
         components: &[&str],
         _authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
@@ -416,7 +417,12 @@ impl Backend for Devices {
         )))
     }
 
-    fn read_link_at(&self, _dir: &ResolvedDir<'_>, _name: &str) -> Result<String, WalkError> {
+    fn read_link_at(
+        &self,
+        _caller: Caller<'_>,
+        _dir: &ResolvedDir<'_>,
+        _name: &str,
+    ) -> Result<String, WalkError> {
         Err(PathError::InvalidPathname.into())
     }
 
@@ -431,14 +437,22 @@ impl Backend for Devices {
         ))
     }
 
-    fn dir_path(&self, dir: &DirHandle) -> Result<Option<Vec<String>>, WalkError> {
+    fn dir_path(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<Vec<String>>, WalkError> {
         Ok(Some(match dir.get_typed::<Self>() {
             DeviceDirHandle::Root => Vec::new(),
             DeviceDirHandle::Pts => alloc::vec!["pts".into()],
         }))
     }
 
-    fn parent_dir(&self, dir: &DirHandle) -> Result<Option<DirHandle>, WalkError> {
+    fn parent_dir(
+        &self,
+        _caller: Caller<'_>,
+        dir: &DirHandle,
+    ) -> Result<Option<DirHandle>, WalkError> {
         Ok(match dir.get_typed::<Self>() {
             DeviceDirHandle::Root => None,
             DeviceDirHandle::Pts => Some(DirHandle::from_typed::<Self>(DeviceDirHandle::Root)),
@@ -484,7 +498,11 @@ impl Backend for Devices {
         Ok(item)
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+    fn list_dir_at(
+        &self,
+        _caller: Caller<'_>,
+        handle: DirHandle,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
         Ok(match handle.into_typed::<Self>() {
             DeviceDirHandle::Root => Device::ALL
                 .iter()
@@ -614,7 +632,7 @@ impl Backend for Devices {
         }))
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+    fn status(&self, _caller: Caller<'_>, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
             HandleRef::File(h) => Ok(match &h.get_typed::<Self>().0 {
                 DeviceFile::Device(device) => device.file_status(self),
@@ -636,15 +654,20 @@ impl Backend for Devices {
         }
     }
 
-    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+    fn resolved_status(
+        &self,
+        caller: Caller<'_>,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<FileStatus, FileStatusError> {
         match target {
             ResolvedTarget::File(h) => Ok(match &h.get_typed::<Self>().0 {
                 DeviceResolvedTarget::Device(device) => device.file_status(self),
                 DeviceResolvedTarget::Subsidiary { index, .. } => self.subsidiary_status(*index),
             }),
-            ResolvedTarget::Dir(h) => self.status(HandleRef::Dir(&DirHandle::from_typed::<Self>(
-                *h.get_typed::<Self>(),
-            ))),
+            ResolvedTarget::Dir(h) => self.status(
+                caller,
+                HandleRef::Dir(&DirHandle::from_typed::<Self>(*h.get_typed::<Self>())),
+            ),
         }
     }
 
