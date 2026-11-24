@@ -21,6 +21,8 @@ sha2 = { version = "0.10", default-features = false }
 spin = { version = "0.9.8", default-features = false, features = ["once", "rwlock", "spin_mutex"] }
 tar-core = { version = "0.1", default-features = false }
 thiserror = { version = "2.0.6", default-features = false }
+vstd.workspace = true
+vlitebox-thirdparty = { path = "../vlitebox-thirdparty" }
 
 [target.'cfg(target_os = "none")'.dependencies]
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
@@ -30,3 +32,6 @@ workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = "3"
+
+[package.metadata.verus]
+verify = true

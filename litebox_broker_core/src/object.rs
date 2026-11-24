@@ -9,6 +9,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
+use vstd::prelude::{verus_spec, verus_verify};
 
 use crate::event::EventObject;
 use crate::fs::File;
@@ -24,6 +25,10 @@ use crate::unix_socket::UnixSocketObject;
 use crate::vsock_socket::VsockSocketObject;
 use crate::{BrokerError, ProcessKey, Result};
 
+#[cfg(verus_keep_ghost)]
+#[path = "object_spec.rs"]
+pub(crate) mod verification;
+
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -36,6 +41,7 @@ bitflags::bitflags! {
 }
 
 /// One process's reference to a broker-owned object.
+#[verus_verify]
 pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,
     pub(crate) owner: ProcessKey,
@@ -49,6 +55,7 @@ pub(crate) struct ObjectReference {
     pub(crate) readiness: Option<ReadinessRegistration>,
 }
 
+#[verus_verify]
 pub(crate) enum ObjectEntry {
     Event(EventObject),
     File(File),
@@ -72,6 +79,7 @@ impl ObjectEntry {
     ///
     /// A duplicable kind whose waiters need wake-ups for changes made by
     /// other processes must also implement [`Self::watch`].
+    #[verus_spec(result => ensures result == verification::permitted_by_kind(self))]
     pub(crate) fn is_duplicable(&self) -> bool {
         match self {
             Self::Event(_)

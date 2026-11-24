@@ -1,0 +1,15 @@
+[package]
+name = "vlitebox-thirdparty"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+spin = { version = "0.9.8", default-features = false, features = ["once", "rwlock", "spin_mutex"] }
+vstd.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.verus]
+verify = true

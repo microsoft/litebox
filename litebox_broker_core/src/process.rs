@@ -33,6 +33,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::signal::MAX_SIGNAL;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
+use vstd::prelude::verus_verify;
 
 /// Platform-provided notification destination for broker-process lifecycle changes.
 pub trait ProcessLifecycleSink: Send + Sync {
@@ -221,6 +222,7 @@ fn unregister_threads(thread_ids: &[Arc<PerNamespaceIds>]) {
 /// key is never reused and never shown to the guest. The broker identifies
 /// processes by it in ownership checks, accounts and maps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[verus_verify]
 pub struct ProcessKey(u64);
 
 impl ProcessKey {

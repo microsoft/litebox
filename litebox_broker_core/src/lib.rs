@@ -15,6 +15,8 @@
 
 extern crate alloc;
 
+use vlitebox_thirdparty as _;
+
 #[cfg(any(test, feature = "test-std-platform"))]
 extern crate std;
 
@@ -380,6 +382,11 @@ pub struct BrokerCore {
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(verus_keep_ghost)]
+pub mod verification {
+    pub use crate::object::verification::{duplication_policy, prove_duplication_policy};
+}
 
 impl BrokerCore {
     /// Creates the broker core with broker-wide limits and service providers.

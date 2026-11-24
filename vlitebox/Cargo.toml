@@ -1,0 +1,19 @@
+[package]
+name = "vlitebox"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+litebox_broker_core = { path = "../litebox_broker_core" }
+vstd.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.verus]
+verify = true
+
+[[example]]
+name = "object_policy_negative"
+path = "src/negative/object_policy_negative.rs"

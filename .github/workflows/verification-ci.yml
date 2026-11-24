@@ -35,3 +35,17 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=$(sed -n 's/^VERUS_RUST_VERSION=//p' .github/tools/install_verus)" >> "$GITHUB_ENV"
       - name: Run verification
         run: cargo verus focus -p litebox_platform_lvbs
+      - name: Verify broker implementation
+        run: cargo verus focus -p litebox_broker_core -- --no-cheating
+      - name: Verify top-level broker properties
+        run: cargo verus focus -p vlitebox -- --no-cheating
+      - name: Reject deliberately false broker property
+        run: |
+          log="$RUNNER_TEMP/object-policy-negative.log"
+          if cargo verus focus -p vlitebox --example object_policy_negative -- --no-cheating > "$log" 2>&1; then
+            cat "$log"
+            echo "Deliberately false object policy unexpectedly verified"
+            exit 1
+          fi
+          cat "$log"
+          grep -q "postcondition not satisfied" "$log"

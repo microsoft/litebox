@@ -5,6 +5,8 @@ members = [
     "litebox_broker_local",
     "litebox_broker_local_userland",
     "litebox_broker_core",
+    "vlitebox-thirdparty",
+    "vlitebox",
     "litebox_broker_platform_linux_userland",
     "litebox_broker_platform_windows_userland",
     "litebox_broker_protocol",
@@ -134,6 +136,9 @@ default-members = [
 
 [workspace.lints.cargo]
 unused_dependencies = "deny"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(verus_keep_ghost)"] }
 
 [workspace.dependencies]
 # Keep these publications compatible with the release in .github/tools/install_verus.
