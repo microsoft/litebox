@@ -16,6 +16,10 @@ workspace = true
 verify = true
 
 [[example]]
+name = "pending_sender_clone_query_negative"
+path = "src/negative/pending_sender_clone_query_negative.rs"
+
+[[example]]
 name = "pending_sender_empty_negative"
 path = "src/negative/pending_sender_empty_negative.rs"
 

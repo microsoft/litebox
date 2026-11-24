@@ -11,6 +11,35 @@ use vstd::prelude::*;
 
 verus! {
 
+pub closed spec fn pending_sender_clone_policy() -> bool {
+    forall|prev: PendingSenders, cur: PendingSenders|
+        #[trigger] PendingSenders::clone.ensures((&prev,), cur) ==> cur == prev
+}
+
+pub proof fn prove_pending_sender_clone()
+    ensures pending_sender_clone_policy(),
+{
+}
+
+pub fn check_cloned_pending_sender_array(senders: [Option<ProcessId>; MAX_SIGNAL as usize])
+    -> (result: ([Option<ProcessId>; MAX_SIGNAL as usize], bool, bool))
+    ensures {
+        &&& result.0 == senders
+        &&& result.1 == result.2
+        &&& result.1 == (forall|i: int| 0 <= i < MAX_SIGNAL as int ==> senders[i].is_none())
+    },
+{
+    let prev = PendingSenders(senders);
+
+    let cur = prev.clone();
+
+    let prior_empty = prev.is_empty();
+
+    let current_empty = cur.is_empty();
+
+    (cur.0, prior_empty, current_empty)
+}
+
 pub closed spec fn pending_sender_empty_policy() -> bool {
     forall|prev: PendingSenders, result: bool|
         #[trigger] PendingSenders::is_empty.ensures((&prev,), result)

@@ -440,7 +440,8 @@ pub mod verification {
         well_formed_futex_request,
     };
     pub use crate::signal::verification::{
-        check_pending_sender_array, pending_sender_empty_policy, prove_pending_sender_empty_query,
+        check_cloned_pending_sender_array, check_pending_sender_array, pending_sender_clone_policy,
+        pending_sender_empty_policy, prove_pending_sender_clone, prove_pending_sender_empty_query,
         prove_signals_projection, signals_projection_policy,
     };
     pub use crate::timer::verification::{prove_timer_projection, timer_projection_policy};

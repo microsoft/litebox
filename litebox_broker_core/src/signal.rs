@@ -336,8 +336,8 @@ impl ProcessSignals {
 /// The process that first sent each pending signal, indexed by signal number
 /// minus one.
 #[derive(Clone, Copy)]
-// In progress: derives, EMPTY initialization and mutating sender operations are unverified.
-#[vstd::prelude::verus_verify(external_derive)]
+// In progress: other derives, EMPTY initialization and mutating sender operations are unverified.
+#[vstd::prelude::verus_verify]
 struct PendingSenders([Option<ProcessId>; MAX_SIGNAL as usize]);
 
 impl PendingSenders {
