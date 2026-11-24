@@ -16,6 +16,10 @@ workspace = true
 verify = true
 
 [[example]]
+name = "duplication_policy_observer_negative"
+path = "src/test-negative/duplication_policy_observer_negative.rs"
+
+[[example]]
 name = "pts_device_minor_truncation_negative"
 path = "src/test-negative/pts_device_minor_truncation_negative.rs"
 

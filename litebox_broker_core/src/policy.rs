@@ -10,12 +10,19 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_protocol::vsock_socket::{VsockAddress, VsockPort};
 use thiserror::Error;
+use vstd::prelude::{verus_spec, verus_verify};
+
+#[cfg(verus_keep_ghost)]
+#[path = "policy_spec.rs"]
+pub mod verification;
 
 /// Maximum number of destination rules in one transport policy.
+#[verus_verify]
 pub const MAX_DESTINATION_RULES: usize = 64;
 
 /// An IPv4 network in canonical CIDR form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[verus_verify]
 pub struct Ipv4Cidr {
     network: Ipv4Address,
     prefix_length: u8,
@@ -66,6 +73,7 @@ const fn ipv4_prefix_mask(prefix_length: u8) -> u32 {
 
 /// Inclusive nonzero transport destination-port range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[verus_verify]
 pub struct DestinationPortRange {
     start: Port,
     end: Port,
@@ -100,6 +108,7 @@ impl DestinationPortRange {
 
 /// One static IPv4 destination authorization rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[verus_verify]
 pub struct DestinationRule {
     caller_credential: CallerCredential,
     destination: Ipv4Cidr,
@@ -176,6 +185,7 @@ pub enum SocketPolicyError {
 
 /// Bounded static IPv4 destination rules for one transport protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[verus_verify]
 struct DestinationPolicy {
     destination_rules: [DestinationRule; MAX_DESTINATION_RULES],
     destination_rule_count: usize,
@@ -201,6 +211,7 @@ impl DestinationPolicy {
 /// Local bind authority is separate from egress destination rules and is
 /// enforced by the broker's guest binding namespace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[verus_verify]
 pub struct SocketPolicy {
     tcp: Option<DestinationPolicy>,
     udp: Option<DestinationPolicy>,
@@ -309,6 +320,7 @@ fn copy_destination_rules(
 
 /// Nonempty inclusive range of vsock ports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[verus_verify]
 pub struct VsockPortRange {
     first: VsockPort,
     last: VsockPort,
@@ -354,6 +366,7 @@ impl VsockPortRange {
 /// The ranges apply to every principal the profile grants rights, unlike
 /// [`SocketPolicy`]'s per-credential rules.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[verus_verify]
 pub struct VsockPolicy {
     connect: Option<VsockPortRange>,
     listen: Option<VsockPortRange>,
@@ -420,6 +433,7 @@ impl VsockPolicy {
 /// Configured broker policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
+#[verus_verify]
 pub enum PolicyProfile {
     /// Deny every operation.
     DefaultDeny,
@@ -436,12 +450,26 @@ pub enum PolicyProfile {
 }
 
 /// Broker policy decision and audit component.
+///
+/// Verification exposes its native representation, not an authentication or
+/// stability guarantee. The non-Copy derived `Clone` has no verified contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[verus_verify]
 pub struct PolicyEngine {
     profile: PolicyProfile,
     socket_policy: SocketPolicy,
     vsock_policy: VsockPolicy,
     process_duplication_enabled: bool,
+}
+
+#[cfg(verus_keep_ghost)]
+vstd::prelude::verus! {
+impl PolicyEngine {
+    /// The original engine's configured process-duplication permission.
+    pub closed spec fn duplication_policy_enabled(&self) -> bool {
+        self.process_duplication_enabled
+    }
+}
 }
 
 impl PolicyEngine {
@@ -493,6 +521,7 @@ impl PolicyEngine {
 
     /// Returns whether a process may duplicate itself into a child process.
     #[must_use]
+    #[verus_spec(result => ensures result == self.duplication_policy_enabled())]
     pub const fn process_duplication_enabled(&self) -> bool {
         self.process_duplication_enabled
     }
