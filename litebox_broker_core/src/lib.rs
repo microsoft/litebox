@@ -92,8 +92,8 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 ///
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-// In progress: derives and live quota enforcement remain unverified.
-#[vstd::prelude::verus_verify(external_derive)]
+// In progress: other derives and live quota enforcement remain unverified.
+#[vstd::prelude::verus_verify]
 pub struct BrokerCoreLimits {
     /// Maximum broker processes, across every PID namespace, that have not
     /// completed core teardown.

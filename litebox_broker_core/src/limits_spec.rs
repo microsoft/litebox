@@ -9,6 +9,16 @@ use vstd::prelude::*;
 
 verus! {
 
+pub closed spec fn limit_clone_policy() -> bool {
+    forall|prev: BrokerCoreLimits, cur: BrokerCoreLimits|
+        #[trigger] BrokerCoreLimits::clone.ensures((&prev,), cur) ==> cur == prev
+}
+
+pub proof fn prove_limit_clone()
+    ensures limit_clone_policy(),
+{
+}
+
 pub open spec fn process_quota_transition(
     prev: BrokerCoreLimits,
     cur: BrokerCoreLimits,

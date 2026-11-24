@@ -9,6 +9,29 @@ use vstd::prelude::*;
 
 verus! {
 
+pub proof fn original_limit_clone_preserves_the_complete_configuration()
+    ensures limits_spec::limit_clone_policy(),
+{
+    limits_spec::prove_limit_clone();
+}
+
+pub fn check_cloned_process_quota_update(
+    prev: BrokerCoreLimits,
+    references: usize,
+    pipe_capacity: usize,
+) -> (result: (BrokerCoreLimits, BrokerCoreLimits))
+    ensures {
+        &&& result.0 == prev
+        &&& limits_spec::process_quota_transition(prev, result.1, references, pipe_capacity)
+    },
+{
+    let cloned = prev.clone();
+
+    let updated = cloned.with_process_quotas(references, pipe_capacity);
+
+    (cloned, updated)
+}
+
 pub proof fn original_limit_builders_preserve_value_frames()
     ensures limits_spec::limit_builder_policy(),
 {
