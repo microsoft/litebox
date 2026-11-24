@@ -30,6 +30,40 @@ pub open spec fn process_limit_transition(
     cur == BrokerCoreLimits { max_processes: processes, ..prev }
 }
 
+pub open spec fn reference_pipe_limit_transition(
+    prev: BrokerCoreLimits,
+    cur: BrokerCoreLimits,
+    references: usize,
+    pipe_capacity: usize,
+) -> bool {
+    cur == BrokerCoreLimits {
+        max_references: references,
+        max_references_per_process: references,
+        max_total_pipe_capacity: pipe_capacity,
+        max_pipe_capacity_per_process: pipe_capacity,
+        ..prev
+    }
+}
+
+pub open spec fn constructor_socket_limit_transition(
+    prev: BrokerCoreLimits,
+    cur: BrokerCoreLimits,
+    references: usize,
+    pipe_capacity: usize,
+    sockets: usize,
+    sockets_per_process: usize,
+) -> bool {
+    cur == BrokerCoreLimits {
+        max_references: references,
+        max_references_per_process: references,
+        max_total_pipe_capacity: pipe_capacity,
+        max_pipe_capacity_per_process: pipe_capacity,
+        max_sockets: sockets,
+        max_sockets_per_process: sockets_per_process,
+        ..prev
+    }
+}
+
 pub open spec fn unix_socket_limit_transition(
     prev: BrokerCoreLimits,
     cur: BrokerCoreLimits,
@@ -135,6 +169,20 @@ pub closed spec fn limit_builder_policy() -> bool {
 
 pub proof fn prove_limit_builder_frames()
     ensures limit_builder_policy(),
+{
+}
+
+pub closed spec fn limit_constructor_policy() -> bool {
+    &&& forall|cur: BrokerCoreLimits, references: usize, pipe_capacity: usize|
+        #[trigger] BrokerCoreLimits::new.ensures((references, pipe_capacity), cur)
+            ==> reference_pipe_limit_transition(BrokerCoreLimits::DEFAULT, cur, references, pipe_capacity)
+    &&& forall|cur: BrokerCoreLimits, references: usize, pipe_capacity: usize, sockets: usize, per_process: usize|
+        #[trigger] BrokerCoreLimits::new_with_all_limits.ensures((references, pipe_capacity, sockets, per_process), cur)
+            ==> constructor_socket_limit_transition(BrokerCoreLimits::DEFAULT, cur, references, pipe_capacity, sockets, per_process)
+}
+
+pub proof fn prove_limit_constructor_frames()
+    ensures limit_constructor_policy(),
 {
 }
 

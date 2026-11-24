@@ -63,6 +63,7 @@ use hashbrown::HashMap;
 use litebox_broker_protocol::process::HostNames;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::{Mutex, rwlock::RwLock};
+use vstd::prelude::verus_spec;
 
 pub use error::BrokerError;
 use fs::FileService;
@@ -91,7 +92,7 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 ///
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-// In progress: derives, defaults/constructors and live quota enforcement remain unverified.
+// In progress: derives, the Default trait implementation and live enforcement remain unverified.
 #[vstd::prelude::verus_verify(external_derive)]
 pub struct BrokerCoreLimits {
     /// Maximum broker processes, across every PID namespace, that have not
@@ -139,8 +140,10 @@ pub struct BrokerCoreLimits {
     pub max_pid_namespaces_per_process: usize,
 }
 
+#[vstd::prelude::verus_verify]
 impl BrokerCoreLimits {
     /// Conservative default authority-state limits.
+    #[vstd::prelude::verus_verify]
     pub const DEFAULT: Self = Self {
         max_processes: 1024,
         max_references: 4096,
@@ -167,6 +170,9 @@ impl BrokerCoreLimits {
     ///
     /// The reference and pipe-capacity process quotas initially match their
     /// broker-wide limits. Use [`Self::with_process_quotas`] to override them.
+    #[verus_spec(result => ensures
+        limits_spec::reference_pipe_limit_transition(Self::DEFAULT, result, max_references, max_total_pipe_capacity)
+    )]
     pub const fn new(max_references: usize, max_total_pipe_capacity: usize) -> Self {
         Self {
             max_processes: Self::DEFAULT.max_processes,
@@ -196,6 +202,9 @@ impl BrokerCoreLimits {
     ///
     /// The reference and pipe-capacity process quotas initially match their
     /// broker-wide limits. Use [`Self::with_process_quotas`] to override them.
+    #[verus_spec(result => ensures
+        limits_spec::constructor_socket_limit_transition(Self::DEFAULT, result, max_references, max_total_pipe_capacity, max_sockets, max_sockets_per_process)
+    )]
     pub const fn new_with_all_limits(
         max_references: usize,
         max_total_pipe_capacity: usize,
@@ -231,7 +240,7 @@ impl BrokerCoreLimits {
     /// A quota above its broker-wide limit is accepted; the broker-wide limit
     /// still applies, so the effective limit is the smaller value.
     #[must_use]
-    #[vstd::prelude::verus_spec(result => ensures
+    #[verus_spec(result => ensures
         limits_spec::process_quota_transition(self, result, max_references_per_process, max_pipe_capacity_per_process)
     )]
     pub const fn with_process_quotas(
@@ -252,7 +261,7 @@ impl BrokerCoreLimits {
     /// A per-process quota above the broker-wide limit is accepted; the
     /// broker-wide limit still applies.
     #[must_use]
-    #[vstd::prelude::verus_spec(result => ensures
+    #[verus_spec(result => ensures
         limits_spec::unix_socket_limit_transition(self, result, max_total_unix_socket_bytes, max_unix_socket_bytes_per_process)
     )]
     pub const fn with_unix_socket_limits(
@@ -273,7 +282,7 @@ impl BrokerCoreLimits {
     /// A per-process quota above the broker-wide limit is accepted; the
     /// broker-wide limit still applies.
     #[must_use]
-    #[vstd::prelude::verus_spec(result => ensures
+    #[verus_spec(result => ensures
         limits_spec::readiness_limit_transition(self, result, max_readiness_queue_entries, max_readiness_queue_entries_per_process)
     )]
     pub const fn with_readiness_queue_limits(
@@ -290,7 +299,7 @@ impl BrokerCoreLimits {
 
     /// Returns these limits with an explicit broker process limit.
     #[must_use]
-    #[vstd::prelude::verus_spec(result => ensures
+    #[verus_spec(result => ensures
         limits_spec::process_limit_transition(self, result, max_processes)
     )]
     pub const fn with_process_limit(self, max_processes: usize) -> Self {
@@ -305,7 +314,7 @@ impl BrokerCoreLimits {
     /// A per-process quota above the broker-wide limit is accepted; the
     /// broker-wide limit still applies.
     #[must_use]
-    #[vstd::prelude::verus_spec(result => ensures
+    #[verus_spec(result => ensures
         limits_spec::thread_limit_transition(self, result, max_threads, max_threads_per_process)
     )]
     pub const fn with_thread_quotas(
@@ -326,7 +335,7 @@ impl BrokerCoreLimits {
     /// A per-child limit above the broker-wide limit is accepted; the
     /// broker-wide limit still applies.
     #[must_use]
-    #[vstd::prelude::verus_spec(result => ensures
+    #[verus_spec(result => ensures
         limits_spec::child_image_limit_transition(self, result, max_child_image_size, max_total_child_image_size)
     )]
     pub const fn with_child_image_size_limits(
@@ -343,7 +352,7 @@ impl BrokerCoreLimits {
 
     /// Returns these limits with an explicit limit on files in host shared memory.
     #[must_use]
-    #[vstd::prelude::verus_spec(result => ensures
+    #[verus_spec(result => ensures
         limits_spec::shared_file_limit_transition(self, result, max_shared_files)
     )]
     pub const fn with_shared_file_limit(self, max_shared_files: usize) -> Self {

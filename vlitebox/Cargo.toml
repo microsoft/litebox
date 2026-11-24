@@ -16,6 +16,14 @@ workspace = true
 verify = true
 
 [[example]]
+name = "limit_constructor_default_quota_negative"
+path = "src/negative/limit_constructor_default_quota_negative.rs"
+
+[[example]]
+name = "constructor_socket_clamping_negative"
+path = "src/negative/constructor_socket_clamping_negative.rs"
+
+[[example]]
 name = "shared_file_thread_frame_negative"
 path = "src/negative/shared_file_thread_frame_negative.rs"
 

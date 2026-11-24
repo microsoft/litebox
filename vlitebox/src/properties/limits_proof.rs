@@ -92,4 +92,44 @@ pub fn check_oversized_child_image_limit(
     prev.with_child_image_size_limits(per_child, total)
 }
 
+pub proof fn original_limit_constructors_preserve_default_frames()
+    ensures limits_spec::limit_constructor_policy(),
+{
+    limits_spec::prove_limit_constructor_frames();
+}
+
+pub fn check_new_at_default_ceilings_changes_local_quotas()
+    -> (cur: BrokerCoreLimits)
+    ensures {
+        &&& limits_spec::reference_pipe_limit_transition(
+            BrokerCoreLimits::DEFAULT,
+            cur,
+            BrokerCoreLimits::DEFAULT.max_references,
+            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+        )
+        &&& cur.max_references_per_process > BrokerCoreLimits::DEFAULT.max_references_per_process
+        &&& cur.max_pipe_capacity_per_process > BrokerCoreLimits::DEFAULT.max_pipe_capacity_per_process
+    },
+{
+    BrokerCoreLimits::new(
+        BrokerCoreLimits::DEFAULT.max_references,
+        BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+    )
+}
+
+pub fn check_constructor_accepts_above_broker_socket_quota(
+    sockets: usize,
+    per_process: usize,
+) -> (cur: BrokerCoreLimits)
+    requires per_process > sockets,
+    ensures {
+        &&& limits_spec::constructor_socket_limit_transition(
+            BrokerCoreLimits::DEFAULT, cur, 0, 0, sockets, per_process,
+        )
+        &&& cur.max_sockets_per_process > cur.max_sockets
+    },
+{
+    BrokerCoreLimits::new_with_all_limits(0, 0, sockets, per_process)
+}
+
 }

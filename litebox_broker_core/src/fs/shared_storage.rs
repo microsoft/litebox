@@ -58,6 +58,7 @@ pub trait SharedFileMemoryProvider: Send + Sync {
 }
 
 /// The default for how many files may keep their contents in host shared memory at once.
+#[vstd::prelude::verus_verify]
 pub const DEFAULT_MAX_SHARED_FILES: usize = 256;
 
 /// Bounds how many files keep their contents in host shared memory at once.
