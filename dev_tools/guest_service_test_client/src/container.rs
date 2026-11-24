@@ -10,8 +10,8 @@ use std::thread;
 
 use anyhow::{Context as _, Result, bail, ensure};
 use litebox_guest_service_protocol::guest_service::{
-    CloseStdinRequest, CreateContainerRequest, Empty, ExecProcessRequest, Process,
-    ReadStreamRequest, ReleaseProcessRequest, SignalProcessRequest, WaitProcessRequest,
+    CloseStdinRequest, CreateContainerRequest, ExecProcessRequest, Process, ReadStreamRequest,
+    ReleaseProcessRequest, SignalProcessRequest, StartContainerRequest, WaitProcessRequest,
     WriteStreamRequest,
 };
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
@@ -19,6 +19,8 @@ use ttrpc::context;
 
 use crate::programs::{Entry, ExitStatus, Run, TERMINAL_COLUMNS, TERMINAL_ROWS};
 
+/// The container's ID: the client runs one.
+const CONTAINER: &str = "test";
 /// The container's init process's exec ID.
 const INIT: &str = "";
 /// The most bytes one read asks for: the most the guest service returns.
@@ -107,16 +109,22 @@ impl Container {
             ..Default::default()
         };
         let create = CreateContainerRequest {
+            container_id: CONTAINER.to_owned(),
             process: Some(process).into(),
             ..Default::default()
         };
         service
             .create_container(context::Context::default(), &create)
             .context("CreateContainer")?;
+        let start = StartContainerRequest {
+            container_id: CONTAINER.to_owned(),
+            ..Default::default()
+        };
         service
-            .start_container(context::Context::default(), &Empty::new())
+            .start_container(context::Context::default(), &start)
             .context("StartContainer")?;
         let close = CloseStdinRequest {
+            container_id: CONTAINER.to_owned(),
             exec_id: INIT.to_owned(),
             ..Default::default()
         };
@@ -133,6 +141,7 @@ impl Container {
     /// Kills the container's init, which ends the container, and checks that it was running.
     pub fn end(self) -> Result<()> {
         let signal = SignalProcessRequest {
+            container_id: CONTAINER.to_owned(),
             exec_id: INIT.to_owned(),
             signal: SIGKILL,
             ..Default::default()
@@ -192,6 +201,7 @@ impl Container {
             ..Default::default()
         };
         let exec = ExecProcessRequest {
+            container_id: CONTAINER.to_owned(),
             exec_id: exec_id.clone(),
             process: Some(process).into(),
             ..Default::default()
@@ -239,6 +249,7 @@ impl Container {
         };
         if !input.is_empty() {
             let write = WriteStreamRequest {
+                container_id: CONTAINER.to_owned(),
                 exec_id: exec_id.to_owned(),
                 data: input.to_vec(),
                 ..Default::default()
@@ -249,6 +260,7 @@ impl Container {
         }
         if !run.console_stdin && !run.terminal {
             let close = CloseStdinRequest {
+                container_id: CONTAINER.to_owned(),
                 exec_id: exec_id.to_owned(),
                 ..Default::default()
             };
@@ -264,6 +276,7 @@ impl Container {
         let mut recorded = Vec::new();
         let mut ready = ReadyLine::default();
         let request = ReadStreamRequest {
+            container_id: CONTAINER.to_owned(),
             exec_id: exec_id.to_owned(),
             len: READ_LEN,
             ..Default::default()
@@ -295,6 +308,7 @@ impl Container {
     /// The exit status of the process `exec_id`, once it exited.
     fn wait(&self, exec_id: &str) -> Result<ExitStatus> {
         let wait = WaitProcessRequest {
+            container_id: CONTAINER.to_owned(),
             exec_id: exec_id.to_owned(),
             ..Default::default()
         };
@@ -307,6 +321,7 @@ impl Container {
 
     fn release(&self, exec_id: &str) -> Result<()> {
         let release = ReleaseProcessRequest {
+            container_id: CONTAINER.to_owned(),
             exec_id: exec_id.to_owned(),
             ..Default::default()
         };

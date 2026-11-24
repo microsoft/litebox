@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! The LiteBox guest service: the broker's root process, which creates and supervises the
-//! container's processes for the containerd shim, serving `litebox_guest_service_protocol` on
+//! containers' processes for the containerd shim, serving `litebox_guest_service_protocol` on
 //! vsock port 1024. It logs to its stderr, which the broker forwards to its own.
 //!
 //! It runs in images of any libc, so build it statically linked:

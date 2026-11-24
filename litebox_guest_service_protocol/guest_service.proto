@@ -4,18 +4,22 @@
 // The protocol between the LiteBox guest service and the containerd shim: ttrpc over protobuf,
 // modelled on Kata Containers' agent API (`agent.proto`), with only what the shim uses.
 //
-// The guest service runs one container. A process is named by its exec ID: the empty one for the
-// container's init process, and for an exec process one that the shim never reuses. Failures are
-// answered with ttrpc statuses. A request whose deadline passes is answered `DEADLINE_EXCEEDED`,
-// but may still take effect: `StartContainer` and `ExecProcess` go on to start their process.
+// The guest service runs one container at a time, until containers get PID namespaces of their
+// own. A process is named by its container's ID and its exec ID: the empty one for the container's
+// init process, and for an exec process one that the shim never reuses in the container. Failures
+// are answered with ttrpc statuses. A request whose deadline passes is answered
+// `DEADLINE_EXCEEDED`, but may still take effect: `StartContainer` and `ExecProcess` go on to start
+// their process.
 //
-// Lifecycle: `CreateContainer` prepares the init process, once per guest service, and the first
+// Lifecycle: `CreateContainer` prepares a container's init process, and the first
 // `StartContainer` launches it: later ones fail with `FAILED_PRECONDITION`. `ExecProcess` runs an
 // exec process at once. `WaitProcess` waits for a process's exit and reports it, as often as asked.
 // `ReleaseProcess` releases an exited process: later requests naming it fail with `NOT_FOUND`, and
 // its transfers in flight end (reads return no data, writes fail). When the init process exits, the
 // guest service kills every other guest process, and reports the init's exit last. If the init
 // process's launch fails, it has ended (its `WaitProcess` reports 127), and so has the container.
+// `RemoveContainer` releases the processes of a container that never started or whose processes
+// all exited, and forgets it.
 
 syntax = "proto3";
 
@@ -23,7 +27,8 @@ package litebox.guest_service.v1;
 
 service GuestService {
     rpc CreateContainer(CreateContainerRequest) returns (Empty);
-    rpc StartContainer(Empty) returns (Empty);
+    rpc StartContainer(StartContainerRequest) returns (Empty);
+    rpc RemoveContainer(RemoveContainerRequest) returns (Empty);
     rpc ExecProcess(ExecProcessRequest) returns (Empty);
     rpc SignalProcess(SignalProcessRequest) returns (Empty);
     rpc WaitProcess(WaitProcessRequest) returns (WaitProcessResponse);
@@ -53,23 +58,35 @@ message Process {
 }
 
 message CreateContainerRequest {
-    Process process = 1;
-}
-
-message ExecProcessRequest {
-    string exec_id = 1;
+    string container_id = 1;
     Process process = 2;
 }
 
+message StartContainerRequest {
+    string container_id = 1;
+}
+
+message RemoveContainerRequest {
+    string container_id = 1;
+}
+
+message ExecProcessRequest {
+    string container_id = 1;
+    string exec_id = 2;
+    Process process = 3;
+}
+
 message SignalProcessRequest {
-    string exec_id = 1;
-    uint32 signal = 2;
+    string container_id = 1;
+    string exec_id = 2;
+    uint32 signal = 3;
     // Signals every guest process but the guest service instead.
-    bool all = 3;
+    bool all = 4;
 }
 
 message WaitProcessRequest {
-    string exec_id = 1;
+    string container_id = 1;
+    string exec_id = 2;
 }
 
 message WaitProcessResponse {
@@ -82,12 +99,14 @@ message WaitProcessResponse {
 
 // Fails with `FAILED_PRECONDITION` while the process runs.
 message ReleaseProcessRequest {
-    string exec_id = 1;
+    string container_id = 1;
+    string exec_id = 2;
 }
 
 message WriteStreamRequest {
-    string exec_id = 1;
-    bytes data = 2;
+    string container_id = 1;
+    string exec_id = 2;
+    bytes data = 3;
 }
 
 message WriteStreamResponse {
@@ -95,9 +114,10 @@ message WriteStreamResponse {
 }
 
 message ReadStreamRequest {
-    string exec_id = 1;
+    string container_id = 1;
+    string exec_id = 2;
     // The most bytes to read: at least 1; a read returns at most 64 KiB.
-    uint32 len = 2;
+    uint32 len = 3;
 }
 
 message ReadStreamResponse {
@@ -108,11 +128,13 @@ message ReadStreamResponse {
 // For a terminal, this hangs the terminal up and ends its output stream; it fails with
 // `FAILED_PRECONDITION` until the terminal's process started.
 message CloseStdinRequest {
-    string exec_id = 1;
+    string container_id = 1;
+    string exec_id = 2;
 }
 
 message TtyWinResizeRequest {
-    string exec_id = 1;
-    uint32 row = 2;
-    uint32 column = 3;
+    string container_id = 1;
+    string exec_id = 2;
+    uint32 row = 3;
+    uint32 column = 4;
 }

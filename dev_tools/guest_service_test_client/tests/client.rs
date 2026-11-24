@@ -16,8 +16,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use litebox_guest_service_protocol::GUEST_SERVICE_PORT;
 use litebox_guest_service_protocol::guest_service::{
     CloseStdinRequest, CreateContainerRequest, Empty, ExecProcessRequest, ReadStreamRequest,
-    ReadStreamResponse, ReleaseProcessRequest, SignalProcessRequest, TtyWinResizeRequest,
-    WaitProcessRequest, WaitProcessResponse, WriteStreamRequest, WriteStreamResponse,
+    ReadStreamResponse, ReleaseProcessRequest, SignalProcessRequest, StartContainerRequest,
+    TtyWinResizeRequest, WaitProcessRequest, WaitProcessResponse, WriteStreamRequest,
+    WriteStreamResponse,
 };
 use litebox_guest_service_protocol::guest_service_ttrpc::{GuestService, create_guest_service};
 use ttrpc::TtrpcContext;
@@ -90,7 +91,11 @@ impl GuestService for Fake {
         Ok(Empty::new())
     }
 
-    fn start_container(&self, _ctx: &TtrpcContext, _request: Empty) -> ttrpc::Result<Empty> {
+    fn start_container(
+        &self,
+        _ctx: &TtrpcContext,
+        _request: StartContainerRequest,
+    ) -> ttrpc::Result<Empty> {
         Ok(Empty::new())
     }
 
