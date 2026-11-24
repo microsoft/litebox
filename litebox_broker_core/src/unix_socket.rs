@@ -47,6 +47,7 @@ use litebox_broker_protocol::unix_socket::{
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, MutexGuard, rwlock::RwLock};
+use vstd::prelude::verus_spec;
 
 use crate::channel::{Channel, ChannelState, Waiter, Wakeups};
 use crate::fs::File;
@@ -55,6 +56,10 @@ use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::socket::SocketOptions;
 use crate::transfer::{append_to_queue, copy_from_queue, take_from_queue};
 use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
+
+#[cfg(verus_keep_ghost)]
+#[path = "unix_socket_spec.rs"]
+pub(crate) mod verification;
 
 /// Guest-visible result of a Unix socket operation.
 pub type UnixSocketResult<T> = core::result::Result<T, UnixSocketError>;
@@ -541,6 +546,7 @@ fn lookup(
 }
 
 impl ObjectEntry {
+    #[verus_spec(result => ensures verification::unix_socket_projection(self, result))]
     fn as_unix_socket(&self) -> Result<&UnixSocketObject> {
         match self {
             Self::UnixSocket(socket) => Ok(socket),

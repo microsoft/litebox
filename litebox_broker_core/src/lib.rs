@@ -392,7 +392,11 @@ pub mod verification {
         check_key_validation, prove_shared_futex_leaves, shared_futex_leaf_policy,
         well_formed_futex_request,
     };
+    pub use crate::signal::verification::{prove_signals_projection, signals_projection_policy};
     pub use crate::timer::verification::{prove_timer_projection, timer_projection_policy};
+    pub use crate::unix_socket::verification::{
+        prove_unix_socket_projection, unix_socket_projection_policy,
+    };
 }
 
 impl BrokerCore {

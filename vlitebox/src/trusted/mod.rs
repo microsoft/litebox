@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 pub mod event_spec;
+pub mod ipc_projection_spec;
 pub mod object_spec;
 pub mod pipe_spec;
 pub mod shared_futex_spec;

@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 pub mod event_proof;
+pub mod ipc_projection_proof;
 pub mod object_proof;
 pub mod pipe_proof;
 pub mod shared_futex_proof;

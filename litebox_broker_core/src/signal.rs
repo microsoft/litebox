@@ -21,10 +21,15 @@ use litebox_broker_protocol::signal::{MAX_SIGNAL, PendingSignal, SignalEvent, Si
 use litebox_broker_protocol::terminal::TerminalEvents;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::Mutex;
+use vstd::prelude::verus_spec;
 
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::{BrokerError, BrokerProcess, Result};
+
+#[cfg(verus_keep_ghost)]
+#[path = "signal_spec.rs"]
+pub(crate) mod verification;
 
 /// Opens the caller's signals, returning a handle that becomes readable while
 /// any event is pending.
@@ -146,6 +151,7 @@ pub fn take(process: &BrokerProcess, handle: ObjectHandle) -> Result<SignalEvent
 }
 
 impl ObjectEntry {
+    #[verus_spec(result => ensures verification::signals_projection(self, result))]
     fn as_signals(&self) -> Result<&SignalsObject> {
         match self {
             Self::Signals(signals) => Ok(signals),

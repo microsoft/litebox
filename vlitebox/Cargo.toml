@@ -42,3 +42,7 @@ path = "src/negative/shared_futex_empty_bitset_negative.rs"
 [[example]]
 name = "shared_futex_alignment_negative"
 path = "src/negative/shared_futex_alignment_negative.rs"
+
+[[example]]
+name = "ipc_projection_negative"
+path = "src/negative/ipc_projection_negative.rs"
