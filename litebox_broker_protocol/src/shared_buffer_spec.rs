@@ -89,6 +89,52 @@ pub proof fn prove_slot_range_bounded(
     lemma_mul_is_commutative(layout.slot_count as int, layout.slot_size as int);
 }
 
+pub open spec fn ranges_separated(first: Range<usize>, second: Range<usize>) -> bool {
+    ||| first.end <= second.start
+    ||| second.end <= first.start
+}
+
+// Successful prefixes in distinct slots are separated even for malformed layouts.
+pub proof fn prove_distinct_slot_ranges_separated(
+    layout: SharedBufferLayout,
+    first_slot: SharedBufferSlotIndex,
+    first_length: usize,
+    first_range: Range<usize>,
+    second_slot: SharedBufferSlotIndex,
+    second_length: usize,
+    second_range: Range<usize>,
+)
+    requires
+        first_slot.0 != second_slot.0,
+        slot_range(layout, first_slot, first_length, Ok(first_range)),
+        slot_range(layout, second_slot, second_length, Ok(second_range)),
+    ensures ranges_separated(first_range, second_range),
+{
+    if first_slot.0 < second_slot.0 {
+        lemma_mul_inequality(
+            first_slot.0 as int + 1,
+            second_slot.0 as int,
+            layout.slot_size as int,
+        );
+        lemma_mul_is_distributive_add_other_way(
+            layout.slot_size as int,
+            first_slot.0 as int,
+            1,
+        );
+    } else {
+        lemma_mul_inequality(
+            second_slot.0 as int + 1,
+            first_slot.0 as int,
+            layout.slot_size as int,
+        );
+        lemma_mul_is_distributive_add_other_way(
+            layout.slot_size as int,
+            second_slot.0 as int,
+            1,
+        );
+    }
+}
+
 pub open spec fn shared_buffer_layout_policy() -> bool {
     &&& (forall|size: u32, count: u32, result: Result<SharedBufferLayout, SharedBufferLayoutError>|
         #[trigger] SharedBufferLayout::new.ensures((size, count), result)

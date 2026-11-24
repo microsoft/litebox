@@ -102,3 +102,7 @@ path = "src/negative/shared_buffer_empty_layout_negative.rs"
 [[example]]
 name = "shared_buffer_slot_error_negative"
 path = "src/negative/shared_buffer_slot_error_negative.rs"
+
+[[example]]
+name = "shared_buffer_slot_overlap_negative"
+path = "src/negative/shared_buffer_slot_overlap_negative.rs"
