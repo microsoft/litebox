@@ -20,12 +20,15 @@ use core::time::Duration;
 use litebox_broker_core::readiness::SharedReadinessWatchers;
 use litebox_broker_core::timer::{Alarm, TimerProvider};
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_common_vm_abi::WallClock;
 use litebox_platform::time::TimeProvider as _;
 use litebox_platform_vm_kernel::{Instant, VmKernel};
 use spin::mutex::SpinMutex;
 
 pub(crate) struct KernelTimers {
     platform: &'static VmKernel,
+    /// Unix time at a point of the kernel clock, as runners get it.
+    wall_clock: WallClock,
     /// Every alarm not yet dropped.
     alarms: SpinMutex<Vec<Weak<KernelAlarm>>>,
 }
@@ -46,9 +49,10 @@ impl Alarm for AlarmHandle {
 }
 
 impl KernelTimers {
-    pub(crate) fn new(platform: &'static VmKernel) -> Self {
+    pub(crate) fn new(platform: &'static VmKernel, wall_clock: WallClock) -> Self {
         Self {
             platform,
+            wall_clock,
             alarms: SpinMutex::new(Vec::new()),
         }
     }
@@ -88,6 +92,14 @@ impl KernelTimers {
 }
 
 impl TimerProvider for KernelTimers {
+    /// [`Self::wall_clock`], advanced by the kernel clock, as runners compute it.
+    fn current_time(&self) -> Duration {
+        let WallClock { unix_ns, at } = self.wall_clock;
+        Duration::from_nanos(
+            unix_ns.saturating_add(self.platform.now().as_nanos().saturating_sub(at)),
+        )
+    }
+
     /// The kernel clock, since its origin.
     fn now(&self) -> Duration {
         Duration::from_nanos(self.platform.now().as_nanos())

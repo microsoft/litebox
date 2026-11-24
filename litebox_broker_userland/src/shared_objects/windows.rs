@@ -8,7 +8,8 @@ use std::os::windows::io::{BorrowedHandle, FromRawHandle as _, OwnedHandle};
 
 use litebox_broker_core::fs::errors::{MapSharedError, StorageError};
 use litebox_broker_core::fs::shared_storage::{
-    HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject,
+    CreateSharedMemoryError, HostHandle, SharedFileMemory, SharedFileMemoryProvider,
+    SharedFileObject,
 };
 use litebox_broker_core::transfer::bounce_buffer;
 use litebox_broker_transport_windows_userland::shared_objects::SectionSender;
@@ -180,11 +181,11 @@ impl<T: std::os::windows::io::AsHandle + Send> HostHandle for Exported<T> {
 /// Creates memory for files in the host's temporary directory.
 pub struct TempFileMemoryProvider;
 
-fn temp_file() -> Result<File, StorageError> {
+fn temp_file() -> Result<File, CreateSharedMemoryError> {
     let directory = std::env::temp_dir();
     loop {
         let mut nonce = [0u8; 8];
-        getrandom::fill(&mut nonce).map_err(|_| StorageError::Io)?;
+        getrandom::fill(&mut nonce).map_err(|_| CreateSharedMemoryError::Io)?;
         let path = directory.join(format!(
             "litebox-shared-file-{}-{:016x}",
             std::process::id(),
@@ -205,8 +206,34 @@ fn temp_file() -> Result<File, StorageError> {
                 return Ok(file);
             }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(storage_error::<TempFile>(&error)),
+            Err(error) => return Err(create_shared_memory_error(&error)),
         }
+    }
+}
+
+/// Classifies a failure creating memory, telling the host running out of memory or handles
+/// apart from the disk being full.
+fn create_shared_memory_error(error: &IoError) -> CreateSharedMemoryError {
+    use windows_sys::Win32::Foundation::{
+        ERROR_COMMITMENT_LIMIT, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL, ERROR_NO_SYSTEM_RESOURCES,
+        ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_OUTOFMEMORY,
+        ERROR_TOO_MANY_OPEN_FILES,
+    };
+
+    match error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+    {
+        Some(
+            ERROR_NOT_ENOUGH_MEMORY
+            | ERROR_OUTOFMEMORY
+            | ERROR_COMMITMENT_LIMIT
+            | ERROR_NOT_ENOUGH_QUOTA
+            | ERROR_NO_SYSTEM_RESOURCES
+            | ERROR_TOO_MANY_OPEN_FILES,
+        ) => CreateSharedMemoryError::OutOfMemory,
+        Some(ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL) => CreateSharedMemoryError::NoSpace,
+        _ => CreateSharedMemoryError::Io,
     }
 }
 
@@ -240,7 +267,7 @@ fn set_sparse(file: &File) {
 }
 
 impl SharedFileMemoryProvider for TempFileMemoryProvider {
-    fn create(&self) -> Result<SharedFileMemory, StorageError> {
+    fn create(&self) -> Result<SharedFileMemory, CreateSharedMemoryError> {
         Ok(create::<TempFile>(temp_file()?))
     }
 }

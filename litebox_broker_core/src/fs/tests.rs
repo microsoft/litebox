@@ -4286,7 +4286,7 @@ mod composed {
 
 mod shared_mapping {
     use super::{Caller, InMem, InodeAllocators, Mode, OFlags, ROOT, Resolver, TestPlatform, USER};
-    use crate::fs::errors::{MapSharedError, OpenError, StorageError, TruncateError, WriteError};
+    use crate::fs::errors::{MapSharedError, OpenError, TruncateError, WriteError};
     use crate::fs::in_mem::InitialNode;
     use crate::fs::shared_storage::test_memory::VecMemoryProvider;
     use crate::fs::shared_storage::{
@@ -4463,13 +4463,13 @@ mod shared_mapping {
 
     #[test]
     fn failed_storage_creation_releases_its_slot_and_preserves_contents() {
-        use crate::fs::shared_storage::SharedFileMemoryProvider;
+        use crate::fs::shared_storage::{CreateSharedMemoryError, SharedFileMemoryProvider};
 
         struct FailingProvider;
 
         impl SharedFileMemoryProvider for FailingProvider {
-            fn create(&self) -> Result<SharedFileMemory, StorageError> {
-                Err(StorageError::NoSpace)
+            fn create(&self) -> Result<SharedFileMemory, CreateSharedMemoryError> {
+                Err(CreateSharedMemoryError::NoSpace)
             }
         }
 
