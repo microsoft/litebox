@@ -17,6 +17,7 @@ mod shared_memory_id_callers;
 
 pub use properties::channel_proof;
 pub use properties::channel_waiters_proof;
+pub use properties::directory_decoder_proof;
 pub use properties::error_proof;
 pub use properties::event_proof;
 pub use properties::file_projection_proof;
@@ -32,6 +33,7 @@ pub use properties::timer_proof;
 pub use properties::transfer_proof;
 pub use trusted::channel_spec;
 pub use trusted::channel_waiters_spec;
+pub use trusted::directory_decoder_spec;
 pub use trusted::error_spec;
 pub use trusted::event_spec;
 pub use trusted::file_projection_spec;

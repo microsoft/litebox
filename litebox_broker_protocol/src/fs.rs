@@ -9,10 +9,13 @@ use core::num::NonZeroU64;
 
 use bitflags::bitflags;
 use thiserror::Error;
-use vstd::prelude::verus_verify;
+use vstd::prelude::{verus_spec, verus_verify};
 
 use crate::ObjectHandle;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
+
+#[cfg(verus_keep_ghost)]
+include!("directory_decoder_spec.rs");
 
 /// Maximum number of shared-buffer slots used by one file read or write.
 pub const MAX_FILE_TRANSFER_SLOT_COUNT: u32 = 16;
@@ -798,6 +801,8 @@ wire_struct! {
 
 /// Error while encoding or decoding a shared directory payload.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+// In progress: derived implementations remain unverified.
+#[verus_verify(external_derive)]
 pub enum DirectoryPayloadError {
     #[error("directory payload is malformed")]
     Malformed,
@@ -1030,6 +1035,7 @@ fn encode_directory_entry(
     Ok(())
 }
 
+#[verus_verify]
 struct DirectoryPayloadDecoder<'a> {
     payload: &'a [u8],
     offset: usize,
@@ -1050,6 +1056,7 @@ impl<'a> DirectoryPayloadDecoder<'a> {
         Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
+    #[verus_spec(result => ensures decoder_take(*old(self), *final(self), len, result))]
     fn take(&mut self, len: usize) -> Result<&'a [u8], DirectoryPayloadError> {
         let end = self
             .offset

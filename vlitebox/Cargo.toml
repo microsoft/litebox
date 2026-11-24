@@ -114,3 +114,11 @@ path = "src/negative/shared_mapping_no_space_negative.rs"
 [[example]]
 name = "shared_mapping_fault_negative"
 path = "src/negative/shared_mapping_fault_negative.rs"
+
+[[example]]
+name = "directory_overflow_frame_negative"
+path = "src/negative/directory_overflow_frame_negative.rs"
+
+[[example]]
+name = "directory_subrange_negative"
+path = "src/negative/directory_subrange_negative.rs"
