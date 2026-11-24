@@ -301,6 +301,9 @@ pub struct BrokerProcess {
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Bytes queued in Unix sockets created by this process.
     pub(crate) unix_socket_bytes: Arc<AtomicUsize>,
+    /// References this process sent that queued Unix socket messages still
+    /// carry.
+    pub(crate) unix_socket_references: Arc<AtomicUsize>,
     /// The provider socket state charged to this process, until it releases
     /// its references.
     socket_account: Mutex<Option<Arc<SocketAccount>>>,
@@ -688,6 +691,7 @@ impl BrokerProcess {
             ended_thread_ids: Mutex::new(Vec::new()),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             unix_socket_bytes: Arc::new(AtomicUsize::new(0)),
+            unix_socket_references: Arc::new(AtomicUsize::new(0)),
             socket_account: Mutex::new(Some(socket_account)),
             readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             pid_namespaces: Arc::new(AtomicUsize::new(0)),

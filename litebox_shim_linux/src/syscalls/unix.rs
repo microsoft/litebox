@@ -25,13 +25,14 @@ use litebox_broker_protocol::{
     fs::{FileMode as Mode, FileUser},
     socket::SocketType,
     unix_socket::{
-        TransferredObjectKind, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketName,
+        MAX_UNIX_SOCKET_OBJECTS, ReceiveOptions, TransferredObjectKind, UNIX_SOCKET_BUFFER_SIZE,
+        UnixSocketAddress, UnixSocketName,
     },
 };
 use litebox_common_linux::{
-    AddressFamily, CmsgHdr, FileDescriptorFlags, OFlags, ReceiveFlags, SendFlags, ShutdownHow,
-    SockFlags, SockType, SocketControlMessageType, SocketOption, SocketOptionLevel,
-    SocketOptionName, UnixProtocol, errno::Errno, program_startup::InheritedFdKind,
+    AddressFamily, CmsgHdr, FileDescriptorFlags, OFlags, ReceiveFlags, SCM_MAX_FD, SendFlags,
+    ShutdownHow, SockFlags, SockType, SocketControlMessageType, SocketOption, SocketOptionName,
+    UnixProtocol, errno::Errno, program_startup::InheritedFdKind,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use zerocopy::IntoBytes as _;
@@ -40,7 +41,7 @@ use crate::{
     GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut,
     syscalls::{
         file::{adopt_handle, linux_status_flags, status_flags_change},
-        net::{ReceivePlan, open_flags, shutdown_mode},
+        net::{ReceivePlan, SOL_SOCKET, control_messages, open_flags, shutdown_mode},
     },
 };
 
@@ -313,7 +314,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     ///
     /// The received data's carried objects are stored in `objects` up to its limit, and discarded
     /// otherwise unless peeking, as Linux discards the descriptors a receive without room for
-    /// them would get.
+    /// them would get. Every receive replaces what `objects` held.
     pub(super) fn recvfrom(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -330,22 +331,19 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
             log_unsupported!("Unsupported recvfrom flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
-        let received = self.socket.receive(
-            cx,
-            buf,
-            flags.contains(ReceiveFlags::PEEK),
-            source_addr.is_some() && !self.is_stream(),
-            flags.contains(ReceiveFlags::DONTWAIT),
-            objects.as_ref().map_or(0, |objects| {
-                objects.limit.saturating_sub(objects.objects.len())
-            }),
-        )?;
+        let options = ReceiveOptions {
+            peek: flags.contains(ReceiveFlags::PEEK),
+            source: source_addr.is_some() && !self.is_stream(),
+            nonblocking: flags.contains(ReceiveFlags::DONTWAIT),
+            max_objects: objects.as_ref().map_or(0, |objects| objects.limit),
+        };
+        let received = self.socket.receive(cx, buf, options)?;
         if let (Some(source_addr), Some(source)) = (source_addr, received.source) {
             *source_addr = Some(source.into());
         }
         if let Some(objects) = objects {
-            objects.truncated |= received.objects_truncated;
-            objects.objects.extend(received.objects);
+            objects.objects = received.objects;
+            objects.truncated = received.objects_truncated;
         }
         Ok(received.length)
     }
@@ -494,7 +492,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     }
 
     /// Adopts a Unix socket of type `socket_type` this process inherited from
-    /// its parent as `handle`.
+    /// its parent, or received with Unix socket data, as `handle`.
     pub(super) fn adopt_inherited_unix_socket(
         &self,
         handle: ObjectHandle,
@@ -510,34 +508,57 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     }
 }
 
-/// Size of a `struct cmsghdr`, which a control message's data follows.
-pub(super) const CMSG_HEADER_SIZE: usize = cmsg_align(size_of::<CmsgHdr>());
-
-/// `SOL_SOCKET`, the level of the control messages that pass descriptors.
-pub(super) const SOL_SOCKET: i32 = SocketOptionLevel::SOCKET as i32;
-
-/// Linux's `SCM_MAX_FD`, the most descriptors one message passes.
-pub(super) const SCM_MAX_FD: usize = 253;
-
-/// Rounds `length` up as `CMSG_ALIGN` does.
-pub(super) const fn cmsg_align(length: usize) -> usize {
-    length.next_multiple_of(size_of::<usize>())
-}
+const _: () = assert!(SCM_MAX_FD <= MAX_UNIX_SOCKET_OBJECTS as usize);
 
 /// Returns the most descriptors an `SCM_RIGHTS` message fits in `capacity` control bytes, as
 /// Linux's `scm_max_fds`.
 pub(super) fn max_received_fds(capacity: usize) -> usize {
-    (capacity.saturating_sub(CMSG_HEADER_SIZE) / size_of::<i32>()).min(SCM_MAX_FD)
+    (capacity.saturating_sub(CmsgHdr::LEN) / size_of::<i32>()).min(SCM_MAX_FD)
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
+    /// Returns the objects of the descriptors that the `SCM_RIGHTS` messages among a Unix socket's
+    /// `control` messages pass, as Linux's `__scm_send`.
+    ///
+    /// Like Linux, this ignores control messages of levels other than `SOL_SOCKET`, and fails with
+    /// `EINVAL` for a malformed message, an unknown type, or more than `SCM_MAX_FD` descriptors,
+    /// and with `EBADF` for a descriptor that is not open.
+    pub(super) fn passed_objects(
+        &self,
+        control: &[u8],
+    ) -> Result<Vec<InheritableFd<Platform>>, Errno> {
+        let mut objects = Vec::new();
+        for message in control_messages(control) {
+            let message = message?;
+            if message.level != SOL_SOCKET {
+                continue;
+            }
+            match SocketControlMessageType::try_from(message.kind) {
+                Ok(SocketControlMessageType::Rights) => {
+                    let (fds, _) = message.data.as_chunks::<{ size_of::<i32>() }>();
+                    if objects.len() + fds.len() > SCM_MAX_FD {
+                        return Err(Errno::EINVAL);
+                    }
+                    for &fd in fds {
+                        let fd = self.files.borrow().typed_fd(i32::from_ne_bytes(fd))?;
+                        objects.push(self.global.shareable_object(&fd)?.1);
+                    }
+                }
+                Ok(SocketControlMessageType::Credentials) => {
+                    log_unsupported!("SCM_CREDENTIALS control messages");
+                    return Err(Errno::EINVAL);
+                }
+                Err(_) => return Err(Errno::EINVAL),
+            }
+        }
+        Ok(objects)
+    }
+
     /// Installs descriptors for `received`'s objects, close-on-exec if `close_on_exec` is set, and
     /// writes the `SCM_RIGHTS` message listing them to the `capacity` control bytes at `control`,
     /// as Linux's `scm_detach_fds`.
     ///
-    /// Returns the control bytes used, and whether objects were discarded (`MSG_CTRUNC`): those
-    /// beyond `received`'s limit or this process's descriptor limit, or all of them if the
-    /// control bytes cannot be written.
+    /// Returns the control bytes used, and whether any objects were discarded (`MSG_CTRUNC`).
     pub(super) fn install_received_objects(
         &self,
         received: ReceivedObjects,
@@ -545,55 +566,54 @@ impl<Platform: ShimPlatform> Task<Platform> {
         capacity: usize,
         close_on_exec: bool,
     ) -> (usize, bool) {
-        let mut truncated = received.truncated;
-        if received.objects.is_empty() {
-            return (0, truncated);
-        }
-        let length = CMSG_HEADER_SIZE + received.objects.len() * size_of::<i32>();
-        // Like Linux, which writes each descriptor before installing it, a receive into control
-        // bytes it cannot write discards the objects.
-        let zeros = alloc::vec![0; length];
-        if control
-            .write_slice_at_offset::<Platform>(0, &zeros)
-            .is_none()
-        {
-            return (0, true);
-        }
-        let mut fds = Vec::with_capacity(received.objects.len());
-        // Like Linux, a failure to install one discards the rest.
+        let count = received.objects.len();
+        let mut installed = 0;
+        // Like Linux, which writes each descriptor before installing it, this stops at the first
+        // it cannot write or install, discarding the rest.
         for object in received.objects {
-            if let Ok(fd) = self.install_received_object(object, close_on_exec) {
-                fds.push(fd);
-            } else {
-                truncated = true;
+            let slot = (CmsgHdr::LEN + installed * size_of::<i32>())
+                .checked_add(control.as_usize())
+                .map(UserPtrMut::<u8>::from_usize);
+            let publish = |fd: i32| {
+                slot.and_then(|slot| slot.write_slice_at_offset::<Platform>(0, &fd.to_ne_bytes()))
+                    .ok_or(Errno::EFAULT)
+            };
+            if self
+                .install_received_object(object, close_on_exec, publish)
+                .is_err()
+            {
                 break;
             }
+            installed += 1;
         }
-        if fds.is_empty() {
-            return (0, true);
+        let truncated = received.truncated || installed < count;
+        if installed == 0 {
+            return (0, truncated);
         }
-        let length = CMSG_HEADER_SIZE + fds.len() * size_of::<i32>();
+        let length = CmsgHdr::LEN + installed * size_of::<i32>();
         let header = CmsgHdr {
             cmsg_len: length,
             cmsg_level: SOL_SOCKET,
             cmsg_type: SocketControlMessageType::Rights.into(),
         };
-        let mut message = Vec::with_capacity(length);
-        message.extend_from_slice(header.as_bytes());
-        message.resize(CMSG_HEADER_SIZE, 0);
-        for fd in fds {
-            message.extend_from_slice(&fd.to_ne_bytes());
+        // Like Linux, the descriptors stay installed even if the header cannot be written, which
+        // then reports no control bytes.
+        if control
+            .write_slice_at_offset::<Platform>(0, header.as_bytes())
+            .is_none()
+        {
+            return (0, truncated);
         }
-        // Like Linux, the descriptors stay installed even if this faults.
-        let _ = control.write_slice_at_offset::<Platform>(0, &message);
-        (cmsg_align(length).min(capacity), truncated)
+        (CmsgHdr::align(length).min(capacity), truncated)
     }
 
-    /// Installs a descriptor for `object` at the lowest free number.
+    /// Installs a descriptor for `object` at the lowest free number, which `publish` must report
+    /// before the descriptor is visible, or the descriptor is not installed.
     fn install_received_object(
         &self,
         object: ReceivedObject,
         close_on_exec: bool,
+        publish: impl FnOnce(i32) -> Result<(), Errno>,
     ) -> Result<i32, Errno> {
         let kind = match object.kind() {
             TransferredObjectKind::File => InheritedFdKind::File,
@@ -620,15 +640,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         };
         let handle = object.into_handle();
-        adopt_handle!(self.global, kind, handle, |adopt| self
-            .install_adopted(adopt()?, close_on_exec))
+        adopt_handle!(self.global, kind, handle, |adopt| self.install_adopted(
+            adopt()?,
+            close_on_exec,
+            publish
+        ))
     }
 
-    /// Installs the adopted `fd` at the lowest free number.
+    /// Installs the adopted `fd` at the lowest free number, which `publish` must report before
+    /// the descriptor is visible, or the descriptor is closed.
     fn install_adopted<Subsystem: FdEnabledSubsystem>(
         &self,
         fd: TypedFd<Subsystem>,
         close_on_exec: bool,
+        publish: impl FnOnce(i32) -> Result<(), Errno>,
     ) -> Result<i32, Errno> {
         if close_on_exec {
             let old = self
@@ -638,11 +663,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
-        let raw_fd = self.files.borrow().insert_raw_fd(fd).map_err(|fd| {
+        let files = self.files.borrow();
+        // The insert, `publish`, and any rollback share one acquisition of the lock, so no other
+        // thread sees or closes the descriptor before `publish` fails.
+        let mut rds = files.raw_descriptor_store.write();
+        let raw_fd = match files.insert_raw_fd_locked(&mut rds, fd) {
+            Ok(raw_fd) => raw_fd,
+            Err(fd) => {
+                drop(rds);
+                self.remove_and_drop_descriptor(&fd);
+                return Err(Errno::EMFILE);
+            }
+        };
+        let number = i32::try_from(raw_fd).expect("descriptor numbers fit in i32");
+        if let Err(errno) = publish(number) {
+            let fd = rds
+                .fd_consume_raw_integer::<Subsystem>(raw_fd)
+                .expect("the descriptor was inserted under this lock");
+            drop(rds);
             self.remove_and_drop_descriptor(&fd);
-            Errno::EMFILE
-        })?;
-        Ok(i32::try_from(raw_fd).expect("descriptor numbers fit in i32"))
+            return Err(errno);
+        }
+        Ok(number)
     }
 }
 

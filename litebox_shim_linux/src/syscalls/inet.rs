@@ -45,7 +45,7 @@ use crate::{
     GlobalState, ShimPlatform, UserPtr, UserPtrMut,
     syscalls::{
         file::{linux_status_flags, status_flags_change},
-        net::{ReceivePlan, control_messages, open_flags, shutdown_mode},
+        net::{ReceivePlan, SOL_SOCKET, control_messages, open_flags, shutdown_mode},
     },
     wait::wait_errno,
 };
@@ -157,13 +157,15 @@ pub(super) fn write_sockaddr<Platform: ShimPlatform>(
 /// `SO_MARK` or `IP_PKTINFO`.
 pub(super) fn check_send_control(control: &[u8], stream: bool) -> Result<(), Errno> {
     const SOL_IP: i32 = SocketOptionLevel::IP as i32;
-    const SOL_SOCKET: i32 = SocketOptionLevel::SOCKET as i32;
     const SOL_UDP: i32 = SocketOptionLevel::UDP as i32;
 
     for message in control_messages(control) {
         let message = message?;
         let parsed = match message.level {
-            SOL_SOCKET => SocketControlMessageType::try_from(message.kind).is_err(),
+            SOL_SOCKET => !matches!(
+                SocketControlMessageType::try_from(message.kind),
+                Ok(SocketControlMessageType::Rights | SocketControlMessageType::Credentials)
+            ),
             SOL_IP | SOL_UDP => !stream,
             _ => false,
         };
@@ -869,7 +871,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     }
 
     /// Adopts an internet socket of type `socket_type` this process inherited
-    /// from its parent as `handle`.
+    /// from its parent, or received with Unix socket data, as `handle`.
     pub(super) fn adopt_inherited_inet_socket(
         &self,
         handle: ObjectHandle,

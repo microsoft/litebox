@@ -1742,3 +1742,107 @@ fn releasing_a_process_collects_the_garbage_it_leaves() {
     drop(other);
     assert_eq!(in_flight(), 0);
 }
+
+#[test]
+fn sends_carry_no_objects_that_belong_to_one_process() {
+    let fixture = Fixture::new();
+    let process = &fixture.process;
+    let (sender, reader) = fixture.pair(SocketType::Datagram);
+    let signals = crate::signal::open(process, Arc::clone(&fixture.readiness_sink)).unwrap();
+    let data: &[u8] = b"x";
+    assert!(matches!(
+        send(
+            process,
+            sender,
+            None,
+            &[reader, signals],
+            &data,
+            USER,
+            &fixture.readiness_sink
+        ),
+        Err(BrokerError::UnsupportedOperation)
+    ));
+    assert_eq!(fixture.in_flight(), 0);
+    assert_eq!(fixture.queued(), (0, 0));
+}
+
+#[test]
+fn closes_that_raced_an_operation_collect_once_it_ends() {
+    let fixture = Fixture::new();
+    let process = &fixture.process;
+    // A socket sent over itself, closed while an operation holds it.
+    let (sender, reader) = fixture.pair(SocketType::Datagram);
+    assert_eq!(
+        fixture.send_objects(process, sender, b"x", &[reader]),
+        Ok(1)
+    );
+    let lease = Lease::new(
+        process
+            .authorized_object(reader, ObjectRights::WAIT)
+            .unwrap(),
+    )
+    .unwrap();
+    fixture.close(reader);
+    assert_eq!(fixture.in_flight(), 1);
+    drop(lease);
+    assert_eq!(fixture.in_flight(), 0);
+    fixture.close(sender);
+    assert_eq!(fixture.queued(), (0, 0));
+}
+
+#[test]
+fn references_in_flight_are_limited_per_sender() {
+    let fixture =
+        Fixture::with_limits(BrokerCoreLimits::DEFAULT.with_process_quotas(8, usize::MAX));
+    let process = &fixture.process;
+    let (sender, reader) = fixture.pair(SocketType::Datagram);
+    let (first, second) = fixture.pair(SocketType::Stream);
+    // Each sent reference stays in flight after the sender's own closes.
+    for _ in 0..4 {
+        assert_eq!(
+            fixture.send_objects(process, sender, b"x", &[first, second]),
+            Ok(1)
+        );
+    }
+    assert_eq!(
+        fixture.send_objects(process, sender, b"x", &[first]),
+        Err(UnixSocketError::TooManyReferences)
+    );
+    // A send that fails leaves the count as it was.
+    assert_eq!(process.unix_socket_references.load(Ordering::Relaxed), 8);
+    let (_, received) = fixture.receive_objects(process, reader, 8, 0, false);
+    assert!(received.objects_truncated);
+    assert_eq!(
+        fixture.send_objects(process, sender, b"x", &[first, second]),
+        Ok(1)
+    );
+}
+
+#[test]
+fn peeking_past_the_object_limit_keeps_the_objects_queued() {
+    let fixture = Fixture::new();
+    let process = &fixture.process;
+    // A socket sent over itself, which only its queue then reaches.
+    let (sender, reader) = fixture.pair(SocketType::Datagram);
+    let (carried, carried_peer) = fixture.pair(SocketType::Stream);
+    assert_eq!(
+        fixture.send_objects(process, sender, b"x", &[reader, carried]),
+        Ok(1)
+    );
+    fixture.close(carried);
+    let (_, peeked) = fixture.receive_objects(process, reader, 8, 0, true);
+    assert!(peeked.objects_truncated);
+    assert_eq!(fixture.in_flight(), 2);
+    assert!(
+        !fixture
+            .readiness(carried_peer)
+            .contains(ReadinessFlags::HANGUP)
+    );
+    fixture.close(reader);
+    assert_eq!(fixture.in_flight(), 0);
+    assert!(
+        fixture
+            .readiness(carried_peer)
+            .contains(ReadinessFlags::HANGUP)
+    );
+}

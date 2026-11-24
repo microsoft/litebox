@@ -892,6 +892,7 @@ impl From<litebox::unix_socket::errors::UnixSocketError> for Errno {
                 SocketError::BrokenPipe => Errno::EPIPE,
                 SocketError::NotPermitted => Errno::EPERM,
                 SocketError::ConnectionReset => Errno::ECONNRESET,
+                SocketError::TooManyReferences => Errno::ETOOMANYREFS,
                 SocketError::File(error) => match error {
                     FileError::NoSuchFileOrDirectory | FileError::MissingComponent => Errno::ENOENT,
                     FileError::AccessNotAllowed

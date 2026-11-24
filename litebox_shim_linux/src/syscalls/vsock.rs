@@ -402,7 +402,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts a vsock socket this process inherited from its parent as `handle`.
+    /// Adopts a vsock socket this process inherited from its parent, or received with Unix
+    /// socket data, as `handle`.
     pub(super) fn adopt_inherited_vsock_socket(
         &self,
         handle: ObjectHandle,

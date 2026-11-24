@@ -395,7 +395,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     }
 
     /// Returns the process this process inherited from its parent as `handle`
-    /// through [`PendingChild::inherit`].
+    /// through [`PendingChild::inherit`], or received with Unix socket data.
     ///
     /// The [`Process`] owns `handle`, so callers adopt each handle once and
     /// share the [`Process`] for every other use.

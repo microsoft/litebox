@@ -98,8 +98,23 @@ impl ObjectHandle {
 
     /// Decodes a handle produced by [`Self::encode`].
     #[must_use]
-    pub fn decode(encoded: [u8; Self::ENCODED_SIZE]) -> Self {
-        Self(u64::from_le_bytes(encoded))
+    pub fn decode(encoded: &[u8; Self::ENCODED_SIZE]) -> Self {
+        Self(u64::from_le_bytes(*encoded))
+    }
+
+    /// Encodes `handles` one after another for a shared buffer.
+    pub fn encode_all(handles: &[Self]) -> impl Iterator<Item = u8> + '_ {
+        handles.iter().flat_map(|handle| handle.encode())
+    }
+
+    /// Decodes the handles [`Self::encode_all`] produced, ignoring trailing
+    /// bytes too few for a handle.
+    pub fn decode_all(encoded: &[u8]) -> impl Iterator<Item = Self> + '_ {
+        encoded
+            .as_chunks::<{ Self::ENCODED_SIZE }>()
+            .0
+            .iter()
+            .map(Self::decode)
     }
 }
 

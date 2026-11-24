@@ -341,7 +341,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts an epoll instance this process inherited from its parent as `handle`.
+    /// Adopts an epoll instance this process inherited from its parent, or received with Unix
+    /// socket data, as `handle`.
     pub(crate) fn adopt_inherited_epoll(
         &self,
         handle: ObjectHandle,

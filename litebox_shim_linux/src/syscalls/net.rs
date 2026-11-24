@@ -26,9 +26,9 @@ use litebox_broker_protocol::{
     vsock_socket::VsockAddress,
 };
 use litebox_common_linux::{
-    AddressFamily, FileDescriptorFlags, IoReadVec, IoWriteVec, ReceiveFlags, SendFlags,
-    ShutdownHow, SockFlags, SockType, SocketControlMessageType, SocketOption, SocketOptionName,
-    UserMmsgHdr, UserMsgHdr, errno::Errno,
+    AddressFamily, CmsgHdr, FileDescriptorFlags, IoReadVec, IoWriteVec, ReceiveFlags, SendFlags,
+    ShutdownHow, SockFlags, SockType, SocketOption, SocketOptionName, UserMmsgHdr, UserMsgHdr,
+    errno::Errno,
 };
 use litebox_common_linux::{PAGE_SIZE, mm::VmemManager};
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
@@ -288,6 +288,9 @@ fn copy_send_control<Platform: ShimPlatform>(
         .ok_or(Errno::EFAULT)
 }
 
+/// `SOL_SOCKET`, the level of the control messages every socket parses.
+pub(super) const SOL_SOCKET: i32 = litebox_common_linux::SocketOptionLevel::SOCKET as i32;
+
 /// A control message that `sendmsg` passes.
 pub(super) struct ControlMessage<'a> {
     /// The message's level, such as `SOL_SOCKET`.
@@ -306,24 +309,22 @@ pub(super) fn control_messages(
 ) -> impl Iterator<Item = Result<ControlMessage<'_>, Errno>> {
     let mut next = Some(0);
     core::iter::from_fn(move || {
-        let offset = next.filter(|&offset| control.len() - offset >= unix::CMSG_HEADER_SIZE)?;
+        let offset = next.filter(|&offset| control.len() - offset >= CmsgHdr::LEN)?;
         next = None;
-        let header = litebox_common_linux::CmsgHdr::read_from_prefix(&control[offset..])
+        let header = CmsgHdr::read_from_prefix(&control[offset..])
             .ok()
             .map(|(header, _)| header)
-            .filter(|header| {
-                (unix::CMSG_HEADER_SIZE..=control.len() - offset).contains(&header.cmsg_len)
-            });
+            .filter(|header| (CmsgHdr::LEN..=control.len() - offset).contains(&header.cmsg_len));
         let Some(header) = header else {
             return Some(Err(Errno::EINVAL));
         };
         next = offset
-            .checked_add(unix::cmsg_align(header.cmsg_len))
+            .checked_add(CmsgHdr::align(header.cmsg_len))
             .filter(|&next| next <= control.len());
         Some(Ok(ControlMessage {
             level: header.cmsg_level,
             kind: header.cmsg_type,
-            data: &control[offset + unix::CMSG_HEADER_SIZE..offset + header.cmsg_len],
+            data: &control[offset + CmsgHdr::LEN..offset + header.cmsg_len],
         }))
     })
 }
@@ -894,18 +895,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: SendFlags,
     ) -> Result<usize, Errno> {
         let msg_name = msg.msg_name;
-        // A vsock socket's destination is never parsed.
+        let read_destination = || {
+            read_sockaddr_from_user::<Platform>(
+                UserPtr::from_usize(msg_name.as_usize()),
+                msg.msg_namelen as usize,
+            )
+        };
+        // Like Linux, which copies the destination first, but never parses a vsock socket's, and
+        // parses a Unix socket's only after its control messages.
         let is_vsock = matches!(socket, AnyTypedFd::Vsock(_));
-        let vsock_destination = is_vsock
+        let is_unix = matches!(socket, AnyTypedFd::Unix(_));
+        let copied_destination = (is_vsock || is_unix)
             && vsock::copy_msg_destination::<Platform>(
                 UserPtr::from_usize(msg_name.as_usize()),
                 msg.msg_namelen,
             )?;
-        let sock_addr = if msg_name.as_usize() != 0 && !is_vsock {
-            Some(read_sockaddr_from_user::<Platform>(
-                UserPtr::from_usize(msg_name.as_usize()),
-                msg.msg_namelen as usize,
-            )?)
+        let vsock_destination = is_vsock && copied_destination;
+        let mut sock_addr = if msg_name.as_usize() != 0 && !is_vsock && !is_unix {
+            Some(read_destination()?)
         } else {
             None
         };
@@ -926,8 +933,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Like Linux, every socket copies the control bytes, then parses them its own way: a vsock
         // socket ignores them.
         let control = copy_send_control::<Platform>(msg.msg_control, msg.msg_controllen)?;
-        let objects = if matches!(socket, AnyTypedFd::Unix(_)) {
-            self.passed_objects(&control)?
+        let objects = if is_unix {
+            let objects = self.passed_objects(&control)?;
+            if msg_name.as_usize() != 0 {
+                sock_addr = Some(read_destination()?);
+            }
+            objects
         } else {
             alloc::vec::Vec::new()
         };
@@ -959,43 +970,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
         self.send_sigpipe_on_epipe(&res, is_message_oriented.get(), flags);
         res
-    }
-
-    /// Returns the objects of the descriptors that the `SCM_RIGHTS` messages among a Unix socket's
-    /// `control` messages pass, as Linux's `__scm_send`.
-    ///
-    /// Like Linux, this ignores control messages of levels other than `SOL_SOCKET`, and fails with
-    /// `EINVAL` for a malformed message, an unknown type, or more than `SCM_MAX_FD` descriptors,
-    /// and with `EBADF` for a descriptor that is not open.
-    fn passed_objects(
-        &self,
-        control: &[u8],
-    ) -> Result<alloc::vec::Vec<litebox::process::InheritableFd<Platform>>, Errno> {
-        let mut objects = alloc::vec::Vec::new();
-        for message in control_messages(control) {
-            let message = message?;
-            if message.level != unix::SOL_SOCKET {
-                continue;
-            }
-            match SocketControlMessageType::try_from(message.kind) {
-                Ok(SocketControlMessageType::Rights) => {
-                    let (fds, _) = message.data.as_chunks::<{ size_of::<i32>() }>();
-                    if objects.len() + fds.len() > unix::SCM_MAX_FD {
-                        return Err(Errno::EINVAL);
-                    }
-                    for &fd in fds {
-                        let fd = self.files.borrow().typed_fd(i32::from_ne_bytes(fd))?;
-                        objects.push(self.global.shareable_object(&fd)?.1);
-                    }
-                }
-                Ok(SocketControlMessageType::Credentials) => {
-                    log_unsupported!("SCM_CREDENTIALS control messages");
-                    return Err(Errno::EINVAL);
-                }
-                Err(_) => return Err(Errno::EINVAL),
-            }
-        }
-        Ok(objects)
     }
 
     /// Handle syscall `sendmmsg`
@@ -1222,7 +1196,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let want_source = msg_name.as_usize() != 0;
         let mut source_addr = None;
-        let mut ret_flags = ReceiveFlags::empty();
+        // Like Linux, which reports `MSG_CMSG_CLOEXEC` back.
+        let mut ret_flags = flags & ReceiveFlags::CMSG_CLOEXEC;
         let plan = socket.plan(flags)?;
         let cx = self.wait_cx().with_timeout(plan.timeout);
 
@@ -1281,15 +1256,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let copied = size.min(chunk_len);
             total_received += copied;
             let reported = if plan.wait_all { total_received } else { size };
-            // Like Linux, a receive that passed descriptors ends the call.
-            let passed_objects = objects
-                .as_ref()
-                .is_some_and(|objects| !objects.objects.is_empty() || objects.truncated);
-            if !plan.wait_all
-                || copied < chunk_len
-                || total_received == total_iov_capacity
-                || passed_objects
-            {
+            if !plan.wait_all || copied < chunk_len || total_received == total_iov_capacity {
                 break reported;
             }
         };

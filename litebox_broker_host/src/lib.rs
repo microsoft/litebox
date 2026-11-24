@@ -730,12 +730,7 @@ fn duplicate_objects_to_child<Memory: SharedMemory>(
     handles
         .try_reserve_exact(data.len() / HANDLE_SIZE)
         .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
-    handles.extend(
-        data.as_chunks::<HANDLE_SIZE>()
-            .0
-            .iter()
-            .map(|bytes| ObjectHandle::decode(*bytes)),
-    );
+    handles.extend(ObjectHandle::decode_all(&data));
     let duplicates = process
         .duplicate_object_references_to_child(child_process_id, &handles, readiness_sink)
         .map_err(RequestFailure::from)?;
@@ -1980,16 +1975,19 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                     }
                 }
             };
-            let mut encoded_objects = allocate_zeroed(objects_length)?;
-            buffer
-                .copy_to_slice_at(address_length, &mut encoded_objects)
-                .map_err(|Fault| RequestFailure::Abort(ErrorCode::Internal))?;
-            let objects: Vec<ObjectHandle> = encoded_objects
-                .as_chunks::<{ ObjectHandle::ENCODED_SIZE }>()
-                .0
-                .iter()
-                .map(|bytes| ObjectHandle::decode(*bytes))
-                .collect();
+            let mut objects = Vec::new();
+            objects
+                .try_reserve_exact(request.object_count as usize)
+                .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
+            for offset in (address_length..address_length + objects_length)
+                .step_by(ObjectHandle::ENCODED_SIZE)
+            {
+                let mut encoded = [0; ObjectHandle::ENCODED_SIZE];
+                buffer
+                    .copy_to_slice_at(offset, &mut encoded)
+                    .map_err(|Fault| RequestFailure::Abort(ErrorCode::Internal))?;
+                objects.push(ObjectHandle::decode(&encoded));
+            }
             Ok(unix_socket::send(
                 process,
                 request.handle,

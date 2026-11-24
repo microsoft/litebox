@@ -37,7 +37,7 @@ pub const MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE: u32 =
 pub const UNIX_SOCKET_BUFFER_SIZE: u32 = 212_992;
 
 /// Maximum bytes one send or receive request transfers, including an encoded
-/// address or name staged with the data.
+/// address or name and the carried objects staged with the data.
 pub const MAX_UNIX_SOCKET_TRANSFER_SIZE: u32 = 4 * SHARED_BUFFER_SLOT_SIZE;
 
 /// Largest accepted listen backlog; larger requests are clamped.
@@ -46,8 +46,11 @@ pub const MAX_UNIX_SOCKET_BACKLOG: u32 = 4096;
 /// Most object references one send carries, as Linux's `SCM_MAX_FD`.
 pub const MAX_UNIX_SOCKET_OBJECTS: u32 = 253;
 
-/// Length in bytes of one encoded [`TransferredObject`].
+/// Length in bytes of one encoded [`TransferredObject`]: its handle, then its
+/// kind's tag and detail.
 pub const ENCODED_TRANSFERRED_OBJECT_SIZE: u32 = 10;
+
+const _: () = assert!(ENCODED_TRANSFERRED_OBJECT_SIZE as usize == ObjectHandle::ENCODED_SIZE + 2);
 
 const _: () = assert!(
     UNIX_SOCKET_BUFFER_SIZE as usize
@@ -257,10 +260,27 @@ pub struct TransferredObject {
     pub kind: TransferredObjectKind,
 }
 
+/// What a receive from a Unix socket got.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Received {
+    /// Number of bytes received into the start of the caller's buffer.
+    pub received: usize,
+    /// Length of the whole datagram or record, or `received` for a stream
+    /// socket.
+    pub length: usize,
+    /// Name of the sending socket, if requested.
+    pub source: Option<UnixSocketName>,
+    /// The caller's new handles to the objects the received data carried.
+    pub objects: Vec<TransferredObject>,
+    /// Whether the received data carried objects the caller got no handle
+    /// for.
+    pub objects_truncated: bool,
+}
+
 impl TransferredObject {
     /// Encodes this object for a shared buffer.
     #[must_use]
-    pub fn encode(&self) -> [u8; ENCODED_TRANSFERRED_OBJECT_SIZE as usize] {
+    pub fn encode(self) -> [u8; ENCODED_TRANSFERRED_OBJECT_SIZE as usize] {
         let socket_type = |socket_type| match socket_type {
             SocketType::Stream => 0,
             SocketType::Datagram => 1,
@@ -279,9 +299,9 @@ impl TransferredObject {
             TransferredObjectKind::Process => (9, 0),
         };
         let mut encoded = [0; ENCODED_TRANSFERRED_OBJECT_SIZE as usize];
-        encoded[..ObjectHandle::ENCODED_SIZE].copy_from_slice(&self.handle.encode());
-        encoded[ObjectHandle::ENCODED_SIZE] = tag;
-        encoded[ObjectHandle::ENCODED_SIZE + 1] = detail;
+        let (handle, kind) = encoded.split_at_mut(ObjectHandle::ENCODED_SIZE);
+        handle.copy_from_slice(&self.handle.encode());
+        kind.copy_from_slice(&[tag, detail]);
         encoded
     }
 
@@ -289,8 +309,9 @@ impl TransferredObject {
     pub fn decode(
         encoded: &[u8; ENCODED_TRANSFERRED_OBJECT_SIZE as usize],
     ) -> Result<Self, UnixSocketCodecError> {
-        let [h0, h1, h2, h3, h4, h5, h6, h7, tag, detail] = *encoded;
-        let handle = ObjectHandle::decode([h0, h1, h2, h3, h4, h5, h6, h7]);
+        let [handle @ .., tag, detail] = encoded;
+        let handle = ObjectHandle::decode(handle);
+        let (tag, detail) = (*tag, *detail);
         let socket_type = || match detail {
             0 => Ok(SocketType::Stream),
             1 => Ok(SocketType::Datagram),
@@ -361,6 +382,10 @@ wire_enum! {
         ConnectionReset,
         #[error("address lookup failed: {0}")]
         File(FileError),
+        /// The sender has as many references in flight in queued messages as
+        /// it may.
+        #[error("too many references are in flight")]
+        TooManyReferences,
     }
 }
 
@@ -676,21 +701,23 @@ mod tests {
             };
             assert_eq!(TransferredObject::decode(&object.encode()), Ok(object));
         }
-        let mut invalid = TransferredObject {
+        let valid = TransferredObject {
             handle: ObjectHandle(1),
             kind: TransferredObjectKind::File,
         }
         .encode();
-        invalid[9] = 1;
-        assert_eq!(
-            TransferredObject::decode(&invalid),
-            Err(UnixSocketCodecError::Invalid)
-        );
-        invalid[8] = 10;
-        assert_eq!(
-            TransferredObject::decode(&invalid),
-            Err(UnixSocketCodecError::Invalid)
-        );
+        // A plain kind with a detail, an unknown tag, and a socket kind with
+        // an unknown socket type.
+        for (tag, detail) in [(0, 1), (10, 0), (3, 3)] {
+            let mut invalid = valid;
+            invalid[ObjectHandle::ENCODED_SIZE] = tag;
+            invalid[ObjectHandle::ENCODED_SIZE + 1] = detail;
+            assert_eq!(
+                TransferredObject::decode(&invalid),
+                Err(UnixSocketCodecError::Invalid),
+                "tag {tag}, detail {detail}"
+            );
+        }
     }
 
     #[test]

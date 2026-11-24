@@ -25,6 +25,14 @@
 
 static int tcp_sender, tcp_receiver, udp_sender, udp_receiver, unix_sender, unix_receiver;
 
+// Bounds every receive from `fd`, so a send that reported success without delivering fails the
+// test instead of hanging it.
+static void bound_receives(int fd) {
+    struct timeval timeout = {.tv_sec = 10};
+    TEST_ASSERT(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0,
+                "setsockopt(SO_RCVTIMEO)");
+}
+
 static void make_sockets(void) {
     struct sockaddr_in address = {.sin_family = AF_INET,
                                   .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
@@ -60,6 +68,9 @@ static void make_sockets(void) {
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) == 0, "socketpair");
     unix_sender = pair[0];
     unix_receiver = pair[1];
+    bound_receives(tcp_receiver);
+    bound_receives(udp_receiver);
+    bound_receives(unix_receiver);
 }
 
 // Sends one byte over `fd` with the `length` control bytes at `control`, returning `sendmsg`'s
@@ -277,6 +288,8 @@ static void test_iovec_errors_precede_control_errors(void) {
 
 int main(void) {
     printf("Testing sendmsg control messages\n");
+    // A watchdog, so a hang fails the test.
+    alarm(60);
     make_sockets();
     test_tcp_ignores_other_levels_and_unix_messages();
     test_tcp_rejects_unknown_socket_messages();

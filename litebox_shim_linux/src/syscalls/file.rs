@@ -253,7 +253,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         })
     }
 
-    /// Adopts a file this process inherited from its parent as `handle`.
+    /// Adopts a file this process inherited from its parent, or received with Unix socket
+    /// data, as `handle`.
     pub(crate) fn adopt_inherited_file(
         &self,
         handle: ObjectHandle,

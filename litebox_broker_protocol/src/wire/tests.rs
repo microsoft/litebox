@@ -1119,6 +1119,9 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::AddressInUse)),
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::NotPermitted)),
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::ConnectionReset)),
+        BrokerResult::UnixSocket(UnixSocketResponse::Failed(
+            UnixSocketError::TooManyReferences,
+        )),
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::File(
             FileError::NoSuchFileOrDirectory
         ))),

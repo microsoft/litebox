@@ -203,7 +203,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         data.try_reserve_exact(handles.len() * ObjectHandle::ENCODED_SIZE)
             .and_then(|()| duplicates.try_reserve_exact(handles.len()))
             .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
-        data.extend(handles.iter().flat_map(|handle| handle.encode()));
+        data.extend(ObjectHandle::encode_all(handles));
         self.write_shared_buffer(buffer, &data);
         match self.request_process(ProcessRequest::DuplicateObjectsToChild(
             DuplicateObjectsToChildRequest {
@@ -213,8 +213,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         ))? {
             ProcessResponse::DuplicateObjectsToChild => {
                 self.read_shared_buffer(buffer, &mut data);
-                let (handles, _) = data.as_chunks::<{ ObjectHandle::ENCODED_SIZE }>();
-                duplicates.extend(handles.iter().map(|bytes| ObjectHandle::decode(*bytes)));
+                duplicates.extend(ObjectHandle::decode_all(&data));
                 Ok(duplicates)
             }
             response => panic!("broker returned unexpected process response: {response:?}"),

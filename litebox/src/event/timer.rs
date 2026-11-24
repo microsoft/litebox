@@ -172,7 +172,8 @@ where
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Returns the timer this process inherited from its parent as `handle`
-    /// through [`PendingChild::inherit`](crate::process::PendingChild::inherit).
+    /// through [`PendingChild::inherit`](crate::process::PendingChild::inherit),
+    /// or received with Unix socket data.
     ///
     /// The timer owns `handle`, so callers adopt each handle once and share
     /// the timer for every other use.

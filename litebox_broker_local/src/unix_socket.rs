@@ -19,13 +19,13 @@ use litebox_broker_protocol::unix_socket::{
     GetUnixSocketNameRequest, GetUnixSocketOptionRequest, ListenUnixSocketRequest,
     MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE,
     MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveOptions,
-    ReceiveUnixSocketRequest, SendUnixSocketRequest, SetUnixSocketOptionRequest,
+    ReceiveUnixSocketRequest, Received, SendUnixSocketRequest, SetUnixSocketOptionRequest,
     ShutdownUnixSocketRequest, TransferredObject, UnixSocketError, UnixSocketName,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-use crate::{BrokerLocal, BrokerLocalError, ReceivedUnixSocket, Result};
+use crate::{BrokerLocal, BrokerLocalError, Result};
 
 type UnixSocketResult<T> = core::result::Result<T, UnixSocketError>;
 
@@ -191,8 +191,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             MAX_UNIX_SOCKET_TRANSFER_SIZE,
         )?;
         self.write_shared_buffer_at(buffer, 0, address);
-        let encoded_objects: Vec<u8> = objects.iter().flat_map(|object| object.encode()).collect();
-        self.write_shared_buffer_at(buffer, address.len(), &encoded_objects);
+        for (index, object) in objects.iter().enumerate() {
+            self.write_shared_buffer_at(
+                buffer,
+                address.len() + index * ObjectHandle::ENCODED_SIZE,
+                &object.encode(),
+            );
+        }
         self.copy_to_shared_buffer(buffer, address.len() + objects_length, data)?;
         match self.request_unix_socket(UnixSocketRequest::Send(SendUnixSocketRequest {
             handle,
@@ -232,7 +237,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         destination: &mut dyn ReadBuffer,
         options: ReceiveOptions,
-    ) -> Result<UnixSocketResult<ReceivedUnixSocket>, Channel::Error> {
+    ) -> Result<UnixSocketResult<Received>, Channel::Error> {
         let ReceiveOptions {
             peek,
             source,
@@ -275,35 +280,41 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                         && object_count <= max_objects,
                     "broker returned inconsistent Unix socket receive lengths"
                 );
-                let mut encoded =
-                    alloc::vec![0; object_count * ENCODED_TRANSFERRED_OBJECT_SIZE as usize];
-                self.read_shared_buffer_at(buffer, objects_offset, &mut encoded);
-                let objects: Vec<_> = encoded
-                    .as_chunks::<{ ENCODED_TRANSFERRED_OBJECT_SIZE as usize }>()
-                    .0
-                    .iter()
-                    .map(|object| {
-                        TransferredObject::decode(object)
-                            .expect("broker returned an invalid carried object")
-                    })
-                    .collect();
-                if let Err(error) = self.copy_from_shared_buffer(buffer, received, destination) {
+                let objects = (0..object_count).map(|index| {
+                    let mut encoded = [0; ENCODED_TRANSFERRED_OBJECT_SIZE as usize];
+                    self.read_shared_buffer_at(
+                        buffer,
+                        objects_offset + index * ENCODED_TRANSFERRED_OBJECT_SIZE as usize,
+                        &mut encoded,
+                    );
+                    TransferredObject::decode(&encoded)
+                        .expect("broker returned an invalid carried object")
+                });
+                let mut received_objects = Vec::new();
+                let copied = received_objects
+                    .try_reserve_exact(object_count)
+                    .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))
+                    .and_then(|()| self.copy_from_shared_buffer(buffer, received, destination));
+                if let Err(error) = copied {
                     // The caller never learns of the handles, so they are released.
                     for object in objects {
                         let _ = self.close_object(object.handle);
                     }
                     return Err(error);
                 }
+                received_objects.extend(objects);
                 let name = source.then(|| {
                     let mut name = [0; MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize];
                     self.read_shared_buffer_at(buffer, received, &mut name[..source_length]);
                     UnixSocketName::decode(&name[..source_length])
                         .expect("broker returned an invalid Unix socket source name")
                 });
-                Ok(Ok(ReceivedUnixSocket {
-                    response,
+                Ok(Ok(Received {
+                    received,
+                    length: response.length as usize,
                     source: name,
-                    objects,
+                    objects: received_objects,
+                    objects_truncated: response.objects_truncated,
                 }))
             }
             UnixSocketResponse::Failed(error) => Ok(Err(error)),

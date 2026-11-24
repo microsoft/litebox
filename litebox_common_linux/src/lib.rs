@@ -2863,6 +2863,20 @@ pub struct CmsgHdr {
     pub cmsg_type: i32,
 }
 
+impl CmsgHdr {
+    /// `CMSG_LEN(0)`: the length of the header, which a message's data follows.
+    pub const LEN: usize = Self::align(size_of::<Self>());
+
+    /// Rounds `length` up as `CMSG_ALIGN` does.
+    #[must_use]
+    pub const fn align(length: usize) -> usize {
+        length.next_multiple_of(size_of::<usize>())
+    }
+}
+
+/// Linux's `SCM_MAX_FD`, the most descriptors the `SCM_RIGHTS` messages of one `sendmsg` pass.
+pub const SCM_MAX_FD: usize = 253;
+
 /// Type of a `SOL_SOCKET` control message.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, IntEnum)]
