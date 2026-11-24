@@ -14,6 +14,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
+use vstd::prelude::verus_spec;
 
 use super::OFlags;
 use super::errors::{
@@ -27,6 +28,10 @@ use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
 use crate::terminal::TerminalEndpoint;
 use crate::{BrokerError, BrokerProcess, Result};
+
+#[cfg(verus_keep_ghost)]
+#[path = "service_spec.rs"]
+pub(crate) mod verification;
 
 /// Guest-visible result of a broker file operation.
 pub type FileResult<T> = core::result::Result<T, FileError>;
@@ -102,6 +107,7 @@ impl File {
 }
 
 impl ObjectEntry {
+    #[verus_spec(result => ensures verification::file_projection(self, result))]
     fn as_file(&self) -> Result<&File> {
         match self {
             Self::File(file) => Ok(file),

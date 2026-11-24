@@ -390,6 +390,7 @@ pub mod verification {
         prove_error_categories,
     };
     pub use crate::event::verification::{event_projection_policy, prove_event_projection};
+    pub use crate::fs::{file_projection_policy, prove_file_projection};
     pub use crate::object::verification::{duplication_policy, prove_duplication_policy};
     pub use crate::pipe::verification::{pipe_projection_policy, prove_pipe_projection};
     pub use crate::shared_futex::verification::{

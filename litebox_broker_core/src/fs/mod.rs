@@ -32,6 +32,9 @@ pub mod tar_ro;
 #[cfg(test)]
 mod tests;
 
+#[cfg(verus_keep_ghost)]
+pub use service::verification::{file_projection_policy, prove_file_projection};
+
 pub use litebox_broker_protocol::fs::{
     FileDirectoryEntry as DirEntry, FileMode as Mode, FileNodeInfo as NodeInfo,
     FileSeekWhence as SeekWhence, FileStatus, FileTimeUpdate, FileTimestamp, FileTimestamps,
