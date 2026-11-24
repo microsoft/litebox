@@ -504,6 +504,10 @@ struct ManualTimerState {
 }
 
 impl ManualTimerProvider {
+    /// The wall-clock time, in seconds since the Unix epoch, when the clock
+    /// starts.
+    pub const EPOCH_SECONDS: u64 = 1_000_000_000;
+
     /// Advances the clock by `duration` and fires every alarm whose deadline
     /// passed.
     pub fn advance(&self, duration: Duration) {
@@ -533,6 +537,12 @@ impl ManualTimerProvider {
 }
 
 impl TimerProvider for ManualTimerProvider {
+    /// A wall clock that starts at [`ManualTimerProvider::EPOCH_SECONDS`] and
+    /// advances with [`Self::now`].
+    fn current_time(&self) -> Duration {
+        Duration::from_secs(Self::EPOCH_SECONDS) + self.state.lock().now
+    }
+
     fn now(&self) -> Duration {
         self.state.lock().now
     }

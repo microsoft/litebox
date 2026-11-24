@@ -96,6 +96,7 @@ fn kernel_main(kernel: Kernel) -> ! {
         vsock: devices.vsock(),
         allow_process_duplication: true,
         pid_namespace,
+        wall_clock,
     });
     let config = ProcessConfig {
         runner,
@@ -143,6 +144,7 @@ fn run_optee(
             allow_process_duplication: false,
             // TA instances are independent roots.
             pid_namespace: PidNamespaceOptions::default(),
+            wall_clock,
         }),
     );
     client::script::run(payload, &mut service);

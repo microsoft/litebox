@@ -159,6 +159,8 @@ pub struct Config {
     pub allow_process_duplication: bool,
     /// The options of the roots' PID namespace.
     pub pid_namespace: PidNamespaceOptions,
+    /// The wall clock, which runners also get.
+    pub wall_clock: litebox_common_vm_abi::WallClock,
 }
 
 /// The kernel's broker; clones share it.
@@ -188,7 +190,7 @@ impl Broker {
     /// mounted.
     pub fn new(config: Config) -> Self {
         let stdio = Arc::new(ConsoleStdio::new(config.console));
-        let timers = Arc::new(KernelTimers::new(config.platform));
+        let timers = Arc::new(KernelTimers::new(config.platform, config.wall_clock));
         let sockets = Arc::new(SmoltcpSocketProvider::new(
             providers::LIMITS.max_sockets,
             providers::LIMITS.max_sockets_per_process,

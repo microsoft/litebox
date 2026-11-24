@@ -46,10 +46,56 @@ pub struct SharedFileMemory {
     pub object: Arc<dyn SharedFileObject>,
 }
 
+/// Failures creating host shared memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreateSharedMemoryError {
+    /// The backing store cannot hold memory of this size.
+    NoSpace,
+    /// The host could not allocate memory or a handle for the memory.
+    OutOfMemory,
+    /// A backing-store operation failed.
+    Io,
+    /// The provider does not support this kind of memory.
+    Unsupported,
+}
+
+impl From<StorageError> for CreateSharedMemoryError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::NoSpace => Self::NoSpace,
+            StorageError::Fault | StorageError::Busy | StorageError::Io => Self::Io,
+        }
+    }
+}
+
+impl From<CreateSharedMemoryError> for MapSharedError {
+    fn from(error: CreateSharedMemoryError) -> Self {
+        match error {
+            CreateSharedMemoryError::NoSpace | CreateSharedMemoryError::OutOfMemory => {
+                Self::NoMemory
+            }
+            CreateSharedMemoryError::Io => Self::Io,
+            CreateSharedMemoryError::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
 /// Platform provider that creates [`SharedFileMemory`].
 pub trait SharedFileMemoryProvider: Send + Sync {
     /// Creates empty memory.
-    fn create(&self) -> Result<SharedFileMemory, StorageError>;
+    fn create(&self) -> Result<SharedFileMemory, CreateSharedMemoryError>;
+
+    /// Creates a zero-filled, fixed-length segment, to be exported as a
+    /// mapping only. Providers exporting resizable file handles must also
+    /// prevent recipients from changing the length through those handles.
+    fn create_segment(
+        &self,
+        len: usize,
+    ) -> Result<Arc<dyn SharedFileObject>, CreateSharedMemoryError> {
+        let mut memory = self.create()?;
+        memory.storage.set_len(len)?;
+        Ok(memory.object)
+    }
 }
 
 /// The default for how many files may keep their contents in host shared memory at once.
@@ -231,7 +277,10 @@ impl FileStorageMut for SharedStorage {
 pub(crate) mod test_memory {
     //! [`SharedFileMemory`] in an ordinary vector, for tests.
 
-    use super::{HostHandle, SharedFileMemory, SharedFileMemoryProvider, SharedFileObject};
+    use super::{
+        CreateSharedMemoryError, HostHandle, SharedFileMemory, SharedFileMemoryProvider,
+        SharedFileObject,
+    };
     use crate::fs::errors::{MapSharedError, StorageError};
     use crate::fs::storage::{FileStorage, FileStorageMut};
     use alloc::boxed::Box;
@@ -380,7 +429,7 @@ pub(crate) mod test_memory {
     }
 
     impl SharedFileMemoryProvider for VecMemoryProvider {
-        fn create(&self) -> Result<SharedFileMemory, StorageError> {
+        fn create(&self) -> Result<SharedFileMemory, CreateSharedMemoryError> {
             let memory = Arc::new(VecMemory {
                 data: Mutex::new(Vec::new()),
                 refuse_shrink: self.refuse_shrink,
