@@ -11,6 +11,13 @@ use litebox_broker_protocol::event::EventConsumption;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::Mutex;
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::old;
+use vstd::prelude::verus_spec;
+
+#[cfg(verus_keep_ghost)]
+#[path = "event_spec.rs"]
+pub(crate) mod verification;
 
 pub(crate) const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
 
@@ -66,6 +73,12 @@ pub fn consume(process: &BrokerProcess, handle: ObjectHandle) -> Result<EventCon
 }
 
 impl ObjectEntry {
+    #[verus_spec(result => ensures
+        verification::event_projection(*old(self), *final(self), match result {
+            Ok(value) => Ok((*value, *final(value))),
+            Err(error) => Err(error),
+        }),
+    )]
     fn as_event_mut(&mut self) -> Result<&mut EventObject> {
         match self {
             Self::Event(event) => Ok(event),

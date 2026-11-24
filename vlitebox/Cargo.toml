@@ -21,3 +21,7 @@ path = "src/negative/object_policy_negative.rs"
 [[example]]
 name = "pipe_projection_negative"
 path = "src/negative/pipe_projection_negative.rs"
+
+[[example]]
+name = "event_projection_negative"
+path = "src/negative/event_projection_negative.rs"
