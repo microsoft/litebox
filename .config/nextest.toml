@@ -32,6 +32,11 @@ test-group = 'litebox-brokers'
 [[profile.ci.overrides]]
 filter = 'package(litebox_containerd_shim) and binary(=shim_windows)'
 test-group = 'litebox-windows-brokers'
+# The Windows loader tests take about a minute. Stop one that hangs well before the profile's 10
+# minutes; their broker runs also have a deadline of their own (`BROKER_RUN_TIMEOUT`).
+[[profile.ci.overrides]]
+filter = 'package(litebox_runner_linux_on_windows_userland) and binary(=loader)'
+slow-timeout = { period = "60s", terminate-after = 5 }
 # On a loaded machine the same runner setup timeout can still make a guest `fork` fail with `EIO`.
 [[profile.ci.overrides]]
 filter = 'package(litebox_containerd_shim) and kind(test)'

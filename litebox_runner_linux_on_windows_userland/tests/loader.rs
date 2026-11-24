@@ -999,9 +999,15 @@ fn run_progs_with_process_duplication(
     )
 }
 
+/// How long a broker run of [`run_progs_with_broker_arguments`] may take before it is killed. The
+/// runs take seconds; without a deadline a hung one would last until nextest's timeout and lose
+/// the guest's output.
+const BROKER_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Builds `programs` statically in WSL, then runs the first with `arguments` under a broker
 /// started with `broker_arguments`, and returns its standard output. Each program is at
-/// `/bin/<program>.hooked`.
+/// `/bin/<program>.hooked`. A run that outlasts [`BROKER_RUN_TIMEOUT`] is killed, and fails with
+/// the output it gave.
 fn run_progs_with_broker_arguments(
     broker: &std::path::Path,
     runner: &std::path::Path,
@@ -1013,14 +1019,34 @@ fn run_progs_with_broker_arguments(
         .iter()
         .map(|program| build_c_guest(program, "broker", GuestLinkage::Static))
         .collect();
-    let output = broker_command(broker, runner, &programs, broker_arguments, arguments)
-        .output()
+    let mut child = broker_command(broker, runner, &programs, broker_arguments, arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
         .expect("failed to run litebox-broker-userland");
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        // On an error, the output read so far is still worth reporting.
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut output);
+        let _ = sender.send(output);
+    });
+    let deadline = std::time::Instant::now() + BROKER_RUN_TIMEOUT;
+    let status = wait_or_kill(&mut child, deadline);
+    let timed_out = std::time::Instant::now() >= deadline;
+    // Bounded, as a process the broker left behind could keep the pipe open.
+    let stdout = receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
     assert!(
-        output.status.success(),
-        "litebox-broker-userland failed: {}\n{stdout}",
-        output.status
+        !timed_out,
+        "litebox-broker-userland did not finish in {BROKER_RUN_TIMEOUT:?}; its output:\n{stdout}"
+    );
+    assert!(
+        status.success(),
+        "litebox-broker-userland failed: {status}\n{stdout}"
     );
     stdout
 }

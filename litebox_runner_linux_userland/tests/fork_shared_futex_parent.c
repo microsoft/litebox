@@ -28,6 +28,12 @@
 #define TIMEOUT_SECONDS 30
 #define ROUNDS 200
 
+// Names the check about to run on standard error, which is unbuffered, so that a run that hangs
+// anyway shows where.
+static void begin(const char *check) {
+    fprintf(stderr, "shared-futex: checking %s\n", check);
+}
+
 struct shared {
     atomic_uint word;
     atomic_uint ready;
@@ -753,20 +759,33 @@ int main(void) {
         perror("mmap");
         return 1;
     }
+    begin("memory");
     int memory = check_memory(shared);
+    begin("wake");
     int wake = check_wake(shared, other);
+    begin("timeout");
     int timeout = check_timeout(shared);
+    begin("interrupted");
     int interrupted = check_interrupted(shared);
+    begin("private");
     int private = check_private(shared) &&
                   check_keyed(shared, FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAKE_PRIVATE) &&
                   check_keyed(shared, FUTEX_WAIT_PRIVATE, FUTEX_WAKE_PRIVATE, FUTEX_WAKE);
+    begin("mutex");
     int mutex = check_mutex(shared);
+    begin("semaphore");
     int semaphore = check_semaphore(shared);
+    begin("bitset");
     int bitset = check_bitset(shared);
+    begin("misaligned");
     int misaligned = check_misaligned(shared);
+    begin("count");
     int count = check_count(shared);
+    begin("inaccessible");
     int inaccessible = check_inaccessible(shared);
+    begin("private-memory");
     int private_memory = check_private_memory(shared);
+    begin("clear-tid");
     int clear_tid = check_clear_tid(shared);
     printf("shared-futex memory=%d wake=%d timeout=%d interrupted=%d private=%d mutex=%d "
            "semaphore=%d bitset=%d misaligned=%d count=%d inaccessible=%d private-memory=%d "

@@ -11,6 +11,11 @@ on:
   pull_request:
   merge_group:
   workflow_dispatch:
+    inputs:
+      windows_fork_futex_stress:
+        description: Only stress test_fork_shared_futex_with_windows_broker on Windows (alone and alongside the other fork tests)
+        type: boolean
+        default: false
 
 # If a new commit is pushed to the branch before ongoing runs finish, cancel the ongoing runs
 concurrency:
@@ -24,6 +29,7 @@ env:
 jobs:
   build_and_test:
     name: Build and Test
+    if: ${{ !inputs.windows_fork_futex_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -146,6 +152,7 @@ jobs:
 
   test_vmm:
     name: Build and Test on VMMs (KVM)
+    if: ${{ !inputs.windows_fork_futex_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -265,6 +272,7 @@ jobs:
 
   build_and_test_riscv64:
     name: Build and Test (RV64 Linux, QEMU user mode)
+    if: ${{ !inputs.windows_fork_futex_stress }}
     runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: -Dwarnings
@@ -294,6 +302,7 @@ jobs:
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
+    if: ${{ !inputs.windows_fork_futex_stress }}
     runs-on: ubuntu-24.04-arm
     env:
       RUSTFLAGS: -Dwarnings
@@ -421,6 +430,7 @@ jobs:
 
   build_and_test_macos_arm64:
     name: Build and Test (macOS AArch64)
+    if: ${{ !inputs.windows_fork_futex_stress }}
     runs-on: macos-26
     env:
       RUSTFLAGS: -Dwarnings
@@ -471,6 +481,7 @@ jobs:
 
   build_and_test_lvbs:
     name: Build and Test LVBS
+    if: ${{ !inputs.windows_fork_futex_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -534,8 +545,12 @@ jobs:
           key: ${{ steps.custom-out-cache.outputs.cache-primary-key }}
 
   build_and_test_windows:
-    name: Build and Test Windows
+    name: ${{ inputs.windows_fork_futex_stress && format('Windows fork futex stress ({0})', matrix.mode) || 'Build and Test Windows' }}
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ${{ fromJSON(inputs.windows_fork_futex_stress && '["alone","loaded"]' || '["ci"]') }}
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
@@ -582,8 +597,9 @@ jobs:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.event_name != 'merge_group' }}
+          save-if: ${{ github.event_name != 'merge_group' && !inputs.windows_fork_futex_stress }}
       - run: cargo clippy --locked --verbose --all-targets --all-features ($env:WINDOWS_CRATES -split ' ')
+        if: ${{ !inputs.windows_fork_futex_stress }}
       - run: cargo build --locked --verbose ($env:WINDOWS_CRATES -split ' ')
       - name: Identify Windows OCI test fixtures
         id: fixture-key
@@ -614,20 +630,30 @@ jobs:
           set-as-default: 'true'
           additional-packages: gcc libc6-dev
       - name: Build Windows containerd-shim test fixtures
+        if: ${{ !inputs.windows_fork_futex_stress }}
         env:
           LITEBOX_SHIM_TEST_FIXTURES: ${{ runner.temp }}\litebox-shim-fixtures
         run: ./.github/tools/build_windows_shim_fixtures.ps1 $env:LITEBOX_SHIM_TEST_FIXTURES
+      - name: Stress test_fork_shared_futex_with_windows_broker
+        if: inputs.windows_fork_futex_stress
+        timeout-minutes: 45
+        env:
+          RUST_BACKTRACE: '1'
+        run: .\.github\tools\windows_fork_futex_stress.ps1 ${{ matrix.mode }}
       - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
+        if: ${{ !inputs.windows_fork_futex_stress }}
         env:
           LITEBOX_SHIM_TEST_FIXTURES: ${{ runner.temp }}\litebox-shim-fixtures
       # The HCS tests need a Windows image's layers: this runner is elevated, with the Containers
       # feature and Docker.
       - name: Pull the Windows image of the containerd-shim HCS tests
+        if: ${{ !inputs.windows_fork_futex_stress }}
         id: windows-layers
         run: |
           $layers = ./.github/tools/pull_windows_test_layers.ps1
           "layers=$layers" >> $env:GITHUB_OUTPUT
       - name: Run the containerd-shim HCS tests
+        if: ${{ !inputs.windows_fork_futex_stress }}
         run: cargo nextest run --locked --profile ci -p litebox_containerd_shim --test shim_windows --run-ignored only
         env:
           LITEBOX_SHIM_TEST_FIXTURES: ${{ runner.temp }}\litebox-shim-fixtures
@@ -637,7 +663,9 @@ jobs:
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
+        if: ${{ !inputs.windows_fork_futex_stress }}
       - name: Build documentation (fail on warnings)
+        if: ${{ !inputs.windows_fork_futex_stress }}
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items ($env:WINDOWS_CRATES -split ' ')
       # Save before rust-cache's post step, and avoid large PR-scoped caches.
       - name: Save Windows OCI test fixtures
@@ -659,6 +687,7 @@ jobs:
 
   build_and_test_snp:
     name: Build and Test SNP
+    if: ${{ !inputs.windows_fork_futex_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -684,6 +713,7 @@ jobs:
 
   confirm_no_std:
     name: Confirm no_std
+    if: ${{ !inputs.windows_fork_futex_stress }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
