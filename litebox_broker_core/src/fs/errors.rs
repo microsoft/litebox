@@ -5,8 +5,13 @@
 
 use litebox_platform::buffer::Fault;
 use thiserror::Error;
+use vstd::prelude::{verus_spec, verus_verify};
 
 use crate::BrokerError;
+
+#[cfg(verus_keep_ghost)]
+#[path = "errors_spec.rs"]
+pub mod verification;
 
 // XXX(jayb): We probably need to introduce a notion of `Stale` to many/most of these errors, in
 // order to more correctly support network-attached file systems.
@@ -36,6 +41,8 @@ pub enum OpenError {
 
 /// Possible errors from [`super::resolver::Resolver::read`]
 #[derive(Error, Debug)]
+// In progress: derived formatting and From<BrokerError> remain unverified.
+#[verus_verify(external_derive)]
 pub enum ReadError {
     #[error("fd has been closed already")]
     ClosedFd,
@@ -53,7 +60,9 @@ pub enum ReadError {
     Broker(#[from] BrokerError),
 }
 
+#[verus_verify]
 impl From<Fault> for ReadError {
+    #[verus_spec(result => ensures result == Self::Broker(BrokerError::Internal))]
     fn from(fault: Fault) -> Self {
         Self::Broker(fault.into())
     }
@@ -61,6 +70,8 @@ impl From<Fault> for ReadError {
 
 /// Possible errors from [`super::resolver::Resolver::write`]
 #[derive(Error, Debug)]
+// In progress: derived formatting and From<BrokerError> remain unverified.
+#[verus_verify(external_derive)]
 pub enum WriteError {
     #[error("fd has been closed already")]
     ClosedFd,
@@ -80,7 +91,9 @@ pub enum WriteError {
     Broker(#[from] BrokerError),
 }
 
+#[verus_verify]
 impl From<Fault> for WriteError {
+    #[verus_spec(result => ensures result == Self::Broker(BrokerError::Internal))]
     fn from(fault: Fault) -> Self {
         Self::Broker(fault.into())
     }
@@ -105,6 +118,8 @@ pub enum SeekError {
 
 /// Possible errors from [`super::resolver::Resolver::truncate`]
 #[derive(Error, Debug)]
+// In progress: derived implementations remain unverified.
+#[verus_verify(external_derive)]
 pub enum TruncateError {
     #[error("fd has been closed already")]
     ClosedFd,
@@ -303,6 +318,8 @@ pub enum ReadDirError {
 
 /// Possible errors from [`super::resolver::Resolver::file_status`]
 #[derive(Error, Debug)]
+// In progress: derived formatting and From<PathError> remain unverified.
+#[verus_verify(external_derive)]
 pub enum FileStatusError {
     #[error("fd has been closed already")]
     ClosedFd,
@@ -335,6 +352,8 @@ pub struct ResolutionError {
 
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
+// In progress: derived implementations remain unverified.
+#[verus_verify(external_derive)]
 pub enum PathError {
     #[error("too many symbolic links encountered")]
     TooManySymlinks,
@@ -352,6 +371,8 @@ pub enum PathError {
 
 /// Possible errors from a [`super::storage::FileStorage`].
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+// In progress: derived implementations remain unverified.
+#[verus_verify(external_derive)]
 pub enum StorageError {
     #[error("no space is left to grow the contents")]
     NoSpace,
@@ -363,13 +384,17 @@ pub enum StorageError {
     Io,
 }
 
+#[verus_verify]
 impl From<Fault> for StorageError {
+    #[verus_spec(result => ensures result == Self::Fault)]
     fn from(_: Fault) -> Self {
         Self::Fault
     }
 }
 
+#[verus_verify]
 impl From<StorageError> for ReadError {
+    #[verus_spec(result => ensures result == verification::storage_read_error(error))]
     fn from(error: StorageError) -> Self {
         match error {
             StorageError::Fault => Fault.into(),
@@ -378,7 +403,9 @@ impl From<StorageError> for ReadError {
     }
 }
 
+#[verus_verify]
 impl From<StorageError> for WriteError {
+    #[verus_spec(result => ensures result == verification::storage_write_error(error))]
     fn from(error: StorageError) -> Self {
         match error {
             StorageError::NoSpace => Self::NoSpace,
@@ -388,7 +415,9 @@ impl From<StorageError> for WriteError {
     }
 }
 
+#[verus_verify]
 impl From<StorageError> for TruncateError {
+    #[verus_spec(result => ensures result == verification::storage_truncate_error(error))]
     fn from(error: StorageError) -> Self {
         match error {
             StorageError::NoSpace => Self::NoSpace,
@@ -399,7 +428,9 @@ impl From<StorageError> for TruncateError {
     }
 }
 
+#[verus_verify]
 impl From<StorageError> for FileStatusError {
+    #[verus_spec(result => ensures result == Self::Io)]
     fn from(_: StorageError) -> Self {
         Self::Io
     }

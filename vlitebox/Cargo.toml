@@ -78,3 +78,11 @@ path = "src/negative/channel_wakeups_negative.rs"
 [[example]]
 name = "channel_extraction_negative"
 path = "src/negative/channel_extraction_negative.rs"
+
+[[example]]
+name = "filesystem_busy_read_negative"
+path = "src/negative/filesystem_busy_read_negative.rs"
+
+[[example]]
+name = "filesystem_fault_write_negative"
+path = "src/negative/filesystem_fault_write_negative.rs"

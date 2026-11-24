@@ -73,7 +73,9 @@ jobs:
             transfer_zeroing_negative \
             channel_saturation_negative \
             channel_wakeups_negative \
-            channel_extraction_negative; do
+            channel_extraction_negative \
+            filesystem_busy_read_negative \
+            filesystem_fault_write_negative; do
             log="$RUNNER_TEMP/$target.log"
             if cargo verus focus -p vlitebox --target-dir target --example "$target" -- --no-cheating > "$log" 2>&1; then
               cat "$log"
