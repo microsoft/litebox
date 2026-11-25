@@ -10,12 +10,13 @@
 //! most for now, as a virtio-fs device whose tag is its guest path, which the kernel keeps
 //! read-only; `virtiofsd` runs without its sandbox, which needs user namespaces, as the broker's
 //! user. The VM publishes no ports yet. The VMM's stdout is the kernel's log, and its stderr the
-//! processes' output.
+//! processes' output. The vhost-user daemons map the guest's memory: `virtiofsd`, QEMU's
+//! `vhost-device-vsock`, and Cloud Hypervisor's passt, which faces remote peers.
 //!
 //! The kernel and the runner are next to this executable unless `LITEBOX_VM_KERNEL` or
-//! `LITEBOX_VM_RUNNER` name them, and must be of this executable's build. The VMM and `virtiofsd`
-//! are, unless their variables name them, the first that the broker's user can run next to this
-//! executable, on the `PATH`, or in `/usr/libexec`, where distributions install `virtiofsd`.
+//! `LITEBOX_VM_RUNNER` name them, and must be of this executable's build. The VMM, `virtiofsd` and
+//! passt are, unless their variables name them, the first that the broker's user can run next to
+//! this executable, on the `PATH`, or in `/usr/libexec`, where distributions install `virtiofsd`.
 
 mod cloud_hypervisor;
 mod qemu;
@@ -64,7 +65,7 @@ pub fn check(vmm: Vmm, plan: &Plan) -> Result<()> {
         return Err(unsupported("the VM backend runs on x86-64 hosts only"));
     }
     if vmm == Vmm::CloudHypervisor {
-        cloud_hypervisor::check(plan)?;
+        cloud_hypervisor::check()?;
     }
     for (protocol, destinations) in [("tcp", &plan.egress.tcp), ("udp", &plan.egress.udp)] {
         if destinations.len() > MAX_DESTINATION_RULES {
@@ -194,8 +195,9 @@ pub fn guardian_arguments(
             .collect(),
     };
     command.env("PATH", search_path()?);
-    if vmm == Vmm::Qemu {
-        qemu::daemons(command, &vm);
+    match vmm {
+        Vmm::Qemu => qemu::daemons(command, &vm),
+        Vmm::CloudHypervisor => cloud_hypervisor::daemons(command, &vm),
     }
     // Only read-only ones reach here (see `RootFs::bind`).
     for (bind, (_, socket)) in binds.iter().zip(&vm.shares) {

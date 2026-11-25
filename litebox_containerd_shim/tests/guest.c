@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -152,6 +153,87 @@ int main(int argc, char **argv) {
         if (bind(server, (struct sockaddr *)&addr, sizeof addr) || listen(server, 1)) return 61;
         dprintf(1, "listening\n");
         return write(accept(server, NULL, NULL), "hello", 5) == 5 ? 0 : 62;
+    }
+    // Connects to 10.0.2.1 at a port over TCP, sends "ping", and prints the reply.
+    if (strcmp(mode, "tcp") == 0 && argc > 2) {
+        struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(atoi(argv[2])),
+                                   .sin_addr.s_addr = htonl(0x0a000201)};
+        int client = socket(AF_INET, SOCK_STREAM, 0);
+        if (connect(client, (struct sockaddr *)&addr, sizeof addr)) {
+            printf("connect: %s\n", strerror(errno));
+            return 71;
+        }
+        if (write(client, "ping", 4) != 4 || shutdown(client, SHUT_WR)) return 72;
+        char reply[64];
+        size_t size = 0;
+        ssize_t got;
+        while (size < sizeof reply && (got = read(client, reply + size, sizeof reply - size)) > 0)
+            size += (size_t)got;
+        // Until an orderly EOF, not a reset.
+        if (got != 0) return 73;
+        printf("tcp=[%.*s]\n", (int)size, reply);
+        return 0;
+    }
+    // Connects to 10.0.2.1 at the port, prints what it reads until EOF, then sends "ping".
+    if (strcmp(mode, "tcp-server-first") == 0 && argc > 2) {
+        struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(atoi(argv[2])),
+                                   .sin_addr.s_addr = htonl(0x0a000201)};
+        int client = socket(AF_INET, SOCK_STREAM, 0);
+        if (connect(client, (struct sockaddr *)&addr, sizeof addr)) return 71;
+        char reply[64];
+        size_t size = 0;
+        ssize_t got;
+        while (size < sizeof reply && (got = read(client, reply + size, sizeof reply - size)) > 0)
+            size += (size_t)got;
+        if (got != 0) return 73;
+        printf("tcp=[%.*s]\n", (int)size, reply);
+        return write(client, "ping", 4) == 4 ? 0 : 72;
+    }
+    // Sends "ping" over a UDP socket connected to 10.0.2.1 at the port, then prints the
+    // receive's error.
+    if (strcmp(mode, "udp-connected") == 0 && argc > 2) {
+        struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(atoi(argv[2])),
+                                   .sin_addr.s_addr = htonl(0x0a000201)};
+        int client = socket(AF_INET, SOCK_DGRAM, 0);
+        if (connect(client, (struct sockaddr *)&addr, sizeof addr) || send(client, "ping", 4, 0) != 4)
+            return 81;
+        char reply[64];
+        if (recv(client, reply, sizeof reply, 0) >= 0) return 82;
+        printf("recv: %s\n", strerror(errno));
+        return 0;
+    }
+    // Sends "ping" over UDP to 10.0.2.1 at a closed port, then at another, from one socket, then
+    // prints the reply.
+    if (strcmp(mode, "udp-past-refused") == 0 && argc > 3) {
+        int client = socket(AF_INET, SOCK_DGRAM, 0);
+        for (int i = 2; i < 4; i++) {
+            struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(atoi(argv[i])),
+                                       .sin_addr.s_addr = htonl(0x0a000201)};
+            if (sendto(client, "ping", 4, 0, (struct sockaddr *)&addr, sizeof addr) != 4) return 81;
+        }
+        char reply[64];
+        ssize_t got = recv(client, reply, sizeof reply, 0);
+        if (got < 0) return 82;
+        printf("udp=[%.*s]\n", (int)got, reply);
+        return 0;
+    }
+    // Sends "ping" over UDP to 10.0.2.1 at each port, from one socket, then prints each reply.
+    if (strcmp(mode, "udp") == 0 && argc > 2) {
+        int client = socket(AF_INET, SOCK_DGRAM, 0);
+        for (int i = 2; i < argc; i++) {
+            struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(atoi(argv[i])),
+                                       .sin_addr.s_addr = htonl(0x0a000201)};
+            if (sendto(client, "ping", 4, 0, (struct sockaddr *)&addr, sizeof addr) != 4) return 81;
+        }
+        for (int i = 2; i < argc; i++) {
+            char reply[64];
+            struct sockaddr_in from;
+            socklen_t length = sizeof from;
+            ssize_t got = recvfrom(client, reply, sizeof reply, 0, (struct sockaddr *)&from, &length);
+            if (got < 0) return 82;
+            printf("udp=[%.*s] from %d\n", (int)got, reply, ntohs(from.sin_port));
+        }
+        return 0;
     }
     for (;;) pause();
 }
