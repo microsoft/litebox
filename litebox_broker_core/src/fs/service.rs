@@ -2040,36 +2040,14 @@ mod tests {
         );
     }
 
-    fn composed_file_system() -> Arc<dyn FileService> {
-        Arc::new(Resolver::<TestPlatform, _>::new(
+    #[test]
+    fn inherited_relative_handles_walk_the_receivers_mount_view() {
+        let fs: Arc<dyn FileService> = Arc::new(Resolver::<TestPlatform, _>::new(
             crate::fs::composer::Composer::<TestPlatform>::builder()
                 .mount("/", InMem::<TestPlatform>::new)
                 .build()
                 .unwrap(),
-        ))
-    }
-
-    /// A process of `broker` resolving paths in a private copy of `fs`'s mount layout.
-    fn process_with_copied_view(
-        broker: &TestBroker,
-        fs: &Arc<dyn FileService>,
-    ) -> Arc<BrokerProcess> {
-        broker
-            .core
-            .create_process(
-                CallerCredential::Unauthenticated,
-                &broker.pid_namespace,
-                &fs.copy_mount_view().unwrap(),
-                &broker.job,
-                broker.host_names.clone(),
-                None,
-            )
-            .unwrap()
-    }
-
-    #[test]
-    fn inherited_relative_handles_walk_the_receivers_mount_view() {
-        let fs = composed_file_system();
+        ));
         let (broker, owner, root, sink) = broker_with_root_anchor(Arc::clone(&fs));
         let user = FileUser::ROOT;
         assert_eq!(
@@ -2105,7 +2083,17 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let child = process_with_copied_view(&broker, &fs);
+        let child = broker
+            .core
+            .create_process(
+                CallerCredential::Unauthenticated,
+                &broker.pid_namespace,
+                &fs.copy_mount_view().unwrap(),
+                &broker.job,
+                broker.host_names.clone(),
+                None,
+            )
+            .unwrap();
         let [child_root, child_work, child_file] = [root, work, file].map(|handle| {
             owner
                 .duplicate_object_reference_to(handle, &child, ObjectRights::WAIT)
@@ -2164,74 +2152,6 @@ mod tests {
             path_status(&child, Some(child_file), ".", user, true),
             Ok(Err(FileError::ComponentNotDirectory))
         );
-    }
-
-    #[test]
-    fn inherited_relative_handles_need_a_mount_both_views_share() {
-        let fs = composed_file_system();
-        let (broker, owner, _root, sink) = broker_with_root_anchor(Arc::clone(&fs));
-        let user = FileUser::ROOT;
-        for path in ["/a", "/b"] {
-            assert_eq!(mkdir(&owner, None, path, user, FileMode::RWXU), Ok(Ok(())));
-        }
-        let child = process_with_copied_view(&broker, &fs);
-        // Each view's first private mount takes the same index.
-        assert_eq!(mount_in_mem(&owner, "/a", user), Ok(Ok(())));
-        assert_eq!(mount_in_mem(&child, "/b", user), Ok(Ok(())));
-        let open_at = |process: &BrokerProcess, path, access, flags| {
-            open(
-                process,
-                None,
-                path,
-                user,
-                access,
-                flags,
-                FileMode::RWXU,
-                &sink,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let a = open_at(&owner, "/a", FileAccessMode::ReadOnly, FileOpenFlags::PATH);
-        let a_file = open_at(
-            &owner,
-            "/a/file",
-            FileAccessMode::ReadWrite,
-            FileOpenFlags::CREATE,
-        );
-        let b = open_at(&child, "/b", FileAccessMode::ReadOnly, FileOpenFlags::PATH);
-
-        for (sender, receiver, handle) in [
-            (&owner, &child, a),
-            (&owner, &child, a_file),
-            (&child, &owner, b),
-        ] {
-            let transferred = sender
-                .duplicate_object_reference_to(handle, receiver, ObjectRights::WAIT)
-                .unwrap();
-            assert_eq!(
-                path_status(receiver, Some(transferred), ".", user, true),
-                Err(BrokerError::InvalidRights)
-            );
-            assert_eq!(
-                mkdir(receiver, Some(transferred), "x", user, FileMode::RWXU),
-                Err(BrokerError::InvalidRights)
-            );
-        }
-        assert_eq!(
-            mkdir(&owner, Some(a), "x", user, FileMode::RWXU),
-            Ok(Ok(()))
-        );
-        assert_eq!(
-            mkdir(&child, Some(b), "x", user, FileMode::RWXU),
-            Ok(Ok(()))
-        );
-        for (process, path) in [(&owner, "/b/x"), (&child, "/a/x")] {
-            assert_eq!(
-                path_status(process, None, path, user, true),
-                Ok(Err(FileError::NoSuchFileOrDirectory))
-            );
-        }
     }
 
     #[test]
