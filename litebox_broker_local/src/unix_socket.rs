@@ -19,24 +19,15 @@ use litebox_broker_protocol::unix_socket::{
     GetUnixSocketNameRequest, GetUnixSocketOptionRequest, ListenUnixSocketRequest,
     MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE,
     MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveOptions,
-    ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
-    SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, TransferredObject, UnixSocketError,
-    UnixSocketName,
+    ReceiveUnixSocketRequest, SendUnixSocketRequest, SetUnixSocketOptionRequest,
+    ShutdownUnixSocketRequest, TransferredObject, UnixSocketError, UnixSocketName,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
-use crate::{BrokerLocal, BrokerLocalError, Result};
+use crate::{BrokerLocal, BrokerLocalError, ReceivedUnixSocket, Result};
 
 type UnixSocketResult<T> = core::result::Result<T, UnixSocketError>;
-
-/// What a receive from a Unix socket got: the broker's response, the sender's
-/// name if requested, and the caller's new handles to the carried objects.
-pub type ReceivedUnixSocket = (
-    ReceiveUnixSocketResponse,
-    Option<UnixSocketName>,
-    Vec<TransferredObject>,
-);
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned Unix socket.
