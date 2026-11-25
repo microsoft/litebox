@@ -89,10 +89,12 @@ impl VirtioNet {
         };
         let (mut receive, mut receive_buffers, transmit, transmit_buffers) =
             setup().inspect_err(|_| transport.fail())?;
+        // After DRIVER_OK: Cloud Hypervisor starts a vhost-user queue at its available index, past
+        // the buffers posted before.
+        transport.start();
         while let Some(buffer) = receive_buffers.free.pop() {
             receive_buffers.post(&mut receive, buffer, BUFFER_SIZE, true);
         }
-        transport.start();
         transport.notify(&receive);
         Ok(Self {
             transport,
