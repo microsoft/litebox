@@ -941,7 +941,15 @@ jobs:
             -E 'test(=test_native::cpu_time_parent)' || true
       - name: Stress
         run: |
+          # The host's CPU-time accounting, which the test's checks depend on.
+          echo "::group::host"
+          uname -a
           nproc
+          cat /sys/devices/system/clocksource/clocksource0/current_clocksource || true
+          grep -E 'CONFIG_(HZ|NO_HZ|TICK_CPU_ACCOUNTING|VIRT_CPU_ACCOUNTING|IRQ_TIME_ACCOUNTING|SCHED_AUTOGROUP)' \
+            "/boot/config-$(uname -r)" || true
+          cat /proc/cmdline
+          echo "::endgroup::"
           mkdir -p "$RUNNER_TEMP/logs"
           end=$((SECONDS + STRESS_SECONDS))
           if [ "${{ matrix.load }}" = loaded ]; then
@@ -971,7 +979,7 @@ jobs:
               echo "::group::cpu_time_parent run $i failed"
               cat "$log"
               echo "::endgroup::"
-              grep -h 'FAIL line' "$log" | sed "s/^/run $i: /" || true
+              grep -hE 'FAIL line|DEBUG' "$log" | sed "s/^/run $i: /" || true
             fi
           done
           echo "cpu_time_parent runs: $i, failures: $failed"

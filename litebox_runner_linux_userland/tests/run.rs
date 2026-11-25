@@ -323,6 +323,9 @@ fn run_native_c_test(path: &str, with_exec_child: bool) {
     if checks_broker_pipes(Path::new(path)) {
         native.env(PIPE_BROKER_VARIABLE, "1");
     }
+    // TEMPORARY (cpu-time-stress branch): lets `cpu_time_parent.c` inspect its child through
+    // `/proc` before reaping it, which only native runs do.
+    native.env("CPU_TIME_DEBUG", "1");
     if with_exec_child {
         let child = build_c_program(EXEC_CHILD, true);
         native.arg(std::path::absolute(child).unwrap());
