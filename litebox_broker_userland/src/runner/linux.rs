@@ -79,9 +79,9 @@ pub(crate) fn create_image(_capacity: u64) -> Result<Box<dyn ProcessImage>, Brok
 /// broker's own parent, would disable native fork. It would also leak a host descriptor into the
 /// sandbox. The standard streams themselves are set by the caller, so they are always occupied.
 pub(super) fn inherit_only_standard_streams(command: &mut Command) {
-    // SAFETY: The hook runs in the forked child before exec and only makes the async-signal-safe
-    // `close_range` system call. Marking descriptors close-on-exec, rather than closing them,
-    // keeps the descriptor through which `Command` reports a failed exec.
+    // SAFETY: The hook runs in the forked child before exec and uses only Linux syscall wrappers.
+    // Marking descriptors close-on-exec, rather than closing them, keeps the descriptor through
+    // which `Command` reports a failed exec.
     unsafe {
         command.pre_exec(|| {
             if libc::syscall(
@@ -91,7 +91,27 @@ pub(super) fn inherit_only_standard_streams(command: &mut Command) {
                 libc::CLOSE_RANGE_CLOEXEC,
             ) != 0
             {
-                return Err(IoError::last_os_error());
+                let error = IoError::last_os_error();
+                if error.raw_os_error() != Some(libc::ENOSYS) {
+                    return Err(error);
+                }
+
+                // Some environments (such as rr) fake ENOSYS for close_range,
+                // so mark each descriptor individually.
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) != 0 {
+                    return Err(IoError::last_os_error());
+                }
+                let limit = libc::c_int::try_from(limit.rlim_cur).unwrap_or(libc::c_int::MAX);
+                for fd in 3..limit {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags != -1 {
+                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
+                }
             }
             Ok(())
         });
