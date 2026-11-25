@@ -18,10 +18,10 @@ use litebox_platform::buffer::RawBytes;
 
 use crate::fs::backend::Caller;
 use crate::fs::errors::{
-    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, SeekError,
-    SymlinkError, TruncateError, WalkError, WriteError,
+    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError,
+    SeekError, SymlinkError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use crate::fs::inode_allocator::InodeAllocators;
+use crate::fs::inode_allocator::{InodeAllocator, InodeAllocators};
 use crate::fs::resolver::{Resolver, ResolverEntry};
 use crate::fs::{FileTimeUpdate, FileTimestamp, FileType, Mode, OFlags, SeekWhence, SetFileTimes};
 use crate::test_platform::TestPlatform;
@@ -150,6 +150,9 @@ struct Server {
     max_write: usize,
     readdir_offsets: Vec<u64>,
     transfer_offsets: Vec<(Opcode, u64)>,
+    /// Each `FUSE_SETATTR`'s owner and group, if it sets them; recorded, not applied, as the
+    /// unprivileged server could set them only to what they are.
+    owner_changes: Vec<(Option<u32>, Option<u32>)>,
     /// Before the transport fails; `None` for never.
     round_trips_left: Option<usize>,
 }
@@ -176,6 +179,7 @@ impl Server {
             max_write: 0,
             readdir_offsets: Vec::new(),
             transfer_offsets: Vec::new(),
+            owner_changes: Vec::new(),
             round_trips_left: None,
         }))
     }
@@ -210,6 +214,8 @@ impl Server {
             5 => Opcode::Readlink,
             6 => Opcode::Symlink,
             9 => Opcode::Mkdir,
+            10 => Opcode::Unlink,
+            11 => Opcode::Rmdir,
             12 => Opcode::Rename,
             14 => Opcode::Open,
             15 => Opcode::Read,
@@ -319,7 +325,7 @@ impl Server {
                 Ok(self.attr_out(&metadata.map_err(errno)?))
             }
             Opcode::Setattr => {
-                use abi::fattr::{ATIME, ATIME_NOW, FH, MODE, MTIME, MTIME_NOW, SIZE};
+                use abi::fattr::{ATIME, ATIME_NOW, FH, GID, MODE, MTIME, MTIME_NOW, SIZE, UID};
                 let valid = r.u32().unwrap();
                 r.skip(4).unwrap();
                 let fh = r.u64().unwrap();
@@ -332,8 +338,20 @@ impl Server {
                 let mtimensec = r.u32().unwrap();
                 r.skip(4).unwrap(); // ctimensec
                 let mode = r.u32().unwrap();
-                if valid & !(SIZE | FH | ATIME | MTIME | ATIME_NOW | MTIME_NOW | MODE) != 0 {
+                r.skip(4).unwrap(); // unused4
+                let uid = r.u32().unwrap();
+                let gid = r.u32().unwrap();
+                let owner_bits = UID | GID;
+                if valid & !(SIZE | FH | ATIME | MTIME | ATIME_NOW | MTIME_NOW | MODE | owner_bits)
+                    != 0
+                {
                     self.violations.push(std::format!("setattr {valid:#x}"));
+                }
+                if valid & owner_bits != 0 {
+                    self.owner_changes.push((
+                        (valid & UID != 0).then_some(uid),
+                        (valid & GID != 0).then_some(gid),
+                    ));
                 }
                 if valid & MODE != 0 {
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -489,11 +507,15 @@ impl Server {
                 out.extend(self.open(OpenState::File(file)));
                 Ok(out)
             }
-            Opcode::Unlink
-            | Opcode::Rmdir
-            | Opcode::Forget
-            | Opcode::BatchForget
-            | Opcode::Init => unreachable!(),
+            Opcode::Unlink => {
+                std::fs::remove_file(path.join(name(r))).map_err(errno)?;
+                Ok(Vec::new())
+            }
+            Opcode::Rmdir => {
+                std::fs::remove_dir(path.join(name(r))).map_err(errno)?;
+                Ok(Vec::new())
+            }
+            Opcode::Forget | Opcode::BatchForget | Opcode::Init => unreachable!(),
         }
     }
 
@@ -891,12 +913,19 @@ macro_rules! assert_err {
 type FuseFs = Resolver<TestPlatform, Fuse<TestPlatform, ServerTransport>>;
 
 fn connect(server: &Arc<Mutex<Server>>) -> Result<Fuse<TestPlatform, ServerTransport>, Error> {
+    connect_with(server, InodeAllocators::new().next())
+}
+
+fn connect_with(
+    server: &Arc<Mutex<Server>>,
+    allocator: InodeAllocator,
+) -> Result<Fuse<TestPlatform, ServerTransport>, Error> {
     let transport = ServerTransport {
         server: Arc::clone(server),
         payload: alloc::vec![0; MAX_PAYLOAD_SIZE],
         reply: Vec::new(),
     };
-    Fuse::new(transport, InodeAllocators::new().next())
+    Fuse::new(transport, allocator)
 }
 
 struct Harness {
@@ -1933,4 +1962,161 @@ fn test_fuse_rename() {
     let renamed = std::fs::read_to_string(h.host_path("b/renamed")).unwrap();
     assert_eq!(renamed, "moved");
     h.finish();
+}
+
+/// Directories made through the share hold files, list them, and are removed: `unlink` refuses a
+/// directory and `rmdir` a file, and both leave the host without the name.
+#[test]
+fn test_fuse_mkdir_unlink_and_rmdir() {
+    let h = Harness::new();
+    let fs = &h.fs;
+    fs.mkdir(USER, None, "/dir", Mode::RWXU).unwrap();
+    fs.mkdir(USER, None, "/dir/nested", Mode::RWXU).unwrap();
+    let mut fd = fs
+        .open(
+            USER,
+            None,
+            "/dir/file",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RWXU,
+        )
+        .unwrap();
+    fs.write(&mut fd, b"nested content", None).unwrap();
+    drop(fd);
+    let names = |path| {
+        let entries = list(fs, path).unwrap();
+        entries
+            .into_iter()
+            .map(|(name, file_type, _)| (name, file_type))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names("/"), [("dir".into(), FileType::Directory)]);
+    assert_eq!(
+        names("/dir"),
+        [
+            ("file".into(), FileType::RegularFile),
+            ("nested".into(), FileType::Directory)
+        ]
+    );
+
+    assert_err!(
+        fs.unlink(USER, None, "/dir/nested"),
+        UnlinkError::IsADirectory
+    );
+    assert_err!(fs.rmdir(USER, None, "/dir/file"), RmdirError::NotADirectory);
+    assert_err!(fs.rmdir(USER, None, "/dir"), RmdirError::NotEmpty);
+    fs.unlink(USER, None, "/dir/file").unwrap();
+    assert!(!h.host_path("dir/file").exists());
+    let gone = fs.open(USER, None, "/dir/file", OFlags::RDONLY, Mode::empty());
+    assert_err!(gone, OpenError::PathError(PathError::NoSuchFileOrDirectory));
+    fs.rmdir(USER, None, "/dir/nested").unwrap();
+    fs.rmdir(USER, None, "/dir").unwrap();
+    assert!(!h.host_path("dir").exists());
+    assert_eq!(names("/"), []);
+    h.finish();
+}
+
+/// `chown` sends the owner and group it changes, and only those.
+#[test]
+fn test_fuse_chown() {
+    let h = Harness::new();
+    std::fs::write(h.host_path("file"), "data").unwrap();
+    let fs = &h.fs;
+    fs.chown(USER, None, "/file", Some(41), Some(42)).unwrap();
+    fs.chown(USER, None, "/file", None, Some(42)).unwrap();
+    fs.chown(USER, None, "/file", Some(41), None).unwrap();
+    assert_eq!(
+        h.server.lock().unwrap().owner_changes,
+        [(Some(41), Some(42)), (None, Some(42)), (Some(41), None)]
+    );
+    h.finish();
+}
+
+/// An overlay checks the guest's permissions on its lower layer's files even when that layer, as
+/// a FUSE server does, enforces only its host user's: the server would let any guest user in.
+#[test]
+fn test_fuse_overlay_authorizes_logical_targets() {
+    use crate::fs::UserInfo;
+    use crate::fs::errors::{ChmodError, ChownError};
+    use crate::fs::in_mem::{InMem, InitialNode};
+    use crate::fs::overlay::Overlay;
+
+    let server = Server::shared(Config::default());
+    let export = server.lock().unwrap().export_dir.path().to_path_buf();
+    let file = export.join("private-file");
+    std::fs::write(&file, b"server-owned data").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let dir = export.join("private-dir");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(dir.join("hidden"), b"hidden").unwrap();
+    let metadata = std::fs::metadata(&file).unwrap();
+    // Neither root nor the files' owner or group, whatever the host's IDs.
+    let other = |id: u32| if id == 1 { 2 } else { 1 };
+    let user = UserInfo {
+        user: other(metadata.uid()),
+        group: other(metadata.gid()),
+    };
+    // Directly, the server lets this other user read the file.
+    let direct: FuseFs = Resolver::new(connect(&server).unwrap());
+    drop(
+        direct
+            .open(user, None, "/private-file", OFlags::RDONLY, Mode::empty())
+            .unwrap(),
+    );
+    drop(direct);
+
+    let allocators = InodeAllocators::new();
+    let upper = InMem::<TestPlatform>::new_initialized(
+        [(
+            "/",
+            InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: UserInfo::ROOT,
+            },
+        )],
+        allocators.next(),
+    );
+    let lower = connect_with(&server, allocators.next()).unwrap();
+    let fs = Resolver::<TestPlatform, _>::new(Overlay::<TestPlatform>::new(
+        upper,
+        lower,
+        allocators.next(),
+    ));
+    for flags in [OFlags::RDONLY, OFlags::WRONLY | OFlags::TRUNC] {
+        assert_err!(
+            fs.open(user, None, "/private-file", flags, Mode::empty()),
+            OpenError::AccessNotAllowed
+        );
+    }
+    assert_err!(
+        fs.open(user, None, "/private-dir", OFlags::RDONLY, Mode::empty()),
+        OpenError::AccessNotAllowed
+    );
+    assert_err!(
+        fs.open(
+            user,
+            None,
+            "/private-dir/hidden",
+            OFlags::PATH,
+            Mode::empty()
+        ),
+        OpenError::PathError(PathError::NoSearchPerms)
+    );
+    assert_err!(
+        fs.chmod(user, None, "/private-file", Mode::RWXU),
+        ChmodError::NotTheOwner
+    );
+    assert_err!(
+        fs.chown(user, None, "/private-file", Some(user.user), None),
+        ChownError::NotTheOwner
+    );
+    let fd = fs
+        .open(user, None, "/private-file", OFlags::PATH, Mode::empty())
+        .unwrap();
+    assert_eq!(fs.handle_status(Caller::default(), &fd).unwrap().size, 17);
+    drop(fd);
+    drop(fs);
+    assert_eq!(std::fs::read(&file).unwrap(), b"server-owned data");
+    server.lock().unwrap().assert_clean();
 }

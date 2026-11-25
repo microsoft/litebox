@@ -994,7 +994,7 @@ impl RawMutexTrait for RawMutex {
 /// How long a [`RawMutex`] spins seeing no change, or a claim stays held for
 /// a waiter (see the shim), before it warns of a possible deadlock (once per
 /// wait); it then waits on, as some locks are held longer: e.g., an open
-/// file's, across a whole read, which takes a 9P round trip per message, each
+/// file's, across a whole read, which takes a FUSE round trip per request, each
 /// up to 30 s, the total unbounded.
 pub const LOCK_WARNING: core::time::Duration = core::time::Duration::from_mins(1);
 

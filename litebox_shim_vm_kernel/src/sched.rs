@@ -51,7 +51,7 @@
 //! - While the boot CPU runs its services (but for their claim waits), a
 //!   process whose request its worker is suspended in waits.
 //! - A thread whose kernel entry finds its process's claim held past a brief
-//!   spin (e.g., by a worker serving a request, across a 9P round trip, or by
+//!   spin (e.g., by a worker serving a request, across a FUSE round trip, or by
 //!   its other threads' entries, long ones or many in a row) is parked (see
 //!   [`Scheduler::parks`]), until a step claims the process again. Its CPU
 //!   steps again at once, and wakes the idle CPUs; but if the claim is still
@@ -563,7 +563,7 @@ impl Shared {
         }
         // The boot CPU takes devices' interrupts, unmarked: one that came as
         // the step ran, after its polls (e.g., as it waited for a lock, or a
-        // 9P response), has it step again.
+        // FUSE reply), has it step again.
         if cpu == CpuId::BOOT && self.events.take_device_interrupt() {
             return true;
         }
@@ -838,7 +838,7 @@ impl<'a> Found<'a> {
 /// Has this CPU's worker serve what the claimed process submitted, if it
 /// is free. Called holding no other claim (by the step's first pass), as a
 /// CPU runs its worker holding none but that of the process it serves: the
-/// work may take long (e.g., a 9P round trip), and would keep other
+/// work may take long (e.g., a FUSE round trip), and would keep other
 /// processes from the other CPUs and the boot CPU's services. Else, if
 /// another CPU's is free (in `free`: not suspended, nor the boot CPU's
 /// outside its steps), returns true, sharing the process with it: the step

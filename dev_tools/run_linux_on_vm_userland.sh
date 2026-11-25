@@ -53,16 +53,14 @@
 # isolated from the host (restrict=on) but for an echo server (cat) at
 # 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
 #
-# A fresh host directory per boot (see start_share) is mounted read-only at
-# /mnt/host (its tag): for the virtiofs test over virtio-fs, served by an
+# The virtiofs test's boots each mount a fresh host directory (see
+# start_share) read-only at /mnt/host (its tag), over virtio-fs, served by an
 # unprivileged virtiofsd ($VIRTIOFSD) of the boot's own, which shares the
-# guest's RAM; for the others, under QEMU, over virtio-9p.
+# guest's RAM.
 #
 # Under Cloud Hypervisor, the VMs run in a network namespace of the run's own,
 # made with (passwordless) sudo, where a TAP device has the guest's gateway
-# (10.0.2.1) and the echo server (10.0.2.100:7). It has no virtio-9p, so the
-# virtio9p test is skipped there; the virtiofs test checks the same over
-# virtio-fs.
+# (10.0.2.1) and the echo server (10.0.2.100:7).
 #
 # With VM_CPUS above 4, the preempt test is skipped: it checks preemption
 # with 8 CPU-bound programs. With fewer than 2, the smp test is skipped: it
@@ -155,7 +153,6 @@ skip_reason() {
         preempt) [[ $VM_CPUS -le 4 ]] || echo "more CPUs than its preemption checks allow" ;;
         smp) [[ $VM_CPUS -ge 2 ]] || echo "needs threads running at once" ;;
         highmem) [[ $VM_MIB -ge 4096 ]] || echo "needs VM_MEM of at least 4G" ;;
-        virtio9p) [[ $VMM == qemu ]] || echo "needs virtio-9p, which only QEMU has" ;;
         virtiofs) [[ -n $VIRTIOFSD ]] || echo "needs virtiofsd, not found ($virtiofsd_wanted)" ;;
     esac
 }
@@ -305,16 +302,11 @@ network_args() {
 }
 
 # Starts boot $1's share, if it has one (see the header), and sets $share to
-# virtio9p, virtiofs, or nothing. A virtiofsd serves one connection: one per
-# boot.
+# virtiofs, or nothing. A virtiofsd serves one connection: one per boot.
 start_share() {
     share=
-    if [[ $test == virtiofs ]]; then
-        share=virtiofs
-    elif [[ $VMM == qemu ]]; then
-        share=virtio9p
-    fi
-    [[ -n $share ]] || return 0
+    [[ $test == virtiofs ]] || return 0
+    share=virtiofs
     local dir="$WORK/$1.share"
     # Fresh, even if a boot of the same name ran before.
     rm -rf "$dir"
@@ -324,20 +316,17 @@ start_share() {
     ln -s greeting.txt "$dir/link.txt"
     ln -s . "$dir/self"
     ln -s /mnt/host/greeting.txt "$dir/abs.txt"
-    if [[ $test == virtio9p || $test == virtiofs ]]; then
-        mkdir -p "$dir/dir/sub" "$dir/many"
-        echo deep >"$dir/dir/sub/deep.txt"
-        echo parent >"$dir/dir/marker"
-        echo child >"$dir/dir/sub/marker"
-        # Made once.
-        [[ -f "$WORK/big.bin" ]] ||
-            python3 -c 'import sys; sys.stdout.buffer.write((bytes(range(251)) * 12583)[:3158073])' \
-                >"$WORK/big.bin"
-        ln "$WORK/big.bin" "$dir/big.bin"
-        touch "$dir"/many/f{0000..2999}
-        ln "$WORK/rootfs/hello" "$dir/hello"
-    fi
-    [[ $share == virtiofs ]] || return 0
+    mkdir -p "$dir/dir/sub" "$dir/many"
+    echo deep >"$dir/dir/sub/deep.txt"
+    echo parent >"$dir/dir/marker"
+    echo child >"$dir/dir/sub/marker"
+    # Made once.
+    [[ -f "$WORK/big.bin" ]] ||
+        python3 -c 'import sys; sys.stdout.buffer.write((bytes(range(251)) * 12583)[:3158073])' \
+            >"$WORK/big.bin"
+    ln "$WORK/big.bin" "$dir/big.bin"
+    touch "$dir"/many/f{0000..2999}
+    ln "$WORK/rootfs/hello" "$dir/hello"
     mkfifo "$dir/fifo"
     # Emptied first: the readiness check must not see an earlier boot's line
     # before the background redirection truncates the file.
@@ -369,21 +358,14 @@ stop_share() {
 
 # The devices of boot $1's share (see `start_share`).
 share_args() {
-    case $share in
-        virtio9p)
-            echo -fsdev "local,id=fs0,path=$WORK/$1.share,security_model=none" \
-                -device virtio-9p-pci,fsdev=fs0,mount_tag=/mnt/host,disable-legacy=on
+    [[ -n $share ]] || return 0
+    case $VMM in
+        qemu)
+            # The vsock arguments share the guest's RAM, as vhost-user needs.
+            echo -chardev "socket,id=vfs0,path=$WORK/$1.virtiofs" \
+                -device vhost-user-fs-pci,chardev=vfs0,tag=/mnt/host
             ;;
-        virtiofs)
-            case $VMM in
-                qemu)
-                    # The vsock arguments share the guest's RAM, as vhost-user needs.
-                    echo -chardev "socket,id=vfs0,path=$WORK/$1.virtiofs" \
-                        -device vhost-user-fs-pci,chardev=vfs0,tag=/mnt/host
-                    ;;
-                cloud-hypervisor) echo --fs "tag=/mnt/host,socket=$WORK/$1.virtiofs" ;;
-            esac
-            ;;
+        cloud-hypervisor) echo --fs "tag=/mnt/host,socket=$WORK/$1.virtiofs" ;;
     esac
 }
 
@@ -528,7 +510,7 @@ boot() {
     local failed_before=$fail
     start_share "$1"
     # virtiofsd accesses the guest's RAM.
-    [[ $share != virtiofs ]] || vm_shared_memory=1
+    [[ -z $share ]] || vm_shared_memory=1
     # shellcheck disable=SC2046 # these print separate arguments
     run_vm "$1" "$KERNEL" "$2" $(console_args "$1") $(network_args) $(share_args "$1") \
         "${vsock[@]}"

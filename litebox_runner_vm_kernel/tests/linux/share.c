@@ -1,14 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// The host directory read-only at /mnt/host, over virtio-9p (the virtio9p
-// test) or virtio-fs (the virtiofs test, with the argument `virtiofs`). Reads
-// files, through symlinks too (abs.txt's absolute target resolves from the
-// guest's root, not the share's) and from a directory's descriptor (dir/sub's
-// `../marker` is dir's), and big.bin, larger than a request carries;
+// The host directory read-only at /mnt/host, over virtio-fs (the virtiofs
+// test). Reads files, through symlinks too (abs.txt's absolute target
+// resolves from the guest's root, not the share's) and from a directory's
+// descriptor (dir/sub's `../marker` is dir's), and big.bin, larger than a
+// request carries;
 // lists many/, more than a FUSE_READDIR reply (64 KiB) holds, and stats 200 of
-// its files, more than a batch of FUSE forgets. With `virtiofs`, also checks a
-// modification time and that the FIFO is hidden, as special files are.
+// its files, more than a batch of FUSE forgets. Also checks a modification
+// time and that the FIFO is hidden, as special files are.
 // Writing, creating, and removing fail with EROFS, but, as on a Linux
 // read-only mount, creating an existing name fails with EEXIST first, and
 // opening an existing file read-only with O_CREAT succeeds.
@@ -135,7 +135,7 @@ static int count_entries(const char *path, const char *name, int *found) {
     return count;
 }
 
-int main(int argc, char **argv) {
+int main(void) {
     int sub = open("/mnt/host/dir/sub", O_RDONLY | O_DIRECTORY);
     if (sub < 0) return fail("dir/sub");
     if (cat("/mnt/host/greeting.txt") != 0 || print_link("link.txt") != 0 ||
@@ -162,20 +162,18 @@ int main(int argc, char **argv) {
                 (long long)st.st_size);
         return 1;
     }
-    if (argc > 1 && strcmp(argv[1], "virtiofs") == 0) {
-        if (st.st_mtime != 1700000000) {
-            fprintf(stderr, "greeting.txt: mtime %lld\n", (long long)st.st_mtime);
-            return 1;
-        }
-        printf("mtime 1700000000\n");
-        int listed = 0;
-        if (count_entries("/mnt/host", "fifo", &listed) < 0) return 1;
-        if (listed || !fails_with(stat("/mnt/host/fifo", &st), EINVAL, "stat the FIFO")) {
-            fprintf(stderr, "the FIFO is not hidden\n");
-            return 1;
-        }
-        printf("fifo hidden\n");
+    if (st.st_mtime != 1700000000) {
+        fprintf(stderr, "greeting.txt: mtime %lld\n", (long long)st.st_mtime);
+        return 1;
     }
+    printf("mtime 1700000000\n");
+    int listed = 0;
+    if (count_entries("/mnt/host", "fifo", &listed) < 0) return 1;
+    if (listed || !fails_with(stat("/mnt/host/fifo", &st), EINVAL, "stat the FIFO")) {
+        fprintf(stderr, "the FIFO is not hidden\n");
+        return 1;
+    }
+    printf("fifo hidden\n");
     int found = 0;
     if (count_entries("/mnt/host", "greeting.txt", &found) < 0) return 1;
     if (!found) {
@@ -205,7 +203,6 @@ int main(int argc, char **argv) {
         !read_only(unlink("/mnt/host/greeting.txt"), "unlink") ||
         !read_only(rename("/mnt/host/greeting.txt", "/mnt/host/moved.txt"), "rename") ||
         !read_only(symlink("x", "/mnt/host/newlink"), "symlink") ||
-        // The 9P backend itself would panic the kernel on this one.
         !read_only(open("/mnt/host", O_WRONLY), "open the directory for writing") ||
         !fails_with(mkdir("/mnt/host/greeting.txt", 0755), EEXIST, "mkdir an existing name") ||
         !fails_with(symlink("x", "/mnt/host/link.txt"), EEXIST, "symlink an existing name") ||
