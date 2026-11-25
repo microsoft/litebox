@@ -61,6 +61,7 @@ use litebox_broker_transport::shared_memory::{SharedBuffer, SharedBufferPool, Sh
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 pub use error::{BrokerLocalError, Result};
+pub use unix_socket::ReceivedUnixSocket;
 
 /// Typed broker-local control adapter for broker operations.
 ///

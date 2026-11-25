@@ -19,8 +19,9 @@ use litebox_broker_protocol::unix_socket::{
     GetUnixSocketNameRequest, GetUnixSocketOptionRequest, ListenUnixSocketRequest,
     MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE,
     MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveOptions,
-    ReceiveUnixSocketRequest, Received, SendUnixSocketRequest, SetUnixSocketOptionRequest,
-    ShutdownUnixSocketRequest, TransferredObject, UnixSocketError, UnixSocketName,
+    ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
+    SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, TransferredObject, UnixSocketError,
+    UnixSocketName,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
@@ -28,6 +29,14 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 type UnixSocketResult<T> = core::result::Result<T, UnixSocketError>;
+
+/// What a receive from a Unix socket got: the broker's response, the sender's
+/// name if requested, and the caller's new handles to the carried objects.
+pub type ReceivedUnixSocket = (
+    ReceiveUnixSocketResponse,
+    Option<UnixSocketName>,
+    Vec<TransferredObject>,
+);
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned Unix socket.
@@ -224,6 +233,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// `buffer`, with handles to at most `options.max_objects` of the objects
     /// it carried.
     ///
+    /// Returns the broker's response with the sender's name, if
+    /// `options.source` is set, and the received objects, which the response
+    /// counts and the broker placed in `buffer`.
+    ///
     /// # Panics
     ///
     /// Panics if `buffer` is not `destination.len()` bytes, plus
@@ -237,7 +250,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         destination: &mut dyn ReadBuffer,
         options: ReceiveOptions,
-    ) -> Result<UnixSocketResult<Received>, Channel::Error> {
+    ) -> Result<UnixSocketResult<ReceivedUnixSocket>, Channel::Error> {
         let ReceiveOptions {
             peek,
             source,
@@ -309,13 +322,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     UnixSocketName::decode(&name[..source_length])
                         .expect("broker returned an invalid Unix socket source name")
                 });
-                Ok(Ok(Received {
-                    received,
-                    length: response.length as usize,
-                    source: name,
-                    objects: received_objects,
-                    objects_truncated: response.objects_truncated,
-                }))
+                Ok(Ok((response, name, received_objects)))
             }
             UnixSocketResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected Unix socket response: {response:?}"),

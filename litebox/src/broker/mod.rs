@@ -9,7 +9,7 @@ use alloc::{
 use core::net::SocketAddrV4;
 
 use hashbrown::HashMap;
-use litebox_broker_local::BrokerLocal;
+use litebox_broker_local::{BrokerLocal, ReceivedUnixSocket};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::ConsumeEventResponse;
 use litebox_broker_protocol::fs::{
@@ -46,8 +46,7 @@ use litebox_broker_protocol::timer::{TimerClock, TimerSetting, TimerSpec};
 use litebox_broker_protocol::unix_socket::{
     CreateUnixSocketPairResponse, ENCODED_TRANSFERRED_OBJECT_SIZE,
     MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE,
-    ReceiveOptions, Received, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
-    UnixSocketName,
+    ReceiveOptions, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError, UnixSocketName,
 };
 use litebox_broker_protocol::vsock_socket::{AcceptVsockSocketResponse, VsockAddress};
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
@@ -727,13 +726,18 @@ pub(crate) trait BrokerControl: Send + Sync {
     /// handles to at most `options.max_objects` of the objects the data
     /// carried.
     ///
-    /// The caller owns the returned handles.
+    /// Returns the broker's response with the sender's name, if
+    /// `options.source` is set, and the received objects. The caller owns the
+    /// returned handles.
     fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
         data: &mut dyn ReadBuffer,
         options: ReceiveOptions,
-    ) -> core::result::Result<core::result::Result<Received, UnixSocketError>, BrokerControlError>;
+    ) -> core::result::Result<
+        core::result::Result<ReceivedUnixSocket, UnixSocketError>,
+        BrokerControlError,
+    >;
 
     fn shutdown_unix_socket(
         &self,
@@ -2085,8 +2089,10 @@ where
         handle: ObjectHandle,
         data: &mut dyn ReadBuffer,
         mut options: ReceiveOptions,
-    ) -> core::result::Result<core::result::Result<Received, UnixSocketError>, BrokerControlError>
-    {
+    ) -> core::result::Result<
+        core::result::Result<ReceivedUnixSocket, UnixSocketError>,
+        BrokerControlError,
+    > {
         let capacity = data.len().min(UNIX_SOCKET_BUFFER_SIZE as usize);
         let data = &mut data.sub_buffer(0, capacity);
         let name_size = if options.source {

@@ -16,7 +16,6 @@ use core::mem::{offset_of, size_of};
 use litebox::{
     event::{Events, IOPollable, observer::Observer, wait::WaitContext},
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
-    pipes::HalfPipeType,
     process::{InheritableFd, ProcessError},
     unix_socket::{self, ReceivedObject},
 };
@@ -25,14 +24,14 @@ use litebox_broker_protocol::{
     fs::{FileMode as Mode, FileUser},
     socket::SocketType,
     unix_socket::{
-        MAX_UNIX_SOCKET_OBJECTS, ReceiveOptions, TransferredObjectKind, UNIX_SOCKET_BUFFER_SIZE,
-        UnixSocketAddress, UnixSocketName,
+        MAX_UNIX_SOCKET_OBJECTS, ReceiveOptions, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress,
+        UnixSocketName,
     },
 };
 use litebox_common_linux::{
     AddressFamily, CmsgHdr, FileDescriptorFlags, OFlags, ReceiveFlags, SCM_MAX_FD, SendFlags,
     ShutdownHow, SockFlags, SockType, SocketControlMessageType, SocketOption, SocketOptionName,
-    UnixProtocol, errno::Errno, program_startup::InheritedFdKind,
+    UnixProtocol, errno::Errno,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use zerocopy::IntoBytes as _;
@@ -615,30 +614,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         close_on_exec: bool,
         publish: impl FnOnce(i32) -> Result<(), Errno>,
     ) -> Result<i32, Errno> {
-        let kind = match object.kind() {
-            TransferredObjectKind::File => InheritedFdKind::File,
-            TransferredObjectKind::PipeReadEnd => InheritedFdKind::Pipe {
-                endpoint: HalfPipeType::ReceiverHalf,
-            },
-            TransferredObjectKind::PipeWriteEnd => InheritedFdKind::Pipe {
-                endpoint: HalfPipeType::SenderHalf,
-            },
-            TransferredObjectKind::UnixSocket(socket_type) => {
-                InheritedFdKind::UnixSocket { socket_type }
-            }
-            TransferredObjectKind::InetSocket(socket_type) => {
-                InheritedFdKind::InetSocket { socket_type }
-            }
-            TransferredObjectKind::VsockSocket => InheritedFdKind::VsockSocket,
-            TransferredObjectKind::EventCounter => InheritedFdKind::Eventfd,
-            TransferredObjectKind::Timer => InheritedFdKind::Timerfd,
-            TransferredObjectKind::ReadinessQueue => InheritedFdKind::Epoll,
-            TransferredObjectKind::Process => InheritedFdKind::Pidfd,
-            kind => {
-                log_unsupported!("receiving a descriptor for {kind:?}");
-                return Err(Errno::EINVAL);
-            }
-        };
+        let kind = object.kind();
         let handle = object.into_handle();
         adopt_handle!(self.global, kind, handle, |adopt| self.install_adopted(
             adopt()?,

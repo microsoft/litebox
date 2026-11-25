@@ -10,10 +10,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-use litebox::pipes::HalfPipeType;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
-use litebox_broker_protocol::socket::SocketType;
+use litebox_broker_protocol::unix_socket::{
+    ENCODED_TRANSFERRED_OBJECT_SIZE, TransferredObject, TransferredObjectKind,
+};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::GuestVectorState;
@@ -40,19 +41,10 @@ pub enum InheritedCwd {
     Path(String),
 }
 
-/// Size of an inherited descriptor's number, handle, and kind tag, which precede its kind's fields.
-const INHERITED_FD_HEADER_SIZE: usize = size_of::<u32>() + size_of::<u64>() + size_of::<u8>();
+/// Size of an inherited descriptor's number followed by its encoded [`TransferredObject`].
+const INHERITED_FD_SIZE: usize = size_of::<u32>() + ENCODED_TRANSFERRED_OBJECT_SIZE as usize;
 /// Size of a memory region's start, end, and flags.
 const FORK_REGION_SIZE: usize = size_of::<[u64; 2]>() + size_of::<u32>();
-const FILE_TAG: u8 = 0;
-const PIPE_TAG: u8 = 1;
-const UNIX_SOCKET_TAG: u8 = 2;
-const EVENTFD_TAG: u8 = 3;
-const TIMERFD_TAG: u8 = 4;
-const EPOLL_TAG: u8 = 5;
-const INET_SOCKET_TAG: u8 = 6;
-const VSOCK_SOCKET_TAG: u8 = 7;
-const PIDFD_TAG: u8 = 8;
 const PROGRAM_STARTUP_TAG: u8 = 0;
 const FORK_STARTUP_TAG: u8 = 1;
 
@@ -150,41 +142,7 @@ pub struct InheritedFd {
     /// the first of them.
     pub handle: ObjectHandle,
     /// What the descriptor refers to.
-    pub kind: InheritedFdKind,
-}
-
-/// The kind of object an [`InheritedFd`] refers to.
-///
-/// The broker keeps the access mode and status flags of every kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InheritedFdKind {
-    /// A file, including a standard stream.
-    File,
-    /// An end of a pipe.
-    Pipe {
-        /// Which end.
-        endpoint: HalfPipeType,
-    },
-    /// A Unix domain socket.
-    UnixSocket {
-        /// Stream, datagram, or sequenced packet.
-        socket_type: SocketType,
-    },
-    /// An eventfd.
-    Eventfd,
-    /// A timerfd.
-    Timerfd,
-    /// An epoll instance.
-    Epoll,
-    /// An IPv4 socket.
-    InetSocket {
-        /// Stream (TCP) or datagram (UDP).
-        socket_type: SocketType,
-    },
-    /// A vsock stream socket.
-    VsockSocket,
-    /// A pidfd.
-    Pidfd,
+    pub kind: TransferredObjectKind,
 }
 
 /// Linux process state needed to continue a child duplicated by `fork` in a fresh runner.
@@ -436,7 +394,7 @@ impl LinuxProgramStartup {
             process: read_signals(&mut input, process_signal_count)?,
             thread: read_signals(&mut input, thread_signal_count)?,
         };
-        if inherited_fd_count > input.len() / INHERITED_FD_HEADER_SIZE {
+        if inherited_fd_count > input.len() / INHERITED_FD_SIZE {
             return Err(LinuxProgramStartupError::Malformed);
         }
         let mut inherited_fds = Vec::new();
@@ -584,7 +542,7 @@ impl LinuxForkStartup {
                 flags,
             });
         }
-        if fd_count > input.len() / (INHERITED_FD_HEADER_SIZE + size_of::<u8>()) {
+        if fd_count > input.len() / (INHERITED_FD_SIZE + size_of::<u8>()) {
             return Err(LinuxProgramStartupError::Malformed);
         }
         let mut fds = Vec::with_capacity(fd_count);
@@ -634,93 +592,29 @@ impl LinuxForkStartup {
 }
 
 impl InheritedFd {
-    fn encoded_len(&self) -> usize {
-        INHERITED_FD_HEADER_SIZE
-            + match self.kind {
-                InheritedFdKind::File
-                | InheritedFdKind::Eventfd
-                | InheritedFdKind::Timerfd
-                | InheritedFdKind::Epoll
-                | InheritedFdKind::VsockSocket
-                | InheritedFdKind::Pidfd => 0,
-                InheritedFdKind::Pipe { .. }
-                | InheritedFdKind::UnixSocket { .. }
-                | InheritedFdKind::InetSocket { .. } => size_of::<u8>(),
-            }
-    }
-
     fn encode(&self, output: &mut Vec<u8>) {
         push_u32(output, self.fd);
-        push_u64(output, self.handle.0);
-        match self.kind {
-            InheritedFdKind::File => output.push(FILE_TAG),
-            InheritedFdKind::UnixSocket { socket_type } => {
-                output.push(UNIX_SOCKET_TAG);
-                output.push(match socket_type {
-                    SocketType::Stream => 0,
-                    SocketType::Datagram => 1,
-                    SocketType::SeqPacket => 2,
-                    _ => unreachable!("Unix sockets are streams, datagrams, or sequenced packets"),
-                });
+        output.extend_from_slice(
+            &TransferredObject {
+                handle: self.handle,
+                kind: self.kind,
             }
-            InheritedFdKind::Pipe { endpoint } => {
-                output.push(PIPE_TAG);
-                output.push(match endpoint {
-                    HalfPipeType::ReceiverHalf => 0,
-                    HalfPipeType::SenderHalf => 1,
-                });
-            }
-            InheritedFdKind::Eventfd => output.push(EVENTFD_TAG),
-            InheritedFdKind::Timerfd => output.push(TIMERFD_TAG),
-            InheritedFdKind::Epoll => output.push(EPOLL_TAG),
-            InheritedFdKind::InetSocket { socket_type } => {
-                output.push(INET_SOCKET_TAG);
-                output.push(match socket_type {
-                    SocketType::Stream => 0,
-                    SocketType::Datagram => 1,
-                    _ => unreachable!("IPv4 sockets are streams or datagrams"),
-                });
-            }
-            InheritedFdKind::VsockSocket => output.push(VSOCK_SOCKET_TAG),
-            InheritedFdKind::Pidfd => output.push(PIDFD_TAG),
-        }
+            .encode(),
+        );
     }
 
     fn decode(input: &mut &[u8]) -> Result<Self, LinuxProgramStartupError> {
         let fd = read_u32(input)?;
-        let handle = ObjectHandle(read_u64(input)?);
-        let kind = match read_u8(input)? {
-            FILE_TAG => InheritedFdKind::File,
-            UNIX_SOCKET_TAG => InheritedFdKind::UnixSocket {
-                socket_type: match read_u8(input)? {
-                    0 => SocketType::Stream,
-                    1 => SocketType::Datagram,
-                    2 => SocketType::SeqPacket,
-                    _ => return Err(LinuxProgramStartupError::Malformed),
-                },
-            },
-            PIPE_TAG => InheritedFdKind::Pipe {
-                endpoint: match read_u8(input)? {
-                    0 => HalfPipeType::ReceiverHalf,
-                    1 => HalfPipeType::SenderHalf,
-                    _ => return Err(LinuxProgramStartupError::Malformed),
-                },
-            },
-            EVENTFD_TAG => InheritedFdKind::Eventfd,
-            TIMERFD_TAG => InheritedFdKind::Timerfd,
-            EPOLL_TAG => InheritedFdKind::Epoll,
-            INET_SOCKET_TAG => InheritedFdKind::InetSocket {
-                socket_type: match read_u8(input)? {
-                    0 => SocketType::Stream,
-                    1 => SocketType::Datagram,
-                    _ => return Err(LinuxProgramStartupError::Malformed),
-                },
-            },
-            VSOCK_SOCKET_TAG => InheritedFdKind::VsockSocket,
-            PIDFD_TAG => InheritedFdKind::Pidfd,
-            _ => return Err(LinuxProgramStartupError::Malformed),
-        };
-        Ok(Self { fd, handle, kind })
+        let object = take_bytes(input, ENCODED_TRANSFERRED_OBJECT_SIZE as usize)?
+            .try_into()
+            .ok()
+            .and_then(|encoded| TransferredObject::decode(encoded).ok())
+            .ok_or(LinuxProgramStartupError::Malformed)?;
+        Ok(Self {
+            fd,
+            handle: object.handle,
+            kind: object.kind,
+        })
     }
 }
 
@@ -810,9 +704,9 @@ fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStart
             return Err(LinuxProgramStartupError::TooLarge);
         }
     }
-    for inherited in &startup.inherited_fds {
+    for _ in &startup.inherited_fds {
         length = length
-            .checked_add(inherited.encoded_len())
+            .checked_add(INHERITED_FD_SIZE)
             .ok_or(LinuxProgramStartupError::TooLarge)?;
         if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
             return Err(LinuxProgramStartupError::TooLarge);
@@ -962,6 +856,7 @@ mod tests {
     use super::*;
     use crate::signal::{SI_USER, SiginfoData};
     use alloc::vec;
+    use litebox_broker_protocol::socket::SocketType;
 
     fn resource_limits() -> ResourceLimitValues {
         core::array::from_fn(|index| crate::Rlimit {
@@ -1076,72 +971,62 @@ mod tests {
                 InheritedFd {
                     fd: 1,
                     handle: ObjectHandle(7),
-                    kind: InheritedFdKind::File,
+                    kind: TransferredObjectKind::File,
                 },
                 InheritedFd {
                     fd: 4,
                     handle: ObjectHandle(u64::MAX),
-                    kind: InheritedFdKind::File,
+                    kind: TransferredObjectKind::File,
                 },
                 InheritedFd {
                     fd: 5,
                     handle: ObjectHandle(8),
-                    kind: InheritedFdKind::Pipe {
-                        endpoint: HalfPipeType::ReceiverHalf,
-                    },
+                    kind: TransferredObjectKind::PipeReadEnd,
                 },
                 InheritedFd {
                     fd: 6,
                     handle: ObjectHandle(9),
-                    kind: InheritedFdKind::Pipe {
-                        endpoint: HalfPipeType::SenderHalf,
-                    },
+                    kind: TransferredObjectKind::PipeWriteEnd,
                 },
                 InheritedFd {
                     fd: 7,
                     handle: ObjectHandle(10),
-                    kind: InheritedFdKind::UnixSocket {
-                        socket_type: SocketType::Datagram,
-                    },
+                    kind: TransferredObjectKind::UnixSocket(SocketType::Datagram),
                 },
                 InheritedFd {
                     fd: 8,
                     handle: ObjectHandle(11),
-                    kind: InheritedFdKind::Eventfd,
+                    kind: TransferredObjectKind::EventCounter,
                 },
                 InheritedFd {
                     fd: 9,
                     handle: ObjectHandle(12),
-                    kind: InheritedFdKind::Timerfd,
+                    kind: TransferredObjectKind::Timer,
                 },
                 InheritedFd {
                     fd: 10,
                     handle: ObjectHandle(13),
-                    kind: InheritedFdKind::Epoll,
+                    kind: TransferredObjectKind::ReadinessQueue,
                 },
                 InheritedFd {
                     fd: 11,
                     handle: ObjectHandle(14),
-                    kind: InheritedFdKind::InetSocket {
-                        socket_type: SocketType::Stream,
-                    },
+                    kind: TransferredObjectKind::InetSocket(SocketType::Stream),
                 },
                 InheritedFd {
                     fd: 12,
                     handle: ObjectHandle(15),
-                    kind: InheritedFdKind::UnixSocket {
-                        socket_type: SocketType::SeqPacket,
-                    },
+                    kind: TransferredObjectKind::UnixSocket(SocketType::SeqPacket),
                 },
                 InheritedFd {
                     fd: 13,
                     handle: ObjectHandle(16),
-                    kind: InheritedFdKind::VsockSocket,
+                    kind: TransferredObjectKind::VsockSocket,
                 },
                 InheritedFd {
                     fd: 14,
                     handle: ObjectHandle(17),
-                    kind: InheritedFdKind::Pidfd,
+                    kind: TransferredObjectKind::Process,
                 },
             ],
         };
@@ -1262,7 +1147,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 0,
                         handle: ObjectHandle(7),
-                        kind: InheritedFdKind::File,
+                        kind: TransferredObjectKind::File,
                     },
                     close_on_exec: false,
                 },
@@ -1270,9 +1155,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 3,
                         handle: ObjectHandle(8),
-                        kind: InheritedFdKind::Pipe {
-                            endpoint: HalfPipeType::SenderHalf,
-                        },
+                        kind: TransferredObjectKind::PipeWriteEnd,
                     },
                     close_on_exec: true,
                 },
@@ -1280,9 +1163,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 4,
                         handle: ObjectHandle(9),
-                        kind: InheritedFdKind::UnixSocket {
-                            socket_type: SocketType::Stream,
-                        },
+                        kind: TransferredObjectKind::UnixSocket(SocketType::Stream),
                     },
                     close_on_exec: false,
                 },
@@ -1290,7 +1171,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 5,
                         handle: ObjectHandle(10),
-                        kind: InheritedFdKind::Eventfd,
+                        kind: TransferredObjectKind::EventCounter,
                     },
                     close_on_exec: true,
                 },
@@ -1298,7 +1179,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 6,
                         handle: ObjectHandle(11),
-                        kind: InheritedFdKind::Timerfd,
+                        kind: TransferredObjectKind::Timer,
                     },
                     close_on_exec: false,
                 },
@@ -1306,7 +1187,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 7,
                         handle: ObjectHandle(12),
-                        kind: InheritedFdKind::Epoll,
+                        kind: TransferredObjectKind::ReadinessQueue,
                     },
                     close_on_exec: true,
                 },
@@ -1314,9 +1195,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 8,
                         handle: ObjectHandle(13),
-                        kind: InheritedFdKind::InetSocket {
-                            socket_type: SocketType::Datagram,
-                        },
+                        kind: TransferredObjectKind::InetSocket(SocketType::Datagram),
                     },
                     close_on_exec: false,
                 },
@@ -1324,7 +1203,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 9,
                         handle: ObjectHandle(14),
-                        kind: InheritedFdKind::VsockSocket,
+                        kind: TransferredObjectKind::VsockSocket,
                     },
                     close_on_exec: true,
                 },
@@ -1332,7 +1211,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 10,
                         handle: ObjectHandle(15),
-                        kind: InheritedFdKind::Pidfd,
+                        kind: TransferredObjectKind::Process,
                     },
                     close_on_exec: false,
                 },

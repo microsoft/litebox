@@ -210,7 +210,7 @@ impl Fixture {
         capacity: usize,
         max_objects: usize,
         peek: bool,
-    ) -> (Vec<u8>, Received) {
+    ) -> (Vec<u8>, UnixSocketReceive) {
         let mut data = vec![0; capacity];
         let options = ReceiveOptions {
             peek,

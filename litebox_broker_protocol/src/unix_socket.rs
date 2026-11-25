@@ -207,12 +207,16 @@ impl UnixSocketAddress {
     }
 }
 
-/// The kind of an object whose reference a Unix socket message carried,
-/// which tells the receiver how to use its new handle.
+/// The kind of an object whose reference another process passed on, by a
+/// Unix socket message or by inheritance, which tells the receiver how to use
+/// its new handle.
 ///
-/// The broker reports the kind, so receivers need not trust senders for it.
+/// For a Unix socket message the broker reports the kind, so receivers need
+/// not trust senders for it.
+///
+/// Receivers match every kind to adopt its handle, so a new kind is
+/// deliberately a breaking change rather than `#[non_exhaustive]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum TransferredObjectKind {
     /// A file, including a terminal or standard stream.
     File,
@@ -224,7 +228,7 @@ pub enum TransferredObjectKind {
     UnixSocket(SocketType),
     /// An internet socket of the given type.
     InetSocket(SocketType),
-    /// A vsock socket.
+    /// A vsock stream socket.
     VsockSocket,
     /// An event counter.
     EventCounter,
@@ -258,23 +262,6 @@ pub struct TransferredObject {
     pub handle: ObjectHandle,
     /// What the handle refers to.
     pub kind: TransferredObjectKind,
-}
-
-/// What a receive from a Unix socket got.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Received {
-    /// Number of bytes received into the start of the caller's buffer.
-    pub received: usize,
-    /// Length of the whole datagram or record, or `received` for a stream
-    /// socket.
-    pub length: usize,
-    /// Name of the sending socket, if requested.
-    pub source: Option<UnixSocketName>,
-    /// The caller's new handles to the objects the received data carried.
-    pub objects: Vec<TransferredObject>,
-    /// Whether the received data carried objects the caller got no handle
-    /// for.
-    pub objects_truncated: bool,
 }
 
 impl TransferredObject {

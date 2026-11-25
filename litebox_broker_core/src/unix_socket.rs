@@ -53,8 +53,8 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_protocol::unix_socket::{
     MAX_UNIX_SOCKET_BACKLOG, MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE,
-    ReceiveOptions, Received, TransferredObject, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress,
-    UnixSocketError, UnixSocketName,
+    ReceiveOptions, TransferredObject, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
+    UnixSocketName,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, MutexGuard, rwlock::RwLock};
@@ -406,6 +406,23 @@ pub fn send(
     result
 }
 
+/// What a receive from a Unix socket got.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnixSocketReceive {
+    /// Number of bytes received into the start of the caller's buffer.
+    pub received: usize,
+    /// Length of the whole datagram or record, or `received` for a stream
+    /// socket.
+    pub length: usize,
+    /// Name of the sending socket, if requested.
+    pub source: Option<UnixSocketName>,
+    /// The caller's new handles to the objects the received data carried.
+    pub objects: Vec<TransferredObject>,
+    /// Whether the received data carried objects the caller got no handle
+    /// for.
+    pub objects_truncated: bool,
+}
+
 /// Receives bytes from a Unix socket into the start of `output`, leaving them
 /// queued if `options.peek` is set and returning the sender's name if
 /// `options.source` is set.
@@ -424,10 +441,10 @@ pub fn send(
 /// still reports it.
 ///
 /// The caller gets references to the objects the received data carried, up
-/// to `options.max_objects`, as [`Received::objects`] lists. Each has the
+/// to `options.max_objects`, as [`UnixSocketReceive::objects`] lists. Each has the
 /// rights the sender's reference had, within the caller's policy, and
 /// publishes readiness through `readiness_sink`. Unless peeking, the objects
-/// it gets no reference to are discarded, as [`Received::objects_truncated`]
+/// it gets no reference to are discarded, as [`UnixSocketReceive::objects_truncated`]
 /// reports; like Linux, a receive that has taken data never fails to give
 /// it, so once one object cannot be given, neither are the rest. A stream
 /// socket receives the objects with the first byte sent with them, and stops
@@ -439,7 +456,7 @@ pub fn receive(
     output: &mut dyn ReadBuffer,
     options: ReceiveOptions,
     readiness_sink: &Arc<dyn ReadinessSink>,
-) -> Result<UnixSocketResult<Received>> {
+) -> Result<UnixSocketResult<UnixSocketReceive>> {
     let ReceiveOptions {
         peek,
         source,
@@ -2015,7 +2032,7 @@ impl Socket {
         peek: bool,
         source: bool,
         nonblocking: bool,
-    ) -> Result<UnixSocketResult<(Received, Delivery)>> {
+    ) -> Result<UnixSocketResult<(UnixSocketReceive, Delivery)>> {
         let source = match &self.state.lock().connection {
             Connection::Connected { peer_name, .. } => source.then(|| peer_name.clone()),
             Connection::None | Connection::Listening { .. } => {
@@ -2024,9 +2041,9 @@ impl Socket {
         };
         let nothing = |source| {
             Ok(Ok((
-                Received {
+                UnixSocketReceive {
                     source,
-                    ..Received::default()
+                    ..UnixSocketReceive::default()
                 },
                 Delivery::None,
             )))
@@ -2085,11 +2102,11 @@ impl Socket {
         };
         wakeups.wake();
         Ok(Ok((
-            Received {
+            UnixSocketReceive {
                 received: length,
                 length,
                 source,
-                ..Received::default()
+                ..UnixSocketReceive::default()
             },
             delivery,
         )))
@@ -2101,7 +2118,7 @@ impl Socket {
         peek: bool,
         source: bool,
         nonblocking: bool,
-    ) -> Result<UnixSocketResult<(Received, Delivery)>> {
+    ) -> Result<UnixSocketResult<(UnixSocketReceive, Delivery)>> {
         let (received, wakeups, delivery) = {
             let mut channel = self.incoming.lock();
             let Some(datagram) = channel.queue.datagrams.front() else {
@@ -2111,9 +2128,9 @@ impl Socket {
                 return if channel.is_shut() && (!nonblocking || self.kind == SocketType::SeqPacket)
                 {
                     Ok(Ok((
-                        Received {
+                        UnixSocketReceive {
                             source: source.then_some(UnixSocketName::Unnamed),
-                            ..Received::default()
+                            ..UnixSocketReceive::default()
                         },
                         Delivery::None,
                     )))
@@ -2125,11 +2142,11 @@ impl Socket {
             let received = output.len().min(length);
             output.copy_from_slice_at(0, &datagram.data[..received])?;
             if peek {
-                let received = Received {
+                let received = UnixSocketReceive {
                     received,
                     length,
                     source: source.then(|| datagram.source.clone()),
-                    ..Received::default()
+                    ..UnixSocketReceive::default()
                 };
                 (
                     received,
@@ -2144,11 +2161,11 @@ impl Socket {
                     .ok_or(BrokerError::Internal)?;
                 channel.remove(datagram.charge());
                 self.sockets.refund(&self.quota, datagram.charge());
-                let received = Received {
+                let received = UnixSocketReceive {
                     received,
                     length,
                     source: source.then_some(datagram.source),
-                    ..Received::default()
+                    ..UnixSocketReceive::default()
                 };
                 // Senders waiting for room retry.
                 (received, channel.wake(), Delivery::take(datagram.objects))
@@ -2165,7 +2182,7 @@ impl Socket {
         peek: bool,
         source: bool,
         nonblocking: bool,
-    ) -> Result<UnixSocketResult<(Received, Delivery)>> {
+    ) -> Result<UnixSocketResult<(UnixSocketReceive, Delivery)>> {
         if !matches!(self.state.lock().connection, Connection::Connected { .. }) {
             return Ok(Err(UnixSocketError::NotConnected));
         }

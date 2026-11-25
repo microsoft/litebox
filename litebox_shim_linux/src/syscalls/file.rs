@@ -15,6 +15,7 @@ use litebox::{
         DirectoryAnchor,
         errors::{LockError, OpenError},
     },
+    pipes::HalfPipeType,
     process::{InheritableFd, ProcessError},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
@@ -26,13 +27,14 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::terminal::{
     ChangeTiming, TerminalOperation, TerminalResponse, TerminalSettings,
 };
+use litebox_broker_protocol::unix_socket::TransferredObjectKind;
 use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 use litebox_common_linux::{
     AccessFlags, AtFlags, CloseRangeFlags, EfdFlags, EpollCreateFlags, FcntlArg,
     FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, PAGE_SIZE,
     Statx, StatxMask, TimeParam,
     errno::Errno,
-    program_startup::{ForkedFd, InheritedFd, InheritedFdKind},
+    program_startup::{ForkedFd, InheritedFd},
 };
 use litebox_platform::buffer::{Buffer as _, Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::time::{Instant as _, TimeProvider};
@@ -183,17 +185,18 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     pub(super) fn shareable_object(
         &self,
         fd: &AnyTypedFd<Platform>,
-    ) -> Result<(InheritedFdKind, InheritableFd<Platform>), Errno> {
+    ) -> Result<(TransferredObjectKind, InheritableFd<Platform>), Errno> {
         Ok(match fd {
             AnyTypedFd::File(file) => (
-                InheritedFdKind::File,
+                TransferredObjectKind::File,
                 InheritableFd::File(self.with_file(file, |file| Ok(Arc::clone(file.file())))?),
             ),
             AnyTypedFd::Pipe(pipe) => {
                 let pipe = self.with_pipe_end(pipe, |pipe| Ok(Arc::clone(pipe.pipe_end())))?;
                 (
-                    InheritedFdKind::Pipe {
-                        endpoint: pipe.endpoint_type(),
+                    match pipe.endpoint_type() {
+                        HalfPipeType::ReceiverHalf => TransferredObjectKind::PipeReadEnd,
+                        HalfPipeType::SenderHalf => TransferredObjectKind::PipeWriteEnd,
                     },
                     InheritableFd::Pipe(pipe),
                 )
@@ -203,27 +206,25 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     Ok(alloc::sync::Arc::clone(socket.unix_socket()))
                 })?;
                 (
-                    InheritedFdKind::UnixSocket {
-                        socket_type: socket.socket_type(),
-                    },
+                    TransferredObjectKind::UnixSocket(socket.socket_type()),
                     InheritableFd::UnixSocket(socket),
                 )
             }
             AnyTypedFd::Eventfd(eventfd) => self.with_eventfd(eventfd, |file| {
                 Ok((
-                    InheritedFdKind::Eventfd,
+                    TransferredObjectKind::EventCounter,
                     InheritableFd::EventCounter(alloc::sync::Arc::clone(file.counter())),
                 ))
             })?,
             AnyTypedFd::Timerfd(timerfd) => self.with_timerfd(timerfd, |file| {
                 Ok((
-                    InheritedFdKind::Timerfd,
+                    TransferredObjectKind::Timer,
                     InheritableFd::Timer(alloc::sync::Arc::clone(file.timer())),
                 ))
             })?,
             AnyTypedFd::Epoll(epoll) => self.with_epoll(epoll, |file| {
                 Ok((
-                    InheritedFdKind::Epoll,
+                    TransferredObjectKind::ReadinessQueue,
                     InheritableFd::ReadinessQueue(alloc::sync::Arc::clone(file.queue())),
                 ))
             })?,
@@ -232,20 +233,18 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     Ok(alloc::sync::Arc::clone(socket.inet_socket()))
                 })?;
                 (
-                    InheritedFdKind::InetSocket {
-                        socket_type: socket.socket_type(),
-                    },
+                    TransferredObjectKind::InetSocket(socket.socket_type()),
                     InheritableFd::InetSocket(socket),
                 )
             }
             AnyTypedFd::Vsock(socket) => (
-                InheritedFdKind::VsockSocket,
+                TransferredObjectKind::VsockSocket,
                 InheritableFd::VsockSocket(
                     self.with_vsock_socket(socket, |socket| Ok(Arc::clone(socket.vsock_socket())))?,
                 ),
             ),
             AnyTypedFd::Pidfd(pidfd) => (
-                InheritedFdKind::Pidfd,
+                TransferredObjectKind::Process,
                 InheritableFd::Process(
                     self.with_pidfd(pidfd, |file| Ok(Arc::clone(file.process())))?,
                 ),
@@ -434,46 +433,53 @@ pub(crate) struct FilesState<Platform: ShimPlatform> {
 ///
 /// Needed because a closure cannot be generic over the subsystem type.
 macro_rules! adopt_handle {
-    ($global:expr, $kind:expr, $handle:expr, |$adopt:ident| $install:expr) => {
+    ($global:expr, $kind:expr, $handle:expr, |$adopt:ident| $install:expr) => {{
+        use litebox::pipes::HalfPipeType;
+        use litebox_broker_protocol::unix_socket::TransferredObjectKind;
         match $kind {
-            InheritedFdKind::File => {
+            TransferredObjectKind::File => {
                 let $adopt = || $global.adopt_inherited_file($handle);
                 $install
             }
-            InheritedFdKind::Pipe { endpoint } => {
-                let $adopt = || $global.adopt_inherited_pipe_end($handle, endpoint);
+            TransferredObjectKind::PipeReadEnd => {
+                let $adopt =
+                    || $global.adopt_inherited_pipe_end($handle, HalfPipeType::ReceiverHalf);
                 $install
             }
-            InheritedFdKind::UnixSocket { socket_type } => {
+            TransferredObjectKind::PipeWriteEnd => {
+                let $adopt = || $global.adopt_inherited_pipe_end($handle, HalfPipeType::SenderHalf);
+                $install
+            }
+            TransferredObjectKind::UnixSocket(socket_type) => {
                 let $adopt = || $global.adopt_inherited_unix_socket($handle, socket_type);
                 $install
             }
-            InheritedFdKind::InetSocket { socket_type } => {
+            TransferredObjectKind::InetSocket(socket_type) => {
                 let $adopt = || $global.adopt_inherited_inet_socket($handle, socket_type);
                 $install
             }
-            InheritedFdKind::Eventfd => {
+            TransferredObjectKind::EventCounter => {
                 let $adopt = || $global.adopt_inherited_eventfd($handle);
                 $install
             }
-            InheritedFdKind::Timerfd => {
+            TransferredObjectKind::Timer => {
                 let $adopt = || $global.adopt_inherited_timerfd($handle);
                 $install
             }
-            InheritedFdKind::Epoll => {
+            TransferredObjectKind::ReadinessQueue => {
                 let $adopt = || $global.adopt_inherited_epoll($handle);
                 $install
             }
-            InheritedFdKind::VsockSocket => {
+            TransferredObjectKind::VsockSocket => {
                 let $adopt = || $global.adopt_inherited_vsock_socket($handle);
                 $install
             }
-            InheritedFdKind::Pidfd => {
+            TransferredObjectKind::Process => {
                 let $adopt = || $global.adopt_inherited_pidfd($handle);
                 $install
             }
         }
-    };
+    }};
 }
 pub(super) use adopt_handle;
 

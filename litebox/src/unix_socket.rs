@@ -346,12 +346,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
                 self.broker
                     .receive_unix_socket(self.handle, &mut buffer, options)
                     .map(|result| {
-                        result.map(|received| Received {
-                            received: received.received,
-                            length: received.length,
-                            source: received.source,
-                            objects: received
-                                .objects
+                        result.map(|(response, source, objects)| Received {
+                            received: response.received as usize,
+                            length: response.length as usize,
+                            source,
+                            objects: objects
                                 .into_iter()
                                 .map(|object| ReceivedObject {
                                     broker: Arc::clone(&self.broker),
@@ -360,7 +359,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
                                     adopted: false,
                                 })
                                 .collect(),
-                            objects_truncated: received.objects_truncated,
+                            objects_truncated: response.objects_truncated,
                         })
                     })
             },
