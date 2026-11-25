@@ -493,35 +493,6 @@ impl<Platform: ShimPlatform> Clone for LinuxShim<Platform> {
 }
 
 impl<Platform: ShimPlatform> LinuxShim<Platform> {
-    /// Opens or adopts the working directory a child inherits.
-    fn open_or_adopt_inherited_cwd(
-        &self,
-        context: &litebox::fs::Context,
-        files: &syscalls::file::FilesState<Platform>,
-        cwd: &litebox_common_linux::program_startup::InheritedCwd,
-        mut inherited: impl Iterator<Item = litebox_common_linux::program_startup::InheritedFd>,
-    ) -> Result<Arc<litebox::fs::File<Platform>>, Errno> {
-        use litebox_common_linux::program_startup::InheritedCwd;
-        Ok(match cwd {
-            InheritedCwd::Path(path) => {
-                if !path.starts_with('/') {
-                    return Err(Errno::EINVAL);
-                }
-                Arc::new(self.0.open_path_dir(context, path)?)
-            }
-            InheritedCwd::File(handle) => {
-                // Broker inheritance deduplicates references. If fchdir used an fd that was
-                // also inherited, share its already adopted file; never own its handle twice.
-                if let Some(fd) = inherited.find(|fd| fd.handle == *handle) {
-                    self.0
-                        .file_for_dirfd(&files.typed_fd_from_raw(fd.fd as usize)?)?
-                } else {
-                    Arc::new(self.0.litebox.adopt_inherited_file(*handle)?)
-                }
-            }
-        })
-    }
-
     /// Loads a program using the initial thread allocated during broker negotiation.
     pub fn load_program(
         &self,
@@ -573,18 +544,16 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             }
             Some(inherited_fds) => files.install_inherited_fds(&self.0, inherited_fds)?,
         }
-        // A program started without a working directory runs at the root.
-        let cwd = match cwd {
-            Some(cwd) => self.open_or_adopt_inherited_cwd(
-                &context,
-                &files,
-                &cwd,
-                inherited_fds.into_iter().flatten(),
-            ),
-            None => self.0.open_path_dir(&context, "/").map(Arc::new),
+        if let Some(litebox_common_linux::program_startup::InheritedCwd::Path(path)) = cwd {
+            if !path.starts_with('/') {
+                return Err(loader::elf::ElfLoaderError::OpenError(Errno::EINVAL));
+            }
+            self.0
+                .litebox
+                .chdir(&context, None, None, &path)
+                .map_err(|error| loader::elf::ElfLoaderError::OpenError(error.into()))?;
         }
-        .map_err(loader::elf::ElfLoaderError::OpenError)?;
-        let fs_state = syscalls::file::FsState::new(context, cwd);
+        let fs_state = syscalls::file::FsState::new(context);
         if let Some(umask) = umask {
             fs_state.set_umask(umask);
         }
@@ -708,7 +677,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             resource_limits,
             dumpable,
             no_new_privs,
-            cwd,
             comm,
             blocked_signals,
             signal_actions,
@@ -757,10 +725,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
         });
         let context = syscalls::file::FsState::<Platform>::context_for(&credentials);
-        let cwd = self
-            .open_or_adopt_inherited_cwd(&context, &files, &cwd, fds.iter().map(|fd| fd.inherited))
-            .map_err(ForkRestoreError::WorkingDirectory)?;
-        let fs_state = syscalls::file::FsState::new(context, cwd);
+        let fs_state = syscalls::file::FsState::new(context);
         fs_state.set_umask(umask);
 
         let signals = syscalls::signal::SignalState::forked(
@@ -879,9 +844,6 @@ pub enum ForkRestoreError {
     /// The inherited descriptors could not be installed.
     #[error("failed to install the inherited descriptors")]
     Descriptors(#[source] loader::elf::ElfLoaderError),
-    /// The working directory could not be restored.
-    #[error("failed to restore the working directory")]
-    WorkingDirectory(#[source] Errno),
 }
 
 /// A handle to a process loaded via [`LinuxShim::load_program`].
@@ -1100,6 +1062,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Write { .. }
                     | SyscallRequest::Chdir { .. }
                     | SyscallRequest::Fchdir { .. }
+                    | SyscallRequest::Getcwd { .. }
+                    | SyscallRequest::Readlink { .. }
+                    | SyscallRequest::Readlinkat { .. }
                     | SyscallRequest::Umask { .. }
             )
         {
@@ -1997,8 +1962,7 @@ mod test_utils {
             });
             let context = syscalls::file::FsState::<Platform>::context_for(&credentials);
             files.initialize_stdio_in_shared_descriptors_table(&self, &context);
-            let cwd = Arc::new(self.open_path_dir(&context, "/").unwrap());
-            let fs_state = Arc::new(syscalls::file::FsState::new(context, cwd));
+            let fs_state = Arc::new(syscalls::file::FsState::new(context));
             let signals = syscalls::signal::SignalState::new_process();
             Task {
                 wait_state: wait::WaitState::new(self.platform),

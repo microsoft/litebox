@@ -897,6 +897,59 @@ fn handle_file_request<Memory: SharedMemory>(
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
+        FileRequest::Chdir {
+            pending_child,
+            dir,
+            path,
+            user,
+        } => {
+            let path = read_file_path(shared_buffers, path)?;
+            Ok(
+                match litebox_broker_core::fs::chdir(process, pending_child, dir, &path, user)? {
+                    Ok(()) => FileResponse::Chdir,
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::Fchdir {
+            pending_child,
+            handle,
+            user,
+        } => Ok(
+            match litebox_broker_core::fs::fchdir(process, pending_child, handle, user)? {
+                Ok(()) => FileResponse::Chdir,
+                Err(error) => FileResponse::Failed(error),
+            },
+        ),
+        FileRequest::GetCwd {
+            pending_child,
+            buffer,
+        } => {
+            validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
+            let path = litebox_broker_core::fs::getcwd(process, pending_child)?;
+            Ok(
+                match write_file_path_response(shared_buffers, buffer, path)? {
+                    Ok(response) => FileResponse::GetCwd(response),
+                    Err(error) => FileResponse::Failed(error),
+                },
+            )
+        }
+        FileRequest::CwdStatus(pending_child) => Ok(
+            match litebox_broker_core::fs::cwd_status(process, pending_child)? {
+                Ok(status) => FileResponse::CwdStatus(status),
+                Err(error) => FileResponse::Failed(error),
+            },
+        ),
+        FileRequest::SetCwdTimes {
+            pending_child,
+            user,
+            times,
+        } => Ok(
+            match litebox_broker_core::fs::set_cwd_times(process, pending_child, user, &times)? {
+                Ok(()) => FileResponse::SetTimes,
+                Err(error) => FileResponse::Failed(error),
+            },
+        ),
         FileRequest::HandlePath(HandleFilePathRequest { handle, buffer }) => {
             validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
             let path = litebox_broker_core::fs::handle_path(process, handle)
@@ -2839,7 +2892,7 @@ mod tests {
         let opened = handle_test_request_with_buffers(
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-                dir: None,
+                dir: litebox_broker_protocol::fs::PathAnchor::None,
                 path: single_slot_sequence(0, 5),
                 user: ROOT,
                 access: FileAccessMode::ReadWrite,
@@ -2903,7 +2956,7 @@ mod tests {
         let directory = handle_test_request_with_buffers(
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-                dir: None,
+                dir: litebox_broker_protocol::fs::PathAnchor::None,
                 path: single_slot_sequence(3, 1),
                 user: ROOT,
                 access: FileAccessMode::ReadOnly,
@@ -3001,7 +3054,7 @@ mod tests {
         let status = handle_test_request_with_buffers(
             &process,
             BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
-                dir: None,
+                dir: litebox_broker_protocol::fs::PathAnchor::None,
                 path: single_slot_sequence(0, 5),
                 user: ROOT,
                 follow_symlinks: true,
@@ -3037,7 +3090,7 @@ mod tests {
             handle_test_request_with_buffers(
                 &process,
                 BrokerOperation::File(FileRequest::Mkdir(MkdirFileRequest {
-                    dir: None,
+                    dir: litebox_broker_protocol::fs::PathAnchor::None,
                     path,
                     user: ROOT,
                     mode: FileMode::from_bits(0o755).unwrap(),
@@ -3322,7 +3375,7 @@ mod tests {
             let opened = handle_test_request_with_buffers(
                 &process,
                 BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-                    dir: None,
+                    dir: litebox_broker_protocol::fs::PathAnchor::None,
                     path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
                     user: ROOT,
                     access: FileAccessMode::WriteOnly,
@@ -3371,7 +3424,7 @@ mod tests {
         let BrokerResult::File(FileResponse::Open(opened)) = handle_test_request_with_buffers(
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-                dir: None,
+                dir: litebox_broker_protocol::fs::PathAnchor::None,
                 path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
                 user: ROOT,
                 access: FileAccessMode::WriteOnly,
@@ -3422,7 +3475,7 @@ mod tests {
         let opened = handle_test_request_with_buffers(
             &process,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-                dir: None,
+                dir: litebox_broker_protocol::fs::PathAnchor::None,
                 path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
                 user: ROOT,
                 access: FileAccessMode::WriteOnly,

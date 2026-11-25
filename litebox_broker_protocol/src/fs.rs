@@ -10,8 +10,8 @@ use core::num::NonZeroU64;
 use bitflags::bitflags;
 use thiserror::Error;
 
-use crate::ObjectHandle;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
+use crate::{ObjectHandle, ProcessId};
 
 /// Maximum number of shared-buffer slots used by one file read or write.
 pub const MAX_FILE_TRANSFER_SLOT_COUNT: u32 = 16;
@@ -408,13 +408,35 @@ wire_struct! {
     }
 }
 
+wire_enum! {
+    /// Explicit starting point of a filesystem path walk.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum PathAnchor {
+        /// An absolute path, with no directory operand.
+        #[default]
+        None,
+        /// A live directory reference owned by the caller.
+        Object(ObjectHandle),
+        /// The caller's or its pending child's working directory.
+        Cwd {
+            /// Selects the pending child instead of the caller.
+            pending_child: Option<ProcessId>,
+        },
+    }
+}
+
+impl From<Option<ObjectHandle>> for PathAnchor {
+    fn from(dir: Option<ObjectHandle>) -> Self {
+        dir.map_or(Self::None, Self::Object)
+    }
+}
+
 wire_struct! {
     /// Opens or creates a fs object.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct OpenFileRequest {
-        /// Directory handle the path resolves from: required when it is relative, `None`
-        /// when it is absolute.
-        pub dir: Option<ObjectHandle>,
+        /// Explicit path anchor.
+        pub dir: PathAnchor,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
         /// Caller identity for permission checks.
@@ -638,9 +660,8 @@ wire_struct! {
     /// Reads status by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct PathFileStatusRequest {
-        /// Directory handle the path resolves from: required when it is relative, `None`
-        /// when it is absolute.
-        pub dir: Option<ObjectHandle>,
+        /// Explicit path anchor.
+        pub dir: PathAnchor,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
         /// Caller identity for permission checks.
@@ -667,9 +688,8 @@ wire_struct! {
     /// Creates a symbolic link by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct SymlinkFileRequest {
-        /// Directory handle the link path resolves from: required when it is relative, `None`
-        /// when it is absolute.
-        pub dir: Option<ObjectHandle>,
+        /// Explicit link path anchor.
+        pub dir: PathAnchor,
         /// Shared-buffer region containing the UTF-8 linkpath followed by the target verbatim.
         pub buffer: SharedBufferSequence,
         /// Length of the linkpath at the start of `buffer`; the remaining bytes are the target.
@@ -683,9 +703,8 @@ wire_struct! {
     /// Reads the target of a symbolic link by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ReadLinkFileRequest {
-        /// Directory handle the path resolves from: required when it is relative, `None`
-        /// when it is absolute.
-        pub dir: Option<ObjectHandle>,
+        /// Explicit path anchor.
+        pub dir: PathAnchor,
         /// Shared-buffer region whose first `path_length` bytes hold one UTF-8 path; the
         /// broker replaces its contents with the link's target.
         pub buffer: SharedBufferSequence,
@@ -752,9 +771,8 @@ wire_struct! {
     /// Changes mode bits by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ChmodFileRequest {
-        /// Directory handle the path resolves from: required when it is relative, `None`
-        /// when it is absolute.
-        pub dir: Option<ObjectHandle>,
+        /// Explicit path anchor.
+        pub dir: PathAnchor,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
         /// Caller identity for permission checks.
@@ -768,9 +786,8 @@ wire_struct! {
     /// Changes ownership by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ChownFileRequest {
-        /// Directory handle the path resolves from: required when it is relative, `None`
-        /// when it is absolute.
-        pub dir: Option<ObjectHandle>,
+        /// Explicit path anchor.
+        pub dir: PathAnchor,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
         /// Caller identity for permission checks.
@@ -786,9 +803,8 @@ wire_struct! {
     /// Removes a file by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct UnlinkFileRequest {
-        /// Directory handle the path resolves from: required when it is relative, `None`
-        /// when it is absolute.
-        pub dir: Option<ObjectHandle>,
+        /// Explicit path anchor.
+        pub dir: PathAnchor,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
         /// Caller identity for permission checks.
@@ -800,12 +816,10 @@ wire_struct! {
     /// Renames a file or directory by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct RenameFileRequest {
-        /// Directory handle the old path resolves from: required when it is relative, `None`
-        /// when it is absolute.
-        pub old_dir: Option<ObjectHandle>,
-        /// Directory handle the new path resolves from: required when it is relative, `None`
-        /// when it is absolute.
-        pub new_dir: Option<ObjectHandle>,
+        /// Explicit old path anchor.
+        pub old_dir: PathAnchor,
+        /// Explicit new path anchor.
+        pub new_dir: PathAnchor,
         /// Shared-buffer region containing the old UTF-8 path followed by the new path.
         pub paths: SharedBufferSequence,
         /// Length of the old path at the start of `paths`.
@@ -819,9 +833,8 @@ wire_struct! {
     /// Creates a directory by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MkdirFileRequest {
-        /// Directory handle the path resolves from: required when it is relative, `None`
-        /// when it is absolute.
-        pub dir: Option<ObjectHandle>,
+        /// Explicit path anchor.
+        pub dir: PathAnchor,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
         /// Caller identity for permission checks.
@@ -846,9 +859,8 @@ wire_struct! {
     /// Removes a directory by path.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct RmdirFileRequest {
-        /// Directory handle the path resolves from: required when it is relative, `None`
-        /// when it is absolute.
-        pub dir: Option<ObjectHandle>,
+        /// Explicit path anchor.
+        pub dir: PathAnchor,
         /// Shared-buffer region containing one UTF-8 path.
         pub path: SharedBufferSequence,
         /// Caller identity for permission checks.

@@ -180,6 +180,7 @@ pub fn bind(
 
     let created = crate::fs::open_without_reference(
         process,
+        litebox_broker_protocol::fs::PathAnchor::None,
         path,
         user,
         FileAccessMode::WriteOnly,
@@ -516,6 +517,7 @@ fn lookup(
     // permission is checked against its status instead.
     let (file, status) = match crate::fs::open_without_reference(
         process,
+        litebox_broker_protocol::fs::PathAnchor::None,
         path,
         user,
         FileAccessMode::ReadOnly,

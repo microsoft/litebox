@@ -10,4 +10,4 @@
 pub mod errors;
 mod file;
 
-pub use file::{Context, File, SharedFileObject};
+pub use file::{Context, DirectoryAnchor, File, SharedFileObject};
