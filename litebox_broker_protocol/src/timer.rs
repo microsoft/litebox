@@ -110,6 +110,17 @@ wire_struct! {
 }
 
 wire_struct! {
+    /// Response to a clock read request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReadClocksResponse {
+        /// Current time on the broker's monotonic clock.
+        pub monotonic: Duration,
+        /// Current wall-clock time since the Unix epoch.
+        pub realtime: Duration,
+    }
+}
+
+wire_struct! {
     /// Request to consume a timer's pending expirations.
     ///
     /// The broker returns `WouldBlock` when no expiration is pending, or

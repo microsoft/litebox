@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::time::Duration;
+
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::message::{
@@ -72,6 +74,19 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn read_timer(&self, handle: ObjectHandle) -> Result<u64, Channel::Error> {
         match self.request_timer(TimerRequest::Read(ReadTimerRequest { handle }))? {
             TimerResponse::Read(response) => Ok(response.expirations),
+            response => panic!("broker returned unexpected timer response: {response:?}"),
+        }
+    }
+
+    /// Reads the broker's monotonic and wall-clock times, in that order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns a protocol
+    /// response that does not match the issued timer request.
+    pub fn read_clocks(&self) -> Result<(Duration, Duration), Channel::Error> {
+        match self.request_timer(TimerRequest::ReadClocks)? {
+            TimerResponse::ReadClocks(response) => Ok((response.monotonic, response.realtime)),
             response => panic!("broker returned unexpected timer response: {response:?}"),
         }
     }

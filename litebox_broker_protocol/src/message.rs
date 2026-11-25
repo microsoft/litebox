@@ -55,8 +55,8 @@ use crate::socket::{
 };
 use crate::terminal::TerminalResponse;
 use crate::timer::{
-    CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
-    ReadTimerResponse, SetTimerRequest, SetTimerResponse,
+    CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadClocksResponse,
+    ReadTimerRequest, ReadTimerResponse, SetTimerRequest, SetTimerResponse,
 };
 use crate::unix_socket::{
     AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
@@ -350,6 +350,9 @@ wire_enum! {
         Get(GetTimerRequest),
         /// Consume a timer's pending expirations.
         Read(ReadTimerRequest),
+        /// Read the broker's monotonic and wall clocks, for runners that cannot read host
+        /// clocks without a system call their sandbox forbids.
+        ReadClocks,
     }
 }
 
@@ -727,6 +730,8 @@ wire_enum! {
         Get(GetTimerResponse),
         /// Read operation response.
         Read(ReadTimerResponse),
+        /// Clock read response.
+        ReadClocks(ReadClocksResponse),
     }
 }
 

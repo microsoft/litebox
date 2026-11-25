@@ -120,6 +120,13 @@ pub fn get(process: &BrokerProcess, handle: ObjectHandle) -> Result<TimerSpec> {
     Ok(timer.current(timer.clock.now()))
 }
 
+/// Returns the provider's monotonic and wall-clock times, in that order.
+#[must_use]
+pub fn read_clocks(process: &BrokerProcess) -> (Duration, Duration) {
+    let clock = &process.core.timer_provider;
+    (clock.now(), clock.current_time())
+}
+
 /// Consumes a timer's pending expirations, returning how many passed.
 ///
 /// Returns `WouldBlock` if none has passed, or `NonBlockingWouldBlock` if the

@@ -173,6 +173,18 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         self.x.broker.clone()
     }
 
+    /// Returns a reader of the broker's monotonic and wall-clock times, in that order, for a
+    /// platform that cannot read host clocks itself. The reader does not keep the association
+    /// alive and returns `None` once it ends.
+    pub fn broker_clock_reader(
+        &self,
+    ) -> Option<
+        impl Fn() -> Option<(core::time::Duration, core::time::Duration)> + Send + Sync + use<Platform>,
+    > {
+        let broker = Arc::downgrade(self.x.broker.as_ref()?);
+        Some(move || broker.upgrade()?.read_clocks().ok())
+    }
+
     pub(crate) fn broker_pollable_registry(&self) -> Arc<broker::BrokerPollableRegistry<Platform>> {
         Arc::clone(&self.x.broker_pollables)
     }

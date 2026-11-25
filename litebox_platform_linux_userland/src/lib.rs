@@ -67,7 +67,16 @@ pub struct LinuxUserland {
     boot_id: std::sync::OnceLock<Vec<u8>>,
     /// Receives the host shared objects that the broker delivers, once the runner installs it.
     shared_objects: std::sync::OnceLock<shared_objects::SharedObjectChannel>,
+    /// Reads the broker's clocks once the host clocks turn out to be unreadable, see
+    /// [`Self::vdso_clock_needs_syscall`]. Installed by the runner.
+    broker_clocks: std::sync::OnceLock<BrokerClockReader>,
+    /// Whether the vDSO reads clocks through the `clock_gettime` system call, which the seccomp
+    /// filter forbids, as when the host clock source has no vDSO support. Set on the first failed
+    /// read rather than probed up front, so hosts with a usable vDSO pay nothing.
+    vdso_clock_needs_syscall: AtomicBool,
 }
+
+type BrokerClockReader = Box<dyn Fn() -> Option<(Duration, Duration)> + Send + Sync>;
 
 /// Determines how an x86-64 guest accesses its thread-local storage.
 #[repr(u8)]
@@ -104,6 +113,8 @@ impl LinuxUserland {
         let platform = Self {
             boot_id: std::sync::OnceLock::new(),
             shared_objects: std::sync::OnceLock::new(),
+            broker_clocks: std::sync::OnceLock::new(),
+            vdso_clock_needs_syscall: AtomicBool::new(false),
         };
         Box::leak(Box::new(platform))
     }
@@ -126,6 +137,8 @@ impl LinuxUserland {
         Box::leak(Box::new(Self {
             boot_id: std::sync::OnceLock::new(),
             shared_objects: std::sync::OnceLock::new(),
+            broker_clocks: std::sync::OnceLock::new(),
+            vdso_clock_needs_syscall: AtomicBool::new(false),
         }))
     }
 
@@ -141,6 +154,23 @@ impl LinuxUserland {
                 .set(shared_objects::SharedObjectChannel::new(socket))
                 .is_ok(),
             "shared-object channel already installed"
+        );
+    }
+
+    /// Installs the reader of the broker's monotonic and wall-clock times, in that order, through
+    /// which this platform reads time once the host clocks turn out to need a system call the
+    /// seccomp filter forbids. It must be installed before the filter is enabled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a reader was already installed.
+    pub fn set_broker_clock_reader(
+        &self,
+        reader: impl Fn() -> Option<(Duration, Duration)> + Send + Sync + 'static,
+    ) {
+        assert!(
+            self.broker_clocks.set(Box::new(reader)).is_ok(),
+            "broker clock reader already installed"
         );
     }
 
@@ -1183,33 +1213,50 @@ impl RawMutexTrait for RawMutex {
     }
 }
 
+impl LinuxUserland {
+    /// Reads `clock`, either `CLOCK_MONOTONIC` or `CLOCK_REALTIME`, from the host or, once the
+    /// host clocks turn out to need a forbidden system call, from the broker. See
+    /// [`Self::vdso_clock_needs_syscall`].
+    fn read_clock(&self, clock: libc::clockid_t) -> Duration {
+        if !self.vdso_clock_needs_syscall.load(Ordering::Relaxed) {
+            let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
+            // SAFETY: `t` is a valid output buffer, initialized when the call succeeds.
+            if unsafe { libc::clock_gettime(clock, t.as_mut_ptr()) } == 0 {
+                let t = unsafe { t.assume_init() };
+                #[expect(clippy::useless_conversion)]
+                return Duration::new(
+                    t.tv_sec.reinterpret_as_unsigned().into(),
+                    t.tv_nsec.reinterpret_as_unsigned().trunc(),
+                );
+            }
+            self.vdso_clock_needs_syscall.store(true, Ordering::Relaxed);
+        }
+        let (monotonic, realtime) = self
+            .broker_clocks
+            .get()
+            .and_then(|reader| reader())
+            .expect("the host clocks are unreadable and the broker clock is unavailable");
+        if clock == libc::CLOCK_MONOTONIC {
+            monotonic
+        } else {
+            realtime
+        }
+    }
+}
+
 impl TimeProvider for LinuxUserland {
     type Instant = Instant;
     type SystemTime = SystemTime;
 
     fn now(&self) -> Self::Instant {
-        let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
-        let t = unsafe { t.assume_init() };
         Instant {
-            #[expect(clippy::useless_conversion)]
-            inner: Duration::new(
-                t.tv_sec.reinterpret_as_unsigned().into(),
-                t.tv_nsec.reinterpret_as_unsigned().trunc(),
-            ),
+            inner: self.read_clock(libc::CLOCK_MONOTONIC),
         }
     }
 
     fn current_time(&self) -> Self::SystemTime {
-        let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
-        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };
-        let t = unsafe { t.assume_init() };
         SystemTime {
-            #[expect(clippy::useless_conversion)]
-            inner: Duration::new(
-                t.tv_sec.reinterpret_as_unsigned().into(),
-                t.tv_nsec.reinterpret_as_unsigned().trunc(),
-            ),
+            inner: self.read_clock(libc::CLOCK_REALTIME),
         }
     }
 
@@ -1925,20 +1972,23 @@ unsafe fn exception_signal_handler(
     if signum == libc::SIGSYS {
         use core::fmt::Write as _;
         #[cfg(target_arch = "x86_64")]
-        let (sysno, arg1) = {
+        let (sysno, arg0, arg1) = {
             let sysno = context.uc_mcontext.gregs[libc::REG_RAX as usize];
             context.uc_mcontext.gregs[libc::REG_RAX as usize] = i64::from(-libc::EINVAL);
             (
                 sysno,
+                context.uc_mcontext.gregs[libc::REG_RDI as usize],
                 context.uc_mcontext.gregs[libc::REG_RSI as usize] as *const core::ffi::c_char,
             )
         };
         #[cfg(target_arch = "aarch64")]
-        let (sysno, arg1) = {
+        let (sysno, arg0, arg1) = {
             let sysno = context.uc_mcontext.regs[8].cast_signed();
+            let arg0 = context.uc_mcontext.regs[0].cast_signed();
             context.uc_mcontext.regs[0] = i64::from(-libc::EINVAL).cast_unsigned();
             (
                 sysno,
+                arg0,
                 context.uc_mcontext.regs[1] as *const core::ffi::c_char,
             )
         };
@@ -1949,6 +1999,12 @@ unsafe fn exception_signal_handler(
             // libc may call `openat` for certain files that we can ignore, e.g., /proc/sys/vm/overcommit_memory.
             // Log the paths in case we need to allow some of them in the future.
             let _ = writeln!(buf, "INFO: openat with {c_path:?} is not allowed");
+        } else if sysno == libc::SYS_clock_gettime
+            && [libc::CLOCK_MONOTONIC, libc::CLOCK_REALTIME]
+                .contains(&i32::try_from(arg0).unwrap_or(-1))
+        {
+            // Expected for the clocks `read_clock` reads when the vDSO needs the system call;
+            // it then reads time from the broker instead.
         } else {
             let _ = writeln!(buf, "WARNING: disallowed syscall invoked: {sysno}");
         }

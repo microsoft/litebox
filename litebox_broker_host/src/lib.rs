@@ -77,7 +77,7 @@ use litebox_broker_protocol::socket::{
     SendSocketResponse, SendToSocketResponse, SocketOutcome,
 };
 use litebox_broker_protocol::timer::{
-    CreateTimerResponse, GetTimerResponse, ReadTimerResponse, SetTimerResponse,
+    CreateTimerResponse, GetTimerResponse, ReadClocksResponse, ReadTimerResponse, SetTimerResponse,
 };
 use litebox_broker_protocol::unix_socket::{
     AcceptUnixSocketResponse, CreateUnixSocketPairResponse, CreateUnixSocketResponse,
@@ -2113,6 +2113,13 @@ fn handle_timer_request(
             .map(|current| TimerResponse::Get(GetTimerResponse { current })),
         TimerRequest::Read(request) => litebox_broker_core::timer::read(process, request.handle)
             .map(|expirations| TimerResponse::Read(ReadTimerResponse { expirations })),
+        TimerRequest::ReadClocks => {
+            let (monotonic, realtime) = litebox_broker_core::timer::read_clocks(process);
+            Ok(TimerResponse::ReadClocks(ReadClocksResponse {
+                monotonic,
+                realtime,
+            }))
+        }
     };
     response.map_err(RequestFailure::from)
 }

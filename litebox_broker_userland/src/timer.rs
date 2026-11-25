@@ -6,7 +6,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::Result as IoResult;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_os = "linux"))]
+use std::time::Instant;
 
 use litebox_broker_core::Result;
 use litebox_broker_core::readiness::SharedReadinessWatchers;
@@ -20,6 +22,7 @@ pub(super) struct UserlandTimerProvider {
 
 /// Alarm queue shared by the provider, its alarms, and the alarm thread.
 struct AlarmScheduler {
+    #[cfg(not(target_os = "linux"))]
     origin: Instant,
     state: Mutex<SchedulerState>,
     /// Signaled when an alarm becomes the earliest pending deadline.
@@ -45,6 +48,7 @@ struct AlarmState {
 impl UserlandTimerProvider {
     pub(super) fn new() -> IoResult<Self> {
         let scheduler = Arc::new(AlarmScheduler {
+            #[cfg(not(target_os = "linux"))]
             origin: Instant::now(),
             state: Mutex::new(SchedulerState::default()),
             wake: Condvar::new(),
@@ -94,7 +98,27 @@ impl TimerProvider for UserlandTimerProvider {
 }
 
 impl AlarmScheduler {
+    #[cfg_attr(target_os = "linux", expect(clippy::unused_self))]
     fn now(&self) -> Duration {
+        // On Linux, the host's `CLOCK_MONOTONIC`, so that a runner that switches to reading time
+        // from the broker (`TimerRequest::ReadClocks`) agrees with host clock values it read
+        // before.
+        #[cfg(target_os = "linux")]
+        {
+            let mut t = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `t` is a valid output buffer.
+            let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut t) };
+            assert_eq!(result, 0, "failed to read CLOCK_MONOTONIC");
+            // `CLOCK_MONOTONIC` is never negative.
+            Duration::new(
+                u64::try_from(t.tv_sec).unwrap_or(0),
+                u32::try_from(t.tv_nsec).unwrap_or(0),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
         self.origin.elapsed()
     }
 

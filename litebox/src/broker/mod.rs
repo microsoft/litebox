@@ -416,6 +416,10 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn read_timer(&self, handle: ObjectHandle) -> core::result::Result<u64, BrokerControlError>;
 
+    fn read_clocks(
+        &self,
+    ) -> core::result::Result<(core::time::Duration, core::time::Duration), BrokerControlError>;
+
     fn create_readiness_queue(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn add_readiness_queue_entry(
@@ -1560,6 +1564,13 @@ where
 
     fn read_timer(&self, handle: ObjectHandle) -> core::result::Result<u64, BrokerControlError> {
         self.request(|local| local.read_timer(handle))
+    }
+
+    fn read_clocks(
+        &self,
+    ) -> core::result::Result<(core::time::Duration, core::time::Duration), BrokerControlError>
+    {
+        self.request(BrokerLocal::read_clocks)
     }
 
     fn create_readiness_queue(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
