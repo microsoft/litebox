@@ -327,6 +327,8 @@ start_share() {
     if [[ $test == virtio9p || $test == virtiofs ]]; then
         mkdir -p "$dir/dir/sub" "$dir/many"
         echo deep >"$dir/dir/sub/deep.txt"
+        echo parent >"$dir/dir/marker"
+        echo child >"$dir/dir/sub/marker"
         # Made once.
         [[ -f "$WORK/big.bin" ]] ||
             python3 -c 'import sys; sys.stdout.buffer.write((bytes(range(251)) * 12583)[:3158073])' \

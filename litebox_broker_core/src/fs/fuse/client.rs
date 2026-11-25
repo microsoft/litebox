@@ -351,26 +351,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Transport> Client<Platform, T> {
         Ok(entry)
     }
 
-    /// `..` of the directory `nodeid`, which must not be the root: servers without a sandbox
-    /// (e.g., `virtiofsd --sandbox=none`) would look outside the export. The parent may be the
-    /// root, whose lookup is counted too.
-    pub(super) fn lookup_parent(&self, nodeid: u64) -> Result<EntryOut, Error> {
-        assert_ne!(nodeid, abi::ROOT_ID, "the root has no parent in the export");
-        let entry = self.call(
-            Opcode::Lookup,
-            nodeid,
-            |r| {
-                r.string("..");
-            },
-            abi::ENTRY_OUT_SIZE,
-            EntryOut::decode,
-        )?;
-        if entry.nodeid == 0 || !entry.attr.is_dir() {
-            return Err(Error::InvalidResponse);
-        }
-        Ok(entry)
-    }
-
     /// Whether the server's user may access `nodeid` as `mask` (`R_OK`, `W_OK`, `X_OK`); as on
     /// Linux, a server without `FUSE_ACCESS` allows everything.
     pub(super) fn access(&self, nodeid: u64, mask: u32) -> Result<(), Error> {

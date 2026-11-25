@@ -4,7 +4,8 @@
 // The host directory read-only at /mnt/host, over virtio-9p (the virtio9p
 // test) or virtio-fs (the virtiofs test, with the argument `virtiofs`). Reads
 // files, through symlinks too (abs.txt's absolute target resolves from the
-// guest's root, not the share's), and big.bin, larger than a request carries;
+// guest's root, not the share's) and from a directory's descriptor (dir/sub's
+// `../marker` is dir's), and big.bin, larger than a request carries;
 // lists many/, more than a FUSE_READDIR reply (64 KiB) holds, and stats 200 of
 // its files, more than a batch of FUSE forgets. With `virtiofs`, also checks a
 // modification time and that the FIFO is hidden, as special files are.
@@ -38,10 +39,10 @@ static int fails_with(int result, int expected, const char *what) {
 
 static int read_only(int result, const char *what) { return fails_with(result, EROFS, what); }
 
-// Copies the file at `path` to stdout.
-static int cat(const char *path) {
+// Copies the file at `path`, from the directory `dir`, to stdout.
+static int cat_at(int dir, const char *path) {
     char buf[256];
-    int fd = open(path, O_RDONLY);
+    int fd = openat(dir, path, O_RDONLY);
     if (fd < 0) return fail(path);
     ssize_t n;
     while ((n = read(fd, buf, sizeof buf)) > 0) fwrite(buf, 1, n, stdout);
@@ -49,6 +50,8 @@ static int cat(const char *path) {
     close(fd);
     return 0;
 }
+
+static int cat(const char *path) { return cat_at(AT_FDCWD, path); }
 
 // Prints the target of the share's symlink `name`.
 static int print_link(const char *name) {
@@ -133,10 +136,13 @@ static int count_entries(const char *path, const char *name, int *found) {
 }
 
 int main(int argc, char **argv) {
+    int sub = open("/mnt/host/dir/sub", O_RDONLY | O_DIRECTORY);
+    if (sub < 0) return fail("dir/sub");
     if (cat("/mnt/host/greeting.txt") != 0 || print_link("link.txt") != 0 ||
         cat("/mnt/host/link.txt") != 0 || cat("/mnt/host/self/greeting.txt") != 0 ||
         print_link("abs.txt") != 0 || cat("/mnt/host/abs.txt") != 0 ||
-        cat("/mnt/host/dir/sub/deep.txt") != 0 || read_big() != 0)
+        cat("/mnt/host/dir/sub/deep.txt") != 0 || cat_at(sub, "../marker") != 0 ||
+        read_big() != 0)
         return 1;
 
     struct stat st;

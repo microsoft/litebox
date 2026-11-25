@@ -121,8 +121,11 @@ enum ReaddirCookies {
     Cycling,
 }
 
+/// By object, as `virtiofsd` keeps them: a node found at another path moves there.
 struct NodeState {
     path: PathBuf,
+    /// Device and inode numbers.
+    object: (u64, u64),
     nlookup: u64,
 }
 
@@ -154,8 +157,10 @@ struct Server {
 impl Server {
     fn shared(config: Config) -> Arc<Mutex<Self>> {
         let export_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let metadata = std::fs::metadata(export_dir.path()).unwrap();
         let root = NodeState {
             path: export_dir.path().to_path_buf(),
+            object: (metadata.dev(), metadata.ino()),
             nlookup: 1,
         };
         Arc::new(Mutex::new(Self {
@@ -238,8 +243,8 @@ impl Server {
         }
         let result = if opcode == Opcode::Init {
             Ok(self.init(&mut r))
-        } else if let Some(node) = self.nodes.get(&nodeid) {
-            let path = node.path.clone();
+        } else if self.nodes.contains_key(&nodeid) {
+            let path = self.locate(nodeid);
             self.dispatch(opcode, &path, &mut r, room)
         } else {
             self.violations
@@ -267,8 +272,8 @@ impl Server {
         match opcode {
             Opcode::Lookup => {
                 let name = name(r);
+                // A server need not resolve them, as `virtiofsd` does not.
                 let path = match name.as_str() {
-                    ".." if path != self.export_dir.path() => path.parent().unwrap().to_path_buf(),
                     "." | ".." => {
                         self.violations
                             .push(std::format!("lookup of {name} in {}", path.display()));
@@ -400,21 +405,7 @@ impl Server {
                 let old = path.join(c_string(r));
                 let new = new_parent.join(c_string(r));
                 std::fs::rename(&old, &new).map_err(errno)?;
-                // As a server that keeps its nodes by object, as `virtiofsd` does.
-                let dirs = self.opens.values_mut().filter_map(|open| match open {
-                    OpenState::Dir(path) => Some(path),
-                    OpenState::File(_) => None,
-                });
-                for moved in self
-                    .nodes
-                    .values_mut()
-                    .map(|node| &mut node.path)
-                    .chain(dirs)
-                {
-                    if let Ok(rest) = moved.strip_prefix(&old) {
-                        *moved = new.join(rest);
-                    }
-                }
+                self.moved(&old, &new);
                 Ok(Vec::new())
             }
             Opcode::Open => {
@@ -565,21 +556,71 @@ impl Server {
 
     /// Counts a lookup of `path`.
     fn entry(&mut self, path: PathBuf, metadata: &Metadata) -> Vec<u8> {
-        let nodeid = if let Some((&nodeid, node)) =
-            self.nodes.iter_mut().find(|(_, node)| node.path == path)
-        {
+        let object = (metadata.dev(), metadata.ino());
+        let found = (self.nodes.iter_mut()).find(|(_, node)| node.object == object);
+        let nodeid = if let Some((&nodeid, node)) = found {
             node.nlookup += 1;
+            let old = core::mem::replace(&mut node.path, path.clone());
+            if old != path {
+                self.moved(&old, &path);
+            }
             nodeid
         } else {
             let nodeid = self.next_nodeid;
             self.next_nodeid += 1;
-            self.nodes.insert(nodeid, NodeState { path, nlookup: 1 });
+            let node = NodeState {
+                path,
+                object,
+                nlookup: 1,
+            };
+            self.nodes.insert(nodeid, node);
             nodeid
         };
         let mut out = nodeid.to_le_bytes().to_vec();
         out.extend([0; 8 * 3 + 4 * 2]); // generation, validity
         self.attr(metadata, &mut out);
         out
+    }
+
+    /// The path of the node `nodeid`'s object, found anew if the host moved it; its old one if the
+    /// object is gone.
+    fn locate(&mut self, nodeid: u64) -> PathBuf {
+        let node = &self.nodes[&nodeid];
+        let at = |path: &Path| {
+            let metadata = std::fs::symlink_metadata(path).ok()?;
+            Some((metadata.dev(), metadata.ino()))
+        };
+        if at(&node.path) == Some(node.object) {
+            return node.path.clone();
+        }
+        let (old, object) = (node.path.clone(), node.object);
+        let mut pending = alloc::vec![self.export_dir.path().to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if at(&path) == Some(object) {
+                    self.moved(&old, &path);
+                    return path;
+                }
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    pending.push(path);
+                }
+            }
+        }
+        old
+    }
+
+    /// Moves the nodes and open directories at or below `old` to `new`.
+    fn moved(&mut self, old: &Path, new: &Path) {
+        let dirs = self.opens.values_mut().filter_map(|open| match open {
+            OpenState::Dir(path) => Some(path),
+            OpenState::File(_) => None,
+        });
+        for moved in (self.nodes.values_mut().map(|node| &mut node.path)).chain(dirs) {
+            if let Ok(rest) = moved.strip_prefix(old) {
+                *moved = new.join(rest);
+            }
+        }
     }
 
     fn forget(&mut self, nodeid: u64, nlookup: u64) {
@@ -1244,6 +1285,76 @@ fn test_fuse_held_directories() {
     );
     drop((root, sub));
     h.finish();
+}
+
+/// A held directory's `..` follows its renames, and its moves on the host once looked up; a lookup
+/// that would make a directory its own ancestor fails with `ELOOP`.
+#[test]
+fn test_fuse_parents_follow_moves() {
+    let h = Harness::new();
+    let fs = &h.fs;
+    for dir in ["a/b", "x", "y", "p/q"] {
+        std::fs::create_dir_all(h.host_path(dir)).unwrap();
+    }
+    let status = |path| fs.file_status(USER, None, path, true).unwrap().node_info;
+    let open_at = |dir: &ResolverEntry<_>, path| {
+        fs.open(USER, Some(dir.anchor()), path, OFlags::PATH, Mode::empty())
+    };
+    let parent = |dir: &ResolverEntry<_>| {
+        let parent = open_at(dir, "..").unwrap();
+        fs.handle_status(Caller::default(), &parent).unwrap()
+    };
+
+    let b = open_dir(fs, "/a/b");
+    assert_eq!(parent(&b).node_info, status("/a"));
+    fs.rename(USER, None, "/a/b", None, "/x/b").unwrap();
+    assert_eq!(parent(&b).node_info, status("/x"));
+    std::fs::rename(h.host_path("x/b"), h.host_path("y/b")).unwrap();
+    drop(open_dir(fs, "/y/b"));
+    assert_eq!(parent(&b).node_info, status("/y"));
+
+    // `q` keeps `p` as its parent while the host moves `q` to the root and `p` into it.
+    let (p, q) = (open_dir(fs, "/p"), open_dir(fs, "/p/q"));
+    std::fs::rename(h.host_path("p/q"), h.host_path("q")).unwrap();
+    std::fs::rename(h.host_path("p"), h.host_path("q/p")).unwrap();
+    assert_err!(
+        open_at(&q, "p"),
+        OpenError::PathError(PathError::TooManySymlinks)
+    );
+    drop(open_dir(fs, "/q"));
+    drop(open_at(&q, "p").unwrap());
+    assert_eq!(parent(&p).node_info, status("/q"));
+    assert_eq!(parent(&q).node_info, status("/"));
+    drop((b, p, q));
+    h.finish();
+}
+
+/// Without recursion: relative walks can make a chain deeper than the kernel's stack allows.
+#[test]
+fn test_fuse_deep_ancestors_drop_iteratively() {
+    type Node = super::Node<TestPlatform, ServerTransport>;
+    let server = Server::shared(Config::default());
+    let fuse = connect(&server).unwrap();
+    let mut dir: Option<Arc<Node>> = None;
+    for id in 0..100_000 {
+        dir = Some(Arc::new(Node {
+            id: abi::ROOT_ID + 1 + id,
+            // Never looked up: nothing to forget.
+            lookups: core::sync::atomic::AtomicU64::new(0),
+            file_type: abi::S_IFDIR,
+            parent: litebox_platform::sync::Mutex::new(dir),
+            dirs: None,
+            client: Arc::clone(&fuse.client),
+        }));
+    }
+    std::thread::Builder::new()
+        .stack_size(128 << 10)
+        .spawn(move || drop(dir))
+        .unwrap()
+        .join()
+        .unwrap();
+    drop(fuse);
+    server.lock().unwrap().assert_clean();
 }
 
 /// `DT_UNKNOWN` entries take their lookup's type and inode number, or are skipped; names that are
