@@ -37,6 +37,10 @@ use crate::readiness_queue::{
     AddReadinessQueueEntryRequest, CreateReadinessQueueResponse, ModifyReadinessQueueEntryRequest,
     ReadinessQueueError, RemoveReadinessQueueEntryRequest, TakeReadyRequest, TakeReadyResponse,
 };
+use crate::segment::{
+    GetSegmentRequest, SegmentError, SegmentId, SegmentInfo, SegmentSlotStatus,
+    SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
+};
 use crate::shared_buffer::SharedBufferSequence;
 use crate::shared_futex::{
     CreateFutexWaiterResponse, FutexArmRequest, FutexDisarmRequest, FutexDisarmResponse,
@@ -121,6 +125,8 @@ wire_enum! {
         SharedFutex(SharedFutexRequest),
         /// Vsock socket request family.
         VsockSocket(VsockSocketRequest),
+        /// Keyed shared segment request family.
+        Segment(SegmentRequest),
     }
 }
 
@@ -205,6 +211,7 @@ impl BrokerOperation {
             | Self::Timer(_)
             | Self::Signal(_)
             | Self::SharedFutex(_)
+            | Self::Segment(_)
             | Self::Process(
                 ProcessRequest::AllocateChild(_)
                 | ProcessRequest::CreateNamespaces(_)
@@ -392,6 +399,27 @@ wire_enum! {
         Wake(FutexWakeRequest),
         /// Disarm a futex waiter, reporting whether it was woken.
         Disarm(FutexDisarmRequest),
+    }
+}
+
+wire_enum! {
+    /// Request about keyed shared segments in the caller's namespace.
+    ///
+    /// Ordinary guest-visible failures are [`SegmentResponse::Failed`].
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SegmentRequest {
+        /// Look up a key, optionally creating a segment.
+        Get(GetSegmentRequest),
+        /// Read a segment's metadata.
+        Status(SegmentId),
+        /// Change a segment's permission bits.
+        Set(SetSegmentRequest),
+        /// Unpublish a segment's key; it is freed once no attachments remain.
+        Remove(SegmentId),
+        /// Summarize the caller's namespace and the limits that apply to it.
+        Info,
+        /// Read the metadata of the segment in a slot.
+        SlotStatus(SegmentSlotStatusRequest),
     }
 }
 
@@ -696,6 +724,8 @@ wire_enum! {
         VsockSocket(VsockSocketResponse),
         /// Operation failed with an ABI-neutral broker error.
         Error(ErrorCode),
+        /// Keyed shared segment response family.
+        Segment(SegmentResponse),
     }
 }
 
@@ -776,6 +806,27 @@ wire_enum! {
         /// Waiting, resource, and request-validation failures use
         /// [`BrokerResult::Error`] instead.
         Failed(ReadinessQueueError),
+    }
+}
+
+wire_enum! {
+    /// Response about keyed shared segments.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SegmentResponse {
+        /// The segment's ID.
+        Get(SegmentId),
+        /// The segment's metadata.
+        Status(SegmentStatus),
+        /// The permission bits were changed.
+        Set,
+        /// The key was unpublished.
+        Remove,
+        /// Segment operation failed with a guest-visible error.
+        Failed(SegmentError),
+        /// The namespace summary and limits.
+        Info(SegmentInfo),
+        /// The segment in the slot, and its metadata.
+        SlotStatus(SegmentSlotStatus),
     }
 }
 

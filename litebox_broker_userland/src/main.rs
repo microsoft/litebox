@@ -369,26 +369,16 @@ where
         .mount_nestable("/", |allocators| {
             let in_mem = InMem::<Platform>::new_initialized(entries, allocators.next());
             // One limit (`BrokerCoreLimits::max_shared_files`) bounds the host resources of every
-            // guest. Mapped files keep their slots until deleted, so one guest can use them all up and
-            // make other guests' mappings fail as out of memory (see `InMem::with_shared_memory`).
-            // Zero keeps every file in broker memory.
-            #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-            let in_mem = if max_shared_files == 0 {
-                in_mem
-            } else {
-                #[cfg(target_os = "linux")]
-                let provider =
-                    litebox_broker_userland::shared_objects::linux::MemfdFileMemoryProvider;
-                #[cfg(all(windows, target_arch = "x86_64"))]
-                let provider =
-                    litebox_broker_userland::shared_objects::windows::TempFileMemoryProvider;
-                in_mem.with_shared_memory(
-                    Arc::new(provider),
-                    Arc::new(SharedFileLimit::new(max_shared_files)),
-                )
+            // guest's files. Mapped files keep their slots until deleted, so one guest can use them
+            // all up and make other guests' mappings fail as out of memory (see
+            // `InMem::with_shared_memory`). Zero keeps every file in broker memory.
+            let provider = litebox_broker_userland::shared_objects::host_memory_provider()
+                .filter(|_| max_shared_files != 0);
+            let in_mem = match provider {
+                Some(provider) => in_mem
+                    .with_shared_memory(provider, Arc::new(SharedFileLimit::new(max_shared_files))),
+                None => in_mem,
             };
-            #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
-            let _ = max_shared_files;
             Overlay::<Platform>::new(
                 in_mem,
                 TarRo::new(tar_data, allocators.next()),

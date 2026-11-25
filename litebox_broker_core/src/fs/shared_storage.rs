@@ -46,7 +46,7 @@ pub struct SharedFileMemory {
     pub object: Arc<dyn SharedFileObject>,
 }
 
-/// Failures creating host shared memory.
+/// Failures creating host shared memory, for a file or a fixed-length segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CreateSharedMemoryError {
     /// The backing store cannot hold memory of this size.

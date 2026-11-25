@@ -254,6 +254,7 @@ impl ProcessKey {
 /// the caller, then [`BrokerCore`] creates and registers this object before
 /// serving its association.
 pub struct BrokerProcess {
+    pub(crate) segments: Mutex<crate::segment::ProcessSegments>,
     pub(crate) core: Arc<BrokerCore>,
     /// The PID namespace this process's later children get their IDs in, if
     /// not its own (see [`Self::create_namespaces`]).
@@ -647,6 +648,11 @@ impl BrokerProcess {
         let socket_account = Arc::new(SocketAccount::new(&core, key));
         Self {
             core,
+            segments: Mutex::new(
+                creator.map_or_else(crate::segment::ProcessSegments::default, |p| {
+                    p.segments.lock().child()
+                }),
+            ),
             children_namespace: Mutex::new(None),
             fs,
             fs_state: Arc::new(FsState {
@@ -874,8 +880,12 @@ impl BrokerProcess {
     /// `UnsupportedOperation` if the request asks for a children's PID
     /// namespace for a pending child or while this process's children already
     /// go to another one. Returns `ResourceExhausted` if that namespace can't
-    /// be created.
+    /// be created, and `PolicyDenied` for a new segment namespace unless the
+    /// process may write.
     pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<()> {
+        if request.new_segment_namespace {
+            self.require_object_rights(ObjectRights::WAIT | ObjectRights::WRITE)?;
+        }
         if request.children_pid_namespace.is_some() && request.process_id != self.id() {
             return Err(BrokerError::UnsupportedOperation);
         }
@@ -912,6 +922,9 @@ impl BrokerProcess {
             let previous = core::mem::replace(&mut *shared, Arc::new(copy));
             drop(shared);
             drop(previous);
+        }
+        if request.new_segment_namespace {
+            target.segments.lock().reset_namespace();
         }
         Ok(())
     }
@@ -3066,6 +3079,7 @@ impl BrokerProcess {
     fn release_references(&self) -> bool {
         let cwd = self.fs_state.cwd.lock().take();
         drop(cwd);
+        self.segments.lock().close();
         let mut invariant_fault = self.references.lock().pending_handles != 0;
         loop {
             let Some(handle) = self.references.lock().handles.pop() else {
@@ -4447,7 +4461,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_pid_namespace_reservation_keeps_host_names_shared() {
+    fn failed_pid_namespace_reservation_keeps_other_namespaces_shared() {
         let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
@@ -4467,6 +4481,7 @@ mod tests {
             root.create_namespaces(CreateNamespacesRequest {
                 process_id: root.id(),
                 children_pid_namespace: Some(PidNamespaceOptions::default()),
+                new_segment_namespace: true,
                 copy_host_names: true,
             }),
             Err(BrokerError::ResourceExhausted),
@@ -4481,6 +4496,26 @@ mod tests {
             &root.children_namespace(),
             root.pid_namespace()
         ));
+        let child = root.take_child_process(child_id).unwrap();
+        assert!(
+            root.segments
+                .lock()
+                .shares_namespace_with(&child.segments.lock())
+        );
+        // Without the PID namespace, the same request succeeds.
+        root.create_namespaces(CreateNamespacesRequest {
+            process_id: root.id(),
+            children_pid_namespace: None,
+            new_segment_namespace: true,
+            copy_host_names: true,
+        })
+        .unwrap();
+        assert!(
+            !root
+                .segments
+                .lock()
+                .shares_namespace_with(&child.segments.lock())
+        );
     }
 
     #[test]
@@ -4515,6 +4550,7 @@ mod tests {
         root.create_namespaces(CreateNamespacesRequest {
             process_id: child_id,
             children_pid_namespace: None,
+            new_segment_namespace: false,
             copy_host_names: true,
         })
         .unwrap();

@@ -1060,6 +1060,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .create_namespaces(CreateNamespacesRequest {
                     process_id: child.identity().process_id,
                     children_pid_namespace: None,
+                    new_segment_namespace: false,
                     copy_host_names: true,
                 })?;
         }
@@ -1152,6 +1153,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .create_namespaces(CreateNamespacesRequest {
                 process_id: ProcessId(self.own_pid_for_requests().cast_unsigned()),
                 children_pid_namespace: new_pid.then_some(PidNamespaceOptions::INIT),
+                new_segment_namespace: false,
                 copy_host_names,
             }) {
             Ok(()) => {}

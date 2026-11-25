@@ -45,10 +45,10 @@ use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
     ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse,
-    ReadinessQueueRequest, ReadinessQueueResponse, SharedFutexRequest, SharedFutexResponse,
-    SignalRequest, SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse,
-    TimerRequest, TimerResponse, UnixSocketRequest, UnixSocketResponse, VsockSocketRequest,
-    VsockSocketResponse,
+    ReadinessQueueRequest, ReadinessQueueResponse, SegmentRequest, SegmentResponse,
+    SharedFutexRequest, SharedFutexResponse, SignalRequest, SignalResponse, SocketRequest,
+    SocketResponse, ThreadRequest, ThreadResponse, TimerRequest, TimerResponse, UnixSocketRequest,
+    UnixSocketResponse, VsockSocketRequest, VsockSocketResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -542,6 +542,9 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::SharedFutex(request) => {
             handle_shared_futex_request(process, request, readiness_sink)
                 .map(BrokerResult::SharedFutex)
+        }
+        BrokerOperation::Segment(request) => {
+            handle_segment_request(process, request).map(BrokerResult::Segment)
         }
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
@@ -2114,6 +2117,30 @@ fn handle_event_request(
                 .map_err(RequestFailure::from)
         }
     }
+}
+
+/// Handles a keyed shared segment request.
+fn handle_segment_request(
+    process: &BrokerProcess,
+    request: SegmentRequest,
+) -> RequestResult<SegmentResponse> {
+    use litebox_broker_core::segment;
+
+    let response = match request {
+        SegmentRequest::Get(request) => segment::get(process, request)?.map(SegmentResponse::Get),
+        SegmentRequest::Status(id) => segment::status(process, id)?.map(SegmentResponse::Status),
+        SegmentRequest::Set(request) => {
+            segment::set(process, request)?.map(|()| SegmentResponse::Set)
+        }
+        SegmentRequest::Remove(id) => {
+            segment::remove(process, id)?.map(|()| SegmentResponse::Remove)
+        }
+        SegmentRequest::Info => segment::info(process)?.map(SegmentResponse::Info),
+        SegmentRequest::SlotStatus(request) => {
+            segment::slot_status(process, request)?.map(SegmentResponse::SlotStatus)
+        }
+    };
+    Ok(response.unwrap_or_else(SegmentResponse::Failed))
 }
 
 fn handle_shared_futex_request(
