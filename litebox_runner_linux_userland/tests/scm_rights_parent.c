@@ -12,13 +12,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -468,10 +468,8 @@ static void test_large_stream_send(void) {
     close(pair[1]);
 }
 
-// Checks that a process waiting on a descriptor it received learns of a change the sender makes
-// once it watches the descriptor. Whether the wait blocks before the change is left to scheduling,
-// so the broker tests check that received references publish readiness.
-static void test_waiting_on_a_passed_descriptor(void) {
+// A child blocked polling a descriptor it received wakes when the sender writes it.
+static void test_polling_a_passed_descriptor(void) {
     int channel[2];
     socket_pair(SOCK_DGRAM, channel);
     int pipe_fds[2];
@@ -484,15 +482,13 @@ static void test_waiting_on_a_passed_descriptor(void) {
         close(pipe_fds[1]);
         struct received received = recv_fds(channel[1], CMSG_SPACE(sizeof(int)), 0);
         TEST_ASSERT(received.count == 1, "receive the read end");
-        int epoll = epoll_create1(0);
-        TEST_ASSERT(epoll >= 0, "epoll_create1");
-        struct epoll_event event = {.events = EPOLLIN, .data.fd = received.fds[0]};
-        TEST_ASSERT(epoll_ctl(epoll, EPOLL_CTL_ADD, received.fds[0], &event) == 0, "epoll_ctl");
-        // The sender writes only after this, so the write is a change the wait must learn of.
-        TEST_ASSERT(send(channel[1], "r", 1, 0) == 1, "report the read end watched");
-        // Bounded only so a missed change fails instead of hanging.
-        TEST_ASSERT(epoll_wait(epoll, &event, 1, 10000) == 1 && (event.events & EPOLLIN),
-                    "the write is reported");
+        // A watchdog rather than a poll timeout, so a missed wake-up kills the child instead of
+        // the poll seeing the write when it times out.
+        alarm(10);
+        TEST_ASSERT(send(channel[1], "r", 1, 0) == 1, "report the read end received");
+        struct pollfd poll_fd = {.fd = received.fds[0], .events = POLLIN};
+        TEST_ASSERT(poll(&poll_fd, 1, -1) == 1 && (poll_fd.revents & POLLIN),
+                    "the write wakes the poll");
         char byte = 0;
         TEST_ASSERT(read(received.fds[0], &byte, 1) == 1 && byte == 'w', "read the write");
         _exit(0);
@@ -501,7 +497,10 @@ static void test_waiting_on_a_passed_descriptor(void) {
     TEST_ASSERT(send_fds(channel[0], "x", &pipe_fds[0], 1) == 1, "send the read end");
     close(pipe_fds[0]);
     char ack;
-    TEST_ASSERT(recv(channel[0], &ack, 1, 0) == 1, "the child watches the read end");
+    TEST_ASSERT(recv(channel[0], &ack, 1, 0) == 1, "the child received the read end");
+    // Give the child time to block. The test passes either way; blocking first only makes it
+    // exercise the wake-up, which the broker tests check deterministically.
+    sleep_ms(100);
     TEST_ASSERT(write(pipe_fds[1], "w", 1) == 1, "write the pipe");
     TEST_ASSERT(reap(child, 1) == 0, "child succeeded");
     close(pipe_fds[1]);
@@ -673,7 +672,7 @@ int main(void) {
     test_partly_writable_control();
     test_descriptor_limit_truncates();
     test_large_stream_send();
-    test_waiting_on_a_passed_descriptor();
+    test_polling_a_passed_descriptor();
     test_other_descriptor_kinds();
     test_peeking_a_datagram_passes_its_descriptors();
     test_queued_descriptors_are_released();
