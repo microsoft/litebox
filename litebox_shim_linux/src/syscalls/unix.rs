@@ -533,10 +533,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     }
                     for &fd in fds {
                         let fd = self.files.borrow().typed_fd(i32::from_ne_bytes(fd))?;
-                        if matches!(fd, super::file::AnyTypedFd::Unix(_)) {
-                            log_unsupported!("passing Unix sockets with SCM_RIGHTS");
-                            return Err(Errno::EOPNOTSUPP);
-                        }
                         objects.push(self.global.shareable_object(&fd)?.1);
                     }
                 }

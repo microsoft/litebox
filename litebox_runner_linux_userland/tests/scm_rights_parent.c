@@ -127,14 +127,14 @@ static int pipe_open(int fd) { return read_now(fd) == -1 && errno == EAGAIN; }
 static void test_pass_between_processes(void) {
     int channel[2];
     socket_pair(SOCK_STREAM, channel);
-    int reply[2];
-    TEST_ASSERT(pipe(reply) == 0, "pipe");
+    int peer[2];
+    socket_pair(SOCK_SEQPACKET, peer);
     pid_t child = fork();
     TEST_ASSERT(child >= 0, "fork");
     if (child == 0) {
         close(channel[0]);
-        close(reply[0]);
-        close(reply[1]);
+        close(peer[0]);
+        close(peer[1]);
         // Send a pipe's read end and a file, keeping only the pipe's write end.
         int pipe_fds[2];
         TEST_ASSERT(pipe(pipe_fds) == 0, "pipe");
@@ -149,10 +149,10 @@ static void test_pass_between_processes(void) {
         close(file);
         TEST_ASSERT(write(pipe_fds[1], "piped", 5) == 5, "write pipe");
         close(pipe_fds[1]);
-        // Receive a pipe's write end from the parent and reply over it.
+        // Receive a socket from the parent and talk over it.
         struct received received = recv_fds(channel[1], CMSG_SPACE(sizeof(int)), 0);
-        TEST_ASSERT(received.count == 1 && received.length == 4, "receive pipe");
-        TEST_ASSERT(write(received.fds[0], "hello", 5) == 5, "write the received pipe");
+        TEST_ASSERT(received.count == 1 && received.length == 4, "receive socket");
+        TEST_ASSERT(send(received.fds[0], "hello", 5, 0) == 5, "send over received socket");
         _exit(0);
     }
     close(channel[1]);
@@ -160,8 +160,8 @@ static void test_pass_between_processes(void) {
     TEST_ASSERT(received.length == 3 && memcmp(received.data, "fds", 3) == 0, "data with fds");
     TEST_ASSERT(received.count == 2 && received.flags == 0, "two descriptors");
     TEST_ASSERT(received.controllen == CMSG_SPACE(sizeof(int) * 2), "control length");
-    TEST_ASSERT(send_fds(channel[0], "pipe", &reply[1], 1) == 4, "send pipe");
-    close(reply[1]);
+    TEST_ASSERT(send_fds(channel[0], "sock", &peer[1], 1) == 4, "send socket");
+    close(peer[1]);
     // The child writes everything before it exits, so nothing below waits.
     TEST_ASSERT(reap(child, 1) == 0, "child succeeded");
 
@@ -173,12 +173,11 @@ static void test_pass_between_processes(void) {
     TEST_ASSERT(read(received.fds[1], buffer, 2) == 2 && memcmp(buffer, "34", 2) == 0,
                 "read the passed file at its offset");
     close(received.fds[1]);
-    TEST_ASSERT(fcntl(reply[0], F_SETFL, O_NONBLOCK) == 0, "set O_NONBLOCK");
-    ssize_t n = read(reply[0], buffer, sizeof(buffer));
-    TEST_ASSERT(n == 5 && memcmp(buffer, "hello", 5) == 0, "read the reply over the passed pipe");
+    ssize_t n = recv(peer[0], buffer, sizeof(buffer), MSG_DONTWAIT);
+    TEST_ASSERT(n == 5 && memcmp(buffer, "hello", 5) == 0, "receive over the passed socket");
     TEST_ASSERT(pipe_ends(received.fds[0]), "the passed pipe ends");
     close(received.fds[0]);
-    close(reply[0]);
+    close(peer[0]);
     close(channel[0]);
 }
 
@@ -202,14 +201,10 @@ static void test_short_control_truncates(void) {
     close(first[0]);
     close(second[0]);
     // No room installs none.
-    TEST_ASSERT(pipe(first) == 0, "pipe");
-    TEST_ASSERT(send_fds(pair[0], "y", &first[1], 1) == 1, "send one descriptor");
-    close(first[1]);
+    TEST_ASSERT(send_fds(pair[0], "y", &pair[0], 1) == 1, "send one descriptor");
     received = recv_fds(pair[1], CMSG_LEN(0), MSG_DONTWAIT);
     TEST_ASSERT(received.count == 0 && (received.flags & MSG_CTRUNC), "truncated to none");
     TEST_ASSERT(received.controllen == 0, "no control bytes");
-    TEST_ASSERT(pipe_ends(first[0]), "the descriptor is released");
-    close(first[0]);
     close(pair[0]);
     close(pair[1]);
 }
@@ -233,22 +228,18 @@ static void test_plain_receives_discard_descriptors(void) {
 static void test_close_on_exec(void) {
     int pair[2];
     socket_pair(SOCK_DGRAM, pair);
-    int pipe_fds[2];
-    TEST_ASSERT(pipe(pipe_fds) == 0, "pipe");
-    TEST_ASSERT(send_fds(pair[0], "x", &pipe_fds[1], 1) == 1, "send");
+    TEST_ASSERT(send_fds(pair[0], "x", &pair[0], 1) == 1, "send");
     struct received received =
         recv_fds(pair[1], CMSG_SPACE(sizeof(int)), MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
     TEST_ASSERT(received.count == 1, "received with MSG_CMSG_CLOEXEC");
     TEST_ASSERT(received.flags == MSG_CMSG_CLOEXEC, "MSG_CMSG_CLOEXEC reported back");
     TEST_ASSERT(fcntl(received.fds[0], F_GETFD) == FD_CLOEXEC, "close-on-exec set");
     close(received.fds[0]);
-    TEST_ASSERT(send_fds(pair[0], "x", &pipe_fds[1], 1) == 1, "send");
+    TEST_ASSERT(send_fds(pair[0], "x", &pair[0], 1) == 1, "send");
     received = recv_fds(pair[1], CMSG_SPACE(sizeof(int)), MSG_DONTWAIT);
     TEST_ASSERT(received.count == 1 && received.flags == 0, "received");
     TEST_ASSERT(fcntl(received.fds[0], F_GETFD) == 0, "close-on-exec clear");
     close(received.fds[0]);
-    close(pipe_fds[0]);
-    close(pipe_fds[1]);
     close(pair[0]);
     close(pair[1]);
 }
@@ -256,10 +247,8 @@ static void test_close_on_exec(void) {
 static void test_stream_receives_stop_after_passed_descriptors(void) {
     int pair[2];
     socket_pair(SOCK_STREAM, pair);
-    int pipe_fds[2];
-    TEST_ASSERT(pipe(pipe_fds) == 0, "pipe");
     TEST_ASSERT(send_fds(pair[0], "ab", NULL, 0) == 2, "send plain");
-    TEST_ASSERT(send_fds(pair[0], "cd", &pipe_fds[1], 1) == 2, "send with descriptor");
+    TEST_ASSERT(send_fds(pair[0], "cd", &pair[0], 1) == 2, "send with descriptor");
     TEST_ASSERT(send_fds(pair[0], "ef", NULL, 0) == 2, "send plain");
     // Peeking passes the descriptors too, and leaves them queued.
     struct received received = recv_fds(pair[1], CMSG_SPACE(sizeof(int)), MSG_PEEK | MSG_DONTWAIT);
@@ -277,7 +266,7 @@ static void test_stream_receives_stop_after_passed_descriptors(void) {
 
     // A byte before those that carry descriptors comes without them, and the first of those with.
     TEST_ASSERT(send_fds(pair[0], "ab", NULL, 0) == 2, "send plain");
-    TEST_ASSERT(send_fds(pair[0], "cd", &pipe_fds[1], 1) == 2, "send with descriptor");
+    TEST_ASSERT(send_fds(pair[0], "cd", &pair[0], 1) == 2, "send with descriptor");
     const char *expected = "abc";
     for (int i = 0; i < 3; i++) {
         received = recv_some_fds(pair[1], 1, CMSG_SPACE(sizeof(int)), MSG_DONTWAIT);
@@ -288,8 +277,6 @@ static void test_stream_receives_stop_after_passed_descriptors(void) {
     received = recv_fds(pair[1], CMSG_SPACE(sizeof(int)), MSG_DONTWAIT);
     TEST_ASSERT(received.length == 1 && received.data[0] == 'd' && received.count == 0,
                 "the rest of the chunk without descriptors");
-    close(pipe_fds[0]);
-    close(pipe_fds[1]);
     close(pair[0]);
     close(pair[1]);
 }
@@ -439,10 +426,7 @@ static void test_large_stream_send(void) {
         for (size_t i = 0; i < SIZE; i++) {
             data[i] = pattern(i);
         }
-        int pipe_fds[2];
-        TEST_ASSERT(pipe(pipe_fds) == 0, "pipe");
-        TEST_ASSERT(send_bytes(pair[0], data, SIZE, &pipe_fds[1], 1) == SIZE,
-                    "send it all at once");
+        TEST_ASSERT(send_bytes(pair[0], data, SIZE, &pair[0], 1) == SIZE, "send it all at once");
         _exit(0);
     }
     close(pair[0]);
@@ -505,6 +489,35 @@ static void test_polling_a_passed_descriptor(void) {
     TEST_ASSERT(reap(child, 1) == 0, "child succeeded");
     close(pipe_fds[1]);
     close(channel[0]);
+}
+
+// Returns whether `predicate(fd)` holds within a few seconds, checking it repeatedly, since Linux
+// releases some descriptors asynchronously.
+static int eventually(int (*predicate)(int), int fd) {
+    for (int i = 0; i < 500; i++) {
+        if (predicate(fd)) {
+            return 1;
+        }
+        sleep_ms(10);
+    }
+    return 0;
+}
+
+static void test_sockets_sent_over_themselves(void) {
+    int pair[2];
+    socket_pair(SOCK_DGRAM, pair);
+    int pipe_fds[2];
+    TEST_ASSERT(pipe(pipe_fds) == 0, "pipe");
+    int sent[2] = {pair[1], pipe_fds[1]};
+    TEST_ASSERT(send_fds(pair[0], "x", sent, 2) == 1, "send the receiver to itself");
+    close(pipe_fds[1]);
+    TEST_ASSERT(pipe_open(pipe_fds[0]), "the queued message holds the write end");
+    close(pair[1]);
+    close(pair[0]);
+    // Only the receiver's own queued message reaches it now, so the garbage collector reclaims
+    // it, releasing the write end.
+    TEST_ASSERT(eventually(pipe_ends, pipe_fds[0]), "the cycle is collected");
+    close(pipe_fds[0]);
 }
 
 static void test_other_descriptor_kinds(void) {
@@ -673,6 +686,7 @@ int main(void) {
     test_descriptor_limit_truncates();
     test_large_stream_send();
     test_polling_a_passed_descriptor();
+    test_sockets_sent_over_themselves();
     test_other_descriptor_kinds();
     test_peeking_a_datagram_passes_its_descriptors();
     test_queued_descriptors_are_released();

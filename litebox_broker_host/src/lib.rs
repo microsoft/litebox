@@ -4278,18 +4278,15 @@ mod tests {
         // A send stages the handles of the objects it carries after the
         // address, and a receive gets the receiver's handles after the
         // name's room.
-        let BrokerResult::Pipe(PipeResponse::Create(carried)) = handle_test_request_with_buffers(
-            &process,
-            BrokerOperation::Pipe(PipeRequest::Create(CreatePipeRequest {
-                capacity: 64,
-                atomic_write_size: 16,
+        let UnixSocketResponse::CreatePair(carried) = request(BrokerOperation::UnixSocket(
+            UnixSocketRequest::CreatePair(CreateUnixSocketRequest {
+                socket_type: SocketType::Datagram,
                 flags: FileOpenFlags::NONE,
-            })),
-            &shared_buffers,
-        ) else {
-            panic!("expected pipe creation");
+            }),
+        )) else {
+            panic!("expected Unix socket pair creation");
         };
-        let mut staged = carried.write_handle.encode().to_vec();
+        let mut staged = carried.first.encode().to_vec();
         staged.push(6);
         assert_eq!(
             request(BrokerOperation::UnixSocket(UnixSocketRequest::Send(
@@ -4324,8 +4321,8 @@ mod tests {
             .unwrap();
         assert_eq!(encoded[0], 6);
         let object = TransferredObject::decode(encoded[8..].try_into().unwrap()).unwrap();
-        assert_ne!(object.handle, carried.write_handle);
-        assert_eq!(object.kind, ObjectKind::PipeWriteEnd);
+        assert_ne!(object.handle, carried.first);
+        assert_eq!(object.kind, ObjectKind::UnixSocket(SocketType::Datagram));
         assert_eq!(
             complete_request(handle_request(
                 &process,

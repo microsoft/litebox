@@ -2957,7 +2957,12 @@ impl BrokerProcess {
     /// lock, so an object may safely release platform resources.
     pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
         let reference = self.remove_object_reference(handle)?;
-        drop(reference);
+        let unix_socket = matches!(&*reference.object.read(), ObjectEntry::UnixSocket(_));
+        if unix_socket {
+            let object = Arc::clone(&reference.object);
+            drop(reference);
+            self.core.unix_sockets.release_reference(object);
+        }
         Ok(())
     }
 
@@ -3126,6 +3131,8 @@ impl BrokerProcess {
         // run while its lock is held.
         let socket_account = self.socket_account.lock().take();
         drop(socket_account);
+        // Messages may now be all that reach Unix sockets this process held.
+        self.core.unix_sockets.collect_all_garbage();
         invariant_fault
     }
 
