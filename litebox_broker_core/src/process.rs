@@ -2585,8 +2585,6 @@ impl BrokerProcess {
         self.create_object_reference_with_rights(object, rights)
     }
 
-    /// Creates a reference with `rights` to `object`, which must be within
-    /// this process's policy.
     pub(crate) fn create_object_reference_with_rights(
         &self,
         object: Arc<RwLock<ObjectEntry>>,

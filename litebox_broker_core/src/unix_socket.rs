@@ -10,14 +10,6 @@
 //! weakly. A socket is torn down explicitly once its last reference closes,
 //! or once its listener closes without accepting it.
 //!
-//! A message can carry references to objects, including other Unix sockets,
-//! which its receiver takes as its own references (see [`send`]). A socket
-//! that only messages queued in such sockets reach, such as one sent over
-//! itself, is garbage that `UnixSockets::collect_garbage` reclaims, as
-//! Linux's collector does. Closing a socket releases what its messages carry
-//! in a loop rather than recursively, so however deeply carried sockets
-//! nest, closing them takes bounded stack.
-//!
 //! Locks are taken only in this order:
 //!
 //! 0. the broker's registry of carried sockets, which also serializes the
@@ -819,11 +811,6 @@ impl UnixSockets {
     }
 
     /// Waits for a running collection to finish.
-    ///
-    /// A receive that peeks at a carried socket gives the caller a reference
-    /// without taking the socket out of flight, so it waits for the collector
-    /// in between, as Linux's `unix_peek_fds` does. The collector then either
-    /// saw the extra reference, or finished before the caller can use it.
     fn synchronize_with_collector(&self) {
         drop(self.in_flight.lock());
     }

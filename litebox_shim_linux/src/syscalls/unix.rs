@@ -30,8 +30,8 @@ use litebox_broker_protocol::{
 };
 use litebox_common_linux::{
     AddressFamily, CmsgHdr, FileDescriptorFlags, OFlags, ReceiveFlags, SCM_MAX_FD, SendFlags,
-    ShutdownHow, SockFlags, SockType, SocketControlMessageType, SocketOption, SocketOptionName,
-    UnixProtocol, errno::Errno,
+    ShutdownHow, SockFlags, SockType, SocketControlMessageName, SocketControlMessageType,
+    SocketOption, SocketOptionLevel, SocketOptionName, UnixProtocol, errno::Errno,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use zerocopy::IntoBytes as _;
@@ -40,7 +40,7 @@ use crate::{
     GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut,
     syscalls::{
         file::{adopt_handle, linux_status_flags, status_flags_change},
-        net::{ReceivePlan, SOL_SOCKET, control_messages, open_flags, shutdown_mode},
+        net::{ReceivePlan, control_messages, open_flags, shutdown_mode},
     },
 };
 
@@ -271,8 +271,6 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         Ok(accepted.into())
     }
 
-    /// Sends `buf` to `addr`, or to the connected peer, carrying `objects`, whose receiver gets
-    /// descriptors for them (`SCM_RIGHTS`).
     pub(super) fn sendto(
         &self,
         task: &Task<Platform>,
@@ -312,8 +310,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     /// requested.
     ///
     /// The received data's carried objects are stored in `objects` up to its limit, and discarded
-    /// otherwise unless peeking, as Linux discards the descriptors a receive without room for
-    /// them would get. Every receive replaces what `objects` held.
+    /// otherwise unless peeking.
     pub(super) fn recvfrom(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -518,10 +515,6 @@ pub(super) fn max_received_fds(capacity: usize) -> usize {
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the objects of the descriptors that the `SCM_RIGHTS` messages among a Unix socket's
     /// `control` messages pass, as Linux's `__scm_send`.
-    ///
-    /// Like Linux, this ignores control messages of levels other than `SOL_SOCKET`, and fails with
-    /// `EINVAL` for a malformed message, an unknown type, or more than `SCM_MAX_FD` descriptors,
-    /// and with `EBADF` for a descriptor that is not open.
     pub(super) fn passed_objects(
         &self,
         control: &[u8],
@@ -529,11 +522,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut objects = Vec::new();
         for message in control_messages(control) {
             let message = message?;
-            if message.level != SOL_SOCKET {
+            let Some(SocketControlMessageName::Socket(kind)) = message.name else {
                 continue;
-            }
-            match SocketControlMessageType::try_from(message.kind) {
-                Ok(SocketControlMessageType::Rights) => {
+            };
+            match kind {
+                SocketControlMessageType::Rights => {
                     let (fds, _) = message.data.as_chunks::<{ size_of::<i32>() }>();
                     if objects.len() + fds.len() > SCM_MAX_FD {
                         return Err(Errno::EINVAL);
@@ -543,11 +536,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         objects.push(self.global.shareable_object(&fd)?.1);
                     }
                 }
-                Ok(SocketControlMessageType::Credentials) => {
+                SocketControlMessageType::Credentials => {
                     log_unsupported!("SCM_CREDENTIALS control messages");
                     return Err(Errno::EINVAL);
                 }
-                Err(_) => return Err(Errno::EINVAL),
             }
         }
         Ok(objects)
@@ -592,7 +584,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let length = CmsgHdr::LEN + installed * size_of::<i32>();
         let header = CmsgHdr {
             cmsg_len: length,
-            cmsg_level: SOL_SOCKET,
+            cmsg_level: SocketOptionLevel::SOCKET as i32,
             cmsg_type: SocketControlMessageType::Rights.into(),
         };
         // Like Linux, the descriptors stay installed even if the header cannot be written, which

@@ -233,10 +233,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// `buffer`, with handles to at most `options.max_objects` of the objects
     /// it carried.
     ///
-    /// Returns the broker's response with the sender's name, if
-    /// `options.source` is set, and the received objects, which the response
-    /// counts and the broker placed in `buffer`.
-    ///
     /// # Panics
     ///
     /// Panics if `buffer` is not `destination.len()` bytes, plus

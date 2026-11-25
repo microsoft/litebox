@@ -286,6 +286,26 @@ static void test_iovec_errors_precede_control_errors(void) {
                 "too many iovecs and unreadable control bytes over a Unix socket");
 }
 
+// Checks that `sendmsg` treats a destination of length zero as none, and parses an inet socket's
+// destination only after checking the iovec.
+static void test_inet_destination(void) {
+    struct sockaddr_in destination = {.sin_family = 12345};
+    struct iovec iov = {.iov_base = "x", .iov_len = 1};
+    struct msghdr msg = {.msg_name = &destination, .msg_iov = &iov, .msg_iovlen = 1};
+    TEST_ASSERT(sendmsg(udp_sender, &msg, 0) == 1, "a destination of length zero");
+    expect_received(udp_receiver);
+
+    msg.msg_namelen = sizeof(destination);
+    msg.msg_iovlen = IOV_MAX + 1;
+    errno = 0;
+    TEST_ASSERT(sendmsg(udp_sender, &msg, 0) == -1 && errno == EMSGSIZE,
+                "too many iovecs and an unknown address family");
+    msg.msg_iovlen = 1;
+    errno = 0;
+    TEST_ASSERT(sendmsg(udp_sender, &msg, 0) == -1 && errno == EAFNOSUPPORT,
+                "an unknown address family");
+}
+
 int main(void) {
     printf("Testing sendmsg control messages\n");
     // A watchdog, so a hang fails the test.
@@ -301,6 +321,7 @@ int main(void) {
     test_malformed_messages();
     test_every_socket_copies_control_bytes();
     test_iovec_errors_precede_control_errors();
+    test_inet_destination();
     printf("All sendmsg control message tests passed.\n");
     return 0;
 }

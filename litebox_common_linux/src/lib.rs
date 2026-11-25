@@ -2887,6 +2887,38 @@ pub enum SocketControlMessageType {
     Credentials = 2,
 }
 
+/// A control message's level and type, as [`SocketOptionName`] is a socket option's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketControlMessageName {
+    /// A `SOL_IP` message, of a type LiteBox doesn't interpret.
+    IP(i32),
+    /// A `SOL_SOCKET` message.
+    Socket(SocketControlMessageType),
+    /// A `SOL_UDP` message, of a type LiteBox doesn't interpret.
+    UDP(i32),
+}
+
+impl SocketControlMessageName {
+    /// Returns the name of a message of `level` and `kind`, or `None` for a level with no control
+    /// messages LiteBox knows, which every socket ignores.
+    ///
+    /// Fails with `EINVAL` for an unknown `SOL_SOCKET` type, which every socket that parses
+    /// control messages rejects, as Linux's `sock_cmsg_send` and `__scm_send` do.
+    pub fn try_from(level: i32, kind: i32) -> Result<Option<Self>, errno::Errno> {
+        let Ok(level) = SocketOptionLevel::try_from(level.cast_unsigned()) else {
+            return Ok(None);
+        };
+        Ok(match level {
+            SocketOptionLevel::IP => Some(Self::IP(kind)),
+            SocketOptionLevel::SOCKET => Some(Self::Socket(
+                SocketControlMessageType::try_from(kind).map_err(|_| errno::Errno::EINVAL)?,
+            )),
+            SocketOptionLevel::UDP => Some(Self::UDP(kind)),
+            SocketOptionLevel::TCP | SocketOptionLevel::RAW => None,
+        })
+    }
+}
+
 /// Linux's `struct mmsghdr`: a `msghdr` paired with the number of bytes
 /// transmitted, used by `sendmmsg`/`recvmmsg`.
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]

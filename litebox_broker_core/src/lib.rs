@@ -91,15 +91,8 @@ pub struct BrokerCoreLimits {
     /// completed core teardown.
     pub max_processes: usize,
     /// Maximum live object references across all processes.
-    ///
-    /// The references that queued Unix socket messages carry are limited to
-    /// the same count separately.
     pub max_references: usize,
     /// Maximum live object references owned by one process.
-    ///
-    /// The references a process sent that queued Unix socket messages carry
-    /// are limited to the same count separately, like Linux's
-    /// `RLIMIT_NOFILE` limit on descriptors in flight.
     pub max_references_per_process: usize,
     /// Maximum total capacity in bytes reserved by live pipes across all processes.
     pub max_total_pipe_capacity: usize,

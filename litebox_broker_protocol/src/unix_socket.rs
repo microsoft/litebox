@@ -411,9 +411,6 @@ wire_struct! {
         pub address_length: u32,
         /// Number of the caller's object handles whose objects the data
         /// carries, at most [`MAX_UNIX_SOCKET_OBJECTS`].
-        ///
-        /// The receiver gets its own references to the objects with the first
-        /// byte of the data. A stream socket that sends no data carries none.
         pub object_count: u32,
         /// Caller identity for filesystem permission checks.
         pub user: FileUser,
@@ -456,9 +453,6 @@ wire_struct! {
         pub capacity: u32,
         /// Maximum carried objects to receive handles for, at most
         /// [`MAX_UNIX_SOCKET_OBJECTS`].
-        ///
-        /// Unless peeking, the receive discards the carried objects beyond
-        /// this.
         pub max_objects: u32,
         /// Whether to leave the data queued.
         pub peek: bool,

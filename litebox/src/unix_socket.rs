@@ -270,8 +270,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     ///
     /// The data carries `objects`, at most
     /// [`MAX_UNIX_SOCKET_OBJECTS`](litebox_broker_protocol::unix_socket::MAX_UNIX_SOCKET_OBJECTS),
-    /// so its receiver gets its own references to them with the first byte. A
-    /// stream socket that sends no data carries none.
+    /// so its receiver gets its own references to them with the first byte.
     pub fn send(
         &self,
         cx: &WaitContext<'_, Platform>,

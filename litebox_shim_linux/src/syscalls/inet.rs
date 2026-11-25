@@ -35,8 +35,7 @@ use litebox_broker_protocol::{
 };
 use litebox_common_linux::{
     AddressFamily, IPProtocol, IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags,
-    SockType, SocketControlMessageType, SocketOption, SocketOptionLevel, SocketOptionName,
-    TcpOption, errno::Errno,
+    SockType, SocketControlMessageName, SocketOption, SocketOptionName, TcpOption, errno::Errno,
 };
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -45,7 +44,7 @@ use crate::{
     GlobalState, ShimPlatform, UserPtr, UserPtrMut,
     syscalls::{
         file::{linux_status_flags, status_flags_change},
-        net::{ReceivePlan, SOL_SOCKET, control_messages, open_flags, shutdown_mode},
+        net::{ReceivePlan, control_messages, open_flags, shutdown_mode},
     },
     wait::wait_errno,
 };
@@ -147,34 +146,19 @@ pub(super) fn write_sockaddr<Platform: ShimPlatform>(
     Ok(bytes.len())
 }
 
-/// Checks the `control` messages that `sendmsg` passes to a TCP socket if `stream` is set, or to a
-/// UDP one, as Linux's `sock_cmsg_send` and, for UDP, `udp_cmsg_send` and `ip_cmsg_send` do.
-///
-/// Like Linux, this ignores the descriptors and credentials that only Unix sockets pass, and the
-/// levels the socket doesn't parse: all but `SOL_SOCKET` and, for UDP, `SOL_IP` and `SOL_UDP`.
-/// It fails with `EINVAL` for every other message: Linux does too for malformed
-/// messages and unknown types, but LiteBox supports none of the types Linux acts on, such as
-/// `SO_MARK` or `IP_PKTINFO`.
-pub(super) fn check_send_control(control: &[u8], stream: bool) -> Result<(), Errno> {
-    const SOL_IP: i32 = SocketOptionLevel::IP as i32;
-    const SOL_UDP: i32 = SocketOptionLevel::UDP as i32;
-
+/// Checks the `control` messages that `sendmsg` passes to an inet socket of `socket_type`, as
+/// Linux's `sock_cmsg_send` and, for UDP, `udp_cmsg_send` and `ip_cmsg_send` do.
+pub(super) fn check_send_control(control: &[u8], socket_type: SocketType) -> Result<(), Errno> {
     for message in control_messages(control) {
         let message = message?;
-        let parsed = match message.level {
-            SOL_SOCKET => !matches!(
-                SocketControlMessageType::try_from(message.kind),
-                Ok(SocketControlMessageType::Rights | SocketControlMessageType::Credentials)
-            ),
-            SOL_IP | SOL_UDP => !stream,
-            _ => false,
-        };
+        // Every known `SOL_SOCKET` type passes descriptors or credentials, which only Unix
+        // sockets act on.
+        let parsed = matches!(
+            message.name,
+            Some(SocketControlMessageName::IP(_) | SocketControlMessageName::UDP(_))
+        ) && socket_type == SocketType::Datagram;
         if parsed {
-            log_unsupported!(
-                "control message of level {} and type {}",
-                message.level,
-                message.kind
-            );
+            log_unsupported!("control message {:?}", message.name);
             return Err(Errno::EINVAL);
         }
     }

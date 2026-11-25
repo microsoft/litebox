@@ -27,8 +27,8 @@ use litebox_broker_protocol::{
 };
 use litebox_common_linux::{
     AddressFamily, CmsgHdr, FileDescriptorFlags, IoReadVec, IoWriteVec, ReceiveFlags, SendFlags,
-    ShutdownHow, SockFlags, SockType, SocketOption, SocketOptionName, UserMmsgHdr, UserMsgHdr,
-    errno::Errno,
+    ShutdownHow, SockFlags, SockType, SocketControlMessageName, SocketOption, SocketOptionName,
+    UserMmsgHdr, UserMsgHdr, errno::Errno,
 };
 use litebox_common_linux::{PAGE_SIZE, mm::VmemManager};
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
@@ -265,11 +265,6 @@ pub(super) fn shutdown_mode(how: ShutdownHow) -> ShutdownMode {
     }
 }
 
-/// Copies the `length` control bytes at `control` that `sendmsg` passes, as Linux does for every
-/// socket before the socket parses them, even when they are too few for a message.
-///
-/// Fails with `ENOBUFS` for at least Linux's default `optmem_max` bytes, and with `EFAULT` if the
-/// bytes are not readable.
 fn copy_send_control<Platform: ShimPlatform>(
     control: UserPtr<u8>,
     length: usize,
@@ -288,22 +283,16 @@ fn copy_send_control<Platform: ShimPlatform>(
         .ok_or(Errno::EFAULT)
 }
 
-/// `SOL_SOCKET`, the level of the control messages every socket parses.
-pub(super) const SOL_SOCKET: i32 = litebox_common_linux::SocketOptionLevel::SOCKET as i32;
-
 /// A control message that `sendmsg` passes.
 pub(super) struct ControlMessage<'a> {
-    /// The message's level, such as `SOL_SOCKET`.
-    pub(super) level: i32,
-    /// The message's type within its level.
-    pub(super) kind: i32,
+    /// The message's level and type, or `None` for a level with no control messages LiteBox
+    /// knows, which every socket ignores.
+    pub(super) name: Option<SocketControlMessageName>,
     /// The message's data.
     pub(super) data: &'a [u8],
 }
 
-/// Returns the control messages in `control` in order, as Linux's `for_each_cmsghdr` walks them:
-/// trailing bytes too few for a header are ignored, and a message whose length is shorter than
-/// its header or runs past `control` ends the walk with `EINVAL`.
+/// Returns the control messages in `control` in order, as Linux's `for_each_cmsghdr` walks them.
 pub(super) fn control_messages(
     control: &[u8],
 ) -> impl Iterator<Item = Result<ControlMessage<'_>, Errno>> {
@@ -318,12 +307,15 @@ pub(super) fn control_messages(
         let Some(header) = header else {
             return Some(Err(Errno::EINVAL));
         };
+        let name = match SocketControlMessageName::try_from(header.cmsg_level, header.cmsg_type) {
+            Ok(name) => name,
+            Err(errno) => return Some(Err(errno)),
+        };
         next = offset
             .checked_add(CmsgHdr::align(header.cmsg_len))
             .filter(|&next| next <= control.len());
         Some(Ok(ControlMessage {
-            level: header.cmsg_level,
-            kind: header.cmsg_type,
+            name,
             data: &control[offset + CmsgHdr::LEN..offset + header.cmsg_len],
         }))
     })
@@ -901,21 +893,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 msg.msg_namelen as usize,
             )
         };
-        // Like Linux, which copies the destination first, but never parses a vsock socket's, and
-        // parses a Unix socket's only after its control messages.
-        let is_vsock = matches!(socket, AnyTypedFd::Vsock(_));
-        let is_unix = matches!(socket, AnyTypedFd::Unix(_));
-        let copied_destination = (is_vsock || is_unix)
-            && vsock::copy_msg_destination::<Platform>(
-                UserPtr::from_usize(msg_name.as_usize()),
-                msg.msg_namelen,
-            )?;
-        let vsock_destination = is_vsock && copied_destination;
-        let mut sock_addr = if msg_name.as_usize() != 0 && !is_vsock && !is_unix {
-            Some(read_destination()?)
-        } else {
-            None
-        };
+        // Like Linux, every socket copies the destination first. An inet or Unix socket parses it
+        // when sending, a Unix socket only after its control messages. A vsock socket's
+        // destination is never parsed, and fails the send.
+        let copied_destination = vsock::copy_msg_destination::<Platform>(
+            UserPtr::from_usize(msg_name.as_usize()),
+            msg.msg_namelen,
+        )?;
         if msg.msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
         }
@@ -933,40 +917,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Like Linux, every socket copies the control bytes, then parses them its own way: a vsock
         // socket ignores them.
         let control = copy_send_control::<Platform>(msg.msg_control, msg.msg_controllen)?;
-        let objects = if is_unix {
-            let objects = self.passed_objects(&control)?;
-            if msg_name.as_usize() != 0 {
-                sock_addr = Some(read_destination()?);
-            }
-            objects
-        } else {
-            alloc::vec::Vec::new()
-        };
         let is_message_oriented = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
             |socket| {
                 is_message_oriented.set(!socket.is_stream());
-                let sock_addr = sock_addr
-                    .clone()
-                    .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
-                    .transpose()?;
+                let sock_addr = if copied_destination {
+                    Some(read_destination()?.inet().ok_or(Errno::EAFNOSUPPORT)?)
+                } else {
+                    None
+                };
                 // Linux parses the messages only after checking a UDP datagram's size and
                 // destination and a TCP socket's connection, which come later here; that only
                 // changes which error a send failing both ways reports.
-                inet::check_send_control(&control, socket.is_stream())?;
+                inet::check_send_control(&control, socket.inet_socket().socket_type())?;
                 socket.sendto(&self.wait_cx(), &data, flags, sock_addr)
             },
             |file| {
-                let unix_addr = sock_addr
-                    .clone()
-                    .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
-                    .transpose()?;
+                let objects = self.passed_objects(&control)?;
+                let unix_addr = if copied_destination {
+                    Some(read_destination()?.unix().ok_or(Errno::EAFNOSUPPORT)?)
+                } else {
+                    None
+                };
                 is_message_oriented.set(!file.is_stream());
                 file.sendto(self, &data, flags, unix_addr, &objects)
             },
-            |socket| socket.sendto(&self.wait_cx(), &data, flags, vsock_destination),
+            |socket| socket.sendto(&self.wait_cx(), &data, flags, copied_destination),
         );
         self.send_sigpipe_on_epipe(&res, is_message_oriented.get(), flags);
         res
@@ -1280,7 +1258,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
 
-        // Report the control bytes delivered, which only pass descriptors.
         let control_used = match objects {
             Some(objects) => {
                 let (used, truncated) = self.install_received_objects(
