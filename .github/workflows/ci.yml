@@ -11,6 +11,12 @@ on:
   pull_request:
   merge_group:
   workflow_dispatch:
+    inputs:
+      cpu_time_stress:
+        # TEMPORARY: see the `cpu_time_stress` job.
+        description: Only stress test_native::cpu_time_parent on AArch64
+        type: boolean
+        default: false
 
 # If a new commit is pushed to the branch before ongoing runs finish, cancel the ongoing runs
 concurrency:
@@ -24,6 +30,8 @@ env:
 jobs:
   build_and_test:
     name: Build and Test
+    # TEMPORARY: skipped when only stressing cpu_time_parent.
+    if: ${{ !inputs.cpu_time_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -146,6 +154,8 @@ jobs:
 
   test_vmm:
     name: Build and Test on VMMs (KVM)
+    # TEMPORARY: skipped when only stressing cpu_time_parent.
+    if: ${{ !inputs.cpu_time_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -265,6 +275,8 @@ jobs:
 
   build_and_test_riscv64:
     name: Build and Test (RV64 Linux, QEMU user mode)
+    # TEMPORARY: skipped when only stressing cpu_time_parent.
+    if: ${{ !inputs.cpu_time_stress }}
     runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: -Dwarnings
@@ -294,6 +306,8 @@ jobs:
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
+    # TEMPORARY: skipped when only stressing cpu_time_parent.
+    if: ${{ !inputs.cpu_time_stress }}
     runs-on: ubuntu-24.04-arm
     env:
       RUSTFLAGS: -Dwarnings
@@ -421,6 +435,8 @@ jobs:
 
   build_and_test_macos_arm64:
     name: Build and Test (macOS AArch64)
+    # TEMPORARY: skipped when only stressing cpu_time_parent.
+    if: ${{ !inputs.cpu_time_stress }}
     runs-on: macos-26
     env:
       RUSTFLAGS: -Dwarnings
@@ -471,6 +487,8 @@ jobs:
 
   build_and_test_lvbs:
     name: Build and Test LVBS
+    # TEMPORARY: skipped when only stressing cpu_time_parent.
+    if: ${{ !inputs.cpu_time_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -535,6 +553,8 @@ jobs:
 
   build_and_test_windows:
     name: Build and Test Windows
+    # TEMPORARY: skipped when only stressing cpu_time_parent.
+    if: ${{ !inputs.cpu_time_stress }}
     runs-on: windows-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -659,6 +679,8 @@ jobs:
 
   build_and_test_snp:
     name: Build and Test SNP
+    # TEMPORARY: skipped when only stressing cpu_time_parent.
+    if: ${{ !inputs.cpu_time_stress }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -684,6 +706,8 @@ jobs:
 
   confirm_no_std:
     name: Confirm no_std
+    # TEMPORARY: skipped when only stressing cpu_time_parent.
+    if: ${{ !inputs.cpu_time_stress }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
@@ -870,3 +894,88 @@ jobs:
             -not -path './litebox_containerd_shim/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'
+
+  # TEMPORARY: stresses `test_native::cpu_time_parent`, which fails rarely on these runners and
+  # never locally, and prints the checks that fail. Run with `gh workflow run CI --ref <branch>
+  # -f cpu_time_stress=true`; do not merge.
+  cpu_time_stress:
+    name: cpu_time_parent stress (${{ matrix.load }}, shard ${{ matrix.shard }})
+    if: github.event_name == 'workflow_dispatch' && inputs.cpu_time_stress
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # `idle` runs the test alone; `loaded` runs it next to the runner's other tests, as the
+        # AArch64 job's `nextest` step does.
+        load: [idle, loaded]
+        shard: [1, 2, 3, 4]
+    env:
+      # How long to keep stressing.
+      STRESS_SECONDS: 3600
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target aarch64-unknown-none
+      - name: Set up Nextest
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iperf3 diod
+      - name: Allow unprivileged user namespaces
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Build
+        run: |
+          cargo build --locked -p litebox_broker_userland -p litebox_egress_proxy
+          cargo nextest run --locked --profile ci -p litebox_runner_linux_userland --no-run
+          # Builds the native fixture once, so that the runs below only run it.
+          cargo nextest run --locked --profile ci -p litebox_runner_linux_userland \
+            -E 'test(=test_native::cpu_time_parent)' || true
+      - name: Stress
+        run: |
+          nproc
+          mkdir -p "$RUNNER_TEMP/logs"
+          end=$((SECONDS + STRESS_SECONDS))
+          if [ "${{ matrix.load }}" = loaded ]; then
+            # The rest of the runner's tests, over and over, in a process group of its own so that
+            # it can be stopped as a whole.
+            setsid bash -c '
+              i=0
+              while [ $SECONDS -lt '"$STRESS_SECONDS"' ]; do
+                i=$((i + 1))
+                cargo nextest run --locked --profile ci -p litebox_runner_linux_userland \
+                  -E "not test(=test_native::cpu_time_parent)" \
+                  > "$RUNNER_TEMP/logs/suite-$i.log" 2>&1 || true
+              done
+            ' &
+            load=$!
+            trap 'kill -- -$load 2>/dev/null' EXIT
+          fi
+          # The test itself, as many times as fit, without retries so that every failure shows.
+          i=0
+          failed=0
+          while [ $SECONDS -lt $end ]; do
+            i=$((i + 1))
+            log="$RUNNER_TEMP/logs/cpu-time-$i.log"
+            if ! cargo nextest run --locked --profile ci --retries 0 -p litebox_runner_linux_userland \
+              -E 'test(=test_native::cpu_time_parent)' > "$log" 2>&1; then
+              failed=$((failed + 1))
+              echo "::group::cpu_time_parent run $i failed"
+              cat "$log"
+              echo "::endgroup::"
+              grep -h 'FAIL line' "$log" | sed "s/^/run $i: /" || true
+            fi
+          done
+          echo "cpu_time_parent runs: $i, failures: $failed"
+          if [ $failed -ne 0 ]; then
+            echo "::error::cpu_time_parent failed $failed of $i runs"
+            exit 1
+          fi
