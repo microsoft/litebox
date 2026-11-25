@@ -125,9 +125,7 @@ struct SharedView {
 ///
 /// Windows unmaps only whole views, so detaching part of one briefly unmaps the rest before
 /// mapping it again. Holding the lock spans that window: the exception handler waits on it to
-/// retry accesses that raced with a split, which is why the table is process-wide. The same lock
-/// serializes native operations on existing reservations, including different logical
-/// reservations that share one native allocation.
+/// retry accesses that raced with a split.
 struct SharedViewTable {
     /// Views by start address.
     views: Mutex<BTreeMap<usize, SharedView>>,
@@ -220,12 +218,11 @@ impl SharedViews {
     /// Windows only allows unmapping the full view, so partial unmapping requires unmapping the
     /// entire view and remapping the surviving parts.
     ///
-    /// Remapped parts briefly allow every access their section allows before their per-page
-    /// protections are restored, since a view's mapping protection also bounds later protection
-    /// changes. A concurrent guest access that the restored protections would deny can therefore
-    /// succeed during a split. This only affects the guest's own memory, and avoiding it would
-    /// require suspending guest threads. Accesses the section itself does not allow, such as
-    /// executing a section delivered without execute rights, still fail throughout.
+    /// Remapped parts briefly allow every access their section allows before their protections
+    /// are restored, since a view's mapping protection also bounds later protection changes. A
+    /// concurrent guest access that the restored protections would deny can therefore succeed
+    /// during a split. This only affects the guest's own memory, and avoiding it would require
+    /// suspending guest threads.
     fn detach(&mut self, range: Range<usize>) {
         for start in self.overlapping(&range) {
             let view = self.views.remove(&start).unwrap();
@@ -786,7 +783,6 @@ fn map_section(
     permissions: MemoryRegionPermissions,
 ) -> Result<(), AllocationError> {
     debug_assert!(section.max_permissions.contains(permissions));
-    let flags = prot_flags(permissions);
     let mut views = SharedViews::lock();
     SHARED_VIEWS.used.store(true, Ordering::Release);
     for allocation in allocations(range.clone()) {
@@ -813,9 +809,9 @@ fn map_section(
         );
         // Views are mapped with the section's full access, which also bounds later protection
         // changes, so narrow it to the requested protection separately.
-        if flags != prot_flags(section.max_permissions) {
+        if permissions != section.max_permissions {
             assert!(
-                protect(&allocation, flags),
+                protect(&allocation, prot_flags(permissions)),
                 "failed to protect shared view: {}",
                 std::io::Error::last_os_error()
             );
@@ -944,7 +940,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
                 .all(|pair| pair[0].range().end == pair[1].range().start),
             "merge_reservations requires ascending, contiguous reservations"
         );
-        let _views = SharedViews::lock();
         for reservation in &reservations {
             for allocation in allocations(reservation.range()) {
                 make_placeholder(allocation);
@@ -991,7 +986,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         if options.contains(AllocationOptions::SHARED) {
             self.commit_shared_pages(range.clone(), permissions)?;
         } else {
-            let _views = SharedViews::lock();
             let flags = prot_flags(permissions);
             for allocation in allocations(range.clone()) {
                 if !Self::commit_private_pages(allocation, flags) {
@@ -1016,8 +1010,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     {
         debug_assert_alignment!(range, ALIGN);
         // Detached shared pages are left reserved, so decommitting them has no effect.
-        let mut views = SharedViews::lock();
-        views.detach(range.clone());
+        SharedViews::lock().detach(range.clone());
         for allocation in allocations(range) {
             assert_ne!(
                 // SAFETY: The caller exclusively owns and excludes users of these pages.
@@ -1042,8 +1035,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         let extent = reservation.range();
         // Detached shared pages are left reserved, so every page is released the same way.
-        let mut views = SharedViews::lock();
-        views.detach(extent.clone());
+        SharedViews::lock().detach(extent.clone());
         for allocation in allocations(extent) {
             Self::release_private_extent(allocation);
         }
@@ -1062,8 +1054,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     {
         debug_assert_alignment!(range, ALIGN);
         let views = SharedViews::lock();
-        // Check the entire range before modifying any allocation. In particular a request to
-        // execute a non-executable shared section must not change protection elsewhere first.
+        // Check the entire range before modifying any allocation.
         if views.overlapping(&range).iter().any(|start| {
             !views.views[start]
                 .section

@@ -289,9 +289,6 @@ impl SharedObjectDelivery for SectionDelivery {
         let file = usize::try_from(file.raw())
             .map_err(|_| IoError::other("host handle does not fit a pointer"))?
             as windows_sys::Win32::Foundation::HANDLE;
-        // Only a writable section can extend the file to cover `end`. A runner that may only read
-        // the file still cannot map it writable: it receives no right to.
-        // File mappings may be executable, as `mmap` allows with `PROT_EXEC`.
         let section = section(file, end)?;
         self.0.send(section, writable, true)
     }
