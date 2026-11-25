@@ -394,11 +394,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok(Process::new(self, broker, handle))
     }
 
-    /// Returns the process `handle` refers to.
+    /// Returns the process this process inherited from its parent as `handle`
+    /// through [`PendingChild::inherit`], or received with Unix socket data.
     ///
     /// The [`Process`] owns `handle`, so callers adopt each handle once and
     /// share the [`Process`] for every other use.
-    pub fn adopt_process(&self, handle: ObjectHandle) -> Result<Process<Platform>, ProcessError> {
+    pub fn adopt_inherited_process(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Process<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(Process::new(self, broker, handle))
     }
@@ -410,23 +414,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
 /// This identifies only the object. The shim records guest-specific details, such as the
 /// descriptor number, in the child's startup payload alongside the handle `inherit` returns.
 pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    /// A file, adopted with [`LiteBox::adopt_file`].
+    /// A file, adopted with [`LiteBox::adopt_inherited_file`].
     File(Arc<File<Platform>>),
-    /// A pipe end, adopted with [`LiteBox::adopt_pipe`].
+    /// A pipe end, adopted with [`LiteBox::adopt_inherited_pipe`].
     Pipe(Arc<PipeEnd<Platform>>),
-    /// A Unix socket, adopted with [`LiteBox::adopt_unix_socket`].
+    /// A Unix socket, adopted with [`LiteBox::adopt_inherited_unix_socket`].
     UnixSocket(Arc<UnixSocket<Platform>>),
-    /// An IPv4 socket, adopted with [`LiteBox::adopt_inet_socket`].
+    /// An IPv4 socket, adopted with [`LiteBox::adopt_inherited_inet_socket`].
     InetSocket(Arc<InetSocket<Platform>>),
-    /// A vsock socket, adopted with [`LiteBox::adopt_vsock_socket`].
+    /// A vsock socket, adopted with [`LiteBox::adopt_inherited_vsock_socket`].
     VsockSocket(Arc<VsockSocket<Platform>>),
-    /// An event counter, adopted with [`LiteBox::adopt_event_counter`].
+    /// An event counter, adopted with [`LiteBox::adopt_inherited_event_counter`].
     EventCounter(Arc<EventCounter<Platform>>),
-    /// A timer, adopted with [`LiteBox::adopt_timer`].
+    /// A timer, adopted with [`LiteBox::adopt_inherited_timer`].
     Timer(Arc<Timer<Platform>>),
-    /// A readiness queue, adopted with [`LiteBox::adopt_readiness_queue`].
+    /// A readiness queue, adopted with [`LiteBox::adopt_inherited_readiness_queue`].
     ReadinessQueue(Arc<ReadinessQueue<Platform>>),
-    /// A process, adopted with [`LiteBox::adopt_process`].
+    /// A process, adopted with [`LiteBox::adopt_inherited_process`].
     Process(Arc<Process<Platform>>),
 }
 

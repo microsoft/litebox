@@ -171,11 +171,16 @@ where
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    /// Returns the timer `handle` refers to.
+    /// Returns the timer this process inherited from its parent as `handle`
+    /// through [`PendingChild::inherit`](crate::process::PendingChild::inherit),
+    /// or received with Unix socket data.
     ///
     /// The timer owns `handle`, so callers adopt each handle once and share
     /// the timer for every other use.
-    pub fn adopt_timer(&self, handle: ObjectHandle) -> Result<Timer<Platform>, ProcessError> {
+    pub fn adopt_inherited_timer(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Timer<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(Timer::from_handle(self, broker, handle))
     }

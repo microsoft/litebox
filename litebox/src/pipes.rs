@@ -88,12 +88,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok((writer, reader))
     }
 
-    /// Returns the pipe end of type `endpoint_type` `handle` refers to.
+    /// Returns the pipe end of type `endpoint_type` this process inherited
+    /// from its parent as `handle` through
+    /// [`PendingChild::inherit`](crate::process::PendingChild::inherit), or
+    /// received with Unix socket data.
     ///
     /// The end owns `handle`, so callers adopt each handle once and share the
     /// end for every other use. The end has no peer in this process, so broker
     /// readiness notifications alone wake its waiters.
-    pub fn adopt_pipe(
+    pub fn adopt_inherited_pipe(
         &self,
         handle: ObjectHandle,
         endpoint_type: HalfPipeType,

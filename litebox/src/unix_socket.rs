@@ -77,8 +77,8 @@ impl ReceivedObject {
     }
 
     /// Gives up ownership of the reference's handle, which the caller adopts
-    /// as [`Self::kind`] describes, with the `adopt_*` method of
-    /// [`LiteBox`] for that kind, such as [`LiteBox::adopt_file`].
+    /// as [`Self::kind`] describes, with the `adopt_inherited_*` method of
+    /// [`LiteBox`] for that kind, such as [`LiteBox::adopt_inherited_file`].
     pub fn into_handle(mut self) -> ObjectHandle {
         self.adopted = true;
         self.handle
@@ -148,11 +148,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         ))
     }
 
-    /// Returns the Unix socket of type `socket_type` `handle` refers to.
+    /// Returns the Unix socket of type `socket_type` this process inherited
+    /// from its parent, or received with Unix socket data, as `handle`.
     ///
     /// The socket owns `handle`, so callers adopt each handle once and share
     /// the socket for every other use.
-    pub fn adopt_unix_socket(
+    pub fn adopt_inherited_unix_socket(
         &self,
         handle: ObjectHandle,
         socket_type: SocketType,

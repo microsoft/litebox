@@ -111,12 +111,13 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts the eventfd `handle` refers to.
-    pub(crate) fn adopt_eventfd(
+    /// Adopts an eventfd this process inherited from its parent, or received with Unix socket
+    /// data, as `handle`.
+    pub(crate) fn adopt_inherited_eventfd(
         &self,
         handle: ObjectHandle,
     ) -> Result<EventfdFd<Platform>, ProcessError> {
-        let counter = self.litebox.adopt_event_counter(handle)?;
+        let counter = self.litebox.adopt_inherited_event_counter(handle)?;
         Ok(self
             .litebox
             .descriptor_table_mut()

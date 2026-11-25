@@ -182,11 +182,13 @@ where
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    /// Returns the event counter `handle` refers to.
+    /// Returns the event counter this process inherited from its parent as
+    /// `handle` through [`PendingChild::inherit`](crate::process::PendingChild::inherit),
+    /// or received with Unix socket data.
     ///
     /// The counter owns `handle`, so callers adopt each handle once and share
     /// the counter for every other use.
-    pub fn adopt_event_counter(
+    pub fn adopt_inherited_event_counter(
         &self,
         handle: ObjectHandle,
     ) -> Result<EventCounter<Platform>, ProcessError> {

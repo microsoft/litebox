@@ -207,12 +207,13 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts the process `handle` refers to as a pidfd.
-    pub(crate) fn adopt_pidfd(
+    /// Adopts a pidfd this process inherited from its parent, or received with Unix socket
+    /// data, as `handle`.
+    pub(crate) fn adopt_inherited_pidfd(
         &self,
         handle: ObjectHandle,
     ) -> Result<PidfdFd<Platform>, ProcessError> {
-        let process = self.litebox.adopt_process(handle)?;
+        let process = self.litebox.adopt_inherited_process(handle)?;
         Ok(self
             .litebox
             .descriptor_table_mut()

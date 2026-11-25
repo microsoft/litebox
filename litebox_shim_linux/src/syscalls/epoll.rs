@@ -341,12 +341,13 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts the epoll instance `handle` refers to.
-    pub(crate) fn adopt_epoll(
+    /// Adopts an epoll instance this process inherited from its parent, or received with Unix
+    /// socket data, as `handle`.
+    pub(crate) fn adopt_inherited_epoll(
         &self,
         handle: ObjectHandle,
     ) -> Result<EpollFd<Platform>, ProcessError> {
-        let queue = self.litebox.adopt_readiness_queue(handle)?;
+        let queue = self.litebox.adopt_inherited_readiness_queue(handle)?;
         Ok(self
             .litebox
             .descriptor_table_mut()

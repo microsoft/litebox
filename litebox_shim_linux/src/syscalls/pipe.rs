@@ -143,13 +143,14 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts the pipe end `handle` refers to.
-    pub(crate) fn adopt_pipe_end(
+    /// Adopts a pipe end this process inherited from its parent, or received with Unix socket
+    /// data, as `handle`.
+    pub(crate) fn adopt_inherited_pipe_end(
         &self,
         handle: ObjectHandle,
         endpoint_type: HalfPipeType,
     ) -> Result<PipeFd<Platform>, litebox::process::ProcessError> {
-        let end = self.litebox.adopt_pipe(handle, endpoint_type)?;
+        let end = self.litebox.adopt_inherited_pipe(handle, endpoint_type)?;
         Ok(self
             .litebox
             .descriptor_table_mut()

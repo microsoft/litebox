@@ -252,12 +252,13 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         })
     }
 
-    /// Adopts the file `handle` refers to.
-    pub(crate) fn adopt_file(
+    /// Adopts a file this process inherited from its parent, or received with Unix socket
+    /// data, as `handle`.
+    pub(crate) fn adopt_inherited_file(
         &self,
         handle: ObjectHandle,
     ) -> Result<FileFd<Platform>, litebox::process::ProcessError> {
-        let file = self.litebox.adopt_file(handle)?;
+        let file = self.litebox.adopt_inherited_file(handle)?;
         Ok(self
             .litebox
             .descriptor_table_mut()
@@ -437,43 +438,44 @@ macro_rules! adopt_handle {
         use litebox_broker_protocol::ObjectKind;
         match $kind {
             ObjectKind::File => {
-                let $adopt = || $global.adopt_file($handle);
+                let $adopt = || $global.adopt_inherited_file($handle);
                 $install
             }
             ObjectKind::PipeReadEnd => {
-                let $adopt = || $global.adopt_pipe_end($handle, HalfPipeType::ReceiverHalf);
+                let $adopt =
+                    || $global.adopt_inherited_pipe_end($handle, HalfPipeType::ReceiverHalf);
                 $install
             }
             ObjectKind::PipeWriteEnd => {
-                let $adopt = || $global.adopt_pipe_end($handle, HalfPipeType::SenderHalf);
+                let $adopt = || $global.adopt_inherited_pipe_end($handle, HalfPipeType::SenderHalf);
                 $install
             }
             ObjectKind::UnixSocket(socket_type) => {
-                let $adopt = || $global.adopt_unix_socket($handle, socket_type);
+                let $adopt = || $global.adopt_inherited_unix_socket($handle, socket_type);
                 $install
             }
             ObjectKind::InetSocket(socket_type) => {
-                let $adopt = || $global.adopt_inet_socket($handle, socket_type);
+                let $adopt = || $global.adopt_inherited_inet_socket($handle, socket_type);
                 $install
             }
             ObjectKind::EventCounter => {
-                let $adopt = || $global.adopt_eventfd($handle);
+                let $adopt = || $global.adopt_inherited_eventfd($handle);
                 $install
             }
             ObjectKind::Timer => {
-                let $adopt = || $global.adopt_timerfd($handle);
+                let $adopt = || $global.adopt_inherited_timerfd($handle);
                 $install
             }
             ObjectKind::ReadinessQueue => {
-                let $adopt = || $global.adopt_epoll($handle);
+                let $adopt = || $global.adopt_inherited_epoll($handle);
                 $install
             }
             ObjectKind::VsockSocket => {
-                let $adopt = || $global.adopt_vsock_socket($handle);
+                let $adopt = || $global.adopt_inherited_vsock_socket($handle);
                 $install
             }
             ObjectKind::Process => {
-                let $adopt = || $global.adopt_pidfd($handle);
+                let $adopt = || $global.adopt_inherited_pidfd($handle);
                 $install
             }
         }
