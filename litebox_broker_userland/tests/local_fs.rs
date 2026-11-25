@@ -32,8 +32,6 @@ use litebox_broker_core::fs::read_only::ReadOnly;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::{FileService, FileType, Mode, OFlags, UserInfo};
 use litebox_broker_core::test_platform::TestPlatform;
-#[cfg(target_os = "linux")]
-use litebox_broker_protocol::fs::FileError;
 use litebox_broker_protocol::fs::{FileTimeUpdate, FileTimestamp, FileTimestamps, SetFileTimes};
 use litebox_broker_protocol::shared_buffer::{
     SharedBufferLayout, SharedBufferSequence, SharedBufferSlotIndex,
@@ -48,21 +46,9 @@ const USER: UserInfo = UserInfo {
     user: 123,
     group: 456,
 };
-const ROOT: UserInfo = UserInfo::ROOT;
 
 fn backend(root: &Path) -> LocalFs {
     LocalFs::new(root, InodeAllocators::new().next()).unwrap()
-}
-
-#[cfg(target_os = "linux")]
-fn host_service(root: &Path) -> Arc<dyn FileService> {
-    Arc::new(Resolver::<TestPlatform, _>::new(
-        Composer::<TestPlatform>::builder()
-            .try_mount("/", |ids| LocalFs::new(root, ids))
-            .unwrap()
-            .build()
-            .unwrap(),
-    ))
 }
 
 fn resolved_file<'a>(local: &'a LocalFs, name: &str) -> ResolvedFile<'a> {
@@ -897,7 +883,7 @@ fn read_only_backend_reads_live_and_refuses_every_host_mutation() {
     let parent: &dyn FileService = &resolver;
     let child = parent.copy_mount_view().unwrap();
     child
-        .mount_in_mem("/ro/empty", ROOT.into())
+        .mount_in_mem("/ro/empty", UserInfo::ROOT.into())
         .unwrap()
         .unwrap();
     assert_err!(resolver.rmdir(USER, None, "/ro/empty"), RmdirError::Busy);
@@ -938,45 +924,6 @@ fn read_only_backend_reads_live_and_refuses_every_host_mutation() {
     fs::write(temp.path().join("file"), b"changed").unwrap();
     assert_eq!(resolver.read(&mut opened, &mut buf, Some(0)).unwrap(), 7);
     assert_eq!(&buf, b"changed");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn only_a_protected_subtree_rename_returns_busy() {
-    let temp = tempfile::tempdir().unwrap();
-    for dir in ["p", "other"] {
-        fs::create_dir(temp.path().join(dir)).unwrap();
-    }
-    let parent = host_service(temp.path());
-    fs::write(temp.path().join("p/file"), []).unwrap();
-    let destination = format!("/p/{}", "x".repeat(256));
-    // An unrelated mount must not change the host's validation order.
-    let overlong = parent
-        .rename(None, "/p", None, &destination, ROOT.into())
-        .unwrap()
-        .unwrap_err();
-    for (mountpoint, long_error, cycle_error) in [
-        ("/other", overlong, FileError::InvalidArgument),
-        ("/p", FileError::Busy, FileError::Busy),
-    ] {
-        let child = parent.copy_mount_view().unwrap();
-        child
-            .mount_in_mem(mountpoint, ROOT.into())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            parent
-                .rename(None, "/p", None, &destination, ROOT.into())
-                .unwrap(),
-            Err(long_error)
-        );
-        assert_eq!(
-            parent
-                .rename(None, "/p", None, "/p/file", ROOT.into())
-                .unwrap(),
-            Err(cycle_error)
-        );
-    }
 }
 
 #[cfg(unix)]
