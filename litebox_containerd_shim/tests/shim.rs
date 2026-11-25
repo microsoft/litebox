@@ -3,7 +3,8 @@
 
 //! Runs the shim daemon as containerd does, against a fake containerd event service, with the
 //! real broker and guest service, on each backend: `userland::<test>`, and `vm::<test>`, ignored
-//! by default, in QEMU with `vhost-device-vsock` (`VHOST_DEVICE_VSOCK`, else from `PATH`).
+//! by default, in QEMU with `vhost-device-vsock` (`VHOST_DEVICE_VSOCK`, else from `PATH`) and
+//! `virtiofsd` (`VIRTIOFSD`, else as the shim finds it).
 
 #![cfg(target_os = "linux")]
 
@@ -265,14 +266,19 @@ impl Shim {
             Backend::Userland => daemon
                 .env("LITEBOX_BROKER", program)
                 .env("LITEBOX_RUNNER", built_runner),
-            Backend::Vm => daemon
-                .env("LITEBOX_VM_KERNEL", program)
-                .env("LITEBOX_VM_RUNNER", built_runner)
-                .env(
-                    "LITEBOX_VHOST_DEVICE_VSOCK",
-                    std::env::var_os("VHOST_DEVICE_VSOCK")
-                        .unwrap_or_else(|| "vhost-device-vsock".into()),
-                ),
+            Backend::Vm => {
+                if let Some(virtiofsd) = std::env::var_os("VIRTIOFSD") {
+                    daemon.env("LITEBOX_VIRTIOFSD", virtiofsd);
+                }
+                daemon
+                    .env("LITEBOX_VM_KERNEL", program)
+                    .env("LITEBOX_VM_RUNNER", built_runner)
+                    .env(
+                        "LITEBOX_VHOST_DEVICE_VSOCK",
+                        std::env::var_os("VHOST_DEVICE_VSOCK")
+                            .unwrap_or_else(|| "vhost-device-vsock".into()),
+                    )
+            }
         };
         let daemon = daemon
             .args(["-socket", &address])
@@ -1759,6 +1765,9 @@ fn binds_copy_files_and_serve_directories(backend: Backend) {
     std::fs::create_dir(&read_only).unwrap();
     std::fs::write(shim.path("read-only/in"), "read-only\n").unwrap();
     std::os::unix::fs::symlink("in", shim.path("read-only/link")).unwrap();
+    std::fs::create_dir(shim.path("read-only/child")).unwrap();
+    std::fs::write(shim.path("read-only/marker"), "parent\n").unwrap();
+    std::fs::write(shim.path("read-only/child/marker"), "child\n").unwrap();
     // Without mounts, the spec's root, here outside the bundle, is the image; `rootfs` is unused.
     let image = shim.path("image");
     std::fs::rename(shim.bundle.join("rootfs"), &image).unwrap();
@@ -1794,6 +1803,16 @@ fn binds_copy_files_and_serve_directories(backend: Backend) {
     let (status, output) = shim.run("e2", &["guest", "read", "/bin/ro/link", "/bin/ro/link"]);
     assert_eq!(status, 0, "{output}");
     assert!(output.ends_with("link=in\nread-only\n"), "{output}");
+    // Relative to a directory in the bind: its parent's file, its own, and out of the bind and back.
+    for (exec_id, dir, path, expected) in [
+        ("e5", "/bin/ro/child", "../marker", "parent\n"),
+        ("e6", "/bin/ro/child", "marker", "child\n"),
+        ("e7", "/bin/ro", "../ro/in", "read-only\n"),
+    ] {
+        let (status, output) = shim.run(exec_id, &["guest", "readat", dir, path]);
+        assert_eq!(status, 0, "{output}");
+        assert!(output.ends_with(expected), "{dir} {path}: {output}");
+    }
     // A read-only directory bind refuses changes, of its files and of its entries.
     for (exec_id, path) in [("e3", "/bin/ro/in"), ("e4", "/usr/bin/ro/out")] {
         let (status, output) = shim.run(exec_id, &["guest", "write", path, "from the guest"]);
@@ -1804,7 +1823,7 @@ fn binds_copy_files_and_serve_directories(backend: Backend) {
         );
     }
     let entries: Vec<_> = std::fs::read_dir(&read_only).unwrap().collect();
-    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.len(), 4);
     assert_eq!(shim.output("read-only/in"), "read-only\n");
     shim.kill_and_finish(pid);
 }
@@ -1906,7 +1925,7 @@ fn refused_or_unsupported_specs_and_annotations_fail_create(backend: Backend) {
             serde_json::json!({"io.litebox.publish.tcp": "127.0.0.1:20881:80"}),
             Code::UNIMPLEMENTED,
         ));
-        // One directory bind at most, at a guest path of at most 31 bytes, its 9p mount tag.
+        // One directory bind at most, at a guest path of at most 36 bytes, its virtio-fs tag.
         let bind = |destination: &str| serde_json::json!({"destination": destination, "type": "bind", "source": data, "options": ["ro"]});
         cases.push((
             "mounts",
@@ -1915,7 +1934,7 @@ fn refused_or_unsupported_specs_and_annotations_fail_create(backend: Backend) {
         ));
         cases.push((
             "mounts",
-            serde_json::json!([bind("/a/directory/bind/beyond/31/bytes")]),
+            serde_json::json!([bind("/a/directory/bind/beyond/thirty-six/bytes")]),
             Code::UNIMPLEMENTED,
         ));
     }
