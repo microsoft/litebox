@@ -490,16 +490,13 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         f(&socket)
     }
 
-    /// Adopts a Unix socket of type `socket_type` this process inherited from
-    /// its parent, or received with Unix socket data, as `handle`.
-    pub(super) fn adopt_inherited_unix_socket(
+    /// Adopts the Unix socket of type `socket_type` `handle` refers to.
+    pub(super) fn adopt_unix_socket(
         &self,
         handle: ObjectHandle,
         socket_type: SocketType,
     ) -> Result<UnixSocketFd<Platform>, ProcessError> {
-        let socket = self
-            .litebox
-            .adopt_inherited_unix_socket(handle, socket_type)?;
+        let socket = self.litebox.adopt_unix_socket(handle, socket_type)?;
         Ok(self
             .litebox
             .descriptor_table_mut()

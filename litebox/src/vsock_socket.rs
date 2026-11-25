@@ -72,10 +72,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         ))
     }
 
-    /// Returns the vsock socket inherited from the parent, or received with
-    /// Unix socket data, as `handle`, which
-    /// the socket then owns, so each handle is adopted once.
-    pub fn adopt_inherited_vsock_socket(
+    /// Returns the vsock socket `handle` refers to.
+    ///
+    /// The socket owns `handle`, so callers adopt each handle once and share
+    /// the socket for every other use.
+    pub fn adopt_vsock_socket(
         &self,
         handle: ObjectHandle,
     ) -> Result<VsockSocket<Platform>, ProcessError> {

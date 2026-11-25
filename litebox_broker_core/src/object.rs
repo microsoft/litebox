@@ -6,9 +6,9 @@
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::ObjectKind;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::unix_socket::TransferredObjectKind;
 use spin::rwlock::RwLock;
 
 use crate::event::EventObject;
@@ -79,18 +79,18 @@ impl ObjectEntry {
 
     /// Returns what a reference to this object another process receives
     /// refers to, or `None` if references to it may not be duplicated.
-    pub(crate) fn transferred_kind(&self) -> Option<TransferredObjectKind> {
+    pub(crate) fn transferred_kind(&self) -> Option<ObjectKind> {
         Some(match self {
-            Self::Event(_) => TransferredObjectKind::EventCounter,
-            Self::File(_) => TransferredObjectKind::File,
-            Self::UnixSocket(socket) => TransferredObjectKind::UnixSocket(socket.socket_type()),
-            Self::Pipe(pipe) if pipe.is_read_end() => TransferredObjectKind::PipeReadEnd,
-            Self::Pipe(_) => TransferredObjectKind::PipeWriteEnd,
-            Self::Socket(socket) => TransferredObjectKind::InetSocket(socket.socket_type()),
-            Self::VsockSocket(_) => TransferredObjectKind::VsockSocket,
-            Self::Timer(_) => TransferredObjectKind::Timer,
-            Self::ReadinessQueue(_) => TransferredObjectKind::ReadinessQueue,
-            Self::Process(_) => TransferredObjectKind::Process,
+            Self::Event(_) => ObjectKind::EventCounter,
+            Self::File(_) => ObjectKind::File,
+            Self::UnixSocket(socket) => ObjectKind::UnixSocket(socket.socket_type()),
+            Self::Pipe(pipe) if pipe.is_read_end() => ObjectKind::PipeReadEnd,
+            Self::Pipe(_) => ObjectKind::PipeWriteEnd,
+            Self::Socket(socket) => ObjectKind::InetSocket(socket.socket_type()),
+            Self::VsockSocket(_) => ObjectKind::VsockSocket,
+            Self::Timer(_) => ObjectKind::Timer,
+            Self::ReadinessQueue(_) => ObjectKind::ReadinessQueue,
+            Self::Process(_) => ObjectKind::Process,
             // Signals belong to their process and a futex waiter to its thread.
             Self::Signals(_) | Self::FutexWaiter(_) => return None,
         })

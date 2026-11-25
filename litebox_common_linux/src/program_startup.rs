@@ -10,11 +10,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
-use litebox_broker_protocol::unix_socket::{
-    ENCODED_TRANSFERRED_OBJECT_SIZE, TransferredObject, TransferredObjectKind,
-};
+use litebox_broker_protocol::unix_socket::{ENCODED_TRANSFERRED_OBJECT_SIZE, TransferredObject};
+use litebox_broker_protocol::{ObjectHandle, ObjectKind};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::GuestVectorState;
@@ -142,7 +140,7 @@ pub struct InheritedFd {
     /// the first of them.
     pub handle: ObjectHandle,
     /// What the descriptor refers to.
-    pub kind: TransferredObjectKind,
+    pub kind: ObjectKind,
 }
 
 /// Linux process state needed to continue a child duplicated by `fork` in a fresh runner.
@@ -971,62 +969,62 @@ mod tests {
                 InheritedFd {
                     fd: 1,
                     handle: ObjectHandle(7),
-                    kind: TransferredObjectKind::File,
+                    kind: ObjectKind::File,
                 },
                 InheritedFd {
                     fd: 4,
                     handle: ObjectHandle(u64::MAX),
-                    kind: TransferredObjectKind::File,
+                    kind: ObjectKind::File,
                 },
                 InheritedFd {
                     fd: 5,
                     handle: ObjectHandle(8),
-                    kind: TransferredObjectKind::PipeReadEnd,
+                    kind: ObjectKind::PipeReadEnd,
                 },
                 InheritedFd {
                     fd: 6,
                     handle: ObjectHandle(9),
-                    kind: TransferredObjectKind::PipeWriteEnd,
+                    kind: ObjectKind::PipeWriteEnd,
                 },
                 InheritedFd {
                     fd: 7,
                     handle: ObjectHandle(10),
-                    kind: TransferredObjectKind::UnixSocket(SocketType::Datagram),
+                    kind: ObjectKind::UnixSocket(SocketType::Datagram),
                 },
                 InheritedFd {
                     fd: 8,
                     handle: ObjectHandle(11),
-                    kind: TransferredObjectKind::EventCounter,
+                    kind: ObjectKind::EventCounter,
                 },
                 InheritedFd {
                     fd: 9,
                     handle: ObjectHandle(12),
-                    kind: TransferredObjectKind::Timer,
+                    kind: ObjectKind::Timer,
                 },
                 InheritedFd {
                     fd: 10,
                     handle: ObjectHandle(13),
-                    kind: TransferredObjectKind::ReadinessQueue,
+                    kind: ObjectKind::ReadinessQueue,
                 },
                 InheritedFd {
                     fd: 11,
                     handle: ObjectHandle(14),
-                    kind: TransferredObjectKind::InetSocket(SocketType::Stream),
+                    kind: ObjectKind::InetSocket(SocketType::Stream),
                 },
                 InheritedFd {
                     fd: 12,
                     handle: ObjectHandle(15),
-                    kind: TransferredObjectKind::UnixSocket(SocketType::SeqPacket),
+                    kind: ObjectKind::UnixSocket(SocketType::SeqPacket),
                 },
                 InheritedFd {
                     fd: 13,
                     handle: ObjectHandle(16),
-                    kind: TransferredObjectKind::VsockSocket,
+                    kind: ObjectKind::VsockSocket,
                 },
                 InheritedFd {
                     fd: 14,
                     handle: ObjectHandle(17),
-                    kind: TransferredObjectKind::Process,
+                    kind: ObjectKind::Process,
                 },
             ],
         };
@@ -1147,7 +1145,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 0,
                         handle: ObjectHandle(7),
-                        kind: TransferredObjectKind::File,
+                        kind: ObjectKind::File,
                     },
                     close_on_exec: false,
                 },
@@ -1155,7 +1153,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 3,
                         handle: ObjectHandle(8),
-                        kind: TransferredObjectKind::PipeWriteEnd,
+                        kind: ObjectKind::PipeWriteEnd,
                     },
                     close_on_exec: true,
                 },
@@ -1163,7 +1161,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 4,
                         handle: ObjectHandle(9),
-                        kind: TransferredObjectKind::UnixSocket(SocketType::Stream),
+                        kind: ObjectKind::UnixSocket(SocketType::Stream),
                     },
                     close_on_exec: false,
                 },
@@ -1171,7 +1169,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 5,
                         handle: ObjectHandle(10),
-                        kind: TransferredObjectKind::EventCounter,
+                        kind: ObjectKind::EventCounter,
                     },
                     close_on_exec: true,
                 },
@@ -1179,7 +1177,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 6,
                         handle: ObjectHandle(11),
-                        kind: TransferredObjectKind::Timer,
+                        kind: ObjectKind::Timer,
                     },
                     close_on_exec: false,
                 },
@@ -1187,7 +1185,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 7,
                         handle: ObjectHandle(12),
-                        kind: TransferredObjectKind::ReadinessQueue,
+                        kind: ObjectKind::ReadinessQueue,
                     },
                     close_on_exec: true,
                 },
@@ -1195,7 +1193,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 8,
                         handle: ObjectHandle(13),
-                        kind: TransferredObjectKind::InetSocket(SocketType::Datagram),
+                        kind: ObjectKind::InetSocket(SocketType::Datagram),
                     },
                     close_on_exec: false,
                 },
@@ -1203,7 +1201,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 9,
                         handle: ObjectHandle(14),
-                        kind: TransferredObjectKind::VsockSocket,
+                        kind: ObjectKind::VsockSocket,
                     },
                     close_on_exec: true,
                 },
@@ -1211,7 +1209,7 @@ mod tests {
                     inherited: InheritedFd {
                         fd: 10,
                         handle: ObjectHandle(15),
-                        kind: TransferredObjectKind::Process,
+                        kind: ObjectKind::Process,
                     },
                     close_on_exec: false,
                 },

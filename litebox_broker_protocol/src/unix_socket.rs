@@ -14,10 +14,11 @@ use alloc::vec::Vec;
 
 use thiserror::Error;
 
-use crate::ObjectHandle;
 use crate::fs::{FileError, FileMode, FileOpenFlags, FileUser};
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use crate::socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType};
+use crate::wire::{self, Wire};
+use crate::{ObjectHandle, ObjectKind};
 
 /// Maximum length in bytes of the guest-visible part of a Unix socket name.
 pub const MAX_UNIX_SOCKET_NAME_SIZE: u32 = 108;
@@ -46,11 +47,12 @@ pub const MAX_UNIX_SOCKET_BACKLOG: u32 = 4096;
 /// Most object references one send carries, as Linux's `SCM_MAX_FD`.
 pub const MAX_UNIX_SOCKET_OBJECTS: u32 = 253;
 
-/// Length in bytes of one encoded [`TransferredObject`]: its handle, then its
-/// kind's tag and detail.
-pub const ENCODED_TRANSFERRED_OBJECT_SIZE: u32 = 10;
-
-const _: () = assert!(ENCODED_TRANSFERRED_OBJECT_SIZE as usize == ObjectHandle::ENCODED_SIZE + 2);
+/// Length in bytes of one encoded [`TransferredObject`].
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a handle and a kind fit in u32"
+)]
+pub const ENCODED_TRANSFERRED_OBJECT_SIZE: u32 = <TransferredObject as Wire>::MAX_SIZE as u32;
 
 const _: () = assert!(
     UNIX_SOCKET_BUFFER_SIZE as usize
@@ -207,39 +209,6 @@ impl UnixSocketAddress {
     }
 }
 
-/// The kind of an object whose reference another process passed on, by a
-/// Unix socket message or by inheritance, which tells the receiver how to use
-/// its new handle.
-///
-/// For a Unix socket message the broker reports the kind, so receivers need
-/// not trust senders for it.
-///
-/// Receivers match every kind to adopt its handle, so a new kind is
-/// deliberately a breaking change rather than `#[non_exhaustive]`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransferredObjectKind {
-    /// A file, including a terminal or standard stream.
-    File,
-    /// The read end of a pipe.
-    PipeReadEnd,
-    /// The write end of a pipe.
-    PipeWriteEnd,
-    /// A Unix socket of the given type.
-    UnixSocket(SocketType),
-    /// An internet socket of the given type.
-    InetSocket(SocketType),
-    /// A vsock stream socket.
-    VsockSocket,
-    /// An event counter.
-    EventCounter,
-    /// A timer.
-    Timer,
-    /// A readiness queue.
-    ReadinessQueue,
-    /// A process.
-    Process,
-}
-
 /// Options of a receive from a Unix socket.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReceiveOptions {
@@ -254,78 +223,30 @@ pub struct ReceiveOptions {
     pub max_objects: usize,
 }
 
-/// A handle the receiver of a Unix socket message got for an object the
-/// message carried.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TransferredObject {
-    /// The receiver's new handle.
-    pub handle: ObjectHandle,
-    /// What the handle refers to.
-    pub kind: TransferredObjectKind,
+wire_struct! {
+    /// A handle the receiver of a Unix socket message got for an object the
+    /// message carried.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TransferredObject {
+        /// The receiver's new handle.
+        pub handle: ObjectHandle,
+        /// What the handle refers to.
+        pub kind: ObjectKind,
+    }
 }
 
 impl TransferredObject {
     /// Encodes this object for a shared buffer.
     #[must_use]
     pub fn encode(self) -> [u8; ENCODED_TRANSFERRED_OBJECT_SIZE as usize] {
-        let socket_type = |socket_type| match socket_type {
-            SocketType::Stream => 0,
-            SocketType::Datagram => 1,
-            SocketType::SeqPacket => 2,
-        };
-        let (tag, detail) = match self.kind {
-            TransferredObjectKind::File => (0, 0),
-            TransferredObjectKind::PipeReadEnd => (1, 0),
-            TransferredObjectKind::PipeWriteEnd => (2, 0),
-            TransferredObjectKind::UnixSocket(kind) => (3, socket_type(kind)),
-            TransferredObjectKind::InetSocket(kind) => (4, socket_type(kind)),
-            TransferredObjectKind::VsockSocket => (5, 0),
-            TransferredObjectKind::EventCounter => (6, 0),
-            TransferredObjectKind::Timer => (7, 0),
-            TransferredObjectKind::ReadinessQueue => (8, 0),
-            TransferredObjectKind::Process => (9, 0),
-        };
-        let mut encoded = [0; ENCODED_TRANSFERRED_OBJECT_SIZE as usize];
-        let (handle, kind) = encoded.split_at_mut(ObjectHandle::ENCODED_SIZE);
-        handle.copy_from_slice(&self.handle.encode());
-        kind.copy_from_slice(&[tag, detail]);
-        encoded
+        wire::encode_padded(&self)
     }
 
     /// Decodes an object produced by [`Self::encode`].
     pub fn decode(
         encoded: &[u8; ENCODED_TRANSFERRED_OBJECT_SIZE as usize],
     ) -> Result<Self, UnixSocketCodecError> {
-        let [handle @ .., tag, detail] = encoded;
-        let handle = ObjectHandle::decode(handle);
-        let (tag, detail) = (*tag, *detail);
-        let socket_type = || match detail {
-            0 => Ok(SocketType::Stream),
-            1 => Ok(SocketType::Datagram),
-            2 => Ok(SocketType::SeqPacket),
-            _ => Err(UnixSocketCodecError::Invalid),
-        };
-        let plain = |kind: TransferredObjectKind, detail: u8| {
-            if detail == 0 {
-                Ok(kind)
-            } else {
-                Err(UnixSocketCodecError::Invalid)
-            }
-        };
-        let kind = match tag {
-            0 => plain(TransferredObjectKind::File, detail)?,
-            1 => plain(TransferredObjectKind::PipeReadEnd, detail)?,
-            2 => plain(TransferredObjectKind::PipeWriteEnd, detail)?,
-            3 => TransferredObjectKind::UnixSocket(socket_type()?),
-            4 => TransferredObjectKind::InetSocket(socket_type()?),
-            5 => plain(TransferredObjectKind::VsockSocket, detail)?,
-            6 => plain(TransferredObjectKind::EventCounter, detail)?,
-            7 => plain(TransferredObjectKind::Timer, detail)?,
-            8 => plain(TransferredObjectKind::ReadinessQueue, detail)?,
-            9 => plain(TransferredObjectKind::Process, detail)?,
-            _ => return Err(UnixSocketCodecError::Invalid),
-        };
-        Ok(Self { handle, kind })
+        wire::decode_padded(encoded).map_err(|_| UnixSocketCodecError::Invalid)
     }
 }
 
@@ -671,16 +592,16 @@ mod tests {
     #[test]
     fn transferred_objects_round_trip() {
         for kind in [
-            TransferredObjectKind::File,
-            TransferredObjectKind::PipeReadEnd,
-            TransferredObjectKind::PipeWriteEnd,
-            TransferredObjectKind::UnixSocket(SocketType::SeqPacket),
-            TransferredObjectKind::InetSocket(SocketType::Datagram),
-            TransferredObjectKind::VsockSocket,
-            TransferredObjectKind::EventCounter,
-            TransferredObjectKind::Timer,
-            TransferredObjectKind::ReadinessQueue,
-            TransferredObjectKind::Process,
+            ObjectKind::File,
+            ObjectKind::PipeReadEnd,
+            ObjectKind::PipeWriteEnd,
+            ObjectKind::UnixSocket(SocketType::SeqPacket),
+            ObjectKind::InetSocket(SocketType::Datagram),
+            ObjectKind::VsockSocket,
+            ObjectKind::EventCounter,
+            ObjectKind::Timer,
+            ObjectKind::ReadinessQueue,
+            ObjectKind::Process,
         ] {
             let object = TransferredObject {
                 handle: ObjectHandle(0x0102_0304_0506_0708),
@@ -690,7 +611,7 @@ mod tests {
         }
         let valid = TransferredObject {
             handle: ObjectHandle(1),
-            kind: TransferredObjectKind::File,
+            kind: ObjectKind::File,
         }
         .encode();
         // A plain kind with a detail, an unknown tag, and a socket kind with

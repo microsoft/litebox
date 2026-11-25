@@ -118,6 +118,36 @@ impl ObjectHandle {
     }
 }
 
+wire_enum! {
+    /// The kind of object a handle refers to, which tells its holder how to use
+    /// it.
+    ///
+    /// Holders match every kind, so it is not `#[non_exhaustive]`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ObjectKind {
+        /// A file, including a terminal or standard stream.
+        File,
+        /// The read end of a pipe.
+        PipeReadEnd,
+        /// The write end of a pipe.
+        PipeWriteEnd,
+        /// A Unix socket of the given type.
+        UnixSocket(socket::SocketType),
+        /// An internet socket of the given type.
+        InetSocket(socket::SocketType),
+        /// A vsock stream socket.
+        VsockSocket,
+        /// An event counter.
+        EventCounter,
+        /// A timer.
+        Timer,
+        /// A readiness queue.
+        ReadinessQueue,
+        /// A process.
+        Process,
+    }
+}
+
 /// Association-scoped broker request identifier.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

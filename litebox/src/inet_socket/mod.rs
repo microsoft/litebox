@@ -98,12 +98,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         ))
     }
 
-    /// Returns the IPv4 socket of type `socket_type` this process inherited
-    /// from its parent, or received with Unix socket data, as `handle`.
+    /// Returns the IPv4 socket of type `socket_type` `handle` refers to.
     ///
     /// The socket owns `handle`, so callers adopt each handle once and share
     /// the socket for every other use.
-    pub fn adopt_inherited_inet_socket(
+    pub fn adopt_inet_socket(
         &self,
         handle: ObjectHandle,
         socket_type: SocketType,

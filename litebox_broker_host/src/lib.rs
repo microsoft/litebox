@@ -2409,6 +2409,7 @@ mod tests {
         AcceptedPlatformVsockSocket, PlatformVsockSocket, VsockProvider,
     };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SocketPolicy, VsockPolicy};
+    use litebox_broker_protocol::ObjectKind;
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest,
     };
@@ -2439,7 +2440,7 @@ mod tests {
     };
     use litebox_broker_protocol::unix_socket::{
         ConnectUnixSocketRequest, CreateUnixSocketRequest, ReceiveUnixSocketRequest,
-        SendUnixSocketRequest, TransferredObject, TransferredObjectKind, UnixSocketName,
+        SendUnixSocketRequest, TransferredObject, UnixSocketName,
     };
     use litebox_broker_protocol::vsock_socket::{
         ConnectVsockSocketRequest, CreateVsockSocketRequest, ReceiveVsockSocketRequest,
@@ -4321,10 +4322,7 @@ mod tests {
         assert_eq!(encoded[0], 6);
         let object = TransferredObject::decode(encoded[8..].try_into().unwrap()).unwrap();
         assert_ne!(object.handle, carried.first);
-        assert_eq!(
-            object.kind,
-            TransferredObjectKind::UnixSocket(SocketType::Datagram)
-        );
+        assert_eq!(object.kind, ObjectKind::UnixSocket(SocketType::Datagram));
         assert_eq!(
             complete_request(handle_request(
                 &process,

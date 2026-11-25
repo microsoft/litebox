@@ -1266,7 +1266,7 @@ fn opposite_connects_do_not_deadlock() {
 
 #[test]
 fn messages_carry_references_to_other_processes() {
-    use litebox_broker_protocol::unix_socket::TransferredObjectKind;
+    use litebox_broker_protocol::ObjectKind;
 
     let fixture = Fixture::new();
     let address = abstract_name(b"carrier");
@@ -1296,10 +1296,7 @@ fn messages_carry_references_to_other_processes() {
     let [object] = received.objects[..] else {
         panic!("expected one object, got {:?}", received.objects);
     };
-    assert_eq!(
-        object.kind,
-        TransferredObjectKind::UnixSocket(SocketType::SeqPacket)
-    );
+    assert_eq!(object.kind, ObjectKind::UnixSocket(SocketType::SeqPacket));
     assert_eq!(
         fixture.send_objects(&fixture.other, object.handle, b"ping", &[]),
         Ok(4)

@@ -195,13 +195,12 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts a timerfd this process inherited from its parent, or received with Unix socket
-    /// data, as `handle`.
-    pub(crate) fn adopt_inherited_timerfd(
+    /// Adopts the timerfd `handle` refers to.
+    pub(crate) fn adopt_timerfd(
         &self,
         handle: ObjectHandle,
     ) -> Result<TimerfdFd<Platform>, ProcessError> {
-        let timer = self.litebox.adopt_inherited_timer(handle)?;
+        let timer = self.litebox.adopt_timer(handle)?;
         Ok(self
             .litebox
             .descriptor_table_mut()

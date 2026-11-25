@@ -11,12 +11,12 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use litebox_broker_protocol::{
-    ObjectHandle,
+    ObjectHandle, ObjectKind,
     error::ErrorCode,
     fs::{FileMode, FileOpenFlags, FileStatusFlags, FileUser},
     socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType},
     unix_socket::{
-        ReceiveOptions, TransferredObjectKind, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress,
+        ReceiveOptions, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress,
         UnixSocketError as ProtocolError, UnixSocketName,
     },
 };
@@ -65,20 +65,20 @@ pub struct Received {
 pub struct ReceivedObject {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
-    kind: TransferredObjectKind,
+    kind: ObjectKind,
     /// Whether the caller took the handle.
     adopted: bool,
 }
 
 impl ReceivedObject {
     /// What the reference refers to, as the broker reports.
-    pub fn kind(&self) -> TransferredObjectKind {
+    pub fn kind(&self) -> ObjectKind {
         self.kind
     }
 
     /// Gives up ownership of the reference's handle, which the caller adopts
-    /// as [`Self::kind`] describes, with the `adopt_inherited_*` method of
-    /// [`LiteBox`] for that kind, such as [`LiteBox::adopt_inherited_file`].
+    /// as [`Self::kind`] describes, with the `adopt_*` method of
+    /// [`LiteBox`] for that kind, such as [`LiteBox::adopt_file`].
     pub fn into_handle(mut self) -> ObjectHandle {
         self.adopted = true;
         self.handle
@@ -148,12 +148,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         ))
     }
 
-    /// Returns the Unix socket of type `socket_type` this process inherited
-    /// from its parent, or received with Unix socket data, as `handle`.
+    /// Returns the Unix socket of type `socket_type` `handle` refers to.
     ///
     /// The socket owns `handle`, so callers adopt each handle once and share
     /// the socket for every other use.
-    pub fn adopt_inherited_unix_socket(
+    pub fn adopt_unix_socket(
         &self,
         handle: ObjectHandle,
         socket_type: SocketType,

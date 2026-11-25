@@ -50,6 +50,11 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    /// Bytes not yet decoded.
+    pub(super) fn remaining(&self) -> &'a [u8] {
+        &self.bytes[self.offset..]
+    }
+
     fn bytes<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
         let end = self
             .offset
