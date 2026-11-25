@@ -1465,6 +1465,54 @@ fn sends_carry_only_objects_the_sender_owns() {
 }
 
 #[test]
+fn received_references_publish_changes_the_sender_makes() {
+    let fixture = Fixture::new();
+    let other = &fixture.other;
+    let (sender, reader) = fixture.pair(SocketType::Datagram);
+    let reader = fixture
+        .process
+        .duplicate_object_reference_to(reader, other, ObjectRights::WAIT)
+        .unwrap();
+    let (write_end, read_end) = fixture.pipe();
+    assert_eq!(
+        fixture.send_objects(&fixture.process, sender, b"x", &[read_end]),
+        Ok(1)
+    );
+    let sink = Arc::new(TestReadinessSink::default());
+    let readiness_sink: Arc<dyn ReadinessSink> = sink.clone();
+    let mut data = vec![0; 8];
+    let options = ReceiveOptions {
+        nonblocking: true,
+        max_objects: 1,
+        ..ReceiveOptions::default()
+    };
+    let received = receive(other, reader, &mut data, options, &readiness_sink)
+        .unwrap()
+        .unwrap();
+    let received_read_end = received.objects[0].handle;
+    sink.published.lock().unwrap().clear();
+    sink.republished.lock().unwrap().clear();
+
+    let byte: &[u8] = b"w";
+    assert_eq!(
+        crate::pipe::write(&fixture.process, write_end, &byte),
+        Ok(1)
+    );
+    let publications: Vec<_> = sink
+        .published
+        .lock()
+        .unwrap()
+        .iter()
+        .chain(sink.republished.lock().unwrap().iter())
+        .copied()
+        .collect();
+    assert!(
+        publications.contains(&(received_read_end, ReadinessFlags::READ)),
+        "the receiver's read end published no readiness: {publications:?}"
+    );
+}
+
+#[test]
 fn passed_references_keep_the_senders_rights() {
     let fixture = Fixture::new();
     let other = &fixture.other;
