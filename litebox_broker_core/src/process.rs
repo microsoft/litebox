@@ -531,8 +531,9 @@ impl ObjectEntry {
 
 struct BrokerProcessState {
     status: ProcessStatus,
-    /// This process's mount view for path lookups. `create_namespaces` may replace it, and
-    /// teardown clears it. Open files keep the view that opened them.
+    /// The file service through which this process opens files and resolves paths.
+    /// `create_namespaces` may replace it with a copy that has a private mount view, and
+    /// teardown clears it. Open files keep the service that opened them.
     fs: Option<Arc<dyn FileService>>,
     /// Final termination status reported by the running process.
     reported_exit_status: Option<ProcessExitStatus>,
@@ -828,7 +829,8 @@ impl BrokerProcess {
         pid_namespace: &Arc<PidNamespace>,
         sibling: bool,
     ) -> Result<Arc<BrokerProcess>> {
-        // Snapshot the creator's view, even for a sibling, without holding the process tree lock.
+        // Snapshot the creator's file service, even for a sibling, without holding the process tree
+        // lock.
         let fs = self.file_service()?;
         let child = {
             // The tree lock orders the new link against this process's and
@@ -903,20 +905,20 @@ impl BrokerProcess {
             return Err(BrokerError::UnsupportedOperation);
         }
         // Declared before the guards below, so that an unused namespace or
-        // view drops after them.
+        // file service drops after them.
         let mut pid_namespace = request
             .children_pid_namespace
             .map(|options| self.new_nested_pid_namespace(options))
             .transpose()?;
-        let mut mount_view = None;
-        let replaced_view = loop {
+        let mut fs_copy = None;
+        let replaced_fs = loop {
             // Copying takes file service locks, which may not nest in a
             // process's, so the copy is made first, and again if the target's
-            // view changes before it is installed.
+            // file service changes before it is installed.
             if request.copy_mount_view {
-                let view = self.target_file_service(request.process_id)?;
-                let copy = view.copy_mount_view()?;
-                mount_view = Some((view, copy));
+                let current = self.target_file_service(request.process_id)?;
+                let copy = current.copy_mount_view()?;
+                fs_copy = Some((current, copy));
             }
             let mut state = self.state.lock();
             if !self.accepts_operations(&state) {
@@ -932,11 +934,11 @@ impl BrokerProcess {
             let mut child_state = child.as_ref().map(|child| child.state.lock());
             let target = child.as_deref().unwrap_or(self);
             let target_state = child_state.as_deref_mut().unwrap_or(&mut *state);
-            if let Some((view, _)) = &mount_view
+            if let Some((current, _)) = &fs_copy
                 && !target_state
                     .fs
                     .as_ref()
-                    .is_some_and(|fs| Arc::ptr_eq(fs, view))
+                    .is_some_and(|fs| Arc::ptr_eq(fs, current))
             {
                 continue;
             }
@@ -960,12 +962,12 @@ impl BrokerProcess {
             if request.new_segment_namespace {
                 target.segments.lock().reset_namespace();
             }
-            // Leaving the loop releases the locks before the replaced view drops.
-            break mount_view
+            // Leaving the loop releases the locks before the replaced file service drops.
+            break fs_copy
                 .take()
                 .and_then(|(_, copy)| target_state.fs.replace(copy));
         };
-        drop(replaced_view);
+        drop(replaced_fs);
         Ok(())
     }
 
@@ -3786,7 +3788,7 @@ mod tests {
         fs::mkdir(&child, None, "/data/child", ROOT, FileMode::RWXU)
             .unwrap()
             .unwrap();
-        // The parent's view has no mount over /data, so the name is free there.
+        // The parent doesn't see the child's /data mount, so the name is free there.
         fs::mkdir(&parent, None, "/data/child", ROOT, FileMode::RWXU)
             .unwrap()
             .unwrap();
@@ -4951,10 +4953,10 @@ mod tests {
             .and_then(alloc::sync::Weak::upgrade)
             .unwrap();
 
-        let view = Arc::downgrade(&child.file_service().unwrap());
+        let fs = Arc::downgrade(&child.file_service().unwrap());
         parent.handle_owner_death();
 
-        assert!(view.upgrade().is_none());
+        assert!(fs.upgrade().is_none());
         assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
         assert!(child.is_released());
         assert!(parent.tree_node.lock().children.is_empty());

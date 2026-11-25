@@ -308,8 +308,9 @@ where
                     return Ok(entry.anchor());
                 }
                 // A handle transferred from a process with another filesystem names nothing here.
-                // One inherited from a related mount view is usable only on an object both views
-                // share, and later lookups from it see this view's mounts.
+                // One opened through a copy of this service with another mount view is usable
+                // only on an object both views contain, and later lookups from it use this
+                // service's mounts.
                 self.related_view_anchor(&state.resolver, &entry)
                     .ok_or(BrokerError::InvalidRights)
             })
@@ -327,8 +328,8 @@ where
     }
 
     fn copy_mount_view(&self) -> Result<Arc<dyn FileService>> {
-        let view = Resolver::copy_mount_view(self).ok_or(BrokerError::UnsupportedOperation)?;
-        Ok(Arc::new(view))
+        let copy = Resolver::copy_mount_view(self).ok_or(BrokerError::UnsupportedOperation)?;
+        Ok(Arc::new(copy))
     }
 
     fn open(

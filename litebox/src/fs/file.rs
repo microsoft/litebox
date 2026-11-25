@@ -135,7 +135,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     ///
     /// A relative `path` requires a directory from this `LiteBox`, including one adopted with
     /// [`Self::adopt_inherited_file`]. Lookups from an inherited directory use this process's
-    /// mounts, and fail if the directory is on a mount this process's view lacks. The other
+    /// mounts, and fail if the directory is on a mount this process's mount view lacks. The other
     /// path-taking methods share these rules.
     ///
     /// `access` and `flags` use the architecture-independent broker contract.

@@ -74,8 +74,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         })
     }
 
-    /// Returns a walk anchor here for `entry`, opened through the related view `opener`, if both
-    /// views contain the object it names. Walks from the anchor see this view's mounts.
+    /// Returns a walk anchor here for `entry`, opened through `opener`, a resolver over a related
+    /// mount view, if both views contain the object it names. Walks from the anchor see this
+    /// resolver's mounts.
     pub(super) fn related_view_anchor(
         &self,
         opener: &Self,
@@ -1488,8 +1489,8 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         path: &str,
         mode: Mode,
     ) -> Result<(), MkdirError> {
-        // A failed mkdir may roll back a temporarily visible directory. A related view
-        // must not mount it between creation and rollback.
+        // A failed mkdir may roll back a temporarily visible directory. Neither this resolver nor
+        // a copy of it may mount on that directory between creation and rollback.
         let _paths = self.composer().map(|c| c.mount_paths.lock());
         let context = context.into();
         let Some((parent, name)) = self
