@@ -40,7 +40,7 @@ use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::{ProcessGroupId, ProcessId, ThreadId};
 #[cfg(target_arch = "aarch64")]
 use litebox_common_linux::SveSetVlFlags;
-use litebox_common_linux::program_startup::{ForkMemoryRegion, InheritedCwd, LinuxForkStartup};
+use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Siginfo, SiginfoChild, Signal};
 use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
@@ -1911,7 +1911,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .name_shared_memory(|| self.issue_shared_memory_id())
                 .map_err(|_| Errno::EAGAIN)?;
         }
-        let (fds, mut objects): (Vec<_>, Vec<_>) =
+        let (fds, objects): (Vec<_>, Vec<_>) =
             self.fds_inherited_across_fork()?.into_iter().unzip();
         let fs = self.fs.borrow();
         let umask = u32::from(fs.umask().bits());
@@ -1926,7 +1926,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             resource_limits: self.thread.process.limits.get(),
             dumpable: self.thread.process.dumpable.load(Ordering::Relaxed),
             no_new_privs: self.thread.no_new_privs.get(),
-            cwd: placeholder_inherited_cwd(),
             comm: self.comm.get(),
             blocked_signals,
             signal_actions,
@@ -1960,8 +1959,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child = self.allocate_child_process(relation)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
-        let (cwd, handles) = self.inherit_with_cwd(&child, &mut objects)?;
-        startup.cwd = cwd;
+        let handles = child.inherit(&objects)?;
         for (forked, handle) in startup.fds.iter_mut().zip(handles) {
             forked.inherited.handle = handle;
         }
@@ -2416,8 +2414,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
 
-        let required_clone_flags =
-            CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
+        // XXX: Support a separate broker filesystem state for threads without CLONE_FS.
+        let required_clone_flags = CloneFlags::VM
+            | CloneFlags::THREAD
+            | CloneFlags::SIGHAND
+            | CloneFlags::FILES
+            | CloneFlags::FS;
 
         let supported_clone_flags = CloneFlags::VM
             | CloneFlags::FS
@@ -2495,11 +2497,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             None
         };
 
-        let fs = if flags.contains(CloneFlags::FS) {
-            self.fs.borrow().clone()
-        } else {
-            alloc::sync::Arc::new((**self.fs.borrow()).clone())
-        };
+        let fs = self.fs.borrow().clone();
 
         let litebox_thread = self.global.create_thread().map_err(|_| Errno::EAGAIN)?;
         let child_tid = i32::try_from(litebox_thread.id())
@@ -3888,30 +3886,6 @@ const SHEBANG_MAX_RECURSION: u32 = 6;
 /// Maximum length of a shebang line that we inspect. Matches Linux `BINPRM_BUF_SIZE`.
 const SHEBANG_MAX_LINE: usize = 256;
 
-impl<P: ShimPlatform> Task<P> {
-    /// Gives `child` its own references to `objects` and the working directory, returning the
-    /// child's working directory and its handles for `objects`, in order. The working directory
-    /// is appended to `objects`, which keeps it open until the child has its own reference.
-    fn inherit_with_cwd(
-        &self,
-        child: &PendingChild,
-        objects: &mut Vec<litebox::process::InheritableFd<P>>,
-    ) -> Result<(InheritedCwd, Vec<litebox_broker_protocol::ObjectHandle>), Errno> {
-        objects.push(litebox::process::InheritableFd::File(self.cwd_handle()));
-        let mut handles = child.inherit(objects).map_err(Errno::from)?;
-        let cwd = handles
-            .pop()
-            .expect("the broker returns one handle per inherited object");
-        Ok((InheritedCwd::File(cwd), handles))
-    }
-}
-
-/// Stands in for the working directory [`Task::inherit_with_cwd`] returns, with the same encoded
-/// size, so a startup payload's size can be checked before the child inherits anything.
-fn placeholder_inherited_cwd() -> InheritedCwd {
-    InheritedCwd::File(litebox_broker_protocol::ObjectHandle(0))
-}
-
 /// Parse a `#!interpreter [optional-arg]` line from a file header buffer.
 ///
 /// Returns `Some((interpreter, optional_arg))` when `buf` starts with `#!` and
@@ -3991,7 +3965,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         envp: alloc::vec::Vec<alloc::ffi::CString>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
-        let (inherited_fds, mut fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
+        let (inherited_fds, fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
             self.fds_inherited_across_exec()?.into_iter().unzip();
         let fs = self.fs.borrow();
         let umask = u32::from(fs.umask().bits());
@@ -4017,7 +3991,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             sve_vl_inherit: self.thread.sve_vl_inherit.get(),
             path,
             execfn,
-            cwd: placeholder_inherited_cwd(),
             argv,
             envp,
             inherited_fds,
@@ -4026,8 +3999,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         startup.encode().map_err(|_| Errno::E2BIG)?;
         let vfork = self.vfork.borrow();
         let child = &vfork.as_ref().expect("vfork transfer lost its child").child;
-        let (cwd, handles) = self.inherit_with_cwd(child, &mut fds)?;
-        startup.cwd = cwd;
+        let handles = child.inherit(&fds)?;
         for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
             inherited.handle = handle;
         }
@@ -6501,41 +6473,6 @@ mod fork_tests {
     use litebox_broker_transport::channel::LocalCallChannel;
 
     #[test]
-    fn startup_pins_path_only_working_directory() {
-        use crate::syscalls::tests::{TestPlatform, test_platform};
-        use litebox::platform::ThreadProvider;
-        use litebox_broker_protocol::fs::FileMode;
-
-        let platform = test_platform();
-        TestPlatform::run_test_thread(|| {
-            let (litebox, pid) = crate::syscalls::test_broker::litebox(platform);
-            let shim = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, pid).build();
-            let task = shim.0.clone().new_test_task();
-            let fs = task.fs.borrow();
-            let path = "/startup-cwd";
-            let renamed = "/renamed-startup-cwd";
-            shim.0
-                .litebox
-                .mkdir_file(&fs.context.read(), None, path, FileMode::RWXU)
-                .unwrap();
-            fs.set_cwd_handle(
-                shim.open_or_adopt_inherited_cwd(
-                    &fs.context.read(),
-                    &task.files.borrow(),
-                    &InheritedCwd::Path(path.into()),
-                    core::iter::empty(),
-                )
-                .unwrap(),
-            );
-            shim.0
-                .litebox
-                .rename_file(&fs.context.read(), None, path, None, renamed)
-                .unwrap();
-            assert_eq!(fs.cwd_handle().path().unwrap(), renamed);
-        });
-    }
-
-    #[test]
     fn native_fork_retains_memory_manager() {
         use crate::syscalls::tests::{TestPlatform, test_platform};
         use litebox::platform::ThreadProvider;
@@ -6623,7 +6560,6 @@ mod fork_tests {
                 resource_limits: task.process().limits.get(),
                 dumpable: true,
                 no_new_privs: false,
-                cwd: InheritedCwd::Path("/".into()),
                 comm: [0; litebox_common_linux::TASK_COMM_LEN],
                 blocked_signals,
                 signal_actions,

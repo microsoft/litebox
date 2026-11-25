@@ -6,14 +6,15 @@
 use alloc::{string::String, sync::Arc};
 use core::any::Any;
 
-use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     DirectoryReadMode, DirectoryTransferError, FileAccessMode, FileError, FileLockOperation,
     FileMode, FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser,
-    MAX_FILE_TRANSFER_SIZE, ReadDirectoryResponse, SetFileTimes, encode_directory_entries_chunk,
+    MAX_FILE_TRANSFER_SIZE, PathAnchor, ReadDirectoryResponse, SetFileTimes,
+    encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
@@ -147,6 +148,10 @@ mod private {
     };
 
     pub trait Service: Send + Sync {
+        fn check_anchor(&self, _file: &File) -> super::Result<()> {
+            Err(BrokerError::InvalidRights)
+        }
+
         /// Opens `path`, binding a file that refers to the opener's controlling terminal to
         /// `controlling_terminal()`.
         #[expect(
@@ -287,19 +292,20 @@ where
     // the same file). No open-description lock is held during the pathname walk.
     fn directory_anchor(&self, directory: Option<&File>) -> Result<Option<DirAnchor>> {
         directory
-            .map(|file| {
-                let state = file
-                    .state
-                    .as_any()
-                    .downcast_ref::<ResolverFile<Platform, Backend>>()
-                    .ok_or(BrokerError::InvalidRights)?;
-                // A handle transferred from a process with another filesystem names nothing here.
-                if !core::ptr::eq(Arc::as_ptr(&state.resolver), self) {
-                    return Err(BrokerError::InvalidRights);
-                }
-                Ok(state.entry.read().anchor())
-            })
+            .map(|file| Ok(self.open_in_this_resolver(file)?.entry.read().anchor()))
             .transpose()
+    }
+
+    fn open_in_this_resolver<'a>(
+        &self,
+        file: &'a File,
+    ) -> Result<&'a ResolverFile<Platform, Backend>> {
+        // A handle transferred from a process with another filesystem names nothing here.
+        file.state
+            .as_any()
+            .downcast_ref::<ResolverFile<Platform, Backend>>()
+            .filter(|state| core::ptr::eq(Arc::as_ptr(&state.resolver), self))
+            .ok_or(BrokerError::InvalidRights)
     }
 }
 
@@ -308,6 +314,10 @@ where
     Backend: super::backend::Backend + 'static,
     Platform: RawSyncPrimitivesProvider,
 {
+    fn check_anchor(&self, file: &File) -> Result<()> {
+        self.open_in_this_resolver(file).map(|_| ())
+    }
+
     fn open(
         self: Arc<Self>,
         directory: Option<&File>,
@@ -805,7 +815,7 @@ where
 )]
 pub fn open(
     process: &BrokerProcess,
-    directory: Option<ObjectHandle>,
+    directory: impl Into<PathAnchor>,
     path: &str,
     user: FileUser,
     access: FileAccessMode,
@@ -852,6 +862,7 @@ fn readable(access: FileAccessMode) -> bool {
 /// backend, so callers drop it outside their locks.
 pub(crate) fn open_without_reference(
     process: &BrokerProcess,
+    anchor: PathAnchor,
     path: &str,
     user: FileUser,
     access: FileAccessMode,
@@ -859,27 +870,26 @@ pub(crate) fn open_without_reference(
     mode: FileMode,
 ) -> Result<FileResult<(File, FileStatus)>> {
     process.require_object_rights(open_required_rights(access, flags)?)?;
-    if let Err(error) = validate_path(None, path) {
-        return Ok(Err(error));
-    }
-    let caller = Caller::new(process);
-    let file = match Arc::clone(&process.fs).open(
-        None,
-        path,
-        Context::new(user, caller),
-        access,
-        flags,
-        mode,
-        &|| crate::process_group::controlling_terminal(process),
-    )? {
-        Ok(file) => file,
-        Err(error) => return Ok(Err(error)),
-    };
-    let status = match file.state.handle_status(caller)? {
-        Ok(status) => status,
-        Err(error) => return Ok(Err(error)),
-    };
-    Ok(Ok((file, status)))
+    with_path_anchor(process, anchor, path, |dir| {
+        let caller = Caller::new(process);
+        let file = match Arc::clone(&process.fs).open(
+            dir,
+            path,
+            Context::new(user, caller),
+            access,
+            flags,
+            mode,
+            &|| crate::process_group::controlling_terminal(process),
+        )? {
+            Ok(file) => file,
+            Err(error) => return Ok(Err(error)),
+        };
+        let status = match file.state.handle_status(caller)? {
+            Ok(status) => status,
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(Ok((file, status)))
+    })
 }
 
 /// Reads bytes from a broker-owned open file.
@@ -998,6 +1008,150 @@ pub fn handle_status(
     file.state.handle_status(Caller::new(process))
 }
 
+fn with_cwd_process<T>(
+    caller: &BrokerProcess,
+    pending_child: Option<ProcessId>,
+    operation: impl FnOnce(&BrokerProcess) -> T,
+) -> Result<T> {
+    if let Some(pid) = pending_child {
+        let child = caller.with_pending_child(pid, Arc::clone)?;
+        Ok(operation(&child))
+    } else {
+        Ok(operation(caller))
+    }
+}
+
+/// Resolves `path` and installs the directory without allocating an object reference.
+pub fn chdir(
+    process: &BrokerProcess,
+    pending_child: Option<ProcessId>,
+    anchor: PathAnchor,
+    path: &str,
+    user: FileUser,
+) -> ServiceResult<()> {
+    with_cwd_process(process, pending_child, |target| {
+        let (dir, status) = match open_without_reference(
+            process,
+            anchor,
+            path,
+            user,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+            FileMode::empty(),
+        )? {
+            Ok(dir) => dir,
+            Err(error) => return Ok(Err(error)),
+        };
+        enter_directory(target, pending_child.is_some(), dir, status, user)
+    })?
+}
+
+/// Installs a directory from a reference owned by the caller.
+pub fn fchdir(
+    process: &BrokerProcess,
+    pending_child: Option<ProcessId>,
+    handle: ObjectHandle,
+    user: FileUser,
+) -> ServiceResult<()> {
+    let dir = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    process.fs.check_anchor(&dir)?;
+    let status = match dir.state.handle_status(Caller::new(process))? {
+        Ok(status) => status,
+        Err(error) => return Ok(Err(error)),
+    };
+    with_cwd_process(process, pending_child, |target| {
+        enter_directory(target, pending_child.is_some(), dir, status, user)
+    })?
+}
+
+fn enter_directory(
+    target: &BrokerProcess,
+    pending: bool,
+    dir: File,
+    status: FileStatus,
+    user: FileUser,
+) -> ServiceResult<()> {
+    if status.file_type != super::FileType::Directory {
+        return Ok(Err(FileError::ComponentNotDirectory));
+    }
+    let search = if user.user == status.owner.user {
+        FileMode::XUSR
+    } else if user.group == status.owner.group {
+        FileMode::XGRP
+    } else {
+        FileMode::XOTH
+    };
+    if user.user != 0 && !status.mode.contains(search) {
+        return Ok(Err(FileError::NoSearchPermissions));
+    }
+    target.replace_cwd(dir, pending)?;
+    Ok(Ok(()))
+}
+
+/// Returns the current name of the caller's or its pending child's working directory.
+pub fn getcwd(process: &BrokerProcess, pending_child: Option<ProcessId>) -> ServiceResult<String> {
+    process.require_object_rights(ObjectRights::WAIT)?;
+    with_cwd_process(process, pending_child, |target| {
+        cwd_path(target, Caller::new(process))
+    })?
+}
+
+pub(super) fn cwd_path(process: &BrokerProcess, caller: Caller<'_>) -> ServiceResult<String> {
+    let dir = process.fs_state.cwd.lock().clone();
+    match dir {
+        Some(dir) => dir.state.handle_path(caller),
+        None => Ok(Ok(String::from("/"))),
+    }
+}
+
+/// Reads status of the working directory itself (including a removed directory).
+pub fn cwd_status(
+    process: &BrokerProcess,
+    pending_child: Option<ProcessId>,
+) -> ServiceResult<FileStatus> {
+    process.require_object_rights(ObjectRights::WAIT)?;
+    let dir = with_cwd_process(process, pending_child, |target| {
+        target.fs_state.cwd.lock().clone()
+    })?;
+    let caller = Caller::new(process);
+    match dir {
+        Some(dir) => dir.state.handle_status(caller),
+        None => process
+            .fs
+            .path_status(None, "/", Context::new(FileUser::ROOT, caller), true),
+    }
+}
+
+/// Changes timestamps of the working directory itself.
+pub fn set_cwd_times(
+    process: &BrokerProcess,
+    pending_child: Option<ProcessId>,
+    user: FileUser,
+    times: &SetFileTimes,
+) -> ServiceResult<()> {
+    process.require_object_rights(ObjectRights::WRITE)?;
+    let dir = with_cwd_process(process, pending_child, |target| {
+        target.fs_state.cwd.lock().clone()
+    })?;
+    let dir = match dir {
+        Some(dir) => dir,
+        None => match open_without_reference(
+            process,
+            PathAnchor::None,
+            "/",
+            user,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::PATH | FileOpenFlags::DIRECTORY,
+            FileMode::empty(),
+        )? {
+            Ok((dir, _)) => dir,
+            Err(error) => return Ok(Err(error)),
+        },
+    };
+    dir.state
+        .set_times(Context::new(user, Caller::new(process)), times)
+}
+
 /// Returns the name of an open file; see
 /// [`HandleFilePathRequest`](litebox_broker_protocol::fs::HandleFilePathRequest).
 pub fn handle_path(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<String>> {
@@ -1063,7 +1217,7 @@ pub fn terminal_control(
 /// `directory` must be given exactly when `path` is relative.
 pub fn path_status(
     process: &BrokerProcess,
-    directory: Option<ObjectHandle>,
+    directory: impl Into<PathAnchor>,
     path: &str,
     user: FileUser,
     follow_symlinks: bool,
@@ -1083,7 +1237,7 @@ pub fn path_status(
 /// `directory` must be given exactly when `path` is relative.
 pub fn read_link(
     process: &BrokerProcess,
-    directory: Option<ObjectHandle>,
+    directory: impl Into<PathAnchor>,
     path: &str,
     user: FileUser,
 ) -> Result<FileResult<String>> {
@@ -1112,7 +1266,7 @@ pub fn set_times(
 /// `directory` must be given exactly when `path` is relative.
 pub fn chmod(
     process: &BrokerProcess,
-    directory: Option<ObjectHandle>,
+    directory: impl Into<PathAnchor>,
     path: &str,
     user: FileUser,
     mode: FileMode,
@@ -1129,7 +1283,7 @@ pub fn chmod(
 /// `directory` must be given exactly when `path` is relative.
 pub fn chown(
     process: &BrokerProcess,
-    directory: Option<ObjectHandle>,
+    directory: impl Into<PathAnchor>,
     path: &str,
     acting_user: FileUser,
     user: Option<u16>,
@@ -1151,7 +1305,7 @@ pub fn chown(
 /// `directory` must be given exactly when `path` is relative.
 pub fn unlink(
     process: &BrokerProcess,
-    directory: Option<ObjectHandle>,
+    directory: impl Into<PathAnchor>,
     path: &str,
     user: FileUser,
 ) -> Result<FileResult<()>> {
@@ -1167,9 +1321,9 @@ pub fn unlink(
 /// must have a directory exactly when it is relative.
 pub fn rename(
     process: &BrokerProcess,
-    old_directory: Option<ObjectHandle>,
+    old_directory: impl Into<PathAnchor>,
     old_path: &str,
-    new_directory: Option<ObjectHandle>,
+    new_directory: impl Into<PathAnchor>,
     new_path: &str,
     user: FileUser,
 ) -> Result<FileResult<()>> {
@@ -1191,7 +1345,7 @@ pub fn rename(
 /// `directory` must be given exactly when `path` is relative.
 pub fn mkdir(
     process: &BrokerProcess,
-    directory: Option<ObjectHandle>,
+    directory: impl Into<PathAnchor>,
     path: &str,
     user: FileUser,
     mode: FileMode,
@@ -1207,7 +1361,7 @@ pub fn mkdir(
 /// Mounts a fresh in-memory filesystem on an existing directory at an absolute path.
 pub fn mount_in_mem(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
     process.require_object_rights(ObjectRights::WRITE)?;
-    if let Err(error) = validate_path(None, path) {
+    if let Err(error) = validate_path(PathAnchor::None, path) {
         return Ok(Err(error));
     }
     process
@@ -1220,7 +1374,7 @@ pub fn mount_in_mem(process: &BrokerProcess, path: &str, user: FileUser) -> Resu
 pub fn symlink(
     process: &BrokerProcess,
     target: &str,
-    directory: Option<ObjectHandle>,
+    directory: impl Into<PathAnchor>,
     linkpath: &str,
     user: FileUser,
 ) -> Result<FileResult<()>> {
@@ -1239,7 +1393,7 @@ pub fn symlink(
 /// `directory` must be given exactly when `path` is relative.
 pub fn rmdir(
     process: &BrokerProcess,
-    directory: Option<ObjectHandle>,
+    directory: impl Into<PathAnchor>,
     path: &str,
     user: FileUser,
 ) -> Result<FileResult<()>> {
@@ -1267,9 +1421,9 @@ fn open_required_rights(access: FileAccessMode, flags: FileOpenFlags) -> Result<
     Ok(rights)
 }
 
-fn validate_path(directory: Option<ObjectHandle>, path: &str) -> FileResult<()> {
+fn validate_path(directory: PathAnchor, path: &str) -> FileResult<()> {
     if !path.is_empty()
-        && path.starts_with('/') == directory.is_none()
+        && path.starts_with('/') == (directory == PathAnchor::None)
         && !path.as_bytes().contains(&0)
     {
         Ok(())
@@ -1281,20 +1435,25 @@ fn validate_path(directory: Option<ObjectHandle>, path: &str) -> FileResult<()> 
 /// Runs `operation` with the open directory a validated `path` is resolved from, if any.
 fn with_path_anchor<T>(
     process: &BrokerProcess,
-    directory: Option<ObjectHandle>,
+    directory: impl Into<PathAnchor>,
     path: &str,
     operation: impl FnOnce(Option<&File>) -> ServiceResult<T>,
 ) -> ServiceResult<T> {
+    let directory = directory.into();
     if let Err(error) = validate_path(directory, path) {
         return Ok(Err(error));
     }
-    // The operation itself checks process rights. Using an open directory as a starting
-    // point needs a live file reference, not a particular file access mode.
-    let file = directory
-        .map(|handle| {
-            file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)
-        })
-        .transpose()?;
+    let file = match directory {
+        PathAnchor::None => None,
+        PathAnchor::Object(handle) => Some(file_with_any_rights(
+            process,
+            handle,
+            ObjectRights::WAIT | ObjectRights::WRITE,
+        )?),
+        PathAnchor::Cwd { pending_child } => with_cwd_process(process, pending_child, |target| {
+            target.fs_state.cwd.lock().clone()
+        })?,
+    };
     operation(file.as_ref())
 }
 
@@ -1597,6 +1756,149 @@ mod tests {
         .unwrap()
         .unwrap();
         (broker, owner, anchor, sink)
+    }
+
+    #[test]
+    fn procfs_reports_broker_owned_cwd() {
+        use crate::fs::{composer::Composer, procfs::ProcFs};
+        use litebox_broker_protocol::fs::decode_directory_entries;
+        use litebox_broker_protocol::process::{CpuTime, ProcessExitStatus};
+
+        let fs = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .mount("/proc", ProcFs::new)
+            .build()
+            .unwrap();
+        let (broker, owner, root, sink) =
+            broker_with_root_anchor(Arc::new(Resolver::<TestPlatform, _>::new(fs)));
+        owner.complete_start().unwrap();
+        let other = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let user = FileUser::ROOT;
+        let open_dir = |path| {
+            open(
+                &owner,
+                None,
+                path,
+                user,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
+                FileMode::empty(),
+                &sink,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        mkdir(&owner, None, "/old", user, FileMode::RWXU)
+            .unwrap()
+            .unwrap();
+        let cwd = open_dir("/old");
+        assert_eq!(
+            fchdir(&other, None, cwd, user),
+            Err(BrokerError::UnknownObject)
+        );
+        let regular = open(
+            &owner,
+            None,
+            "/file",
+            user,
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::CREATE,
+            FileMode::RWXU,
+            &sink,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            fchdir(&owner, None, regular, user),
+            Ok(Err(FileError::ComponentNotDirectory))
+        );
+        fchdir(&owner, None, cwd, user).unwrap().unwrap();
+        owner.close_object_reference(cwd).unwrap();
+        assert_eq!(
+            fchdir(&owner, None, cwd, user),
+            Err(BrokerError::UnknownObject)
+        );
+
+        let read_cwd = |path| read_link(&owner, None, path, user);
+        let self_cwd = "/proc/self/cwd";
+        let pid = alloc::format!("/proc/{}", owner.id().0);
+        let pid_cwd = alloc::format!("{pid}/cwd");
+        assert_eq!(read_cwd(self_cwd), Ok(Ok("/old".into())));
+        assert_eq!(read_cwd(&pid_cwd), Ok(Ok("/old".into())));
+        assert_eq!(
+            read_link(&other, None, &pid_cwd, user),
+            Ok(Err(FileError::NoSearchPermissions))
+        );
+        assert_eq!(
+            path_status(&owner, PathAnchor::None, ".", user, true),
+            Ok(Err(FileError::InvalidPathname))
+        );
+        assert_eq!(
+            path_status(
+                &owner,
+                PathAnchor::Cwd {
+                    pending_child: None
+                },
+                ".",
+                user,
+                true
+            ),
+            path_status(&owner, PathAnchor::None, "/old", user, true),
+        );
+        path_status(&owner, Some(root), "old", user, true)
+            .unwrap()
+            .unwrap();
+
+        let link_status = || {
+            path_status(&owner, None, self_cwd, user, false)
+                .unwrap()
+                .unwrap()
+        };
+        let link = link_status();
+        assert_eq!(link.file_type, FileType::SymbolicLink);
+        let mut bytes = [0; 128];
+        let page = read_directory(
+            &owner,
+            open_dir(&pid),
+            &mut bytes.as_mut_slice(),
+            DirectoryReadMode::List(0),
+        )
+        .unwrap()
+        .unwrap();
+        let entries = decode_directory_entries(&bytes[..page.length as usize]).unwrap();
+        assert!(entries.iter().any(|entry| entry.name == "cwd"
+            && entry.file_type == FileType::SymbolicLink
+            && entry.ino_info == Some(link.node_info)));
+
+        rename(&owner, None, "/old", None, "/new", user)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_cwd(self_cwd), Ok(Ok("/new".into())));
+        assert_eq!(
+            path_status(&owner, None, self_cwd, user, true),
+            path_status(&owner, None, "/new", user, true)
+        );
+        rmdir(&owner, None, "/new", user).unwrap().unwrap();
+        assert_eq!(
+            read_cwd(self_cwd),
+            Ok(Err(FileError::NoSuchFileOrDirectory))
+        );
+
+        assert_eq!(
+            getcwd(&owner, None),
+            Ok(Err(FileError::NoSuchFileOrDirectory))
+        );
+        chdir(&owner, None, PathAnchor::None, "/", user)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_cwd(self_cwd), Ok(Ok("/".into())));
+        assert_eq!(link_status().node_info, link.node_info);
+        owner
+            .complete_exit(ProcessExitStatus::Exited { code: 0 }, CpuTime::default())
+            .unwrap();
+        assert!(owner.fs_state.cwd.lock().is_none());
     }
 
     #[test]

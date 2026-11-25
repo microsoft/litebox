@@ -10,14 +10,12 @@ use core::net::SocketAddrV4;
 
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::ConsumeEventResponse;
 use litebox_broker_protocol::fs::{
     DirectoryReadMode, FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode,
     FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
-    MapFileResponse, ReadDirectoryResponse, SetFileTimes,
+    MapFileResponse, PathAnchor, ReadDirectoryResponse, SetFileTimes,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
@@ -51,6 +49,7 @@ use litebox_broker_protocol::unix_socket::{
     UnixSocketName,
 };
 use litebox_broker_protocol::vsock_socket::{AcceptVsockSocketResponse, VsockAddress};
+use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
 
@@ -474,7 +473,7 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn open_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         access: FileAccessMode,
@@ -533,7 +532,7 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn path_file_status(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         follow_symlinks: bool,
@@ -541,7 +540,7 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn read_link_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError>;
@@ -563,6 +562,38 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
     ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError>;
 
+    fn chdir(
+        &self,
+        pending_child: Option<ProcessId>,
+        dir: PathAnchor,
+        path: &str,
+        user: FileUser,
+    ) -> Result<Result<(), FileError>, BrokerControlError>;
+
+    fn fchdir(
+        &self,
+        pending_child: Option<ProcessId>,
+        handle: ObjectHandle,
+        user: FileUser,
+    ) -> Result<Result<(), FileError>, BrokerControlError>;
+
+    fn getcwd(
+        &self,
+        pending_child: Option<ProcessId>,
+    ) -> Result<Result<String, FileError>, BrokerControlError>;
+
+    fn cwd_status(
+        &self,
+        pending_child: Option<ProcessId>,
+    ) -> Result<Result<FileStatus, FileError>, BrokerControlError>;
+
+    fn set_cwd_times(
+        &self,
+        pending_child: Option<ProcessId>,
+        user: FileUser,
+        times: &SetFileTimes,
+    ) -> Result<Result<(), FileError>, BrokerControlError>;
+
     fn is_terminal_file(
         &self,
         handle: ObjectHandle,
@@ -576,7 +607,7 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn chmod_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         mode: FileMode,
@@ -584,7 +615,7 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn chown_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         acting_user: FileUser,
         user: Option<u16>,
@@ -594,30 +625,30 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn symlink_file(
         &self,
         target: &str,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         linkpath: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
     fn unlink_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
     fn rename_file(
         &self,
-        old_dir: Option<ObjectHandle>,
+        old_dir: PathAnchor,
         old_path: &str,
-        new_dir: Option<ObjectHandle>,
+        new_dir: PathAnchor,
         new_path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
 
     fn mkdir_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         mode: FileMode,
@@ -631,7 +662,7 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn rmdir_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError>;
@@ -1657,7 +1688,7 @@ where
 
     fn open_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         access: FileAccessMode,
@@ -1755,7 +1786,7 @@ where
 
     fn path_file_status(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         follow_symlinks: bool,
@@ -1768,7 +1799,7 @@ where
 
     fn read_link_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<String, FileError>, BrokerControlError> {
@@ -1800,6 +1831,50 @@ where
         self.request(|local| local.handle_file_path(handle, lease.sequence()))
     }
 
+    fn chdir(
+        &self,
+        pending_child: Option<ProcessId>,
+        dir: PathAnchor,
+        path: &str,
+        user: FileUser,
+    ) -> Result<Result<(), FileError>, BrokerControlError> {
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| local.chdir(lease.sequence(), pending_child, dir, path, user))
+    }
+
+    fn fchdir(
+        &self,
+        pending_child: Option<ProcessId>,
+        handle: ObjectHandle,
+        user: FileUser,
+    ) -> Result<Result<(), FileError>, BrokerControlError> {
+        self.request(|local| local.fchdir(pending_child, handle, user))
+    }
+
+    fn getcwd(
+        &self,
+        pending_child: Option<ProcessId>,
+    ) -> Result<Result<String, FileError>, BrokerControlError> {
+        let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
+        self.request(|local| local.getcwd(pending_child, lease.sequence()))
+    }
+
+    fn cwd_status(
+        &self,
+        pending_child: Option<ProcessId>,
+    ) -> Result<Result<FileStatus, FileError>, BrokerControlError> {
+        self.request(|local| local.cwd_status(pending_child))
+    }
+
+    fn set_cwd_times(
+        &self,
+        pending_child: Option<ProcessId>,
+        user: FileUser,
+        times: &SetFileTimes,
+    ) -> Result<Result<(), FileError>, BrokerControlError> {
+        self.request(|local| local.set_cwd_times(pending_child, user, times))
+    }
+
     fn is_terminal_file(
         &self,
         handle: ObjectHandle,
@@ -1818,7 +1893,7 @@ where
 
     fn chmod_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         mode: FileMode,
@@ -1829,7 +1904,7 @@ where
 
     fn chown_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         acting_user: FileUser,
         user: Option<u16>,
@@ -1844,7 +1919,7 @@ where
     fn symlink_file(
         &self,
         target: &str,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         linkpath: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
@@ -1859,7 +1934,7 @@ where
 
     fn unlink_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
@@ -1869,9 +1944,9 @@ where
 
     fn rename_file(
         &self,
-        old_dir: Option<ObjectHandle>,
+        old_dir: PathAnchor,
         old_path: &str,
-        new_dir: Option<ObjectHandle>,
+        new_dir: PathAnchor,
         new_path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
@@ -1888,7 +1963,7 @@ where
 
     fn mkdir_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         mode: FileMode,
@@ -1908,7 +1983,7 @@ where
 
     fn rmdir_file(
         &self,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {

@@ -15,7 +15,7 @@ use crate::fs::{
     FileSeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate, FileTimestamp, FileTimestamps,
     FileType, FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
     LockFileRequest, MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
+    OpenFileRequest, OpenFileResponse, PathAnchor, PathFileStatusRequest, ReadDirectoryRequest,
     ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
     RenameFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes,
     SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
@@ -283,7 +283,7 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::FillRandom(sequence(7, 256)),
         BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-            dir: Some(handle),
+            dir: PathAnchor::Object(handle),
             path: sequence(1, 7),
             user: FileUser { user: 2, group: 3 },
             access: FileAccessMode::ReadWrite,
@@ -330,13 +330,17 @@ fn request_codec_round_trips_all_variants() {
             }),
         })),
         BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
-            dir: Some(handle),
+            dir: PathAnchor::Cwd {
+                pending_child: Some(ProcessId(77))
+            },
             path: sequence(5, 9),
             user: FileUser { user: 2, group: 3 },
             follow_symlinks: true,
         })),
         BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
-            dir: Some(handle),
+            dir: PathAnchor::Cwd {
+                pending_child: None
+            },
             path: sequence(5, 9),
             user: FileUser { user: 2, group: 3 },
             follow_symlinks: false,
@@ -365,49 +369,49 @@ fn request_codec_round_trips_all_variants() {
             },
         })),
         BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
-            dir: Some(handle),
+            dir: PathAnchor::Object(handle),
             path: sequence(6, 9),
             user: FileUser { user: 2, group: 3 },
             mode: FileMode::from_bits(0o755).unwrap(),
         })),
         BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
-            dir: Some(handle),
+            dir: PathAnchor::Object(handle),
             path: sequence(7, 9),
             acting_user: FileUser { user: 0, group: 0 },
             user: Some(2),
             group: None,
         })),
         BrokerOperation::File(FileRequest::Unlink(UnlinkFileRequest {
-            dir: Some(handle),
+            dir: PathAnchor::Object(handle),
             path: sequence(8, 9),
             user: FileUser { user: 2, group: 3 },
         })),
         BrokerOperation::File(FileRequest::Mkdir(MkdirFileRequest {
-            dir: Some(handle),
+            dir: PathAnchor::Object(handle),
             path: sequence(9, 9),
             user: FileUser { user: 2, group: 3 },
             mode: FileMode::from_bits(0o750).unwrap(),
         })),
         BrokerOperation::File(FileRequest::Rmdir(RmdirFileRequest {
-            dir: Some(handle),
+            dir: PathAnchor::Object(handle),
             path: sequence(10, 9),
             user: FileUser { user: 2, group: 3 },
         })),
         BrokerOperation::File(FileRequest::Rename(RenameFileRequest {
-            old_dir: Some(ObjectHandle(0)),
-            new_dir: Some(handle),
+            old_dir: PathAnchor::Object(ObjectHandle(0)),
+            new_dir: PathAnchor::Object(handle),
             paths: largest_sequence,
             old_path_length: 3,
             user: FileUser { user: 2, group: 3 },
         })),
         BrokerOperation::File(FileRequest::Symlink(SymlinkFileRequest {
-            dir: Some(handle),
+            dir: PathAnchor::Object(handle),
             buffer: sequence(6, 9),
             path_length: 3,
             user: FileUser { user: 2, group: 3 },
         })),
         BrokerOperation::File(FileRequest::ReadLink(ReadLinkFileRequest {
-            dir: Some(handle),
+            dir: PathAnchor::Object(handle),
             buffer: sequence(11, 256),
             path_length: 9,
             user: FileUser { user: 2, group: 3 },
@@ -424,6 +428,32 @@ fn request_codec_round_trips_all_variants() {
             path: sequence(14, 9),
             user: FileUser { user: 2, group: 3 },
         })),
+        BrokerOperation::File(FileRequest::Chdir {
+            pending_child: Some(ProcessId(77)),
+            dir: PathAnchor::Cwd {
+                pending_child: Some(ProcessId(77))
+            },
+            path: sequence(14, 9),
+            user: FileUser::ROOT,
+        }),
+        BrokerOperation::File(FileRequest::Fchdir {
+            pending_child: None,
+            handle,
+            user: FileUser::ROOT
+        }),
+        BrokerOperation::File(FileRequest::GetCwd {
+            pending_child: None,
+            buffer: sequence(14, 256)
+        }),
+        BrokerOperation::File(FileRequest::CwdStatus(Some(ProcessId(77)))),
+        BrokerOperation::File(FileRequest::SetCwdTimes {
+            pending_child: None,
+            user: FileUser::ROOT,
+            times: SetFileTimes {
+                access: FileTimeUpdate::Omit,
+                modify: FileTimeUpdate::Now
+            },
+        }),
         BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Stream,
@@ -1311,6 +1341,8 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::File(FileResponse::Unlink),
         BrokerResult::File(FileResponse::Mkdir),
         BrokerResult::File(FileResponse::Mount),
+        BrokerResult::File(FileResponse::Chdir),
+        BrokerResult::File(FileResponse::GetCwd(FilePathResponse { length: 1 })),
         BrokerResult::File(FileResponse::Rmdir),
         BrokerResult::File(FileResponse::ReadLink(FilePathResponse { length: 31 })),
         BrokerResult::File(FileResponse::HandlePath(FilePathResponse { length: 41 })),
@@ -2013,7 +2045,7 @@ fn decode_rejects_malformed_fs_request_frames() {
     let open = BrokerRequest {
         request_id: TEST_REQUEST_ID,
         operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-            dir: None,
+            dir: PathAnchor::None,
             path: sequence(1, 9),
             user: FileUser { user: 2, group: 3 },
             access: FileAccessMode::ReadOnly,
@@ -2032,7 +2064,7 @@ fn decode_rejects_malformed_fs_request_frames() {
 
     let open = encode_request(&open);
     let mut invalid_dir = open.clone();
-    invalid_dir[11] = 2;
+    invalid_dir[11] = 0xff;
     assert_eq!(decode_request(&invalid_dir), Err(WireError::InvalidTag));
     let mut unknown_access = open.clone();
     unknown_access[25] = 0xff;
@@ -2076,7 +2108,7 @@ fn decode_rejects_malformed_fs_request_frames() {
     let chown = BrokerRequest {
         request_id: TEST_REQUEST_ID,
         operation: BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
-            dir: None,
+            dir: PathAnchor::None,
             path: sequence(1, 9),
             acting_user: FileUser { user: 0, group: 0 },
             user: Some(2),
@@ -2746,7 +2778,7 @@ fn fs_open_request_wire_shape_is_pinned() {
         encode_request(&BrokerRequest {
             request_id: RequestId(13),
             operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-                dir: None,
+                dir: PathAnchor::None,
                 path: sequence(2, 3),
                 user: FileUser { user: 5, group: 7 },
                 access: FileAccessMode::ReadWrite,

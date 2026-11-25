@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Read-only process directories and the caller-relative `self` symlink.
+//! Read-only process directories with `self` and per-process `cwd` symlinks.
 
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -9,7 +9,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use hashbrown::HashMap;
-use litebox_broker_protocol::ProcessId;
+use litebox_broker_protocol::{ProcessId, fs::FileError};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::Mutex;
 
@@ -37,7 +37,22 @@ pub struct ProcFs {
     self_link: NodeInfo,
     allocator: InodeAllocator,
     // Per mount: a process can appear in several procfs mounts.
-    pid_inodes: Mutex<HashMap<ProcessKey, (Weak<BrokerProcess>, NodeInfo)>>,
+    pid_inodes: Mutex<HashMap<ProcessKey, (Weak<BrokerProcess>, ProcessInodes)>>,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessInodes {
+    dir: NodeInfo,
+    cwd: NodeInfo,
+}
+
+/// Identity of a procfs symlink.
+#[derive(Clone)]
+pub enum Symlink {
+    /// A link to the caller's PID directory.
+    SelfLink,
+    /// A process's working directory.
+    Cwd(Weak<BrokerProcess>),
 }
 
 /// Identity of a procfs directory, including the process's lifetime rather than just its PID.
@@ -57,13 +72,15 @@ impl Directory {
             .ok_or(PathError::NoSuchFileOrDirectory)
     }
 
-    fn visible_pid(
+    fn visible_process(
         process: &Weak<BrokerProcess>,
         caller: Caller<'_>,
-    ) -> Result<ProcessId, PathError> {
-        Self::live_process(process)?
+    ) -> Result<(Arc<BrokerProcess>, ProcessId), PathError> {
+        let process = Self::live_process(process)?;
+        let pid = process
             .process_id_in_namespace(requester(caller)?.pid_namespace())
-            .ok_or(PathError::NoSuchFileOrDirectory)
+            .ok_or(PathError::NoSuchFileOrDirectory)?;
+        Ok((process, pid))
     }
 }
 
@@ -115,7 +132,7 @@ impl ProcFs {
         ResolvedDir::from_typed::<Self>(dir, permissions(DIR_MODE))
     }
 
-    fn pid_inode(&self, process: &Arc<BrokerProcess>) -> NodeInfo {
+    fn process_inodes(&self, process: &Arc<BrokerProcess>) -> ProcessInodes {
         let mut inodes = self.pid_inodes.lock();
         let key = process.key();
         if let Some((_, inode)) = inodes.get(&key) {
@@ -123,9 +140,12 @@ impl ProcFs {
         }
         // Don't upgrade the weak refs: dropping the last strong ref would run process cleanup.
         inodes.retain(|_, (process, _)| process.strong_count() != 0);
-        let inode = self.allocator.next();
-        inodes.insert(key, (Arc::downgrade(process), inode));
-        inode
+        let nodes = ProcessInodes {
+            dir: self.allocator.next(),
+            cwd: self.allocator.next(),
+        };
+        inodes.insert(key, (Arc::downgrade(process), nodes));
+        nodes
     }
 
     fn directory_status(&self, dir: &Directory) -> Result<FileStatus, FileStatusError> {
@@ -133,7 +153,7 @@ impl ProcFs {
             Directory::Root => self.root,
             Directory::Process(process) => {
                 let process = Directory::live_process(process)?;
-                self.pid_inode(&process)
+                self.process_inodes(&process).dir
             }
         };
         Ok(FileStatus {
@@ -147,13 +167,27 @@ impl ProcFs {
         })
     }
 
-    fn symlink_status(&self, caller: Caller<'_>) -> Result<FileStatus, FileStatusError> {
+    fn symlink_status(
+        &self,
+        caller: Caller<'_>,
+        link: &Symlink,
+    ) -> Result<FileStatus, FileStatusError> {
+        let (node_info, size) = match link {
+            Symlink::SelfLink => (
+                self.self_link,
+                requester(caller)?.id().0.to_string().len() as u64,
+            ),
+            Symlink::Cwd(process) => (
+                self.process_inodes(&Directory::live_process(process)?).cwd,
+                0,
+            ),
+        };
         Ok(FileStatus {
             file_type: FileType::SymbolicLink,
             mode: LINK_MODE,
-            size: requester(caller)?.id().0.to_string().len() as u64,
+            size,
             owner: UserInfo::ROOT,
-            node_info: self.self_link,
+            node_info,
             times: None,
             blksize: DEFAULT_DIRECTORY_SIZE,
         })
@@ -162,9 +196,9 @@ impl ProcFs {
 
 impl BackendHandles for ProcFs {
     type ResolvedDir<'a> = Directory;
-    type ResolvedFile<'a> = ();
+    type ResolvedFile<'a> = Symlink;
     type DirHandle = Directory;
-    type FileHandle = ();
+    type FileHandle = Symlink;
 }
 
 impl Backend for ProcFs {
@@ -189,37 +223,43 @@ impl Backend for ProcFs {
                 unreachable!()
             };
             authorize_dir_lookup(info).map_err(fail)?;
-            match current.get_typed::<Self>() {
+            let link = match current.get_typed::<Self>() {
+                Directory::Root if name == "self" && caller.process().is_some() => {
+                    Some(Symlink::SelfLink)
+                }
                 Directory::Root => {
-                    if let Some(process) = caller.process() {
-                        if name == "self" {
-                            if index + 1 < components.len() {
-                                return Err(ResolutionError {
-                                    component: Some(index + 1),
-                                    error: PathError::ComponentNotADirectory.into(),
-                                });
-                            }
-                            return Ok(Resolution::Found(ResolvedTarget::File(
-                                ResolvedFile::from_typed::<Self>(
-                                    (),
-                                    permissions(LINK_MODE),
-                                    FileType::SymbolicLink,
-                                ),
-                            )));
-                        }
-                        if let Some(target) = parse_pid(name)
-                            .and_then(|pid| process.pid_namespace().registered_process(pid).ok())
-                        {
-                            current =
-                                Self::resolved_dir(Directory::Process(Arc::downgrade(&target)));
-                            continue;
-                        }
+                    if let Some(target) = caller.process().and_then(|process| {
+                        process
+                            .pid_namespace()
+                            .registered_process(parse_pid(name)?)
+                            .ok()
+                    }) {
+                        current = Self::resolved_dir(Directory::Process(Arc::downgrade(&target)));
+                        continue;
                     }
+                    None
                 }
                 Directory::Process(target) => {
-                    Directory::visible_pid(target, caller).map_err(|error| fail(error.into()))?;
+                    Directory::visible_process(target, caller)
+                        .map_err(|error| fail(error.into()))?;
                     // XXX: Add fd/ and other process entries when the broker can supply their data.
+                    (name == "cwd").then(|| Symlink::Cwd(target.clone()))
                 }
+            };
+            if let Some(link) = link {
+                if index + 1 < components.len() {
+                    return Err(ResolutionError {
+                        component: Some(index + 1),
+                        error: PathError::ComponentNotADirectory.into(),
+                    });
+                }
+                return Ok(Resolution::Found(ResolvedTarget::File(
+                    ResolvedFile::from_typed::<Self>(
+                        link,
+                        permissions(LINK_MODE),
+                        FileType::SymbolicLink,
+                    ),
+                )));
             }
             return if index + 1 == components.len() {
                 Ok(Resolution::MissingFinal { parent: current })
@@ -236,10 +276,29 @@ impl Backend for ProcFs {
         dir: &ResolvedDir<'_>,
         name: &str,
     ) -> Result<String, WalkError> {
-        if matches!(dir.get_typed::<Self>(), Directory::Root) && name == "self" {
-            return Ok(requester(caller)?.id().0.to_string());
+        match (dir.get_typed::<Self>(), name) {
+            (Directory::Root, "self") => Ok(requester(caller)?.id().0.to_string()),
+            (Directory::Process(target), "cwd") => {
+                let (target, _) = Directory::visible_process(target, caller)?;
+                let process = requester(caller)?;
+                // XXX: Use a ptrace-style access check for another process's cwd.
+                if target.key() != process.key() {
+                    return Err(PathError::NoSearchPerms.into());
+                }
+                // XXX: Following this link should jump to the held directory (as for fd/N),
+                // not re-walk the path text.
+                match super::service::cwd_path(&target, caller) {
+                    Ok(Ok(path)) => Ok(path),
+                    // XXX: Linux shows "<path> (deleted)" for a removed cwd.
+                    Ok(Err(FileError::NoSuchFileOrDirectory)) => {
+                        Err(PathError::NoSuchFileOrDirectory.into())
+                    }
+                    Ok(Err(FileError::NoSearchPermissions)) => Err(PathError::NoSearchPerms.into()),
+                    _ => Err(WalkError::Io),
+                }
+            }
+            _ => Err(PathError::NoSuchFileOrDirectory.into()),
         }
-        Err(PathError::NoSuchFileOrDirectory.into())
     }
 
     fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
@@ -265,7 +324,8 @@ impl Backend for ProcFs {
         Ok(match dir.get_typed::<Self>() {
             Directory::Root => Some(Vec::new()),
             Directory::Process(p) if caller.process().is_some() => {
-                Some(vec![Directory::visible_pid(p, caller)?.0.to_string()])
+                let (_, pid) = Directory::visible_process(p, caller)?;
+                Some(vec![pid.0.to_string()])
             }
             // A contextless walking snapshot cannot name a PID directory.
             Directory::Process(_) => None,
@@ -280,7 +340,7 @@ impl Backend for ProcFs {
         match dir.get_typed::<Self>() {
             Directory::Root => Ok(None),
             Directory::Process(p) => {
-                Directory::visible_pid(p, caller)?;
+                Directory::visible_process(p, caller)?;
                 Ok(Some(DirHandle::from_typed::<Self>(Directory::Root)))
             }
         }
@@ -290,9 +350,9 @@ impl Backend for ProcFs {
         Ok(())
     }
 
-    fn open_file(&self, _file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
+    fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
         assert!(flags.contains(OFlags::PATH | OFlags::NOFOLLOW));
-        Ok(FileHandle::from_typed::<Self>(()))
+        Ok(FileHandle::from_typed::<Self>(file.into_typed::<Self>()))
     }
 
     fn list_dir_at(
@@ -301,8 +361,13 @@ impl Backend for ProcFs {
         handle: DirHandle,
     ) -> Result<Vec<DirEntry>, ReadDirError> {
         if let Directory::Process(p) = handle.get_typed::<Self>() {
-            Directory::visible_pid(p, caller).map_err(|_| ReadDirError::Removed)?;
-            return Ok(Vec::new());
+            let (process, _) =
+                Directory::visible_process(p, caller).map_err(|_| ReadDirError::Removed)?;
+            return Ok(vec![DirEntry {
+                name: String::from("cwd"),
+                file_type: FileType::SymbolicLink,
+                ino_info: Some(self.process_inodes(&process).cwd),
+            }]);
         }
         let Some(process) = caller.process() else {
             return Ok(Vec::new());
@@ -321,7 +386,7 @@ impl Backend for ProcFs {
                     .0
                     .to_string(),
                 file_type: FileType::Directory,
-                ino_info: Some(self.pid_inode(&process)),
+                ino_info: Some(self.process_inodes(&process).dir),
             }
         }));
         Ok(entries)
@@ -330,7 +395,7 @@ impl Backend for ProcFs {
     fn status(&self, caller: Caller<'_>, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
             HandleRef::Dir(dir) => self.directory_status(dir.get_typed::<Self>()),
-            HandleRef::File(_) => self.symlink_status(caller),
+            HandleRef::File(file) => self.symlink_status(caller, file.get_typed::<Self>()),
         }
     }
 
@@ -343,11 +408,11 @@ impl Backend for ProcFs {
             ResolvedTarget::Dir(dir) => {
                 let dir = dir.get_typed::<Self>();
                 if let Directory::Process(p) = dir {
-                    Directory::visible_pid(p, caller)?;
+                    Directory::visible_process(p, caller)?;
                 }
                 self.directory_status(dir)
             }
-            ResolvedTarget::File(_) => self.symlink_status(caller),
+            ResolvedTarget::File(file) => self.symlink_status(caller, file.get_typed::<Self>()),
         }
     }
 

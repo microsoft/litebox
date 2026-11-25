@@ -176,6 +176,11 @@ struct ProcessReferences {
     pending_handles: usize,
 }
 
+pub(crate) struct FsState {
+    // None is the initial root, which does not need an open reference.
+    pub(crate) cwd: Mutex<Option<crate::fs::File>>,
+}
+
 /// One live broker thread of a process. Its process's thread table owns it,
 /// and the thread registry of every namespace it has an ID in refers to it.
 pub(crate) struct BrokerThread {
@@ -258,6 +263,8 @@ pub struct BrokerProcess {
     /// The file service through which it opens files: its parent's, for a
     /// child.
     pub(crate) fs: Arc<dyn FileService>,
+    // XXX: Share this state between processes created with CLONE_FS.
+    pub(crate) fs_state: Arc<FsState>,
     /// The job that accounts for it: its parent's, for a child.
     pub(crate) job: Arc<Job>,
     /// This process's IDs in its own namespace, [`Self::pid_namespace`], which
@@ -642,6 +649,9 @@ impl BrokerProcess {
             core,
             children_namespace: Mutex::new(None),
             fs,
+            fs_state: Arc::new(FsState {
+                cwd: Mutex::new(creator.and_then(|creator| creator.fs_state.cwd.lock().clone())),
+            }),
             job,
             ids,
             key,
@@ -2923,6 +2933,18 @@ impl BrokerProcess {
         object::set_status_flags(&object, request.mask, request.flags)
     }
 
+    pub(crate) fn replace_cwd(&self, dir: crate::fs::File, pending: bool) -> Result<()> {
+        let old = {
+            let state = self.state.lock();
+            if !(self.awaits_startup(&state) || !pending && self.accepts_operations(&state)) {
+                return Err(BrokerError::PeerClosed);
+            }
+            self.fs_state.cwd.lock().replace(dir)
+        };
+        drop(old);
+        Ok(())
+    }
+
     /// Closes one object reference owned by this process.
     ///
     /// The underlying object is released when this was the last live reference.
@@ -3042,6 +3064,8 @@ impl BrokerProcess {
     ///
     /// Calling this method more than once is harmless.
     fn release_references(&self) -> bool {
+        let cwd = self.fs_state.cwd.lock().take();
+        drop(cwd);
         let mut invariant_fault = self.references.lock().pending_handles != 0;
         loop {
             let Some(handle) = self.references.lock().handles.pop() else {

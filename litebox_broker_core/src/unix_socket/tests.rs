@@ -390,6 +390,7 @@ fn path_connections_require_write_permission() {
 
     let (file, _) = crate::fs::open_without_reference(
         &fixture.process,
+        litebox_broker_protocol::fs::PathAnchor::None,
         "/file",
         USER,
         FileAccessMode::WriteOnly,

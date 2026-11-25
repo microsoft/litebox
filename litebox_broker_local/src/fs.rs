@@ -4,7 +4,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryReadMode,
@@ -12,14 +11,16 @@ use litebox_broker_protocol::fs::{
     FileMode, FileOpenFlags, FilePathResponse, FileSeekWhence, FileStatus, FileUser,
     HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
     MAX_FILE_TRANSFER_SIZE, MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest,
-    OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadLinkFileRequest, RenameFileRequest, RmdirFileRequest, SeekFileRequest,
-    SetFileTimes, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
-    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, try_decode_directory_entries,
+    OpenFileRequest, PathAnchor, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadDirectoryResponse, ReadFileRequest, ReadLinkFileRequest, RenameFileRequest,
+    RmdirFileRequest, SeekFileRequest, SetFileTimes, SetTimesFileRequest, SymlinkFileRequest,
+    TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
@@ -42,7 +43,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn open_file(
         &self,
         path_buffer: SharedBufferSequence,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         access: FileAccessMode,
@@ -280,7 +281,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn path_file_status(
         &self,
         path_buffer: SharedBufferSequence,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         follow_symlinks: bool,
@@ -391,7 +392,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn chmod_file(
         &self,
         path_buffer: SharedBufferSequence,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         mode: FileMode,
@@ -418,7 +419,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn chown_file(
         &self,
         path_buffer: SharedBufferSequence,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         acting_user: FileUser,
         user: Option<u16>,
@@ -447,7 +448,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn unlink_file(
         &self,
         path_buffer: SharedBufferSequence,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
@@ -472,9 +473,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn rename_file(
         &self,
         paths_buffer: SharedBufferSequence,
-        old_dir: Option<ObjectHandle>,
+        old_dir: PathAnchor,
         old_path: &str,
-        new_dir: Option<ObjectHandle>,
+        new_dir: PathAnchor,
         new_path: &str,
         user: FileUser,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
@@ -509,7 +510,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn mkdir_file(
         &self,
         path_buffer: SharedBufferSequence,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
         mode: FileMode,
@@ -559,7 +560,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn rmdir_file(
         &self,
         path_buffer: SharedBufferSequence,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
@@ -587,7 +588,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         buffer: SharedBufferSequence,
         target: &str,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         linkpath: &str,
         user: FileUser,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
@@ -624,7 +625,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn read_link_file(
         &self,
         buffer: SharedBufferSequence,
-        dir: Option<ObjectHandle>,
+        dir: PathAnchor,
         path: &str,
         user: FileUser,
     ) -> Result<FileOperationResult<String>, Channel::Error> {
@@ -668,6 +669,103 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             response => {
                 panic!("broker returned unexpected file handle-path response: {response:?}")
             }
+        }
+    }
+
+    /// Changes the working directory by path.
+    pub fn chdir(
+        &self,
+        buffer: SharedBufferSequence,
+        pending_child: Option<ProcessId>,
+        dir: PathAnchor,
+        path: &str,
+        user: FileUser,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.write_file_buffer(buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
+        self.change_cwd(FileRequest::Chdir {
+            pending_child,
+            dir,
+            path: buffer,
+            user,
+        })
+    }
+
+    /// Changes the working directory to an open directory.
+    pub fn fchdir(
+        &self,
+        pending_child: Option<ProcessId>,
+        handle: ObjectHandle,
+        user: FileUser,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.change_cwd(FileRequest::Fchdir {
+            pending_child,
+            handle,
+            user,
+        })
+    }
+
+    fn change_cwd(&self, request: FileRequest) -> Result<FileOperationResult<()>, Channel::Error> {
+        match self.request_file(request)? {
+            FileResponse::Chdir => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected chdir response: {response:?}"),
+        }
+    }
+
+    /// Reads the current working directory's name.
+    ///
+    /// # Panics
+    /// Panics if the broker returns an invalid path or an unrelated response.
+    pub fn getcwd(
+        &self,
+        pending_child: Option<ProcessId>,
+        buffer: SharedBufferSequence,
+    ) -> Result<FileOperationResult<String>, Channel::Error> {
+        match self.request_file(FileRequest::GetCwd {
+            pending_child,
+            buffer,
+        })? {
+            FileResponse::GetCwd(response) => {
+                Ok(Ok(self.read_path_response_buffer(buffer, response)?))
+            }
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected getcwd response: {response:?}"),
+        }
+    }
+
+    /// Reads status of the working directory itself.
+    ///
+    /// # Panics
+    /// Panics if the broker returns an unrelated response.
+    pub fn cwd_status(
+        &self,
+        pending_child: Option<ProcessId>,
+    ) -> Result<FileOperationResult<FileStatus>, Channel::Error> {
+        match self.request_file(FileRequest::CwdStatus(pending_child))? {
+            FileResponse::CwdStatus(status) => Ok(Ok(status)),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected cwd status response: {response:?}"),
+        }
+    }
+
+    /// Changes timestamps of the working directory itself.
+    ///
+    /// # Panics
+    /// Panics if the broker returns an unrelated response.
+    pub fn set_cwd_times(
+        &self,
+        pending_child: Option<ProcessId>,
+        user: FileUser,
+        times: &SetFileTimes,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        match self.request_file(FileRequest::SetCwdTimes {
+            pending_child,
+            user,
+            times: *times,
+        })? {
+            FileResponse::SetTimes => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected cwd set-times response: {response:?}"),
         }
     }
 
@@ -813,7 +911,7 @@ mod tests {
             local
                 .open_file(
                     sequence([0], 5),
-                    None,
+                    PathAnchor::None,
                     "/file",
                     ROOT,
                     FileAccessMode::ReadWrite,
@@ -851,7 +949,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .path_file_status(sequence([3], 5), None, "/file", ROOT, true)
+                .path_file_status(sequence([3], 5), PathAnchor::None, "/file", ROOT, true)
                 .unwrap(),
             Ok(status)
         );
@@ -874,7 +972,7 @@ mod tests {
         assert!(matches!(
             local.channel.sent_operations.borrow().as_slice(),
             [
-                BrokerOperation::File(FileRequest::Open(OpenFileRequest { dir: None, .. })),
+                BrokerOperation::File(FileRequest::Open(OpenFileRequest { dir: PathAnchor::None, .. })),
                 BrokerOperation::File(FileRequest::Write(_)),
                 BrokerOperation::File(FileRequest::Read(_)),
                 BrokerOperation::File(FileRequest::Seek(_)),
@@ -929,8 +1027,10 @@ mod tests {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let local = test_broker_local(channel, memory.clone());
         let paths = sequence([0], 7);
-        let old_dir = Some(ObjectHandle(5));
-        let new_dir = Some(ObjectHandle(7));
+        let old_dir = PathAnchor::Object(ObjectHandle(5));
+        let new_dir = PathAnchor::Cwd {
+            pending_child: None,
+        };
 
         assert_eq!(
             local

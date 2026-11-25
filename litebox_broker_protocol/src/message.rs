@@ -8,13 +8,13 @@ use crate::event::{
 };
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
-    HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest, LockFileRequest,
-    MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, ReadLinkFileRequest, RenameFileRequest, RmdirFileRequest,
-    SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest, SetTimesFileRequest,
-    SymlinkFileRequest, TerminalControlFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse,
+    FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
+    LockFileRequest, MapFileRequest, MapFileResponse, MkdirFileRequest, MountFileRequest,
+    OpenFileRequest, OpenFileResponse, PathAnchor, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, ReadLinkFileRequest,
+    RenameFileRequest, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetFileTimes,
+    SetStatusFlagsRequest, SetTimesFileRequest, SymlinkFileRequest, TerminalControlFileRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -152,6 +152,8 @@ impl BrokerOperation {
                 | FileRequest::Rename(RenameFileRequest { paths: buffer, .. })
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Mount(MountFileRequest { path: buffer, .. })
+                | FileRequest::Chdir { path: buffer, .. }
+                | FileRequest::GetCwd { buffer, .. }
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. })
                 | FileRequest::HandlePath(HandleFilePathRequest { buffer, .. })
                 | FileRequest::ReadLink(ReadLinkFileRequest { buffer, .. })
@@ -245,7 +247,10 @@ impl BrokerOperation {
                 | FileRequest::SetTimes(_)
                 | FileRequest::IsTerminal(_)
                 | FileRequest::TerminalControl(_)
-                | FileRequest::Map(_),
+                | FileRequest::Map(_)
+                | FileRequest::Fchdir { .. }
+                | FileRequest::CwdStatus(_)
+                | FileRequest::SetCwdTimes { .. },
             )
             | Self::UnixSocket(
                 UnixSocketRequest::Create(_)
@@ -1085,6 +1090,44 @@ wire_enum! {
         Map(MapFileRequest),
         /// Mount a fresh tmpfs at a directory path.
         Mount(MountFileRequest),
+        /// Resolve and change a process's working directory.
+        Chdir {
+            /// Selects the pending child instead of the caller.
+            pending_child: Option<ProcessId>,
+            /// Explicit path anchor.
+            dir: PathAnchor,
+            /// Shared-buffer region containing a UTF-8 path.
+            path: SharedBufferSequence,
+            /// Credentials for search permission checks.
+            user: FileUser,
+        },
+        /// Change a process's working directory to an open directory.
+        Fchdir {
+            /// Selects the pending child instead of the caller.
+            pending_child: Option<ProcessId>,
+            /// Directory handle owned by the caller.
+            handle: ObjectHandle,
+            /// Credentials for search permission checks.
+            user: FileUser,
+        },
+        /// Return the current name of the working directory.
+        GetCwd {
+            /// Selects the pending child instead of the caller.
+            pending_child: Option<ProcessId>,
+            /// Shared-buffer region in which to return the path.
+            buffer: SharedBufferSequence,
+        },
+        /// Read the working directory's status, optionally for the pending child.
+        CwdStatus(Option<ProcessId>),
+        /// Set the working directory's times without walking a path.
+        SetCwdTimes {
+            /// Selects the pending child instead of the caller.
+            pending_child: Option<ProcessId>,
+            /// Credentials for permission checks.
+            user: FileUser,
+            /// Timestamp updates.
+            times: SetFileTimes,
+        },
     }
 }
 
@@ -1140,6 +1183,12 @@ wire_enum! {
         Failed(FileError),
         /// Tmpfs mount completed.
         Mount,
+        /// Working directory changed.
+        Chdir,
+        /// Working directory path.
+        GetCwd(FilePathResponse),
+        /// Working directory status.
+        CwdStatus(FileStatus),
     }
 }
 
