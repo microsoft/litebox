@@ -10,10 +10,6 @@
 //! weakly. A socket is torn down explicitly once its last reference closes,
 //! or once its listener closes without accepting it.
 //!
-//! A message can carry references to objects other than Unix sockets, which
-//! its receiver takes as its own references (see [`send`]). Since no carried
-//! object carries references itself, they can form no cycle.
-//!
 //! Locks are taken only in this order:
 //!
 //! 1. one socket's readiness watchers, which serialize its publications;
@@ -335,15 +331,7 @@ pub fn accept(
 /// with [`BrokerError::WouldBlock`] while the receiving socket is full.
 ///
 /// The sent data carries the objects `objects` refer to, at most
-/// [`MAX_UNIX_SOCKET_OBJECTS`], so its receiver gets its own references to
-/// them with their rights, as [`receive`] describes. Carrying a Unix socket
-/// fails with [`UnixSocketError::Unsupported`]. A stream socket that
-/// sends no data carries none, like Linux. Like Linux, the send fails with
-/// [`UnixSocketError::TooManyReferences`] if the references this process
-/// sent that queued messages carry would exceed its reference quota. Since
-/// the receiver can then change the objects, this process's references first
-/// start publishing readiness through `readiness_sink`, as
-/// [`BrokerProcess::register_readiness`] describes.
+/// [`MAX_UNIX_SOCKET_OBJECTS`].
 pub fn send(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -427,15 +415,7 @@ pub struct UnixSocketReceive {
 /// still reports it.
 ///
 /// The caller gets references to the objects the received data carried, up
-/// to `options.max_objects`, as [`UnixSocketReceive::objects`] lists. Each has the
-/// rights the sender's reference had, within the caller's policy, and
-/// publishes readiness through `readiness_sink`. Unless peeking, the objects
-/// it gets no reference to are discarded, as [`UnixSocketReceive::objects_truncated`]
-/// reports; like Linux, a receive that has taken data never fails to give
-/// it, so once one object cannot be given, neither are the rest. A stream
-/// socket receives the objects with the first byte sent with them, and stops
-/// receiving after the last, so one receive gets the objects of at most one
-/// send, as in Linux.
+/// to `options.max_objects`, as [`UnixSocketReceive::objects`] lists.
 pub fn receive(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -793,11 +773,6 @@ impl UnixSockets {
     }
 }
 
-/// A reference to an object other than a Unix socket that a queued message
-/// carries, which its receiver takes as its own.
-///
-/// Dropping it releases the reference. It must not drop while any socket
-/// lock is held, since releasing the object may release platform resources.
 struct InFlightObject {
     object: Arc<RwLock<ObjectEntry>>,
     rights: ObjectRights,
@@ -890,7 +865,7 @@ impl Carrying {
                 if !entry.is_duplicable() {
                     return Err(BrokerError::UnsupportedOperation);
                 }
-                // Only Unix sockets carry references, so carrying none keeps
+                // TODO: Only Unix sockets carry references, so carrying none keeps
                 // carried references from forming cycles.
                 if matches!(&*entry, ObjectEntry::UnixSocket(_)) {
                     return Ok(Err(UnixSocketError::Unsupported));
@@ -924,10 +899,6 @@ impl Carrying {
     }
 }
 
-/// Sockets to tear down and carried objects to release once every lock is
-/// released, which closing a socket works through in a loop: closing a
-/// listener closes the connections waiting in its backlog here rather than
-/// in a nested call.
 #[derive(Default)]
 struct Teardown {
     sockets: Vec<Arc<Socket>>,
@@ -949,8 +920,6 @@ impl Teardown {
     }
 }
 
-/// The carried objects a receive got, which it gives the caller references to
-/// once every socket lock is released.
 #[derive(Default)]
 enum Delivery {
     #[default]
@@ -1016,8 +985,10 @@ impl Delivery {
                     0
                 };
                 for object in objects.into_iter().take(max_objects) {
-                    let (shared, rights) = object.duplicate();
-                    let Some(given) = give(shared, rights) else {
+                    // The charge drops with what is left of `object`, once
+                    // the receiver holds its own reference.
+                    let InFlightObject { object, rights, .. } = object;
+                    let Some(given) = give(object, rights) else {
                         break;
                     };
                     installed.push(given);
@@ -1124,9 +1095,6 @@ enum Connection {
 }
 
 /// Data queued for a socket to receive.
-///
-/// Dropping it drops the objects its messages carry, so it must not drop
-/// while any socket lock is held.
 #[derive(Default)]
 struct Queue {
     /// Bytes queued for a stream socket.

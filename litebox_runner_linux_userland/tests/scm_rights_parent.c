@@ -18,7 +18,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_FDS 4
@@ -467,6 +469,46 @@ static void test_large_stream_send(void) {
     close(pair[1]);
 }
 
+// Checks that a process polling a descriptor it received wakes for changes the sender makes.
+static void test_polling_a_passed_descriptor(void) {
+    int channel[2];
+    socket_pair(SOCK_DGRAM, channel);
+    int pipe_fds[2];
+    TEST_ASSERT(pipe(pipe_fds) == 0, "pipe");
+    pid_t child = fork();
+    TEST_ASSERT(child >= 0, "fork");
+    if (child == 0) {
+        close(channel[0]);
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        struct received received = recv_fds(channel[1], CMSG_SPACE(sizeof(int)), 0);
+        TEST_ASSERT(received.count == 1, "receive the read end");
+        TEST_ASSERT(send(channel[1], "r", 1, 0) == 1, "report the read end received");
+        struct pollfd poll_fd = {.fd = received.fds[0], .events = POLLIN};
+        struct timespec start, end;
+        TEST_ASSERT(clock_gettime(CLOCK_MONOTONIC, &start) == 0, "clock_gettime");
+        TEST_ASSERT(poll(&poll_fd, 1, 10000) == 1 && (poll_fd.revents & POLLIN),
+                    "the write wakes the poll");
+        TEST_ASSERT(clock_gettime(CLOCK_MONOTONIC, &end) == 0, "clock_gettime");
+        // A poll that missed the wake-up would only see the write once it timed out.
+        TEST_ASSERT(end.tv_sec - start.tv_sec < 5, "the poll wakes promptly");
+        char byte = 0;
+        TEST_ASSERT(read(received.fds[0], &byte, 1) == 1 && byte == 'w', "read the write");
+        _exit(0);
+    }
+    close(channel[1]);
+    TEST_ASSERT(send_fds(channel[0], "x", &pipe_fds[0], 1) == 1, "send the read end");
+    close(pipe_fds[0]);
+    char ack;
+    TEST_ASSERT(recv(channel[0], &ack, 1, 0) == 1, "the child received the read end");
+    // Gives the child time to block in poll, so the write wakes it rather than precedes it.
+    sleep_ms(100);
+    TEST_ASSERT(write(pipe_fds[1], "w", 1) == 1, "write the pipe");
+    TEST_ASSERT(reap(child, 1) == 0, "child succeeded");
+    close(pipe_fds[1]);
+    close(channel[0]);
+}
+
 static void test_other_descriptor_kinds(void) {
     int pair[2];
     socket_pair(SOCK_DGRAM, pair);
@@ -632,6 +674,7 @@ int main(void) {
     test_partly_writable_control();
     test_descriptor_limit_truncates();
     test_large_stream_send();
+    test_polling_a_passed_descriptor();
     test_other_descriptor_kinds();
     test_peeking_a_datagram_passes_its_descriptors();
     test_queued_descriptors_are_released();
