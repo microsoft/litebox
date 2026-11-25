@@ -32,7 +32,7 @@ pub(crate) fn build_programs(backend: Backend, destination: &Path) -> (PathBuf, 
     let (program, runner) = match backend {
         Backend::Userland => build_broker_and_runner(&target),
         #[cfg(target_os = "linux")]
-        Backend::Vm => build_vm_kernel_and_runner(&target),
+        Backend::Vm | Backend::CloudHypervisor => build_vm_kernel_and_runner(&target),
     };
     std::fs::create_dir_all(destination).unwrap();
     let [guest_service, program, runner] = [guest_service, program, runner].map(|source| {

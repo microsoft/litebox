@@ -68,7 +68,7 @@ fn cleanup_pending() -> ttrpc::Error {
 
 /// The directories of a container: `<root>/<namespace>/<id>` holds the root archive, or the VM's
 /// payload; the socket directory, short enough for socket paths, holds the bridge (and the VM's
-/// device socket); the broker's temporary directory holds its control sockets. The platform
+/// device sockets); the broker's temporary directory holds its control sockets. The platform
 /// places the last two: `socket_dir` and `temp_dir`.
 ///
 /// Everything the shim creates or removes here, and every socket it serves, is below one of
@@ -123,10 +123,10 @@ impl StateDir {
             |error: io::Error| internal(format!("cannot create the state directory: {error}"));
         self.deprivileged = match (backend, deprivileged()?) {
             #[cfg(target_os = "linux")]
-            (Backend::Vm, Deprivileged::Runners(uid, gid)) => Deprivileged::Broker(uid, gid),
+            (Backend::Vm(_), Deprivileged::Runners(uid, gid)) => Deprivileged::Broker(uid, gid),
             (Backend::Userland, deprivileged) => deprivileged,
             #[cfg(target_os = "linux")]
-            (Backend::Vm, deprivileged) => deprivileged,
+            (Backend::Vm(_), deprivileged) => deprivileged,
         };
         self.private_roots().map_err(failed)?;
         // The namespace's directory and the socket root, which the broker's user traverses.
@@ -204,6 +204,12 @@ impl StateDir {
 
     fn bridge(&self) -> PathBuf {
         self.sockets.join("vsock")
+    }
+
+    /// The socket `name` of a VM device daemon.
+    #[cfg(target_os = "linux")]
+    fn device_socket(&self, name: &str) -> PathBuf {
+        self.sockets.join(name)
     }
 }
 

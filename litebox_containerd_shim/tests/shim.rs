@@ -2,9 +2,10 @@
 // Licensed under the MIT license.
 
 //! Runs the shim daemon as containerd does, against a fake containerd event service, with the
-//! real broker and guest service, on each backend: `userland::<test>`, and `vm::<test>`, ignored
-//! by default, in QEMU with `vhost-device-vsock` (`VHOST_DEVICE_VSOCK`, else from `PATH`) and
-//! `virtiofsd` (`VIRTIOFSD`, else as the shim finds it).
+//! real broker and guest service, on each backend: `userland::<test>`; and, ignored by default,
+//! `vm::<test>`, in QEMU with `vhost-device-vsock` (`VHOST_DEVICE_VSOCK`, else from `PATH`), and
+//! `ch::<test>`, in Cloud Hypervisor (`CLOUD_HYPERVISOR`, else from `PATH`), both with `virtiofsd`
+//! (`VIRTIOFSD`, else as the shim finds it).
 
 #![cfg(target_os = "linux")]
 
@@ -43,7 +44,9 @@ const NAMESPACE: &str = "litebox-test";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
     Userland,
+    /// In QEMU.
     Vm,
+    CloudHypervisor,
 }
 
 impl Backend {
@@ -52,6 +55,7 @@ impl Backend {
         match self {
             Self::Userland => env!("CARGO_BIN_EXE_containerd-shim-litebox-v1"),
             Self::Vm => env!("CARGO_BIN_EXE_containerd-shim-litebox-vm-v1"),
+            Self::CloudHypervisor => env!("CARGO_BIN_EXE_containerd-shim-litebox-ch-v1"),
         }
     }
 
@@ -59,12 +63,13 @@ impl Backend {
     fn broker_program(self) -> &'static str {
         match self {
             Self::Userland => "litebox-broker-userland",
-            Self::Vm => "litebox_runner_vm_kernel",
+            Self::Vm | Self::CloudHypervisor => "litebox_runner_vm_kernel",
         }
     }
 }
 
-/// Defines each test `test(backend)` once per backend, as `userland::test` and `vm::test`.
+/// Defines each test `test(backend)` once per backend, as `userland::test`, `vm::test` and
+/// `ch::test`.
 macro_rules! on_both_backends {
     (
         $($test:ident),* $(,)?;
@@ -131,7 +136,40 @@ macro_rules! on_both_backends {
                 #[ignore = "boots QEMU, and needs root and users other than root; CI runs it in the \
                             QEMU job under `unshare --map-auto -rm`"]
                 fn $vm_root() {
-                    super::$vm_root();
+                    super::$vm_root(super::Backend::Vm);
+                }
+            )*
+        }
+        mod ch {
+            $(
+                #[test]
+                #[ignore = "boots Cloud Hypervisor; CI runs it in the VMM job"]
+                fn $test() {
+                    super::$test(super::Backend::CloudHypervisor);
+                }
+            )*
+            $(
+                #[test]
+                #[ignore = "boots Cloud Hypervisor, and needs mount privilege; CI runs it in the VMM \
+                            job under `unshare -rm`"]
+                fn $privileged() {
+                    super::$privileged(super::Backend::CloudHypervisor);
+                }
+            )*
+            $(
+                #[test]
+                #[ignore = "boots Cloud Hypervisor, and needs root; CI runs it in the VMM job under \
+                            `unshare --map-auto -rm`"]
+                fn $root() {
+                    super::$root(super::Backend::CloudHypervisor);
+                }
+            )*
+            $(
+                #[test]
+                #[ignore = "boots Cloud Hypervisor, and needs root and users other than root; CI \
+                            runs it in the VMM job under `unshare --map-auto -rm`"]
+                fn $vm_root() {
+                    super::$vm_root(super::Backend::CloudHypervisor);
                 }
             )*
         }
@@ -177,6 +215,7 @@ fn each_backends_shim_reports_its_runtime() {
     for (backend, runtime) in [
         (Backend::Userland, "io.containerd.litebox.v1"),
         (Backend::Vm, "io.containerd.litebox-vm.v1"),
+        (Backend::CloudHypervisor, "io.containerd.litebox-ch.v1"),
     ] {
         let output = Command::new(backend.shim()).arg("-info").output().unwrap();
         assert!(output.status.success(), "{output:?}");
@@ -266,9 +305,14 @@ impl Shim {
             Backend::Userland => daemon
                 .env("LITEBOX_BROKER", program)
                 .env("LITEBOX_RUNNER", built_runner),
-            Backend::Vm => {
-                if let Some(virtiofsd) = std::env::var_os("VIRTIOFSD") {
-                    daemon.env("LITEBOX_VIRTIOFSD", virtiofsd);
+            Backend::Vm | Backend::CloudHypervisor => {
+                for (variable, shims) in [
+                    ("VIRTIOFSD", "LITEBOX_VIRTIOFSD"),
+                    ("CLOUD_HYPERVISOR", "LITEBOX_CLOUD_HYPERVISOR"),
+                ] {
+                    if let Some(value) = std::env::var_os(variable) {
+                        daemon.env(shims, value);
+                    }
                 }
                 daemon
                     .env("LITEBOX_VM_KERNEL", program)
@@ -664,9 +708,12 @@ fn a_container_runs_and_reports_its_exit(backend: Backend) {
     std::fs::create_dir(&first).unwrap();
     std::fs::write(first.join("sh"), "#!/bin/sh\n").unwrap();
     std::fs::set_permissions(first.join("sh"), std::fs::Permissions::from_mode(0o641)).unwrap();
-    shim.configure(|spec| {
-        spec["annotations"] = serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80-81"});
-    });
+    // Cloud Hypervisor's has no network yet.
+    if backend != Backend::CloudHypervisor {
+        shim.configure(|spec| {
+            spec["annotations"] = serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80-81"});
+        });
+    }
     let pid = shim.create().unwrap();
     // The init's pid is the broker's, which allows the annotation's egress; or QEMU's, whose
     // payload does.
@@ -678,6 +725,9 @@ fn a_container_runs_and_reports_its_exit(backend: Backend) {
                 cmdline.contains("--allow-tcp-destination\u{0}10.1.0.0/16:80-81\u{0}"),
                 "{cmdline}"
             );
+        }
+        Backend::CloudHypervisor => {
+            assert!(cmdline.contains("cloud-hypervisor"), "{cmdline}");
         }
         Backend::Vm => {
             assert!(cmdline.contains("qemu-system-x86_64"), "{cmdline}");
@@ -1189,10 +1239,10 @@ fn with_litebox_user_the_guardian_broker_and_runners_run_as_that_user() {
     }
 }
 
-/// QEMU, here the daemon's user's, opens the payload in the state directory by path: an earlier
+/// The VMM, here the daemon's user's, opens the payload in the state directory by path: an earlier
 /// container's broker user, who may own the directory, loses it.
-fn as_root_a_vm_takes_back_a_state_directory_another_user_owns() {
-    let mut shim = Shim::launch(Backend::Vm, &process(&["guest", "exit", "0"]));
+fn as_root_a_vm_takes_back_a_state_directory_another_user_owns(backend: Backend) {
+    let mut shim = Shim::launch(backend, &process(&["guest", "exit", "0"]));
     let state = shim.state_dir();
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -1200,24 +1250,25 @@ fn as_root_a_vm_takes_back_a_state_directory_another_user_owns() {
         .create(&state)
         .unwrap();
     std::os::unix::fs::chown(&state, Some(4242), Some(4243)).unwrap();
-    let qemu = shim.create().unwrap();
+    let vmm = shim.create().unwrap();
     let daemon = std::fs::metadata(shim.dir.path()).unwrap().uid();
     let metadata = std::fs::metadata(&state).unwrap();
     assert_eq!((metadata.uid(), metadata.mode() & 0o7777), (daemon, 0o700));
     shim.start("").unwrap();
     assert_eq!(shim.wait(""), 0);
-    shim.finish(qemu);
+    shim.finish(vmm);
 }
 
-/// The VM's guardian, device daemon and QEMU have `/dev/kvm`'s group as their only supplementary
-/// group, unless it is root's or the overflow group (one the user namespace does not map).
-fn with_litebox_user_the_vm_runs_as_that_user() {
+/// The VM's guardian, device daemon, if any, and VMM have `/dev/kvm`'s group as their only
+/// supplementary group, unless it is root's or the overflow group (one the user namespace does not
+/// map).
+fn with_litebox_user_the_vm_runs_as_that_user(backend: Backend) {
     let env = [("LITEBOX_USER", "4242:4243"), ("LITEBOX_ROOT_BROKER", "1")];
     // The strictest umask: what the user reads must not depend on it.
-    let mut shim = Shim::launch_as(Backend::Vm, &process(&["guest", "family"]), &env, 0o077);
+    let mut shim = Shim::launch_as(backend, &process(&["guest", "family"]), &env, 0o077);
     // The user traverses it to the VM's programs and the state root.
     std::fs::set_permissions(shim.dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
-    let qemu = shim.create().unwrap();
+    let vmm = shim.create().unwrap();
     // The state directory, with the payload, is the daemon's: the user only traverses it.
     let daemon = std::fs::metadata(shim.dir.path()).unwrap().uid();
     let state = std::fs::metadata(shim.state_dir()).unwrap();
@@ -1227,10 +1278,11 @@ fn with_litebox_user_the_vm_runs_as_that_user() {
     );
     shim.start("").unwrap();
     shim.wait_output("c.out", "child\n");
-    let guardian = stat_fields(qemu).unwrap()[1].parse().unwrap();
-    // The device daemon and QEMU.
+    let guardian = stat_fields(vmm).unwrap()[1].parse().unwrap();
+    // The device daemon and QEMU, or Cloud Hypervisor.
     let children = processes_with(1, guardian);
-    assert_eq!(children.len(), 2, "{children:?}");
+    let expected = if backend == Backend::Vm { 2 } else { 1 };
+    assert_eq!(children.len(), expected, "{children:?}");
     // `/dev/kvm`'s group, unless there is none (TCG), or it is root's or the overflow group.
     let overflow: u32 = std::fs::read_to_string("/proc/sys/kernel/overflowgid")
         .unwrap()
@@ -1252,7 +1304,7 @@ fn with_litebox_user_the_vm_runs_as_that_user() {
         assert_eq!(ids("Gid:"), ["4243"; 4], "{pid}");
         assert_eq!(ids("Groups:"), expected, "{pid}");
     }
-    shim.kill_and_finish(qemu);
+    shim.kill_and_finish(vmm);
 }
 
 fn as_root_the_broker_joins_or_creates_the_container_s_network_namespace(backend: Backend) {
@@ -1304,7 +1356,7 @@ fn a_created_container_is_deleted_with_its_broker(backend: Backend) {
     let pid = shim.create().unwrap();
     let image = match backend {
         Backend::Userland => "rootfs.tar",
-        Backend::Vm => "payload.tar",
+        Backend::Vm | Backend::CloudHypervisor => "payload.tar",
     };
     assert!(shim.state_dir().join(image).exists());
     shim.finish(pid);
@@ -1326,10 +1378,12 @@ fn the_broker_group_dies_with_the_daemon(backend: Backend) {
     shim.start("").unwrap();
     shim.wait_output("c.out", "child\n");
     let members = group_members(pid);
-    // The guardian, the broker and its runners; or the guardian, vhost-device-vsock and QEMU.
+    // The guardian, the broker and its runners; the guardian, vhost-device-vsock and QEMU; or the
+    // guardian and Cloud Hypervisor.
     let expected = match backend {
         Backend::Userland => 4..usize::MAX,
         Backend::Vm => 3..4,
+        Backend::CloudHypervisor => 2..3,
     };
     assert!(expected.contains(&members()), "{}", members());
     shim.daemon.kill().unwrap();
@@ -1699,7 +1753,7 @@ fn the_container_cannot_kill_the_guest_service(backend: Backend) {
 fn start_unanswered(shim: &Shim, pid: u32, exec_id: &str) {
     let stopped = match shim.backend {
         Backend::Userland => processes_with(1, pid),
-        Backend::Vm => vec![pid],
+        Backend::Vm | Backend::CloudHypervisor => vec![pid],
     };
     assert_ne!(stopped.len(), 0, "the broker has no runners");
     for process in stopped {
@@ -1918,7 +1972,17 @@ fn refused_or_unsupported_specs_and_annotations_fail_create(backend: Backend) {
             Code::INVALID_ARGUMENT,
         ),
     ];
-    if backend == Backend::Vm {
+    if backend == Backend::CloudHypervisor {
+        // It has no network yet; and a comma separates its options.
+        let bind = serde_json::json!({"destination": "/a,b", "type": "bind", "source": data, "options": ["ro"]});
+        cases.push((
+            "annotations",
+            serde_json::json!({"io.litebox.egress.tcp": "10.1.0.0/16:80"}),
+            Code::UNIMPLEMENTED,
+        ));
+        cases.push(("mounts", serde_json::json!([bind]), Code::UNIMPLEMENTED));
+    }
+    if backend != Backend::Userland {
         // The VM publishes no ports yet.
         cases.push((
             "annotations",

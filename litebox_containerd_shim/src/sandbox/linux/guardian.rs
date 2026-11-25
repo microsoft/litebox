@@ -24,8 +24,6 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{Mode, OFlags};
 use rustix::process::{Pid, PidfdFlags, Signal};
 
-use crate::Backend;
-
 /// The leading argument of the broker's guardian mode, which containerd never passes.
 pub const GUARDIAN_MODE: &str = "__litebox-guardian";
 /// The leading argument of the VM's guardian mode, which containerd never passes.
@@ -39,14 +37,11 @@ pub const DEVICE_FD: RawFd = 4;
 /// How long a `connect` daemon may take to listen on its socket.
 const DAEMON_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Runs the guardian of `backend` with `args` (see `guard_broker` and `guard_vm`), and exits.
-pub fn main(backend: Backend, args: &[OsString]) -> ! {
+/// Runs the guardian `guard` ([`guard_broker`] or [`guard_vm`]) with `args`, and exits.
+pub(super) fn main(guard: fn(&[OsString]) -> io::Result<i32>, args: &[OsString]) -> ! {
     // The broker's sockets are its user's only, whatever containerd's umask.
     rustix::process::umask(Mode::from_raw_mode(0o077));
-    let code = match backend {
-        Backend::Userland => guard_broker(args),
-        Backend::Vm => guard_vm(args),
-    };
+    let code = guard(args);
     std::process::exit(code.unwrap_or_else(|error| {
         eprintln!("litebox guardian: {error}");
         125
@@ -91,7 +86,7 @@ fn spawn(command: &mut Command) -> io::Result<(Child, OwnedFd)> {
 
 /// The broker's guardian, with the broker's temporary directory, how to give it (`plain` or
 /// `fd`), and the broker's program and arguments.
-fn guard_broker(args: &[OsString]) -> io::Result<i32> {
+pub(super) fn guard_broker(args: &[OsString]) -> io::Result<i32> {
     let [temp, how, program, broker_args @ ..] = args else {
         return Err(io::Error::other("this mode is private to the shim"));
     };
@@ -136,7 +131,7 @@ fn pass_fd(command: &mut Command, fd: OwnedFd, number: RawFd) {
 ///   the VMM to take as [`DEVICE_FD`]; one at most.
 /// - `listen`: a daemon that takes `SOCKET`, which the guardian binds, as [`LISTENER_FD`], so that
 ///   the VMM may connect to it at once.
-fn guard_vm(args: &[OsString]) -> io::Result<i32> {
+pub(super) fn guard_vm(args: &[OsString]) -> io::Result<i32> {
     let private = || io::Error::other("this mode is private to the shim");
     let mut commands: Vec<&[OsString]> = args.split(|arg| arg == "--").collect();
     let Some((vmm, vmm_args)) = commands.pop().and_then(<[OsString]>::split_first) else {

@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "containerd-shim-litebox-vm-v1"
 path = "src/main_vm.rs"
 
+[[bin]]
+name = "containerd-shim-litebox-ch-v1"
+path = "src/main_ch.rs"
+
 [target.'cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))'.dependencies]
 containerd-shim = "0.10"
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }

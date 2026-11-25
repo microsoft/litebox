@@ -120,7 +120,7 @@ jobs:
           command -v newuidmap >/dev/null || sudo apt-get install -y uidmap
           grep -q "^$(id -un):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
           chmod o+x "$HOME"
-          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'not test(/^vm::/)'
+          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'not test(/^(vm|ch)::/)'
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests
@@ -230,14 +230,14 @@ jobs:
           if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      - name: Test the containerd shim on the VM backend (KVM)
+      - name: Test the containerd shim on the VM backends, QEMU and Cloud Hypervisor (KVM)
         # The privileged ones run under `unshare`, as in the build job.
         run: |
-          ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'test(/^vm::/) and not test(/with_mount_privilege|with_litebox_user|as_root_/)'
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'test(/^(vm|ch)::/) and not test(/with_mount_privilege|with_litebox_user|as_root_/)'
           command -v newuidmap >/dev/null || sudo apt-get install -y uidmap
           grep -q "^$(id -un):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
           chmod o+x "$HOME"
-          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'test(/^vm::(with_mount_privilege|with_litebox_user|as_root_)/)'
+          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'test(/^(vm|ch)::(with_mount_privilege|with_litebox_user|as_root_)/)'
       - name: Run OP-TEE TAs in a QEMU VM with stacked runners on 2 CPUs (KVM)
         run: |
           VM_CPUS=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
@@ -385,7 +385,7 @@ jobs:
           command -v newuidmap >/dev/null || sudo apt-get install -y uidmap
           grep -q "^$(id -un):" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
           chmod o+x "$HOME"
-          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'not test(/^vm::/)'
+          unshare --map-auto --map-root-user --mount -- ./.github/tools/github_actions_run_cargo nextest -p litebox_containerd_shim --run-ignored only -E 'not test(/^(vm|ch)::/)'
       - name: Test AArch64 copy-based fork
         # Forces copy-based fork, which refuses to fork a process with shared mappings: the deep
         # fork-chain test and the tests that share memory across fork (shared futexes,
