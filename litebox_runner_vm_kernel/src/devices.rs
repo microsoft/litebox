@@ -13,8 +13,8 @@
 //!   deadlines.
 //! - [`ProcessTimer`]: the same timer, while a process runs, for its
 //!   `SetTimer` deadline and time slice.
-//! - [`Devices::shares`]: the VM's virtio-9p and virtio-fs devices, each a
-//!   host directory mounted at its tag.
+//! - [`Devices::shares`]: the VM's virtio-fs devices, each a host directory
+//!   mounted at its tag.
 //! - [`InterruptController`]: the local APICs, to start and wake the other
 //!   CPUs, and to have them flush their TLBs.
 //!
@@ -44,12 +44,10 @@ use litebox_broker_core::vsock_socket::transport::{
 use litebox_broker_protocol::vsock_socket::VsockPort;
 use litebox_broker_smoltcp::Network;
 use litebox_broker_vm_kernel::Events;
-use litebox_broker_vm_kernel::share::{NinePTransport, NinePTransportError, Server, Share};
+use litebox_broker_vm_kernel::share::Share;
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::clock::Clock;
-use litebox_hal::devices::{
-    self as hal, ConsoleDevice, FuseDevice, NetworkDevice, NinePDevice, VsockDevice,
-};
+use litebox_hal::devices::{self as hal, ConsoleDevice, FuseDevice, NetworkDevice, VsockDevice};
 use litebox_hal::interrupt::{LocalApic, SPURIOUS_VECTORS, StartupIpi};
 use litebox_hal::virtio::fs::Shared as FuseShared;
 use litebox_platform::buffer::RawBytes;
@@ -63,7 +61,7 @@ use spin::Mutex;
 /// fails.
 const SHARE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often a share waiting for its server is polled, whether or not it
-/// interrupts (see [`NinePShare`] and [`FuseShare`]).
+/// interrupts (see [`FuseShare`]).
 const SHARE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// The local APIC's timer.
@@ -231,72 +229,43 @@ impl Devices {
             .lock()
     }
 
-    /// The VM's virtio-9p and virtio-fs devices, brought up, as shares
-    /// mounted at their tags (see [`mount_path`]). Devices that cannot be
-    /// driven, or whose tag is not such a path or repeats another's, are
-    /// skipped. Call once.
+    /// The VM's virtio-fs devices, brought up, as shares mounted at their
+    /// tags (see [`mount_path`]). Devices that cannot be driven, or whose tag
+    /// is not such a path or repeats another's, are skipped. Call once.
     pub fn shares(&'static self) -> Vec<Share> {
         let target = self.apic.target(DEVICE_VECTOR);
-        let nine_p = NinePDevice::probe_all(self.platform, target)
-            .into_iter()
-            .map(|probed| {
-                probed
-                    .map(ShareDevice::NineP)
-                    .map_err(|error| ("virtio-9p", error))
-            });
-        let fuse = FuseDevice::probe_all(self.platform, target)
-            .into_iter()
-            .map(|probed| {
-                probed
-                    .map(ShareDevice::Fuse)
-                    .map_err(|error| ("virtio-fs", error))
-            });
         let mut shares: Vec<Share> = Vec::new();
-        for probed in nine_p.chain(fuse) {
+        for probed in FuseDevice::probe_all(self.platform, target) {
             let device = match probed {
                 Ok(device) => device,
-                Err((kind, error)) => {
-                    litebox_util_log::warn!(kind:% = kind, error:% = error; "share device unusable");
+                Err(error) => {
+                    litebox_util_log::warn!(error:% = error; "virtio-fs device unusable");
                     continue;
                 }
             };
-            let Some(path) = device.tag().and_then(mount_path) else {
+            let Some(path) = mount_path(device.tag()) else {
                 litebox_util_log::warn!(
-                    kind:% = device.kind(),
                     device:% = device,
-                    tag:? = device.tag().map(String::from_utf8_lossy);
-                    "share device's tag is not a path to mount at"
+                    tag:? = String::from_utf8_lossy(device.tag());
+                    "virtio-fs device's tag is not a path to mount at"
                 );
                 continue;
             };
             if shares.iter().any(|share| share.path == path) {
                 litebox_util_log::warn!(
-                    kind:% = device.kind(),
                     device:% = device,
                     path:% = path;
-                    "share device's tag repeats another's"
+                    "virtio-fs device's tag repeats another's"
                 );
                 continue;
             }
-            litebox_util_log::info!(
-                kind:% = device.kind(),
-                device:% = device,
-                path:% = path;
-                "share"
-            );
-            let server = match device {
-                ShareDevice::NineP(device) => Server::NineP(Box::new(NinePShare {
-                    devices: self,
-                    device,
-                    failed: false,
-                })),
-                ShareDevice::Fuse(device) => Server::Fuse(Box::new(FuseShare {
-                    devices: self,
-                    device,
-                    failed: false,
-                })),
-            };
-            shares.push(Share { path, server });
+            litebox_util_log::info!(device:% = device, path:% = path; "share");
+            let transport = Box::new(FuseShare {
+                devices: self,
+                device,
+                failed: false,
+            });
+            shares.push(Share { path, transport });
         }
         shares
     }
@@ -367,7 +336,7 @@ impl Devices {
     /// `litebox_platform_vm_kernel::cpu`), only takes the pending interrupts
     /// ([`cpu::relax`]), without arming the timer (a VM exit under KVM), as
     /// the caller polls meanwhile: until the scheduler acknowledges it, a
-    /// driver's waits (e.g., a 9P round trip's) busy-poll, which costs only
+    /// driver's waits (e.g., a FUSE round trip's) busy-poll, which costs only
     /// CPU time.
     fn halt(&self, deadline: Option<Instant>) {
         if cpu::marked() {
@@ -606,37 +575,6 @@ fn broker_id(id: hal::ConnectionId) -> ConnectionId {
     }
 }
 
-/// A share's device, by the protocol its server speaks.
-enum ShareDevice {
-    NineP(NinePDevice),
-    Fuse(FuseDevice),
-}
-
-impl ShareDevice {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::NineP(_) => "virtio-9p",
-            Self::Fuse(_) => "virtio-fs",
-        }
-    }
-
-    fn tag(&self) -> Option<&[u8]> {
-        match self {
-            Self::NineP(device) => device.mount_tag(),
-            Self::Fuse(device) => Some(device.tag()),
-        }
-    }
-}
-
-impl core::fmt::Display for ShareDevice {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::NineP(device) => device.fmt(f),
-            Self::Fuse(device) => device.fmt(f),
-        }
-    }
-}
-
 // The FUSE client's messages fit the device's.
 const _: () = {
     assert!(FuseDevice::MAX_REQUEST_SIZE >= fuse::MIN_REQUEST_SIZE);
@@ -646,51 +584,15 @@ const _: () = {
     assert!(FuseDevice::OUT_HEADER_SIZE == fuse::OUT_HEADER_SIZE);
 };
 
-/// A share's virtio-9p device: a request at a time, waiting for its response
-/// in [`Devices::halt`], not suspending the worker: the 9P client holds its
+/// A share's virtio-fs device: a request at a time, waiting for its reply in
+/// [`Devices::halt`], not suspending the worker: the FUSE client holds its
 /// lock across the round trip, and while the worker is suspended, the kernel
 /// may take it (e.g., ending another process's association closes its files),
-/// which nothing on that CPU would release. Polled even if it interrupts:
-/// its interrupt goes to the boot CPU, which wakes this one for it (see
+/// which nothing on that CPU would release. Polled even if it interrupts: its
+/// interrupt goes to the boot CPU, which wakes this one for it (see
 /// [`Devices::on_interrupt`]) only as it takes interrupts, which it may not
 /// for a while, running kernel code (e.g., creating or freeing a process's
 /// address space, or spinning for a spin lock).
-struct NinePShare {
-    devices: &'static Devices,
-    device: NinePDevice,
-    /// A request timed out, and the device may still answer it: the share is
-    /// no longer used.
-    failed: bool,
-}
-
-impl NinePTransport for NinePShare {
-    fn max_message_size(&self) -> usize {
-        NinePDevice::MAX_MESSAGE_SIZE
-    }
-
-    fn round_trip(
-        &mut self,
-        request: &[u8],
-        response: &mut [u8],
-    ) -> Result<usize, NinePTransportError> {
-        if self.failed || !self.device.transmit(request) {
-            return Err(NinePTransportError);
-        }
-        let device = &mut self.device;
-        let Some(len) = self.devices.wait_for_share(|| device.receive(response)) else {
-            litebox_util_log::warn!(
-                device:% = self.device;
-                "9P server did not answer; share failed"
-            );
-            self.failed = true;
-            return Err(NinePTransportError);
-        };
-        Ok(len)
-    }
-}
-
-/// A share's virtio-fs device, waiting as [`NinePShare`] does, for the same
-/// reasons: the FUSE client holds its lock across the round trip.
 struct FuseShare {
     devices: &'static Devices,
     device: FuseDevice,
