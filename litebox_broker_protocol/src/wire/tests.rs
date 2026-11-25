@@ -76,8 +76,9 @@ use crate::socket::{
     TakeSocketErrorRequest, TakeSocketErrorResponse,
 };
 use crate::timer::{
-    CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
-    ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerClock, TimerSetting, TimerSpec,
+    CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadClocksResponse,
+    ReadTimerRequest, ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerClock,
+    TimerSetting, TimerSpec,
 };
 use crate::unix_socket::{
     AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
@@ -174,6 +175,7 @@ fn request_codec_round_trips_all_variants() {
         })),
         BrokerOperation::Timer(TimerRequest::Get(GetTimerRequest { handle })),
         BrokerOperation::Timer(TimerRequest::Read(ReadTimerRequest { handle })),
+        BrokerOperation::Timer(TimerRequest::ReadClocks),
         BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Create),
         BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Add(
             AddReadinessQueueEntryRequest {
@@ -1041,6 +1043,10 @@ fn response_codec_round_trips_all_variants() {
         })),
         BrokerResult::Timer(TimerResponse::Read(ReadTimerResponse {
             expirations: u64::MAX
+        })),
+        BrokerResult::Timer(TimerResponse::ReadClocks(ReadClocksResponse {
+            monotonic: Duration::new(1, 2),
+            realtime: Duration::new(u64::MAX, 999_999_999),
         })),
         BrokerResult::UnixSocket(UnixSocketResponse::Create(CreateUnixSocketResponse {
             handle

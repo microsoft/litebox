@@ -139,6 +139,9 @@ impl NativeForkRunner {
         platform.set_shared_object_channel(shared_object_channel);
         let (litebox, process_id, initial_thread) =
             litebox::LiteBox::new_process_with_broker_local(platform, local);
+        if let Some(reader) = litebox.broker_clock_reader() {
+            platform.set_broker_clock_reader(reader);
+        }
         let process_id =
             i32::try_from(process_id.0).context("process ID does not fit Linux pid_t")?;
         coordinator.install_dispatch(litebox.broker_failure_dispatcher());
@@ -419,6 +422,9 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
     platform.set_shared_object_channel(shared_object_channel);
     let (litebox, process_id, initial_thread) =
         litebox::LiteBox::new_process_with_broker_local(platform, broker_local);
+    if let Some(reader) = litebox.broker_clock_reader() {
+        platform.set_broker_clock_reader(reader);
+    }
     let process_id = i32::try_from(process_id.0).context("process ID does not fit Linux pid_t")?;
     broker_association_coordinator.install_dispatch(litebox.broker_failure_dispatcher());
     litebox_platform_linux_userland::with_guest_signals_blocked(|| {
