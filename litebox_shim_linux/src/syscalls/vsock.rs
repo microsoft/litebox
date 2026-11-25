@@ -19,12 +19,9 @@ use alloc::{
 };
 use litebox::{
     event::{Events, IOPollable, observer::Observer, wait::WaitContext},
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
-    process::ProcessError,
     vsock_socket::{self, errors::VsockSocketError},
 };
 use litebox_broker_protocol::{
-    ObjectHandle,
     socket::{SocketError, SocketType},
     vsock_socket::{VsockAddress, VsockCid, VsockPort},
 };
@@ -50,14 +47,7 @@ const SO_PROTOCOL: u32 = 38;
 /// `SO_DOMAIN`, which [`SocketOption`] does not have.
 const SO_DOMAIN: u32 = 39;
 
-pub(crate) struct VsockSocketSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
-impl<Platform: ShimPlatform> FdEnabledSubsystem for VsockSocketSubsystem<Platform> {
-    type Entry = VsockSocket<Platform>;
-}
-
-impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for VsockSocket<Platform> {}
-
-pub(crate) type VsockSocketFd<Platform> = TypedFd<VsockSocketSubsystem<Platform>>;
+pub(crate) type VsockSocketFd<Platform> = VsockSocket<Platform>;
 
 /// Parses a `sockaddr_vm` of `bytes.len()` bytes as Linux does: the whole structure, of family
 /// `AF_VSOCK`, with no flags but `VMADDR_FLAG_TO_HOST`. Like Linux, the reserved and zero bytes
@@ -192,30 +182,28 @@ impl<Platform: ShimPlatform> From<vsock_socket::VsockSocket<Platform>> for Vsock
     }
 }
 
-impl<Platform: ShimPlatform> VsockSocket<Platform> {
-    /// Creates a socket of type `ty` for `protocol`, which must be 0 or `PF_VSOCK`; only stream
-    /// sockets are supported.
-    pub(super) fn new(
-        litebox: &litebox::LiteBox<Platform>,
-        ty: SockType,
-        protocol: u8,
-        flags: SockFlags,
-    ) -> Result<Self, Errno> {
-        if protocol != 0 && protocol != PF_VSOCK {
-            return Err(Errno::EPROTONOSUPPORT);
-        }
-        let SockType::Stream = ty else {
-            log_unsupported!("vsock socket type {ty:?}");
-            return Err(Errno::ESOCKTNOSUPPORT);
-        };
-        match litebox.create_vsock_socket(SocketType::Stream, open_flags(flags)) {
-            Ok(socket) => Ok(socket.into()),
-            Err(VsockSocketError::Unsupported) => Err(Errno::EAFNOSUPPORT),
-            Err(error) => Err(error.into()),
-        }
+pub(super) fn create_request(
+    ty: SockType,
+    protocol: u8,
+    flags: SockFlags,
+) -> Result<litebox_broker_protocol::vsock_socket::CreateVsockSocketRequest, Errno> {
+    if protocol != 0 && protocol != PF_VSOCK {
+        return Err(Errno::EPROTONOSUPPORT);
     }
+    let SockType::Stream = ty else {
+        log_unsupported!("vsock socket type {ty:?}");
+        return Err(Errno::ESOCKTNOSUPPORT);
+    };
+    Ok(
+        litebox_broker_protocol::vsock_socket::CreateVsockSocketRequest {
+            socket_type: SocketType::Stream,
+            flags: open_flags(flags),
+        },
+    )
+}
 
-    /// The LiteBox socket, which a child process inherits.
+impl<Platform: ShimPlatform> VsockSocket<Platform> {
+    /// The LiteBox socket.
     pub(crate) fn vsock_socket(&self) -> &Arc<vsock_socket::VsockSocket<Platform>> {
         &self.socket
     }
@@ -230,17 +218,6 @@ impl<Platform: ShimPlatform> VsockSocket<Platform> {
 
     pub(super) fn listen(&self, backlog: u16) -> Result<(), Errno> {
         Ok(self.socket.listen(u32::from(backlog))?)
-    }
-
-    /// Accepts a connection, returning it and its peer's address; `flags` sets the new socket's
-    /// status flags only.
-    pub(super) fn accept(
-        &self,
-        cx: &WaitContext<'_, Platform>,
-        flags: SockFlags,
-    ) -> Result<(Self, VsockAddress), Errno> {
-        let (accepted, peer) = self.socket.accept(cx, open_flags(flags), false)?;
-        Ok((accepted.into(), peer))
     }
 
     /// Connects as Linux does: a blocking connect waits for the host's answer, a nonblocking one
@@ -394,25 +371,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &VsockSocketFd<Platform>,
         f: impl FnOnce(&VsockSocket<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
-        let handle = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(Errno::EBADF)?;
-        handle.with_entry(f)
-    }
-
-    /// Adopts a vsock socket this process inherited from its parent, or received with Unix
-    /// socket data, as `handle`.
-    pub(super) fn adopt_inherited_vsock_socket(
-        &self,
-        handle: ObjectHandle,
-    ) -> Result<VsockSocketFd<Platform>, ProcessError> {
-        let socket = self.litebox.adopt_inherited_vsock_socket(handle)?;
-        Ok(self
-            .litebox
-            .descriptor_table_mut()
-            .insert::<VsockSocketSubsystem<Platform>>(VsockSocket::from(socket)))
+        f(fd)
     }
 }
 

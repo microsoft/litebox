@@ -21,6 +21,7 @@ extern crate std;
 mod channel;
 mod error;
 pub mod event;
+mod fd;
 pub mod fs;
 mod id;
 pub mod job;

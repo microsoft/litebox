@@ -5,7 +5,6 @@
 //! and sessions, and signals between processes.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
@@ -26,17 +25,10 @@ use crate::LiteBox;
 use crate::broker::{
     BrokerControl, BrokerPollableRegistry, error::BrokerControlError, readiness_events,
 };
-use crate::event::{
-    Events, IOPollable, counter::EventCounter, observer::Observer, polling::Pollee,
-    readiness_queue::ReadinessQueue, timer::Timer,
-};
+use crate::event::{Events, IOPollable, observer::Observer, polling::Pollee};
 use crate::fs::File;
 use crate::fs::errors::StatusFlagsError;
-use crate::inet_socket::InetSocket;
-use crate::pipes::PipeEnd;
 use crate::sync::RawSyncPrimitivesProvider;
-use crate::unix_socket::UnixSocket;
-use crate::vsock_socket::VsockSocket;
 
 /// Error returned by the broker-backed process service.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
@@ -395,60 +387,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok(Process::new(self, broker, handle))
     }
 
-    /// Returns the process this process inherited from its parent as `handle`
-    /// through [`PendingChild::inherit`], or received with Unix socket data.
-    ///
-    /// The [`Process`] owns `handle`, so callers adopt each handle once and
-    /// share the [`Process`] for every other use.
-    pub fn adopt_inherited_process(
+    /// Borrows a descriptor-table process handle.
+    pub fn borrow_fd_process(
         &self,
         handle: ObjectHandle,
     ) -> Result<Process<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(Process::new(self, broker, handle))
-    }
-}
-
-/// A descriptor a pending child process can inherit through [`PendingChild::inherit`], or that
-/// data sent with [`UnixSocket::send`] can carry.
-///
-/// This identifies only the object. The shim records guest-specific details, such as the
-/// descriptor number, in the child's startup payload alongside the handle `inherit` returns.
-pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    /// A file, adopted with [`LiteBox::adopt_inherited_file`].
-    File(Arc<File<Platform>>),
-    /// A pipe end, adopted with [`LiteBox::adopt_inherited_pipe`].
-    Pipe(Arc<PipeEnd<Platform>>),
-    /// A Unix socket, adopted with [`LiteBox::adopt_inherited_unix_socket`].
-    UnixSocket(Arc<UnixSocket<Platform>>),
-    /// An IPv4 socket, adopted with [`LiteBox::adopt_inherited_inet_socket`].
-    InetSocket(Arc<InetSocket<Platform>>),
-    /// A vsock socket, adopted with [`LiteBox::adopt_inherited_vsock_socket`].
-    VsockSocket(Arc<VsockSocket<Platform>>),
-    /// An event counter, adopted with [`LiteBox::adopt_inherited_event_counter`].
-    EventCounter(Arc<EventCounter<Platform>>),
-    /// A timer, adopted with [`LiteBox::adopt_inherited_timer`].
-    Timer(Arc<Timer<Platform>>),
-    /// A readiness queue, adopted with [`LiteBox::adopt_inherited_readiness_queue`].
-    ReadinessQueue(Arc<ReadinessQueue<Platform>>),
-    /// A process, adopted with [`LiteBox::adopt_inherited_process`].
-    Process(Arc<Process<Platform>>),
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InheritableFd<Platform> {
-    /// The broker handle of the object.
-    pub(crate) fn handle(&self) -> ObjectHandle {
-        match self {
-            Self::File(file) => file.handle(),
-            Self::Pipe(pipe) => pipe.handle(),
-            Self::UnixSocket(socket) => socket.handle(),
-            Self::InetSocket(socket) => socket.handle(),
-            Self::VsockSocket(socket) => socket.handle(),
-            Self::EventCounter(counter) => counter.handle(),
-            Self::Timer(timer) => timer.handle(),
-            Self::ReadinessQueue(queue) => queue.handle(),
-            Self::Process(process) => process.handle(),
-        }
+        let mut process = Process::new(self, broker, handle);
+        process.owns_handle = false;
+        Ok(process)
     }
 }
 
@@ -508,41 +455,16 @@ impl PendingChild {
         Ok(())
     }
 
-    /// Gives this pending child process its own references to the objects
-    /// `fds` refer to, returning the child's handles in the same order.
-    ///
-    /// Like descriptors a Linux child inherits, each child reference shares
-    /// its object's state, such as a file's offset, a pipe's buffer, or an
-    /// event counter's count.
-    /// Descriptors sharing an open file description get the same handle. The
-    /// child adopts each handle as the [`InheritableFd`] variant describes and
-    /// releases its references when it terminates. If this fails, the child
-    /// receives none of them.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns fewer handles than were duplicated.
-    pub fn inherit<Platform: RawSyncPrimitivesProvider + TimeProvider>(
+    /// Gives the child its own reference to an open file, independent of its descriptor table.
+    pub fn inherit_file<Platform: RawSyncPrimitivesProvider + TimeProvider>(
         &self,
-        fds: &[InheritableFd<Platform>],
-    ) -> Result<Vec<ObjectHandle>, ProcessError> {
-        // `fds` holds the objects, which keeps their handles open until the child has its own.
-        let fd_handles: Vec<ObjectHandle> = fds.iter().map(InheritableFd::handle).collect();
-        let mut handles = fd_handles.clone();
-        handles.sort_unstable();
-        handles.dedup();
-        let inherited = self
-            .broker
-            .duplicate_objects_to_child(self.identity.process_id, &handles)?;
-        Ok(fd_handles
-            .iter()
-            .map(|handle| {
-                let index = handles
-                    .binary_search(handle)
-                    .expect("every descriptor handle was duplicated");
-                inherited[index]
-            })
-            .collect())
+        file: &File<Platform>,
+    ) -> Result<ObjectHandle, ProcessError> {
+        self.broker
+            .duplicate_objects_to_child(self.identity.process_id, &[file.handle()])?
+            .first()
+            .copied()
+            .ok_or(ProcessError::Unavailable)
     }
 
     /// Writes `data` at `offset` of this pending child process's memory image,
@@ -627,7 +549,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Signals<Platform> {
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for Signals<Platform> {
     fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
+        self.pollable_registry
+            .unregister_pollable(self.handle, &self.pollee);
         let _ = self.broker.close_object(self.handle);
     }
 }
@@ -653,11 +576,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Signals<
 /// discarded, or it never started) or otherwise leaves the broker.
 ///
 /// Each [`LiteBox::open_process`] call opens a separate broker object with its
-/// own status flags, which copies inherited through [`PendingChild::inherit`]
-/// share.
+/// own status flags, shared by copies of a descriptor referring to that object.
 pub struct Process<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
+    owns_handle: bool,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
 }
@@ -676,6 +599,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
             handle,
             pollable_registry,
             pollee,
+            owns_handle: true,
         }
     }
 
@@ -734,8 +658,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for Process<Platform> {
     fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
-        let _ = self.broker.close_object(self.handle);
+        self.pollable_registry
+            .unregister_pollable(self.handle, &self.pollee);
+        if self.owns_handle {
+            let _ = self.broker.close_object(self.handle);
+        }
     }
 }
 

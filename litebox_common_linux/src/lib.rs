@@ -1987,8 +1987,8 @@ pub struct TaskParams {
     pub ignored_signals: SigSet,
     /// Queued signals pending at start for the process or its main thread, with their `siginfo`.
     pub pending_signals: program_startup::PendingSignalQueues,
-    /// Descriptors inherited from the parent, or `None` to start with the standard streams.
-    pub inherited_fds: Option<alloc::vec::Vec<program_startup::InheritedFd>>,
+    /// Whether the broker already has this process's descriptor table from its parent.
+    pub inherited: bool,
     /// Initial launch directory, or `None` to keep the broker's working directory.
     pub cwd: Option<program_startup::InheritedCwd>,
     /// The file mode creation mask inherited from the parent, or `None` to start with `0o022`.
@@ -2148,8 +2148,19 @@ impl RlimitResource {
     pub const RLIM_NLIMITS: usize = RlimitResource::RTTIME as usize + 1;
 }
 
-/// The soft and hard limits of every resource, indexed by [`RlimitResource`].
-pub type ResourceLimitValues = [Rlimit; RlimitResource::RLIM_NLIMITS];
+/// Shim-owned soft and hard limits. NOFILE has no slot because it lives in the broker.
+pub type ResourceLimitValues = [Rlimit; RlimitResource::RLIM_NLIMITS - 1];
+
+impl RlimitResource {
+    /// Index in the shim's limit array, or `None` for broker-owned NOFILE.
+    pub const fn shim_limit_index(self) -> Option<usize> {
+        match self {
+            Self::NOFILE => None,
+            _ if (self as usize) < Self::NOFILE as usize => Some(self as usize),
+            _ => Some(self as usize - 1),
+        }
+    }
+}
 
 // FUTURE: The rust compiler is currently confused (in the shim, where a pointer
 // to this is taken) by the overly recursive nature of the trait bounds if we

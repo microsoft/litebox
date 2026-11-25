@@ -62,6 +62,7 @@ pub const MAX_UDP_DATAGRAM_SIZE: usize =
 pub struct InetSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
+    owns_handle: bool,
     socket_type: SocketType,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
@@ -98,23 +99,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         ))
     }
 
-    /// Returns the IPv4 socket of type `socket_type` this process inherited
-    /// from its parent, or received with Unix socket data, as `handle`.
-    ///
-    /// The socket owns `handle`, so callers adopt each handle once and share
-    /// the socket for every other use.
-    pub fn adopt_inherited_inet_socket(
+    /// Borrows a descriptor-table IPv4 socket.
+    pub fn borrow_fd_inet_socket(
         &self,
         handle: ObjectHandle,
         socket_type: SocketType,
     ) -> Result<InetSocket<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(InetSocket::new(
-            broker,
-            self.broker_pollable_registry(),
-            handle,
-            socket_type,
-        ))
+        let mut socket =
+            InetSocket::new(broker, self.broker_pollable_registry(), handle, socket_type);
+        socket.owns_handle = false;
+        Ok(socket)
     }
 }
 
@@ -128,6 +123,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         let socket = Self {
             broker,
             handle,
+            owns_handle: true,
             socket_type,
             pollable_registry,
             pollee: Arc::new(Pollee::new()),
@@ -139,8 +135,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InetSocket<Platform> {
         socket
     }
 
-    /// The broker handle this socket owns.
-    pub(crate) fn handle(&self) -> ObjectHandle {
+    /// The broker handle for operations on this socket.
+    pub fn handle(&self) -> ObjectHandle {
         self.handle
     }
 
@@ -428,8 +424,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for InetSock
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for InetSocket<Platform> {
     fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
-        let _ = self.broker.close_object(self.handle);
+        self.pollable_registry
+            .unregister_pollable(self.handle, &self.pollee);
+        if self.owns_handle {
+            let _ = self.broker.close_object(self.handle);
+        }
     }
 }
 

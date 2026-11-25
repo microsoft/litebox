@@ -13,22 +13,28 @@ use core::{
     time::Duration,
 };
 
+use alloc::sync::Arc;
 use litebox::{
-    event::wait::WaitContext,
-    fd::{EntryHandle, FdEnabledSubsystem},
+    event::{
+        Events, IOPollable,
+        polling::TryOpError,
+        wait::{WaitContext, WaitError},
+    },
     inet_socket::SOCKET_RECEIVE_OPERATION_SIZE,
     platform::page_mgmt::MemoryRegionPermissions,
     utils::TruncateExt as _,
 };
 use litebox_broker_protocol::{
+    error::ErrorCode,
+    fd::{FdCreate, FdOperation, FdPeer, FdRequest, FdResponse},
     fs::FileOpenFlags,
     socket::{self, ShutdownMode},
     vsock_socket::VsockAddress,
 };
 use litebox_common_linux::{
-    AddressFamily, CmsgHdr, FileDescriptorFlags, IoReadVec, IoWriteVec, ReceiveFlags, SendFlags,
-    ShutdownHow, SockFlags, SockType, SocketControlMessageName, SocketOption, SocketOptionName,
-    UserMmsgHdr, UserMsgHdr, errno::Errno,
+    AddressFamily, CmsgHdr, IoReadVec, IoWriteVec, ReceiveFlags, SendFlags, ShutdownHow, SockFlags,
+    SockType, SocketControlMessageName, SocketOption, SocketOptionName, UserMmsgHdr, UserMsgHdr,
+    errno::Errno,
 };
 use litebox_common_linux::{PAGE_SIZE, mm::VmemManager};
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
@@ -37,10 +43,10 @@ use zerocopy::FromBytes as _;
 
 use crate::guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
 use crate::syscalls::{
-    file::{AnyTypedFd, FilesState},
-    inet::{self, InetSocket, InetSocketSubsystem},
-    unix::{self, UnixSocket, UnixSocketAddr, UnixSocketSubsystem},
-    vsock::{self, VsockSocket, VsockSocketSubsystem},
+    file::AnyTypedFd,
+    inet::{self, InetSocket},
+    unix::{self, UnixSocket, UnixSocketAddr},
+    vsock::{self, VsockSocket},
 };
 use crate::{GlobalState, ShimPlatform, Task};
 use crate::{UserPtr, UserPtrMut};
@@ -50,9 +56,9 @@ use crate::{UserPtr, UserPtrMut};
 const UIO_MAXIOV: usize = 1024;
 
 enum ReceiveSocket<Platform: ShimPlatform> {
-    Inet(EntryHandle<Platform, InetSocketSubsystem<Platform>>),
-    Unix(EntryHandle<Platform, UnixSocketSubsystem<Platform>>),
-    Vsock(EntryHandle<Platform, VsockSocketSubsystem<Platform>>),
+    Inet(Arc<InetSocket<Platform>>),
+    Unix(Arc<UnixSocket<Platform>>),
+    Vsock(Arc<VsockSocket<Platform>>),
 }
 
 /// How a receive call receives from its socket, which the socket's family decides.
@@ -69,11 +75,20 @@ pub(super) struct ReceivePlan {
 }
 
 impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
+    fn from_typed(socket: &AnyTypedFd<Platform>) -> Result<Self, Errno> {
+        match socket {
+            AnyTypedFd::Inet(fd) => Ok(Self::Inet(fd.clone())),
+            AnyTypedFd::Unix(fd) => Ok(Self::Unix(fd.clone())),
+            AnyTypedFd::Vsock(fd) => Ok(Self::Vsock(fd.clone())),
+            _ => Err(Errno::ENOTSOCK),
+        }
+    }
+
     /// Plans a receive call with `flags`.
     fn plan(&self, flags: ReceiveFlags) -> Result<ReceivePlan, Errno> {
         match self {
-            ReceiveSocket::Inet(handle) => handle.with_entry(|socket| socket.receive_plan(flags)),
-            ReceiveSocket::Unix(handle) => Ok(handle.with_entry(UnixSocket::receive_plan)),
+            ReceiveSocket::Inet(socket) => socket.receive_plan(flags),
+            ReceiveSocket::Unix(socket) => Ok(socket.receive_plan()),
             // Vsock sockets don't support `MSG_WAITALL`.
             ReceiveSocket::Vsock(_) => Ok(ReceivePlan {
                 is_stream: true,
@@ -105,30 +120,24 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
     ) -> Result<usize, Errno> {
         let want_source = source_addr.is_some();
         let (size, addr) = match self {
-            ReceiveSocket::Inet(handle) => {
+            ReceiveSocket::Inet(socket) => {
                 let mut addr = None;
-                let size = handle.with_entry(|socket| {
-                    socket.receive(
-                        cx,
-                        buf,
-                        flags,
-                        has_prior_progress,
-                        want_source.then_some(&mut addr),
-                    )
-                })?;
+                let size = socket.receive(
+                    cx,
+                    buf,
+                    flags,
+                    has_prior_progress,
+                    want_source.then_some(&mut addr),
+                )?;
                 (size, addr.map(SocketAddress::Inet))
             }
-            ReceiveSocket::Unix(handle) => {
+            ReceiveSocket::Unix(socket) => {
                 let mut addr = None;
-                let size = handle.with_entry(|socket| {
-                    socket.recvfrom(cx, buf, flags, want_source.then_some(&mut addr), objects)
-                })?;
+                let size =
+                    socket.recvfrom(cx, buf, flags, want_source.then_some(&mut addr), objects)?;
                 (size, addr.map(SocketAddress::Unix))
             }
-            ReceiveSocket::Vsock(handle) => (
-                handle.with_entry(|socket| socket.receive(cx, buf, flags))?,
-                None,
-            ),
+            ReceiveSocket::Vsock(socket) => (socket.receive(cx, buf, flags)?, None),
         };
         if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
             *source_addr = Some(addr);
@@ -144,8 +153,8 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
         has_prior_progress: bool,
     ) -> Result<bool, Errno> {
         // Vsock sockets cannot peek, but probe without taking data.
-        if let ReceiveSocket::Vsock(handle) = self {
-            return handle.with_entry(|socket| socket.probe(cx, flags));
+        if let ReceiveSocket::Vsock(socket) = self {
+            return socket.probe(cx, flags);
         }
         let mut probe = [0];
         self.receive(
@@ -181,29 +190,6 @@ impl<Platform: ShimPlatform> super::file::FilesState<Platform> {
             AnyTypedFd::Inet(fd) => global.with_inet_socket(fd, inet_op),
             AnyTypedFd::Unix(fd) => global.with_unix_socket(fd, unix_op),
             AnyTypedFd::Vsock(fd) => global.with_vsock_socket(fd, vsock_op),
-            _ => Err(Errno::ENOTSOCK),
-        }
-    }
-
-    fn pin_receive_socket(
-        &self,
-        global: &GlobalState<Platform>,
-        socket: &AnyTypedFd<Platform>,
-    ) -> Result<ReceiveSocket<Platform>, Errno> {
-        let descriptor_table = global.litebox.descriptor_table();
-        match socket {
-            AnyTypedFd::Inet(fd) => descriptor_table
-                .entry_handle(fd)
-                .map(ReceiveSocket::Inet)
-                .ok_or(Errno::EBADF),
-            AnyTypedFd::Unix(fd) => descriptor_table
-                .entry_handle(fd)
-                .map(ReceiveSocket::Unix)
-                .ok_or(Errno::EBADF),
-            AnyTypedFd::Vsock(fd) => descriptor_table
-                .entry_handle(fd)
-                .map(ReceiveSocket::Vsock)
-                .ok_or(Errno::EBADF),
             _ => Err(Errno::ENOTSOCK),
         }
     }
@@ -458,48 +444,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: SockFlags,
         protocol: u8,
     ) -> Result<u32, Errno> {
-        let files = self.files.borrow();
-        let file = match domain {
-            AddressFamily::INET => {
-                let socket = InetSocket::new(&self.global.litebox, ty, protocol, flags)?;
-                self.insert_socket::<InetSocketSubsystem<Platform>>(&files, socket, flags)?
-            }
-            AddressFamily::UNIX => {
-                let socket = UnixSocket::new(&self.global.litebox, ty, protocol, flags)?;
-                self.insert_socket::<UnixSocketSubsystem<Platform>>(&files, socket, flags)?
-            }
-            AddressFamily::VSOCK => {
-                let socket = VsockSocket::new(&self.global.litebox, ty, protocol, flags)?;
-                self.insert_socket::<VsockSocketSubsystem<Platform>>(&files, socket, flags)?
-            }
+        let object = match domain {
+            AddressFamily::INET => FdCreate::Inet(inet::create_request(ty, protocol, flags)?),
+            AddressFamily::UNIX => FdCreate::Unix(
+                litebox_broker_protocol::unix_socket::CreateUnixSocketRequest {
+                    socket_type: unix::socket_type(ty, protocol)?,
+                    flags: open_flags(flags),
+                },
+            ),
+            AddressFamily::VSOCK => FdCreate::Vsock(vsock::create_request(ty, protocol, flags)?),
             AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
             _ => unimplemented!(),
         };
-        Ok(u32::try_from(file).unwrap())
-    }
-
-    /// Publishes `socket` as a new file descriptor, closing it on failure.
-    ///
-    /// `SOCK_CLOEXEC` in `flags` sets the descriptor's close-on-exec flag.
-    fn insert_socket<S: FdEnabledSubsystem>(
-        &self,
-        files: &FilesState<Platform>,
-        socket: S::Entry,
-        flags: SockFlags,
-    ) -> Result<usize, Errno> {
-        let typed = {
-            let mut dt = self.global.litebox.descriptor_table_mut();
-            let typed = dt.insert::<S>(socket);
-            if flags.contains(SockFlags::CLOEXEC) {
-                let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
-                assert!(old.is_none());
-            }
-            typed
-        };
-        files.insert_raw_fd(typed).map_err(|typed| {
-            self.remove_and_drop_descriptor(&typed);
-            Errno::EMFILE
-        })
+        self.create_fds(object, flags.contains(SockFlags::CLOEXEC))
+            .map(|(fd, _, _)| fd.number)
+            .map_err(|error| {
+                if matches!(domain, AddressFamily::VSOCK) && error == Errno::EOPNOTSUPP {
+                    Errno::EAFNOSUPPORT
+                } else {
+                    error
+                }
+            })
     }
 
     pub(crate) fn sys_socketpair(
@@ -523,8 +488,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Creates a connected socket pair, returning its descriptors once `publish` has stored them.
-    ///
-    /// See [`Self::install_fd_pair`] for the contract of `publish`.
     pub(super) fn do_socketpair(
         &self,
         domain: AddressFamily,
@@ -535,19 +498,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(u32, u32), Errno> {
         match domain {
             AddressFamily::UNIX => {
-                let (sock1, sock2) =
-                    UnixSocket::new_connected_pair(&self.global.litebox, ty, protocol, flags)?;
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                let typed1 = dt.insert::<UnixSocketSubsystem<Platform>>(sock1);
-                let typed2 = dt.insert::<UnixSocketSubsystem<Platform>>(sock2);
-                if flags.contains(SockFlags::CLOEXEC) {
-                    let old = dt.set_fd_metadata(&typed1, FileDescriptorFlags::FD_CLOEXEC);
-                    assert!(old.is_none());
-                    let old = dt.set_fd_metadata(&typed2, FileDescriptorFlags::FD_CLOEXEC);
-                    assert!(old.is_none());
-                }
-                drop(dt);
-                self.install_fd_pair(typed1, typed2, publish)
+                let request = litebox_broker_protocol::unix_socket::CreateUnixSocketRequest {
+                    socket_type: unix::socket_type(ty, protocol)?,
+                    flags: open_flags(flags),
+                };
+                self.create_fd_pair(
+                    FdCreate::UnixPair(request),
+                    flags.contains(SockFlags::CLOEXEC),
+                    publish,
+                )
             }
             AddressFamily::INET
             | AddressFamily::INET6
@@ -654,58 +613,180 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: SockFlags,
     ) -> Result<u32, Errno> {
         let socket = self.files.borrow().socket_from_raw(sockfd)?;
-        let mut remote_addr = addr.is_some().then(SocketAddress::default);
-        let fd = self.do_accept(&socket, remote_addr.as_mut(), flags)?;
-        if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
-            let addrlen = addrlen.ok_or(Errno::EFAULT)?;
-            if let Err(err) = write_sockaddr_to_user::<Platform>(remote_addr, addr, addrlen) {
-                // If we fail to write the address back to user, we need to close the accepted socket.
-                self.sys_close(i32::try_from(fd).unwrap())
-                    .expect("close a newly-accepted socket failed");
-                return Err(err);
+        self.accept_and_publish(&socket, flags, addr.is_some(), |peer| {
+            if let (Some(addr), Some(peer)) = (addr, peer) {
+                write_sockaddr_to_user::<Platform>(peer, addr, addrlen.ok_or(Errno::EFAULT)?)?;
             }
-        }
-        Ok(fd)
+            Ok(())
+        })
     }
+    #[cfg(test)]
     pub(super) fn do_accept(
         &self,
         socket: &AnyTypedFd<Platform>,
         peer: Option<&mut SocketAddress>,
         flags: SockFlags,
     ) -> Result<u32, Errno> {
-        let files = self.files.borrow();
-        let want_peer = peer.is_some();
-        let (file, peer_addr) = files.with_typed_socket(
-            &self.global,
-            socket,
-            |socket| {
-                let mut socket_addr =
-                    want_peer.then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
-                let accepted = socket.accept(&self.wait_cx(), flags, socket_addr.as_mut())?;
-                let raw_fd =
-                    self.insert_socket::<InetSocketSubsystem<Platform>>(&files, accepted, flags)?;
-                Ok((raw_fd, socket_addr.map(SocketAddress::Inet)))
-            },
-            |socket| {
-                let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);
-                let accepted = socket.accept(&self.wait_cx(), flags, socket_addr.as_mut())?;
-                let raw_fd =
-                    self.insert_socket::<UnixSocketSubsystem<Platform>>(&files, accepted, flags)?;
-                Ok((raw_fd, socket_addr.map(SocketAddress::Unix)))
-            },
-            |socket| {
-                let (accepted, peer) = socket.accept(&self.wait_cx(), flags)?;
-                let raw_fd =
-                    self.insert_socket::<VsockSocketSubsystem<Platform>>(&files, accepted, flags)?;
-                Ok((raw_fd, want_peer.then_some(SocketAddress::Vsock(peer))))
-            },
-        )?;
+        self.accept_and_publish(socket, flags, peer.is_some(), |address| {
+            if let (Some(peer), Some(address)) = (peer, address) {
+                *peer = address;
+            }
+            Ok(())
+        })
+    }
 
-        if let (Some(peer), Some(addr)) = (peer, peer_addr) {
-            *peer = addr;
+    fn accept_and_publish(
+        &self,
+        socket: &AnyTypedFd<Platform>,
+        flags: SockFlags,
+        want_peer: bool,
+        publish: impl FnOnce(Option<SocketAddress>) -> Result<(), Errno>,
+    ) -> Result<u32, Errno> {
+        use litebox_broker_protocol::socket::{
+            AcceptSocketRequest, SocketOptionName as OptionName, SocketOptionValue,
+        };
+        use litebox_broker_protocol::unix_socket::AcceptUnixSocketRequest;
+        let status = open_flags(flags);
+        let (object, listener): (_, &dyn IOPollable) = match socket {
+            AnyTypedFd::Inet(fd) if fd.is_stream() => (
+                FdCreate::AcceptInet(AcceptSocketRequest {
+                    handle: fd.inet_socket().handle(),
+                    flags: status,
+                }),
+                &**fd,
+            ),
+            AnyTypedFd::Inet(_) => return Err(Errno::EOPNOTSUPP),
+            AnyTypedFd::Unix(fd) => {
+                let unix = fd.unix_socket();
+                (
+                    FdCreate::AcceptUnix {
+                        request: AcceptUnixSocketRequest {
+                            handle: unix.handle(),
+                            flags: status,
+                        },
+                        kind: unix.socket_type(),
+                        name: None,
+                    },
+                    &**fd,
+                )
+            }
+            AnyTypedFd::Vsock(fd) => (
+                FdCreate::AcceptVsock {
+                    handle: fd.vsock_socket().handle(),
+                    flags: status,
+                },
+                &**fd,
+            ),
+            _ => return Err(Errno::ENOTSOCK),
+        };
+        let files = self.files.borrow().clone();
+        let mutation = files.mutation();
+        let mut attempt = || {
+            let request = FdRequest {
+                pending_child: self.pending_fd_child(),
+                operation: FdOperation::Create {
+                    object: object.clone(),
+                    cloexec: flags.contains(SockFlags::CLOEXEC),
+                },
+            };
+            let result = if want_peer && matches!(socket, AnyTypedFd::Unix(_)) {
+                self.global.litebox.accept_unix_fd(request)
+            } else {
+                self.global
+                    .litebox
+                    .fd_request(request)
+                    .map(|response| (response, None))
+            };
+            match result {
+                Err(ErrorCode::WouldBlock) => Err(TryOpError::TryAgain),
+                Err(error) => Err(TryOpError::Other(super::fd_cache::fd_errno(error))),
+                Ok((FdResponse::SocketFailed(socket::SocketError::NotConnected), _))
+                    if matches!(socket, AnyTypedFd::Inet(_)) =>
+                {
+                    Err(TryOpError::Other(Errno::EINVAL))
+                }
+                Ok((FdResponse::SocketFailed(error), _))
+                    if matches!(socket, AnyTypedFd::Vsock(_)) =>
+                {
+                    Err(TryOpError::Other(
+                        litebox::vsock_socket::errors::VsockSocketError::Socket(error).into(),
+                    ))
+                }
+                Ok(result) => Ok(result),
+            }
+        };
+        let (response, unix_peer) = match attempt() {
+            Err(TryOpError::TryAgain) => {
+                let timeout = match socket {
+                    AnyTypedFd::Inet(fd) => fd.receive_timeout()?,
+                    AnyTypedFd::Unix(fd) => {
+                        match fd.unix_socket().get_option(OptionName::ReceiveTimeout)? {
+                            SocketOptionValue::ReceiveTimeout(timeout) => timeout,
+                            _ => return Err(Errno::EIO),
+                        }
+                    }
+                    _ => None,
+                };
+                self.wait_cx()
+                    .with_timeout(timeout)
+                    .wait_on_events(
+                        false,
+                        Events::IN,
+                        |observer, filter| {
+                            listener.register_observer(observer, filter);
+                            Ok(())
+                        },
+                        &mut attempt,
+                    )
+                    .map_err(|error| match error {
+                        TryOpError::TryAgain | TryOpError::WaitError(WaitError::TimedOut) => {
+                            Errno::EAGAIN
+                        }
+                        TryOpError::WaitError(WaitError::Interrupted)
+                            if timeout.is_none() && !matches!(socket, AnyTypedFd::Vsock(_)) =>
+                        {
+                            Errno::ERESTARTSYS
+                        }
+                        TryOpError::WaitError(WaitError::Interrupted) => Errno::EINTR,
+                        TryOpError::Other(error) => error,
+                    })?
+            }
+            Err(TryOpError::Other(error)) => return Err(error),
+            Err(TryOpError::WaitError(_)) => unreachable!(),
+            Ok(response) => response,
+        };
+        let FdResponse::Installed {
+            first,
+            peer,
+            revision,
+            ..
+        } = response
+        else {
+            return self
+                .cache_installed(&mutation, response)
+                .and(Err(Errno::EIO));
+        };
+        let copied = (|| {
+            let address = if want_peer {
+                Some(match peer {
+                    Some(FdPeer::Inet(peer)) => SocketAddress::Inet(SocketAddr::V4(peer)),
+                    Some(FdPeer::Vsock(peer)) => SocketAddress::Vsock(peer),
+                    Some(FdPeer::Unix(_)) => {
+                        SocketAddress::Unix(unix_peer.ok_or(Errno::EIO)?.into())
+                    }
+                    None => return Err(Errno::EIO),
+                })
+            } else {
+                None
+            };
+            publish(address)
+        })();
+        if let Err(error) = copied {
+            self.rollback_fds(&mutation, first.number, None, revision);
+            return Err(error);
         }
-
-        Ok(u32::try_from(file).unwrap())
+        self.cache_installed(&mutation, response)?;
+        Ok(first.number)
     }
 
     /// Handle syscall `connect`
@@ -1006,10 +1087,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         addrlen: UserPtrMut<u32>,
     ) -> Result<usize, Errno> {
         let typed_socket = self.files.borrow().socket_from_raw(fd)?;
-        let socket = self
-            .files
-            .borrow()
-            .pin_receive_socket(&self.global, &typed_socket)?;
+        let socket = ReceiveSocket::from_typed(&typed_socket)?;
         let plan = socket.plan(flags)?;
         let cx = self.wait_cx().with_timeout(plan.timeout);
         let mut source_addr = None;
@@ -1101,10 +1179,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
-        let socket = self
-            .files
-            .borrow()
-            .pin_receive_socket(&self.global, socket)?;
+        let socket = ReceiveSocket::from_typed(socket)?;
         socket.receive(&self.wait_cx(), buf, flags, false, source_addr, None)
     }
 
@@ -1126,10 +1201,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let typed_socket = self.files.borrow().socket_from_raw(fd)?;
-        let socket = self
-            .files
-            .borrow()
-            .pin_receive_socket(&self.global, &typed_socket)?;
+        let socket = ReceiveSocket::from_typed(&typed_socket)?;
         self.do_recvmsg(&socket, msg_ptr, flags)
     }
 
@@ -1320,10 +1392,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Linux looks up the fd before touching vlen/msgvec, so a bogus fd
         // takes priority over a bogus msgvec pointer or vlen == 0.
         let typed_socket = self.files.borrow().socket_from_raw(fd)?;
-        let socket = self
-            .files
-            .borrow()
-            .pin_receive_socket(&self.global, &typed_socket)?;
+        let socket = ReceiveSocket::from_typed(&typed_socket)?;
 
         if vlen == 0 {
             return Ok(0);
@@ -1391,7 +1460,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // asynchronous errors.
         if let (Some(async_error), ReceiveSocket::Inet(handle)) = (async_error_to_restore, &socket)
         {
-            handle.with_entry(|socket| socket.set_async_error(async_error));
+            handle.set_async_error(async_error);
         }
 
         // Match Linux's `__sys_recvmmsg`: the remaining timespec is only
@@ -1576,7 +1645,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 #[cfg(test)]
 mod tests {
-    use litebox_common_linux::{AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType};
+    use litebox_common_linux::{
+        AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, errno::Errno,
+    };
 
     use crate::syscalls::tests::init_platform;
 
@@ -1633,11 +1704,7 @@ mod tests {
         task.do_sendto(&new_sender_typed, b"new", SendFlags::empty(), None)
             .unwrap();
 
-        let socket = task
-            .files
-            .borrow()
-            .pin_receive_socket(&task.global, &old_receiver_typed)
-            .unwrap();
+        let socket = super::ReceiveSocket::from_typed(&old_receiver_typed).unwrap();
         assert_eq!(
             task.sys_dup(
                 new_receiver.try_into().unwrap(),
@@ -1649,18 +1716,18 @@ mod tests {
         );
 
         let mut old = [0; 3];
-        let received = socket
-            .receive(
+        // The borrowed handle can be retired, but must never address the replacement.
+        assert_eq!(
+            socket.receive(
                 &task.wait_cx(),
                 &mut old,
                 ReceiveFlags::empty(),
                 false,
                 None,
                 None,
-            )
-            .unwrap();
-        assert_eq!(received, old.len());
-        assert_eq!(&old, b"old");
+            ),
+            Err(Errno::EBADF)
+        );
 
         let mut new = [0; 3];
         let replacement = typed_socket(&task, old_receiver);

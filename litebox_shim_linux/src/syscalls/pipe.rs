@@ -8,33 +8,19 @@
 //! presentation: `pipe2` flags, `fcntl` status flags, and errno mapping.
 
 use alloc::sync::{Arc, Weak};
-use core::num::NonZero;
 
 use litebox::{
     event::{Events, IOPollable, observer::Observer, wait::WaitContext},
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     pipes::{self, HalfPipeType},
 };
-use litebox_broker_protocol::{
-    ObjectHandle,
-    fs::{FileMode as Mode, FileOpenFlags},
-};
+use litebox_broker_protocol::{ObjectHandle, fs::FileMode as Mode};
 use litebox_common_linux::{InodeType, OFlags, errno::Errno};
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 use super::file::{linux_status_flags, status_flags_change};
 use crate::{GlobalState, ShimPlatform};
 
-const DEFAULT_PIPE_BUF_SIZE: usize = 64 * 1024;
-
-pub(crate) struct PipeSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
-impl<Platform: ShimPlatform> FdEnabledSubsystem for PipeSubsystem<Platform> {
-    type Entry = PipeEnd<Platform>;
-}
-
-impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for PipeEnd<Platform> {}
-
-pub(crate) type PipeFd<Platform> = TypedFd<PipeSubsystem<Platform>>;
+pub(crate) type PipeFd<Platform> = PipeEnd<Platform>;
 
 /// A pipe end descriptor's open file description.
 pub(crate) struct PipeEnd<Platform: ShimPlatform> {
@@ -102,58 +88,25 @@ impl<Platform: ShimPlatform> PipeEnd<Platform> {
 }
 
 impl<Platform: ShimPlatform> GlobalState<Platform> {
-    /// Creates a pipe with the `pipe2` flags `flags`, returning its write and read ends
-    /// respectively.
-    pub(crate) fn create_linux_pipe(
-        &self,
-        flags: OFlags,
-    ) -> Result<(PipeEnd<Platform>, PipeEnd<Platform>), Errno> {
-        if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
-            return Err(Errno::EINVAL);
-        }
-        if flags.contains(OFlags::DIRECT) {
-            todo!("O_DIRECT not supported");
-        }
-        let status_flags = if flags.contains(OFlags::NONBLOCK) {
-            FileOpenFlags::NONBLOCKING
-        } else {
-            FileOpenFlags::NONE
-        };
-
-        let (writer, reader) = self.litebox.create_pipe(
-            DEFAULT_PIPE_BUF_SIZE,
-            status_flags,
-            // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
-            NonZero::new(4096),
-        )?;
-        Ok((writer.into(), reader.into()))
-    }
-
     /// Runs `f` on the pipe end at `fd`, without holding the descriptor table.
     pub(crate) fn with_pipe_end<R>(
         &self,
         fd: &PipeFd<Platform>,
         f: impl FnOnce(&PipeEnd<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
-        let handle = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(Errno::EBADF)?;
-        handle.with_entry(f)
+        f(fd)
     }
 
-    /// Adopts a pipe end this process inherited from its parent, or received with Unix socket
-    /// data, as `handle`.
-    pub(crate) fn adopt_inherited_pipe_end(
+    pub(crate) fn borrow_pipe(
         &self,
         handle: ObjectHandle,
-        endpoint_type: HalfPipeType,
+        read: bool,
     ) -> Result<PipeFd<Platform>, litebox::process::ProcessError> {
-        let end = self.litebox.adopt_inherited_pipe(handle, endpoint_type)?;
-        Ok(self
-            .litebox
-            .descriptor_table_mut()
-            .insert::<PipeSubsystem<Platform>>(end))
+        let endpoint = if read {
+            HalfPipeType::ReceiverHalf
+        } else {
+            HalfPipeType::SenderHalf
+        };
+        Ok(self.litebox.borrow_fd_pipe(handle, endpoint)?.into())
     }
 }

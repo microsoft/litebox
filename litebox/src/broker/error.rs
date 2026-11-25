@@ -49,6 +49,16 @@ pub(crate) enum BrokerObjectError {
     Fault,
 }
 
+impl From<BrokerControlError> for ErrorCode {
+    fn from(error: BrokerControlError) -> Self {
+        match error {
+            BrokerControlError::AssociationFailed => Self::PeerClosed,
+            BrokerControlError::Broker(error) => error,
+            BrokerControlError::Fault => Self::Internal,
+        }
+    }
+}
+
 impl From<BrokerControlError> for BrokerObjectError {
     fn from(error: BrokerControlError) -> Self {
         match error {

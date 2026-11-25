@@ -6,6 +6,7 @@ use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
     CreateEventRequest, CreateEventResponse,
 };
+use crate::fd::{FdCreate, FdOperation, FdRequest, FdResponse};
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileError, FilePathResponse, FileStatus, FileStatusFlags,
     FileUser, HandleFilePathRequest, HandleFileStatusRequest, IsTerminalFileRequest,
@@ -127,6 +128,8 @@ wire_enum! {
         VsockSocket(VsockSocketRequest),
         /// Keyed shared segment request family.
         Segment(SegmentRequest),
+        /// Guest descriptor table request.
+        Fd(FdRequest),
     }
 }
 
@@ -135,7 +138,21 @@ impl BrokerOperation {
     #[must_use]
     pub const fn shared_buffer(&self) -> Option<SharedBufferSequence> {
         match self {
-            Self::Pipe(
+            Self::Fd(FdRequest {
+                operation:
+                    FdOperation::List(buffer)
+                    | FdOperation::Exec(Some(buffer))
+                    | FdOperation::Create {
+                        object:
+                            FdCreate::Open(OpenFileRequest { path: buffer, .. })
+                            | FdCreate::AcceptUnix {
+                                name: Some(buffer), ..
+                            },
+                        ..
+                    },
+                ..
+            })
+            | Self::Pipe(
                 PipeRequest::Read(ReadPipeRequest { buffer, .. })
                 | PipeRequest::Write(WritePipeRequest { buffer, .. }),
             )
@@ -202,6 +219,7 @@ impl BrokerOperation {
                 | VsockSocketRequest::Receive(ReceiveVsockSocketRequest { buffer, .. }),
             ) => Some(*buffer),
             Self::Thread(_)
+            | Self::Fd(_)
             | Self::CloseObject(_)
             | Self::CheckReadiness(_)
             | Self::GetStatusFlags(_)
@@ -726,6 +744,8 @@ wire_enum! {
         Error(ErrorCode),
         /// Keyed shared segment response family.
         Segment(SegmentResponse),
+        /// Guest descriptor table response.
+        Fd(FdResponse),
     }
 }
 

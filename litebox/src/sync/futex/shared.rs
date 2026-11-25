@@ -191,7 +191,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SharedFutexWaiter<Platf
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for SharedFutexWaiter<Platform> {
     fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
+        self.pollable_registry
+            .unregister_pollable(self.handle, &self.pollee);
         let _ = self.broker.close_object(self.handle);
     }
 }

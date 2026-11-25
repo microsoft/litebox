@@ -6,7 +6,7 @@
 use alloc::{ffi::CString, vec::Vec};
 use core::ffi::CStr;
 use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
-use litebox::{platform::RawConstPointer, utils::ReinterpretSignedExt};
+use litebox::platform::RawConstPointer;
 use litebox_common_linux::{
     MapFlags, PAGE_SIZE,
     errno::Errno,
@@ -26,8 +26,6 @@ use crate::{ShimPlatform, Task};
 // An opened elf file
 struct ElfFile<'a, Platform: ShimPlatform> {
     task: &'a Task<Platform>,
-    fd: i32,
-    #[cfg(target_arch = "aarch64")]
     file_fd: alloc::sync::Arc<crate::syscalls::file::FileFd<Platform>>,
     load_high: bool,
     reserve_runtime_trampoline: bool,
@@ -35,17 +33,9 @@ struct ElfFile<'a, Platform: ShimPlatform> {
 
 impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
     fn new(task: &'a Task<Platform>, path: &str) -> Result<Self, Errno> {
-        let fd = task.open_program_file(path)?.reinterpret_as_signed();
-        #[cfg(target_arch = "aarch64")]
-        let Ok(crate::syscalls::file::AnyTypedFd::File(file_fd)) = task.typed_fd(fd) else {
-            let _ = task.sys_close(fd);
-            return Err(Errno::EBADF);
-        };
         Ok(ElfFile {
             task,
-            fd,
-            #[cfg(target_arch = "aarch64")]
-            file_fd,
+            file_fd: task.open_program_file(path)?,
             load_high: false,
             reserve_runtime_trampoline: false,
         })
@@ -54,7 +44,7 @@ impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
 
 impl<Platform: ShimPlatform> Drop for ElfFile<'_, Platform> {
     fn drop(&mut self) {
-        self.task.sys_close(self.fd).expect("failed to close fd");
+        self.task.finalize_elf_patch(self.file_fd.clone());
     }
 }
 
@@ -68,7 +58,7 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::ReadAt for &'_ ElfFil
             }
             // Try to read the remaining bytes
             let file_offset = usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?;
-            let bytes_read = self.task.sys_read(self.fd, &mut *buf, Some(file_offset))?;
+            let bytes_read = self.file_fd.read(&mut *buf, Some(file_offset), None)?;
             if bytes_read == 0 {
                 // reached the end of the file
                 return Err(Errno::ENODATA);
@@ -83,7 +73,7 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::ReadAt for &'_ ElfFil
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
-        Ok(self.task.file_status(self.fd)?.size)
+        Ok(self.file_fd.status()?.size)
     }
 }
 
@@ -159,13 +149,22 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
         offset: u64,
         prot: &litebox_common_linux::loader::Protection,
     ) -> Result<(), Self::Error> {
-        self.task.sys_mmap(
-            address,
+        let file = crate::syscalls::file::AnyTypedFd::File(self.file_fd.clone());
+        let len = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::ENOMEM)?;
+        let offset = usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?;
+        if !offset.is_multiple_of(PAGE_SIZE) || !address.is_multiple_of(PAGE_SIZE) || len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        offset.checked_add(len).ok_or(Errno::EOVERFLOW)?;
+        self.task.do_mmap_resolved_file(
+            Some(address),
             len,
             prot.flags(),
             MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
-            self.fd,
-            usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?,
+            &file,
+            offset,
         )?;
         Ok(())
     }
@@ -278,7 +277,9 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
                 .get(&patch_key)
                 .is_some_and(crate::loader::patch::ElfPatchState::trampoline_is_populated)
             {
-                litebox_util_log::error!(fd:? = self.file.fd; "AArch64 trampoline was not populated while loading the ELF");
+                litebox_util_log::error!(
+                    "AArch64 trampoline was not populated while loading the ELF"
+                );
                 return Err(ElfLoaderError::LoadError(
                     litebox_common_linux::loader::ElfLoadError::InvalidProgramHeader,
                 ));

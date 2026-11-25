@@ -22,6 +22,7 @@ extern crate std;
 
 mod error;
 mod event;
+mod fd;
 mod fs;
 mod pipe;
 mod process;
@@ -240,6 +241,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 | ErrorCode::NonBlockingWouldBlock
                 | ErrorCode::PeerClosed
                 | ErrorCode::OutOfMemory
+                | ErrorCode::TooManyOpenFiles
+                | ErrorCode::InvalidArgument
+                | ErrorCode::DescriptorBusy
                 | ErrorCode::UnsupportedOperation => Err(BrokerLocalError::Broker(error)),
                 ErrorCode::UnsupportedVersion
                 | ErrorCode::MalformedRequest

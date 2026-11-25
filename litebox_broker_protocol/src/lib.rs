@@ -21,6 +21,7 @@ mod macros;
 
 pub mod error;
 pub mod event;
+pub mod fd;
 pub mod fs;
 pub mod message;
 pub mod pipe;
@@ -166,4 +167,4 @@ pub struct SharedObjectToken(pub u64);
 pub struct ProtocolVersion(pub u16);
 
 /// Current broker protocol version.
-pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
+pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(2);

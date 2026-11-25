@@ -52,6 +52,7 @@ pub enum TimerError {
 pub struct Timer<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
+    owns_handle: bool,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
 }
@@ -93,6 +94,7 @@ where
         Self {
             broker,
             handle,
+            owns_handle: true,
             pollable_registry,
             pollee,
         }
@@ -171,18 +173,12 @@ where
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    /// Returns the timer this process inherited from its parent as `handle`
-    /// through [`PendingChild::inherit`](crate::process::PendingChild::inherit),
-    /// or received with Unix socket data.
-    ///
-    /// The timer owns `handle`, so callers adopt each handle once and share
-    /// the timer for every other use.
-    pub fn adopt_inherited_timer(
-        &self,
-        handle: ObjectHandle,
-    ) -> Result<Timer<Platform>, ProcessError> {
+    /// Borrows a descriptor-table timer.
+    pub fn borrow_fd_timer(&self, handle: ObjectHandle) -> Result<Timer<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(Timer::from_handle(self, broker, handle))
+        let mut timer = Timer::from_handle(self, broker, handle);
+        timer.owns_handle = false;
+        Ok(timer)
     }
 }
 
@@ -191,8 +187,11 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
-        let _ = self.broker.close_object(self.handle);
+        self.pollable_registry
+            .unregister_pollable(self.handle, &self.pollee);
+        if self.owns_handle {
+            let _ = self.broker.close_object(self.handle);
+        }
     }
 }
 

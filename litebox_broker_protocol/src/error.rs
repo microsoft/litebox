@@ -37,5 +37,11 @@ wire_enum! {
         PeerClosed,
         #[error("broker memory allocation failed")]
         OutOfMemory,
+        #[error("descriptor table is full")]
+        TooManyOpenFiles,
+        #[error("invalid argument")]
+        InvalidArgument,
+        #[error("descriptor is being installed")]
+        DescriptorBusy,
     }
 }

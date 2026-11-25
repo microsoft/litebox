@@ -15,12 +15,11 @@ use alloc::{
 use core::mem::{offset_of, size_of};
 use litebox::{
     event::{Events, IOPollable, observer::Observer, wait::WaitContext},
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
-    process::{InheritableFd, ProcessError},
     unix_socket::{self, ReceivedObject},
 };
 use litebox_broker_protocol::{
     ObjectHandle,
+    fd::{FdCreate, FdOperation, FdResponse},
     fs::{FileMode as Mode, FileUser},
     socket::SocketType,
     unix_socket::{
@@ -29,9 +28,9 @@ use litebox_broker_protocol::{
     },
 };
 use litebox_common_linux::{
-    AddressFamily, CmsgHdr, FileDescriptorFlags, OFlags, ReceiveFlags, SCM_MAX_FD, SendFlags,
-    ShutdownHow, SockFlags, SockType, SocketControlMessageName, SocketControlMessageType,
-    SocketOption, SocketOptionLevel, SocketOptionName, UnixProtocol, errno::Errno,
+    AddressFamily, CmsgHdr, OFlags, ReceiveFlags, SCM_MAX_FD, SendFlags, ShutdownHow, SockType,
+    SocketControlMessageName, SocketControlMessageType, SocketOption, SocketOptionLevel,
+    SocketOptionName, UnixProtocol, errno::Errno,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use zerocopy::IntoBytes as _;
@@ -39,19 +38,12 @@ use zerocopy::IntoBytes as _;
 use crate::{
     GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut,
     syscalls::{
-        file::{adopt_handle, linux_status_flags, status_flags_change},
-        net::{ReceivePlan, control_messages, open_flags, shutdown_mode},
+        file::{linux_status_flags, status_flags_change},
+        net::{ReceivePlan, control_messages, shutdown_mode},
     },
 };
 
-pub(crate) struct UnixSocketSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
-impl<Platform: ShimPlatform> FdEnabledSubsystem for UnixSocketSubsystem<Platform> {
-    type Entry = UnixSocket<Platform>;
-}
-
-impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for UnixSocket<Platform> {}
-
-pub(crate) type UnixSocketFd<Platform> = TypedFd<UnixSocketSubsystem<Platform>>;
+pub(crate) type UnixSocketFd<Platform> = UnixSocket<Platform>;
 
 /// C-compatible structure for Unix socket addresses.
 const UNIX_PATH_MAX: usize = 108;
@@ -188,31 +180,6 @@ impl<Platform: ShimPlatform> From<unix_socket::UnixSocket<Platform>> for UnixSoc
 }
 
 impl<Platform: ShimPlatform> UnixSocket<Platform> {
-    /// Creates a socket of type `sock_type` for `protocol`, which must be zero.
-    pub(super) fn new(
-        litebox: &litebox::LiteBox<Platform>,
-        sock_type: SockType,
-        protocol: u8,
-        flags: SockFlags,
-    ) -> Result<Self, Errno> {
-        let socket =
-            litebox.create_unix_socket(socket_type(sock_type, protocol)?, open_flags(flags))?;
-        Ok(socket.into())
-    }
-
-    /// Creates a pair of connected sockets of type `sock_type` for `protocol`, which must be
-    /// zero.
-    pub(super) fn new_connected_pair(
-        litebox: &litebox::LiteBox<Platform>,
-        sock_type: SockType,
-        protocol: u8,
-        flags: SockFlags,
-    ) -> Result<(Self, Self), Errno> {
-        let (first, second) = litebox
-            .create_unix_socket_pair(socket_type(sock_type, protocol)?, open_flags(flags))?;
-        Ok((first.into(), second.into()))
-    }
-
     /// The LiteBox socket, which a child process inherits.
     pub(crate) fn unix_socket(&self) -> &Arc<unix_socket::UnixSocket<Platform>> {
         &self.socket
@@ -258,26 +225,13 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     /// Accepts a connection, storing the connecting socket's name in `peer` if requested.
     ///
     /// `flags` sets the status flags of the new socket only.
-    pub(super) fn accept(
-        &self,
-        cx: &WaitContext<'_, Platform>,
-        flags: SockFlags,
-        peer: Option<&mut UnixSocketAddr>,
-    ) -> Result<UnixSocket<Platform>, Errno> {
-        let accepted = self.socket.accept(cx, open_flags(flags), false)?;
-        if let Some(peer) = peer {
-            *peer = accepted.name(true)?.into();
-        }
-        Ok(accepted.into())
-    }
-
     pub(super) fn sendto(
         &self,
         task: &Task<Platform>,
         buf: impl WriteBuffer,
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
-        objects: &[InheritableFd<Platform>],
+        objects: &[ObjectHandle],
     ) -> Result<usize, Errno> {
         // Like Linux, Unix sockets ignore `MSG_EOR`; each sequenced-packet send already ends a
         // record.
@@ -476,31 +430,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &UnixSocketFd<Platform>,
         f: impl FnOnce(&UnixSocket<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
-        let handle = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(Errno::EBADF)?;
-        let socket = handle.with_entry(|entry| UnixSocket {
-            socket: Arc::clone(&entry.socket),
-        });
-        f(&socket)
-    }
-
-    /// Adopts a Unix socket of type `socket_type` this process inherited from
-    /// its parent, or received with Unix socket data, as `handle`.
-    pub(super) fn adopt_inherited_unix_socket(
-        &self,
-        handle: ObjectHandle,
-        socket_type: SocketType,
-    ) -> Result<UnixSocketFd<Platform>, ProcessError> {
-        let socket = self
-            .litebox
-            .adopt_inherited_unix_socket(handle, socket_type)?;
-        Ok(self
-            .litebox
-            .descriptor_table_mut()
-            .insert::<UnixSocketSubsystem<Platform>>(UnixSocket::from(socket)))
+        f(fd)
     }
 }
 
@@ -515,10 +445,7 @@ pub(super) fn max_received_fds(capacity: usize) -> usize {
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the objects of the descriptors that the `SCM_RIGHTS` messages among a Unix socket's
     /// `control` messages pass, as Linux's `__scm_send`.
-    pub(super) fn passed_objects(
-        &self,
-        control: &[u8],
-    ) -> Result<Vec<InheritableFd<Platform>>, Errno> {
+    pub(super) fn passed_objects(&self, control: &[u8]) -> Result<Vec<ObjectHandle>, Errno> {
         let mut objects = Vec::new();
         for message in control_messages(control) {
             let message = message?;
@@ -532,12 +459,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         return Err(Errno::EINVAL);
                     }
                     for &fd in fds {
-                        let fd = self.files.borrow().typed_fd(i32::from_ne_bytes(fd))?;
-                        if matches!(fd, super::file::AnyTypedFd::Unix(_)) {
-                            log_unsupported!("passing Unix sockets with SCM_RIGHTS");
-                            return Err(Errno::EOPNOTSUPP);
-                        }
-                        objects.push(self.global.shareable_object(&fd)?.1);
+                        objects.push(
+                            self.files
+                                .borrow()
+                                .transferable_handle(i32::from_ne_bytes(fd))?,
+                        );
                     }
                 }
                 SocketControlMessageType::Credentials => {
@@ -603,59 +529,39 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Installs a descriptor for `object` at the lowest free number, which `publish` must report
-    /// before the descriptor is visible, or the descriptor is not installed.
+    /// successfully or the broker installation is rolled back.
     fn install_received_object(
         &self,
         object: ReceivedObject,
         close_on_exec: bool,
         publish: impl FnOnce(i32) -> Result<(), Errno>,
     ) -> Result<i32, Errno> {
-        let kind = object.kind();
-        let handle = object.into_handle();
-        adopt_handle!(self.global, kind, handle, |adopt| self.install_adopted(
-            adopt()?,
-            close_on_exec,
-            publish
-        ))
-    }
-
-    /// Installs the adopted `fd` at the lowest free number, which `publish` must report before
-    /// the descriptor is visible, or the descriptor is closed.
-    fn install_adopted<Subsystem: FdEnabledSubsystem>(
-        &self,
-        fd: TypedFd<Subsystem>,
-        close_on_exec: bool,
-        publish: impl FnOnce(i32) -> Result<(), Errno>,
-    ) -> Result<i32, Errno> {
-        if close_on_exec {
-            let old = self
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
-            assert!(old.is_none());
-        }
-        let files = self.files.borrow();
-        // The insert, `publish`, and any rollback share one acquisition of the lock, so no other
-        // thread sees or closes the descriptor before `publish` fails.
-        let mut rds = files.raw_descriptor_store.write();
-        let raw_fd = match files.insert_raw_fd_locked(&mut rds, fd) {
-            Ok(raw_fd) => raw_fd,
-            Err(fd) => {
-                drop(rds);
-                self.remove_and_drop_descriptor(&fd);
-                return Err(Errno::EMFILE);
-            }
+        let files = self.files.borrow().clone();
+        let mutation = files.mutation();
+        // XXX: Import adds a reference and dropping `object` then closes the received one, so N
+        // received fds cost 1 + 2N broker calls. Import should take over the received reference
+        // or be batched; K1 will have the broker install received fds directly.
+        let response = self.fd_request(FdOperation::Create {
+            object: FdCreate::Import(object.handle()),
+            cloexec: close_on_exec,
+        })?;
+        let FdResponse::Installed {
+            first,
+            second: None,
+            revision,
+            ..
+        } = response
+        else {
+            return self
+                .cache_installed(&mutation, response)
+                .and(Err(Errno::EIO));
         };
-        let number = i32::try_from(raw_fd).expect("descriptor numbers fit in i32");
-        if let Err(errno) = publish(number) {
-            let fd = rds
-                .fd_consume_raw_integer::<Subsystem>(raw_fd)
-                .expect("the descriptor was inserted under this lock");
-            drop(rds);
-            self.remove_and_drop_descriptor(&fd);
-            return Err(errno);
+        let number = i32::try_from(first.number).expect("descriptor numbers fit in i32");
+        if let Err(error) = publish(number) {
+            self.rollback_fds(&mutation, first.number, None, revision);
+            return Err(error);
         }
+        self.cache_installed(&mutation, response)?;
         Ok(number)
     }
 }
@@ -671,7 +577,7 @@ impl<Platform: ShimPlatform> IOPollable for UnixSocket<Platform> {
 }
 
 /// The socket type of a Unix socket of type `sock_type` for `protocol`.
-fn socket_type(sock_type: SockType, protocol: u8) -> Result<SocketType, Errno> {
+pub(super) fn socket_type(sock_type: SockType, protocol: u8) -> Result<SocketType, Errno> {
     UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
     match sock_type {
         SockType::Stream => Ok(SocketType::Stream),
@@ -1345,7 +1251,14 @@ mod tests {
     #[test]
     fn test_socketpair_race_with_concurrent_close() {
         let task = init_platform();
-        task.files.borrow().set_max_fd(4);
+        task.do_prlimit(
+            litebox_common_linux::RlimitResource::NOFILE,
+            Some(litebox_common_linux::Rlimit {
+                rlim_cur: 4,
+                rlim_max: 4,
+            }),
+        )
+        .unwrap();
 
         let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let stop_closer = stop.clone();

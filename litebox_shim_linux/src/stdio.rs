@@ -5,57 +5,49 @@
 
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
 
-use crate::syscalls::file::{FileSubsystem, FilesState};
+use crate::syscalls::{fd_cache::fd_errno, file::FilesState};
 use crate::{GlobalState, ShimPlatform};
+use litebox_broker_protocol::fd::FdResponse;
+use litebox_common_linux::errno::Errno;
 
 impl<Platform: ShimPlatform> FilesState<Platform> {
-    pub(crate) fn initialize_stdio_in_shared_descriptors_table(
+    pub(crate) fn initialize_stdio(
         &self,
         global: &GlobalState<Platform>,
         context: &litebox::fs::Context,
-    ) {
-        let stdin = global
-            .litebox
-            .open_file(
-                context,
-                None,
-                "/dev/stdin",
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::NONE,
-                Mode::empty(),
-            )
-            .unwrap();
-        let stdout = global
-            .litebox
-            .open_file(
-                context,
-                None,
-                "/dev/stdout",
-                FileAccessMode::WriteOnly,
-                FileOpenFlags::NONE,
-                Mode::empty(),
-            )
-            .unwrap();
-        let stderr = global
-            .litebox
-            .open_file(
-                context,
-                None,
-                "/dev/stderr",
-                FileAccessMode::WriteOnly,
-                FileOpenFlags::NONE,
-                Mode::empty(),
-            )
-            .unwrap();
-        let mut rds = self.raw_descriptor_store.write();
-        for (raw_fd, file) in [(0, stdin), (1, stdout), (2, stderr)] {
-            let fd = global
+    ) -> Result<(), Errno> {
+        let mutation = self.mutation();
+        for (number, (path, access)) in [
+            ("/dev/stdin", FileAccessMode::ReadOnly),
+            ("/dev/stdout", FileAccessMode::WriteOnly),
+            ("/dev/stderr", FileAccessMode::WriteOnly),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = global
                 .litebox
-                .descriptor_table_mut()
-                .insert::<FileSubsystem<Platform>>(file);
-            let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
-            assert!(success);
+                .open_fd(
+                    None,
+                    context,
+                    litebox::fs::DirectoryAnchor::None,
+                    path,
+                    access,
+                    FileOpenFlags::NONE,
+                    Mode::empty(),
+                    false,
+                )
+                .map_err(fd_errno)??;
+            let FdResponse::Installed {
+                first, revision, ..
+            } = response
+            else {
+                return Err(Errno::EIO);
+            };
+            assert_eq!(first.number as usize, number);
+            mutation.install(global, revision, first)?;
         }
+        Ok(())
     }
 }
 

@@ -262,7 +262,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 execfn,
                 argv,
                 envp,
-                inherited_fds,
             } = *startup;
             (
                 litebox_common_linux::TaskParams {
@@ -274,7 +273,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     blocked_signals,
                     ignored_signals,
                     pending_signals,
-                    inherited_fds: Some(inherited_fds),
+                    inherited: true,
                     cwd: None,
                     umask: Some(umask),
                     resource_limits: Some(resource_limits),
@@ -326,7 +325,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     ignored_signals: litebox_common_linux::signal::SigSet::empty(),
                     pending_signals:
                         litebox_common_linux::program_startup::PendingSignalQueues::default(),
-                    inherited_fds: None,
+                    inherited: false,
                     cwd: None,
                     umask: None,
                     resource_limits: None,

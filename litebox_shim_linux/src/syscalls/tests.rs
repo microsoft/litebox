@@ -403,7 +403,14 @@ fn test_file_status_flags() {
 #[test]
 fn test_pipe2_race_with_concurrent_close() {
     let task = init_platform();
-    task.files.borrow().set_max_fd(4);
+    task.do_prlimit(
+        litebox_common_linux::RlimitResource::NOFILE,
+        Some(litebox_common_linux::Rlimit {
+            rlim_cur: 4,
+            rlim_max: 4,
+        }),
+    )
+    .unwrap();
 
     let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
     let stop_closer = stop.clone();
@@ -807,18 +814,20 @@ fn test_rlimit_nofile() {
             task.sys_open("/prlimit_file", OFlags::CREAT | OFlags::RDONLY, Mode::RWXU)
                 .expect_err("open should fail due to new cur limit"),
             Errno::EMFILE,
-            "a failed guest-fd allocation must close its transient broker handle"
+            "open must fail before creating a file when no descriptor is available"
         );
     }
     task.do_prlimit(RlimitResource::NOFILE, Some(cur_lim))
         .expect("restoring the NOFILE limit must succeed");
     task.sys_close(i32::try_from(probe_fd).unwrap()).unwrap();
-    task.sys_unlinkat(
-        litebox_common_linux::AT_FDCWD,
-        "/prlimit_file",
-        AtFlags::empty(),
-    )
-    .expect("the file created before descriptor allocation failed must remain removable");
+    assert_eq!(
+        task.sys_unlinkat(
+            litebox_common_linux::AT_FDCWD,
+            "/prlimit_file",
+            AtFlags::empty()
+        ),
+        Err(Errno::ENOENT)
+    );
 }
 
 #[test]
@@ -1078,64 +1087,35 @@ fn test_rwlock_readers_not_starved_after_writer_handoff() {
 }
 
 #[test]
-fn exec_inherits_only_transferable_descriptors() {
+fn exec_commit_sweeps_cloexec_and_keeps_sparse_descriptors() {
     let task = init_platform();
-    let inherited = || {
-        task.fds_inherited_across_exec().map(|fds| {
-            fds.into_iter()
-                .map(|(inherited, _)| inherited.fd)
-                .collect::<alloc::vec::Vec<_>>()
-        })
-    };
-
-    // Files, pipes, eventfds, epoll instances, and pidfds transfer unless they are close-on-exec.
-    let (read_fd, write_fd) = task.do_pipe2(OFlags::empty(), |_, _| Ok(())).unwrap();
-    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, 3, 4]));
-    task.sys_close(read_fd.try_into().unwrap()).unwrap();
-    task.sys_close(write_fd.try_into().unwrap()).unwrap();
+    let (read_fd, write_fd) = task.do_pipe2(OFlags::CLOEXEC, |_, _| Ok(())).unwrap();
     let eventfd = task.sys_eventfd2(0, EfdFlags::empty()).unwrap();
-    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, eventfd]));
-    task.sys_close(eventfd.try_into().unwrap()).unwrap();
     let epoll = task
         .sys_epoll_create(EpollCreateFlags::EPOLL_CLOEXEC)
         .unwrap();
-    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2]));
-    let epoll_fd = epoll.try_into().unwrap();
-    task.sys_fcntl(epoll_fd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
-        .unwrap();
-    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, epoll]));
-    task.sys_close(epoll_fd).unwrap();
+    task.sys_fcntl(
+        epoll.cast_signed(),
+        FcntlArg::SETFD(FileDescriptorFlags::empty()),
+    )
+    .unwrap();
     let pidfd = task
         .sys_pidfd_open(task.sys_getpid(), PidfdFlags::empty())
         .unwrap();
-    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2]));
-    let pidfd_fd = pidfd.try_into().unwrap();
-    task.sys_fcntl(pidfd_fd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
-        .unwrap();
-    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, pidfd]));
-    task.sys_close(pidfd_fd).unwrap();
-
-    // A fresh runner installs descriptors at most a bounded distance apart.
-    assert_eq!(task.sys_dup(1, Some(258), None), Ok(258));
-    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, 258]));
-    task.sys_close(258).unwrap();
-    assert_eq!(task.sys_dup(1, Some(259), None), Ok(259));
-    assert_eq!(inherited(), Err(Errno::EAGAIN));
-    task.sys_close(259).unwrap();
-
-    // The broker shares a positioned directory with the runner that inherits it.
-    let dir_fd = task
-        .sys_open("/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
-        .unwrap();
-    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, dir_fd]));
-    let mut buffer = alloc::vec![0u8; 4096];
-    task.sys_getdirent64(
-        dir_fd.try_into().unwrap(),
-        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
-        buffer.len(),
-    )
-    .unwrap();
-    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, dir_fd]));
+    let high = 1000;
+    assert_eq!(task.sys_dup(1, Some(high), None), Ok(high.cast_unsigned()));
+    task.commit_exec_fds().unwrap();
+    for fd in [read_fd, write_fd, pidfd] {
+        assert_eq!(
+            task.sys_fcntl(fd.cast_signed(), FcntlArg::GETFD),
+            Err(Errno::EBADF)
+        );
+        assert!(matches!(task.typed_fd(fd.cast_signed()), Err(Errno::EBADF)));
+    }
+    for fd in [eventfd, epoll, high.cast_unsigned()] {
+        assert_eq!(task.sys_fcntl(fd.cast_signed(), FcntlArg::GETFD), Ok(0));
+        assert!(task.typed_fd(fd.cast_signed()).is_ok());
+    }
 }
 
 #[test]

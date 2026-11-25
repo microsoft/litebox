@@ -100,6 +100,7 @@ use litebox_platform::buffer::{Buffer, Fault, ReadBuffer, WriteBuffer};
 use spin::mutex::SpinMutex;
 
 mod error;
+mod fd;
 pub mod readiness;
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -500,6 +501,9 @@ fn handle_request<Memory: SharedMemory>(
     match operation {
         BrokerOperation::Thread(request) => {
             handle_thread_request(process, request).map(BrokerResult::Thread)
+        }
+        BrokerOperation::Fd(request) => {
+            fd::handle(process, request, shared_buffers, readiness_sink).map(BrokerResult::Fd)
         }
         BrokerOperation::CloseObject(handle) => process
             .close_object_reference(handle)
@@ -2863,6 +2867,7 @@ mod tests {
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
+        descriptor_tables_copy_and_commit_exec(&broker);
         active_requests_operate_timers(&broker, &timer_provider);
         active_requests_operate_shared_futexes(&broker);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
@@ -2882,6 +2887,189 @@ mod tests {
         association_allows_slot_reuse_during_response_emission(&broker);
         association_allows_out_of_order_responses(&broker);
         association_preserves_the_initiating_failure(&broker);
+    }
+
+    fn descriptor_tables_copy_and_commit_exec(broker: &TestBroker) {
+        use litebox_broker_protocol::fd::{
+            DupTarget, FD_LIST_STRIDE, FdCreate, FdInfo, FdOperation, FdRequest, FdResponse,
+        };
+        use litebox_broker_protocol::pipe::CreatePipeRequest;
+        use litebox_broker_protocol::process::{ResourceKind, ResourceLimit};
+        use litebox_broker_protocol::readiness::ReadinessFlags;
+
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let buffers = test_shared_buffers();
+        let readiness = test_readiness_sink();
+        let request = |pending_child, operation| match handle_request(
+            &parent,
+            BrokerOperation::Fd(FdRequest {
+                pending_child,
+                operation,
+            }),
+            &buffers,
+            &readiness,
+        )? {
+            BrokerResult::Fd(response) => Ok(response),
+            result => panic!("expected a descriptor response, got {result:?}"),
+        };
+        let pipe = || FdOperation::Create {
+            object: FdCreate::Pipe(CreatePipeRequest {
+                capacity: 4096,
+                atomic_write_size: 4096,
+                flags: FileOpenFlags::NONE,
+            }),
+            cloexec: false,
+        };
+        parent
+            .set_resource_limit(
+                parent.id(),
+                ResourceKind::OpenFiles,
+                ResourceLimit::new(1, 1024).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            request(None, pipe()),
+            Err(RequestFailure::Respond(ErrorCode::TooManyOpenFiles))
+        );
+        parent
+            .set_resource_limit(
+                parent.id(),
+                ResourceKind::OpenFiles,
+                ResourceLimit::new(1024, 1024).unwrap(),
+            )
+            .unwrap();
+        let FdResponse::Installed {
+            first: read,
+            second: Some(write),
+            revision: installed,
+            ..
+        } = request(None, pipe()).unwrap()
+        else {
+            panic!("pipe not installed")
+        };
+        assert_eq!((read.number, write.number), (0, 1));
+        assert_eq!(
+            parent.close_object_reference(write.handle),
+            Err(BrokerError::UnknownObject)
+        );
+        assert!(matches!(
+            request(
+                None,
+                FdOperation::Duplicate {
+                    fd: write.number,
+                    target: DupTarget::AtLeast(1000),
+                    cloexec: true,
+                }
+            ),
+            Ok(FdResponse::Installed {
+                first: FdInfo { number: 1000, .. },
+                ..
+            })
+        ));
+
+        let child = parent
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        let buffer = single_slot_sequence(0, SHARED_BUFFER_SLOT_SIZE);
+        assert!(matches!(
+            request(Some(child), FdOperation::List(buffer)),
+            Ok(FdResponse::Listed { entries: 3, .. })
+        ));
+        let mut bytes = [0; 3 * FD_LIST_STRIDE];
+        buffers.read(SharedBufferSlotIndex(0), &mut bytes).unwrap();
+        let child_write = FdInfo::read(&bytes[FD_LIST_STRIDE..2 * FD_LIST_STRIDE]).unwrap();
+        let child_dup = FdInfo::read(&bytes[2 * FD_LIST_STRIDE..]).unwrap();
+        assert_eq!(child_write.number, write.number);
+        assert_ne!(child_write.handle, write.handle);
+        assert_eq!(
+            (child_dup.number, child_dup.handle),
+            (1000, child_write.handle)
+        );
+        assert!(parent.check_readiness(child_write.handle).is_ok());
+        assert_eq!(
+            request(Some(child), FdOperation::GetCloexec(1000)),
+            Ok(FdResponse::Cloexec(true))
+        );
+        assert!(matches!(
+            request(
+                Some(child),
+                FdOperation::CloseRange {
+                    first: 1,
+                    last: 1,
+                    cloexec: true
+                }
+            ),
+            Ok(FdResponse::Changed(_))
+        ));
+        assert_eq!(
+            request(None, FdOperation::GetCloexec(1)),
+            Ok(FdResponse::Cloexec(false))
+        );
+        assert!(matches!(
+            request(Some(child), FdOperation::Exec(Some(buffer))),
+            Ok(FdResponse::Listed { entries: 1, .. })
+        ));
+        assert_eq!(
+            parent.check_readiness(child_write.handle),
+            Err(BrokerError::UnknownObject)
+        );
+        let child = parent.take_child_process(child).unwrap();
+        let child_read = child.fd_info(0).unwrap().handle;
+        assert_eq!(
+            parent.check_readiness(child_read),
+            Err(BrokerError::UnknownObject)
+        );
+        assert!(child.check_readiness(child_read).is_ok());
+        request(None, FdOperation::Close(write.number)).unwrap();
+        assert!(
+            !parent
+                .check_readiness(read.handle)
+                .unwrap()
+                .contains(ReadinessFlags::CLOSED)
+        );
+        assert!(matches!(
+            request(
+                None,
+                FdOperation::Duplicate {
+                    fd: 1000,
+                    target: DupTarget::Exact {
+                        number: write.number,
+                        distinct: true
+                    },
+                    cloexec: false
+                }
+            ),
+            Ok(FdResponse::Installed { .. })
+        ));
+        // A failed copyout from the original pipe cannot close a reused fd, even when
+        // the replacement points to the same open file description.
+        assert!(matches!(
+            request(
+                None,
+                FdOperation::Rollback {
+                    first: write.number,
+                    second: None,
+                    installed
+                }
+            ),
+            Ok(FdResponse::RolledBack {
+                first: false,
+                second: false,
+                ..
+            })
+        ));
+        request(None, FdOperation::Close(write.number)).unwrap();
+        request(None, FdOperation::Close(1000)).unwrap();
+        assert!(
+            parent
+                .check_readiness(read.handle)
+                .unwrap()
+                .contains(ReadinessFlags::CLOSED)
+        );
     }
 
     fn setup_failure_leaves_the_process_with_the_caller(broker: &TestBroker) {

@@ -80,7 +80,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Same as [`Self::do_mmap_file`], for a descriptor already resolved.
-    fn do_mmap_resolved_file(
+    pub(crate) fn do_mmap_resolved_file(
         &self,
         suggested_addr: Option<usize>,
         len: usize,

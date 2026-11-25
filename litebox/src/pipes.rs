@@ -88,21 +88,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok((writer, reader))
     }
 
-    /// Returns the pipe end of type `endpoint_type` this process inherited
-    /// from its parent as `handle` through
-    /// [`PendingChild::inherit`](crate::process::PendingChild::inherit), or
-    /// received with Unix socket data.
-    ///
-    /// The end owns `handle`, so callers adopt each handle once and share the
-    /// end for every other use. The end has no peer in this process, so broker
-    /// readiness notifications alone wake its waiters.
-    pub fn adopt_inherited_pipe(
+    /// Borrows a descriptor-table pipe end. The broker publishes its readiness.
+    pub fn borrow_fd_pipe(
         &self,
         handle: ObjectHandle,
         endpoint_type: HalfPipeType,
     ) -> Result<PipeEnd<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(PipeEnd::new(self, broker, handle, endpoint_type))
+        let mut pipe = PipeEnd::new(self, broker, handle, endpoint_type);
+        pipe.owns_handle = false;
+        Ok(pipe)
     }
 }
 
@@ -222,6 +217,7 @@ impl From<TryOpError<PipeError>> for PipeError {
 pub struct PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
+    owns_handle: bool,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
     /// The other end's pollee, if this process created the pipe, which this
@@ -243,6 +239,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> PipeEnd<Platform> {
         Self {
             broker,
             handle,
+            owns_handle: true,
             pollable_registry,
             pollee,
             peer_pollee: Weak::new(),
@@ -417,8 +414,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for PipeEnd<
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for PipeEnd<Platform> {
     fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
-        let _ = self.broker.close_object(self.handle);
+        self.pollable_registry
+            .unregister_pollable(self.handle, &self.pollee);
+        if self.owns_handle {
+            let _ = self.broker.close_object(self.handle);
+        }
         if let Some(peer_pollee) = self.peer_pollee.upgrade() {
             let event = match self.endpoint_type {
                 HalfPipeType::SenderHalf => Events::HUP,

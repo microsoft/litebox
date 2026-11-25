@@ -112,6 +112,7 @@ pub struct ReadyEntry {
 pub struct ReadinessQueue<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
+    owns_handle: bool,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
 }
@@ -147,14 +148,10 @@ where
         Self {
             broker,
             handle,
+            owns_handle: true,
             pollable_registry,
             pollee,
         }
-    }
-
-    /// The broker handle this queue owns.
-    pub(crate) fn handle(&self) -> ObjectHandle {
-        self.handle
     }
 
     /// Starts watching `target` under `key`.
@@ -321,18 +318,15 @@ fn broker_interest(interest: ReadinessInterest) -> ReadinessQueueInterest {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    /// Returns the readiness queue this process inherited from its parent as
-    /// `handle` through [`PendingChild::inherit`](crate::process::PendingChild::inherit),
-    /// or received with Unix socket data.
-    ///
-    /// The queue owns `handle`, so callers adopt each handle once and share
-    /// the queue for every other use.
-    pub fn adopt_inherited_readiness_queue(
+    /// Borrows a descriptor-table readiness queue.
+    pub fn borrow_fd_readiness_queue(
         &self,
         handle: ObjectHandle,
     ) -> Result<ReadinessQueue<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(ReadinessQueue::from_handle(self, broker, handle))
+        let mut queue = ReadinessQueue::from_handle(self, broker, handle);
+        queue.owns_handle = false;
+        Ok(queue)
     }
 }
 
@@ -341,8 +335,11 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
-        let _ = self.broker.close_object(self.handle);
+        self.pollable_registry
+            .unregister_pollable(self.handle, &self.pollee);
+        if self.owns_handle {
+            let _ = self.broker.close_object(self.handle);
+        }
     }
 }
 

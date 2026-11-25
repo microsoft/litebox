@@ -7,24 +7,17 @@ use alloc::sync::Arc;
 
 use litebox::{
     event::{Events, IOPollable, counter::EventCounter, observer::Observer, wait::WaitContext},
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     process::ProcessError,
     sync::RawSyncPrimitivesProvider,
 };
-use litebox_broker_protocol::{ObjectHandle, fs::FileOpenFlags};
-use litebox_common_linux::{EfdFlags, OFlags, errno::Errno};
+use litebox_broker_protocol::ObjectHandle;
+use litebox_common_linux::{OFlags, errno::Errno};
 use litebox_platform::time::TimeProvider;
 
 use super::file::{linux_status_flags, status_flags_change};
 use crate::{GlobalState, ShimPlatform};
 
-pub(crate) struct EventfdSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
-impl<Platform: ShimPlatform> FdEnabledSubsystem for EventfdSubsystem<Platform> {
-    type Entry = EventFile<Platform>;
-}
-impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for EventFile<Platform> {}
-
-pub(crate) type EventfdFd<Platform> = TypedFd<EventfdSubsystem<Platform>>;
+pub(crate) type EventfdFd<Platform> = EventFile<Platform>;
 
 /// An eventfd, whose count, status flags, and semaphore mode the broker owns.
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
@@ -69,61 +62,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
 }
 
 impl<Platform: ShimPlatform> GlobalState<Platform> {
-    pub(crate) fn create_linux_eventfd(
-        &self,
-        initval: u32,
-        flags: EfdFlags,
-    ) -> Result<EventFile<Platform>, Errno> {
-        if flags
-            .intersects((EfdFlags::SEMAPHORE | EfdFlags::CLOEXEC | EfdFlags::NONBLOCK).complement())
-        {
-            return Err(Errno::EINVAL);
-        }
-
-        let status = if flags.contains(EfdFlags::NONBLOCK) {
-            FileOpenFlags::NONBLOCKING
-        } else {
-            FileOpenFlags::NONE
-        };
-        let counter = EventCounter::new(
-            &self.litebox,
-            u64::from(initval),
-            status,
-            flags.contains(EfdFlags::SEMAPHORE),
-        )
-        .map_err(Errno::from)?;
-        Ok(EventFile {
-            counter: Arc::new(counter),
-        })
-    }
-
     /// Runs `f` on the eventfd at `fd`, without holding the descriptor table.
     pub(crate) fn with_eventfd<R>(
         &self,
         fd: &EventfdFd<Platform>,
         f: impl FnOnce(&EventFile<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
-        let handle = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(Errno::EBADF)?;
-        handle.with_entry(f)
+        f(fd)
     }
 
-    /// Adopts an eventfd this process inherited from its parent, or received with Unix socket
-    /// data, as `handle`.
-    pub(crate) fn adopt_inherited_eventfd(
+    pub(crate) fn borrow_eventfd(
         &self,
         handle: ObjectHandle,
     ) -> Result<EventfdFd<Platform>, ProcessError> {
-        let counter = self.litebox.adopt_inherited_event_counter(handle)?;
-        Ok(self
-            .litebox
-            .descriptor_table_mut()
-            .insert::<EventfdSubsystem<Platform>>(EventFile {
-                counter: Arc::new(counter),
-            }))
+        Ok(EventFile {
+            counter: Arc::new(self.litebox.borrow_fd_event_counter(handle)?),
+        })
     }
 }
 
@@ -134,11 +88,8 @@ mod tests {
     #[test]
     fn test_eventfd_uses_broker_control() {
         let task = crate::syscalls::tests::init_platform();
-        let event = task
-            .global
-            .create_linux_eventfd(0, EfdFlags::NONBLOCK)
-            .unwrap();
-        drop(event);
+        let event = task.sys_eventfd2(0, EfdFlags::NONBLOCK).unwrap();
+        task.sys_close(event.cast_signed()).unwrap();
     }
 
     #[test]

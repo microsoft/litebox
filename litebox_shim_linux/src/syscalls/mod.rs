@@ -5,6 +5,7 @@
 
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
+pub(crate) mod fd_cache;
 pub mod file;
 mod futex;
 pub(crate) mod inet;
