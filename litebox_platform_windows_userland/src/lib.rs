@@ -202,16 +202,6 @@ unsafe extern "system" fn vectored_exception_handler(
 unsafe extern "system" fn vectored_exception_handler_inner(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
-    // SAFETY: The system passes a valid exception record for the duration of the handler.
-    let exception_record = unsafe { &*(*exception_info).ExceptionRecord };
-    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
-        && page_mgmt::retry_after_shared_view_split(
-            exception_record.ExceptionInformation[1],
-            exception_record.ExceptionInformation[0],
-        )
-    {
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
     // SAFETY: The owning thread keeps an installed `TlsState` alive until it clears the slot.
     let tls = get_tls_ptr().map(|tls| unsafe { &*tls });
     let (info, exception_record, context);
@@ -220,13 +210,25 @@ unsafe extern "system" fn vectored_exception_handler_inner(
         exception_record = &*info.ExceptionRecord;
         context = &mut *info.ContextRecord;
     }
+    let is_access_violation =
+        exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION;
+    let retry_after_shared_view_split = || {
+        is_access_violation
+            && page_mgmt::retry_after_shared_view_split(
+                exception_record.ExceptionInformation[1],
+                exception_record.ExceptionInformation[0],
+            )
+    };
 
     // A thread without TLS is outside the guest too: LiteBox can access guest memory before
     // a thread installs TLS or after it uninstalls it, as when the shim is dropped.
     let Some(tls) = tls.filter(|tls| tls.is_in_guest.get()) else {
+        if retry_after_shared_view_split() {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // This might be a faulting guest memory access in LiteBox code. Try to
         // recover.
-        if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        if is_access_violation
             && let Some(recover) =
                 litebox::mm::exception_table::search_exception_tables(context.Rip.trunc())
         {
@@ -237,21 +239,35 @@ unsafe extern "system" fn vectored_exception_handler_inner(
         // Not one of our exceptions; let other handlers process it.
         return EXCEPTION_CONTINUE_SEARCH;
     };
+
+    // `ThreadHandle::interrupt` suspended this thread while the kernel was still dispatching a
+    // guest exception, saved the guest context, and redirected the thread to
+    // `interrupt_callback`; the kernel then dispatched the exception with that redirected
+    // context. The saved guest context is already correct, so resume at the callback without
+    // overwriting it. The faulting guest instruction runs again after the interrupt.
+    if context.Rip == interrupt_callback as *const () as usize as u64 {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // Leave the guest before calling anything outside ntdll and this module, so that
+    // `ThreadHandle::interrupt` does not mistake host code for guest code.
     tls.is_in_guest.set(false);
 
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
     save_guest_context(tls, regs, context);
 
-    // If it looks like fs base was cleared, then go through the interrupt path
-    // instead of the exception path to restore the fs base and try again.
+    // If the fault hit a shared view that a concurrent split briefly unmapped, or if it looks
+    // like fs base was cleared, then go through the interrupt path instead of the exception
+    // path to retry the faulting instruction (restoring fs base on the way).
     //
-    // This is done instead of just fixing up fsbase and returning here to avoid
-    // missing a real interrupt that arrives while resuming the guest. Go through
-    // the interrupt path to ensure that any pending interrupts are also handled.
-    if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
-        && guest_tls_mode() == GuestTlsMode::Linux
-        && unsafe { litebox::arch::x86_64::rdfsbase() } == 0
-        && tls.guest_fs_base.get() != 0
+    // This is done instead of just returning to the guest here to avoid missing a real
+    // interrupt that arrives while resuming the guest. Go through the interrupt path to ensure
+    // that any pending interrupts are also handled.
+    if retry_after_shared_view_split()
+        || (is_access_violation
+            && guest_tls_mode() == GuestTlsMode::Linux
+            && unsafe { litebox::arch::x86_64::rdfsbase() } == 0
+            && tls.guest_fs_base.get() != 0)
     {
         set_context_to_interrupt_callback(context);
     } else {
@@ -936,6 +952,7 @@ exception_callback:
     call {exception_handler}
     jmp .Ldone
 
+    .globl  interrupt_callback
 interrupt_callback:
     mov  r11, QWORD PTR gs:[{TEB_RUNTIME_TLS_OFFSET}]
     mov  BYTE PTR [r11 + {IS_IN_GUEST}], 0
@@ -1162,6 +1179,12 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 
     let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
     assert!(!tls.is_in_guest.get());
+    // Resuming the guest at `interrupt_callback` would re-enter the interrupt path forever
+    // instead of running the guest.
+    assert_ne!(
+        ctx.rip, interrupt_callback as *const () as usize,
+        "guest RIP is interrupt_callback"
+    );
     match guest_tls_mode() {
         GuestTlsMode::Linux => WindowsUserland::<PAGE_SIZE>::restore_thread_fs_base(tls),
         GuestTlsMode::Windows => {
@@ -2445,6 +2468,62 @@ mod tests {
             }
             assert_eq!(worker.join().unwrap(), 2);
         });
+    }
+
+    #[test]
+    fn exception_after_interrupt_redirect_keeps_saved_guest_context() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            CONTEXT, CONTEXT_CONTROL_AMD64, EXCEPTION_POINTERS, EXCEPTION_RECORD,
+        };
+
+        const GUEST_RIP: usize = 0x418e1f;
+
+        crate::GUEST_TLS_MODE.store(
+            crate::GuestTlsMode::Linux as u8,
+            core::sync::atomic::Ordering::Release,
+        );
+        std::thread::spawn(|| {
+            let mut regs = litebox_common_linux::PtRegs {
+                rip: GUEST_RIP,
+                ..Default::default()
+            };
+            let tls = crate::TlsState::new();
+            tls.guest_context_top
+                .set(core::ptr::from_mut(&mut regs).wrapping_add(1));
+            // SAFETY: `tls` outlives its installation on this thread.
+            unsafe { crate::teb::install_tls(&tls) };
+            tls.is_in_guest.set(true);
+
+            // An interrupt saved the guest context and redirected the thread while the kernel
+            // was dispatching a guest access violation.
+            let callback = crate::interrupt_callback as *const () as usize as u64;
+            let mut context = CONTEXT {
+                ContextFlags: CONTEXT_CONTROL_AMD64,
+                Rip: callback,
+                ..Default::default()
+            };
+            let mut record = EXCEPTION_RECORD {
+                ExceptionCode: windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION,
+                NumberParameters: 2,
+                ..Default::default()
+            };
+            record.ExceptionInformation[1] = 0x2d0;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &raw mut record,
+                ContextRecord: &raw mut context,
+            };
+            // SAFETY: The exception pointers reference live records for the call.
+            let result = unsafe { crate::vectored_exception_handler_inner(&raw mut pointers) };
+
+            let in_guest = tls.is_in_guest.replace(false);
+            crate::teb::uninstall_tls();
+            assert_eq!(result, crate::EXCEPTION_CONTINUE_EXECUTION);
+            assert!(in_guest);
+            assert_eq!(context.Rip, callback);
+            assert_eq!(regs.rip, GUEST_RIP);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
