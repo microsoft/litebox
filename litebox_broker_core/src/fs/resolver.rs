@@ -62,9 +62,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         (&self.backend as &dyn core::any::Any).downcast_ref()
     }
 
-    /// Resolve paths against a private copy of the mount layout. Locks on shared files
-    /// still conflict across views. Existing open descriptions keep their original resolver.
-    /// Copies share the runtime mount budget; copying the layout consumes no mount slots.
+    /// Returns a resolver over a private copy of the mount layout, or `None` if the backend isn't
+    /// a [`Composer`]. Advisory locks still conflict across views, and files already open keep
+    /// this resolver.
     #[must_use]
     pub(super) fn copy_mount_view(&self) -> Option<Resolver<Platform, Composer<Platform>>> {
         Some(Resolver {
@@ -74,8 +74,8 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         })
     }
 
-    /// Anchor an entry opened through `opener`, a related mount view, if both views share the
-    /// object it names. Walks from the anchor still use this view's mounts.
+    /// Returns a walk anchor here for `entry`, opened through the related view `opener`, if both
+    /// views contain the object it names. Walks from the anchor see this view's mounts.
     pub(super) fn related_view_anchor(
         &self,
         opener: &Self,

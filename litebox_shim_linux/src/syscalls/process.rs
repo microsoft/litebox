@@ -2245,8 +2245,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Among other flags, a child process supports `CLONE_PARENT` and the namespace flags
     /// `CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWIPC`. A `vfork` child supports
-    /// `CLONE_CLEAR_SIGHAND` and the same namespace flags except `CLONE_NEWNS`: until exec,
-    /// its path operations use its parent's file service. Both support `CLONE_PIDFD`, but threads
+    /// `CLONE_CLEAR_SIGHAND` and the same namespace flags except `CLONE_NEWNS`, since until exec
+    /// it resolves paths through its parent's `LiteBox`. Both support `CLONE_PIDFD`, but threads
     /// don't, since thread pidfds are unsupported. Both support only `SIGCHLD` as the exit
     /// signal, as `posix_spawn` uses, except that, like Linux, a sibling (`CLONE_PARENT`) gets this
     /// process's exit signal instead. Other process creation is unsupported.

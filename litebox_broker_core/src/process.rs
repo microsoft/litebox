@@ -531,7 +531,8 @@ impl ObjectEntry {
 
 struct BrokerProcessState {
     status: ProcessStatus,
-    /// Path lookups use this view until teardown. Open files hold their own references.
+    /// This process's mount view for path lookups. `create_namespaces` may replace it, and
+    /// teardown clears it. Open files keep the view that opened them.
     fs: Option<Arc<dyn FileService>>,
     /// Final termination status reported by the running process.
     reported_exit_status: Option<ProcessExitStatus>,
@@ -885,13 +886,15 @@ impl BrokerProcess {
     /// child `request.process_id`, leaving all the existing namespaces intact
     /// on failure.
     ///
-    /// Returns `UnknownObject` if the target is neither, and
-    /// `UnsupportedOperation` if the request asks for a children's PID
-    /// namespace for a pending child or while this process's children already
-    /// go to another one, or for a copy of a mount view that the target's file
-    /// service can't copy. Returns `ResourceExhausted` if that namespace can't
-    /// be created, and `PolicyDenied` for a new segment namespace unless the
-    /// process may write.
+    /// Returns:
+    /// - `UnknownObject` if the target is neither.
+    /// - `UnsupportedOperation` if the request asks for a children's PID
+    ///   namespace for a pending child, or while this process's children
+    ///   already go to another one, or for a mount view copy that the target's
+    ///   file service can't make.
+    /// - `ResourceExhausted` if the PID namespace can't be created.
+    /// - `PolicyDenied` for a new segment namespace unless the process may
+    ///   write.
     pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<()> {
         if request.new_segment_namespace {
             self.require_object_rights(ObjectRights::WAIT | ObjectRights::WRITE)?;

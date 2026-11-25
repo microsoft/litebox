@@ -38,8 +38,9 @@ use thiserror::Error;
 pub struct Composer<Platform: RawSyncPrimitivesProvider> {
     state: RwLock<Platform, MountState>,
     resources: Arc<MountResources>,
-    /// The resolver holds this lock from lookup through mount publication, mkdir, unlink,
-    /// rmdir, or rename so directory names stay stable while it checks mountpoint pins.
+    /// Shared by all copies of this view. The resolver holds it from lookup to completion of
+    /// each mount, mkdir, unlink, rmdir, and rename, so no view can mount on a directory that
+    /// another is creating, removing, or renaming.
     pub(super) mount_paths: Arc<Mutex<Platform, ()>>,
 }
 
@@ -53,7 +54,7 @@ struct MountState {
     virtual_dirs: Vec<VirtualDir>,
 }
 
-/// Identity allocation and the runtime mount budget span all copies of a view.
+/// Device and inode allocators and the runtime mount budget, shared by all related views.
 struct MountResources {
     allocators: InodeAllocators,
     virtual_dir_allocator: InodeAllocator,
@@ -91,7 +92,8 @@ pub struct ComposerBuilder<Platform: RawSyncPrimitivesProvider> {
 struct Mount {
     path: Arc<[String]>,
     backend: Box<dyn Backend>,
-    /// Paths pinned by live mounts attached to this backend, including those in other views.
+    /// Mount points on this backend, from any related view. A live one keeps its directory and
+    /// ancestors from being removed or renamed.
     points: spin::Mutex<Vec<Weak<[String]>>>,
     _slot: Option<RuntimeMountSlot>,
 }
@@ -177,12 +179,10 @@ fn parse_mount_path(raw: &str) -> Result<Vec<String>, MountError> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
-    /// Copy the current mount layout. Later mounts are visible only in the view where they
-    /// are made. Existing mounts share their backends and keep their device and inode numbers.
-    /// All related views share the runtime mount budget; copying does not consume mount slots.
-    /// As with any two backends, handles must be used with the instance that produced them,
-    /// unless [`Self::shares_handle`] accepts them.
-    /// The resolver shares the advisory-lock table between copies.
+    /// Copy the mount layout into a new view. Existing mounts are shared, with the same device
+    /// and inode numbers; later mounts appear only in the view that makes them. Related views
+    /// share one runtime mount budget, and copying uses none of it. A handle works in another
+    /// view only if [`Self::shares_handle`] accepts it.
     #[must_use]
     pub(super) fn copy_mount_view(&self) -> Self {
         Self {
@@ -193,15 +193,15 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
     }
 
     /// Whether `handle`, produced by `other`, names the same object in this view, so walks
-    /// may start from it here. A mounted handle must come from the exact mount at its index in
-    /// both views; a virtual directory must have the same node in two related views.
+    /// may start from it here. This holds if both views contain the mount the handle came from
+    /// or, for a synthesized directory, if both are related views with the same one at its path.
     pub(super) fn shares_handle(&self, other: &Self, handle: HandleRef<'_>) -> bool {
         let mount_index = match handle {
             HandleRef::File(file) => file.get_typed::<Self>().mount_index,
             HandleRef::Dir(dir) => match &dir.get_typed::<Self>().inner {
                 ComposerDirHandleInner::Mounted { mount_index, .. } => *mount_index,
                 ComposerDirHandleInner::Virtual { path } => {
-                    // Independent namespaces number their virtual directories alike.
+                    // Unrelated views number their virtual directories alike.
                     let node = |view: &Self| {
                         view.state
                             .read()
@@ -466,9 +466,9 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
     /// Namespace location of a directory inside `mount`, used to find mount crossings below it,
     /// or `None` if the location recorded when the handle was created should be used.
     ///
-    /// The recorded location is only trusted when no mount is nested below `mount` or when the
-    /// backend cannot name the directory, since a rename or a later runtime mount can make it
-    /// stale.
+    /// The recorded location is only trusted when no mount is nested below `mount` and no mount
+    /// in any related view lies on its backend, or when the backend cannot name the directory,
+    /// since a rename or a later runtime mount can make it stale.
     fn current_route(
         &self,
         caller: Caller<'_>,
@@ -485,7 +485,8 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         self.nested_mounts(mount).next().is_some()
     }
 
-    /// A held directory's recorded path can also go stale before a sibling view pins it.
+    /// Whether a rename could have made a recorded path in `mount` stale in a way that matters:
+    /// a nested mount in this view, or a mount on this backend in any related view.
     fn needs_current_route(&self, mount: &Mount) -> bool {
         self.has_nested_mount(mount)
             || mount
@@ -561,8 +562,9 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         }
     }
 
-    /// Check an rmdir without consuming the parent, so the resolver can report a mount conflict
-    /// even when it already knows the parent is read-only.
+    /// Returns `Busy` if `name` in `parent` is a mount point or an ancestor of one in any related
+    /// view. It borrows `parent`, so the resolver can report this before refusing a read-only
+    /// parent.
     pub(super) fn check_rmdir(
         &self,
         parent: &ResolvedDir<'_>,
@@ -582,8 +584,9 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         Ok(())
     }
 
-    /// Check both endpoints without issuing a rename, including when the resolver already
-    /// knows a parent is read-only.
+    /// Returns the error the mount layout gives a rename, without calling a backend: an invalid
+    /// name, `Busy` for a mount point or an ancestor of one at either end, `ReadOnlyFileSystem`
+    /// between synthesized directories, or `CrossDevice` across mounts.
     pub(super) fn check_rename(
         &self,
         old_dir: &DirHandle,
@@ -2034,7 +2037,7 @@ mod tests {
                 "{components:?}",
             );
         }
-        // Independent namespaces number their mounts and virtual directories alike.
+        // Unrelated views number their mounts and virtual directories alike.
         for components in [&[][..], &["data"][..]] {
             let handle = dir(&unrelated, components);
             assert!(!parent.shares_handle(&unrelated, HandleRef::Dir(&handle)));
