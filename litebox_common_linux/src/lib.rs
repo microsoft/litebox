@@ -65,6 +65,98 @@ pub const STDIN_FILENO: i32 = 0;
 pub const STDOUT_FILENO: i32 = 1;
 pub const STDERR_FILENO: i32 = 2;
 
+// linux/ipc.h and linux/shm.h (SysV shared memory)
+pub const IPC_PRIVATE: i32 = 0;
+/// `shm_perm.mode` bit of a segment marked for removal.
+pub const SHM_DEST: u32 = 0o1000;
+
+bitflags::bitflags! {
+    /// `shmflg` argument to `shmget(2)`. Its low nine bits are the new segment's mode.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ShmgetFlags: core::ffi::c_int {
+        const IPC_CREAT = 0o1000;
+        const IPC_EXCL = 0o2000;
+        const SHM_HUGETLB = 0o4000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+/// `cmd` argument to `shmctl(2)`, limited to the supported commands.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntEnum)]
+pub enum ShmctlCmd {
+    /// `IPC_RMID`.
+    Remove = 0,
+    /// `IPC_SET`.
+    Set = 1,
+    /// `IPC_STAT`.
+    Stat = 2,
+    /// `IPC_INFO`, which reads [`ShmLimits`].
+    Limits = 3,
+    /// `SHM_STAT`, which takes an index rather than a segment ID.
+    StatIndex = 13,
+    /// `SHM_INFO`, which reads [`ShmUsage`].
+    Usage = 14,
+    /// `SHM_STAT_ANY`, `SHM_STAT` without the read permission check.
+    StatIndexAny = 15,
+}
+
+/// Linux `ipc64_perm` on x86-64 and AArch64.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub struct IpcPerm {
+    pub key: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub cuid: u32,
+    pub cgid: u32,
+    pub mode: u32,
+    pub seq: u16,
+    pub reserved_pad: [u8; 6],
+    pub reserved: [u64; 2],
+}
+
+/// Linux `shmid64_ds` passed to `shmctl` on x86-64 and AArch64.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub struct ShmidDs {
+    pub shm_perm: IpcPerm,
+    pub shm_segsz: u64,
+    pub shm_atime: i64,
+    pub shm_dtime: i64,
+    pub shm_ctime: i64,
+    pub shm_cpid: i32,
+    pub shm_lpid: i32,
+    pub shm_nattch: u64,
+    pub reserved: [u64; 2],
+}
+
+/// Linux `shminfo64`, which `shmctl(IPC_INFO)` writes, on x86-64 and AArch64.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub struct ShmLimits {
+    pub shmmax: u64,
+    pub shmmin: u64,
+    pub shmmni: u64,
+    pub shmseg: u64,
+    pub shmall: u64,
+    pub unused: [u64; 4],
+}
+
+/// Linux `shm_info`, which `shmctl(SHM_INFO)` writes, on x86-64 and AArch64.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub struct ShmUsage {
+    pub used_ids: i32,
+    pub pad: [u8; 4],
+    pub shm_tot: u64,
+    pub shm_rss: u64,
+    pub shm_swp: u64,
+    pub swap_attempts: u64,
+    pub swap_successes: u64,
+}
+
 // linux/futex.h
 pub const FUTEX_WAIT: i32 = 0;
 pub const FUTEX_WAKE: i32 = 1;
@@ -3111,6 +3203,16 @@ pub enum SyscallRequest {
         fd: i32,
         offset: usize,
     },
+    Shmget {
+        key: i32,
+        size: usize,
+        shmflg: ShmgetFlags,
+    },
+    Shmctl {
+        shmid: i32,
+        cmd: ShmctlCmd,
+        buf: UserPtrMut<ShmidDs>,
+    },
     Mprotect {
         addr: UserPtrMut<u8>,
         length: usize,
@@ -3810,6 +3912,8 @@ impl SyscallRequest {
             }),
             Sysno::mprotect => sys_req!(Mprotect { addr:*, length, prot }),
             Sysno::munmap => sys_req!(Munmap { addr:*, length }),
+            Sysno::shmget => sys_req!(Shmget { key, size, shmflg }),
+            Sysno::shmctl => sys_req!(Shmctl { shmid, cmd:?, buf:* }),
             Sysno::brk => sys_req!(Brk { addr:* }),
             Sysno::mremap => sys_req!(Mremap { old_addr:*, old_size, new_size, flags, new_addr }),
             Sysno::rt_sigprocmask => sys_req!(RtSigprocmask {
@@ -4809,6 +4913,7 @@ reinterpret_truncated_from_usize_for! {
         RngFlags,
         TimerFlags,
         StatxMask,
+        ShmgetFlags,
     ],
 }
 

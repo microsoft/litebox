@@ -296,10 +296,7 @@ pub(super) enum RestartBlock<Instant> {
     },
 }
 
-/// The UTS and IPC namespace flags, which need the permission check. A new UTS namespace gets a
-/// copy of its creator's host names (see `ChildRelation::new_host_names`). LiteBox has no IPC
-/// objects, so a new IPC namespace has nothing to scope and is indistinguishable from its
-/// creator's; IPC objects, if added, must be kept per namespace.
+/// Namespace flags requiring administrative permission even without a new PID namespace.
 const UTS_AND_IPC_NAMESPACE_FLAGS: CloneFlags = CloneFlags::NEWUTS.union(CloneFlags::NEWIPC);
 
 /// How a new child process relates to the process creating it.
@@ -310,18 +307,17 @@ struct ChildRelation {
     new_pid_namespace: bool,
     /// Whether the child's parent is the creating process's parent.
     sibling: bool,
-    /// Whether the child is in a new UTS namespace, with its own copy of the creating process's
-    /// host names rather than sharing them.
-    new_host_names: bool,
+    /// Which of its creator's UTS and IPC namespaces the child does not share.
+    new_namespaces: CloneFlags,
 }
 
 impl ChildRelation {
-    /// A plain child, in the PID namespace for the creating process's children, sharing its host
-    /// names.
+    /// A plain child, in the PID namespace for the creating process's children, sharing its UTS
+    /// and IPC namespaces.
     const CHILD: Self = Self {
         new_pid_namespace: false,
         sibling: false,
-        new_host_names: false,
+        new_namespaces: CloneFlags::empty(),
     };
 }
 
@@ -1054,15 +1050,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 error => error.into(),
             })?;
         // On failure, dropping the child cancels it.
-        if relation.new_host_names {
-            self.global
+        if !relation.new_namespaces.is_empty() {
+            match self
+                .global
                 .litebox
                 .create_namespaces(CreateNamespacesRequest {
                     process_id: child.identity().process_id,
                     children_pid_namespace: None,
-                    new_segment_namespace: false,
-                    copy_host_names: true,
-                })?;
+                    new_segment_namespace: relation.new_namespaces.contains(CloneFlags::NEWIPC),
+                    copy_host_names: relation.new_namespaces.contains(CloneFlags::NEWUTS),
+                }) {
+                // Without the services, host names are fixed and there are no segments.
+                Ok(()) | Err(ProcessError::Unavailable) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(child)
     }
@@ -1116,9 +1117,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Unlike Linux, `CLONE_NEWPID` fails in a `vfork` child, whose requests go to the broker as
     /// its parent's, and in a process with more than one thread, since LiteBox keeps the PID
-    /// namespace for a process's children per process rather than per thread. Likewise, since
-    /// LiteBox keeps host names per process, `CLONE_NEWUTS` moves the whole process, with all its
-    /// threads, to the new UTS namespace, not just the calling thread.
+    /// namespace for a process's children per process rather than per thread. UTS and IPC
+    /// namespace changes likewise move all threads in the process, not just the calling thread.
     pub(crate) fn sys_unshare(&self, flags: CloneFlags) -> Result<usize, Errno> {
         if flags.is_empty() {
             return Ok(0);
@@ -1129,7 +1129,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         self.check_admin()?;
         let new_pid = flags.contains(CloneFlags::NEWPID);
-        let copy_host_names = flags.contains(CloneFlags::NEWUTS);
         if new_pid {
             // A `vfork` child makes its requests as its parent, whose children this would change.
             if self.vfork.borrow().is_some() {
@@ -1143,9 +1142,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return Err(Errno::EINVAL);
             }
         }
-        if !new_pid && !copy_host_names {
-            return Ok(0);
-        }
         // One request, so that a failure leaves every namespace unchanged.
         match self
             .global
@@ -1153,11 +1149,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .create_namespaces(CreateNamespacesRequest {
                 process_id: ProcessId(self.own_pid_for_requests().cast_unsigned()),
                 children_pid_namespace: new_pid.then_some(PidNamespaceOptions::INIT),
-                new_segment_namespace: false,
-                copy_host_names,
+                new_segment_namespace: flags.contains(CloneFlags::NEWIPC),
+                copy_host_names: flags.contains(CloneFlags::NEWUTS),
             }) {
             Ok(()) => {}
-            // If LiteBox can't change host names, they are fixed, so there is nothing to copy.
+            // Without the services, host names are fixed and there are no segments.
             Err(ProcessError::Unavailable) if !new_pid => return Ok(0),
             // The namespace limits, like Linux's nesting and count limits.
             Err(ProcessError::ResourceExhausted) => return Err(Errno::ENOSPC),
@@ -2352,7 +2348,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let relation = ChildRelation {
                 new_pid_namespace: self.clone_creates_pid_namespace(flags)?,
                 sibling,
-                new_host_names: flags.contains(CloneFlags::NEWUTS),
+                new_namespaces: flags & UTS_AND_IPC_NAMESPACE_FLAGS,
             };
             let child_tid: usize = child_tid.trunc();
             let tid_if = |flag| if flags.contains(flag) { child_tid } else { 0 };
@@ -2395,7 +2391,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let relation = ChildRelation {
                 new_pid_namespace: self.clone_creates_pid_namespace(flags)?,
                 sibling: false,
-                new_host_names: flags.contains(CloneFlags::NEWUTS),
+                new_namespaces: flags & UTS_AND_IPC_NAMESPACE_FLAGS,
             };
             return self.begin_vfork(
                 ctx,

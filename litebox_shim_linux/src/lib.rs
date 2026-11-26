@@ -1026,6 +1026,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Setsid
                     | SyscallRequest::Getsid { .. }
                     | SyscallRequest::Unshare { .. }
+                    // The segment handlers reject these without touching parent state.
+                    | SyscallRequest::Shmget { .. }
+                    | SyscallRequest::Shmctl { .. }
                     | SyscallRequest::Uname { .. }
                     | SyscallRequest::Sethostname { .. }
                     | SyscallRequest::Setdomainname { .. }
@@ -1298,6 +1301,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .sys_mremap(old_addr, old_size, new_size, flags, new_addr)
                 .map(|ptr| ptr.as_usize()),
             SyscallRequest::Munmap { addr, length } => syscall!(sys_munmap(addr, length)),
+            SyscallRequest::Shmget { key, size, shmflg } => syscall!(sys_shmget(key, size, shmflg)),
+            SyscallRequest::Shmctl { shmid, cmd, buf } => syscall!(sys_shmctl(shmid, cmd, buf)),
             SyscallRequest::Brk { addr } => self.sys_brk(addr),
             SyscallRequest::Readv { fd, iovec, iovcnt } => self.sys_readv(fd, iovec, iovcnt),
             SyscallRequest::Writev { fd, iovec, iovcnt } => self.sys_writev(fd, iovec, iovcnt),
