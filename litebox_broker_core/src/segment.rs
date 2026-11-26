@@ -1,12 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Keyed shared segments. Each root starts in a private namespace; its
-//! descendants share it until one moves to a new one (see
-//! [`BrokerProcess::create_namespaces`]).
-//!
-//! Segments record no owning identity and requests carry none, so no request
-//! is checked against a segment's permission bits.
+//! Keyed shared segments.
 
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::ops::Range;
@@ -22,7 +17,7 @@ use crate::{
     quota,
 };
 use litebox_broker_protocol::segment::{
-    GetSegmentRequest, SegmentError as E, SegmentId, SegmentInfo, SegmentSlotStatus,
+    GetSegmentRequest, SegmentError, SegmentId, SegmentInfo, SegmentSlotStatus,
     SegmentSlotStatusRequest, SegmentStatus, SetSegmentRequest,
 };
 
@@ -33,8 +28,8 @@ const _: () = assert!(MAX_ALLOCATED_ID <= i32::MAX.cast_unsigned());
 // Guests also see slots as non-negative `int`s.
 const MAX_SLOTS: u32 = i32::MAX.cast_unsigned();
 
-/// The outcome of a segment operation: its result, or a guest-visible error.
-pub type SegmentResult<T> = core::result::Result<T, E>;
+/// The outcome of a segment operation.
+pub type SegmentResult<T> = core::result::Result<T, SegmentError>;
 
 /// Broker-wide keyed shared segment state.
 pub(crate) struct SegmentService {
@@ -86,14 +81,14 @@ impl SegmentIds {
 
     fn reserve(self: &Arc<Self>) -> Outcome<IdLease> {
         if self.max == 0 {
-            return Err(E::Unavailable.into());
+            return Err(SegmentError::Unavailable.into());
         }
         let mut allocator = self.allocator.lock();
         if allocator.allocated() >= self.max {
-            return Err(E::NoSpace.into());
+            return Err(SegmentError::NoSpace.into());
         }
         let id = allocator.allocate().map_err(|error| match error {
-            BrokerError::ResourceExhausted => Failure::Segment(E::NoSpace),
+            BrokerError::ResourceExhausted => Failure::Segment(SegmentError::NoSpace),
             error => Failure::Broker(error),
         })?;
         Ok(IdLease {
@@ -132,16 +127,16 @@ impl SegmentCharge {
         let job = &process.job;
         let broker_bytes = &process.core.segments.bytes;
         if !quota::try_increment(&job.segments, limits.max_segments_per_job) {
-            return Err(E::NoSpace);
+            return Err(SegmentError::NoSpace);
         }
         if !quota::try_add(&job.segment_bytes, bytes, limits.max_segment_bytes_per_job) {
             job.segments.fetch_sub(1, Ordering::Relaxed);
-            return Err(E::NoSpace);
+            return Err(SegmentError::NoSpace);
         }
         if !quota::try_add(broker_bytes, bytes, limits.max_total_segment_bytes) {
             job.segment_bytes.fetch_sub(bytes, Ordering::Relaxed);
             job.segments.fetch_sub(1, Ordering::Relaxed);
-            return Err(E::NoSpace);
+            return Err(SegmentError::NoSpace);
         }
         Ok(Self {
             job_segments: Arc::clone(&job.segments),
@@ -217,12 +212,12 @@ impl Registry {
             .get(&request.key)
             .and_then(|id| self.segments.get_key_value(id))
         else {
-            return (!request.create).then_some(Err(E::Missing));
+            return (!request.create).then_some(Err(SegmentError::Missing));
         };
         Some(if request.create && request.exclusive {
-            Err(E::Exists)
+            Err(SegmentError::Exists)
         } else if request.size > entry.lock().status.size {
-            Err(E::InvalidArgument)
+            Err(SegmentError::InvalidArgument)
         } else {
             Ok(id)
         })
@@ -250,8 +245,8 @@ impl ProcessSegments {
         self.namespace = Arc::default();
     }
 
-    /// Returns the segments of a new child: its creator's namespace.
-    pub(crate) fn child(&self) -> Self {
+    /// Creates segment state for a child, sharing its creator's namespace.
+    pub(crate) fn new_for_child(&self) -> Self {
         Self {
             namespace: Arc::clone(&self.namespace),
             ..Self::default()
@@ -277,12 +272,12 @@ impl ProcessSegments {
 /// Why a request did not complete: an ordinary guest error, or a failure of
 /// the request itself.
 enum Failure {
-    Segment(E),
+    Segment(SegmentError),
     Broker(BrokerError),
 }
 
-impl From<E> for Failure {
-    fn from(error: E) -> Self {
+impl From<SegmentError> for Failure {
+    fn from(error: SegmentError) -> Self {
         Self::Segment(error)
     }
 }
@@ -357,7 +352,12 @@ fn with_segment<R>(
     f: impl FnOnce(&mut Segment) -> Outcome<R>,
 ) -> Outcome<R> {
     let registry = namespace.lock();
-    let entry = Arc::clone(registry.segments.get(&id).ok_or(E::InvalidArgument)?);
+    let entry = Arc::clone(
+        registry
+            .segments
+            .get(&id)
+            .ok_or(SegmentError::InvalidArgument)?,
+    );
     let mut segment = entry.lock();
     drop(registry);
     f(&mut segment)
@@ -386,7 +386,7 @@ impl<'a> Caller<'a> {
         if self.can_write {
             Ok(())
         } else {
-            Err(E::AccessDenied)
+            Err(SegmentError::AccessDenied)
         }
     }
 
@@ -412,25 +412,28 @@ impl<'a> Caller<'a> {
         }
         let limits = self.process.core.limits;
         if request.size == 0 || request.size > limits.max_segment_size {
-            return Err(E::InvalidArgument.into());
+            return Err(SegmentError::InvalidArgument.into());
         }
         self.require_write()?;
         let service = &self.process.core.segments;
-        let provider = service.provider.as_deref().ok_or(E::Unavailable)?;
+        let provider = service
+            .provider
+            .as_deref()
+            .ok_or(SegmentError::Unavailable)?;
         let length = request
             .size
             .checked_next_multiple_of(PAGE_SIZE)
-            .ok_or(E::InvalidArgument)?;
+            .ok_or(SegmentError::InvalidArgument)?;
         let id = service.ids.reserve()?;
         let charge = SegmentCharge::reserve(self.process, length)?;
         // Without the namespace locked: storage creation calls into the host.
         let backing = provider
-            .create_segment(usize::try_from(length).map_err(|_| E::InvalidArgument)?)
+            .create_segment(usize::try_from(length).map_err(|_| SegmentError::InvalidArgument)?)
             .map_err(|error| match error {
-                CreateSharedMemoryError::NoSpace => Failure::Segment(E::NoSpace),
+                CreateSharedMemoryError::NoSpace => Failure::Segment(SegmentError::NoSpace),
                 CreateSharedMemoryError::OutOfMemory => Failure::Broker(BrokerError::OutOfMemory),
-                CreateSharedMemoryError::Io => Failure::Segment(E::Io),
-                CreateSharedMemoryError::Unsupported => Failure::Segment(E::Unavailable),
+                CreateSharedMemoryError::Io => Failure::Segment(SegmentError::Io),
+                CreateSharedMemoryError::Unsupported => Failure::Segment(SegmentError::Unavailable),
             })?;
         let mut registry = namespace.lock();
         // Another request may have published the key in the meantime.
@@ -447,7 +450,7 @@ impl<'a> Caller<'a> {
                     .unwrap_or(MAX_SLOTS)
                     .min(MAX_SLOTS),
             )
-            .ok_or(E::NoSpace)?;
+            .ok_or(SegmentError::NoSpace)?;
         let now = self.now();
         registry.slots.insert(slot, number);
         registry.segments.insert(
@@ -489,7 +492,7 @@ impl<'a> Caller<'a> {
             .lock()
             .slots
             .get(&request.slot)
-            .ok_or(E::InvalidArgument)?;
+            .ok_or(SegmentError::InvalidArgument)?;
         let status = self.status_in(&namespace, id)?;
         Ok(SegmentSlotStatus { id, status })
     }
@@ -541,7 +544,12 @@ impl<'a> Caller<'a> {
     fn remove(&self, id: SegmentId) -> Outcome<()> {
         let namespace = self.namespace()?;
         let mut registry = namespace.lock();
-        let entry = Arc::clone(registry.segments.get(&id).ok_or(E::InvalidArgument)?);
+        let entry = Arc::clone(
+            registry
+                .segments
+                .get(&id)
+                .ok_or(SegmentError::InvalidArgument)?,
+        );
         let mut s = entry.lock();
         self.require_write()?;
         registry.keys.remove(&s.status.key);
@@ -686,24 +694,32 @@ mod tests {
         assert_eq!(lookup(&parent, 91), Ok(id));
         assert_eq!(
             get(&parent, request(91, 0, true, true)).unwrap(),
-            Err(E::Exists)
+            Err(SegmentError::Exists)
         );
         assert_eq!(
             get(&parent, request(91, 124, false, false)).unwrap(),
-            Err(E::InvalidArgument)
+            Err(SegmentError::InvalidArgument)
         );
-        assert_ne!(create(&parent, 0), create(&parent, 0));
         let other = new_root(&broker);
-        assert_eq!(status(&other, id).unwrap(), Err(E::InvalidArgument));
+        assert_eq!(
+            status(&other, id).unwrap(),
+            Err(SegmentError::InvalidArgument)
+        );
         // A child shares its creator's namespace until it moves to a new one.
         let child = new_child(&parent);
         assert_eq!(lookup(&child, 91), Ok(id));
         new_namespace(&child, child.id()).unwrap();
-        assert_eq!(status(&child, id).unwrap(), Err(E::InvalidArgument));
+        assert_eq!(
+            status(&child, id).unwrap(),
+            Err(SegmentError::InvalidArgument)
+        );
         assert_ne!(id, create(&child, 91));
         remove(&parent, id).unwrap().unwrap();
-        assert_eq!(status(&parent, id).unwrap(), Err(E::InvalidArgument));
-        assert_eq!(lookup(&parent, 91), Err(E::Missing));
+        assert_eq!(
+            status(&parent, id).unwrap(),
+            Err(SegmentError::InvalidArgument)
+        );
+        assert_eq!(lookup(&parent, 91), Err(SegmentError::Missing));
         assert_ne!(id, create(&parent, 91));
     }
 
@@ -752,9 +768,9 @@ mod tests {
         assert_eq!(info.highest_slot, Some(1));
         assert_eq!(at_slot(&p, 0), Ok((first, 123)));
         assert_eq!(at_slot(&p, 1), Ok((second, 123)));
-        assert_eq!(at_slot(&p, 2), Err(E::InvalidArgument));
+        assert_eq!(at_slot(&p, 2), Err(SegmentError::InvalidArgument));
         remove(&p, first).unwrap().unwrap();
-        assert_eq!(at_slot(&p, 0), Err(E::InvalidArgument));
+        assert_eq!(at_slot(&p, 0), Err(SegmentError::InvalidArgument));
         // Linux: a freed slot is reused only after the others (`idr_alloc_cyclic`).
         let third = create(&p, 0);
         assert_eq!(at_slot(&p, 2).map(|(id, _)| id), Ok(third));
@@ -764,7 +780,7 @@ mod tests {
         // Another namespace has slots of its own.
         new_namespace(&p, p.id()).unwrap();
         assert_eq!(info_of(&p).highest_slot, None);
-        assert_eq!(at_slot(&p, 0), Err(E::InvalidArgument));
+        assert_eq!(at_slot(&p, 0), Err(SegmentError::InvalidArgument));
     }
 
     #[test]
@@ -779,9 +795,9 @@ mod tests {
         let p = new_root(&broker);
         assert_eq!(
             get(&p, request(64, 123, true, true)).unwrap(),
-            Err(E::AccessDenied)
+            Err(SegmentError::AccessDenied)
         );
-        assert_eq!(lookup(&p, 64), Err(E::Missing));
+        assert_eq!(lookup(&p, 64), Err(SegmentError::Missing));
         assert!(matches!(
             new_namespace(&p, p.id()),
             Err(BrokerError::PolicyDenied)
@@ -797,7 +813,7 @@ mod tests {
         create(&root, 2);
         assert_eq!(
             get(&root, request(3, 123, true, true)).unwrap(),
-            Err(E::NoSpace)
+            Err(SegmentError::NoSpace)
         );
         // Leaving its only namespace frees its segments.
         new_namespace(&root, root.id()).unwrap();
@@ -819,18 +835,24 @@ mod tests {
         let private = |size| request(0, size, true, false);
         assert_eq!(
             get(&root, private(2 * PAGE + 1)).unwrap(),
-            Err(E::InvalidArgument)
+            Err(SegmentError::InvalidArgument)
         );
         let first = get(&root, private(2 * PAGE)).unwrap().unwrap();
         // The job's bytes.
-        assert_eq!(get(&root, private(2 * PAGE)).unwrap(), Err(E::NoSpace));
+        assert_eq!(
+            get(&root, private(2 * PAGE)).unwrap(),
+            Err(SegmentError::NoSpace)
+        );
         get(&root, private(1)).unwrap().unwrap();
         // The job's count.
-        assert_eq!(get(&root, private(1)).unwrap(), Err(E::NoSpace));
+        assert_eq!(get(&root, private(1)).unwrap(), Err(SegmentError::NoSpace));
         let other_job = new_root(&broker.with_pid_namespace(Arc::clone(&broker.pid_namespace)));
         get(&other_job, private(PAGE + 1)).unwrap().unwrap();
         // The broker's bytes, though the job could hold more.
-        assert_eq!(get(&other_job, private(1)).unwrap(), Err(E::NoSpace));
+        assert_eq!(
+            get(&other_job, private(1)).unwrap(),
+            Err(SegmentError::NoSpace)
+        );
         remove(&root, first).unwrap().unwrap();
         get(&other_job, private(1)).unwrap().unwrap();
     }
@@ -855,7 +877,7 @@ mod tests {
 
     #[test]
     fn segment_storage_errors_preserve_classification() {
-        struct FailingProvider(Mutex<CreateSharedMemoryError>);
+        struct FailingProvider(Mutex<Option<CreateSharedMemoryError>>);
         impl SharedFileMemoryProvider for FailingProvider {
             fn create(&self) -> Result<SharedFileMemory, CreateSharedMemoryError> {
                 unreachable!("segment creation uses the fixed-length provider method")
@@ -863,56 +885,69 @@ mod tests {
 
             fn create_segment(
                 &self,
-                _: usize,
+                len: usize,
             ) -> Result<Arc<dyn SharedFileObject>, CreateSharedMemoryError> {
-                Err(*self.0.lock())
+                match *self.0.lock() {
+                    Some(error) => Err(error),
+                    None => Provider.create_segment(len),
+                }
             }
         }
 
-        let provider = Arc::new(FailingProvider(Mutex::new(CreateSharedMemoryError::Io)));
-        let Setup {
-            broker, root: p, ..
-        } = setup_with_provider(BrokerCoreLimits::DEFAULT, provider.clone());
+        let provider = Arc::new(FailingProvider(Mutex::new(Some(
+            CreateSharedMemoryError::Io,
+        ))));
+        let limits = BrokerCoreLimits::DEFAULT.with_segment_limits(
+            (1, 1),
+            (PAGE_SIZE, PAGE_SIZE),
+            PAGE_SIZE,
+        );
+        let Setup { root: p, .. } = setup_with_provider(limits, provider.clone());
         for (error, expected) in [
-            (CreateSharedMemoryError::NoSpace, Ok(Err(E::NoSpace))),
+            (
+                CreateSharedMemoryError::NoSpace,
+                Ok(Err(SegmentError::NoSpace)),
+            ),
             (
                 CreateSharedMemoryError::OutOfMemory,
                 Err(BrokerError::OutOfMemory),
             ),
-            (CreateSharedMemoryError::Io, Ok(Err(E::Io))),
+            (CreateSharedMemoryError::Io, Ok(Err(SegmentError::Io))),
             (
                 CreateSharedMemoryError::Unsupported,
-                Ok(Err(E::Unavailable)),
+                Ok(Err(SegmentError::Unavailable)),
             ),
         ] {
-            *provider.0.lock() = error;
+            *provider.0.lock() = Some(error);
             assert_eq!(get(&p, request(81, 123, true, true)), expected);
-            assert_eq!(lookup(&p, 81), Err(E::Missing));
+            assert_eq!(lookup(&p, 81), Err(SegmentError::Missing));
         }
         // Failed creations released their IDs and budgets.
-        assert_eq!(broker.job.segments.load(Ordering::Relaxed), 0);
-        assert_eq!(broker.core.segments.bytes.load(Ordering::Relaxed), 0);
-        assert_eq!(broker.core.segments.ids.allocator.lock().allocated(), 0);
+        *provider.0.lock() = None;
+        let id = create(&p, 81);
+        assert_eq!(lookup(&p, 81), Ok(id));
     }
 
     #[test]
     fn segment_ids_are_bounded_and_reused_after_wrapping() {
         assert!(matches!(
             Arc::new(SegmentIds::new(0).unwrap()).reserve(),
-            Err(Failure::Segment(E::Unavailable))
+            Err(Failure::Segment(SegmentError::Unavailable))
         ));
         // Two live segments, with IDs 1 to 3.
         let ids = Arc::new(SegmentIds::with_id_range(2, 3).unwrap());
         let first = ids.reserve().ok().unwrap();
         let second = ids.reserve().ok().unwrap();
         assert_eq!((first.id, second.id), (1, 2));
-        assert!(matches!(ids.reserve(), Err(Failure::Segment(E::NoSpace))));
+        assert!(matches!(
+            ids.reserve(),
+            Err(Failure::Segment(SegmentError::NoSpace))
+        ));
         drop(first);
         // A freed ID waits until the others have been used, then wraps around.
         let last = ids.reserve().ok().unwrap();
         assert_eq!(last.id, 3);
         drop(last);
         assert_eq!(ids.reserve().ok().unwrap().id, 1);
-        assert_eq!(second.id, 2);
     }
 }

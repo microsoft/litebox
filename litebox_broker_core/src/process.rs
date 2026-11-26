@@ -650,7 +650,7 @@ impl BrokerProcess {
             core,
             segments: Mutex::new(
                 creator.map_or_else(crate::segment::ProcessSegments::default, |p| {
-                    p.segments.lock().child()
+                    p.segments.lock().new_for_child()
                 }),
             ),
             children_namespace: Mutex::new(None),

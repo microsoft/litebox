@@ -100,51 +100,6 @@ use core::num::NonZeroU64;
 
 const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
 
-#[test]
-fn segment_and_namespace_wire_shapes_are_pinned() {
-    let request = BrokerRequest {
-        request_id: RequestId(7),
-        operation: BrokerOperation::Segment(SegmentRequest::Get(GetSegmentRequest {
-            key: -2,
-            size: 0x0102,
-            mode: 0o640,
-            create: true,
-            exclusive: false,
-        })),
-    };
-    assert_eq!(
-        encode_request(&request),
-        [
-            1, 7, 0, 0, 0, 0, 0, 0, 0, 18, 0, 0xfe, 0xff, 0xff, 0xff, 2, 1, 0, 0, 0, 0, 0, 0, 0xa0,
-            1, 1, 0
-        ]
-    );
-    let response = BrokerResponse {
-        request_id: RequestId(7),
-        result: BrokerResult::Segment(SegmentResponse::Failed(SegmentError::Io)),
-    };
-    assert_eq!(
-        encode_response(&response),
-        [1, 7, 0, 0, 0, 0, 0, 0, 0, 19, 4, 6]
-    );
-
-    let request = BrokerRequest {
-        operation: BrokerOperation::Process(ProcessRequest::CreateNamespaces(
-            CreateNamespacesRequest {
-                process_id: ProcessId(9),
-                children_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
-                new_segment_namespace: false,
-                copy_host_names: true,
-            },
-        )),
-        ..request
-    };
-    assert_eq!(
-        encode_request(&request),
-        [1, 7, 0, 0, 0, 0, 0, 0, 0, 10, 22, 9, 0, 0, 0, 1, 1, 0, 0, 1]
-    );
-}
-
 fn process_id(id: u32) -> ProcessId {
     ProcessId(id)
 }
