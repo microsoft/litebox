@@ -651,7 +651,7 @@ struct TestSocketState {
     pending_accept: StdMutex<Option<PendingAcceptedConnection>>,
     /// Whether the provider reports [`SocketAddressing::Host`].
     host_addressing: core::sync::atomic::AtomicBool,
-    connect_egresses: StdMutex<std::vec::Vec<SocketEgress>>,
+    connect_egresses: StdMutex<std::vec::Vec<SocketEgressVerdict>>,
     reject_next_connect: StdMutex<Option<SocketError>>,
     refuse_next_connect: core::sync::atomic::AtomicBool,
     /// What `local_address` reports next, instead of the socket's address.
@@ -852,9 +852,6 @@ impl SocketProvider for TestSocketProvider {
             *self.state.failed_readiness.lock().unwrap() = Some(readiness);
             return Err(BrokerError::OutOfMemory);
         }
-        if self.state.host_addressing.load(Ordering::Relaxed) && is_udp(request) {
-            return Err(BrokerError::UnsupportedOperation);
-        }
         *self.state.live_readiness.lock().unwrap() = Some(readiness.clone());
         let socket = Arc::new(TestPlatformSocket {
             state: Arc::clone(&self.state),
@@ -963,7 +960,7 @@ impl PlatformSocket for TestPlatformSocket {
             return Err(BrokerError::Internal);
         }
         let address = match request {
-            SocketBindRequest::Guest(binding) => {
+            SocketBindRequest::Isolated(binding) => {
                 let address = binding.local_address();
                 *self.guest_binding.lock().unwrap() = Some(binding);
                 address
@@ -1067,12 +1064,12 @@ impl PlatformSocket for TestPlatformSocket {
         &self,
         address: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
-        egress: SocketEgress,
+        egress: SocketEgressVerdict,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         let connect_call = self.state.connect_calls.fetch_add(1, Ordering::Relaxed) + 1;
         // Core lets the provider decide egress only with host addressing.
         if !self.state.host_addressing.load(Ordering::Relaxed) {
-            assert_eq!(egress, SocketEgress::Permitted);
+            assert_eq!(egress, SocketEgressVerdict::Permitted);
         }
         self.state.connect_egresses.lock().unwrap().push(egress);
         let connect_block = self.state.connect_block.lock().unwrap().take();
@@ -1434,9 +1431,9 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
     assert_eq!(
         provider.state.connect_egresses.lock().unwrap().as_slice(),
         [
-            SocketEgress::ServedOnly,
-            SocketEgress::ServedOnly,
-            SocketEgress::Permitted
+            SocketEgressVerdict::ServedOnly,
+            SocketEgressVerdict::ServedOnly,
+            SocketEgressVerdict::Permitted
         ]
     );
     assert_eq!(
@@ -1473,7 +1470,7 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
     assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 4);
     assert_eq!(
         provider.state.connect_egresses.lock().unwrap().last(),
-        Some(&SocketEgress::ServedOnly)
+        Some(&SocketEgressVerdict::ServedOnly)
     );
 
     // A rejection keeps an explicit bind.
@@ -1492,7 +1489,7 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
     assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 5);
     assert_eq!(
         provider.state.connect_egresses.lock().unwrap().last(),
-        Some(&SocketEgress::ServedOnly)
+        Some(&SocketEgressVerdict::ServedOnly)
     );
     assert_eq!(
         provider.state.connect_destinations.lock().unwrap().last(),
@@ -1516,7 +1513,7 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
     );
     assert_eq!(
         provider.state.connect_egresses.lock().unwrap().last(),
-        Some(&SocketEgress::ServedOnly)
+        Some(&SocketEgressVerdict::ServedOnly)
     );
     assert_eq!(
         check_connect(&process, unchanged),
@@ -1569,8 +1566,8 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
     );
     assert_eq!(provider.state.retired_sockets.load(Ordering::Relaxed), 0);
 
-    // Core retires a stream whose platform reports no port or a multicast or
-    // broadcast IP, without reaching the platform again.
+    // Core retires a stream whose platform reports no port, a multicast IP, or
+    // the limited broadcast IP, without reaching the platform again.
     for (retired, address) in (1..).zip([
         host_source(0),
         SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), 60_011),
@@ -1606,6 +1603,27 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
         process.close_object_reference(invalid).unwrap();
     }
 
+    // Nor may the host refine an unspecified IP to the limited broadcast one.
+    let unrefinable = create(&process, create_request(), readiness.clone()).unwrap();
+    provider.report_connect_address_once(Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 60_013)));
+    assert_eq!(
+        connect(&process, unrefinable, external),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    provider
+        .state
+        .status_responses
+        .lock()
+        .unwrap()
+        .push_back(PlatformSocketStatus {
+            status: SocketConnectionStatus::Connected,
+            local_address: Some(SocketAddrV4::new(Ipv4Addr::BROADCAST, 60_013)),
+            pending_error: None,
+        });
+    assert_eq!(status(&process, unrefinable), Err(BrokerError::Internal));
+    assert_eq!(provider.state.retired_sockets.load(Ordering::Relaxed), 4);
+    process.close_object_reference(unrefinable).unwrap();
+
     // The host must keep a stream's port.
     provider
         .state
@@ -1618,7 +1636,26 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
             pending_error: None,
         });
     assert_eq!(status(&process, socket), Err(BrokerError::Internal));
-    assert_eq!(provider.state.retired_sockets.load(Ordering::Relaxed), 4);
+    assert_eq!(provider.state.retired_sockets.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn host_addressing_refuses_sockets_other_than_tcp() {
+    let provider = Arc::new(TestSocketProvider::host());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+
+    assert_eq!(
+        create(
+            &process,
+            create_udp_request(),
+            Arc::new(TestReadinessSink::default())
+        ),
+        Err(BrokerError::UnsupportedOperation)
+    );
+    assert!(provider.state.creates.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -1663,7 +1700,8 @@ fn host_addressing_binds_listens_and_accepts_host_addresses() {
     }
     assert_eq!(provider.state.retired_sockets.load(Ordering::Relaxed), 3);
 
-    // Multicast and broadcast addresses are never the host's own.
+    // Multicast addresses and the limited broadcast address are never the
+    // host's own.
     let unbindable = create(&process, create_request(), readiness.clone()).unwrap();
     for ip in [Ipv4Addr::new(224, 0, 0, 1), Ipv4Addr::BROADCAST] {
         assert_eq!(
@@ -1715,6 +1753,8 @@ fn host_addressing_binds_listens_and_accepts_host_addresses() {
     for local_address in [
         SocketAddrV4::new(*host_local.ip(), host_local.port() + 1),
         SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, host_local.port()),
+        SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), host_local.port()),
+        SocketAddrV4::new(Ipv4Addr::BROADCAST, host_local.port()),
     ] {
         provider.accept_next_host_connection(local_address, client);
         provider.retain_next_socket();
@@ -1725,7 +1765,7 @@ fn host_addressing_binds_listens_and_accepts_host_addresses() {
     }
     assert_eq!(
         provider.state.retired_sockets.load(Ordering::Relaxed),
-        retired_before + 2
+        retired_before + 4
     );
     provider
         .state

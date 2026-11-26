@@ -11,8 +11,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::{
     AcceptedPlatformSocket, GuestSourceLease, PlatformConnectError, PlatformDatagramReceive,
-    PlatformSocket, PlatformSocketStatus, PlatformStreamReceive, SocketBindRequest, SocketEgress,
-    SocketProvider,
+    PlatformSocket, PlatformSocketStatus, PlatformStreamReceive, SocketBindRequest,
+    SocketEgressVerdict, SocketProvider,
 };
 use litebox_broker_core::{BrokerError, ProcessKey, Result as BrokerResult};
 use litebox_broker_protocol::ObjectHandle;
@@ -111,7 +111,7 @@ fn invalid<T>() -> SocketOutcome<T> {
 impl PlatformSocket for SmoltcpSocket {
     fn bind(&self, request: SocketBindRequest) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
         // This provider addresses sockets in isolation.
-        let SocketBindRequest::Guest(binding) = request else {
+        let SocketBindRequest::Isolated(binding) = request else {
             return Err(BrokerError::Internal);
         };
         self.run(|stack| match stack.parts(self.id)?.0 {
@@ -149,7 +149,7 @@ impl PlatformSocket for SmoltcpSocket {
         &self,
         address: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
-        _egress: SocketEgress,
+        _egress: SocketEgressVerdict,
     ) -> Result<SocketConnectionStatus, PlatformConnectError> {
         self.run(|stack| {
             let unchanged = PlatformConnectError::PeerUnchanged(BrokerError::Internal);

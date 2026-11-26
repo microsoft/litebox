@@ -52,8 +52,9 @@ fn is_concrete_internal_address(address: Ipv4Addr) -> bool {
 
 /// Returns whether the IP is unspecified, loopback, or [`GUEST_IPV4_ADDRESS`].
 ///
-/// The port is ignored. [`HOST_GATEWAY_IPV4_ADDRESS`] remains external and
-/// subject to destination policy.
+/// The port is ignored. With [`SocketAddressing::Isolated`],
+/// [`HOST_GATEWAY_IPV4_ADDRESS`] remains external and subject to destination
+/// policy.
 #[must_use]
 pub fn is_internal_socket_address(address: SocketAddrV4) -> bool {
     address.ip().is_unspecified() || is_concrete_internal_address(*address.ip())
@@ -73,7 +74,9 @@ pub fn host_socket_destination(external_destination: SocketAddrV4) -> SocketAddr
     }
 }
 
-/// Normalizes and validates one guest-requested IPv4 destination.
+/// Normalizes and validates one guest-requested IPv4 destination with the
+/// rules of [`SocketAddressing::Isolated`], as
+/// [`SocketAddressing::normalize_destination`] does for that mode.
 ///
 /// Unspecified destinations use the Linux-compatible loopback interpretation.
 /// Broadcast, multicast, reserved, and nonzero `0/8` destinations are rejected.
@@ -212,10 +215,10 @@ impl GuestPortBinding {
         }
         let source_address =
             GuestSocketBinding::new(self).source_address_for_destination(destination)?;
-        Some(GuestSourceLease::retaining(
+        Some(GuestSourceLease {
+            port_owner: Some(SourcePortOwner::Guest(Arc::clone(self))),
             source_address,
-            Arc::clone(self) as Arc<dyn Any + Send + Sync>,
-        ))
+        })
     }
 }
 
@@ -394,37 +397,53 @@ impl Eq for GuestSocketBinding {}
 ///
 /// With [`SocketAddressing::Isolated`], core creates this value from a live
 /// guest binding, which it retains, when a TCP connection targets the guest
-/// namespace. A provider names a client it does not bind for the guest with
-/// [`Self::external`], which retains nothing, and one whose port it holds
-/// itself, as a [`SocketAddressing::Host`] provider holds a connector's host
-/// port, with [`Self::retaining`]. A lease grants no bind or listen authority.
-/// An internal platform path must carry the lease through any queued
-/// connection and return it from [`PlatformSocket::accept`]. Dropping the
-/// lease releases what it retains, and with the final reference to a guest
-/// binding, its namespace entry.
+/// namespace. A provider names any other client itself: with
+/// [`Self::with_port_owner`] if the provider holds the client's port, as a
+/// [`SocketAddressing::Host`] provider holds the host port of a connector
+/// within itself, and otherwise with [`Self::external`], which retains
+/// nothing. A lease grants no bind or listen authority. An internal platform
+/// path must carry the lease through any queued connection and return it from
+/// [`PlatformSocket::accept`]. Dropping the lease releases what it retains,
+/// and with the final reference to a guest binding, its namespace entry.
 pub struct GuestSourceLease {
-    _holder: Option<Arc<dyn Any + Send + Sync>>,
+    port_owner: Option<SourcePortOwner>,
     source_address: SocketAddrV4,
 }
 
+/// What a [`GuestSourceLease`] keeps alive to hold its source port.
+#[expect(
+    dead_code,
+    reason = "a lease holds its owner only to release it on drop"
+)]
+enum SourcePortOwner {
+    /// The guest port binding core reserved.
+    Guest(Arc<GuestPortBinding>),
+    /// An object of the provider's own, such as a bound host socket.
+    Provider(Arc<dyn Any + Send + Sync>),
+}
+
 impl GuestSourceLease {
-    /// Names a peer that retains no guest binding, at `source_address`: one
-    /// outside the guest network, or with [`SocketAddressing::Host`], any
-    /// client of a host socket.
+    /// Names a peer at `source_address` whose port the lease does not hold:
+    /// one outside the guest network, or with [`SocketAddressing::Host`], a
+    /// client that reached the listener through the host rather than within
+    /// the provider.
     #[must_use]
     pub fn external(source_address: SocketAddrV4) -> Self {
         Self {
-            _holder: None,
+            port_owner: None,
             source_address,
         }
     }
 
-    /// Names a peer at `source_address` whose port `holder` holds, keeping
-    /// `holder` alive as long as the lease.
+    /// Names a peer at `source_address` whose port the provider's own
+    /// `port_owner` holds, keeping `port_owner` alive as long as the lease.
     #[must_use]
-    pub fn retaining(source_address: SocketAddrV4, holder: Arc<dyn Any + Send + Sync>) -> Self {
+    pub fn with_port_owner(
+        source_address: SocketAddrV4,
+        port_owner: Arc<dyn Any + Send + Sync>,
+    ) -> Self {
         Self {
-            _holder: Some(holder),
+            port_owner: Some(SourcePortOwner::Provider(port_owner)),
             source_address,
         }
     }
@@ -442,11 +461,13 @@ pub struct AcceptedPlatformSocket {
     pub socket: Arc<dyn PlatformSocket>,
     /// Exact guest destination reached by the connector.
     pub local_address: SocketAddrV4,
-    /// Identifies the connecting peer's guest-visible source, retaining a guest's binding.
+    /// Identifies the connecting peer's guest-visible source, retaining the
+    /// owner of its port if the lease has one.
     pub guest_source_lease: GuestSourceLease,
 }
 
-/// Broker failure from a platform connect operation.
+/// Failure of a platform connect operation: a broker error, or a socket error
+/// that rejected the attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlatformConnectError {
     /// The failed operation is known not to have changed the socket's peer.
@@ -516,15 +537,16 @@ pub enum SocketAddressing {
     Isolated,
     /// Each guest TCP socket is a host socket at its own host address and
     /// port, as when the broker runs in a network namespace of the guest's
-    /// own. The platform binds it, checking the address the guest names and
-    /// choosing a port for port 0, or as an unbound stream connects, and
-    /// reports the addresses the host assigns; core reserves no ports. A connection to a listener of the
-    /// provider's own sockets may stay within the provider; any other
-    /// destination is reached only as destination policy permits, as
-    /// [`SocketEgress`] describes.
+    /// own. The platform binds a socket at the address the guest names,
+    /// choosing the port for port 0, and binds an unbound stream as it
+    /// connects. It reports the addresses the host assigns; core reserves no
+    /// ports. A connection to a listener of the provider's own sockets may
+    /// stay within the provider; any other destination is reached only as
+    /// destination policy permits, as [`SocketEgressVerdict`] describes.
     ///
-    /// Core supports only TCP with this mode, so a provider reporting it must
-    /// fail [`SocketProvider::create`] for UDP sockets.
+    /// Core supports only TCP with this mode: it fails the creation of any
+    /// other socket with [`BrokerError::UnsupportedOperation`] without calling
+    /// [`SocketProvider::create`].
     Host,
 }
 
@@ -551,9 +573,10 @@ impl SocketAddressing {
     }
 }
 
-/// What destination policy lets a [`PlatformSocket::connect`] reach.
+/// Destination policy's verdict on what a [`PlatformSocket::connect`] may
+/// reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SocketEgress {
+pub enum SocketEgressVerdict {
     /// Policy permits the destination, which the provider reaches as its
     /// [`SocketAddressing`] describes. Core passes this for every
     /// [`SocketAddressing::Isolated`] connect, having checked its destination
@@ -578,14 +601,15 @@ pub enum SocketEgress {
 pub enum SocketBindRequest {
     /// A [`SocketAddressing::Isolated`] bind to the guest address core
     /// reserved.
-    Guest(GuestSocketBinding),
+    Isolated(GuestSocketBinding),
     /// A [`SocketAddressing::Host`] bind, which the platform performs.
     Host(HostBindRequest),
 }
 
 /// A [`SocketAddressing::Host`] bind: the local address the guest requested.
-/// The platform shares it as the socket's [`SocketOptionName::ReuseAddress`],
-/// which it keeps, directs.
+/// The platform stores the socket's [`SocketOptionName::ReuseAddress`]
+/// setting and shares the address with other sockets only as that setting
+/// allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostBindRequest {
     address: SocketAddrV4,
@@ -657,14 +681,15 @@ pub trait PlatformSocket: Send + Sync {
     /// Binds this socket to a local address and returns the assigned address.
     ///
     /// With [`SocketAddressing::Isolated`], a broker-managed TCP or UDP
-    /// socket receives [`SocketBindRequest::Guest`], a broker-reserved,
+    /// socket receives [`SocketBindRequest::Isolated`], a broker-reserved,
     /// guest-visible address with a nonzero port, and must echo it unchanged.
     /// A UDP bind may be entirely logical and need not allocate a host socket.
     /// With [`SocketAddressing::Host`], a TCP socket receives
     /// [`SocketBindRequest::Host`] and binds a platform socket to the
     /// requested address, returning the address the platform assigned: the
-    /// requested IP with a nonzero port. A failed outcome or broker error must
-    /// leave the socket unbound and retryable.
+    /// requested IP and port, or a port the platform chose for port 0. A
+    /// failed outcome or broker error must leave the socket unbound and
+    /// retryable.
     fn bind(&self, request: SocketBindRequest) -> Result<SocketOutcome<SocketAddrV4>>;
 
     /// Returns the address this socket is bound to, or `None` while it is
@@ -716,19 +741,19 @@ pub trait PlatformSocket: Send + Sync {
     /// it through to [`AcceptedPlatformSocket`]; external paths may drop it.
     /// A [`SocketAddressing::Host`] provider that connects within itself
     /// names the connector with a lease of its own instead, which retains the
-    /// connector's port (see [`GuestSourceLease::retaining`]). Each end of
-    /// such a connection should keep the host port of its own address bound
-    /// while it lives, even after the listener closes, so that no host socket
-    /// takes it. Returning
-    /// [`PlatformConnectError::PeerUnchanged`] or
+    /// connector's port (see [`GuestSourceLease::with_port_owner`]). Each end
+    /// of such a connection should keep the host port of its own address
+    /// bound while it lives, even after the listener closes, so that no host
+    /// socket takes it. Returning [`PlatformConnectError::PeerUnchanged`] or
     /// [`PlatformConnectError::Rejected`] requires releasing the lease;
-    /// [`PlatformSocket::retire`] must release one retained by an indeterminate
-    /// or in-progress operation. `address` is the normalized guest-visible
-    /// destination; the provider must validate it with
-    /// [`SocketAddressing::normalize_destination`] before choosing a host-socket target.
+    /// [`PlatformSocket::retire`] must release one retained by an
+    /// indeterminate or in-progress operation. `address` is the normalized
+    /// guest-visible destination; the provider must validate it with
+    /// [`SocketAddressing::normalize_destination`] before choosing a
+    /// host-socket target.
     ///
     /// `egress` is what destination policy lets the connect reach, as
-    /// [`SocketEgress`] describes. With [`SocketAddressing::Host`], an
+    /// [`SocketEgressVerdict`] describes. With [`SocketAddressing::Host`], an
     /// attempt on an unbound stream binds it as a host socket's connect does,
     /// at an address the platform chooses (see [`Self::local_address`]); an
     /// attempt that starts no connection leaves it unbound.
@@ -736,7 +761,7 @@ pub trait PlatformSocket: Send + Sync {
         &self,
         address: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
-        egress: SocketEgress,
+        egress: SocketEgressVerdict,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError>;
 
     /// Sends bytes from the start of `data` (see [`crate::transfer`]) without
@@ -828,8 +853,9 @@ pub trait PlatformSocket: Send + Sync {
 
     /// Sets a TCP socket's [`SocketOptionValue::NoDelay`] or
     /// [`SocketOptionValue::KeepAlive`], which the transport implements, and,
-    /// with [`SocketAddressing::Host`], its [`SocketOptionValue::ReuseAddress`],
-    /// which directs how its host socket shares its address, from its bind on.
+    /// with [`SocketAddressing::Host`], its
+    /// [`SocketOptionValue::ReuseAddress`], which governs whether its host
+    /// socket may share its address.
     ///
     /// A socket accepted from a listener starts with the listener's values.
     fn set_tcp_option(&self, value: SocketOptionValue) -> Result<()>;
@@ -845,11 +871,13 @@ pub trait PlatformSocket: Send + Sync {
     /// `Unconnected`. For datagram sockets, the broker owns the peer state, so
     /// the platform reports `Unconnected` or `Connected` and uses
     /// `pending_error` for asynchronous failures. Any reported local address
-    /// must preserve the bound port. With [`SocketAddressing::Isolated`], its
-    /// IP must be accepted by [`is_internal_socket_address`], and host
-    /// addresses must never be exposed; with [`SocketAddressing::Host`], it is
-    /// the host socket's own. An unbound datagram must not report a local
-    /// address.
+    /// must preserve the bound port, and its IP replaces an unspecified one
+    /// core recorded, as after a wildcard bind. With
+    /// [`SocketAddressing::Isolated`], its IP must be accepted by
+    /// [`is_internal_socket_address`], and host addresses must never be
+    /// exposed. With [`SocketAddressing::Host`], it is the host socket's own,
+    /// and a stream for which [`Self::local_address`] returned `None` must not
+    /// report one. An unbound datagram must not report a local address.
     fn status(&self) -> Result<PlatformSocketStatus>;
 
     /// Synchronously and idempotently ends this socket's platform authority.
@@ -896,13 +924,20 @@ impl SocketProvider for UnsupportedSocketProvider {
 /// Creates a broker-owned socket.
 ///
 /// The socket starts with the status flags `request.flags`, which must be
-/// within [`FileOpenFlags::STATUS`].
+/// within [`FileOpenFlags::STATUS`]. With [`SocketAddressing::Host`], only a
+/// TCP socket can be created; any other fails with
+/// [`BrokerError::UnsupportedOperation`].
 pub fn create(
     process: &BrokerProcess,
     request: CreateSocketRequest,
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<ObjectHandle> {
     let status = StatusFlags::new(request.flags)?;
+    // XXX: Support UDP with host addressing. Core's datagram paths still
+    // assume isolated addressing for policy, source validation, and replies.
+    if process.core.socket_addressing == SocketAddressing::Host && !is_tcp(request) {
+        return Err(BrokerError::UnsupportedOperation);
+    }
     let rights = process
         .core
         .policy
@@ -1169,8 +1204,8 @@ fn transport_connect(
             create_request.protocol,
             destination,
         ) {
-            Ok(()) => SocketEgress::Permitted,
-            Err(BrokerError::PolicyDenied) => SocketEgress::ServedOnly,
+            Ok(()) => SocketEgressVerdict::Permitted,
+            Err(BrokerError::PolicyDenied) => SocketEgressVerdict::ServedOnly,
             Err(error) => return Err(error),
         }
     } else {
@@ -1179,7 +1214,7 @@ fn transport_connect(
             create_request.protocol,
             destination,
         ) {
-            Ok(()) => SocketEgress::Permitted,
+            Ok(()) => SocketEgressVerdict::Permitted,
             Err(BrokerError::PolicyDenied) => {
                 return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
             }
@@ -1298,7 +1333,12 @@ fn transport_connect(
         // A connection that has already ended may have released its address.
         match resource.platform_socket.local_address() {
             Ok(None) => {}
-            Ok(Some(local_address)) if is_host_connect_address(local_address) => {
+            // The host bound the stream as it connected, at a nonzero port and
+            // a unicast IP, or an unspecified one that `stream_status` refines
+            // once the platform reports it.
+            Ok(Some(local_address))
+                if local_address.port() != 0 && is_host_endpoint_ip(*local_address.ip()) =>
+            {
                 attach_binding(object, local_address, None)?;
             }
             Ok(Some(_)) => {
@@ -1323,7 +1363,7 @@ fn transport_connect(
 }
 
 /// Binds a socket to a supported guest-namespace address or, with
-/// [`SocketAddressing::Host`], to the host address the platform binds.
+/// [`SocketAddressing::Host`], through the platform to a host address.
 pub fn bind(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1543,10 +1583,26 @@ pub fn accept(
         local_address,
         guest_source_lease,
     } = accepted;
+    // With isolated addressing, a peer within the guest network holds a guest
+    // port, which only core's lease retains.
+    debug_assert!(
+        process.core.socket_addressing == SocketAddressing::Host
+            || matches!(
+                guest_source_lease.port_owner,
+                Some(SourcePortOwner::Guest(_))
+            )
+            || !is_internal_socket_address(guest_source_lease.source_address())
+    );
     let covered = match process.core.socket_addressing {
         SocketAddressing::Isolated => listener_resource.port_binding_covers(local_address),
-        SocketAddressing::Host => listener_address
-            .is_some_and(|listener_address| host_listener_covers(listener_address, local_address)),
+        // A host listener accepts at a concrete unicast IP on its port, and
+        // only at its own IP unless it listens on the wildcard address.
+        SocketAddressing::Host => listener_address.is_some_and(|listener| {
+            !local_address.ip().is_unspecified()
+                && is_host_endpoint_ip(*local_address.ip())
+                && local_address.port() == listener.port()
+                && (listener.ip().is_unspecified() || listener.ip() == local_address.ip())
+        }),
     };
     if !covered {
         socket.retire();
@@ -1579,15 +1635,6 @@ pub fn accept(
         local_address,
         remote_address,
     }))
-}
-
-/// Whether a [`SocketAddressing::Host`] listener bound at `listener` may
-/// accept a connection to `address`: a concrete address on its port, and its
-/// IP unless it listens on the wildcard address.
-fn host_listener_covers(listener: SocketAddrV4, address: SocketAddrV4) -> bool {
-    !address.ip().is_unspecified()
-        && address.port() == listener.port()
-        && (listener.ip().is_unspecified() || listener.ip() == address.ip())
 }
 
 /// Sends TCP stream bytes without waiting for readiness.
@@ -2423,9 +2470,11 @@ fn stream_status(
     match (socket.local_address, platform_status.local_address) {
         (Some(broker_local_address), Some(observed)) => {
             // With host addressing, the host's own addresses are the guest's.
-            let invalid_local_address = observed.port() != broker_local_address.port()
-                || (resource.addressing == SocketAddressing::Isolated
-                    && !is_internal_socket_address(observed));
+            let valid_ip = match resource.addressing {
+                SocketAddressing::Isolated => is_internal_socket_address(observed),
+                SocketAddressing::Host => is_host_endpoint_ip(*observed.ip()),
+            };
+            let invalid_local_address = observed.port() != broker_local_address.port() || !valid_ip;
             if invalid_local_address {
                 socket.listening = false;
                 socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
@@ -2845,7 +2894,7 @@ fn reserve_and_bind(
     let binding = GuestSocketBinding::new(&port_binding);
     match resource
         .platform_socket
-        .bind(SocketBindRequest::Guest(binding))?
+        .bind(SocketBindRequest::Isolated(binding))?
     {
         SocketOutcome::Completed(bound_address) if bound_address == local_address => Ok(
             ReserveAndBindOutcome::Completed(local_address, Some(port_binding)),
@@ -2855,16 +2904,16 @@ fn reserve_and_bind(
     }
 }
 
-/// Binds a [`SocketAddressing::Host`] socket, which the platform does at the
-/// requested address as the `SO_REUSEADDR` setting it keeps directs. Core
-/// reserves nothing and checks only that the platform bound the requested IP
-/// and, if one was requested, port.
+/// Binds a [`SocketAddressing::Host`] socket through the platform, which
+/// shares the address only as the socket's `SO_REUSEADDR` setting allows.
+/// Core reserves nothing; it rejects multicast addresses and the limited
+/// broadcast address, and checks that the platform bound the requested IP and
+/// port, or a nonzero port in place of port 0.
 fn host_bind(
     resource: &SocketResource,
     requested_address: SocketAddrV4,
 ) -> Result<ReserveAndBindOutcome> {
-    let ip = requested_address.ip();
-    if ip.is_multicast() || ip.is_broadcast() {
+    if !is_host_endpoint_ip(*requested_address.ip()) {
         return Ok(ReserveAndBindOutcome::Failed(
             SocketError::AddressNotAvailable,
         ));
@@ -2889,12 +2938,11 @@ fn host_bind(
     }
 }
 
-/// Returns whether the address a host bound for a connecting stream has a
-/// nonzero port and a unicast or unspecified IP, the latter of which
-/// [`stream_status`] refines once the platform reports it.
-fn is_host_connect_address(address: SocketAddrV4) -> bool {
-    let ip = address.ip();
-    !(ip.is_multicast() || ip.is_broadcast()) && address.port() != 0
+/// Returns whether a [`SocketAddressing::Host`] TCP socket may have local IP
+/// `ip`: a unicast or unspecified address, not multicast or the limited
+/// broadcast address.
+fn is_host_endpoint_ip(ip: Ipv4Addr) -> bool {
+    !(ip.is_multicast() || ip.is_broadcast())
 }
 
 fn retire_before_releasing_binding(
@@ -2910,7 +2958,7 @@ fn transport_connect_datagram(
     object: &spin::RwLock<ObjectEntry>,
     create_request: CreateSocketRequest,
     destination: SocketAddrV4,
-    egress: SocketEgress,
+    egress: SocketEgressVerdict,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let (resource, previous_status, needs_bind) = {
         let mut object = object.write();
@@ -3072,8 +3120,9 @@ fn finish_retired_connect(object: &spin::RwLock<ObjectEntry>) {
     }
 }
 
-/// Gives `resource` its guest port binding, if core reserved one, returning
-/// it if the resource already has one.
+/// Stores `port_binding` in `resource` if core reserved one; a
+/// [`SocketAddressing::Host`] socket has none. If `resource` already holds a
+/// binding, keeps that one and returns `port_binding` to the caller.
 fn set_optional_port_binding(
     resource: &SocketResource,
     port_binding: Option<Arc<GuestPortBinding>>,

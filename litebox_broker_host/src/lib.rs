@@ -2564,7 +2564,7 @@ mod tests {
             &self,
             request: litebox_broker_core::socket::SocketBindRequest,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
-            let litebox_broker_core::socket::SocketBindRequest::Guest(binding) = request else {
+            let litebox_broker_core::socket::SocketBindRequest::Isolated(binding) = request else {
                 return Err(litebox_broker_core::BrokerError::Internal);
             };
             let address = binding.local_address();
@@ -2604,7 +2604,7 @@ mod tests {
             &self,
             address: SocketAddrV4,
             _guest_source_lease: Option<litebox_broker_core::socket::GuestSourceLease>,
-            _egress: litebox_broker_core::socket::SocketEgress,
+            _egress: litebox_broker_core::socket::SocketEgressVerdict,
         ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
             let source_address = self
                 .binding

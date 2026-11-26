@@ -229,7 +229,7 @@ impl SocketPolicy {
     /// network. With
     /// [`SocketAddressing::Host`](crate::socket::SocketAddressing::Host), that
     /// network holds only listeners of the provider's own sockets, as
-    /// [`SocketEgress::ServedOnly`](crate::socket::SocketEgress::ServedOnly)
+    /// [`SocketEgressVerdict::ServedOnly`](crate::socket::SocketEgressVerdict::ServedOnly)
     /// describes.
     #[must_use]
     pub const fn guest_network() -> Self {
