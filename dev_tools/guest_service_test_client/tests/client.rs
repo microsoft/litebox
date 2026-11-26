@@ -24,7 +24,8 @@ use litebox_guest_service_protocol::guest_service_ttrpc::{GuestService, create_g
 use ttrpc::TtrpcContext;
 
 /// A process of the fake: `/echo [CODE]` writes its input to its stdout once it ends, and exits
-/// with CODE (default 0); `/kill SIGNAL` does so too, but then SIGNAL kills it; `/ready` first
+/// with CODE (default 0); `/kill SIGNAL` does so too, but then SIGNAL kills it; `/lost` fails to
+/// start, as if the guest service stopped answering; `/ready` first
 /// writes `ready`, then its input as it comes, and exits once it has some. A terminal's resize
 /// writes `size ROWSxCOLUMNS` to its process's stdout.
 #[derive(Default)]
@@ -106,6 +107,9 @@ impl GuestService for Fake {
         request: ExecProcessRequest,
     ) -> ttrpc::Result<Empty> {
         let args = &request.process.args;
+        if args[0] == "/lost" {
+            return Err(ttrpc::Error::Others("lost".to_owned()));
+        }
         let process = Process {
             program: args[0].clone(),
             end: match (
@@ -342,6 +346,23 @@ fn a_run_that_ends_otherwise_fails() {
     assert!(!report.contains("run 1"), "{report}");
     assert!(
         report.ends_with("FAIL: failed: run 0 (/echo)\n"),
+        "{report}"
+    );
+}
+
+/// Even with `--keep-going`, no run runs once the guest service stops answering; the last line
+/// names the run that lost it.
+#[test]
+fn a_lost_guest_service_stops_the_runs() {
+    let (passed, report, _) = run_client_with(
+        r#"[{ "argv": ["/echo", "1"] }, { "argv": ["/lost"] }, { "argv": ["/echo"] }]"#,
+        None,
+        &["--keep-going"],
+    );
+    assert!(!passed, "{report}");
+    assert!(!report.contains("run 2"), "{report}");
+    assert!(
+        report.ends_with("FAIL: failed: run 0 (/echo 1), run 1 (/lost)\n"),
         "{report}"
     );
 }

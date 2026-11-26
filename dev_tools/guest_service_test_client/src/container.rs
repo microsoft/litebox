@@ -112,6 +112,16 @@ impl Progress {
     }
 }
 
+/// How an entry's runs ended.
+#[derive(Default)]
+pub struct EntryResult {
+    /// The failed runs, as `run INDEX (LABEL)`.
+    pub failures: Vec<String>,
+    /// Whether a run failed as the guest service did (e.g., as the VM ended), not as the run
+    /// ended: no other run could run.
+    pub lost: bool,
+}
+
 /// How a run ended.
 struct Outcome {
     exit_status: ExitStatus,
@@ -182,9 +192,8 @@ impl Container {
         self.release(INIT)
     }
 
-    /// Runs `entry`, whose first run is run `first`, checks how its runs ended, and returns the
-    /// failed ones, as `run INDEX (LABEL)`.
-    pub fn run_entry(&self, first: usize, entry: &Entry) -> Vec<String> {
+    /// Runs `entry`, whose first run is run `first`, and checks how its runs ended.
+    pub fn run_entry(&self, first: usize, entry: &Entry) -> EntryResult {
         let runs = entry.runs();
         let outcomes: Vec<Result<Outcome>> = thread::scope(|scope| {
             let started: Vec<_> = (first..)
@@ -199,18 +208,20 @@ impl Container {
                 })
                 .collect()
         });
-        let mut failures = Vec::new();
+        let mut result = EntryResult::default();
         for ((index, run), outcome) in (first..).zip(runs).zip(outcomes) {
             let run_label = format!("run {index} ({})", run.label());
+            // A run that did not end, as the guest service stopped answering, loses the service.
+            result.lost |= outcome.is_err();
             match outcome.and_then(|outcome| check(run, &outcome)) {
                 Ok(()) => println!("PASS  {run_label}"),
                 Err(error) => {
                     println!("FAIL  {run_label}: {error:#}");
-                    failures.push(run_label);
+                    result.failures.push(run_label);
                 }
             }
         }
-        failures
+        result
     }
 
     /// Runs `run`, number `index`, in an exec process of its own.
