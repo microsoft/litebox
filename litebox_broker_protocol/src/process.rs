@@ -49,7 +49,7 @@ wire_struct! {
         pub new_segment_namespace: bool,
         /// Give the target a private copy of its host names.
         pub copy_host_names: bool,
-        /// Give the target a private copy of its mount view. Only valid for a pending child.
+        /// Give the target a private copy of its mount view.
         pub copy_mount_view: bool,
     }
 }

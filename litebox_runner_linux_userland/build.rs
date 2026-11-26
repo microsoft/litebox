@@ -16,6 +16,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "gate_signals.c",
     "held_lower_dir.c",
     "mount_namespace_clone.c",
+    "mount_namespace_unshare.c",
     "native_tp.c",
     "inherited_ignored_signals.c",
     "mount.c",

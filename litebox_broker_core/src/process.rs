@@ -902,12 +902,15 @@ impl BrokerProcess {
     /// child `request.process_id`, leaving all the existing namespaces intact
     /// on failure.
     ///
+    /// A mount that this process makes while its own mount view is copied may
+    /// apply only to its previous view.
+    ///
     /// Returns:
     /// - `UnknownObject` if the target is neither.
     /// - `UnsupportedOperation` if the request asks for a children's PID
     ///   namespace for a pending child, or while this process's children
-    ///   already go to another one, or for a mount view copy for this process
-    ///   itself or that the target's file service can't make.
+    ///   already go to another one, or for a mount view copy that the
+    ///   target's file service can't make.
     /// - `ResourceExhausted` if the PID namespace can't be created.
     /// - `PolicyDenied` for a new segment namespace unless the process may
     ///   write.
@@ -916,11 +919,6 @@ impl BrokerProcess {
             self.require_object_rights(ObjectRights::WAIT | ObjectRights::WRITE)?;
         }
         if request.children_pid_namespace.is_some() && request.process_id != self.id() {
-            return Err(BrokerError::UnsupportedOperation);
-        }
-        // A running process's view could gain a mount between the copy and its
-        // installation, which would lose that mount.
-        if request.copy_mount_view && request.process_id == self.id() {
             return Err(BrokerError::UnsupportedOperation);
         }
         // Declared before the guards below, so that an unused namespace or
@@ -935,7 +933,11 @@ impl BrokerProcess {
             // process's, so the copy is made first, and again if the target's
             // file service changes before it is installed.
             if request.copy_mount_view {
-                let current = self.pending_child_file_service(request.process_id)?;
+                let current = if request.process_id == self.id() {
+                    self.file_service()?
+                } else {
+                    self.pending_child_file_service(request.process_id)?
+                };
                 let copy = current.copy_mount_view()?;
                 fs_copy = Some((current, copy));
             }
@@ -3874,32 +3876,67 @@ mod tests {
     }
 
     #[test]
-    fn process_cannot_copy_its_own_mount_view() {
-        use crate::fs::{composer::Composer, in_mem::InMem, resolver::Resolver};
+    fn process_copies_its_own_mount_view() {
+        use crate::fs::{self, composer::Composer, in_mem::InMem, resolver::Resolver};
 
         let fs = Composer::<TestPlatform>::builder()
             .mount("/", InMem::<TestPlatform>::new)
             .build()
             .unwrap();
-        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
         .unwrap();
-        let process = broker
+        let parent = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        process.complete_start().unwrap();
-        assert_eq!(
-            process.create_namespaces(CreateNamespacesRequest {
-                process_id: process.id(),
-                children_pid_namespace: None,
+        parent.complete_start().unwrap();
+        let child_id = parent
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        let child = parent.take_child_process(child_id).unwrap();
+        child.complete_start().unwrap();
+        for dir in ["/shared", "/private"] {
+            fs::mkdir(&parent, None, dir, ROOT, FileMode::RWXU)
+                .unwrap()
+                .unwrap();
+        }
+        fs::mount_in_mem(&parent, "/shared", ROOT).unwrap().unwrap();
+        child
+            .create_namespaces(CreateNamespacesRequest {
+                process_id: child.id(),
+                children_pid_namespace: Some(PidNamespaceOptions::default()),
                 new_segment_namespace: false,
                 copy_host_names: false,
                 copy_mount_view: true,
-            }),
-            Err(BrokerError::UnsupportedOperation)
+            })
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &child.children_namespace(),
+            child.pid_namespace()
+        ));
+        fs::mount_in_mem(&child, "/private", ROOT).unwrap().unwrap();
+        fs::mkdir(&child, None, "/private/child", ROOT, FileMode::RWXU)
+            .unwrap()
+            .unwrap();
+        fs::mkdir(&parent, None, "/shared/parent", ROOT, FileMode::RWXU)
+            .unwrap()
+            .unwrap();
+        // The copy keeps the earlier mount shared, and the later one only in the child's view.
+        assert!(
+            fs::path_status(&child, None, "/shared/parent", ROOT, true)
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(
+            fs::path_status(&parent, None, "/private/child", ROOT, true)
+                .unwrap()
+                .err(),
+            Some(FileError::NoSuchFileOrDirectory)
         );
     }
 

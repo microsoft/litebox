@@ -235,6 +235,31 @@ fn fork_style_clone_copies_the_mount_view() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn unshare_copies_the_mount_view() {
+    let target = common::compile(
+        "./tests/mount_namespace_unshare.c",
+        "mount_namespace_unshare",
+        true,
+        false,
+    );
+    for (name, uid) in [
+        ("mount_unshare_root", 0),
+        ("mount_unshare_unprivileged", 1000),
+    ] {
+        let mut runner = Runner::new(&target, name);
+        runner.allow_process_duplication().guest_uid(uid).arg(name);
+        let output = String::from_utf8(runner.output()).unwrap();
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "mount namespace unshare ok"),
+            "{output}"
+        );
+    }
+}
+
 include!(concat!(env!("OUT_DIR"), "/c_tests.rs"));
 
 /// The program that C tests of the `with_exec_child` kind execute.

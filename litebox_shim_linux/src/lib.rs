@@ -1080,21 +1080,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 mountflags,
                 data,
             } => {
-                // XXX(jayb): tmpfs options (size=, mode=, ...) unsupported; Linux accepts them.
-                if let Some(data) = data
-                    && data.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)? != 0
-                {
-                    log_unsupported!("tmpfs mount options");
-                    return Err(Errno::EINVAL);
-                }
                 let target = target.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
                 let filesystemtype = filesystemtype
-                    .ok_or(Errno::EFAULT)?
-                    .to_cstring::<Platform>()
-                    .ok_or(Errno::EFAULT)?;
+                    .map(|filesystemtype| {
+                        filesystemtype.to_cstring::<Platform>().ok_or(Errno::EFAULT)
+                    })
+                    .transpose()?;
                 let target = target.to_str().map_err(|_| Errno::EINVAL)?;
-                let filesystemtype = filesystemtype.to_str().map_err(|_| Errno::EINVAL)?;
-                syscall!(sys_mount(target, filesystemtype, mountflags))
+                syscall!(sys_mount(
+                    target,
+                    filesystemtype.as_deref(),
+                    mountflags,
+                    data
+                ))
             }
             SyscallRequest::Symlinkat {
                 target,
