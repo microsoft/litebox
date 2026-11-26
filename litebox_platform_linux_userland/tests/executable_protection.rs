@@ -1,7 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#![cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#![cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "riscv64")
+))]
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use litebox::platform::PageManagementProvider;
@@ -20,11 +23,22 @@ unsafe fn call(entry: usize) -> u32 {
     let result: u32;
     // SAFETY: Forwarded caller contract; `clobber_abi("C")` covers the callee's clobbers,
     // including the link register written by `blr`.
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!(
             "blr {entry}",
             entry = in(reg) entry,
             lateout("x0") result,
+            clobber_abi("C"),
+        );
+    }
+    // SAFETY: As above, with `ra` written by `jalr`.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "jalr {entry}",
+            entry = in(reg) entry,
+            lateout("a0") result,
             clobber_abi("C"),
         );
     }
@@ -60,8 +74,11 @@ fn cache_synchronization_preserves_live_execution() {
         .unwrap();
     });
     let entry = range.start + 128;
-    // MOV w0, #42; RET. The executor has no TLS, syscall, or guest-stack dependencies.
-    let instructions = [0x5280_0540u32, 0xd65f_03c0];
+    // Returns 42, with no TLS, syscall, or guest-stack dependencies.
+    #[cfg(target_arch = "aarch64")]
+    let instructions = [0x5280_0540u32, 0xd65f_03c0]; // MOV w0, #42; RET
+    #[cfg(target_arch = "riscv64")]
+    let instructions = [0x02a0_0513u32, 0x0000_8067]; // li a0, 42; ret
     // SAFETY: the newly owned mapping is writable and the destination is aligned.
     unsafe {
         core::ptr::copy_nonoverlapping(

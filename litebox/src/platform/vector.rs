@@ -27,9 +27,12 @@ pub trait GuestVectorStateProvider {
     fn get_guest_sve_vl(&self) -> Option<crate::arch::aarch64::vector::SveVectorLength>;
 }
 
-// TODO: replace this blanket with architecture-specific providers before
-// implementing guest vector-state preservation outside AArch64.
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+// Architectures without guest FP state preservation.
+#[cfg(not(any(
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "x86_64"
+)))]
 impl<T> GuestVectorStateProvider for T {
     type GuestVectorState = ();
 

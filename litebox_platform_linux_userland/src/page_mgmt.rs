@@ -69,6 +69,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     /// the allocator to place into a region holding no existing mapping.
     #[cfg(target_arch = "aarch64")]
     const TASK_ADDR_MAX: usize = 0x0000_FFFF_FFFF_F000; // (1 << 48) - PAGE_SIZE;
+    /// Guest policy: the guest task range is the Sv39 user address space, which
+    /// every RV64 Linux host provides. On Sv48 and Sv57 hosts, Linux's default
+    /// `mmap` window is 47 bits, so host mappings default to lying above it.
+    #[cfg(target_arch = "riscv64")]
+    const TASK_ADDR_MAX: usize = litebox::arch::riscv64::USER_ADDR_END;
     /// With ASLR disabled the host's top-down mmap area begins just below
     /// `0x7FFF_F800_0000`; with ASLR enabled it is randomized by at most 1 TiB
     /// below that. Placing guest memory under this limit keeps it out of the
@@ -81,6 +86,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     /// this limit has no effect.
     #[cfg(target_arch = "aarch64")]
     const PLACEMENT_ADDR_MAX: usize = 0x4000_0000_0000;
+    /// As on x86-64, keeps guest memory below host mappings so `fork` can restore it in a fresh
+    /// runner: on Sv39 hosts, the host's top-down mmap area and stack lie just below 256 GiB, the
+    /// end of the task range; on larger hosts, host mappings default to lying above that range.
+    #[cfg(target_arch = "riscv64")]
+    const PLACEMENT_ADDR_MAX: usize = 0x20_0000_0000;
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
         HintPlacementBehavior::Directional(AllocationDirection::TopDown);
 
@@ -335,7 +345,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             Iterator<Item = &'reservation litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
         litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>: 'reservation,
     {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::mprotect,
@@ -345,6 +355,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
         }
         .expect("mprotect failed");
+        // RV64 instruction fetch is not coherent with stores, but unlike on
+        // AArch64 synchronizing needs no access to the range itself.
+        #[cfg(target_arch = "riscv64")]
+        if new_permissions.contains(MemoryRegionPermissions::EXEC) {
+            sync_instruction_stream(range.clone());
+        }
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -658,11 +674,15 @@ mod tests {
             )
         };
         assert_ne!(old, libc::MAP_FAILED);
-        // Find a free destination by mapping and releasing it.
-        // SAFETY: Anonymous mappings replace nothing, and nothing uses the released one.
+        // Find a free destination by mapping and releasing it. The hint keeps it in the task
+        // range on hosts that place mappings above it, such as RV64 ones with Sv48.
+        let hint =
+            <LinuxUserland as litebox::platform::PageManagementProvider<PAGE>>::PLACEMENT_ADDR_MAX
+                - 2 * PAGE;
+        // SAFETY: Anonymous mappings at a hint replace nothing, and nothing uses the released one.
         let new = unsafe {
             let new = libc::mmap(
-                core::ptr::null_mut(),
+                hint as *mut libc::c_void,
                 2 * PAGE,
                 libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,

@@ -26,7 +26,7 @@
 //! rewrite RV64 Linux guests ahead of time: the backend supports a subset of
 //! integer and compressed instructions in static ET_EXEC files with ELF mapping symbols.
 //! It redirects ECALL and virtualizes gp using [`litebox_trampoline::riscv64::GateTls`].
-//! There is not yet a corresponding RV64 Linux userland runner.
+//! The RV64 Linux userland platform runs such guests; there is not yet an RV64 runner.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;

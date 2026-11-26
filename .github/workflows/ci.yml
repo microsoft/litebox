@@ -282,8 +282,10 @@ jobs:
       CARGO_BUILD_TARGET: riscv64gc-unknown-linux-gnu
       CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
       CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUNNER: qemu-riscv64 -L /usr/riscv64-linux-gnu
+      # Tests that re-execute themselves run through binfmt_misc, which needs the RV64 loader too.
+      QEMU_LD_PREFIX: /usr/riscv64-linux-gnu
       # Grow this list as each crate gains RV64 support.
-      RISCV64_CRATES: -p litebox -p litebox_platform -p litebox_trampoline -p litebox_common_linux
+      RISCV64_CRATES: -p litebox -p litebox_platform -p litebox_trampoline -p litebox_common_linux -p litebox_platform_linux_userland
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -297,9 +299,11 @@ jobs:
       - name: Install RV64 cross toolchain and emulator
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user
+          sudo apt-get install -y --no-install-recommends gcc-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user qemu-user-binfmt
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $RISCV64_CRATES
-      - run: ./.github/tools/github_actions_run_cargo nextest --features litebox_platform/lock_tracing $RISCV64_CRATES
+      # QEMU user mode does not emulate seccomp (`prctl(PR_SET_SECCOMP)` fails with `EINVAL`,
+      # `seccomp` with `ENOSYS`), so the platform tests that install a filter run only on RV64 Linux.
+      - run: ./.github/tools/github_actions_run_cargo nextest --features litebox_platform/lock_tracing $RISCV64_CRATES -E 'not (package(litebox_platform_linux_userland) and test(/seccomp|filtered_process/))'
       - name: Execute an ahead-of-time rewritten RV64 guest
         run: ./.github/tools/github_actions_run_cargo nextest --target x86_64-unknown-linux-gnu -p litebox_syscall_rewriter --test riscv64_tests --run-ignored only
 
