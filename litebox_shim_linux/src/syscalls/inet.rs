@@ -20,16 +20,13 @@ use litebox::{
         polling::TryOpError,
         wait::{WaitContext, WaitError},
     },
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     inet_socket::{
         self,
-        errors::{AcceptError, ConnectError, ShutdownError, SocketReadError, SocketWriteError},
+        errors::{ConnectError, ShutdownError, SocketReadError, SocketWriteError},
     },
-    process::ProcessError,
     utils::TruncateExt as _,
 };
 use litebox_broker_protocol::{
-    ObjectHandle,
     fs::FileOpenFlags,
     socket::{self, SocketType},
 };
@@ -63,14 +60,7 @@ macro_rules! convert_flags {
     };
 }
 
-pub(crate) struct InetSocketSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
-impl<Platform: ShimPlatform> FdEnabledSubsystem for InetSocketSubsystem<Platform> {
-    type Entry = InetSocket<Platform>;
-}
-
-impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for InetSocket<Platform> {}
-
-pub(crate) type InetSocketFd<Platform> = TypedFd<InetSocketSubsystem<Platform>>;
+pub(crate) type InetSocketFd<Platform> = InetSocket<Platform>;
 
 /// An internet socket descriptor's open file description.
 pub(crate) struct InetSocket<Platform: ShimPlatform> {
@@ -165,42 +155,48 @@ pub(super) fn check_send_control(control: &[u8], socket_type: SocketType) -> Res
     Ok(())
 }
 
-impl<Platform: ShimPlatform> InetSocket<Platform> {
-    /// Creates a socket of type `ty` for `protocol`, where zero selects the type's default.
-    pub(super) fn new(
-        litebox: &litebox::LiteBox<Platform>,
-        ty: SockType,
-        protocol: u8,
-        flags: SockFlags,
-    ) -> Result<Self, Errno> {
-        let protocol = IPProtocol::try_from(protocol).map_err(|_| {
-            log_unsupported!("protocol = {protocol}");
-            Errno::EPROTONOSUPPORT
-        })?;
-        let socket_type = match ty {
-            SockType::Stream => {
-                if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
-                    return Err(Errno::EINVAL);
-                }
-                SocketType::Stream
+pub(super) fn create_request(
+    ty: SockType,
+    protocol: u8,
+    flags: SockFlags,
+) -> Result<socket::CreateSocketRequest, Errno> {
+    let protocol = IPProtocol::try_from(protocol).map_err(|_| {
+        log_unsupported!("protocol = {protocol}");
+        Errno::EPROTONOSUPPORT
+    })?;
+    let socket_type = match ty {
+        SockType::Stream => {
+            if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
+                return Err(Errno::EINVAL);
             }
-            SockType::Datagram => {
-                if !matches!(protocol, IPProtocol::Default | IPProtocol::UDP) {
-                    return Err(Errno::EINVAL);
-                }
-                SocketType::Datagram
+            SocketType::Stream
+        }
+        SockType::Datagram => {
+            if !matches!(protocol, IPProtocol::Default | IPProtocol::UDP) {
+                return Err(Errno::EINVAL);
             }
-            SockType::Raw => todo!(),
-            SockType::SeqPacket => {
-                log_unsupported!("inet sequenced-packet socket");
-                return Err(Errno::ESOCKTNOSUPPORT);
-            }
-            _ => unimplemented!(),
-        };
-        let socket = litebox.create_inet_socket(socket_type, open_flags(flags))?;
-        Ok(socket.into())
-    }
+            SocketType::Datagram
+        }
+        SockType::Raw => todo!(),
+        SockType::SeqPacket => {
+            log_unsupported!("inet sequenced-packet socket");
+            return Err(Errno::ESOCKTNOSUPPORT);
+        }
+        _ => unimplemented!(),
+    };
+    Ok(socket::CreateSocketRequest {
+        address_family: socket::AddressFamily::Ipv4,
+        socket_type,
+        protocol: if socket_type == SocketType::Stream {
+            socket::IpProtocol::Tcp
+        } else {
+            socket::IpProtocol::Udp
+        },
+        flags: open_flags(flags),
+    })
+}
 
+impl<Platform: ShimPlatform> InetSocket<Platform> {
     /// The LiteBox socket.
     pub(crate) fn inet_socket(&self) -> &Arc<inet_socket::InetSocket<Platform>> {
         &self.socket
@@ -250,7 +246,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
     }
 
     /// The longest time a blocking receive or accept waits, or `None` to wait indefinitely.
-    fn receive_timeout(&self) -> Result<Option<Duration>, Errno> {
+    pub(super) fn receive_timeout(&self) -> Result<Option<Duration>, Errno> {
         self.timeout(socket::SocketOptionName::ReceiveTimeout)
     }
 
@@ -317,34 +313,6 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
 
     pub(super) fn listen(&self, backlog: u16) -> Result<(), Errno> {
         Ok(self.socket.listen(backlog)?)
-    }
-
-    /// Accepts a connection, storing the connecting socket's address in `peer` if requested.
-    ///
-    /// `flags` sets the status flags of the new socket only.
-    pub(super) fn accept(
-        &self,
-        cx: &WaitContext<'_, Platform>,
-        flags: SockFlags,
-        mut peer: Option<&mut SocketAddr>,
-    ) -> Result<Self, Errno> {
-        let (result, timeout) = self.wait(
-            cx,
-            false,
-            Events::IN,
-            || self.receive_timeout(),
-            || {
-                self.socket
-                    .accept(open_flags(flags), peer.as_deref_mut())
-                    .map_err(|error| match error {
-                        AcceptError::NoConnectionsReady => TryOpError::TryAgain,
-                        error => TryOpError::Other(error.into()),
-                    })
-            },
-        );
-        Ok(result
-            .map_err(|error| wait_errno(timeout, socket_io_errno(error)))?
-            .into())
     }
 
     pub(super) fn connect(
@@ -846,28 +814,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &InetSocketFd<Platform>,
         f: impl FnOnce(&InetSocket<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
-        let handle = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(Errno::EBADF)?;
-        handle.with_entry(f)
-    }
-
-    /// Adopts an internet socket of type `socket_type` this process inherited
-    /// from its parent, or received with Unix socket data, as `handle`.
-    pub(super) fn adopt_inherited_inet_socket(
-        &self,
-        handle: ObjectHandle,
-        socket_type: SocketType,
-    ) -> Result<InetSocketFd<Platform>, ProcessError> {
-        let socket = self
-            .litebox
-            .adopt_inherited_inet_socket(handle, socket_type)?;
-        Ok(self
-            .litebox
-            .descriptor_table_mut()
-            .insert::<InetSocketSubsystem<Platform>>(InetSocket::from(socket)))
+        f(fd)
     }
 }
 
@@ -937,7 +884,14 @@ mod tests {
         let fd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .unwrap();
-        task.files.borrow().set_max_fd(fd as usize);
+        task.do_prlimit(
+            litebox_common_linux::RlimitResource::NOFILE,
+            Some(litebox_common_linux::Rlimit {
+                rlim_cur: fd as usize,
+                rlim_max: fd as usize,
+            }),
+        )
+        .unwrap();
         assert_eq!(
             task.do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0),
             Err(Errno::EMFILE)

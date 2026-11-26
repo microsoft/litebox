@@ -170,18 +170,33 @@ wire_enum! {
         /// Creating a thread or process fails with `ResourceExhausted` once the
         /// creator's job has as many threads as the creator's soft limit.
         Tasks,
+        /// Exclusive upper bound on the number assigned to a new descriptor.
+        OpenFiles,
     }
 }
 
 impl ResourceKind {
     /// Every kind.
-    pub const ALL: [Self; 2] = [Self::CpuTime, Self::Tasks];
+    pub const ALL: [Self; 3] = [Self::CpuTime, Self::Tasks, Self::OpenFiles];
+
+    /// Limits of a process that no process created. Descriptor limits match Linux's
+    /// `INR_OPEN_CUR` and `INR_OPEN_MAX`.
+    #[must_use]
+    pub const fn default_limit(self) -> ResourceLimit {
+        match self {
+            Self::CpuTime | Self::Tasks => ResourceLimit::UNLIMITED,
+            Self::OpenFiles => ResourceLimit {
+                soft: 1024,
+                hard: 4096,
+            },
+        }
+    }
 }
 
 /// Soft and hard limits on a process's use of one [`ResourceKind`].
 ///
 /// The soft limit never exceeds the hard limit. A process starts with the
-/// limits of the process that created it, or unlimited if none did, and can
+/// limits of the process that created it, or the resource's default, and can
 /// lower its hard limit but never raise it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceLimit {
@@ -198,6 +213,9 @@ impl ResourceLimit {
         soft: Self::INFINITY,
         hard: Self::INFINITY,
     };
+
+    /// Largest open-files limit, matching Linux's `nr_open`.
+    pub const MAX_OPEN_FILES: usize = 1 << 20;
 
     /// Returns the limits `soft` and `hard`, or `None` if `soft` exceeds
     /// `hard`.

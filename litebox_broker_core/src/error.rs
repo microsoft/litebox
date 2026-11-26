@@ -32,6 +32,12 @@ pub enum BrokerError {
     OutOfMemory,
     #[error("unsupported broker operation")]
     UnsupportedOperation,
+    #[error("descriptor table is full")]
+    TooManyOpenFiles,
+    #[error("invalid argument")]
+    InvalidArgument,
+    #[error("descriptor is being installed")]
+    DescriptorBusy,
 }
 
 impl BrokerError {
@@ -68,6 +74,9 @@ impl From<BrokerError> for ErrorCode {
             BrokerError::PeerClosed => Self::PeerClosed,
             BrokerError::OutOfMemory => Self::OutOfMemory,
             BrokerError::UnsupportedOperation => Self::UnsupportedOperation,
+            BrokerError::TooManyOpenFiles => Self::TooManyOpenFiles,
+            BrokerError::InvalidArgument => Self::InvalidArgument,
+            BrokerError::DescriptorBusy => Self::DescriptorBusy,
         }
     }
 }

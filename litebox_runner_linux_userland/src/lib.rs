@@ -488,7 +488,6 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                 execfn,
                 argv,
                 envp,
-                inherited_fds,
             } = *startup;
             (
                 litebox_common_linux::TaskParams {
@@ -500,7 +499,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                     blocked_signals,
                     ignored_signals,
                     pending_signals,
-                    inherited_fds: Some(inherited_fds),
+                    inherited: true,
                     cwd: None,
                     umask: Some(umask),
                     resource_limits: Some(resource_limits),
@@ -552,7 +551,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
                     blocked_signals: SigSet::empty(),
                     ignored_signals: inherited_ignored_signals,
                     pending_signals: PendingSignalQueues::default(),
-                    inherited_fds: None,
+                    inherited: false,
                     cwd: None,
                     umask: None,
                     resource_limits: None,

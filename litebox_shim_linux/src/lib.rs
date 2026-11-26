@@ -511,7 +511,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             blocked_signals,
             ignored_signals,
             pending_signals,
-            inherited_fds,
+            inherited,
             cwd,
             umask,
             resource_limits,
@@ -526,11 +526,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         let resource_limits = resource_limits
             .unwrap_or_else(syscalls::process::ResourceLimits::<Platform>::default_values);
 
-        let files = syscalls::file::FilesState::new();
-        files.set_max_fd(
-            resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
-        );
-        let files = Arc::new(files);
         let credentials = Arc::new(syscalls::process::Credentials {
             uid,
             euid,
@@ -538,12 +533,15 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
         });
         let context = syscalls::file::FsState::<Platform>::context_for(&credentials);
-        match &inherited_fds {
-            None => {
-                files.initialize_stdio_in_shared_descriptors_table(&self.0, &context);
+        let files = Arc::new(
+            if inherited {
+                syscalls::file::FilesState::from_broker(&self.0, None)
+            } else {
+                let files = syscalls::file::FilesState::new();
+                files.initialize_stdio(&self.0, &context).map(|()| files)
             }
-            Some(inherited_fds) => files.install_inherited_fds(&self.0, inherited_fds)?,
-        }
+            .map_err(loader::elf::ElfLoaderError::OpenError)?,
+        );
         if let Some(litebox_common_linux::program_startup::InheritedCwd::Path(path)) = cwd {
             if !path.starts_with('/') {
                 return Err(loader::elf::ElfLoaderError::OpenError(Errno::EINVAL));
@@ -692,7 +690,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             initial_program_break,
             program_break,
             regions,
-            fds,
         } = startup;
         let pid = self.0.process_id;
         if syscall_entry_point != self.0.platform.get_syscall_entry_point() {
@@ -711,12 +708,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 .restore_program_break(initial_program_break, program_break);
         }
 
-        let files = syscalls::file::FilesState::new();
-        files.set_max_fd(
-            resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
-        );
-        files
-            .install_forked_fds(&self.0, &fds)
+        let files = syscalls::file::FilesState::from_broker(&self.0, None)
             .map_err(ForkRestoreError::Descriptors)?;
         let credentials = Arc::new(syscalls::process::Credentials {
             uid,
@@ -841,9 +833,9 @@ pub enum ForkRestoreError {
     /// The process image could not be read.
     #[error("failed to read the process image")]
     Image(#[source] Errno),
-    /// The inherited descriptors could not be installed.
-    #[error("failed to install the inherited descriptors")]
-    Descriptors(#[source] loader::elf::ElfLoaderError),
+    /// The broker descriptor table could not be read.
+    #[error("failed to read the broker descriptor table")]
+    Descriptors(#[source] Errno),
 }
 
 /// A handle to a process loaded via [`LinuxShim::load_program`].
@@ -879,60 +871,6 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
             syscalls::process::ExitStatus::Exit(v) => i32::from(v) & 0xff,
             syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 128,
         }
-    }
-}
-
-impl<Platform: ShimPlatform> Task<Platform> {
-    fn close_on_exec(&self) {
-        let files = self.files.borrow();
-        let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
-        for raw_fd in alive_fds {
-            if let Ok(fd) = files.typed_fd_from_raw(raw_fd)
-                && syscalls::file::get_file_descriptor_flags(&fd, &self.global)
-                    .contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
-            {
-                let _ = self.do_close(raw_fd);
-            }
-        }
-    }
-}
-
-impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
-    /// Resolve a userland fd number, rejecting negative values with `EBADF`.
-    pub(crate) fn typed_fd(&self, fd: i32) -> Result<syscalls::file::AnyTypedFd<Platform>, Errno> {
-        self.typed_fd_from_raw(usize::try_from(fd).map_err(|_| Errno::EBADF)?)
-    }
-
-    pub(crate) fn typed_fd_from_raw(
-        &self,
-        fd: usize,
-    ) -> Result<syscalls::file::AnyTypedFd<Platform>, Errno> {
-        Self::typed_fd_locked(&self.raw_descriptor_store.read(), fd)
-    }
-
-    /// Like [`Self::typed_fd_from_raw`], with the raw descriptor store already locked.
-    pub(crate) fn typed_fd_locked(
-        rds: &litebox::fd::RawDescriptorStorage,
-        fd: usize,
-    ) -> Result<syscalls::file::AnyTypedFd<Platform>, Errno> {
-        macro_rules! resolve_fd {
-            ($subsystem:ty, $variant:ident) => {
-                if let Ok(fd) = rds.fd_from_raw_integer::<$subsystem>(fd) {
-                    return Ok(syscalls::file::AnyTypedFd::$variant(fd));
-                }
-            };
-        }
-
-        resolve_fd!(syscalls::file::FileSubsystem<Platform>, File);
-        resolve_fd!(syscalls::inet::InetSocketSubsystem<Platform>, Inet);
-        resolve_fd!(syscalls::pipe::PipeSubsystem<Platform>, Pipe);
-        resolve_fd!(syscalls::eventfd::EventfdSubsystem<Platform>, Eventfd);
-        resolve_fd!(syscalls::epoll::EpollSubsystem<Platform>, Epoll);
-        resolve_fd!(syscalls::unix::UnixSocketSubsystem<Platform>, Unix);
-        resolve_fd!(syscalls::timerfd::TimerfdSubsystem<Platform>, Timerfd);
-        resolve_fd!(syscalls::vsock::VsockSocketSubsystem<Platform>, Vsock);
-        resolve_fd!(syscalls::pidfd::PidfdSubsystem<Platform>, Pidfd);
-        Err(Errno::EBADF)
     }
 }
 
@@ -1059,6 +997,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         ..
                     }
                     | SyscallRequest::Openat { .. }
+                    | SyscallRequest::Pipe2 { .. }
+                    | SyscallRequest::Socket { .. }
+                    | SyscallRequest::Socketpair { .. }
+                    | SyscallRequest::Accept { .. }
+                    | SyscallRequest::Eventfd2 { .. }
+                    | SyscallRequest::TimerfdCreate { .. }
+                    | SyscallRequest::EpollCreate { .. }
                     | SyscallRequest::Write { .. }
                     | SyscallRequest::Chdir { .. }
                     | SyscallRequest::Fchdir { .. }
@@ -1923,11 +1868,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
 
 impl<Platform: ShimPlatform> Drop for Task<Platform> {
     fn drop(&mut self) {
-        // A thread can end inside a `vfork` window, as when a sibling thread execs. The process
-        // goes on, so the child's descriptors must not keep their open file descriptions alive.
-        if self.vfork.get_mut().is_some() {
-            self.close_vfork_child_descriptors();
-        }
+        // Cancel the pending child and let the broker release its table.
+        drop(self.vfork.get_mut().take());
         self.prepare_for_exit();
         // Remove the local identity before the broker can release it for reuse.
         self.thread.remove_thread_id();
@@ -1961,7 +1903,7 @@ mod test_utils {
                 egid: 0,
             });
             let context = syscalls::file::FsState::<Platform>::context_for(&credentials);
-            files.initialize_stdio_in_shared_descriptors_table(&self, &context);
+            files.initialize_stdio(&self, &context).unwrap();
             let fs_state = Arc::new(syscalls::file::FsState::new(context));
             let signals = syscalls::signal::SignalState::new_process();
             Task {

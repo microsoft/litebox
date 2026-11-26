@@ -41,6 +41,10 @@ pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,
     pub(crate) owner: ProcessKey,
     pub(crate) rights: ObjectRights,
+    /// Whether this reference is released by descriptor-table operations, not CloseObject.
+    pub(crate) fd_owned: bool,
+    /// Temporary access through the association in which a vfork child runs.
+    pub(crate) pending_fd_access: Option<(ProcessKey, Arc<core::sync::atomic::AtomicBool>)>,
     /// Position of this reference's handle in the owner's handle list.
     pub(crate) process_reference_index: usize,
     /// Readiness publication for kinds whose state changes outside this

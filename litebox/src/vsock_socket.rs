@@ -51,6 +51,7 @@ use errors::VsockSocketError;
 pub struct VsockSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
+    owns_handle: bool,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
 }
@@ -72,19 +73,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         ))
     }
 
-    /// Returns the vsock socket inherited from the parent, or received with
-    /// Unix socket data, as `handle`, which
-    /// the socket then owns, so each handle is adopted once.
-    pub fn adopt_inherited_vsock_socket(
+    /// Borrows a descriptor-table vsock socket.
+    pub fn borrow_fd_vsock_socket(
         &self,
         handle: ObjectHandle,
     ) -> Result<VsockSocket<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(VsockSocket::new(
-            broker,
-            self.broker_pollable_registry(),
-            handle,
-        ))
+        let mut socket = VsockSocket::new(broker, self.broker_pollable_registry(), handle);
+        socket.owns_handle = false;
+        Ok(socket)
     }
 }
 
@@ -99,13 +96,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> VsockSocket<Platform> {
         Self {
             broker,
             handle,
+            owns_handle: true,
             pollable_registry,
             pollee,
         }
     }
 
-    /// The broker handle this socket owns.
-    pub(crate) fn handle(&self) -> ObjectHandle {
+    /// The broker handle for operations on this socket.
+    pub fn handle(&self) -> ObjectHandle {
         self.handle
     }
 
@@ -355,8 +353,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for VsockSoc
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for VsockSocket<Platform> {
     fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
-        let _ = self.broker.close_object(self.handle);
+        self.pollable_registry
+            .unregister_pollable(self.handle, &self.pollee);
+        if self.owns_handle {
+            let _ = self.broker.close_object(self.handle);
+        }
     }
 }
 

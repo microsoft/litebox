@@ -1237,6 +1237,10 @@ fn run_test_broker_connection(
     control_stream: std::os::unix::net::UnixStream,
     close_object_count_tx: std::sync::mpsc::Sender<usize>,
 ) {
+    use litebox_broker_protocol::{
+        fd::{FdKind, FdOperation, FdRequest, FdResponse},
+        message::{BrokerOperation, BrokerResult},
+    };
     let shared_memory = litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create(
         litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
     )
@@ -1298,9 +1302,8 @@ fn run_test_broker_connection(
         .expect("failed to activate broker test control ring");
     let publisher_readiness = readiness.clone();
     let publisher = std::thread::spawn(move || publisher_readiness.run(&mut notifications));
-    // The number of objects closed, and the open file and signal handles excluded from it since
-    // every runner opens them.
-    let counts = std::sync::Mutex::new((0, Vec::new()));
+    // Count explicit non-file descriptor closes. Loader and cwd handles are not descriptors.
+    let counts = std::sync::Mutex::new((0, std::collections::BTreeSet::new()));
     // Serves each call lane the runner starts using on its own thread, until the runner closes the
     // association.
     std::thread::scope(|scope| {
@@ -1319,20 +1322,15 @@ fn run_test_broker_connection(
                         .expect("failed to receive broker test request")
                     {
                         litebox_broker_transport::channel::HostReceive::Message(request) => {
-                            if let litebox_broker_protocol::message::BrokerOperation::CloseObject(
-                                handle,
-                            ) = &request.operation
+                            let closed = if let BrokerOperation::Fd(FdRequest {
+                                operation: FdOperation::Close(fd),
+                                ..
+                            }) = &request.operation
                             {
-                                let (close_object_count, uncounted_handles) =
-                                    &mut *counts.lock().unwrap();
-                                if let Some(index) =
-                                    uncounted_handles.iter().position(|value| value == handle)
-                                {
-                                    uncounted_handles.swap_remove(index);
-                                } else {
-                                    *close_object_count += 1;
-                                }
-                            }
+                                Some(*fd)
+                            } else {
+                                None
+                            };
                             association
                                 .execute_request_with(
                                     request,
@@ -1344,19 +1342,34 @@ fn run_test_broker_connection(
                                         )
                                     },
                                     |response| {
-                                        match &response.result {
-                                        litebox_broker_protocol::message::BrokerResult::File(
-                                            litebox_broker_protocol::message::FileResponse::Open(
-                                                open,
-                                            ),
-                                        ) => counts.lock().unwrap().1.push(open.handle),
-                                        litebox_broker_protocol::message::BrokerResult::Signal(
-                                            litebox_broker_protocol::message::SignalResponse::Open(
-                                                open,
-                                            ),
-                                        ) => counts.lock().unwrap().1.push(open.handle),
-                                        _ => {}
-                                    }
+                                        {
+                                            let (close_count, non_files) =
+                                                &mut *counts.lock().unwrap();
+                                            match &response.result {
+                                                BrokerResult::Fd(FdResponse::Installed {
+                                                    first,
+                                                    second,
+                                                    ..
+                                                }) => {
+                                                    for fd in core::iter::once(first).chain(second)
+                                                    {
+                                                        if fd.kind == FdKind::File {
+                                                            non_files.remove(&fd.number);
+                                                        } else {
+                                                            non_files.insert(fd.number);
+                                                        }
+                                                    }
+                                                }
+                                                BrokerResult::Fd(FdResponse::Changed(_)) => {
+                                                    if let Some(fd) = closed
+                                                        && non_files.remove(&fd)
+                                                    {
+                                                        *close_count += 1;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
                                         lane.send_response(response)
                                     },
                                 )
@@ -1455,13 +1468,12 @@ console.log(content);
     assert_eq!(broker_thread.next_close_object_count(), 0);
 
     eventfd_runner.broker_socket(&control_socket_path).run();
-    // eventfd.c creates thirteen eventfd objects and one epoll instance; each should release one
-    // broker object.
-    assert_eq!(broker_thread.next_close_object_count(), 14);
+    // Every successful explicit close must reach the broker, even for duplicates.
+    assert_eq!(broker_thread.next_close_object_count(), 17);
 
     pipe_runner.broker_socket(&control_socket_path).run();
-    // pipe_broker.c creates five pipes; each endpoint owns one broker object.
-    assert_eq!(broker_thread.next_close_object_count(), 10);
+    // Each close of a pipe end reaches the broker, including the duplicate writer.
+    assert_eq!(broker_thread.next_close_object_count(), 11);
 
     urandom_runner
         .broker_socket(&control_socket_path)
@@ -1803,7 +1815,7 @@ fn test_runner_broker_udp_with_rewriter() {
         .arg(refused_address.port().to_string())
         .broker_socket(&control_socket_path)
         .run();
-    assert_eq!(broker.next_close_object_count(), 3);
+    assert_eq!(broker.next_close_object_count(), 4);
     broker.join();
     server.join().unwrap();
 }

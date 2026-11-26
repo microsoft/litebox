@@ -144,7 +144,7 @@ fn serve_requests(
         blocked_signals: litebox_common_linux::signal::SigSet::empty(),
         ignored_signals: litebox_common_linux::signal::SigSet::empty(),
         pending_signals: litebox_common_linux::program_startup::PendingSignalQueues::default(),
-        inherited_fds: None,
+        inherited: false,
         cwd: None,
         umask: None,
         resource_limits: None,
@@ -246,7 +246,6 @@ fn run_launched(
         execfn,
         argv,
         envp,
-        inherited_fds,
     } = match LinuxProcessStartup::decode(&startup.payload) {
         Ok(LinuxProcessStartup::Program(startup)) => *startup,
         // The kernel supports no memory image; a `fork` clones the process.
@@ -262,7 +261,7 @@ fn run_launched(
         blocked_signals,
         ignored_signals,
         pending_signals,
-        inherited_fds: Some(inherited_fds),
+        inherited: true,
         cwd: None,
         umask: Some(umask),
         resource_limits: Some(resource_limits),

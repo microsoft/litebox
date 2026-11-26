@@ -8,7 +8,6 @@ use core::time::Duration;
 
 use litebox::{
     event::{Events, IOPollable, observer::Observer, timer::Timer, wait::WaitContext},
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     process::ProcessError,
     sync::RawSyncPrimitivesProvider,
 };
@@ -18,21 +17,15 @@ use litebox_broker_protocol::{
     timer::{TimerClock, TimerSetting, TimerSpec},
 };
 use litebox_common_linux::{
-    CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, FileDescriptorFlags, Itimerspec, OFlags,
-    TfdFlags, TfdTimerFlags, errno::Errno,
+    CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, Itimerspec, OFlags, TfdFlags, TfdTimerFlags,
+    errno::Errno,
 };
 use litebox_platform::time::{Instant as _, TimeProvider};
 
 use super::file::{AnyTypedFd, linux_status_flags, status_flags_change};
 use crate::{GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut};
 
-pub(crate) struct TimerfdSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
-impl<Platform: ShimPlatform> FdEnabledSubsystem for TimerfdSubsystem<Platform> {
-    type Entry = TimerFile<Platform>;
-}
-impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for TimerFile<Platform> {}
-
-pub(crate) type TimerfdFd<Platform> = TypedFd<TimerfdSubsystem<Platform>>;
+pub(crate) type TimerfdFd<Platform> = TimerFile<Platform>;
 
 /// A timerfd, whose clock, schedule, expirations, and status flags the broker owns.
 pub(crate) struct TimerFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
@@ -76,6 +69,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for TimerFil
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `timerfd_create`.
     pub(crate) fn sys_timerfd_create(&self, clockid: i32, flags: TfdFlags) -> Result<u32, Errno> {
+        use litebox_broker_protocol::{fd::FdCreate, timer::CreateTimerRequest};
         if flags.intersects((TfdFlags::CLOEXEC | TfdFlags::NONBLOCK).complement()) {
             return Err(Errno::EINVAL);
         }
@@ -90,24 +84,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             FileOpenFlags::NONE
         };
-        let timer = Timer::new(&self.global.litebox, status, clock).map_err(Errno::from)?;
-        let file = TimerFile {
-            timer: Arc::new(timer),
-        };
-
-        let mut dt = self.global.litebox.descriptor_table_mut();
-        let typed = dt.insert::<TimerfdSubsystem<Platform>>(file);
-        if flags.contains(TfdFlags::CLOEXEC) {
-            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
-            assert!(old.is_none());
-        }
-        drop(dt);
-        let files = self.files.borrow();
-        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-            self.remove_and_drop_descriptor(&typed);
-            Errno::EMFILE
-        })?;
-        Ok(raw_fd.try_into().unwrap())
+        Ok(self
+            .create_fds(
+                FdCreate::Timer(CreateTimerRequest {
+                    flags: status,
+                    clock,
+                }),
+                flags.contains(TfdFlags::CLOEXEC),
+            )?
+            .0
+            .number)
     }
 
     /// Handle syscall `timerfd_settime`.
@@ -187,27 +173,16 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &TimerfdFd<Platform>,
         f: impl FnOnce(&TimerFile<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
-        let handle = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(Errno::EBADF)?;
-        handle.with_entry(f)
+        f(fd)
     }
 
-    /// Adopts a timerfd this process inherited from its parent, or received with Unix socket
-    /// data, as `handle`.
-    pub(crate) fn adopt_inherited_timerfd(
+    pub(crate) fn borrow_timerfd(
         &self,
         handle: ObjectHandle,
     ) -> Result<TimerfdFd<Platform>, ProcessError> {
-        let timer = self.litebox.adopt_inherited_timer(handle)?;
-        Ok(self
-            .litebox
-            .descriptor_table_mut()
-            .insert::<TimerfdSubsystem<Platform>>(TimerFile {
-                timer: Arc::new(timer),
-            }))
+        Ok(TimerFile {
+            timer: Arc::new(self.litebox.borrow_fd_timer(handle)?),
+        })
     }
 }
 

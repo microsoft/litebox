@@ -818,7 +818,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         Ok(())
     }
 
-    fn write_file_buffer(
+    pub(crate) fn write_file_buffer(
         &self,
         buffer: SharedBufferSequence,
         data: &[u8],

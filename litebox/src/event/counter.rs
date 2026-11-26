@@ -50,6 +50,7 @@ pub enum EventCounterError {
 pub struct EventCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
+    owns_handle: bool,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
 }
@@ -93,6 +94,7 @@ where
         Self {
             broker,
             handle,
+            owns_handle: true,
             pollable_registry,
             pollee,
         }
@@ -182,18 +184,15 @@ where
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
-    /// Returns the event counter this process inherited from its parent as
-    /// `handle` through [`PendingChild::inherit`](crate::process::PendingChild::inherit),
-    /// or received with Unix socket data.
-    ///
-    /// The counter owns `handle`, so callers adopt each handle once and share
-    /// the counter for every other use.
-    pub fn adopt_inherited_event_counter(
+    /// Borrows a descriptor-table event counter.
+    pub fn borrow_fd_event_counter(
         &self,
         handle: ObjectHandle,
     ) -> Result<EventCounter<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(EventCounter::from_handle(self, broker, handle))
+        let mut counter = EventCounter::from_handle(self, broker, handle);
+        counter.owns_handle = false;
+        Ok(counter)
     }
 }
 
@@ -202,8 +201,11 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
-        let _ = self.broker.close_object(self.handle);
+        self.pollable_registry
+            .unregister_pollable(self.handle, &self.pollee);
+        if self.owns_handle {
+            let _ = self.broker.close_object(self.handle);
+        }
     }
 }
 

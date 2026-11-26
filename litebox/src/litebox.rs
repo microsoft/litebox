@@ -3,10 +3,12 @@
 
 //! A module to house all the code for the top-level [`LiteBox`] object.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ProcessId;
+use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_protocol::fd::{FdInfo, FdRequest, FdResponse};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
@@ -31,6 +33,43 @@ pub struct LiteBox<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
+    /// Sends a descriptor-table operation to the broker.
+    pub fn fd_request(&self, request: FdRequest) -> Result<FdResponse, ErrorCode> {
+        Ok(self
+            .broker_control()
+            .ok_or(ErrorCode::PeerClosed)?
+            .fd_request(request)?)
+    }
+
+    /// Accepts and installs a Unix socket, returning its peer name in the same request.
+    pub fn accept_unix_fd(
+        &self,
+        request: FdRequest,
+    ) -> Result<
+        (
+            FdResponse,
+            Option<litebox_broker_protocol::unix_socket::UnixSocketName>,
+        ),
+        ErrorCode,
+    > {
+        Ok(self
+            .broker_control()
+            .ok_or(ErrorCode::PeerClosed)?
+            .accept_unix_fd(request)?)
+    }
+
+    /// Lists the selected descriptor table, optionally sweeping CLOEXEC first.
+    pub fn list_fds(
+        &self,
+        pending_child: Option<ProcessId>,
+        exec: bool,
+    ) -> Result<(u64, Vec<FdInfo>), ErrorCode> {
+        Ok(self
+            .broker_control()
+            .ok_or(ErrorCode::PeerClosed)?
+            .list_fds(pending_child, exec)?)
+    }
+
     /// Create a new (empty) [`LiteBox`] instance for the given `platform`.
     ///
     /// # Panics

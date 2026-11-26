@@ -36,7 +36,7 @@ use crate::{
         wait::{WaitContext, WaitError},
     },
     fs::errors::StatusFlagsError,
-    process::{InheritableFd, ProcessError},
+    process::ProcessError,
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
@@ -76,9 +76,12 @@ impl ReceivedObject {
         self.kind
     }
 
-    /// Gives up ownership of the reference's handle, which the caller adopts
-    /// as [`Self::kind`] describes, with the `adopt_inherited_*` method of
-    /// [`LiteBox`] for that kind, such as [`LiteBox::adopt_inherited_file`].
+    /// Borrows the reference's handle until this object is dropped.
+    pub fn handle(&self) -> ObjectHandle {
+        self.handle
+    }
+
+    /// Gives up ownership of the reference's handle.
     pub fn into_handle(mut self) -> ObjectHandle {
         self.adopted = true;
         self.handle
@@ -107,6 +110,7 @@ impl Drop for ReceivedObject {
 pub struct UnixSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
+    owns_handle: bool,
     socket_type: SocketType,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
@@ -148,18 +152,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         ))
     }
 
-    /// Returns the Unix socket of type `socket_type` this process inherited
-    /// from its parent, or received with Unix socket data, as `handle`.
-    ///
-    /// The socket owns `handle`, so callers adopt each handle once and share
-    /// the socket for every other use.
-    pub fn adopt_inherited_unix_socket(
+    /// Borrows a descriptor-table Unix socket.
+    pub fn borrow_fd_unix_socket(
         &self,
         handle: ObjectHandle,
         socket_type: SocketType,
     ) -> Result<UnixSocket<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(UnixSocket::new(self, broker, handle, socket_type))
+        let mut socket = UnixSocket::new(self, broker, handle, socket_type);
+        socket.owns_handle = false;
+        Ok(socket)
     }
 }
 
@@ -176,14 +178,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         Self {
             broker,
             handle,
+            owns_handle: true,
             socket_type,
             pollable_registry,
             pollee,
         }
     }
 
-    /// The broker handle this socket owns.
-    pub(crate) fn handle(&self) -> ObjectHandle {
+    /// The broker handle for operations on this socket.
+    pub fn handle(&self) -> ObjectHandle {
         self.handle
     }
 
@@ -251,6 +254,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         Ok(Self {
             broker: Arc::clone(&self.broker),
             handle,
+            owns_handle: true,
             socket_type: self.socket_type,
             pollable_registry: Arc::clone(&self.pollable_registry),
             pollee,
@@ -276,24 +280,21 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         cx: &WaitContext<'_, Platform>,
         address: Option<&UnixSocketAddress>,
         data: impl WriteBuffer,
-        objects: &[InheritableFd<Platform>],
+        objects: &[ObjectHandle],
         user: FileUser,
         nonblock: bool,
     ) -> Result<usize, UnixSocketError> {
-        // `objects` holds the objects, which keeps their handles open until
-        // the send completes.
-        let objects: Vec<ObjectHandle> = objects.iter().map(InheritableFd::handle).collect();
         if self.socket_type != SocketType::Stream {
             return self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
                 self.broker
-                    .send_unix_socket(self.handle, address, &objects, &data, user)
+                    .send_unix_socket(self.handle, address, objects, &data, user)
             });
         }
         let mut sent: usize = 0;
         loop {
             let length = (data.len() - sent).min(UNIX_SOCKET_BUFFER_SIZE as usize);
             let chunk = &(&data).sub_buffer(sent, length);
-            let objects = if sent == 0 { &objects[..] } else { &[] };
+            let objects = if sent == 0 { objects } else { &[] };
             let result = self.wait(cx, nonblock, SocketOptionName::SendTimeout, || {
                 self.broker
                     .send_unix_socket(self.handle, address, objects, chunk, user)
@@ -475,8 +476,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for UnixSock
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for UnixSocket<Platform> {
     fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
-        let _ = self.broker.close_object(self.handle);
+        self.pollable_registry
+            .unregister_pollable(self.handle, &self.pollee);
+        if self.owns_handle {
+            let _ = self.broker.close_object(self.handle);
+        }
     }
 }
 
@@ -500,8 +504,8 @@ impl From<BrokerObjectError> for UnixSocketError {
             BrokerObjectError::PermissionDenied => Self::PermissionDenied,
             BrokerObjectError::UnsupportedOperation => Self::Unsupported,
             BrokerObjectError::Fault => Self::Fault,
+            BrokerObjectError::InvalidObject => Self::Closed,
             BrokerObjectError::Control
-            | BrokerObjectError::InvalidObject
             | BrokerObjectError::WouldBlock
             | BrokerObjectError::PeerClosed => Self::Io,
         }
@@ -540,6 +544,9 @@ pub mod errors {
         Unsupported,
         #[error("Unix socket broker I/O failed")]
         Io,
+        /// The socket handle was closed.
+        #[error("Unix socket handle is closed")]
+        Closed,
         /// Copying to or from the caller's buffer faulted.
         #[error("copying the transferred bytes faulted")]
         Fault,

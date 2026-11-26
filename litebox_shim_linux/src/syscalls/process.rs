@@ -1707,7 +1707,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Ends the `vfork` window after the child exits or starts its own runner,
     /// restoring the parent's context and returning the child's PID to it.
     fn resume_vfork_parent(&self, ctx: &mut litebox_common_linux::PtRegs) -> usize {
-        self.close_vfork_child_descriptors();
         let state = self
             .vfork
             .borrow_mut()
@@ -1721,20 +1720,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .platform
             .set_guest_vector_state(&state.parent_vector_state);
         state.child_pid.cast_unsigned() as usize
-    }
-
-    /// Closes the `vfork` child's descriptors, as its exit would, while the window is still open.
-    pub(crate) fn close_vfork_child_descriptors(&self) {
-        let child_fds: Vec<usize> = self
-            .files
-            .borrow()
-            .raw_descriptor_store
-            .read()
-            .iter_alive()
-            .collect();
-        for raw_fd in child_fds {
-            let _ = self.do_close(raw_fd);
-        }
     }
 
     /// Terminates the shared runner when the constrained `vfork` window cannot continue.
@@ -1877,9 +1862,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// has a single thread, a copy of the calling one; the parent's other threads pause while the
     /// parent is copied.
     ///
-    /// Only a process outside a `vfork` window, with no ELF file mid-load, and only descriptors a
-    /// fresh runner can inherit is duplicated; otherwise this fails with `EAGAIN`. Without [`COPY_BASED_FORK`], a process that cannot fork natively is
-    /// not duplicated either; this fails with `ENOSYS`.
+    /// A process in a `vfork` window or with an ELF file mid-load cannot fork (`EAGAIN`).
+    /// Without [`COPY_BASED_FORK`], a process that cannot fork natively fails with `ENOSYS`.
     /// A process with shared mappings additionally needs a native launcher, through which the
     /// child shares them and keeps read-only copies of files read-only; otherwise this fails with
     /// `EAGAIN`.
@@ -1913,13 +1897,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .name_shared_memory(|| self.issue_shared_memory_id())
                 .map_err(|_| Errno::EAGAIN)?;
         }
-        let (fds, objects): (Vec<_>, Vec<_>) =
-            self.fds_inherited_across_fork()?.into_iter().unzip();
         let fs = self.fs.borrow();
         let umask = u32::from(fs.umask().bits());
         drop(fs);
         let (blocked_signals, signal_actions, alternate_signal_stack) = self.signals.fork_state();
-        let mut startup = LinuxForkStartup {
+        let startup = LinuxForkStartup {
             uid: self.credentials.uid,
             euid: self.credentials.euid,
             gid: self.credentials.gid,
@@ -1952,30 +1934,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
             initial_program_break: 0,
             program_break: 0,
             regions: Vec::new(),
-            fds,
         };
-        // The child keeps the references it inherits until it exits, so check the size first.
         startup.encode().map_err(|_| Errno::ENOMEM)?;
 
         // Dropping the pending child on failure discards it.
         let child = self.allocate_child_process(relation)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
-        let handles = child.inherit(&objects)?;
-        for (forked, handle) in startup.fds.iter_mut().zip(handles) {
-            forked.inherited.handle = handle;
-        }
         // Like Linux, the pidfd is installed after the child's descriptors are copied. The other
         // threads stay paused until the child starts or the pidfd is removed, so that, as on
         // Linux, none sees a pidfd for a child that fails to start.
         let pidfd = pidfd
-            .map(|dest| self.install_child_pidfd(&self.files.borrow(), &child, dest))
+            .map(|dest| self.install_child_pidfd(&child, dest))
             .transpose()?;
         let started = self.start_forked_child(&child, startup, has_shared_mappings);
         if started.is_err()
             && let Some(pidfd) = pidfd
         {
-            self.remove_child_pidfd(pidfd);
+            let _ = self.do_close(pidfd as usize);
         }
         drop(pause);
         started.map(|()| child_pid.cast_unsigned() as usize)
@@ -2191,22 +2167,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             parent_context.regs[0] = child_pid.cast_unsigned() as usize;
         }
-        let child_files = self.files.borrow().copy_for_vfork(&self.global);
-        // A sibling may have changed the parent's limits since this task's descriptor table was
-        // limited, so limit the child's to its copy of the limits.
+        let child_files =
+            super::file::FilesState::from_broker(&self.global, Some(child.identity().process_id))?;
         let resource_limits = self.thread.process.limits.get();
-        child_files.set_max_fd(
-            resource_limits[litebox_common_linux::RlimitResource::NOFILE as usize].rlim_cur,
-        );
-        let parent_files = self.files.replace(Arc::new(child_files));
-        // Like Linux, the pidfd is installed after the child's descriptors are copied.
-        if let Some(dest) = pidfd
-            && let Err(error) = self.install_child_pidfd(&parent_files, &child, dest)
-        {
-            self.close_vfork_child_descriptors();
-            self.files.replace(parent_files);
-            return Err(error);
+        // CLONE_PIDFD installs into the parent only, after the broker copied its table.
+        if let Some(dest) = pidfd {
+            self.install_child_pidfd(&child, dest)?;
         }
+        let parent_files = self.files.replace(Arc::new(child_files));
         let child_fs = crate::syscalls::file::FsState::clone(&self.fs.borrow());
         let parent_fs = self.fs.replace(Arc::new(child_fs));
         let child_init_process = self.process_is_init(child.identity().process_id);
@@ -2592,15 +2560,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 }
 
-const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
-pub(crate) const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+pub(crate) const RLIMIT_NOFILE_MAX: usize = ResourceLimit::MAX_OPEN_FILES;
 /// The default soft and hard limits on queued signals, which Linux scales with memory size.
 const RLIMIT_SIGPENDING: usize = 4096;
 
 /// A process's resource limits.
 ///
-/// Every limit is kept, reported, and inherited, but only `NOFILE` and `SIGPENDING` are enforced.
-/// When LiteBox keeps the limits on `CPU` and `NPROC` instead, this copy of them goes unused.
+/// Linux shim limits. The broker keeps NOFILE and, when available, CPU and NPROC.
 pub(crate) struct ResourceLimits<Platform: ShimPlatform> {
     limits: RwLock<Platform, ResourceLimitValues>,
 }
@@ -2612,9 +2578,8 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
         let mut limits = [Rlimit {
             rlim_cur: rlim_t::MAX,
             rlim_max: rlim_t::MAX,
-        }; RlimitResource::RLIM_NLIMITS];
+        }; RlimitResource::RLIM_NLIMITS - 1];
         for (resource, rlim_cur, rlim_max) in [
-            (RlimitResource::NOFILE, RLIMIT_NOFILE_CUR, RLIMIT_NOFILE_MAX),
             (
                 RlimitResource::STACK,
                 crate::loader::DEFAULT_STACK_SIZE,
@@ -2629,7 +2594,7 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
                 RLIMIT_SIGPENDING,
             ),
         ] {
-            limits[resource as usize] = Rlimit { rlim_cur, rlim_max };
+            limits[resource.shim_limit_index().unwrap()] = Rlimit { rlim_cur, rlim_max };
         }
         limits
     }
@@ -2646,7 +2611,7 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
     }
 
     pub(crate) fn get_rlimit_cur(&self, resource: litebox_common_linux::RlimitResource) -> usize {
-        self.limits.read()[resource as usize].rlim_cur
+        self.limits.read()[resource.shim_limit_index().unwrap()].rlim_cur
     }
 }
 
@@ -2656,6 +2621,7 @@ fn litebox_resource_kind(resource: litebox_common_linux::RlimitResource) -> Opti
     match resource {
         RlimitResource::CPU => Some(ResourceKind::CpuTime),
         RlimitResource::NPROC => Some(ResourceKind::Tasks),
+        RlimitResource::NOFILE => Some(ResourceKind::OpenFiles),
         _ => None,
     }
 }
@@ -2677,9 +2643,10 @@ fn rlim_from_litebox(value: u64) -> litebox_common_linux::rlim_t {
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the limit on `resource`, which a `vfork` child keeps its own copy of.
     pub(crate) fn rlimit(&self, resource: litebox_common_linux::RlimitResource) -> Rlimit {
+        let index = resource.shim_limit_index().unwrap();
         match &*self.vfork.borrow() {
-            Some(vfork) => vfork.resource_limits[resource as usize],
-            None => self.thread.process.limits.limits.read()[resource as usize],
+            Some(vfork) => vfork.resource_limits[index],
+            None => self.thread.process.limits.limits.read()[index],
         }
     }
 
@@ -2714,7 +2681,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     });
                 }
                 // Without LiteBox's process service, this process keeps the limit itself.
-                Err(ProcessError::Unavailable) => {}
+                Err(ProcessError::Unavailable) if resource != ResourceKind::OpenFiles => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -2724,10 +2691,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if new_limit.rlim_cur > new_limit.rlim_max {
             return Err(Errno::EINVAL);
         }
-        let is_nofile = matches!(resource, litebox_common_linux::RlimitResource::NOFILE);
-        if is_nofile && new_limit.rlim_max > RLIMIT_NOFILE_MAX {
-            return Err(Errno::EPERM);
-        }
         let mut vfork = self.vfork.borrow_mut();
         let mut process_limits;
         let limits = if let Some(vfork) = vfork.as_mut() {
@@ -2736,16 +2699,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             process_limits = self.thread.process.limits.limits.write();
             &mut *process_limits
         };
-        let old_limit = limits[resource as usize];
+        let index = resource.shim_limit_index().ok_or(Errno::EIO)?;
+        let old_limit = limits[index];
         // Note process with `CAP_SYS_RESOURCE` can increase the hard limit, but we don't
         // support capabilities in LiteBox, so we don't check for that here.
         if new_limit.rlim_max > old_limit.rlim_max {
             return Err(Errno::EPERM);
         }
-        if is_nofile {
-            self.files.borrow().set_max_fd(new_limit.rlim_cur);
-        }
-        limits[resource as usize] = new_limit;
+        limits[index] = new_limit;
         Ok(old_limit)
     }
 
@@ -3967,8 +3928,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         envp: alloc::vec::Vec<alloc::ffi::CString>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
-        let (inherited_fds, fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
-            self.fds_inherited_across_exec()?.into_iter().unzip();
         let fs = self.fs.borrow();
         let umask = u32::from(fs.umask().bits());
         drop(fs);
@@ -3978,7 +3937,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .as_ref()
             .expect("vfork transfer lost its child")
             .resource_limits;
-        let mut startup = LinuxProgramStartup {
+        let startup = LinuxProgramStartup {
             uid: self.credentials.uid,
             euid: self.credentials.euid,
             gid: self.credentials.gid,
@@ -3995,20 +3954,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             execfn,
             argv,
             envp,
-            inherited_fds,
         };
-        // The child keeps the references it inherits until it exits, so check the size first.
-        startup.encode().map_err(|_| Errno::E2BIG)?;
+        let payload = startup.encode().map_err(|_| Errno::E2BIG)?;
         let vfork = self.vfork.borrow();
         let child = &vfork.as_ref().expect("vfork transfer lost its child").child;
-        let handles = child.inherit(&fds)?;
-        for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
-            inherited.handle = handle;
-        }
-        let payload = startup
-            .encode()
-            .expect("the startup fit with placeholder handles");
-        let started = child.start(&payload);
+        // The broker already owns the child's cwd and descriptors. Failure after commit is fatal.
+        let committed = self.fd_request(litebox_broker_protocol::fd::FdOperation::Exec(None));
+        let started = committed
+            .map_err(|_| ProcessError::Unavailable)
+            .and_then(|_| child.start(&payload));
         drop(vfork);
         if started.is_err() {
             // The broker no longer holds a pending child that could retry or exit.
@@ -4098,8 +4052,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EBUSY);
         }
 
-        // Close CLOEXEC descriptors
-        self.close_on_exec();
+        if self.commit_exec_fds().is_err() {
+            self.sys_exit_group(127);
+            return Ok(0);
+        }
 
         // unmmap all memory mappings and reset brk
         if let Some(robust_list) = self.thread.robust_list.take() {
@@ -6576,7 +6532,6 @@ mod fork_tests {
                 initial_program_break: 0,
                 program_break: 0,
                 regions: Vec::new(),
-                fds: Vec::new(),
             };
             let shim = crate::LinuxShim(task.global.clone());
             let thread = task.global.litebox.create_thread().unwrap();

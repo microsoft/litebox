@@ -633,8 +633,9 @@ fn main() {}
 /// Raises the soft limit on open descriptors as far as the hard limit allows.
 #[cfg(target_os = "linux")]
 fn raise_open_file_limit() {
-    /// The kernel's default `fs.nr_open`, above which the limit cannot be raised.
-    const MAX_OPEN_FILES: u64 = 1 << 20;
+    // The kernel's default `fs.nr_open`, above which the limit cannot be raised.
+    const MAX_OPEN_FILES: u64 =
+        litebox_broker_protocol::process::ResourceLimit::MAX_OPEN_FILES as u64;
     let mut limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
     let target = limit.maximum.unwrap_or(MAX_OPEN_FILES).min(MAX_OPEN_FILES);
     if limit.current.is_none_or(|current| current >= target) {

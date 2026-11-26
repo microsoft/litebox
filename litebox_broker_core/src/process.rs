@@ -292,6 +292,12 @@ pub struct BrokerProcess {
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this process.
     references: Mutex<ProcessReferences>,
+    // XXX: Share this table for CLONE_FILES across processes.
+    pub(crate) files: Arc<crate::fd::FdTable>,
+    // Pending fd handles are usable only via the creator's association until handoff; typed
+    // shim clients borrow them and never issue Drop RPCs.
+    pending_fd_access: Option<(ProcessKey, Arc<AtomicBool>)>,
+    pending_fd_calls: AtomicUsize,
     /// Authoritative broker threads owned by this process, by their IDs in its
     /// namespace; each is counted in the core's active thread count.
     threads: Mutex<HashMap<ThreadId, Arc<BrokerThread>>>,
@@ -354,18 +360,21 @@ impl SharedHostNames {
 struct ResourceLimits {
     cpu_time: ResourceLimit,
     tasks: ResourceLimit,
+    open_files: ResourceLimit,
 }
 
 impl ResourceLimits {
-    const UNLIMITED: Self = Self {
-        cpu_time: ResourceLimit::UNLIMITED,
-        tasks: ResourceLimit::UNLIMITED,
+    const DEFAULT: Self = Self {
+        cpu_time: ResourceKind::CpuTime.default_limit(),
+        tasks: ResourceKind::Tasks.default_limit(),
+        open_files: ResourceKind::OpenFiles.default_limit(),
     };
 
     fn get(&self, resource: ResourceKind) -> ResourceLimit {
         match resource {
             ResourceKind::CpuTime => self.cpu_time,
             ResourceKind::Tasks => self.tasks,
+            ResourceKind::OpenFiles => self.open_files,
         }
     }
 
@@ -373,6 +382,7 @@ impl ResourceLimits {
         match resource {
             ResourceKind::CpuTime => &mut self.cpu_time,
             ResourceKind::Tasks => &mut self.tasks,
+            ResourceKind::OpenFiles => &mut self.open_files,
         }
     }
 }
@@ -645,7 +655,7 @@ impl BrokerProcess {
             |creator| creator.process_group(),
         );
         process_group.retain();
-        let resource_limits = creator.map_or(ResourceLimits::UNLIMITED, |creator| {
+        let resource_limits = creator.map_or(ResourceLimits::DEFAULT, |creator| {
             creator.resource_limits.lock().limits
         });
         let socket_account = Arc::new(SocketAccount::new(&core, key));
@@ -693,6 +703,10 @@ impl BrokerProcess {
                 handles: Vec::new(),
                 pending_handles: 0,
             }),
+            files: Arc::default(),
+            pending_fd_access: creator
+                .map(|creator| (creator.key, Arc::new(AtomicBool::new(true)))),
+            pending_fd_calls: AtomicUsize::new(0),
             threads: Mutex::new(HashMap::new()),
             ended_thread_ids: Mutex::new(Vec::new()),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
@@ -995,7 +1009,7 @@ impl BrokerProcess {
             None => self.children_namespace(),
         };
         let child = self.create_child(&pid_namespace, sibling)?;
-        let result = {
+        let result = self.copy_fds_to(&child).and_then(|()| {
             let mut state = self.state.lock();
             if !self.accepts_operations(&state) {
                 Err(BrokerError::PeerClosed)
@@ -1033,7 +1047,7 @@ impl BrokerProcess {
                     identity
                 }
             }
-        };
+        });
         if result.is_err() {
             child.discard(BrokerError::PeerClosed);
         }
@@ -1092,6 +1106,9 @@ impl BrokerProcess {
     ) -> Result<ChildWithConnection<Connection>> {
         let mut state = self.state.lock();
         let pending = self.pending_child(&mut state, child_process_id)?;
+        if pending.process.pending_fd_calls.load(Ordering::Acquire) != 0 {
+            return Err(BrokerError::WouldBlock);
+        }
         let connection = match pending
             .connection
             .take()
@@ -1108,17 +1125,68 @@ impl BrokerProcess {
             .pending_child_process
             .take()
             .ok_or(BrokerError::Internal)?;
+        pending.process.revoke_pending_fd_access();
+        drop(state);
+        pending.process.reset_fd_readiness();
         Ok((pending.process, connection))
     }
 
     /// Takes the pending child selected by `child_process_id`.
     fn take_pending_child(&self, child_process_id: ProcessId) -> Result<PendingChild> {
         let mut state = self.state.lock();
-        self.pending_child(&mut state, child_process_id)?;
-        state
+        let child = &self.pending_child(&mut state, child_process_id)?.process;
+        if child.pending_fd_calls.load(Ordering::Acquire) != 0 {
+            return Err(BrokerError::WouldBlock);
+        }
+        child.revoke_pending_fd_access();
+        let pending = state
             .pending_child_process
             .take()
-            .ok_or(BrokerError::Internal)
+            .ok_or(BrokerError::Internal)?;
+        drop(state);
+        pending.process.reset_fd_readiness();
+        Ok(pending)
+    }
+
+    /// Runs one descriptor-table operation on this process or its pending child.
+    pub fn with_fd_target<R, E: From<BrokerError>>(
+        &self,
+        pending_child: Option<ProcessId>,
+        f: impl FnOnce(&Self) -> core::result::Result<R, E>,
+    ) -> core::result::Result<R, E> {
+        struct InFlight<'a>(&'a AtomicUsize);
+        impl Drop for InFlight<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Release);
+            }
+        }
+        let Some(pid) = pending_child else {
+            return f(self);
+        };
+        let child = self.with_pending_child(pid, |child| {
+            child.pending_fd_calls.fetch_add(1, Ordering::Relaxed);
+            Arc::clone(child)
+        })?;
+        let _in_flight = InFlight(&child.pending_fd_calls);
+        f(&child)
+    }
+
+    fn revoke_pending_fd_access(&self) {
+        if let Some((_, active)) = &self.pending_fd_access {
+            active.store(false, Ordering::Release);
+        }
+    }
+
+    fn reset_fd_readiness(&self) {
+        let process_references = self.references.lock();
+        let mut references = self.core.references.write();
+        for handle in &process_references.handles {
+            if let Some(reference) = references.get_mut(handle)
+                && reference.fd_owned
+            {
+                reference.readiness = None;
+            }
+        }
     }
 
     /// Lets `write` store `length` bytes at `offset` in the memory image of
@@ -2877,6 +2945,8 @@ impl BrokerProcess {
                 rights,
                 process_reference_index,
                 readiness,
+                fd_owned: false,
+                pending_fd_access: None,
             },
         );
         reference_handles.push(handle);
@@ -2895,7 +2965,7 @@ impl BrokerProcess {
     ) -> Result<Arc<RwLock<ObjectEntry>>> {
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != self.key {
+        if !self.can_access_reference(reference) {
             return Err(BrokerError::UnknownObject);
         }
         if !reference.rights.contains(required_rights) {
@@ -2912,13 +2982,60 @@ impl BrokerProcess {
         debug_assert!(!allowed_rights.is_empty());
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != self.key {
+        if !self.can_access_reference(reference) {
             return Err(BrokerError::UnknownObject);
         }
         if !reference.rights.intersects(allowed_rights) {
             return Err(BrokerError::InvalidRights);
         }
         Ok(Arc::clone(&reference.object))
+    }
+
+    fn can_access_reference(&self, reference: &ObjectReference) -> bool {
+        reference.owner == self.key
+            || reference
+                .pending_fd_access
+                .as_ref()
+                .is_some_and(|(creator, active)| {
+                    *creator == self.key && active.load(Ordering::Acquire)
+                })
+    }
+
+    pub(crate) fn register_fd_readiness(
+        &self,
+        handles: &[ObjectHandle],
+        sink: &Arc<dyn ReadinessSink>,
+    ) -> Result<()> {
+        let mut references = self.core.references.write();
+        for handle in handles {
+            let reference = references
+                .get_mut(handle)
+                .filter(|reference| reference.owner == self.key)
+                .ok_or(BrokerError::UnknownObject)?;
+            if reference.readiness.is_none() {
+                reference.readiness = reference.object.read().watch(*handle, sink)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_fd_handles(&self, handles: &[ObjectHandle]) -> Result<()> {
+        let mut references = self.core.references.write();
+        if handles.iter().any(|handle| {
+            !references
+                .get(handle)
+                .is_some_and(|reference| reference.owner == self.key && !reference.fd_owned)
+        }) {
+            return Err(BrokerError::UnknownObject);
+        }
+        for handle in handles {
+            let reference = references.get_mut(handle).unwrap();
+            reference.fd_owned = true;
+            reference
+                .pending_fd_access
+                .clone_from(&self.pending_fd_access);
+        }
+        Ok(())
     }
 
     /// Returns the current readiness of a broker-owned object.
@@ -2969,12 +3086,18 @@ impl BrokerProcess {
     /// Destruction happens after releasing the process-wide reference-table
     /// lock, so an object may safely release platform resources.
     pub fn close_object_reference(&self, handle: ObjectHandle) -> Result<()> {
-        let reference = self.remove_object_reference(handle)?;
+        let reference = self.remove_object_reference(handle, false)?;
         drop(reference);
         Ok(())
     }
 
-    fn remove_object_reference(&self, handle: ObjectHandle) -> Result<ObjectReference> {
+    /// Infallible because the caller has already freed the descriptor number, as Linux close does.
+    /// The handle may already be gone if the process is concurrently releasing its references.
+    pub(crate) fn close_fd_handle(&self, handle: ObjectHandle) {
+        drop(self.remove_object_reference(handle, true));
+    }
+
+    fn remove_object_reference(&self, handle: ObjectHandle, fd: bool) -> Result<ObjectReference> {
         let mut process_references = self.references.lock();
         let reference_handles = &mut process_references.handles;
         let mut references = self.core.references.write();
@@ -2986,7 +3109,7 @@ impl BrokerProcess {
         // reach the shared rollback below instead of dropping the removed
         // reference while either reference-index lock is held.
         let removal_result = (|| {
-            if reference.owner != self.key {
+            if reference.owner != self.key || reference.fd_owned != fd {
                 return Err(BrokerError::UnknownObject);
             }
             if reference_handles.get(index) != Some(&handle) {
@@ -3085,6 +3208,8 @@ impl BrokerProcess {
         let cwd = self.fs_state.cwd.lock().take();
         drop(cwd);
         self.segments.lock().close();
+        self.revoke_pending_fd_access();
+        self.retire_fds();
         let mut invariant_fault = self.references.lock().pending_handles != 0;
         loop {
             let Some(handle) = self.references.lock().handles.pop() else {
@@ -4395,11 +4520,15 @@ mod tests {
             .unwrap();
         parent.complete_start().unwrap();
         let parent_id = parent.id();
-        for resource in ResourceKind::ALL {
-            assert_eq!(
-                parent.get_resource_limit(parent_id, resource),
-                Ok(ResourceLimit::UNLIMITED)
-            );
+        for (resource, default) in [
+            (ResourceKind::CpuTime, ResourceLimit::UNLIMITED),
+            (ResourceKind::Tasks, ResourceLimit::UNLIMITED),
+            (
+                ResourceKind::OpenFiles,
+                ResourceLimit::new(1024, 4096).unwrap(),
+            ),
+        ] {
+            assert_eq!(parent.get_resource_limit(parent_id, resource), Ok(default));
         }
         let limit = ResourceLimit::new(2, 5).unwrap();
         assert_eq!(
@@ -4653,6 +4782,10 @@ mod tests {
             [
                 (ResourceKind::CpuTime, cpu_limit),
                 (ResourceKind::Tasks, ResourceLimit::UNLIMITED),
+                (
+                    ResourceKind::OpenFiles,
+                    ResourceKind::OpenFiles.default_limit()
+                ),
             ]
         );
 

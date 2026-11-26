@@ -8,6 +8,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_protocol::fd::FdResponse;
 use litebox_broker_protocol::fs::{
     DirectoryReadMode, DirectoryRecordBudget, FileAccessMode, FileDirectoryEntry, FileError,
     FileLockOperation, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
@@ -165,8 +166,51 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         Ok(File::new(self, broker, handle))
     }
 
+    /// Opens a file and installs it in the selected process's descriptor table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_fd(
+        &self,
+        pending_child: Option<ProcessId>,
+        context: &Context,
+        dir: DirectoryAnchor<'_, Platform>,
+        path: &str,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+        mode: Mode,
+        cloexec: bool,
+    ) -> Result<Result<FdResponse, OpenError>, ErrorCode> {
+        let broker = self.broker_control().ok_or(ErrorCode::PeerClosed)?;
+        let dir = match Self::path_anchor(&broker, dir, path) {
+            Ok(dir) => dir,
+            Err(error) => return Ok(Err(error.into())),
+        };
+        match broker.open_fd(
+            pending_child,
+            dir,
+            path,
+            context.acting_user(),
+            access,
+            flags,
+            mode & Mode::SUPPORTED,
+            cloexec,
+        )? {
+            FdResponse::FileFailed(error) => Ok(Err(error.into())),
+            response => Ok(Ok(response)),
+        }
+    }
+
+    /// Wraps a descriptor-table handle without owning it.
+    pub fn borrow_fd_file(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<File<Platform>, crate::process::ProcessError> {
+        let mut file = self.adopt_inherited_file(handle)?;
+        file.owns_handle = false;
+        Ok(file)
+    }
+
     /// Returns the file this process inherited from its parent as `handle`
-    /// through [`PendingChild::inherit`](crate::process::PendingChild::inherit),
+    /// through [`PendingChild::inherit_file`](crate::process::PendingChild::inherit_file),
     /// or received with Unix socket data.
     ///
     /// The file owns `handle`, so callers adopt each handle once and share the
@@ -395,6 +439,7 @@ impl Default for Context {
 pub struct File<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
+    owns_handle: bool,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     /// Waiters on the file, registered when the file is first waited on or
     /// polled to receive the readiness the broker publishes for it.
@@ -410,6 +455,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> File<Platform> {
         Self {
             broker,
             handle,
+            owns_handle: true,
             pollable_registry: litebox.broker_pollable_registry(),
             pollee: spin::Once::new(),
         }
@@ -722,10 +768,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable for Fi
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> Drop for File<Platform> {
     fn drop(&mut self) {
         // Stop receiving the file's readiness before the broker releases its handle.
-        if self.pollee.get().is_some() {
-            self.pollable_registry.unregister_pollable(self.handle);
+        if let Some(pollee) = self.pollee.get() {
+            self.pollable_registry
+                .unregister_pollable(self.handle, pollee);
         }
-        let _ = self.broker.close_object(self.handle);
+        if self.owns_handle {
+            let _ = self.broker.close_object(self.handle);
+        }
     }
 }
 

@@ -7,24 +7,19 @@ use alloc::sync::Arc;
 
 use litebox::{
     event::{Events, IOPollable, observer::Observer},
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     process::{PendingChild, Process, ProcessError},
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_broker_protocol::{ObjectHandle, ProcessId, fs::FileOpenFlags};
-use litebox_common_linux::{FileDescriptorFlags, OFlags, PidfdFlags, errno::Errno};
+use litebox_common_linux::{OFlags, PidfdFlags, errno::Errno};
 use litebox_platform::time::TimeProvider;
 
-use super::file::{AnyTypedFd, FilesState, linux_status_flags, status_flags_change};
+use super::file::{AnyTypedFd, linux_status_flags, status_flags_change};
 use crate::{GlobalState, ShimPlatform, Task, UserPtrMut};
+use litebox_broker_protocol::fd::{FdCreate, FdOperation, FdResponse};
+use litebox_broker_protocol::process::OpenProcessHandleRequest;
 
-pub(crate) struct PidfdSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
-impl<Platform: ShimPlatform> FdEnabledSubsystem for PidfdSubsystem<Platform> {
-    type Entry = PidFile<Platform>;
-}
-impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for PidFile<Platform> {}
-
-pub(crate) type PidfdFd<Platform> = TypedFd<PidfdSubsystem<Platform>>;
+pub(crate) type PidfdFd<Platform> = PidFile<Platform>;
 
 /// A pidfd, whose process handle and status flags the broker owns, so processes that share it
 /// through `fork` see one handle.
@@ -77,11 +72,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             log_unsupported!("pidfd_open with PIDFD_THREAD");
             return Err(Errno::EINVAL);
         }
-        // The shared LiteBox instance retains the parent's process identity during `vfork`.
-        if self.vfork.borrow().is_some() {
-            log_unsupported!("pidfd_open in a vfork child");
-            return Err(Errno::EINVAL);
-        }
+        let pid = self.translate_id_for_requests(pid)?;
         if pid != self.pid && self.process().has_thread(pid) {
             return Err(Errno::ENOENT);
         }
@@ -90,93 +81,51 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             FileOpenFlags::NONE
         };
-        let process = match self
-            .global
-            .litebox
-            .open_process(ProcessId(pid.cast_unsigned()), status)
-        {
-            Ok(process) => process,
-            Err(ProcessError::NoSuchProcess) => {
-                return Err(match self.thread_owner(pid) {
-                    Ok(_) => Errno::ENOENT,
-                    Err(error) => error.into(),
-                });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let raw_fd = self.install_pidfd(&self.files.borrow(), process, None)?;
-        Ok(u32::try_from(raw_fd).unwrap())
+        Ok(self
+            .create_fds(
+                FdCreate::Pidfd(OpenProcessHandleRequest {
+                    process_id: ProcessId(pid.cast_unsigned()),
+                    flags: status,
+                }),
+                true,
+            )?
+            .0
+            .number)
     }
 
-    /// Installs a pidfd for the pending `child` in `files`, as `CLONE_PIDFD` does, stores its
-    /// number at `dest`, and returns it.
+    /// Installs CLONE_PIDFD in the parent after the child table is copied.
     pub(crate) fn install_child_pidfd(
         &self,
-        files: &FilesState<Platform>,
         child: &PendingChild,
         dest: UserPtrMut<i32>,
-    ) -> Result<usize, Errno> {
-        let process = self
-            .global
-            .litebox
-            .open_process(child.identity().process_id, FileOpenFlags::NONE)?;
-        self.install_pidfd(files, process, Some(dest))
-    }
-
-    /// Installs a close-on-exec pidfd for `process` at the lowest free descriptor of `files`,
-    /// stores its number at `dest`, if given, and returns it.
-    pub(crate) fn install_pidfd(
-        &self,
-        files: &FilesState<Platform>,
-        process: Process<Platform>,
-        dest: Option<UserPtrMut<i32>>,
-    ) -> Result<usize, Errno> {
-        let file = PidFile {
-            process: Arc::new(process),
+    ) -> Result<u32, Errno> {
+        let files = self.files.borrow().clone();
+        let mutation = files.mutation();
+        let response = self.fd_request(FdOperation::Create {
+            object: FdCreate::Pidfd(OpenProcessHandleRequest {
+                process_id: child.identity().process_id,
+                flags: FileOpenFlags::NONE,
+            }),
+            cloexec: true,
+        })?;
+        let FdResponse::Installed {
+            first, revision, ..
+        } = response
+        else {
+            return Err(self
+                .cache_installed(&mutation, response)
+                .err()
+                .unwrap_or(Errno::EIO));
         };
-        let mut dt = self.global.litebox.descriptor_table_mut();
-        let typed = dt.insert::<PidfdSubsystem<Platform>>(file);
-        let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
-        assert!(old.is_none());
-        drop(dt);
-        // The insert, the store, and any rollback share one acquisition of the lock, so no other
-        // thread can see or replace the descriptor before the store fails.
-        let mut rds = files.raw_descriptor_store.write();
-        let raw_fd = match files.insert_raw_fd_locked(&mut rds, typed) {
-            Ok(raw_fd) => raw_fd,
-            Err(typed) => {
-                drop(rds);
-                self.remove_and_drop_descriptor(&typed);
-                return Err(Errno::EMFILE);
-            }
-        };
-        if let Some(dest) = dest {
-            let number = i32::try_from(raw_fd).unwrap();
-            if dest.write_at_offset::<Platform>(0, number).is_none() {
-                let fd = rds
-                    .fd_consume_raw_integer::<PidfdSubsystem<Platform>>(raw_fd)
-                    .unwrap();
-                drop(rds);
-                self.remove_and_drop_descriptor(&fd);
-                return Err(Errno::EFAULT);
-            }
+        if dest
+            .write_at_offset::<Platform>(0, first.number.cast_signed())
+            .is_none()
+        {
+            self.rollback_fds(&mutation, first.number, None, revision);
+            return Err(Errno::EFAULT);
         }
-        Ok(raw_fd)
-    }
-
-    /// Closes the pidfd [`Self::install_child_pidfd`] installed at `raw_fd` in this task's
-    /// descriptor table for a child that failed to start.
-    ///
-    /// The other threads must have stayed paused since, so that none could see the pidfd.
-    pub(crate) fn remove_child_pidfd(&self, raw_fd: usize) {
-        let fd = self
-            .files
-            .borrow()
-            .raw_descriptor_store
-            .write()
-            .fd_consume_raw_integer::<PidfdSubsystem<Platform>>(raw_fd)
-            .expect("the other threads are paused");
-        self.remove_and_drop_descriptor(&fd);
+        self.cache_installed(&mutation, response)?;
+        Ok(first.number)
     }
 
     /// Runs `f` on the pidfd at `fd`, failing with `EBADF` if `fd` is not a pidfd.
@@ -199,26 +148,15 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &PidfdFd<Platform>,
         f: impl FnOnce(&PidFile<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
-        let handle = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(Errno::EBADF)?;
-        handle.with_entry(f)
+        f(fd)
     }
 
-    /// Adopts a pidfd this process inherited from its parent, or received with Unix socket
-    /// data, as `handle`.
-    pub(crate) fn adopt_inherited_pidfd(
+    pub(crate) fn borrow_pidfd(
         &self,
         handle: ObjectHandle,
     ) -> Result<PidfdFd<Platform>, ProcessError> {
-        let process = self.litebox.adopt_inherited_process(handle)?;
-        Ok(self
-            .litebox
-            .descriptor_table_mut()
-            .insert::<PidfdSubsystem<Platform>>(PidFile {
-                process: Arc::new(process),
-            }))
+        Ok(PidFile {
+            process: Arc::new(self.litebox.borrow_fd_process(handle)?),
+        })
     }
 }

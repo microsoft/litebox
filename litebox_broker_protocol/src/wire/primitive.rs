@@ -19,7 +19,7 @@ use super::{Wire, WireError};
 
 #[derive(Default)]
 pub(crate) struct Encoder {
-    bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
 }
 
 impl Encoder {
@@ -38,7 +38,7 @@ pub(crate) struct Decoder<'a> {
 }
 
 impl<'a> Decoder<'a> {
-    pub(super) const fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 

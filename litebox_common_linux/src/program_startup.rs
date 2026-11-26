@@ -11,8 +11,6 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
-use litebox_broker_protocol::unix_socket::{ENCODED_TRANSFERRED_OBJECT_SIZE, TransferredObject};
-use litebox_broker_protocol::{ObjectHandle, ObjectKind};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::GuestVectorState;
@@ -23,7 +21,7 @@ use crate::{PtRegs, ResourceLimitValues, TASK_COMM_LEN};
 use litebox::arch::aarch64::vector::SveVectorLength;
 
 const HEADER_SIZE: usize = size_of::<u8>()
-    + size_of::<[u32; 12]>()
+    + size_of::<[u32; 11]>()
     + size_of::<[u64; 2]>()
     + size_of::<ResourceLimitValues>()
     + size_of::<u8>()
@@ -39,12 +37,10 @@ pub enum InheritedCwd {
     Path(String),
 }
 
-/// Size of an inherited descriptor's number followed by its encoded [`TransferredObject`].
-const INHERITED_FD_SIZE: usize = size_of::<u32>() + ENCODED_TRANSFERRED_OBJECT_SIZE as usize;
 /// Size of a memory region's start, end, and flags.
 const FORK_REGION_SIZE: usize = size_of::<[u64; 2]>() + size_of::<u32>();
-const PROGRAM_STARTUP_TAG: u8 = 0;
-const FORK_STARTUP_TAG: u8 = 1;
+const PROGRAM_STARTUP_TAG: u8 = 2;
+const FORK_STARTUP_TAG: u8 = 3;
 
 /// Linux startup of a child process in a fresh runner.
 pub enum LinuxProcessStartup {
@@ -108,8 +104,6 @@ pub struct LinuxProgramStartup {
     pub argv: Vec<CString>,
     /// Program environment.
     pub envp: Vec<CString>,
-    /// Descriptors the program inherits, in strictly ascending descriptor order.
-    pub inherited_fds: Vec<InheritedFd>,
 }
 
 /// Queued signals pending for a process that starts a program, with each instance's `siginfo`.
@@ -122,25 +116,6 @@ pub struct PendingSignalQueues {
     pub process: Vec<Siginfo>,
     /// Signals pending for the thread that starts the program, which becomes its main thread.
     pub thread: Vec<Siginfo>,
-}
-
-/// A descriptor inherited across `execve`, as Linux keeps every descriptor not marked
-/// close-on-exec.
-///
-/// This is the Linux startup record for a descriptor whose object the parent passed to the child
-/// as a [`litebox::process::InheritableFd`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InheritedFd {
-    /// Descriptor number.
-    pub fd: u32,
-    /// The child's broker handle to the descriptor's object, as returned by
-    /// [`litebox::process::PendingChild::inherit`].
-    ///
-    /// Descriptors with the same handle share one open file description, whose kind is taken from
-    /// the first of them.
-    pub handle: ObjectHandle,
-    /// What the descriptor refers to.
-    pub kind: ObjectKind,
 }
 
 /// Linux process state needed to continue a child duplicated by `fork` in a fresh runner.
@@ -198,8 +173,6 @@ pub struct LinuxForkStartup {
     ///
     /// Native fork leaves this empty because the inherited manager already owns the mappings.
     pub regions: Vec<ForkMemoryRegion>,
-    /// Descriptors the child inherits, in strictly ascending descriptor order.
-    pub fds: Vec<ForkedFd>,
 }
 
 /// A memory region of a process duplicated by `fork`.
@@ -219,15 +192,6 @@ impl ForkMemoryRegion {
         self.flags
             .intersects(VmFlags::VM_ACCESS_FLAGS | VmFlags::VM_HAS_CONTENTS)
     }
-}
-
-/// A descriptor a child duplicated by `fork` inherits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ForkedFd {
-    /// The descriptor and the child's broker handle to its object.
-    pub inherited: InheritedFd,
-    /// Whether the descriptor is closed on `execve`.
-    pub close_on_exec: bool,
 }
 
 /// Invalid or unsupported Linux program startup data.
@@ -293,11 +257,6 @@ impl LinuxProgramStartup {
             &mut output,
             u32::try_from(self.envp.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
         );
-        push_u32(
-            &mut output,
-            u32::try_from(self.inherited_fds.len())
-                .map_err(|_| LinuxProgramStartupError::TooLarge)?,
-        );
         for queue in [&self.pending_signals.process, &self.pending_signals.thread] {
             push_u32(
                 &mut output,
@@ -321,9 +280,6 @@ impl LinuxProgramStartup {
             .chain(&self.pending_signals.thread)
         {
             output.extend_from_slice(siginfo.as_bytes());
-        }
-        for inherited in &self.inherited_fds {
-            inherited.encode(&mut output);
         }
         debug_assert_eq!(output.len(), encoded_len);
         Ok(output)
@@ -356,8 +312,6 @@ impl LinuxProgramStartup {
         let argv_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let envp_count = usize::try_from(read_u32(&mut input)?)
-            .map_err(|_| LinuxProgramStartupError::Malformed)?;
-        let inherited_fd_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let process_signal_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
@@ -392,16 +346,6 @@ impl LinuxProgramStartup {
             process: read_signals(&mut input, process_signal_count)?,
             thread: read_signals(&mut input, thread_signal_count)?,
         };
-        if inherited_fd_count > input.len() / INHERITED_FD_SIZE {
-            return Err(LinuxProgramStartupError::Malformed);
-        }
-        let mut inherited_fds = Vec::new();
-        inherited_fds
-            .try_reserve_exact(inherited_fd_count)
-            .map_err(|_| LinuxProgramStartupError::TooLarge)?;
-        for _ in 0..inherited_fd_count {
-            inherited_fds.push(InheritedFd::decode(&mut input)?);
-        }
         if !input.is_empty() {
             return Err(LinuxProgramStartupError::Malformed);
         }
@@ -423,7 +367,6 @@ impl LinuxProgramStartup {
             execfn,
             argv: values,
             envp,
-            inherited_fds,
         };
         validate(&startup)?;
         Ok(startup)
@@ -463,20 +406,14 @@ impl LinuxForkStartup {
         output.extend_from_slice(self.resource_limits.as_bytes());
         output.push(u8::from(self.dumpable));
         output.push(u8::from(self.no_new_privs));
-        for count in [self.regions.len(), self.fds.len()] {
-            push_u32(
-                &mut output,
-                u32::try_from(count).map_err(|_| LinuxProgramStartupError::TooLarge)?,
-            );
-        }
+        push_u32(
+            &mut output,
+            u32::try_from(self.regions.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
+        );
         for region in &self.regions {
             push_u64(&mut output, region.range.start as u64);
             push_u64(&mut output, region.range.end as u64);
             push_u32(&mut output, region.flags.bits());
-        }
-        for fd in &self.fds {
-            fd.inherited.encode(&mut output);
-            output.push(u8::from(fd.close_on_exec));
         }
         if output.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
             return Err(LinuxProgramStartupError::TooLarge);
@@ -524,8 +461,6 @@ impl LinuxForkStartup {
         let no_new_privs = read_bool(&mut input)?;
         let region_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
-        let fd_count = usize::try_from(read_u32(&mut input)?)
-            .map_err(|_| LinuxProgramStartupError::Malformed)?;
         if region_count > input.len() / FORK_REGION_SIZE {
             return Err(LinuxProgramStartupError::Malformed);
         }
@@ -538,18 +473,6 @@ impl LinuxForkStartup {
             regions.push(ForkMemoryRegion {
                 range: start..end,
                 flags,
-            });
-        }
-        if fd_count > input.len() / (INHERITED_FD_SIZE + size_of::<u8>()) {
-            return Err(LinuxProgramStartupError::Malformed);
-        }
-        let mut fds = Vec::with_capacity(fd_count);
-        for _ in 0..fd_count {
-            let inherited = InheritedFd::decode(&mut input)?;
-            let close_on_exec = read_bool(&mut input)?;
-            fds.push(ForkedFd {
-                inherited,
-                close_on_exec,
             });
         }
         if !input.is_empty() {
@@ -582,37 +505,9 @@ impl LinuxForkStartup {
             initial_program_break,
             program_break,
             regions,
-            fds,
         };
         validate_fork(&startup)?;
         Ok(startup)
-    }
-}
-
-impl InheritedFd {
-    fn encode(&self, output: &mut Vec<u8>) {
-        push_u32(output, self.fd);
-        output.extend_from_slice(
-            &TransferredObject {
-                handle: self.handle,
-                kind: self.kind,
-            }
-            .encode(),
-        );
-    }
-
-    fn decode(input: &mut &[u8]) -> Result<Self, LinuxProgramStartupError> {
-        let fd = read_u32(input)?;
-        let object = take_bytes(input, ENCODED_TRANSFERRED_OBJECT_SIZE as usize)?
-            .try_into()
-            .ok()
-            .and_then(|encoded| TransferredObject::decode(encoded).ok())
-            .ok_or(LinuxProgramStartupError::Malformed)?;
-        Ok(Self {
-            fd,
-            handle: object.handle,
-            kind: object.kind,
-        })
     }
 }
 
@@ -655,13 +550,6 @@ fn validate_fork(startup: &LinuxForkStartup) -> Result<(), LinuxProgramStartupEr
         }
         previous_end = region.range.end;
     }
-    if startup
-        .fds
-        .windows(2)
-        .any(|pair| pair[0].inherited.fd >= pair[1].inherited.fd)
-    {
-        return Err(LinuxProgramStartupError::Malformed);
-    }
     Ok(())
 }
 
@@ -697,14 +585,6 @@ fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStart
         length = length
             .checked_add(size_of::<u32>())
             .and_then(|length| length.checked_add(value.as_bytes().len()))
-            .ok_or(LinuxProgramStartupError::TooLarge)?;
-        if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
-            return Err(LinuxProgramStartupError::TooLarge);
-        }
-    }
-    for _ in &startup.inherited_fds {
-        length = length
-            .checked_add(INHERITED_FD_SIZE)
             .ok_or(LinuxProgramStartupError::TooLarge)?;
         if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
             return Err(LinuxProgramStartupError::TooLarge);
@@ -854,7 +734,6 @@ mod tests {
     use super::*;
     use crate::signal::{SI_USER, SiginfoData};
     use alloc::vec;
-    use litebox_broker_protocol::socket::SocketType;
 
     fn resource_limits() -> ResourceLimitValues {
         core::array::from_fn(|index| crate::Rlimit {
@@ -892,7 +771,6 @@ mod tests {
             execfn: "/child".into(),
             argv: vec![CString::new("child").unwrap()],
             envp: Vec::new(),
-            inherited_fds: Vec::new(),
         }
     }
 
@@ -965,68 +843,6 @@ mod tests {
                 CString::new("argument").unwrap(),
             ],
             envp: vec![CString::new("KEY=value").unwrap()],
-            inherited_fds: vec![
-                InheritedFd {
-                    fd: 1,
-                    handle: ObjectHandle(7),
-                    kind: ObjectKind::File,
-                },
-                InheritedFd {
-                    fd: 4,
-                    handle: ObjectHandle(u64::MAX),
-                    kind: ObjectKind::File,
-                },
-                InheritedFd {
-                    fd: 5,
-                    handle: ObjectHandle(8),
-                    kind: ObjectKind::PipeReadEnd,
-                },
-                InheritedFd {
-                    fd: 6,
-                    handle: ObjectHandle(9),
-                    kind: ObjectKind::PipeWriteEnd,
-                },
-                InheritedFd {
-                    fd: 7,
-                    handle: ObjectHandle(10),
-                    kind: ObjectKind::UnixSocket(SocketType::Datagram),
-                },
-                InheritedFd {
-                    fd: 8,
-                    handle: ObjectHandle(11),
-                    kind: ObjectKind::EventCounter,
-                },
-                InheritedFd {
-                    fd: 9,
-                    handle: ObjectHandle(12),
-                    kind: ObjectKind::Timer,
-                },
-                InheritedFd {
-                    fd: 10,
-                    handle: ObjectHandle(13),
-                    kind: ObjectKind::ReadinessQueue,
-                },
-                InheritedFd {
-                    fd: 11,
-                    handle: ObjectHandle(14),
-                    kind: ObjectKind::InetSocket(SocketType::Stream),
-                },
-                InheritedFd {
-                    fd: 12,
-                    handle: ObjectHandle(15),
-                    kind: ObjectKind::UnixSocket(SocketType::SeqPacket),
-                },
-                InheritedFd {
-                    fd: 13,
-                    handle: ObjectHandle(16),
-                    kind: ObjectKind::VsockSocket,
-                },
-                InheritedFd {
-                    fd: 14,
-                    handle: ObjectHandle(17),
-                    kind: ObjectKind::Process,
-                },
-            ],
         };
 
         assert_eq!(
@@ -1054,7 +870,6 @@ mod tests {
             execfn: "/child".into(),
             argv: vec![CString::new("").unwrap(); 1025],
             envp: Vec::new(),
-            inherited_fds: Vec::new(),
         };
 
         assert_eq!(
@@ -1140,80 +955,6 @@ mod tests {
                     flags: VmFlags::empty(),
                 },
             ],
-            fds: vec![
-                ForkedFd {
-                    inherited: InheritedFd {
-                        fd: 0,
-                        handle: ObjectHandle(7),
-                        kind: ObjectKind::File,
-                    },
-                    close_on_exec: false,
-                },
-                ForkedFd {
-                    inherited: InheritedFd {
-                        fd: 3,
-                        handle: ObjectHandle(8),
-                        kind: ObjectKind::PipeWriteEnd,
-                    },
-                    close_on_exec: true,
-                },
-                ForkedFd {
-                    inherited: InheritedFd {
-                        fd: 4,
-                        handle: ObjectHandle(9),
-                        kind: ObjectKind::UnixSocket(SocketType::Stream),
-                    },
-                    close_on_exec: false,
-                },
-                ForkedFd {
-                    inherited: InheritedFd {
-                        fd: 5,
-                        handle: ObjectHandle(10),
-                        kind: ObjectKind::EventCounter,
-                    },
-                    close_on_exec: true,
-                },
-                ForkedFd {
-                    inherited: InheritedFd {
-                        fd: 6,
-                        handle: ObjectHandle(11),
-                        kind: ObjectKind::Timer,
-                    },
-                    close_on_exec: false,
-                },
-                ForkedFd {
-                    inherited: InheritedFd {
-                        fd: 7,
-                        handle: ObjectHandle(12),
-                        kind: ObjectKind::ReadinessQueue,
-                    },
-                    close_on_exec: true,
-                },
-                ForkedFd {
-                    inherited: InheritedFd {
-                        fd: 8,
-                        handle: ObjectHandle(13),
-                        kind: ObjectKind::InetSocket(SocketType::Datagram),
-                    },
-                    close_on_exec: false,
-                },
-                ForkedFd {
-                    inherited: InheritedFd {
-                        fd: 9,
-                        handle: ObjectHandle(14),
-                        kind: ObjectKind::VsockSocket,
-                    },
-                    close_on_exec: true,
-                },
-                ForkedFd {
-                    inherited: InheritedFd {
-                        fd: 10,
-                        handle: ObjectHandle(15),
-                        kind: ObjectKind::Process,
-                    },
-                    close_on_exec: false,
-                },
-            ],
         }
     }
 
@@ -1225,7 +966,6 @@ mod tests {
             panic!("fork startup must decode as a fork");
         };
         assert_eq!(decoded.regions, startup.regions);
-        assert_eq!(decoded.fds, startup.fds);
         assert_eq!(decoded.comm, startup.comm);
         assert_eq!(decoded.signal_actions[0].restorer, 0x5678);
         assert_eq!(decoded.resource_limits, startup.resource_limits);
@@ -1267,7 +1007,7 @@ mod tests {
             Err(LinuxProgramStartupError::Malformed)
         ));
         let mut unknown = encoded;
-        unknown[0] = 2;
+        unknown[0] = 1;
         assert!(matches!(
             LinuxProcessStartup::decode(&unknown),
             Err(LinuxProgramStartupError::Malformed)
@@ -1277,12 +1017,6 @@ mod tests {
         overlapping.regions[1].range = 0x40_1000..0x40_3000;
         assert!(matches!(
             overlapping.encode(),
-            Err(LinuxProgramStartupError::Malformed)
-        ));
-        let mut unordered = startup.clone();
-        unordered.fds.swap(0, 1);
-        assert!(matches!(
-            unordered.encode(),
             Err(LinuxProgramStartupError::Malformed)
         ));
         let mut soft_above_hard = startup;

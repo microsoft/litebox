@@ -12,10 +12,13 @@ use hashbrown::HashMap;
 use litebox_broker_local::{BrokerLocal, ReceivedUnixSocket};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::ConsumeEventResponse;
+use litebox_broker_protocol::fd::{
+    FD_LIST_BUFFER_SIZE, FdCreate, FdInfo, FdOperation, FdPeer, FdRequest, FdResponse,
+};
 use litebox_broker_protocol::fs::{
     DirectoryReadMode, FileAccessMode, FileDirectoryEntry, FileError, FileLockOperation, FileMode,
     FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
-    MapFileResponse, PathAnchor, ReadDirectoryResponse, SetFileTimes,
+    MapFileResponse, OpenFileRequest, PathAnchor, ReadDirectoryResponse, SetFileTimes,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
@@ -882,6 +885,32 @@ pub(crate) trait BrokerControl: SegmentControl {
 
     fn futex_disarm(&self, waiter: ObjectHandle) -> core::result::Result<bool, BrokerControlError>;
 
+    fn fd_request(&self, request: FdRequest) -> Result<FdResponse, BrokerControlError>;
+
+    fn accept_unix_fd(
+        &self,
+        request: FdRequest,
+    ) -> Result<(FdResponse, Option<UnixSocketName>), BrokerControlError>;
+
+    fn list_fds(
+        &self,
+        pending_child: Option<ProcessId>,
+        exec: bool,
+    ) -> Result<(u64, Vec<FdInfo>), BrokerControlError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_fd(
+        &self,
+        pending_child: Option<ProcessId>,
+        dir: PathAnchor,
+        path: &str,
+        user: FileUser,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+        mode: FileMode,
+        cloexec: bool,
+    ) -> Result<FdResponse, BrokerControlError>;
+
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 
     fn fail_connection(&self);
@@ -899,15 +928,18 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
     }
 
     pub(crate) fn register_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
-        let previous = self.pollables.lock().insert(handle, Arc::downgrade(pollee));
-        assert!(
-            previous.is_none(),
-            "broker handle already has a registered pollable"
-        );
+        // A borrowed view's last Arc can disappear just before its destructor unregisters.
+        self.pollables.lock().insert(handle, Arc::downgrade(pollee));
     }
 
-    pub(crate) fn unregister_pollable(&self, handle: ObjectHandle) {
-        self.pollables.lock().remove(&handle);
+    pub(crate) fn unregister_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
+        let mut pollables = self.pollables.lock();
+        if pollables
+            .get(&handle)
+            .is_some_and(|current| core::ptr::eq(current.as_ptr(), Arc::as_ptr(pollee)))
+        {
+            pollables.remove(&handle);
+        }
     }
 
     pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessFlags)
@@ -2362,6 +2394,71 @@ where
 
     fn futex_disarm(&self, waiter: ObjectHandle) -> core::result::Result<bool, BrokerControlError> {
         self.request(|local| local.futex_disarm(waiter))
+    }
+
+    fn fd_request(&self, request: FdRequest) -> Result<FdResponse, BrokerControlError> {
+        self.request(|local| local.fd_request(request))
+    }
+
+    fn accept_unix_fd(
+        &self,
+        mut request: FdRequest,
+    ) -> Result<(FdResponse, Option<UnixSocketName>), BrokerControlError> {
+        let FdOperation::Create {
+            object: FdCreate::AcceptUnix { name, .. },
+            ..
+        } = &mut request.operation
+        else {
+            return Err(BrokerControlError::Broker(ErrorCode::InvalidArgument));
+        };
+        let lease = self.acquire_shared_buffer(MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize)?;
+        let buffer = lease.sequence();
+        *name = Some(buffer);
+        self.request(|local| {
+            let response = local.fd_request(request)?;
+            let peer = if let FdResponse::Installed {
+                peer: Some(FdPeer::Unix(len)),
+                ..
+            } = response
+            {
+                Some(local.fd_unix_peer(buffer, len)?)
+            } else {
+                None
+            };
+            Ok((response, peer))
+        })
+    }
+
+    fn list_fds(
+        &self,
+        pending_child: Option<ProcessId>,
+        exec: bool,
+    ) -> Result<(u64, Vec<FdInfo>), BrokerControlError> {
+        let lease = self.acquire_shared_buffer(FD_LIST_BUFFER_SIZE as usize)?;
+        self.request(|local| local.list_fds(pending_child, lease.sequence(), exec))
+    }
+
+    fn open_fd(
+        &self,
+        pending_child: Option<ProcessId>,
+        dir: PathAnchor,
+        path: &str,
+        user: FileUser,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+        mode: FileMode,
+        cloexec: bool,
+    ) -> Result<FdResponse, BrokerControlError> {
+        let lease = self.acquire_file_path_buffer(path)?;
+        let request = OpenFileRequest {
+            dir,
+            path: lease.sequence(),
+            user,
+            access,
+            flags,
+            mode,
+        };
+        self.request(|local| local.open_fd(pending_child, request, path, cloexec))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {

@@ -12,12 +12,9 @@ use litebox::{
         Events, IOPollable,
         observer::Observer,
         polling::TryOpError,
-        readiness_queue::{
-            ReadinessInterest, ReadinessQueue, ReadinessQueueError, ReadinessTarget,
-        },
+        readiness_queue::{ReadinessInterest, ReadinessQueue, ReadinessTarget},
         wait::{WaitContext, WaitError, Waker},
     },
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     process::ProcessError,
     utils::ReinterpretUnsignedExt,
 };
@@ -39,13 +36,7 @@ use super::{
 };
 use crate::{GlobalState, ShimPlatform};
 
-pub(crate) struct EpollSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
-impl<Platform: ShimPlatform> FdEnabledSubsystem for EpollSubsystem<Platform> {
-    type Entry = EpollFile<Platform>;
-}
-impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for EpollFile<Platform> {}
-
-pub(crate) type EpollFd<Platform> = TypedFd<EpollSubsystem<Platform>>;
+pub(crate) type EpollFd<Platform> = EpollFile<Platform>;
 
 bitflags::bitflags! {
     /// Linux's epoll flags.
@@ -72,81 +63,39 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
 
 impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
     pub fn try_from(files: &FilesState<Platform>, raw_fd: usize) -> Result<Self, Errno> {
-        let rds = files.raw_descriptor_store.read();
-        if let Ok(fd) = rds.fd_from_raw_integer::<super::file::FileSubsystem<Platform>>(raw_fd) {
-            return Ok(EpollDescriptor::File(fd));
-        }
-        if let Ok(fd) =
-            rds.fd_from_raw_integer::<super::inet::InetSocketSubsystem<Platform>>(raw_fd)
-        {
-            return Ok(EpollDescriptor::Inet(fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer::<super::pipe::PipeSubsystem<Platform>>(raw_fd) {
-            return Ok(EpollDescriptor::Pipe(fd));
-        }
-        if let Ok(fd) =
-            rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem<Platform>>(raw_fd)
-        {
-            return Ok(EpollDescriptor::Eventfd(fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<Platform>>(raw_fd) {
-            return Ok(EpollDescriptor::Epoll(fd));
-        }
-        if let Ok(fd) =
-            rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<Platform>>(raw_fd)
-        {
-            return Ok(EpollDescriptor::Unix(fd));
-        }
-        if let Ok(fd) =
-            rds.fd_from_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
-        {
-            return Ok(EpollDescriptor::Timerfd(fd));
-        }
-        if let Ok(fd) =
-            rds.fd_from_raw_integer::<super::vsock::VsockSocketSubsystem<Platform>>(raw_fd)
-        {
-            return Ok(EpollDescriptor::Vsock(fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer::<super::pidfd::PidfdSubsystem<Platform>>(raw_fd) {
-            return Ok(EpollDescriptor::Pidfd(fd));
-        }
-        Err(Errno::EBADF)
+        use super::file::AnyTypedFd;
+        Ok(match files.typed_fd_from_raw(raw_fd)? {
+            AnyTypedFd::File(fd) => Self::File(fd),
+            AnyTypedFd::Inet(fd) => Self::Inet(fd),
+            AnyTypedFd::Pipe(fd) => Self::Pipe(fd),
+            AnyTypedFd::Eventfd(fd) => Self::Eventfd(fd),
+            AnyTypedFd::Epoll(fd) => Self::Epoll(fd),
+            AnyTypedFd::Unix(fd) => Self::Unix(fd),
+            AnyTypedFd::Timerfd(fd) => Self::Timerfd(fd),
+            AnyTypedFd::Vsock(fd) => Self::Vsock(fd),
+            AnyTypedFd::Pidfd(fd) => Self::Pidfd(fd),
+        })
     }
 
     /// Returns the interesting events now and monitors their occurrence in the future if the
     /// observer is provided.
-    ///
-    /// Returns `None` if the descriptor has been closed.
-    fn poll(
-        &self,
-        global: &GlobalState<Platform>,
-        mask: Events,
-        observer: Option<Weak<dyn Observer<Events>>>,
-    ) -> Option<Events> {
+    fn poll(&self, mask: Events, observer: Option<Weak<dyn Observer<Events>>>) -> Events {
         let poll = |iop: &dyn IOPollable| {
             if let Some(observer) = observer {
                 iop.register_observer(observer, mask);
             }
             iop.check_io_events() & (mask | Events::ALWAYS_POLLED)
         };
-        // Like in-flight operations, polling releases the table lock before using (and dropping)
-        // its entry handle, so it never finalizes an entry under the lock.
-        macro_rules! poll_entry {
-            ($fd:expr) => {{
-                let handle = global.litebox.descriptor_table().entry_handle($fd)?;
-                Some(handle.with_entry(|entry| poll(entry)))
-            }};
-        }
         match self {
-            EpollDescriptor::Eventfd(fd) => poll_entry!(fd),
-            EpollDescriptor::Epoll(fd) => poll_entry!(fd),
-            EpollDescriptor::File(fd) => poll_entry!(fd),
-            EpollDescriptor::Inet(fd) => poll_entry!(fd),
-            EpollDescriptor::Pipe(fd) => poll_entry!(fd),
-            EpollDescriptor::Unix(fd) => poll_entry!(fd),
-            EpollDescriptor::Timerfd(fd) => poll_entry!(fd),
-            EpollDescriptor::Vsock(fd) => poll_entry!(fd),
-            EpollDescriptor::Pidfd(fd) => poll_entry!(fd),
+            Self::Eventfd(fd) => poll(&**fd),
+            Self::Epoll(fd) => poll(&**fd),
+            Self::File(fd) => poll(&**fd),
+            Self::Inet(fd) => poll(&**fd),
+            Self::Pipe(fd) => poll(&**fd),
+            Self::Unix(fd) => poll(&**fd),
+            Self::Timerfd(fd) => poll(&**fd),
+            Self::Vsock(fd) => poll(&**fd),
+            Self::Pidfd(fd) => poll(&**fd),
         }
     }
 
@@ -200,21 +149,6 @@ pub(crate) struct EpollFile<Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> EpollFile<Platform> {
-    pub(crate) fn new(global: &GlobalState<Platform>) -> Result<Self, Errno> {
-        // Exhaustion means ENOSPC only for epoll_ctl's watch limit.
-        let queue = ReadinessQueue::new(&global.litebox).map_err(|error| match error {
-            ReadinessQueueError::ResourceExhausted => Errno::ENOMEM,
-            error => error.into(),
-        })?;
-        Ok(Self {
-            queue: Arc::new(queue),
-        })
-    }
-
-    pub(crate) fn queue(&self) -> &Arc<ReadinessQueue<Platform>> {
-        &self.queue
-    }
-
     /// Takes up to `maxevents` ready events, waiting for one if there are none.
     ///
     /// Returns no events if `cx` times out.
@@ -333,27 +267,16 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &EpollFd<Platform>,
         f: impl FnOnce(&EpollFile<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
-        let handle = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(Errno::EBADF)?;
-        handle.with_entry(f)
+        f(fd)
     }
 
-    /// Adopts an epoll instance this process inherited from its parent, or received with Unix
-    /// socket data, as `handle`.
-    pub(crate) fn adopt_inherited_epoll(
+    pub(crate) fn borrow_epoll(
         &self,
         handle: ObjectHandle,
     ) -> Result<EpollFd<Platform>, ProcessError> {
-        let queue = self.litebox.adopt_inherited_readiness_queue(handle)?;
-        Ok(self
-            .litebox
-            .descriptor_table_mut()
-            .insert::<EpollSubsystem<Platform>>(EpollFile {
-                queue: Arc::new(queue),
-            }))
+        Ok(EpollFile {
+            queue: Arc::new(self.litebox.borrow_fd_readiness_queue(handle)?),
+        })
     }
 }
 
@@ -398,12 +321,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
         });
     }
 
-    fn scan_once(
-        &mut self,
-        global: &GlobalState<Platform>,
-        files: &FilesState<Platform>,
-        waker: Option<&Waker<Platform>>,
-    ) -> bool {
+    fn scan_once(&mut self, files: &FilesState<Platform>, waker: Option<&Waker<Platform>>) -> bool {
         let mut is_ready = false;
         for entry in &mut self.entries {
             entry.revents = if entry.fd < 0 {
@@ -429,9 +347,7 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
                     None
                 };
                 // TODO: add machinery to unregister the observer to avoid leaks.
-                poll_descriptor
-                    .poll(global, entry.mask, observer)
-                    .unwrap_or(Events::NVAL)
+                poll_descriptor.poll(entry.mask, observer)
             } else {
                 Events::NVAL
             };
@@ -443,24 +359,23 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
     }
 
     /// Scans the poll set for ready fds once.
-    pub fn scan(&mut self, global: &GlobalState<Platform>, files: &FilesState<Platform>) {
-        self.scan_once(global, files, None);
+    pub fn scan(&mut self, files: &FilesState<Platform>) {
+        self.scan_once(files, None);
     }
 
     /// Waits for any of the fds in the poll set to become ready.
     pub fn wait(
         &mut self,
-        global: &GlobalState<Platform>,
         cx: &WaitContext<'_, Platform>,
         files: &FilesState<Platform>,
     ) -> Result<(), WaitError> {
-        if self.scan_once(global, files, None) {
+        if self.scan_once(files, None) {
             return Ok(());
         }
 
         let mut register = true;
         cx.wait_until(|| {
-            if self.scan_once(global, files, register.then_some(cx.waker())) {
+            if self.scan_once(files, register.then_some(cx.waker())) {
                 return true;
             }
             // Don't register observers again in the next iteration.
@@ -592,12 +507,12 @@ mod test {
             revents[0]
         };
 
-        set.wait(&task.global, &WaitState::new(platform()).context(), &no_fds)
+        set.wait(&WaitState::new(platform()).context(), &no_fds)
             .unwrap();
         assert_eq!(revents(&set), Events::NVAL);
 
         task.sys_write(wfd, &[1], None).unwrap();
-        set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
+        set.wait(&WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
 
@@ -605,7 +520,6 @@ mod test {
         assert_eq!(task.sys_read(rfd, &mut buf, None).unwrap(), 1);
         assert_eq!(buf, [1]);
         set.wait(
-            &task.global,
             &WaitState::new(platform())
                 .context()
                 .with_timeout(core::time::Duration::from_millis(100)),
@@ -619,7 +533,7 @@ mod test {
             assert_eq!(task.sys_write(wfd, &[1], None).unwrap(), 1);
         });
 
-        set.wait(&task.global, &WaitState::new(platform()).context(), &fds)
+        set.wait(&WaitState::new(platform()).context(), &fds)
             .unwrap();
         assert_eq!(revents(&set), Events::IN);
 

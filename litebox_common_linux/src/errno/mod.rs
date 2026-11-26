@@ -906,6 +906,7 @@ impl From<litebox::unix_socket::errors::UnixSocketError> for Errno {
                 },
                 _ => Errno::EIO,
             },
+            UnixSocketError::Closed => Errno::EBADF,
             UnixSocketError::WouldBlock => Errno::EAGAIN,
             UnixSocketError::Interrupted => Errno::EINTR,
             UnixSocketError::WaitError(error) => match error {

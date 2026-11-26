@@ -9,6 +9,7 @@ use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
     CreateEventResponse, EventConsumption,
 };
+use crate::fd::{DupTarget, FdCreate, FdInfo, FdKind, FdOperation, FdRequest, FdResponse};
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryReadMode, DirectoryRecordBudget, FileAccessMode,
     FileError, FileLockOperation, FileMode, FileNodeInfo, FileOpenFlags, FilePathResponse,
@@ -806,6 +807,35 @@ fn request_codec_round_trips_all_variants() {
             handle,
             name: SocketOptionName::SendTimeout,
         })),
+        BrokerOperation::Fd(FdRequest {
+            pending_child: Some(process_id(u32::MAX)),
+            operation: FdOperation::Create {
+                object: FdCreate::Open(OpenFileRequest {
+                    dir: PathAnchor::Object(handle),
+                    path: largest_sequence,
+                    user: FileUser { user: 1, group: 2 },
+                    access: FileAccessMode::ReadOnly,
+                    flags: FileOpenFlags::NONE,
+                    mode: FileMode::empty(),
+                }),
+                cloexec: true,
+            },
+        }),
+        BrokerOperation::Fd(FdRequest {
+            pending_child: None,
+            operation: FdOperation::Duplicate {
+                fd: 3,
+                target: DupTarget::Exact {
+                    number: 900,
+                    distinct: true
+                },
+                cloexec: false
+            },
+        }),
+        BrokerOperation::Fd(FdRequest {
+            pending_child: None,
+            operation: FdOperation::Exec(Some(largest_sequence)),
+        }),
     ];
     let mut maximum_encoded_size = 0;
 
@@ -1554,6 +1584,21 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::Error(ErrorCode::PeerClosed),
         BrokerResult::Error(ErrorCode::OutOfMemory),
         BrokerResult::Error(ErrorCode::Internal),
+        BrokerResult::Error(ErrorCode::TooManyOpenFiles),
+        BrokerResult::Fd(FdResponse::Installed {
+            first: FdInfo {
+                number: 3,
+                handle: ObjectHandle(10),
+                kind: FdKind::PipeRead
+            },
+            second: Some(FdInfo {
+                number: 4,
+                handle: ObjectHandle(11),
+                kind: FdKind::PipeWrite
+            }),
+            revision: u64::MAX,
+            peer: None,
+        }),
     ];
     let mut maximum_encoded_size = 0;
 

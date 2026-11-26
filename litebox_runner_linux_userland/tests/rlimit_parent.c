@@ -4,7 +4,7 @@
 // Checks that every resource limit can be read and set, that fork, vfork, and execve keep the
 // limits and descriptors above a lowered NOFILE limit, that a vfork child's limits are its own,
 // that real-time signals queue, and that the NPROC and CPU limits are enforced.
-// Usage: rlimit_parent [child]; with "child", exits 0 if the inherited limits are as expected.
+// Usage: rlimit_parent [child fd]; in child mode, checks the inherited limits and fd.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -22,8 +22,8 @@
 // Limits set before creating children, which every child must inherit.
 #define CORE_MAX 12345
 #define NOFILE_CUR 200
-// A descriptor opened before lowering NOFILE_CUR below it, which every child must keep.
-#define HIGH_FD 250
+// Prefer a sparse descriptor, but the native test runs under the host's NOFILE limit.
+#define PREFERRED_FD 60000
 #define RT_SIGNALS 3
 
 extern char **environ;
@@ -52,10 +52,14 @@ static int set(int resource, rlim_t cur, rlim_t max) {
     return setrlimit(resource, &limit) == 0 ? 0 : errno;
 }
 
-static int has_inherited_limits(void) {
+static rlim_t lowered_nofile(int fd) {
+    return fd < NOFILE_CUR ? (rlim_t)fd : NOFILE_CUR;
+}
+
+static int has_inherited_limits(int fd) {
     struct rlimit core = get(RLIMIT_CORE);
     return core.rlim_cur == 0 && core.rlim_max == CORE_MAX &&
-           get(RLIMIT_NOFILE).rlim_cur == NOFILE_CUR && fcntl(HIGH_FD, F_GETFD) != -1;
+           get(RLIMIT_NOFILE).rlim_cur == lowered_nofile(fd) && fcntl(fd, F_GETFD) != -1;
 }
 
 static pid_t fork_flushed(void) {
@@ -80,7 +84,7 @@ static void on_rt_signal(int signal) {
     rt_deliveries++;
 }
 
-static void check_get_and_set(void) {
+static int check_get_and_set(void) {
     for (int resource = 0; resource < RLIM_NLIMITS; resource++) {
         struct rlimit limit = get(resource);
         CHECK(limit.rlim_cur <= limit.rlim_max);
@@ -98,33 +102,43 @@ static void check_get_and_set(void) {
     CHECK(set(RLIMIT_CORE, 0, CORE_MAX + 1) == EPERM);
     struct rlimit core = get(RLIMIT_CORE);
     CHECK(core.rlim_cur == 0 && core.rlim_max == CORE_MAX);
-    CHECK(dup2(STDOUT_FILENO, HIGH_FD) == HIGH_FD);
-    CHECK(set(RLIMIT_NOFILE, NOFILE_CUR, get(RLIMIT_NOFILE).rlim_max) == 0);
+    struct rlimit nofile = get(RLIMIT_NOFILE);
+    int minimum = nofile.rlim_cur > PREFERRED_FD ? PREFERRED_FD : (int)(nofile.rlim_cur / 2);
+    if (minimum <= STDERR_FILENO) {
+        minimum = STDERR_FILENO + 1;
+    }
+    int fd = fcntl(STDOUT_FILENO, F_DUPFD, minimum);
+    if (fd == -1) {
+        perror("duplicate stdout above the new NOFILE limit");
+        exit(1);
+    }
+    CHECK(set(RLIMIT_NOFILE, lowered_nofile(fd), nofile.rlim_max) == 0);
     CHECK(prlimit(0, RLIMIT_CORE, NULL, (struct rlimit *)8) == -1 && errno == EFAULT);
     CHECK(prlimit(0, RLIMIT_CORE, (struct rlimit *)8, NULL) == -1 && errno == EFAULT);
+    return fd;
 }
 
-static void check_fork(char *self) {
+static void check_fork(char *self, int fd, char *fd_arg) {
     pid_t child = fork_flushed();
     if (child == 0) {
-        _exit(has_inherited_limits() ? 0 : 1);
+        _exit(has_inherited_limits(fd) ? 0 : 1);
     }
     CHECK(child > 0 && wait_code(child) == 0);
 
     child = fork_flushed();
     if (child == 0) {
-        char *argv[] = {self, "child", NULL};
+        char *argv[] = {self, "child", fd_arg, NULL};
         execv(self, argv);
         _exit(2);
     }
     CHECK(child > 0 && wait_code(child) == 0);
 }
 
-static void check_vfork(char *self) {
+static void check_vfork(char *self, int fd, char *fd_arg) {
     fflush(stdout);
     pid_t child = vfork();
     if (child == 0) {
-        int inherited = has_inherited_limits();
+        int inherited = has_inherited_limits(fd);
         struct rlimit core = {1, CORE_MAX};
         _exit(inherited && setrlimit(RLIMIT_CORE, &core) == 0 ? 0 : 1);
     }
@@ -132,7 +146,7 @@ static void check_vfork(char *self) {
     // The child's change was its own.
     CHECK(get(RLIMIT_CORE).rlim_cur == 0);
 
-    char *argv[] = {self, "child", NULL};
+    char *argv[] = {self, "child", fd_arg, NULL};
     fflush(stdout);
     CHECK(posix_spawn(&child, self, NULL, NULL, argv, environ) == 0);
     CHECK(wait_code(child) == 0);
@@ -194,12 +208,14 @@ static void check_cpu(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc > 1 && strcmp(argv[1], "child") == 0) {
-        return has_inherited_limits() ? 0 : 1;
+    if (argc == 3 && strcmp(argv[1], "child") == 0) {
+        return has_inherited_limits(atoi(argv[2])) ? 0 : 1;
     }
-    check_get_and_set();
-    check_fork(argv[0]);
-    check_vfork(argv[0]);
+    int fd = check_get_and_set();
+    char fd_arg[32];
+    snprintf(fd_arg, sizeof fd_arg, "%d", fd);
+    check_fork(argv[0], fd, fd_arg);
+    check_vfork(argv[0], fd, fd_arg);
     check_rt_signals();
     check_nproc();
     check_cpu();
