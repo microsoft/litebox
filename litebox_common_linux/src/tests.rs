@@ -307,7 +307,7 @@ fn riscv64_decodes_fstatat_but_not_legacy_renameat() {
         (dirfd, pathname.as_usize(), buf.as_usize()),
         (AT_FDCWD, 0x2_0000, 0x3_0000)
     );
-    regs.a7 = 38; // __NR_renameat on arm64 only, not RV64.
+    regs.a7 = 38; // Generic __NR_renameat, which RV64's table omits.
     assert!(matches!(
         SyscallRequest::try_from_raw(regs.syscall_number(), &regs, |_| {}),
         Err(errno::Errno::ENOSYS)

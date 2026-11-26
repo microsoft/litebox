@@ -428,7 +428,7 @@ pub struct FileStat {
     pub __unused: [i64; 3],
 }
 
-/// Linux's 64-bit `struct stat` from `asm-generic/stat.h`.
+/// Linux's generic `struct stat` from `asm-generic/stat.h`, in its LP64 layout.
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 #[repr(C)]
 #[derive(Clone, Default, PartialEq, Debug, FromBytes, IntoBytes)]
@@ -1586,7 +1586,7 @@ pub struct Ucred {
     pub gid: u32,
 }
 
-// Both fields of the Linux UAPI `__kernel_old_timeval` are signed longs on LP64.
+// Linux's LP64 `__kernel_old_time_t` and `__kernel_suseconds_t` are both signed `long`.
 cfg_if::cfg_if! {
     if #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))] {
         pub type time_t = i64;
@@ -1699,8 +1699,9 @@ pub struct TimeVal {
 }
 
 impl TimeVal {
-    /// Linux `select` carries whole seconds out of `tv_usec` before validating
-    /// the timeout. Interval timers instead require an already normalized value.
+    /// Converts a `select` timeout. Like Linux, this carries whole seconds out of
+    /// `tv_usec` before validating; the plain `TryFrom` conversion requires a
+    /// normalized value.
     fn select_timeout(self) -> Result<Duration, errno::Errno> {
         let normalized = Self {
             tv_sec: self
@@ -4586,14 +4587,15 @@ pub struct PtRegs {
 #[repr(C)]
 #[derive(Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 pub struct PtRegs {
-    /// Guest resume PC, not the return address inside a rewritten syscall gate.
+    /// Guest resume PC, not the gate continuation in live `t0`.
     pub pc: usize,
     pub ra: usize,
     pub sp: usize,
-    /// Guest-visible `gp`, not the runner's physical gate pointer.
+    /// Guest-visible `gp`, not physical `gp`, which points to runner TLS.
     pub gp: usize,
     /// Guest TLS pointer.
     pub tp: usize,
+    /// Guest `t0` (the gate's `spill`), not the live continuation.
     pub t0: usize,
     pub t1: usize,
     pub t2: usize,
@@ -4729,7 +4731,10 @@ impl PtRegs {
         true
     }
 
-    /// RV64GC PCs must be halfword-aligned. The guest frame contains no privileged state.
+    /// Validates the context for return to RV64 Linux user mode.
+    ///
+    /// Returns `false` if `pc` or `sp` are outside the RV64 user address range, or if
+    /// `pc` is not 2-byte aligned. The frame holds no privileged state, so nothing is modified.
     #[cfg(target_arch = "riscv64")]
     #[must_use]
     pub fn sanitize_for_user_return(&mut self) -> bool {
@@ -4742,6 +4747,7 @@ impl PtRegs {
         {
             self.orig_rax
         }
+        // AArch64 syscall ABI: `w8`, mirrored in `pt_regs::syscallno`.
         #[cfg(target_arch = "aarch64")]
         {
             self.syscallno.cast_unsigned() as usize
