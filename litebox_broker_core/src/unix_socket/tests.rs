@@ -1677,19 +1677,29 @@ fn references_in_flight_are_limited_per_sender() {
     let process = &fixture.process;
     let (sender, reader) = fixture.pair(SocketType::Datagram);
     let (first, second) = fixture.pipe();
-    // Each sent reference stays in flight after the sender's own closes.
-    for _ in 0..4 {
+    // Each queued message keeps its references in flight.
+    for _ in 0..3 {
         assert_eq!(
             fixture.send_objects(process, sender, b"x", &[first, second]),
             Ok(1)
         );
     }
+    // The third object exceeds the limit after the first two fit, and the
+    // failed send must release the two it counted.
+    assert_eq!(
+        fixture.send_objects(process, sender, b"x", &[first, second, first]),
+        Err(UnixSocketError::TooManyReferences)
+    );
+    assert_eq!(
+        fixture.send_objects(process, sender, b"x", &[first, second]),
+        Ok(1)
+    );
     assert_eq!(
         fixture.send_objects(process, sender, b"x", &[first]),
         Err(UnixSocketError::TooManyReferences)
     );
-    // A send that fails leaves the count as it was.
-    assert_eq!(process.unix_socket_references.load(Ordering::Relaxed), 8);
+    // Receiving a message, even discarding its objects, takes them out of
+    // flight.
     let (_, received) = fixture.receive_objects(process, reader, 8, 0, false);
     assert!(received.objects_truncated);
     assert_eq!(
