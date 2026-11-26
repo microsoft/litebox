@@ -257,7 +257,7 @@ jobs:
         # A boot runs all of a test's programs, some 70s in CI: TIMEOUT leaves room for slow runners.
         run: |
           TIMEOUT=300 VMM=cloud-hypervisor VM_CPUS=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
-            ./dev_tools/run_linux_on_vm_userland.sh -t hosted -t hosted_dedicated -t hosted_root_init
+            ./dev_tools/run_linux_on_vm_userland.sh -t hosted -t hosted_dedicated -t hosted_init
       - name: Run threaded Linux programs in a Cloud Hypervisor VM with stacked runners on 4 CPUs, release
         run: |
           VMM=cloud-hypervisor VM_CPUS=4 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \

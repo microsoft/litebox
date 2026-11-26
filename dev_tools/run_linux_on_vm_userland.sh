@@ -57,8 +57,13 @@
 #   hosted_dedicated: the runs of
 #     litebox_runner_vm_kernel/tests/hosted_dedicated.json, as its dedicated
 #     tests run them, with their arguments, and checks of their output.
-#   hosted_root_init: an init test, root_init.c, as litebox.init, which must
-#     also print `root-init survived`.
+#   hosted_init: a boot each of litebox_runner_vm_kernel/tests/hosted_init.json's
+#     programs, which, as the hosted runner's first process, expect to be
+#     process 1 with no parent: each is litebox.init, an ordinary process (with
+#     litebox.root_process_as_init=0, so debug kernels only), or, with
+#     `as_init`, the guest's init; its exit status (`expect_status`) and console
+#     (`expect_console_contains`) are checked. One with arguments starts
+#     through hosted_init.c, which execs the command line in a file.
 # hosted and hosted_dedicated run every program, even after one fails, and
 # their failures name each program that failed.
 # Their root also has dash as /bin/sh, a /tmp, and a directory /held/lower,
@@ -125,6 +130,7 @@ USERLAND_DIR="$REPO_DIR/litebox_runner_linux_on_vm_userland"
 TESTS_DIR="$KERNEL_DIR/tests/linux"
 HOSTED_TESTS_DIR="$REPO_DIR/litebox_runner_linux_userland/tests"
 HOSTED_DEDICATED="$KERNEL_DIR/tests/hosted_dedicated.json"
+HOSTED_INIT="$KERNEL_DIR/tests/hosted_init.json"
 HOSTED_SKIPPED="$KERNEL_DIR/tests/hosted_skipped.json"
 # shellcheck source=dev_tools/vm_test_lib.sh
 source "$SCRIPT_DIR/vm_test_lib.sh"
@@ -163,10 +169,10 @@ virtiofsd=
 
 # Init tests (see the header): their init's path in the root.
 declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writable_root [egress]=/egress
-    [console_flood]=/console_flood [lifecycle]=/lifecycle [hosted_root_init]=/hosted/root_init)
+    [console_flood]=/console_flood [lifecycle]=/lifecycle)
 
 # The hosted tests (see the header), which run only when given with -t.
-HOSTED=(hosted hosted_dedicated hosted_root_init)
+HOSTED=(hosted hosted_dedicated hosted_init)
 
 # Whether test $1 is a hosted test.
 is_hosted() {
@@ -178,6 +184,7 @@ test_json() {
     case $1 in
         hosted) echo "$WORK/hosted.json" ;;
         hosted_dedicated) echo "$HOSTED_DEDICATED" ;;
+        hosted_init) echo "$HOSTED_INIT" ;;
         *) echo "$TESTS_DIR/$1.json" ;;
     esac
 }
@@ -289,12 +296,16 @@ for t in "${tests[@]}"; do
     ! is_hosted "$t" || hosted=1
 done
 if [[ $hosted -ne 0 ]]; then
-    # The hosted sweep's programs.json, and, a line each, the programs that the hosted tests run.
+    # The hosted sweep's programs.json; hosted_init's boots, a line each, `NAME AS_INIT INIT
+    # EXPECT_STATUS` in $WORK/hosted_init.boots, with the strings that its console must contain
+    # in $WORK/hosted_init/NAME.contains, and the command lines of its launcher's copies in
+    # rootfs/hosted/init; and, a line each, the programs that the hosted tests run.
+    mkdir -p "$WORK/rootfs/hosted/init" "$WORK/hosted_init"
     hosted_programs=$(python3 - "$HOSTED_TESTS_DIR" "$HOSTED_SKIPPED" "$HOSTED_DEDICATED" \
-        "$WORK/hosted.json" <<'EOF'
+        "$HOSTED_INIT" "$WORK" <<'EOF'
 import json, pathlib, re, sys
 
-tests, skipped_path, dedicated, out = map(pathlib.Path, sys.argv[1:])
+tests, skipped_path, dedicated, init, work = map(pathlib.Path, sys.argv[1:])
 # The kinds of the hosted tests' programs: their build.rs's lists of names.
 build_rs = tests.parent / "build.rs"
 lists = {
@@ -311,7 +322,7 @@ skipped = json.loads(skipped_path.read_text())
 for name in skipped:
     if name in unswept or not (tests / name).is_file():
         sys.exit(f"error: {skipped_path} skips {name}, which the sweep does not run")
-runs, programs = [], {"vfork_exec_child", "root_init"}
+runs, programs = [], {"vfork_exec_child"}
 for source in sorted(tests.glob("*.c")):
     if source.name in unswept or source.name in skipped:
         continue
@@ -320,8 +331,22 @@ for source in sorted(tests.glob("*.c")):
         argv.append("/hosted/vfork_exec_child")
     runs.append({"argv": argv, "envp": ["HOME=/", "LITEBOX_PIPE_BROKER=1"]})
     programs.add(source.stem)
-programs.update(re.findall(r"/hosted/(\w+)", dedicated.read_text()))
-out.write_text(json.dumps(runs, indent=1))
+programs.update(re.findall(r"/hosted/(\w+)", dedicated.read_text() + init.read_text()))
+(work / "hosted.json").write_text(json.dumps(runs, indent=1))
+boots = []
+for entry in json.loads(init.read_text()):
+    name, argv = entry["name"], entry["argv"]
+    status = entry["expect_status"]
+    if not re.fullmatch(r"\w+", name) or not argv or not re.fullmatch(r"(exited|signaled) \d+", status):
+        sys.exit(f"error: {init}: a bad entry {entry}")
+    path = argv[0]
+    if len(argv) > 1:
+        path = f"/hosted/init/{name}"
+        (work / "rootfs" / path[1:]).with_suffix(".args").write_text("\n".join(argv) + "\n")
+    boots.append(f"{name} {int(entry.get('as_init', False))} {path} {status}")
+    contains = "".join(f"{text}\n" for text in entry.get("expect_console_contains", []))
+    (work / "hosted_init" / f"{name}.contains").write_text(contains)
+(work / "hosted_init.boots").write_text("".join(f"{boot}\n" for boot in boots))
 print("\n".join(sorted(programs)))
 EOF
     )
@@ -330,6 +355,11 @@ EOF
     # shellcheck disable=SC2016 # expanded by the inner shell
     xargs -P "$(nproc)" -I{} sh -c '${CC:-cc} -static -w -o "$1/{}" "$2/{}.c"' _ \
         "$WORK/rootfs/hosted" "$HOSTED_TESTS_DIR" <<<"$hosted_programs"
+    # hosted_init's launcher, a copy for each command line.
+    ${CC:-cc} -static -O2 -o "$WORK/hosted_init/launcher" "$KERNEL_DIR/tests/hosted_init.c"
+    for args in "$WORK/rootfs/hosted/init"/*.args; do
+        [[ ! -f $args ]] || cp "$WORK/hosted_init/launcher" "${args%.args}"
+    done
     # dash as /bin/sh, and a /tmp, for the shells that programs start.
     mkdir -p "$WORK/rootfs/bin" "$WORK/rootfs/tmp"
     cp /usr/bin/dash "$WORK/rootfs/bin/sh"
@@ -561,6 +591,19 @@ check_records() {
         }' "$1"
 }
 
+# Checks hosted_init's boot $1, hosted_init.NAME: its init's exit status and console (see the
+# header).
+check_hosted_init() {
+    show_output "$1"
+    local name=${1#hosted_init.} expected text
+    expected=$(awk -v name="$name" '$1 == name { print $4, $5 }' "$WORK/hosted_init.boots")
+    grep -qE "^\[litebox\] init exit status: $expected"$'\r?$' "$WORK/$1.log" ||
+        { echo "no init exit status \`$expected\` in the log"; return 1; }
+    while IFS= read -r text; do
+        grep -qF -- "$text" "$WORK/$1.console" || { echo "no \`$text\` on the console"; return 1; }
+    done <"$WORK/hosted_init/$name.contains"
+}
+
 # Shows boot $1's output, and checks what only its kernel can (see the
 # header); for an init test, that init exited 0.
 check_boot() {
@@ -569,8 +612,6 @@ check_boot() {
         grep -qF '[litebox] init exit status: exited 0' "$WORK/$1.log" ||
             { echo "no exit status 0 of init in the log"; return 1; }
         [[ $1 != console_flood ]] || check_records "$WORK/$1.console" 4 512
-        [[ $1 != hosted_root_init ]] || grep -qF "root-init survived" "$WORK/$1.console" ||
-            { echo "no \`root-init survived\` on the console"; return 1; }
         return
     fi
     # The container's end must end every guest process (e.g., fork.c's).
@@ -641,6 +682,26 @@ for test in "${tests[@]}"; do
     vsock=()
     kernel_args=
     counted=
+    if [[ $test == hosted_init ]]; then
+        while read -r name as_init path expected_status; do
+            if [[ $as_init -eq 0 && $profile != debug ]]; then
+                echo "FAIL  hosted_init.$name  (runs as an ordinary process 1: needs a debug kernel)"
+                fail=$((fail + 1))
+                failed+=("hosted_init.$name")
+                continue
+            fi
+            pack_payload "hosted_init.$name" "$WORK/rootfs.tar"
+            kernel_args="litebox.init=$path"
+            [[ $as_init -ne 0 ]] || kernel_args+=" litebox.root_process_as_init=0"
+            check=check_hosted_init
+            # The kernel reports a failure for any other status: check_hosted_init judges it.
+            [[ $expected_status == "exited 0" ]] || guest_failure_expected=1
+            boot "hosted_init.$name" "$WORK/hosted_init.$name.tar"
+            check=check_boot
+            guest_failure_expected=
+        done <"$WORK/hosted_init.boots"
+        continue
+    fi
     if [[ -n ${INIT_TESTS[$test]:-} ]]; then
         mkdir -p "$WORK/$test"
         cp "$WORK/rootfs.tar" "$WORK/$test/rootfs.tar"

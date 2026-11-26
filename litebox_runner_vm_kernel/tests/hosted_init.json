@@ -1,0 +1,51 @@
+[
+  {
+    "name": "root_init_as_init",
+    "argv": [
+      "/hosted/root_init"
+    ],
+    "as_init": true,
+    "expect_status": "exited 0",
+    "expect_console_contains": [
+      "root-init survived"
+    ]
+  },
+  {
+    "name": "root_init",
+    "argv": [
+      "/hosted/root_init"
+    ],
+    "expect_status": "signaled 9",
+    "expect_console_contains": [
+      "root-init started"
+    ]
+  },
+  {
+    "name": "process_tree_parent",
+    "argv": [
+      "/hosted/process_tree_parent"
+    ],
+    "expect_status": "exited 0",
+    "expect_console_contains": [
+      "process-tree failures=0"
+    ]
+  },
+  {
+    "name": "process_group_parent",
+    "argv": [
+      "/hosted/process_group_parent"
+    ],
+    "expect_status": "exited 0",
+    "expect_console_contains": [
+      "process-group failures=0"
+    ]
+  },
+  {
+    "name": "fork_inet_parent",
+    "argv": [
+      "/hosted/fork_inet_parent",
+      "/hosted/vfork_exec_child"
+    ],
+    "expect_status": "exited 0"
+  }
+]

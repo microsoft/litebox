@@ -1,8 +1,8 @@
 {
   "cpu_time_parent.c": "the VM's userland platform measures no CPU time: clock_gettime on a CPU clock fails with EINVAL",
-  "fork_inet_parent.c": "expects LiteBox's initial process to adopt an orphan, which in the VM the container's init does",
-  "process_group_parent.c": "expects no other process to remain, but in the VM the container's init does",
-  "process_tree_parent.c": "expects LiteBox's initial process to have no parent and adopt orphans, which in the VM the container's init does",
+  "fork_inet_parent.c": "runs as process 1 in hosted_init.json",
+  "process_group_parent.c": "runs as process 1 in hosted_init.json",
+  "process_tree_parent.c": "runs as process 1 in hosted_init.json",
   "rlimit_parent.c": "hangs: without CPU time, nothing enforces RLIMIT_CPU",
   "shared_file_mapping.c": "a shared mapping of a file in the VM's root fails with ENODEV",
   "tcp_broker.c": "needs its broker test's host server; with one, shutdown(SHUT_WR) of a reset socket returns 0, not ENOTCONN",
