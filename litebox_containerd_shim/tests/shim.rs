@@ -69,10 +69,12 @@ impl Backend {
 }
 
 /// Defines each test `test(backend)` once per backend, as `userland::test`, `vm::test` and
-/// `ch::test`.
+/// `ch::test`; but each of `one vmm` only as `userland::test` and `vm::test`: the VM backends
+/// differ only in how they start the VM, which these tests don't depend on.
 macro_rules! on_both_backends {
     (
         $($test:ident),* $(,)?;
+        one vmm: $($one_vmm:ident),* $(,)?;
         privileged: $($privileged:ident),* $(,)?;
         as root: $($root:ident),* $(,)?;
         vm only: $($vm_only:ident),* $(,)?;
@@ -83,6 +85,12 @@ macro_rules! on_both_backends {
                 #[test]
                 fn $test() {
                     super::$test(super::Backend::Userland);
+                }
+            )*
+            $(
+                #[test]
+                fn $one_vmm() {
+                    super::$one_vmm(super::Backend::Userland);
                 }
             )*
             $(
@@ -106,6 +114,13 @@ macro_rules! on_both_backends {
                 #[ignore = "boots QEMU; CI runs it in the QEMU job"]
                 fn $test() {
                     super::$test(super::Backend::Vm);
+                }
+            )*
+            $(
+                #[test]
+                #[ignore = "boots QEMU; CI runs it in the QEMU job"]
+                fn $one_vmm() {
+                    super::$one_vmm(super::Backend::Vm);
                 }
             )*
             $(
@@ -178,7 +193,11 @@ macro_rules! on_both_backends {
 
 on_both_backends! {
     a_container_runs_and_reports_its_exit,
-    execs_take_input_and_their_output_comes_before_their_exit,
+    the_broker_group_dies_with_the_daemon,
+    binds_copy_files_and_serve_directories,
+    a_container_with_a_small_memory_limit_runs,
+    refused_or_unsupported_specs_and_annotations_fail_create;
+    one vmm: execs_take_input_and_their_output_comes_before_their_exit,
     a_reader_of_the_output_may_start_after_the_exit,
     an_exec_s_output_ends_once_idle_or_at_its_delete,
     an_exec_s_delete_closes_its_unread_output,
@@ -188,7 +207,6 @@ on_both_backends! {
     kills_reach_their_process,
     without_mount_privilege_root_file_system_mounts_fail_create,
     a_created_container_is_deleted_with_its_broker,
-    the_broker_group_dies_with_the_daemon,
     hooks_run_on_the_host_with_the_state,
     a_logging_program_gets_the_output,
     the_delete_action_finishes_a_delete_cut_short,
@@ -197,10 +215,7 @@ on_both_backends! {
     a_broker_that_dies_stops_created_execs_and_refuses_more,
     the_container_cannot_kill_the_guest_service,
     a_guest_service_that_does_not_answer_is_taken_for_dead,
-    a_guest_service_that_does_not_answer_an_exec_is_taken_for_dead,
-    binds_copy_files_and_serve_directories,
-    a_container_with_a_small_memory_limit_runs,
-    refused_or_unsupported_specs_and_annotations_fail_create;
+    a_guest_service_that_does_not_answer_an_exec_is_taken_for_dead;
     privileged: with_mount_privilege_bind_and_overlay_mounts_are_read_then_unmounted;
     as root: as_root_the_broker_joins_or_creates_the_container_s_network_namespace;
     vm only: a_dead_vsock_device_stops_the_broker, qemu_takes_the_cpu_quota_and_prefers_kvm,
