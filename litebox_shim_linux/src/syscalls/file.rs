@@ -1438,9 +1438,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_mount(
         &self,
         target: &str,
-        filesystemtype: Option<&core::ffi::CStr>,
+        filesystemtype: Option<&str>,
         flags: usize,
-        data: Option<UserPtr<u8>>,
     ) -> Result<(), Errno> {
         // No set-ID exec or device nodes exist, so NOSUID/NODEV already hold; atime flags are advisory.
         const ACCEPTED_FLAGS: usize = (1 << 1) // MS_NOSUID
@@ -1457,13 +1456,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         const MS_PRIVATE: usize = 1 << 18;
         const MS_SLAVE: usize = 1 << 19;
         const MS_SHARED: usize = 1 << 20;
-        // Like Linux, which copies the data in first, fail if it can't be read, even if ignored.
-        let data_start = data
-            .map(|data| data.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT))
-            .transpose()?;
-        // Like Linux, a propagation flag, unless with `MS_REMOUNT` or `MS_BIND` (both unsupported,
-        // so rejected below), makes this a change of the target's propagation type, which ignores
-        // the file system type and data.
+        // Like Linux, a propagation flag, unless `MS_REMOUNT` or `MS_BIND` is also set (both
+        // unsupported, so rejected below), makes this a change of the target's propagation type,
+        // which ignores the file system type.
         if flags & (MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED) != 0 {
             self.sys_stat(target)?;
             self.check_admin()?;
@@ -1484,14 +1479,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         // Like Linux, a new mount needs a file system type.
         let filesystemtype = filesystemtype.ok_or(Errno::EINVAL)?;
-        if filesystemtype != c"tmpfs" {
-            log_unsupported!("mount filesystem {filesystemtype:?}");
+        if filesystemtype != "tmpfs" {
+            log_unsupported!("mount filesystem {filesystemtype}");
             return Err(Errno::ENODEV);
-        }
-        // XXX(jayb): tmpfs options (size=, mode=, ...) unsupported; Linux accepts them.
-        if data_start.is_some_and(|byte| byte != 0) {
-            log_unsupported!("tmpfs mount options");
-            return Err(Errno::EINVAL);
         }
         // Mounting is name-based, so a relative target is named from the cwd handle's current path.
         let target = self.absolute_name(target)?;
@@ -3387,45 +3377,43 @@ mod tests {
         let fd = i32::try_from(fd).unwrap();
         let old_dev = task.sys_stat("/mount_tmpfs_test").unwrap().st_dev;
         assert_eq!(
-            task.sys_mount("/missing_mount_target", Some(c"tmpfs"), 0, None),
+            task.sys_mount("/missing_mount_target", Some("tmpfs"), 0),
             Err(Errno::ENOENT)
         );
         assert_eq!(
-            task.sys_mount("/mount_tmpfs_test/old", Some(c"tmpfs"), 0, None),
+            task.sys_mount("/mount_tmpfs_test/old", Some("tmpfs"), 0),
             Err(Errno::ENOTDIR)
         );
         assert_eq!(
-            task.sys_mount("/mount_tmpfs_test", Some(c"proc"), 0, None),
+            task.sys_mount("/mount_tmpfs_test", Some("proc"), 0),
             Err(Errno::ENODEV)
         );
         for flags in [1, 1 << 3, 1 << 5, 1 << 12, 1 << 13, usize::MAX] {
             assert_eq!(
-                task.sys_mount("/mount_tmpfs_test", Some(c"tmpfs"), flags, None),
+                task.sys_mount("/mount_tmpfs_test", Some("tmpfs"), flags),
                 Err(Errno::EINVAL)
             );
         }
         assert_eq!(
-            task.sys_mount("/mount_tmpfs_test", None, 0, None),
+            task.sys_mount("/mount_tmpfs_test", None, 0),
             Err(Errno::EINVAL)
         );
         // Propagation changes ignore the type, and only `MS_PRIVATE` and `MS_SLAVE`, both no-ops
         // for mounts that never propagate, are supported.
         assert_eq!(
-            task.sys_mount("/missing_mount_target", None, MS_PRIVATE, None),
+            task.sys_mount("/missing_mount_target", None, MS_PRIVATE),
             Err(Errno::ENOENT)
         );
         for flags in [MS_REC | MS_PRIVATE, MS_SLAVE] {
-            task.sys_mount("/", None, flags, None).unwrap();
+            task.sys_mount("/", None, flags).unwrap();
         }
-        task.sys_mount("/", Some(c"\xff"), MS_PRIVATE, None)
-            .unwrap();
         for flags in [MS_SHARED, MS_PRIVATE | MS_SLAVE, MS_PRIVATE | 1] {
             assert_eq!(
-                task.sys_mount("/", Some(c"tmpfs"), flags, None),
+                task.sys_mount("/", Some("tmpfs"), flags),
                 Err(Errno::EINVAL)
             );
         }
-        task.sys_mount("/mount_tmpfs_test", Some(c"tmpfs"), 0, None)
+        task.sys_mount("/mount_tmpfs_test", Some("tmpfs"), 0)
             .unwrap();
         let status = task.sys_stat("/mount_tmpfs_test").unwrap();
         assert_ne!({ status.st_dev }, old_dev);
@@ -3437,7 +3425,7 @@ mod tests {
         task.sys_fstat(fd).unwrap();
         task.sys_close(fd).unwrap();
         assert_eq!(
-            task.sys_mount("/mount_tmpfs_test", Some(c"tmpfs"), 0, None),
+            task.sys_mount("/mount_tmpfs_test", Some("tmpfs"), 0),
             Err(Errno::EBUSY)
         );
         let fd = task

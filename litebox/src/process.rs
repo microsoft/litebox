@@ -98,7 +98,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// child, all of them or none. A new children's PID namespace, only for
     /// this process, is nested in its own, and the first child created in it
     /// becomes its first process. A mount this process makes while its own
-    /// mount view is copied may apply only to its previous view.
+    /// mount view is being copied may apply only to its previous view.
     ///
     /// Fails with [`ProcessError::InvalidChild`] if the target is neither,
     /// with [`ProcessError::Unavailable`] if this process's children already

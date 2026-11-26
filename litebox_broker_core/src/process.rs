@@ -902,8 +902,8 @@ impl BrokerProcess {
     /// child `request.process_id`, leaving all the existing namespaces intact
     /// on failure.
     ///
-    /// A mount that this process makes while its own mount view is copied may
-    /// apply only to its previous view.
+    /// A mount that this process makes while its own mount view is being
+    /// copied may apply only to its previous view.
     ///
     /// Returns:
     /// - `UnknownObject` if the target is neither.

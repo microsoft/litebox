@@ -1120,21 +1120,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(true)
     }
 
-    /// Handles syscall `unshare`. Only `CLONE_NEWNS`, which like Linux implies `CLONE_FS`,
-    /// `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWIPC` are supported.
+    /// Handles syscall `unshare`. Only `CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWUTS`, and
+    /// `CLONE_NEWIPC` are supported, plus `CLONE_FS` with `CLONE_NEWNS`, which implies it.
     ///
-    /// Unlike Linux, `CLONE_NEWNS` and `CLONE_NEWPID` fail in a `vfork` child, whose requests go to
-    /// the broker as its parent's, and in a process with more than one thread, since LiteBox keeps
-    /// the mount view and the PID namespace for a process's children per process rather than per
-    /// thread. Likewise, since LiteBox keeps host names per process, `CLONE_NEWUTS` moves the whole
+    /// Unlike Linux, `CLONE_NEWNS` and `CLONE_NEWPID` fail in a `vfork` child, whose requests are
+    /// made as its parent's, and in a process with more than one thread, since LiteBox keeps a
+    /// process's mount view and its children's PID namespace per process rather than per thread.
+    /// Likewise, since LiteBox keeps host names per process, `CLONE_NEWUTS` moves the whole
     /// process, with all its threads, to the new UTS namespace, not just the calling thread.
     pub(crate) fn sys_unshare(&self, flags: CloneFlags) -> Result<usize, Errno> {
         if flags.is_empty() {
             return Ok(0);
         }
         let mut supported = CloneFlags::NEWNS | CloneFlags::NEWPID | UTS_AND_IPC_NAMESPACE_FLAGS;
-        // Like Linux, `CLONE_NEWNS` implies `CLONE_FS`, which changes nothing more: the caller must
-        // be its process's only thread, and processes never share file system information.
+        // Like Linux, `CLONE_NEWNS` implies `CLONE_FS`, which is a no-op here: the caller must be
+        // its process's only thread, and processes never share file system information.
         if flags.contains(CloneFlags::NEWNS) {
             supported |= CloneFlags::FS;
         }
@@ -1147,8 +1147,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let copy_host_names = flags.contains(CloneFlags::NEWUTS);
         let copy_mount_view = flags.contains(CloneFlags::NEWNS);
         if new_pid || copy_mount_view {
-            // A `vfork` child makes its requests as its parent, so its lookups, mounts and children
-            // would still use the parent's mount view and PID namespace for children.
+            // A `vfork` child makes its requests as its parent, so its lookups and mounts would
+            // still use the parent's mount view, and its children the parent's PID namespace for
+            // children.
             if self.vfork.borrow().is_some() {
                 log_unsupported!("unshare with flags {:?} in a vfork child", flags);
                 return Err(Errno::EINVAL);
