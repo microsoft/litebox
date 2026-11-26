@@ -1120,39 +1120,50 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(true)
     }
 
-    /// Handles syscall `unshare`. Only `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWIPC` are
-    /// supported.
+    /// Handles syscall `unshare`. Only `CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWUTS`, and
+    /// `CLONE_NEWIPC` are supported, plus `CLONE_FS` with `CLONE_NEWNS`, which implies it.
     ///
-    /// Unlike Linux, `CLONE_NEWPID` fails in a `vfork` child, whose requests go to the broker as
-    /// its parent's, and in a process with more than one thread, since LiteBox keeps the PID
-    /// namespace for a process's children per process rather than per thread. Likewise, since
-    /// LiteBox keeps host names per process, `CLONE_NEWUTS` moves the whole process, with all its
-    /// threads, to the new UTS namespace, not just the calling thread.
+    /// Unlike Linux, `CLONE_NEWNS` and `CLONE_NEWPID` fail in a `vfork` child, whose requests are
+    /// made as its parent's, and in a process with more than one thread, since LiteBox keeps a
+    /// process's mount view and its children's PID namespace per process rather than per thread.
+    /// Likewise, since LiteBox keeps host names per process, `CLONE_NEWUTS` moves the whole
+    /// process, with all its threads, to the new UTS namespace, not just the calling thread.
     pub(crate) fn sys_unshare(&self, flags: CloneFlags) -> Result<usize, Errno> {
         if flags.is_empty() {
             return Ok(0);
         }
-        if flags.intersects(!(CloneFlags::NEWPID | UTS_AND_IPC_NAMESPACE_FLAGS)) {
+        let mut supported = CloneFlags::NEWNS | CloneFlags::NEWPID | UTS_AND_IPC_NAMESPACE_FLAGS;
+        // Like Linux, `CLONE_NEWNS` implies `CLONE_FS`, which is a no-op here: the caller must be
+        // its process's only thread, and processes never share file system information.
+        if flags.contains(CloneFlags::NEWNS) {
+            supported |= CloneFlags::FS;
+        }
+        if flags.intersects(!supported) {
             log_unsupported!("unshare with flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
         self.check_admin()?;
         let new_pid = flags.contains(CloneFlags::NEWPID);
         let copy_host_names = flags.contains(CloneFlags::NEWUTS);
-        if new_pid {
-            // A `vfork` child makes its requests as its parent, whose children this would change.
+        let copy_mount_view = flags.contains(CloneFlags::NEWNS);
+        if new_pid || copy_mount_view {
+            // A `vfork` child makes its requests as its parent, so its lookups and mounts would
+            // still use the parent's mount view, and its children the parent's PID namespace for
+            // children.
             if self.vfork.borrow().is_some() {
-                log_unsupported!("unshare(CLONE_NEWPID) in a vfork child");
+                log_unsupported!("unshare with flags {:?} in a vfork child", flags);
                 return Err(Errno::EINVAL);
             }
-            self.check_can_create_pid_namespace()?;
+            if new_pid {
+                self.check_can_create_pid_namespace()?;
+            }
             // As the only thread, the caller is the only one that could create threads or change
             // this process's state, so nothing changes what was checked until this returns.
             if self.thread.process.nr_threads() > 1 {
                 return Err(Errno::EINVAL);
             }
         }
-        if !new_pid && !copy_host_names {
+        if !new_pid && !copy_host_names && !copy_mount_view {
             return Ok(0);
         }
         // One request, so that a failure leaves every namespace unchanged.
@@ -1164,11 +1175,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 children_pid_namespace: new_pid.then_some(PidNamespaceOptions::INIT),
                 new_segment_namespace: false,
                 copy_host_names,
-                copy_mount_view: false,
+                copy_mount_view,
             }) {
             Ok(()) => {}
             // If LiteBox can't change host names, they are fixed, so there is nothing to copy.
-            Err(ProcessError::Unavailable) if !new_pid => return Ok(0),
+            Err(ProcessError::Unavailable) if !new_pid && !copy_mount_view => return Ok(0),
             // The namespace limits, like Linux's nesting and count limits.
             Err(ProcessError::ResourceExhausted) => return Err(Errno::ENOSPC),
             Err(error) => return Err(error.into()),

@@ -1089,12 +1089,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 let target = target.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
                 let filesystemtype = filesystemtype
-                    .ok_or(Errno::EFAULT)?
-                    .to_cstring::<Platform>()
-                    .ok_or(Errno::EFAULT)?;
+                    .map(|filesystemtype| {
+                        filesystemtype
+                            .to_cstring::<Platform>()
+                            .ok_or(Errno::EFAULT)?
+                            .into_string()
+                            .map_err(|_| Errno::EINVAL)
+                    })
+                    .transpose()?;
                 let target = target.to_str().map_err(|_| Errno::EINVAL)?;
-                let filesystemtype = filesystemtype.to_str().map_err(|_| Errno::EINVAL)?;
-                syscall!(sys_mount(target, filesystemtype, mountflags))
+                syscall!(sys_mount(target, filesystemtype.as_deref(), mountflags))
             }
             SyscallRequest::Symlinkat {
                 target,
