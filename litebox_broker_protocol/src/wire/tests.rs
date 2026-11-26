@@ -625,18 +625,21 @@ fn request_codec_round_trips_all_variants() {
             children_pid_namespace: Some(PidNamespaceOptions::new(true, true)),
             new_segment_namespace: false,
             copy_host_names: false,
+            copy_mount_view: true,
         })),
         BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
             process_id: process_id(u32::MAX),
             children_pid_namespace: Some(PidNamespaceOptions::new(true, false)),
             new_segment_namespace: true,
             copy_host_names: true,
+            copy_mount_view: false,
         })),
         BrokerOperation::Process(ProcessRequest::CreateNamespaces(CreateNamespacesRequest {
             process_id: process_id(1),
             children_pid_namespace: None,
             new_segment_namespace: false,
             copy_host_names: true,
+            copy_mount_view: true,
         })),
         BrokerOperation::Process(ProcessRequest::DuplicateObjectsToChild(
             DuplicateObjectsToChildRequest {
@@ -1986,6 +1989,7 @@ fn decode_rejects_malformed_request_frames() {
                 children_pid_namespace: Some(PidNamespaceOptions::default()),
                 new_segment_namespace: false,
                 copy_host_names: false,
+                copy_mount_view: false,
             },
         )),
     });

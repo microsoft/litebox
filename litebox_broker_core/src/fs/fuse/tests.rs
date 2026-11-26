@@ -1266,10 +1266,13 @@ fn test_fuse_held_directories() {
     let root = fs
         .open(USER, None, "/", OFlags::PATH, Mode::empty())
         .unwrap();
-    assert_eq!(fs.handle_path(Caller::default(), &root).unwrap(), "/");
+    assert_eq!(fs.handle_path(Caller::default(), &root, fs).unwrap(), "/");
     let sub = open_dir(fs, "/d/sub");
     fs.rename(USER, None, "/d", None, "/e").unwrap();
-    assert_eq!(fs.handle_path(Caller::default(), &sub).unwrap(), "/d/sub");
+    assert_eq!(
+        fs.handle_path(Caller::default(), &sub, fs).unwrap(),
+        "/d/sub"
+    );
     let flags = OFlags::CREAT | OFlags::WRONLY;
     drop(
         fs.open(USER, Some(sub.anchor()), "f", flags, Mode::RWXU)
@@ -1309,7 +1312,7 @@ fn test_fuse_held_directories() {
     std::fs::remove_dir(h.host_path("e/sub")).unwrap();
     assert_err!(fs.read_dir(Caller::default(), &sub), ReadDirError::Removed);
     assert_err!(
-        fs.handle_path(Caller::default(), &sub),
+        fs.handle_path(Caller::default(), &sub, fs),
         WalkError::PathError(PathError::NoSuchFileOrDirectory)
     );
     drop((root, sub));

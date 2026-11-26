@@ -6,14 +6,15 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
-use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
+use litebox_platform::sync::{Mutex, RawSyncPrimitivesProvider, RwLock};
 
 use super::backend::{
     Backend, BackendHandles, Caller, CreationMetadata, DirHandle, DirPathResult, FileHandle,
@@ -36,22 +37,46 @@ use thiserror::Error;
 /// A [`Backend`] composed from mounted [`Backend`]s at various paths.
 pub struct Composer<Platform: RawSyncPrimitivesProvider> {
     state: RwLock<Platform, MountState>,
+    resources: Arc<MountResources>,
+    /// Shared by all copies of this view. The resolver holds it from lookup to completion of
+    /// each mount, mkdir, rmdir, and rename, so no view can mount on a directory that another
+    /// is creating, removing, or renaming.
+    pub(super) mount_lock: Arc<Mutex<Platform, ()>>,
 }
 
+#[derive(Clone)]
 struct MountState {
-    // Append-only: borrowed backend handles point into these boxes.
-    #[expect(
-        clippy::vec_box,
-        reason = "published mounts need stable addresses for borrowed handles"
-    )]
-    mounts: Vec<Box<Mount>>,
-    limit: usize,
-    allocators: InodeAllocators,
-    virtual_dir_allocator: InodeAllocator,
+    // Append-only in each view: borrowed backend handles point into the published mounts.
+    mounts: Vec<Arc<Mount>>,
     // TODO(jayb): We have these to account for `/mnt` in something like mounting `/mnt/foo`; I am
     // not certain this is the best design (maybe we should have something _explicitly_ make
     // `/mnt`), but for now, this is the design I've chosen.
     virtual_dirs: Vec<VirtualDir>,
+}
+
+/// Device and inode allocators and the runtime mount budget, shared by all related views.
+struct MountResources {
+    allocators: InodeAllocators,
+    virtual_dir_allocator: InodeAllocator,
+    runtime_mounts: AtomicUsize,
+}
+
+struct RuntimeMountSlot(Arc<MountResources>);
+
+impl RuntimeMountSlot {
+    fn reserve(resources: &Arc<MountResources>) -> Result<Self, MountError> {
+        if crate::quota::try_increment(&resources.runtime_mounts, RUNTIME_MOUNT_CAPACITY) {
+            Ok(Self(Arc::clone(resources)))
+        } else {
+            Err(MountError::NoSpace)
+        }
+    }
+}
+
+impl Drop for RuntimeMountSlot {
+    fn drop(&mut self) {
+        self.0.runtime_mounts.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A [`Composer`] builder.
@@ -67,9 +92,28 @@ pub struct ComposerBuilder<Platform: RawSyncPrimitivesProvider> {
 struct Mount {
     path: Vec<String>,
     backend: Box<dyn Backend>,
+    /// Mount points on this backend, from any related view. A live one keeps its directory and
+    /// ancestors from being removed or renamed.
+    points: spin::Mutex<Vec<(Vec<String>, Weak<Mount>)>>,
+    /// Returns a unit of the runtime mount budget when the last view drops this mount; `None`
+    /// for startup mounts.
+    _slot: Option<RuntimeMountSlot>,
 }
 
 impl Mount {
+    fn pin(&self, mount: &Arc<Mount>) {
+        let mut points = self.points.lock();
+        points.retain(|(_, point)| point.strong_count() != 0);
+        points.push((mount.path.clone(), Arc::downgrade(mount)));
+    }
+
+    fn protects(&self, path: &[String]) -> bool {
+        self.points
+            .lock()
+            .iter()
+            .any(|(point, mount)| mount.strong_count() != 0 && point.starts_with(path))
+    }
+
     fn has_caller_relative_ancestor(&self, descendant: &[String]) -> bool {
         // XXX: Path-keyed mounts can't follow a procfs PID across namespaces or PID reuse; reject
         // until mounts bind to identity.
@@ -136,6 +180,48 @@ fn parse_mount_path(raw: &str) -> Result<Vec<String>, MountError> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
+    /// Copy the mount layout into a new view. Existing mounts are shared, with the same device
+    /// and inode numbers; later mounts appear only in the view that makes them. Related views
+    /// share one runtime mount budget, and copying uses none of it. A handle works in another
+    /// view only if [`Self::shares_handle`] accepts it.
+    #[must_use]
+    pub(super) fn copy_mount_view(&self) -> Self {
+        Self {
+            state: RwLock::new(self.state.read().clone()),
+            resources: Arc::clone(&self.resources),
+            mount_lock: Arc::clone(&self.mount_lock),
+        }
+    }
+
+    /// Whether `handle`, produced by `other`, names the same object in this view, so walks
+    /// may start from it here. This holds if both views contain the mount the handle came from
+    /// or, for a synthesized directory, if both are related views with the same one at its path.
+    pub(super) fn shares_handle(&self, other: &Self, handle: HandleRef<'_>) -> bool {
+        let mount_index = match handle {
+            HandleRef::File(file) => file.get_typed::<Self>().mount_index,
+            HandleRef::Dir(dir) => match &dir.get_typed::<Self>().inner {
+                ComposerDirHandleInner::Mounted { mount_index, .. } => *mount_index,
+                ComposerDirHandleInner::Virtual { path } => {
+                    // Unrelated views number their virtual directories alike.
+                    let node = |view: &Self| {
+                        view.state
+                            .read()
+                            .virtual_dirs
+                            .iter()
+                            .find(|dir| dir.path == *path)
+                            .map(|dir| dir.node_info)
+                    };
+                    return Arc::ptr_eq(&self.resources, &other.resources)
+                        && node(self).is_some_and(|node_info| node(other) == Some(node_info));
+                }
+            },
+        };
+        // Both views keep their mounts alive while borrowed, so equal addresses are one mount.
+        self.mount_at(mount_index)
+            .zip(other.mount_at(mount_index))
+            .is_some_and(|(mine, theirs)| core::ptr::eq(mine, theirs))
+    }
+
     /// Append a mounted backend without invalidating existing handles.
     ///
     /// Missing ancestor directories are synthesized; callers that require an existing target
@@ -153,15 +239,15 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         let path = parse_mount_path(path)?;
         let mut state = self.state.write();
         // XXX(jayb): No mount stacking or unmount; Linux would stack here instead of EBUSY.
-        if MountRelation::of(state.mounts.iter().map(Box::as_ref), &path) == MountRelation::Exact {
+        if MountRelation::of(state.mounts.iter().map(Arc::as_ref), &path) == MountRelation::Exact {
             return Err(MountError::Busy);
         }
-        if state.mounts.len() >= state.limit {
-            return Err(MountError::NoSpace);
-        }
+        let slot = RuntimeMountSlot::reserve(&self.resources)?;
         let mount = Mount {
             path,
-            backend: Box::new(make(state.allocators.next())),
+            backend: Box::new(make(self.resources.allocators.next())),
+            points: spin::Mutex::default(),
+            _slot: Some(slot),
         };
         if state.mounts.iter().any(|other| {
             other.has_caller_relative_ancestor(&mount.path)
@@ -169,11 +255,20 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         }) {
             return Err(MountError::InvalidMountPath);
         }
+        let mount = Arc::new(mount);
+        // The most specific mounted ancestor supplies the covered directory. Pins belong
+        // to that backend, not to the pathname in unrelated private mounts at the same path.
+        if let Some(parent) = state
+            .mounts
+            .iter()
+            .filter(|other| mount.path.starts_with(&other.path))
+            .max_by_key(|other| other.path.len())
+        {
+            parent.pin(&mount);
+        }
         let MountState {
             mounts,
             virtual_dirs,
-            virtual_dir_allocator,
-            ..
         } = &mut *state;
         for len in 0..mount.path.len() {
             let ancestor = &mount.path[..len];
@@ -182,13 +277,13 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
             }
             virtual_dirs.push(VirtualDir {
                 path: ancestor.to_vec(),
-                node_info: virtual_dir_allocator.next(),
+                node_info: self.resources.virtual_dir_allocator.next(),
             });
         }
         // Publish fallback metadata first: a host ancestor can disappear after validation.
         // XXX(jayb): Mounts are keyed by path, not dentry; renaming an ancestor doesn't move the
         // mount as on Linux.
-        mounts.push(Box::new(mount));
+        mounts.push(mount);
         Ok(())
     }
 
@@ -260,7 +355,12 @@ impl<Platform: RawSyncPrimitivesProvider> ComposerBuilder<Platform> {
         for (raw, backend) in self.mounts {
             let path = parse_mount_path(&raw).map_err(|_| BuildError::InvalidMountPath)?;
             paths.push(path.clone());
-            mounts.push(Mount { path, backend });
+            mounts.push(Mount {
+                path,
+                backend,
+                points: spin::Mutex::default(),
+                _slot: None,
+            });
         }
 
         let sorted_paths = {
@@ -298,18 +398,17 @@ impl<Platform: RawSyncPrimitivesProvider> ComposerBuilder<Platform> {
             }
         }
 
-        let mount_limit = mounts.len() + RUNTIME_MOUNT_CAPACITY;
-        let mut published = Vec::with_capacity(mount_limit);
-        published.extend(mounts.into_iter().map(Box::new));
-
         // TODO(jayb): Validate mounted backend device IDs once backends expose that cheaply.
         Ok(Composer {
+            mount_lock: Arc::new(Mutex::new(())),
             state: RwLock::new(MountState {
-                mounts: published,
-                limit: mount_limit,
+                mounts: mounts.into_iter().map(Arc::new).collect(),
+                virtual_dirs,
+            }),
+            resources: Arc::new(MountResources {
                 allocators: self.allocators,
                 virtual_dir_allocator,
-                virtual_dirs,
+                runtime_mounts: AtomicUsize::new(0),
             }),
         })
     }
@@ -345,10 +444,9 @@ fn append_components(mut path: Vec<String>, components: &[&str]) -> Vec<String> 
 impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
     fn mount_at(&self, index: usize) -> Option<&Mount> {
         let mount = core::ptr::from_ref(self.state.read().mounts.get(index)?.as_ref());
-        // SAFETY: Writers only push new boxed mounts; published mounts remain immutable.
-        // Their boxes keep their addresses stable, and the pointees cannot be freed while
-        // `self` is borrowed. The read lock synchronizes publication and is released before
-        // calling into a backend.
+        // SAFETY: This view only appends Arcs; its own strong reference keeps each published
+        // mount at a stable address as long as `self` is borrowed, independently of other views.
+        // The read lock synchronizes publication and is released before calling into a backend.
         Some(unsafe { &*mount })
     }
 
@@ -368,16 +466,16 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
     /// Namespace location of a directory inside `mount`, used to find mount crossings below it,
     /// or `None` if the location recorded when the handle was created should be used.
     ///
-    /// The recorded location is only trusted when no mount is nested below `mount` or when the
-    /// backend cannot name the directory, since a rename or a later runtime mount can make it
-    /// stale.
+    /// The recorded location is only trusted when no mount is nested below `mount` and no mount
+    /// in any related view lies on its backend, or when the backend cannot name the directory,
+    /// since a rename or a later runtime mount can make it stale.
     fn current_route(
         &self,
         caller: Caller<'_>,
         mount: &Mount,
         dir: &DirHandle,
     ) -> Result<Option<Vec<String>>, WalkError> {
-        if !self.has_nested_mount(mount) {
+        if !self.needs_current_route(mount) {
             return Ok(None);
         }
         Self::route_from_backend_path(mount, mount.backend.dir_path(caller, dir))
@@ -385,6 +483,17 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
 
     fn has_nested_mount(&self, mount: &Mount) -> bool {
         self.nested_mounts(mount).next().is_some()
+    }
+
+    /// Whether a rename could have made a recorded path in `mount` stale in a way that matters:
+    /// a nested mount in this view, or a mount on this backend in any related view.
+    fn needs_current_route(&self, mount: &Mount) -> bool {
+        self.has_nested_mount(mount)
+            || mount
+                .points
+                .lock()
+                .iter()
+                .any(|(_, point)| point.strong_count() != 0)
     }
 
     /// Mounts strictly below `mount`'s mount point.
@@ -409,6 +518,9 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
         let mut route = mount.path.clone();
         match backend_path {
             Ok(Some(path)) => route.extend(path),
+            // XXX: A backend that can't name the directory (e.g., FUSE) leaves a recorded route
+            // that a rename may have made stale, so a mount point or pin below it can be missed;
+            // fixing this needs dentry-keyed mounts (see `mount`).
             Ok(None) => return Ok(None),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
                 route.push(UNLINKED_ROUTE_COMPONENT.to_string());
@@ -438,6 +550,18 @@ impl<Platform: RawSyncPrimitivesProvider> Composer<Platform> {
             return Err(error);
         }
         Ok(path)
+    }
+
+    fn check_backing_mount<E>(&self, mount: usize, path: &[String], error: E) -> Result<(), E> {
+        if self
+            .mount_at(mount)
+            .expect("initialized mount")
+            .protects(path)
+        {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns child names from mount paths only; mounted backend contents are not inspected.
@@ -864,7 +988,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 let mount = self.initialized_mount(*mount_index);
                 // Take the route and the walk from one snapshot, so a concurrent rename cannot
                 // make them disagree.
-                let (handle, route) = if self.has_nested_mount(mount) {
+                let (handle, route) = if self.needs_current_route(mount) {
                     let (handle, name) = mount.backend.walking_dir_with_path(handle)?;
                     (handle, Self::route_from_backend_path(mount, name)?)
                 } else {
@@ -1276,7 +1400,8 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                 let ResolvedTarget::Dir(handle) = target else {
                     unreachable!()
                 };
-                self.checked_child_path(path, name, RmdirError::ReadOnlyFileSystem)?;
+                let path = self.checked_child_path(path, name, RmdirError::ReadOnlyFileSystem)?;
+                self.check_backing_mount(mount_index, &path, RmdirError::Busy)?;
                 self.backend(mount_index).rmdir_at(handle, name)
             }
         }
@@ -1296,13 +1421,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
         }
         let old_dir = old_dir.into_typed::<Self>().inner;
         let new_dir = new_dir.into_typed::<Self>().inner;
-        for (dir, name) in [(&old_dir, old_name), (&new_dir, new_name)] {
-            let path = match dir {
-                ComposerDirHandleInner::Virtual { path }
-                | ComposerDirHandleInner::Mounted { path, .. } => path,
-            };
-            self.checked_child_path(path.clone(), name, RenameError::Busy)?;
-        }
+        let path = |dir: &ComposerDirHandleInner, name: &str| match dir {
+            ComposerDirHandleInner::Virtual { path }
+            | ComposerDirHandleInner::Mounted { path, .. } => {
+                self.checked_child_path(path.clone(), name, RenameError::Busy)
+            }
+        };
+        let old_path = path(&old_dir, old_name)?;
+        let new_path = path(&new_dir, new_name)?;
         match (old_dir, new_dir) {
             (
                 ComposerDirHandleInner::Mounted {
@@ -1315,9 +1441,13 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Composer<Platform> {
                     handle: new_handle,
                     ..
                 },
-            ) if old_mount == new_mount => self
-                .backend(old_mount)
-                .rename_at(old_handle, old_name, new_handle, new_name),
+            ) if old_mount == new_mount => {
+                // Mounts in other views pin only directories of the backend they cover.
+                self.check_backing_mount(old_mount, &old_path, RenameError::Busy)?;
+                self.check_backing_mount(old_mount, &new_path, RenameError::Busy)?;
+                self.backend(old_mount)
+                    .rename_at(old_handle, old_name, new_handle, new_name)
+            }
             (ComposerDirHandleInner::Virtual { .. }, ComposerDirHandleInner::Virtual { .. }) => {
                 Err(RenameError::ReadOnlyFileSystem)
             }
@@ -1545,6 +1675,29 @@ mod tests {
             composer.initialized_mounts().count(),
             1 + RUNTIME_MOUNT_CAPACITY
         );
+    }
+
+    #[test]
+    fn copied_views_share_slots_until_the_last_view_releases_the_mount() {
+        let parent = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        parent.mount("/shared", InMem::<TestPlatform>::new).unwrap();
+        let child = parent.copy_mount_view();
+        for index in 1..RUNTIME_MOUNT_CAPACITY {
+            child
+                .mount(&format!("/private/{index}"), InMem::<TestPlatform>::new)
+                .unwrap();
+        }
+        let grandchild = child.copy_mount_view();
+        drop(child);
+        assert_eq!(
+            parent.mount::<InMem<TestPlatform>>("/other", |_| panic!("exhausted constructor")),
+            Err(MountError::NoSpace),
+        );
+        drop(grandchild);
+        parent.mount("/other", InMem::<TestPlatform>::new).unwrap();
     }
 
     #[test]
@@ -1794,6 +1947,55 @@ mod tests {
                     .size,
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn related_views_share_handles_only_to_common_objects() {
+        let parent = Composer::<TestPlatform>::builder()
+            .mount("/data", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        let child = parent.copy_mount_view();
+        // Both private mounts take index 1, and each view gets its own virtual `/p`.
+        parent.mount("/p/q", InMem::<TestPlatform>::new).unwrap();
+        child.mount("/p/r", InMem::<TestPlatform>::new).unwrap();
+        let unrelated = Composer::<TestPlatform>::builder()
+            .mount("/data", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        let dir = |view: &Composer<TestPlatform>, components: &[&str]| {
+            let Resolution::Found(ResolvedTarget::Dir(dir)) = view
+                .resolve(
+                    Caller::default(),
+                    view.root(Caller::default()).unwrap(),
+                    components,
+                    &|_| Ok(()),
+                )
+                .unwrap()
+            else {
+                panic!("expected directory");
+            };
+            view.open_dir(dir, OFlags::PATH).unwrap()
+        };
+
+        for (components, shared) in [
+            (&[][..], true),
+            (&["data"][..], true),
+            (&["p"][..], false),
+            (&["p", "q"][..], false),
+        ] {
+            let handle = dir(&parent, components);
+            assert_eq!(
+                child.shares_handle(&parent, HandleRef::Dir(&handle)),
+                shared,
+                "{components:?}",
+            );
+        }
+        // Unrelated views number their mounts and virtual directories alike.
+        for components in [&[][..], &["data"][..]] {
+            let handle = dir(&unrelated, components);
+            assert!(!parent.shares_handle(&unrelated, HandleRef::Dir(&handle)));
         }
     }
 }

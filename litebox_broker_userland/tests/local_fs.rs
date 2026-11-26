@@ -30,7 +30,7 @@ use litebox_broker_core::fs::errors::{TruncateError, WriteError};
 use litebox_broker_core::fs::inode_allocator::InodeAllocators;
 use litebox_broker_core::fs::read_only::ReadOnly;
 use litebox_broker_core::fs::resolver::Resolver;
-use litebox_broker_core::fs::{FileType, Mode, OFlags, UserInfo};
+use litebox_broker_core::fs::{FileService, FileType, Mode, OFlags, UserInfo};
 use litebox_broker_core::test_platform::TestPlatform;
 use litebox_broker_protocol::fs::{FileTimeUpdate, FileTimestamp, FileTimestamps, SetFileTimes};
 use litebox_broker_protocol::shared_buffer::{
@@ -879,6 +879,18 @@ fn read_only_backend_reads_live_and_refuses_every_host_mutation() {
             RenameError::ReadOnlyFileSystem
         );
     }
+    // A mount in another view forbids the mutation before the read-only backend is called.
+    let parent: &dyn FileService = &resolver;
+    let child = parent.copy_mount_view().unwrap();
+    child
+        .mount_in_mem("/ro/empty", UserInfo::ROOT.into())
+        .unwrap()
+        .unwrap();
+    assert_err!(resolver.rmdir(USER, None, "/ro/empty"), RmdirError::Busy);
+    assert_err!(
+        resolver.rename(USER, None, "/ro/empty", None, "/ro/moved"),
+        RenameError::Busy
+    );
     assert_err!(
         resolver.chmod(USER, None, "/ro/file", Mode::RUSR),
         ChmodError::ReadOnlyFileSystem

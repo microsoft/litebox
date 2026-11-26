@@ -371,6 +371,7 @@ mod tests {
             children_pid_namespace: Some(options),
             new_segment_namespace: false,
             copy_host_names: false,
+            copy_mount_view: false,
         })
     }
 

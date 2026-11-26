@@ -261,9 +261,6 @@ pub struct BrokerProcess {
     ///
     /// No other lock is taken while this one is held.
     children_namespace: Mutex<Option<Arc<PidNamespace>>>,
-    /// The file service through which it opens files: its parent's, for a
-    /// child.
-    pub(crate) fs: Arc<dyn FileService>,
     // XXX: Share this state between processes created with CLONE_FS.
     pub(crate) fs_state: Arc<FsState>,
     /// The job that accounts for it: its parent's, for a child.
@@ -544,6 +541,10 @@ impl ObjectEntry {
 
 struct BrokerProcessState {
     status: ProcessStatus,
+    /// The file service through which this process opens files and resolves paths.
+    /// `create_namespaces` may replace it with a copy that has a private mount view, and
+    /// teardown clears it. Open files keep the service that opened them.
+    fs: Option<Arc<dyn FileService>>,
     /// Final termination status reported by the running process.
     reported_exit_status: Option<ProcessExitStatus>,
     /// Child retained until this process requests startup.
@@ -667,7 +668,6 @@ impl BrokerProcess {
                 }),
             ),
             children_namespace: Mutex::new(None),
-            fs,
             fs_state: Arc::new(FsState {
                 cwd: Mutex::new(creator.and_then(|creator| creator.fs_state.cwd.lock().clone())),
             }),
@@ -692,6 +692,7 @@ impl BrokerProcess {
             }),
             state: Mutex::new(BrokerProcessState {
                 status: ProcessStatus::Starting,
+                fs: Some(fs),
                 reported_exit_status: None,
                 pending_child_process: None,
                 retirement: ProcessRetirement::Active { abnormal: false },
@@ -824,6 +825,10 @@ impl BrokerProcess {
         &self.core
     }
 
+    pub(crate) fn file_service(&self) -> Result<Arc<dyn FileService>> {
+        self.state.lock().fs.clone().ok_or(BrokerError::PeerClosed)
+    }
+
     /// Creates one child of this process and its initial thread, with IDs in
     /// `pid_namespace`, which is this process's namespace or nested in it, in
     /// this process's job, with its file service, credential and host names.
@@ -838,6 +843,9 @@ impl BrokerProcess {
         pid_namespace: &Arc<PidNamespace>,
         sibling: bool,
     ) -> Result<Arc<BrokerProcess>> {
+        // Snapshot the creator's file service, even for a sibling, without holding the process tree
+        // lock.
+        let fs = self.file_service()?;
         let child = {
             // The tree lock orders the new link against this process's and
             // the parent's exits.
@@ -868,7 +876,7 @@ impl BrokerProcess {
                 self.core.register_process(
                     self.caller_credential,
                     pid_namespace,
-                    &self.fs,
+                    &fs,
                     &self.job,
                     &host_names,
                     Some(&parent),
@@ -894,12 +902,15 @@ impl BrokerProcess {
     /// child `request.process_id`, leaving all the existing namespaces intact
     /// on failure.
     ///
-    /// Returns `UnknownObject` if the target is neither, and
-    /// `UnsupportedOperation` if the request asks for a children's PID
-    /// namespace for a pending child or while this process's children already
-    /// go to another one. Returns `ResourceExhausted` if that namespace can't
-    /// be created, and `PolicyDenied` for a new segment namespace unless the
-    /// process may write.
+    /// Returns:
+    /// - `UnknownObject` if the target is neither.
+    /// - `UnsupportedOperation` if the request asks for a children's PID
+    ///   namespace for a pending child, or while this process's children
+    ///   already go to another one, or for a mount view copy for this process
+    ///   itself or that the target's file service can't make.
+    /// - `ResourceExhausted` if the PID namespace can't be created.
+    /// - `PolicyDenied` for a new segment namespace unless the process may
+    ///   write.
     pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<()> {
         if request.new_segment_namespace {
             self.require_object_rights(ObjectRights::WAIT | ObjectRights::WRITE)?;
@@ -907,44 +918,85 @@ impl BrokerProcess {
         if request.children_pid_namespace.is_some() && request.process_id != self.id() {
             return Err(BrokerError::UnsupportedOperation);
         }
-        // Declared before the guards below, so that an unused namespace drops
-        // after them.
+        // A running process's view could gain a mount between the copy and its
+        // installation, which would lose that mount.
+        if request.copy_mount_view && request.process_id == self.id() {
+            return Err(BrokerError::UnsupportedOperation);
+        }
+        // Declared before the guards below, so that an unused namespace or
+        // file service drops after them.
         let mut pid_namespace = request
             .children_pid_namespace
             .map(|options| self.new_nested_pid_namespace(options))
             .transpose()?;
-        let mut state = self.state.lock();
-        if !self.accepts_operations(&state) {
-            return Err(BrokerError::PeerClosed);
-        }
-        let target = if request.process_id == self.id() {
-            self
-        } else {
-            &self.pending_child(&mut state, request.process_id)?.process
-        };
-        // Holding the child's state keeps it pending until the changes are made.
-        let _child_state = (!core::ptr::eq(target, self)).then(|| target.state.lock());
-
-        // The only check left, last since its lock may not nest another. Each
-        // later change locks only its own namespace and cannot fail.
-        if pid_namespace.is_some() {
-            let mut children_namespace = self.children_namespace.lock();
-            if children_namespace.is_some() {
-                return Err(BrokerError::UnsupportedOperation);
+        let mut fs_copy = None;
+        let replaced_fs = loop {
+            // Copying takes file service locks, which may not nest in a
+            // process's, so the copy is made first, and again if the target's
+            // file service changes before it is installed.
+            if request.copy_mount_view {
+                let current = self.pending_child_file_service(request.process_id)?;
+                let copy = current.copy_mount_view()?;
+                fs_copy = Some((current, copy));
             }
-            *children_namespace = pid_namespace.take();
-        }
-        if request.copy_host_names {
-            let mut shared = target.host_names.lock();
-            let copy = SharedHostNames::new(shared.0.lock().clone());
-            let previous = core::mem::replace(&mut *shared, Arc::new(copy));
-            drop(shared);
-            drop(previous);
-        }
-        if request.new_segment_namespace {
-            target.segments.lock().reset_namespace();
-        }
+            let mut state = self.state.lock();
+            if !self.accepts_operations(&state) {
+                return Err(BrokerError::PeerClosed);
+            }
+            let child = if request.process_id == self.id() {
+                None
+            } else {
+                let pending = self.pending_child(&mut state, request.process_id)?;
+                Some(Arc::clone(&pending.process))
+            };
+            // Holding the child's state keeps it pending until the changes are made.
+            let mut child_state = child.as_ref().map(|child| child.state.lock());
+            let target = child.as_deref().unwrap_or(self);
+            let target_state = child_state.as_deref_mut().unwrap_or(&mut *state);
+            if let Some((current, _)) = &fs_copy
+                && !target_state
+                    .fs
+                    .as_ref()
+                    .is_some_and(|fs| Arc::ptr_eq(fs, current))
+            {
+                continue;
+            }
+
+            // The only check left, last since its lock may not nest another.
+            // Each later change locks only its own namespace and cannot fail.
+            if pid_namespace.is_some() {
+                let mut children_namespace = self.children_namespace.lock();
+                if children_namespace.is_some() {
+                    return Err(BrokerError::UnsupportedOperation);
+                }
+                *children_namespace = pid_namespace.take();
+            }
+            if request.copy_host_names {
+                let mut shared = target.host_names.lock();
+                let copy = SharedHostNames::new(shared.0.lock().clone());
+                let previous = core::mem::replace(&mut *shared, Arc::new(copy));
+                drop(shared);
+                drop(previous);
+            }
+            if request.new_segment_namespace {
+                target.segments.lock().reset_namespace();
+            }
+            // Leaving the loop releases the locks before the replaced file service drops.
+            break fs_copy
+                .take()
+                .and_then(|(_, copy)| target_state.fs.replace(copy));
+        };
+        drop(replaced_fs);
         Ok(())
+    }
+
+    /// Returns the file service of this process's pending child `process_id`.
+    fn pending_child_file_service(&self, process_id: ProcessId) -> Result<Arc<dyn FileService>> {
+        let child = {
+            let mut state = self.state.lock();
+            Arc::clone(&self.pending_child(&mut state, process_id)?.process)
+        };
+        child.file_service()
     }
 
     /// Creates a PID namespace with `options` nested in this process's for its
@@ -2396,8 +2448,12 @@ impl BrokerProcess {
                 }
             }
         }
-        // Like a failed start, a failed child's threads end.
+        // As in fail_start, release resources outside the tree lock, even if a supervisor
+        // still holds the failed process.
         for child in &failed_children {
+            if child.release_references() {
+                child.state.lock().retirement.mark_abnormal();
+            }
             child.end_threads(false);
         }
         if !failed_children.is_empty() {
@@ -3265,6 +3321,10 @@ impl BrokerProcess {
         // run while its lock is held.
         let socket_account = self.socket_account.lock().take();
         drop(socket_account);
+        // A zombie must not pin its namespace's runtime mount slots. The last reference may
+        // destroy backends, so release it outside the state lock.
+        let fs = self.state.lock().fs.take();
+        drop(fs);
         invariant_fault
     }
 
@@ -3750,6 +3810,97 @@ mod tests {
         assert_eq!(take_republished(&parent_sink), []);
         assert_eq!(child.close_object_reference(child_event), Ok(()));
         assert_eq!(*child_sink.retired.lock().unwrap(), [child_event]);
+    }
+
+    #[test]
+    fn private_mount_view_is_released_before_child_is_reaped() {
+        use crate::fs::{self, composer::Composer, in_mem::InMem, resolver::Resolver};
+
+        let fs = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        let broker = TestBrokerBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child_id = parent
+            .allocate_child_process(None, false)
+            .unwrap()
+            .process_id;
+        parent
+            .create_namespaces(CreateNamespacesRequest {
+                process_id: child_id,
+                children_pid_namespace: None,
+                new_segment_namespace: false,
+                copy_host_names: false,
+                copy_mount_view: true,
+            })
+            .unwrap();
+        let child = parent.take_child_process(child_id).unwrap();
+        child.complete_start().unwrap();
+        fs::mkdir(&parent, None, "/container", ROOT, FileMode::RWXU)
+            .unwrap()
+            .unwrap();
+        fs::mkdir(&parent, None, "/container/data", ROOT, FileMode::RWXU)
+            .unwrap()
+            .unwrap();
+        fs::mount_in_mem(&child, "/container/data", ROOT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::rename(&parent, None, "/container", None, "/moved", ROOT),
+            Ok(Err(FileError::Busy))
+        );
+        assert_eq!(
+            fs::rmdir(&parent, None, "/container/data", ROOT),
+            Ok(Err(FileError::Busy))
+        );
+        child.complete_exit(EXITED, CpuTime::default()).unwrap();
+        assert!(broker.pid_namespace.is_registered(child.id()));
+        fs::rename(&parent, None, "/container", None, "/moved", ROOT)
+            .unwrap()
+            .unwrap();
+        fs::rmdir(&parent, None, "/moved/data", ROOT)
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn process_cannot_copy_its_own_mount_view() {
+        use crate::fs::{composer::Composer, in_mem::InMem, resolver::Resolver};
+
+        let fs = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
+        let broker = TestBrokerBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        process.complete_start().unwrap();
+        assert_eq!(
+            process.create_namespaces(CreateNamespacesRequest {
+                process_id: process.id(),
+                children_pid_namespace: None,
+                new_segment_namespace: false,
+                copy_host_names: false,
+                copy_mount_view: true,
+            }),
+            Err(BrokerError::UnsupportedOperation)
+        );
     }
 
     #[test]
@@ -4617,6 +4768,7 @@ mod tests {
                 children_pid_namespace: Some(PidNamespaceOptions::default()),
                 new_segment_namespace: true,
                 copy_host_names: true,
+                copy_mount_view: false,
             }),
             Err(BrokerError::ResourceExhausted),
         );
@@ -4642,6 +4794,7 @@ mod tests {
             children_pid_namespace: None,
             new_segment_namespace: true,
             copy_host_names: true,
+            copy_mount_view: false,
         })
         .unwrap();
         assert!(
@@ -4686,6 +4839,7 @@ mod tests {
             children_pid_namespace: None,
             new_segment_namespace: false,
             copy_host_names: true,
+            copy_mount_view: false,
         })
         .unwrap();
         root.set_host_name(child_id, HostNameKind::Host, host_name(b"child"))
@@ -4879,10 +5033,16 @@ mod tests {
 
     #[test]
     fn owner_death_fails_and_retires_pending_child_process() {
+        use crate::fs::{composer::Composer, in_mem::InMem, resolver::Resolver};
+        let fs = Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap();
         let broker = TestBrokerBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
         .unwrap();
         let parent = broker
@@ -4893,6 +5053,15 @@ mod tests {
             .allocate_child_process(None, false)
             .unwrap()
             .process_id;
+        parent
+            .create_namespaces(CreateNamespacesRequest {
+                process_id,
+                children_pid_namespace: None,
+                new_segment_namespace: false,
+                copy_host_names: false,
+                copy_mount_view: true,
+            })
+            .unwrap();
         let child = broker
             .pid_namespace
             .processes
@@ -4901,8 +5070,10 @@ mod tests {
             .and_then(alloc::sync::Weak::upgrade)
             .unwrap();
 
+        let fs = Arc::downgrade(&child.file_service().unwrap());
         parent.handle_owner_death();
 
+        assert!(fs.upgrade().is_none());
         assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
         assert!(child.is_released());
         assert!(parent.tree_node.lock().children.is_empty());

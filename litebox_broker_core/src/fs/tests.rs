@@ -117,6 +117,242 @@ fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform, TarRo> {
     Resolver::new(TarRo::new(tar_data, InodeAllocators::new().next()))
 }
 
+#[test]
+fn copied_mount_views_share_files_and_locks_but_not_new_mounts() {
+    use alloc::sync::Arc;
+    use litebox_broker_protocol::fs::FileLockOperation::Exclusive;
+
+    let parent = Resolver::<TestPlatform, _>::new(
+        super::composer::Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap(),
+    );
+    parent.mkdir(ROOT, None, "/work", Mode::RWXU).unwrap();
+    parent.mount_in_mem(ROOT, "/work").unwrap();
+    parent.mkdir(ROOT, None, "/work/dir", Mode::RWXU).unwrap();
+    let file = "/work/dir/file";
+    let mut original = parent
+        .open(ROOT, None, file, OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+        .unwrap();
+    let child = parent.copy_mount_view().unwrap();
+    let mut opened = child
+        .open(ROOT, None, file, OFlags::RDWR, Mode::empty())
+        .unwrap();
+
+    let owner: Arc<dyn Send + Sync> = Arc::new(());
+    let other: Arc<dyn Send + Sync> = Arc::new(());
+    parent
+        .lock(&original, Arc::downgrade(&owner), Exclusive)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        child
+            .lock(&opened, Arc::downgrade(&other), Exclusive)
+            .unwrap_err(),
+        crate::BrokerError::NonBlockingWouldBlock
+    );
+
+    let underlying = parent
+        .file_status(ROOT, None, "/work/dir", true)
+        .unwrap()
+        .node_info;
+    child.mount_in_mem(ROOT, "/work/dir").unwrap();
+    assert_eq!(
+        parent
+            .file_status(ROOT, None, "/work/dir", true)
+            .unwrap()
+            .node_info,
+        underlying
+    );
+    assert_ne!(
+        child
+            .file_status(ROOT, None, "/work/dir", true)
+            .unwrap()
+            .node_info
+            .dev,
+        underlying.dev,
+    );
+    assert!(matches!(
+        child.open(ROOT, None, file, OFlags::RDONLY, Mode::empty()),
+        Err(super::errors::OpenError::PathError(
+            super::errors::PathError::NoSuchFileOrDirectory
+        ))
+    ));
+    assert_eq!(child.write(&mut opened, b"x", None).unwrap(), 1);
+    let mut data = [0; 1];
+    assert_eq!(parent.read(&mut original, &mut data, None).unwrap(), 1);
+    assert_eq!(&data, b"x");
+    // Both views can now mount at the same path without colliding device identities.
+    parent.mount_in_mem(ROOT, "/work/dir").unwrap();
+    assert_ne!(
+        parent
+            .file_status(ROOT, None, "/work/dir", true)
+            .unwrap()
+            .node_info
+            .dev,
+        child
+            .file_status(ROOT, None, "/work/dir", true)
+            .unwrap()
+            .node_info
+            .dev,
+    );
+}
+
+#[test]
+fn private_mount_rejects_removal_and_replacement() {
+    use super::errors::{RenameError, RmdirError, UnlinkError};
+    let parent = Resolver::<TestPlatform, _>::new(
+        super::composer::Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .mount("/other", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap(),
+    );
+    parent.mkdir(ROOT, None, "/pinned", Mode::RWXU).unwrap();
+    parent
+        .mkdir(ROOT, None, "/other/source", Mode::RWXU)
+        .unwrap();
+    parent
+        .open(ROOT, None, "/file", OFlags::CREAT, Mode::RWXU)
+        .unwrap();
+    let child = parent.copy_mount_view().unwrap();
+    child.mount_in_mem(ROOT, "/pinned").unwrap();
+
+    for (old, new) in [("/pinned", "/other/new"), ("/other/source", "/pinned")] {
+        assert!(matches!(
+            parent.rename(ROOT, None, old, None, new),
+            Err(RenameError::CrossDevice)
+        ));
+    }
+    assert!(matches!(
+        parent.rename(ROOT, None, "/missing", None, "/pinned"),
+        Err(RenameError::Busy)
+    ));
+    assert!(matches!(
+        parent.rename(ROOT, None, "/pinned", None, "/pinned"),
+        Err(RenameError::Busy)
+    ));
+    assert!(matches!(
+        parent.rename(ROOT, None, "/pinned", None, "/pinned/new"),
+        Err(RenameError::Busy)
+    ));
+    assert!(matches!(
+        parent.rename(ROOT, None, "/file", None, "/pinned"),
+        Err(RenameError::Busy)
+    ));
+    assert!(matches!(
+        parent.rename(ROOT, None, "/pinned", None, "/file"),
+        Err(RenameError::Busy)
+    ));
+    assert!(matches!(
+        parent.unlink(ROOT, None, "/pinned"),
+        Err(UnlinkError::IsADirectory)
+    ));
+    parent
+        .mkdir(ROOT, None, "/pinned/child", Mode::RWXU)
+        .unwrap();
+    assert!(matches!(
+        parent.rmdir(ROOT, None, "/pinned"),
+        Err(RmdirError::Busy)
+    ));
+    assert!(matches!(
+        child.rename(ROOT, None, "/pinned", None, "/pinned"),
+        Err(RenameError::Busy)
+    ));
+    assert!(matches!(
+        child.rmdir(ROOT, None, "/pinned"),
+        Err(RmdirError::ReadOnlyFileSystem)
+    ));
+    assert!(
+        parent
+            .file_status(ROOT, None, "/pinned/child", true)
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_private_mount_does_not_pin_names_in_an_unrelated_backend() {
+    let fs = Resolver::<TestPlatform, _>::new(
+        super::composer::Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap(),
+    );
+    fs.mkdir(ROOT, None, "/work", Mode::RWXU).unwrap();
+    fs.mkdir(ROOT, None, "/work/data", Mode::RWXU).unwrap();
+    let child = fs.copy_mount_view().unwrap();
+    child.mount_in_mem(ROOT, "/work/data").unwrap();
+    fs.mount_in_mem(ROOT, "/work").unwrap();
+    fs.mkdir(ROOT, None, "/work/data", Mode::RWXU).unwrap();
+    fs.rename(ROOT, None, "/work/data", None, "/work/renamed")
+        .unwrap();
+    assert!(child.file_status(ROOT, None, "/work/data", true).is_ok());
+}
+
+#[test]
+fn relative_rename_uses_the_held_parent_after_its_name_is_reused() {
+    let fs = Resolver::<TestPlatform, _>::new(
+        super::composer::Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap(),
+    );
+    fs.mkdir(ROOT, None, "/old", Mode::RWXU).unwrap();
+    let held = fs
+        .open(ROOT, None, "/old", OFlags::PATH, Mode::empty())
+        .unwrap();
+    fs.mkdir(ROOT, Some(held.anchor()), "target", Mode::RWXU)
+        .unwrap();
+    fs.rename(ROOT, None, "/old", None, "/moved").unwrap();
+    fs.mkdir(ROOT, None, "/old", Mode::RWXU).unwrap();
+    fs.rename(ROOT, Some(held.anchor()), "target", None, "/old/target")
+        .unwrap();
+    let child = fs.copy_mount_view().unwrap();
+    child.mount_in_mem(ROOT, "/old/target").unwrap();
+    fs.mkdir(ROOT, Some(held.anchor()), "target", Mode::RWXU)
+        .unwrap();
+    fs.rmdir(ROOT, Some(held.anchor()), "target").unwrap();
+    assert!(fs.file_status(ROOT, None, "/old/target", true).is_ok());
+}
+
+#[test]
+fn private_mount_and_ancestor_rename_have_one_order() {
+    use super::errors::RenameError;
+    use litebox_broker_protocol::fs::FileError;
+    use std::{sync::Barrier, thread};
+
+    let parent = Resolver::<TestPlatform, _>::new(
+        super::composer::Composer::<TestPlatform>::builder()
+            .mount("/", InMem::<TestPlatform>::new)
+            .build()
+            .unwrap(),
+    );
+    parent.mkdir(ROOT, None, "/work", Mode::RWXU).unwrap();
+    parent
+        .mkdir(ROOT, None, "/work/target", Mode::RWXU)
+        .unwrap();
+    let child = parent.copy_mount_view().unwrap();
+    let start = Barrier::new(2);
+    thread::scope(|s| {
+        let mount = s.spawn(|| {
+            start.wait();
+            child.mount_in_mem(ROOT, "/work/target")
+        });
+        start.wait();
+        let rename = parent.rename(ROOT, None, "/work", None, "/moved");
+        match (mount.join().unwrap(), rename) {
+            (Ok(()), Err(RenameError::Busy)) => {
+                assert!(child.file_status(ROOT, None, "/work/target", true).is_ok());
+            }
+            (Err(FileError::MissingComponent), Ok(())) => {
+                assert!(child.file_status(ROOT, None, "/moved/target", true).is_ok());
+            }
+            other => panic!("inconsistent mount and rename: {other:?}"),
+        }
+    });
+}
+
 /// The path that `path` opens as, and up to 1 KiB of its content.
 fn read_path<Backend: super::backend::Backend + 'static>(
     fs: &Resolver<TestPlatform, Backend>,
@@ -2616,7 +2852,10 @@ mod tar_ro {
                 Mode::empty(),
             )
             .unwrap();
-        assert_eq!(fs.handle_path(Caller::default(), &bar).unwrap(), "/bar");
+        assert_eq!(
+            fs.handle_path(Caller::default(), &bar, &fs).unwrap(),
+            "/bar"
+        );
         let up = fs
             .open(
                 USER,
@@ -2626,7 +2865,7 @@ mod tar_ro {
                 Mode::empty(),
             )
             .unwrap();
-        assert_eq!(fs.handle_path(Caller::default(), &up).unwrap(), "/");
+        assert_eq!(fs.handle_path(Caller::default(), &up, &fs).unwrap(), "/");
         assert!(
             fs.file_status(USER, Some(bar.anchor()), "baz", true)
                 .is_ok()
@@ -3632,13 +3871,16 @@ mod overlay {
         ));
         assert!(fs.file_status(user, Some(bar.anchor()), ".", true).is_ok());
         assert!(matches!(
-            fs.handle_path(Caller::default(), &bar),
+            fs.handle_path(Caller::default(), &bar, &fs),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         let parent = fs
             .open(user, Some(bar.anchor()), "..", OFlags::PATH, Mode::empty())
             .unwrap();
-        assert_eq!(fs.handle_path(Caller::default(), &parent).unwrap(), "/");
+        assert_eq!(
+            fs.handle_path(Caller::default(), &parent, &fs).unwrap(),
+            "/"
+        );
     }
 
     #[test]
@@ -3695,8 +3937,11 @@ mod overlay {
         fs.rename(USER, None, "/a", None, "/b").unwrap();
 
         // Like Linux, held directories (and their descendants) move with the rename.
-        assert_eq!(fs.handle_path(Caller::default(), &a).unwrap(), "/b");
-        assert_eq!(fs.handle_path(Caller::default(), &sub).unwrap(), "/b/sub");
+        assert_eq!(fs.handle_path(Caller::default(), &a, &fs).unwrap(), "/b");
+        assert_eq!(
+            fs.handle_path(Caller::default(), &sub, &fs).unwrap(),
+            "/b/sub"
+        );
         let b_node = fs.file_status(USER, None, "/b", true).unwrap().node_info;
         assert_eq!(
             fs.handle_status(Caller::default(), &a).unwrap().node_info,
@@ -3713,14 +3958,14 @@ mod overlay {
             b_node
         );
         assert_eq!(
-            fs.handle_path(Caller::default(), &sub_parent).unwrap(),
+            fs.handle_path(Caller::default(), &sub_parent, &fs).unwrap(),
             "/b"
         );
 
         // The replaced directory is unlinked: it has no name, but `..` still reaches its former
         // parent rather than the directory that took its name.
         assert!(matches!(
-            fs.handle_path(Caller::default(), &old_b),
+            fs.handle_path(Caller::default(), &old_b, &fs),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(matches!(
@@ -3737,7 +3982,8 @@ mod overlay {
             )
             .unwrap();
         assert_eq!(
-            fs.handle_path(Caller::default(), &old_b_parent).unwrap(),
+            fs.handle_path(Caller::default(), &old_b_parent, &fs)
+                .unwrap(),
             "/"
         );
         assert_eq!(
@@ -3817,13 +4063,16 @@ mod devices {
         let pts = fs
             .open(USER, None, "/dev/pts", OFlags::PATH, Mode::empty())
             .unwrap();
-        assert_eq!(fs.handle_path(Caller::default(), &pts).unwrap(), "/dev/pts");
+        assert_eq!(
+            fs.handle_path(Caller::default(), &pts, &fs).unwrap(),
+            "/dev/pts"
+        );
         for (path, expected) in [("..", "/dev"), ("../..", "/")] {
             let parent = fs
                 .open(USER, Some(pts.anchor()), path, OFlags::PATH, Mode::empty())
                 .unwrap();
             assert_eq!(
-                fs.handle_path(Caller::default(), &parent).unwrap(),
+                fs.handle_path(Caller::default(), &parent, &fs).unwrap(),
                 expected
             );
         }

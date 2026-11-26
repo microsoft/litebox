@@ -311,7 +311,8 @@ pub trait Backend: Send + Sync + Any {
         metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError>;
 
-    /// Remove `name` after the resolver authorizes search and write access to `parent`.
+    /// Remove the non-directory `name` from `parent` after the resolver authorizes search and
+    /// write access to `parent`. If `name` is a directory, fail without removing it.
     fn unlink_at(&self, parent: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError>;
 
     /// Remove the directory `name` at `parent`.

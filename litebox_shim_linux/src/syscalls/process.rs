@@ -304,6 +304,10 @@ const UTS_AND_IPC_NAMESPACE_FLAGS: CloneFlags = CloneFlags::NEWUTS.union(CloneFl
 
 /// How a new child process relates to the process creating it.
 #[derive(Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each clone flag chooses independently"
+)]
 struct ChildRelation {
     /// Whether the child is the first process of a new PID namespace, with
     /// `PidNamespaceOptions::INIT`.
@@ -313,15 +317,19 @@ struct ChildRelation {
     /// Whether the child is in a new UTS namespace, with its own copy of the creating process's
     /// host names rather than sharing them.
     new_host_names: bool,
+    /// Whether the child is in a new mount namespace, with its own copy of the creating process's
+    /// mount view rather than sharing it.
+    new_mount_view: bool,
 }
 
 impl ChildRelation {
     /// A plain child, in the PID namespace for the creating process's children, sharing its host
-    /// names.
+    /// names and mount view.
     const CHILD: Self = Self {
         new_pid_namespace: false,
         sibling: false,
         new_host_names: false,
+        new_mount_view: false,
     };
 }
 
@@ -1054,14 +1062,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 error => error.into(),
             })?;
         // On failure, dropping the child cancels it.
-        if relation.new_host_names {
+        if relation.new_host_names || relation.new_mount_view {
             self.global
                 .litebox
                 .create_namespaces(CreateNamespacesRequest {
                     process_id: child.identity().process_id,
                     children_pid_namespace: None,
                     new_segment_namespace: false,
-                    copy_host_names: true,
+                    copy_host_names: relation.new_host_names,
+                    copy_mount_view: relation.new_mount_view,
                 })?;
         }
         Ok(child)
@@ -1155,6 +1164,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 children_pid_namespace: new_pid.then_some(PidNamespaceOptions::INIT),
                 new_segment_namespace: false,
                 copy_host_names,
+                copy_mount_view: false,
             }) {
             Ok(()) => {}
             // If LiteBox can't change host names, they are fixed, so there is nothing to copy.
@@ -2202,8 +2212,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `CLONE_VM | CLONE_VFORK`.
     ///
     /// Among other flags, a child process supports `CLONE_PARENT` and the namespace flags
-    /// `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWIPC`, and a `vfork` child supports
-    /// `CLONE_CLEAR_SIGHAND` and the same namespace flags. Both support `CLONE_PIDFD`, but threads
+    /// `CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWUTS`, and `CLONE_NEWIPC`. A `vfork` child supports
+    /// `CLONE_CLEAR_SIGHAND` and the same namespace flags except `CLONE_NEWNS`, since until exec
+    /// it resolves paths through its parent's `LiteBox`. Both support `CLONE_PIDFD`, but threads
     /// don't, since thread pidfds are unsupported. Both support only `SIGCHLD` as the exit
     /// signal, as `posix_spawn` uses, except that, like Linux, a sibling (`CLONE_PARENT`) gets this
     /// process's exit signal instead. Other process creation is unsupported.
@@ -2292,6 +2303,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 | CloneFlags::PARENT
                 | CloneFlags::PIDFD
                 | CloneFlags::NEWPID
+                | CloneFlags::NEWNS
                 | UTS_AND_IPC_NAMESPACE_FLAGS;
             if flags.intersects(!supported_fork_flags) {
                 log_unsupported!("fork clone with flags: {:?}", flags);
@@ -2314,13 +2326,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if sibling && self.is_first_process() {
                 return Err(Errno::EINVAL);
             }
-            if flags.intersects(UTS_AND_IPC_NAMESPACE_FLAGS) {
+            if flags.intersects(UTS_AND_IPC_NAMESPACE_FLAGS | CloneFlags::NEWNS) {
                 self.check_admin()?;
             }
             let relation = ChildRelation {
                 new_pid_namespace: self.clone_creates_pid_namespace(flags)?,
                 sibling,
                 new_host_names: flags.contains(CloneFlags::NEWUTS),
+                new_mount_view: flags.contains(CloneFlags::NEWNS),
             };
             let child_tid: usize = child_tid.trunc();
             let tid_if = |flag| if flags.contains(flag) { child_tid } else { 0 };
@@ -2364,6 +2377,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 new_pid_namespace: self.clone_creates_pid_namespace(flags)?,
                 sibling: false,
                 new_host_names: flags.contains(CloneFlags::NEWUTS),
+                new_mount_view: false,
             };
             return self.begin_vfork(
                 ctx,

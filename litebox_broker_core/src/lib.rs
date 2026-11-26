@@ -591,8 +591,9 @@ impl BrokerCore {
     /// Counts and registers one process, without an initial thread, in
     /// `pid_namespace` and `job`, opening files through `fs` and using the
     /// host names `host_names`. With `parent`, the process is its child,
-    /// `parent` must have the same `job` and `fs`, and `pid_namespace` is
-    /// `parent`'s namespace or one nested in it.
+    /// `parent` must have the same `job`, and `pid_namespace` is `parent`'s
+    /// namespace or one nested in it. `fs` is the creator's, which may differ
+    /// from `parent`'s.
     ///
     /// This publishes the process before its creation is final: a caller whose
     /// later step fails undoes the registration by discarding the process. So

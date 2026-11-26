@@ -446,6 +446,32 @@ fn test_nine_p_unlink_and_rmdir() {
 }
 
 #[test]
+fn tremove_fallback_preserves_entries_of_the_wrong_kind() {
+    let server = DiodServer::start();
+    std::fs::write(server.export_path().join("file"), b"keep").unwrap();
+    std::fs::create_dir(server.export_path().join("dir")).unwrap();
+    let backend = attach(server.connect(), &server, InodeAllocators::new().next());
+    backend.unlinkat_supported.store(false, Ordering::SeqCst);
+    let fs = Resolver::<TestPlatform, _>::new(backend);
+
+    assert!(matches!(
+        fs.unlink(USER, None, "/dir"),
+        Err(UnlinkError::IsADirectory)
+    ));
+    assert!(matches!(
+        fs.rmdir(USER, None, "/file"),
+        Err(RmdirError::NotADirectory)
+    ));
+    assert!(server.export_path().join("dir").is_dir());
+    assert_eq!(
+        std::fs::read(server.export_path().join("file")).unwrap(),
+        b"keep"
+    );
+    fs.unlink(USER, None, "/file").unwrap();
+    fs.rmdir(USER, None, "/dir").unwrap();
+}
+
+#[test]
 fn test_nine_p_seek_and_partial_read() {
     let server = DiodServer::start();
     let fs = connect_9p(&server);
@@ -1239,7 +1265,7 @@ fn nine_p_held_directories_name_and_walk() {
     let root = fs
         .open(USER, None, "/", OFlags::PATH, Mode::empty())
         .unwrap();
-    assert_eq!(fs.handle_path(Caller::default(), &root).unwrap(), "/");
+    assert_eq!(fs.handle_path(Caller::default(), &root, &fs).unwrap(), "/");
     // 9P cannot name other directories, so they report the name they were opened by.
     let sub = fs
         .open(
@@ -1250,7 +1276,10 @@ fn nine_p_held_directories_name_and_walk() {
             Mode::empty(),
         )
         .unwrap();
-    assert_eq!(fs.handle_path(Caller::default(), &sub).unwrap(), "/d/sub");
+    assert_eq!(
+        fs.handle_path(Caller::default(), &sub, &fs).unwrap(),
+        "/d/sub"
+    );
     // A directory opened for reading still walks relative paths and lists afterwards.
     drop(
         fs.open(
@@ -1340,7 +1369,10 @@ fn nine_p_held_directory_search_is_checked_by_the_server() {
     let parent = fs
         .open(USER, Some(d.anchor()), "..", OFlags::PATH, Mode::empty())
         .unwrap();
-    assert_eq!(fs.handle_path(Caller::default(), &parent).unwrap(), "/");
+    assert_eq!(
+        fs.handle_path(Caller::default(), &parent, &fs).unwrap(),
+        "/"
+    );
 }
 
 #[test]
@@ -1361,7 +1393,10 @@ fn nine_p_removed_held_directory_has_no_name() {
         .unwrap()
     });
     for gone in &held {
-        assert_eq!(fs.handle_path(Caller::default(), gone).unwrap(), "/gone");
+        assert_eq!(
+            fs.handle_path(Caller::default(), gone, &fs).unwrap(),
+            "/gone"
+        );
     }
 
     fs.rmdir(USER, None, "/gone").unwrap();
@@ -1369,7 +1404,7 @@ fn nine_p_removed_held_directory_has_no_name() {
     // Like Linux, an unlinked directory has no name, rather than the name it was opened by.
     for gone in &held {
         assert!(matches!(
-            fs.handle_path(Caller::default(), gone),
+            fs.handle_path(Caller::default(), gone, &fs),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }

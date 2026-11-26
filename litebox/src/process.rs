@@ -97,14 +97,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Applies the requested namespace changes to this process or its pending
     /// child, all of them or none. A new children's PID namespace, only for
     /// this process, is nested in its own, and the first child created in it
-    /// becomes its first process.
+    /// becomes its first process. A copy of the mount view is only for a
+    /// pending child.
     ///
     /// Fails with [`ProcessError::InvalidChild`] if the target is neither,
     /// with [`ProcessError::Unavailable`] if this process's children already
-    /// go to another PID namespace, with [`ProcessError::ResourceExhausted`]
-    /// at a namespace count or nesting limit, and with
-    /// [`ProcessError::PolicyDenied`] if this process may not create a segment
-    /// namespace.
+    /// go to another PID namespace or the target's mount view can't be copied,
+    /// with [`ProcessError::ResourceExhausted`] at a namespace count or
+    /// nesting limit, and with [`ProcessError::PolicyDenied`] if this process
+    /// may not create a segment namespace.
     pub fn create_namespaces(&self, request: CreateNamespacesRequest) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.create_namespaces(request)?)
