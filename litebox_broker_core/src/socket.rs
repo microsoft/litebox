@@ -5,6 +5,7 @@
 //! lifecycle.
 
 use alloc::sync::Arc;
+use core::any::Any;
 use core::fmt;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::AtomicUsize;
@@ -38,7 +39,11 @@ const FIRST_EPHEMERAL_PORT: u16 = 49152;
 /// Fixed broker-wide private IPv4 identity of the shared guest network.
 pub const GUEST_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 
-/// Fixed guest-visible address used to reach host-loopback services.
+/// Fixed guest-visible address of the host with
+/// [`SocketAddressing::Isolated`]: a provider on host sockets reaches
+/// host-loopback services there (see [`host_socket_destination`]), and one on
+/// a network device uses it as the gateway. With [`SocketAddressing::Host`],
+/// it has no special meaning.
 pub const HOST_GATEWAY_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 1);
 
 fn is_concrete_internal_address(address: Ipv4Addr) -> bool {
@@ -54,7 +59,11 @@ pub fn is_internal_socket_address(address: SocketAddrV4) -> bool {
     address.ip().is_unspecified() || is_concrete_internal_address(*address.ip())
 }
 
-/// Returns the host-socket destination for a normalized external destination.
+/// Returns the host-socket destination for a normalized external destination
+/// of a [`SocketAddressing::Isolated`] socket, which reaches
+/// [`HOST_GATEWAY_IPV4_ADDRESS`] at the host's loopback. A
+/// [`SocketAddressing::Host`] provider connects to the destination policy
+/// authorized, unchanged.
 #[must_use]
 pub fn host_socket_destination(external_destination: SocketAddrV4) -> SocketAddrV4 {
     if *external_destination.ip() == HOST_GATEWAY_IPV4_ADDRESS {
@@ -73,17 +82,7 @@ pub fn host_socket_destination(external_destination: SocketAddrV4) -> SocketAddr
 pub fn normalize_socket_destination(
     requested: SocketAddrV4,
 ) -> core::result::Result<SocketAddrV4, SocketError> {
-    let destination = if requested.ip().is_unspecified() {
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, requested.port())
-    } else {
-        requested
-    };
-    let destination_ip = *destination.ip();
-    let first_octet = destination_ip.octets()[0];
-    if first_octet == 0 || destination_ip.is_multicast() || first_octet >= 240 {
-        return Err(SocketError::InvalidArgument);
-    }
-    Ok(destination)
+    SocketAddressing::Isolated.normalize_destination(requested)
 }
 
 /// Platform-observed socket state returned to the broker for reconciliation.
@@ -213,10 +212,10 @@ impl GuestPortBinding {
         }
         let source_address =
             GuestSocketBinding::new(self).source_address_for_destination(destination)?;
-        Some(GuestSourceLease {
-            _binding: Some(Arc::clone(self)),
+        Some(GuestSourceLease::retaining(
             source_address,
-        })
+            Arc::clone(self) as Arc<dyn Any + Send + Sync>,
+        ))
     }
 }
 
@@ -393,25 +392,39 @@ impl Eq for GuestSocketBinding {}
 
 /// Lease naming one exact guest-visible TCP source endpoint.
 ///
-/// Core creates this value from a live guest binding, which it retains, when a
-/// TCP connection targets the guest namespace. A provider names a client from
-/// outside the guest with [`Self::external`], which retains nothing. A lease
-/// grants no bind or listen authority. A
-/// internal platform path must carry the lease through any queued connection
-/// and return it from [`PlatformSocket::accept`]. Dropping the final binding
-/// reference releases the namespace entry.
+/// With [`SocketAddressing::Isolated`], core creates this value from a live
+/// guest binding, which it retains, when a TCP connection targets the guest
+/// namespace. A provider names a client it does not bind for the guest with
+/// [`Self::external`], which retains nothing, and one whose port it holds
+/// itself, as a [`SocketAddressing::Host`] provider holds a connector's host
+/// port, with [`Self::retaining`]. A lease grants no bind or listen authority.
+/// An internal platform path must carry the lease through any queued
+/// connection and return it from [`PlatformSocket::accept`]. Dropping the
+/// lease releases what it retains, and with the final reference to a guest
+/// binding, its namespace entry.
 pub struct GuestSourceLease {
-    _binding: Option<Arc<GuestPortBinding>>,
+    _holder: Option<Arc<dyn Any + Send + Sync>>,
     source_address: SocketAddrV4,
 }
 
 impl GuestSourceLease {
-    /// Names a peer outside the guest network, retaining nothing, at `source_address`.
+    /// Names a peer that retains no guest binding, at `source_address`: one
+    /// outside the guest network, or with [`SocketAddressing::Host`], any
+    /// client of a host socket.
     #[must_use]
     pub fn external(source_address: SocketAddrV4) -> Self {
-        debug_assert!(!is_internal_socket_address(source_address));
         Self {
-            _binding: None,
+            _holder: None,
+            source_address,
+        }
+    }
+
+    /// Names a peer at `source_address` whose port `holder` holds, keeping
+    /// `holder` alive as long as the lease.
+    #[must_use]
+    pub fn retaining(source_address: SocketAddrV4, holder: Arc<dyn Any + Send + Sync>) -> Self {
+        Self {
+            _holder: Some(holder),
             source_address,
         }
     }
@@ -442,6 +455,14 @@ pub enum PlatformConnectError {
     ///
     /// Core retires the platform socket before permitting another operation.
     PeerIndeterminate(BrokerError),
+    /// The attempt failed with this socket error before it changed the
+    /// socket, which stays as it was for another attempt.
+    ///
+    /// Core reports the error as the attempt's [`SocketOutcome::Failed`].
+    /// A stream's [`SocketConnectionStatus::Failed`] from the provider instead
+    /// becomes its lasting state; a datagram socket keeps its previous peer
+    /// after either.
+    Rejected(SocketError),
 }
 
 /// Broker socket and endpoint metadata returned by an accept operation.
@@ -480,6 +501,106 @@ pub struct PlatformDatagramReceive {
     pub source_address: SocketAddrV4,
 }
 
+/// How a provider addresses its sockets, as [`SocketProvider::addressing`]
+/// reports; core addresses every socket the same way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SocketAddressing {
+    /// Guests share a private network that core addresses. Core reserves
+    /// each guest port, at [`GUEST_IPV4_ADDRESS`], loopback, or the wildcard
+    /// address, in a namespace of its own, independent of host ports.
+    /// Connections between guest addresses stay within the provider. Other
+    /// destinations, including [`HOST_GATEWAY_IPV4_ADDRESS`], are external;
+    /// the provider reaches them as destination policy permits, e.g., through
+    /// host sockets or a network device.
+    #[default]
+    Isolated,
+    /// Each guest TCP socket is a host socket at its own host address and
+    /// port, as when the broker runs in a network namespace of the guest's
+    /// own. The platform binds it, checking the address the guest names and
+    /// choosing a port for port 0, or as an unbound stream connects, and
+    /// reports the addresses the host assigns; core reserves no ports. A connection to a listener of the
+    /// provider's own sockets may stay within the provider; any other
+    /// destination is reached only as destination policy permits, as
+    /// [`SocketEgress`] describes.
+    ///
+    /// Core supports only TCP with this mode, so a provider reporting it must
+    /// fail [`SocketProvider::create`] for UDP sockets.
+    Host,
+}
+
+impl SocketAddressing {
+    /// Maps the unspecified destination to loopback before policy or routing.
+    /// Only the isolated network reserves `0/8` and `240/4`; a host can use
+    /// addresses from these ranges as unicast. Neither mode supports multicast
+    /// or the limited broadcast address.
+    pub fn normalize_destination(
+        self,
+        requested: SocketAddrV4,
+    ) -> core::result::Result<SocketAddrV4, SocketError> {
+        let ip = *requested.ip();
+        if ip.is_unspecified() {
+            return Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, requested.port()));
+        }
+        if ip.is_multicast()
+            || ip.is_broadcast()
+            || (self == Self::Isolated && matches!(ip.octets()[0], 0 | 240..=255))
+        {
+            return Err(SocketError::InvalidArgument);
+        }
+        Ok(requested)
+    }
+}
+
+/// What destination policy lets a [`PlatformSocket::connect`] reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketEgress {
+    /// Policy permits the destination, which the provider reaches as its
+    /// [`SocketAddressing`] describes. Core passes this for every
+    /// [`SocketAddressing::Isolated`] connect, having checked its destination
+    /// itself.
+    Permitted,
+    /// With [`SocketAddressing::Host`], policy permits the destination only
+    /// if a listener of the provider's own sockets serves it, so the provider
+    /// must not connect to it from the host. It checks for such a listener in
+    /// the same step as the connect, so that the listener cannot close in
+    /// between, and connects to one within the provider. Without one, if the
+    /// destination is one of the host's own addresses, the provider fails the
+    /// connect as a host refuses it, with [`SocketConnectionStatus::Failed`]
+    /// and [`SocketError::ConnectionRefused`], even if another host process
+    /// listens there. Otherwise policy denies it, with
+    /// [`PlatformConnectError::Rejected`] and [`SocketError::PolicyDenied`],
+    /// which leaves the socket as it was, as a destination core denies does.
+    ServedOnly,
+}
+
+/// The address a [`PlatformSocket::bind`] binds a socket to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SocketBindRequest {
+    /// A [`SocketAddressing::Isolated`] bind to the guest address core
+    /// reserved.
+    Guest(GuestSocketBinding),
+    /// A [`SocketAddressing::Host`] bind, which the platform performs.
+    Host(HostBindRequest),
+}
+
+/// A [`SocketAddressing::Host`] bind: the local address the guest requested.
+/// The platform shares it as the socket's [`SocketOptionName::ReuseAddress`],
+/// which it keeps, directs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostBindRequest {
+    address: SocketAddrV4,
+}
+
+impl HostBindRequest {
+    /// Returns the requested local address. Its port is 0 for one the
+    /// platform chooses, and its IP the wildcard address or any unicast
+    /// address, which the platform checks.
+    #[must_use]
+    pub const fn address(&self) -> SocketAddrV4 {
+        self.address
+    }
+}
+
 /// Broker-wide socket provider supplied by the host platform.
 ///
 /// The provider creates per-socket [`PlatformSocket`] resources and owns any
@@ -511,6 +632,12 @@ pub trait SocketProvider: Send + Sync {
     /// This is a teardown and accounting boundary, not a separate network
     /// namespace; it must not disturb endpoints owned by other processes.
     fn close_process(&self, process_key: ProcessKey);
+
+    /// Returns how this provider addresses its sockets, which must not
+    /// change. Core reads it once, when it starts.
+    fn addressing(&self) -> SocketAddressing {
+        SocketAddressing::Isolated
+    }
 }
 
 /// One nonblocking socket resource created by [`SocketProvider`].
@@ -527,14 +654,32 @@ pub trait SocketProvider: Send + Sync {
 /// the guest; core may cache the projection but does not reconstruct
 /// host-resource lifecycle state from status.
 pub trait PlatformSocket: Send + Sync {
-    /// Binds this socket to a local address and echoes the assigned address.
+    /// Binds this socket to a local address and returns the assigned address.
     ///
-    /// A broker-managed TCP or UDP socket receives a broker-reserved,
-    /// guest-visible address with a nonzero port and must echo it unchanged. A
-    /// UDP bind may be entirely logical and need not allocate a host socket.
-    /// A failed outcome or broker error must leave the socket unbound and
-    /// retryable.
-    fn bind(&self, binding: GuestSocketBinding) -> Result<SocketOutcome<SocketAddrV4>>;
+    /// With [`SocketAddressing::Isolated`], a broker-managed TCP or UDP
+    /// socket receives [`SocketBindRequest::Guest`], a broker-reserved,
+    /// guest-visible address with a nonzero port, and must echo it unchanged.
+    /// A UDP bind may be entirely logical and need not allocate a host socket.
+    /// With [`SocketAddressing::Host`], a TCP socket receives
+    /// [`SocketBindRequest::Host`] and binds a platform socket to the
+    /// requested address, returning the address the platform assigned: the
+    /// requested IP with a nonzero port. A failed outcome or broker error must
+    /// leave the socket unbound and retryable.
+    fn bind(&self, request: SocketBindRequest) -> Result<SocketOutcome<SocketAddrV4>>;
+
+    /// Returns the address this socket is bound to, or `None` while it is
+    /// unbound.
+    ///
+    /// Core calls this only with [`SocketAddressing::Host`], once a connect
+    /// of an unbound stream returns `Connecting` or `Connected`, to learn the
+    /// address the platform bound, which must have a nonzero port and a
+    /// unicast IP, or the unspecified IP that some hosts report until the
+    /// connection completes (see [`PlatformSocket::status`]). A connection
+    /// that has already ended may have released it, as a host socket's does,
+    /// leaving `None`.
+    fn local_address(&self) -> Result<Option<SocketAddrV4>> {
+        Err(BrokerError::UnsupportedOperation)
+    }
 
     /// Starts a TCP listener and returns its unchanged guest-visible address.
     ///
@@ -557,25 +702,41 @@ pub trait PlatformSocket: Send + Sync {
     /// Starts a connection attempt.
     ///
     /// A stream attempt may return `Connecting` and stores ordinary failures as
-    /// terminal state. A datagram connect completes immediately; the core
+    /// terminal state; [`PlatformConnectError::Rejected`] fails one retryably
+    /// instead. A datagram connect completes immediately; the core
     /// permits replacing its peer and treats synchronous failures as retryable
     /// operation outcomes. A datagram `Failed` status must leave the previous
     /// peer unchanged. Platform failures must distinguish a peer known to be
     /// unchanged from one whose state is indeterminate. Once an external
     /// host-socket connect may have started, implementations must retain enough
     /// platform state to settle or conservatively retire it without
-    /// reconstructing its lifecycle during teardown. A guest TCP attempt
-    /// receives a source lease. An internal path must move it through to
-    /// [`AcceptedPlatformSocket`]; external paths may drop it. Returning
-    /// [`PlatformConnectError::PeerUnchanged`] requires releasing the lease;
+    /// reconstructing its lifecycle during teardown. Core passes a source
+    /// lease only to a [`SocketAddressing::Isolated`] TCP attempt whose
+    /// destination is within the guest network. An internal path must move
+    /// it through to [`AcceptedPlatformSocket`]; external paths may drop it.
+    /// A [`SocketAddressing::Host`] provider that connects within itself
+    /// names the connector with a lease of its own instead, which retains the
+    /// connector's port (see [`GuestSourceLease::retaining`]). Each end of
+    /// such a connection should keep the host port of its own address bound
+    /// while it lives, even after the listener closes, so that no host socket
+    /// takes it. Returning
+    /// [`PlatformConnectError::PeerUnchanged`] or
+    /// [`PlatformConnectError::Rejected`] requires releasing the lease;
     /// [`PlatformSocket::retire`] must release one retained by an indeterminate
     /// or in-progress operation. `address` is the normalized guest-visible
     /// destination; the provider must validate it with
-    /// [`normalize_socket_destination`] before choosing a host-socket target.
+    /// [`SocketAddressing::normalize_destination`] before choosing a host-socket target.
+    ///
+    /// `egress` is what destination policy lets the connect reach, as
+    /// [`SocketEgress`] describes. With [`SocketAddressing::Host`], an
+    /// attempt on an unbound stream binds it as a host socket's connect does,
+    /// at an address the platform chooses (see [`Self::local_address`]); an
+    /// attempt that starts no connection leaves it unbound.
     fn connect(
         &self,
         address: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
+        egress: SocketEgress,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError>;
 
     /// Sends bytes from the start of `data` (see [`crate::transfer`]) without
@@ -666,13 +827,14 @@ pub trait PlatformSocket: Send + Sync {
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>>;
 
     /// Sets a TCP socket's [`SocketOptionValue::NoDelay`] or
-    /// [`SocketOptionValue::KeepAlive`], which the transport implements.
+    /// [`SocketOptionValue::KeepAlive`], which the transport implements, and,
+    /// with [`SocketAddressing::Host`], its [`SocketOptionValue::ReuseAddress`],
+    /// which directs how its host socket shares its address, from its bind on.
     ///
     /// A socket accepted from a listener starts with the listener's values.
     fn set_tcp_option(&self, value: SocketOptionValue) -> Result<()>;
 
-    /// Reads a TCP socket's [`SocketOptionName::NoDelay`] or
-    /// [`SocketOptionName::KeepAlive`].
+    /// Reads a TCP socket's option that [`Self::set_tcp_option`] sets.
     fn get_tcp_option(&self, name: SocketOptionName) -> Result<SocketOptionValue>;
 
     /// Returns platform-observed socket state and consumes at most one pending
@@ -683,9 +845,11 @@ pub trait PlatformSocket: Send + Sync {
     /// `Unconnected`. For datagram sockets, the broker owns the peer state, so
     /// the platform reports `Unconnected` or `Connected` and uses
     /// `pending_error` for asynchronous failures. Any reported local address
-    /// must preserve the broker-reserved port and have an IP accepted by
-    /// [`is_internal_socket_address`]. An unbound datagram must not report a
-    /// local address, and host addresses must never be exposed.
+    /// must preserve the bound port. With [`SocketAddressing::Isolated`], its
+    /// IP must be accepted by [`is_internal_socket_address`], and host
+    /// addresses must never be exposed; with [`SocketAddressing::Host`], it is
+    /// the host socket's own. An unbound datagram must not report a local
+    /// address.
     fn status(&self) -> Result<PlatformSocketStatus>;
 
     /// Synchronously and idempotently ends this socket's platform authority.
@@ -771,6 +935,7 @@ pub fn create(
         guest_source_lease: Mutex::new(None),
         error_queries: Mutex::new(()),
         account,
+        addressing: process.core.socket_addressing,
     });
     let socket = SocketObject::new(resource, request, status);
     socket.sync_readiness();
@@ -784,12 +949,19 @@ pub fn create(
 /// reports it as [`check_connect`] does, except that an attempt still in
 /// progress fails with `AlreadyInProgress`. Port zero and the unspecified
 /// address fail with `ConnectionRefused` without changing the socket.
-/// Otherwise an authorized attempt first binds an unbound socket.
+/// Otherwise an authorized attempt binds an unbound socket: core binds it
+/// first, except that with [`SocketAddressing::Host`], the platform binds a
+/// stream as it starts a connection, as a host socket's connect does.
 /// Connect never reports [`SocketConnectionStatus::Failed`]: a failed attempt
-/// is a [`SocketOutcome::Failed`], after which a stream is unconnected but
-/// fails every later attempt the same way. UDP connects complete
-/// synchronously, and a failed attempt preserves the previous peer. Policy
-/// denial is also a [`SocketOutcome::Failed`] that preserves existing state.
+/// is a [`SocketOutcome::Failed`]. Once this or [`check_connect`] reports
+/// that the platform failed a stream's connection, the stream is unconnected,
+/// and a later attempt that the address and policy checks do not fail first
+/// fails with that connection's error without reaching the platform. An
+/// attempt that policy denies or the platform rejects (see
+/// [`PlatformConnectError::Rejected`]) leaves the stream's connection state
+/// unchanged and keeps an existing bind, including one core made for the
+/// attempt. UDP connects complete synchronously, and a failed attempt
+/// preserves the previous peer.
 pub fn connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -980,27 +1152,43 @@ fn transport_connect(
     if address.port() == 0 {
         return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
     }
-    let destination = match normalize_socket_destination(address) {
+    let addressing = process.core.socket_addressing;
+    let destination = match addressing.normalize_destination(address) {
         Ok(destination) => destination,
         Err(error) => return Ok(SocketOutcome::Failed(error)),
     };
 
+    let host_addressing = addressing == SocketAddressing::Host;
     // Destination denial is an operation-level socket failure. Failures while
-    // evaluating policy remain broker errors.
-    match process.core.policy.authorize_socket_connect(
-        process.caller_credential,
-        create_request.protocol,
-        destination,
-    ) {
-        Ok(()) => {}
-        Err(BrokerError::PolicyDenied) => {
-            return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
+    // evaluating policy remain broker errors. With host addressing, a
+    // destination the rules deny may still be one of the provider's own
+    // listeners, which the provider decides as it connects.
+    let egress = if host_addressing {
+        match process.core.policy.authorize_socket_connect_by_rules(
+            process.caller_credential,
+            create_request.protocol,
+            destination,
+        ) {
+            Ok(()) => SocketEgress::Permitted,
+            Err(BrokerError::PolicyDenied) => SocketEgress::ServedOnly,
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
-    }
+    } else {
+        match process.core.policy.authorize_socket_connect(
+            process.caller_credential,
+            create_request.protocol,
+            destination,
+        ) {
+            Ok(()) => SocketEgress::Permitted,
+            Err(BrokerError::PolicyDenied) => {
+                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
+            }
+            Err(error) => return Err(error),
+        }
+    };
 
     if is_udp(create_request) {
-        return transport_connect_datagram(process, object, create_request, destination);
+        return transport_connect_datagram(process, object, create_request, destination, egress);
     }
 
     let (resource, needs_bind) = {
@@ -1029,7 +1217,9 @@ fn transport_connect(
         socket.disconnected = false;
         (Arc::clone(&socket.resource), socket.local_address.is_none())
     };
-    if needs_bind {
+    // With host addressing, the platform binds an unbound stream as it
+    // connects, as a host socket's connect does.
+    if needs_bind && !host_addressing {
         let binding =
             match reserve_and_bind(process, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
                 Ok(binding) => binding,
@@ -1053,31 +1243,41 @@ fn transport_connect(
             }
         }
     }
-    if resource
-        .source_address_for_destination(destination)
-        .is_none()
-    {
-        abandon_connect(object);
-        return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
-    }
-    let guest_source_lease = match resource.source_lease_for_connect(destination) {
-        Ok(lease) => lease,
-        Err(error) => {
-            finish_retired_connect(object);
-            resource.retire();
-            return Err(error);
+    // With host addressing, the host chooses the source, and the provider
+    // names it to any listener of its own.
+    let guest_source_lease = if host_addressing {
+        None
+    } else {
+        if resource
+            .source_address_for_destination(destination)
+            .is_none()
+        {
+            abandon_connect(object);
+            return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
+        }
+        match resource.source_lease_for_connect(destination) {
+            Ok(lease) => lease,
+            Err(error) => {
+                finish_retired_connect(object);
+                resource.retire();
+                return Err(error);
+            }
         }
     };
-    let status = match resource
+    let attempt = resource
         .platform_socket
-        .connect(destination, guest_source_lease)
-    {
+        .connect(destination, guest_source_lease, egress);
+    let status = match attempt {
         Ok(SocketConnectionStatus::Unconnected) => {
             finish_retired_connect(object);
             resource.retire();
             return Err(BrokerError::Internal);
         }
         Ok(status) => status,
+        Err(PlatformConnectError::Rejected(error)) => {
+            abandon_connect(object);
+            return Ok(SocketOutcome::Failed(error));
+        }
         Err(PlatformConnectError::PeerUnchanged(error)) => {
             abandon_connect(object);
             return Err(error);
@@ -1088,6 +1288,31 @@ fn transport_connect(
             return Err(error);
         }
     };
+    if needs_bind
+        && host_addressing
+        && matches!(
+            status,
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        )
+    {
+        // A connection that has already ended may have released its address.
+        match resource.platform_socket.local_address() {
+            Ok(None) => {}
+            Ok(Some(local_address)) if is_host_connect_address(local_address) => {
+                attach_binding(object, local_address, None)?;
+            }
+            Ok(Some(_)) => {
+                finish_retired_connect(object);
+                resource.retire();
+                return Err(BrokerError::Internal);
+            }
+            Err(error) => {
+                finish_retired_connect(object);
+                resource.retire();
+                return Err(error);
+            }
+        }
+    }
     let mut object = object.write();
     if let ObjectEntry::Socket(socket) = &mut *object {
         socket.connect_in_flight = false;
@@ -1097,7 +1322,8 @@ fn transport_connect(
     Ok(SocketOutcome::Completed(status))
 }
 
-/// Binds a socket to a supported guest-namespace address.
+/// Binds a socket to a supported guest-namespace address or, with
+/// [`SocketAddressing::Host`], to the host address the platform binds.
 pub fn bind(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1135,7 +1361,7 @@ fn transport_bind(
     };
     match reserve_and_bind(process, create_request, &resource, address) {
         Ok(ReserveAndBindOutcome::Completed(local_address, port_binding)) => {
-            finish_configuration(object, Some(local_address), Some(port_binding), false)?;
+            finish_configuration(object, Some(local_address), port_binding, false)?;
             Ok(SocketOutcome::Completed(local_address))
         }
         Ok(ReserveAndBindOutcome::Failed(error)) => {
@@ -1155,9 +1381,12 @@ fn transport_bind(
 }
 
 /// Starts or reconfigures a TCP listener in the broker's guest network
-/// namespace.
+/// namespace or, with [`SocketAddressing::Host`], at host addresses, where
+/// any client that reaches them can connect; destination rules do not filter
+/// incoming connections.
 ///
-/// An unbound socket is first bound to an ephemeral loopback endpoint.
+/// An unbound socket is first bound to an ephemeral loopback endpoint or,
+/// with [`SocketAddressing::Host`], to an ephemeral port on every address.
 pub fn listen(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1205,12 +1434,13 @@ fn transport_listen(
     let mut local_address = existing_local_address;
     let mut port_binding = None;
     if local_address.is_none() {
-        let binding = match reserve_and_bind(
-            process,
-            create_request,
-            &resource,
-            DEFAULT_TCP_LISTEN_ADDRESS,
-        ) {
+        // Linux binds an unbound listener to the wildcard address, which
+        // host addressing follows; isolated guests listen on loopback.
+        let default_address = match process.core.socket_addressing {
+            SocketAddressing::Isolated => DEFAULT_TCP_LISTEN_ADDRESS,
+            SocketAddressing::Host => DEFAULT_LOCAL_ADDRESS,
+        };
+        let binding = match reserve_and_bind(process, create_request, &resource, default_address) {
             Ok(binding) => binding,
             Err(error) => {
                 finish_configuration(object, None, None, false)?;
@@ -1220,7 +1450,7 @@ fn transport_listen(
         match binding {
             ReserveAndBindOutcome::Completed(address, binding) => {
                 local_address = Some(address);
-                port_binding = Some(binding);
+                port_binding = binding;
             }
             ReserveAndBindOutcome::Failed(error) => {
                 finish_configuration(object, None, None, false)?;
@@ -1270,7 +1500,7 @@ pub fn accept(
 ) -> Result<SocketOutcome<AcceptedBrokerSocket>> {
     let status = StatusFlags::new(flags)?;
     let listener = process.authorized_object(handle, ObjectRights::WAIT)?;
-    let (listener_resource, create_request, nonblocking) = {
+    let (listener_resource, create_request, nonblocking, listener_address) = {
         let listener = listener.read();
         let ObjectEntry::Socket(socket) = &*listener else {
             return Err(BrokerError::InvalidRights);
@@ -1285,6 +1515,7 @@ pub fn accept(
             Arc::clone(&socket.resource),
             socket.create_request,
             socket.status.nonblocking(),
+            socket.local_address,
         )
     };
     let rights = process
@@ -1312,7 +1543,12 @@ pub fn accept(
         local_address,
         guest_source_lease,
     } = accepted;
-    if !listener_resource.port_binding_covers(local_address) {
+    let covered = match process.core.socket_addressing {
+        SocketAddressing::Isolated => listener_resource.port_binding_covers(local_address),
+        SocketAddressing::Host => listener_address
+            .is_some_and(|listener_address| host_listener_covers(listener_address, local_address)),
+    };
+    if !covered {
         socket.retire();
         readiness.retire();
         return Err(BrokerError::Internal);
@@ -1326,6 +1562,7 @@ pub fn accept(
         guest_source_lease: Mutex::new(Some(guest_source_lease)),
         error_queries: Mutex::new(()),
         account: Arc::clone(&listener_resource.account),
+        addressing: listener_resource.addressing,
     });
     let accepted_socket = SocketObject::new_connected(
         resource,
@@ -1342,6 +1579,15 @@ pub fn accept(
         local_address,
         remote_address,
     }))
+}
+
+/// Whether a [`SocketAddressing::Host`] listener bound at `listener` may
+/// accept a connection to `address`: a concrete address on its port, and its
+/// IP unless it listens on the wildcard address.
+fn host_listener_covers(listener: SocketAddrV4, address: SocketAddrV4) -> bool {
+    !address.ip().is_unspecified()
+        && address.port() == listener.port()
+        && (listener.ip().is_unspecified() || listener.ip() == address.ip())
 }
 
 /// Sends TCP stream bytes without waiting for readiness.
@@ -1581,7 +1827,7 @@ fn transport_send_to(
     if needs_bind {
         match reserve_and_bind(process, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
             Ok(ReserveAndBindOutcome::Completed(local_address, port_binding)) => {
-                finish_configuration(object, Some(local_address), Some(port_binding), false)?;
+                finish_configuration(object, Some(local_address), port_binding, false)?;
             }
             Ok(ReserveAndBindOutcome::Failed(error)) => {
                 finish_configuration(object, None, None, false)?;
@@ -1830,9 +2076,10 @@ fn transport_receive_from(
 
 /// Sets one option of a broker-owned socket.
 ///
-/// The transport implements a TCP socket's `NoDelay` and `KeepAlive`; the
-/// broker stores the other options, and fails with `UnsupportedOperation` for
-/// `NoDelay` on a datagram socket.
+/// The transport implements a TCP socket's `NoDelay` and `KeepAlive`, and with
+/// [`SocketAddressing::Host`] its `ReuseAddress`; the broker stores the other
+/// options, and fails with `UnsupportedOperation` for `NoDelay` on a datagram
+/// socket.
 pub fn set_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -1843,7 +2090,7 @@ pub fn set_option(
     let ObjectEntry::Socket(socket) = &mut *object else {
         return Err(BrokerError::InvalidRights);
     };
-    if !is_tcp_option(socket.create_request, value.name()) {
+    if !is_tcp_option(socket, value.name()) {
         return socket.options.set(value);
     }
     if socket.resource_retired {
@@ -1866,7 +2113,7 @@ pub fn get_option(
     let ObjectEntry::Socket(socket) = &*object else {
         return Err(BrokerError::InvalidRights);
     };
-    if !is_tcp_option(socket.create_request, name) {
+    if !is_tcp_option(socket, name) {
         return socket.options.get(name);
     }
     if socket.resource_retired {
@@ -1881,14 +2128,14 @@ pub fn get_option(
     Ok(value)
 }
 
-/// Returns whether the transport of a socket created by `create_request`
-/// implements the option `name`.
-fn is_tcp_option(create_request: CreateSocketRequest, name: SocketOptionName) -> bool {
-    is_tcp(create_request)
-        && matches!(
-            name,
-            SocketOptionName::NoDelay | SocketOptionName::KeepAlive
-        )
+/// Returns whether the transport of `socket` implements the option `name`.
+fn is_tcp_option(socket: &SocketObject, name: SocketOptionName) -> bool {
+    is_tcp(socket.create_request)
+        && match name {
+            SocketOptionName::NoDelay | SocketOptionName::KeepAlive => true,
+            SocketOptionName::ReuseAddress => socket.resource.addressing == SocketAddressing::Host,
+            _ => false,
+        }
 }
 
 /// Returns `error`, reporting [`BrokerError::WouldBlock`] as
@@ -2173,27 +2420,35 @@ fn stream_status(
             false,
         ));
     }
-    let Some(broker_local_address) = socket.local_address else {
-        socket.listening = false;
-        socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
-        socket.resource_retired = true;
-        drop(object);
-        resource.retire();
-        return Err(BrokerError::Internal);
-    };
-    if let Some(observed) = platform_status.local_address {
-        let invalid_local_address =
-            observed.port() != broker_local_address.port() || !is_internal_socket_address(observed);
-        if invalid_local_address {
+    match (socket.local_address, platform_status.local_address) {
+        (Some(broker_local_address), Some(observed)) => {
+            // With host addressing, the host's own addresses are the guest's.
+            let invalid_local_address = observed.port() != broker_local_address.port()
+                || (resource.addressing == SocketAddressing::Isolated
+                    && !is_internal_socket_address(observed));
+            if invalid_local_address {
+                socket.listening = false;
+                socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+                socket.resource_retired = true;
+                drop(object);
+                resource.retire();
+                return Err(BrokerError::Internal);
+            }
+            if broker_local_address.ip().is_unspecified() {
+                socket.local_address = Some(observed);
+            }
+        }
+        (Some(_), None) => {}
+        // With host addressing, a connection that ended before core read the
+        // address the platform bound for it has none.
+        (None, None) if resource.addressing == SocketAddressing::Host => {}
+        (None, _) => {
             socket.listening = false;
             socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
             socket.resource_retired = true;
             drop(object);
             resource.retire();
             return Err(BrokerError::Internal);
-        }
-        if broker_local_address.ip().is_unspecified() {
-            socket.local_address = Some(observed);
         }
     }
     if platform_status.status == SocketConnectionStatus::Unconnected {
@@ -2562,10 +2817,12 @@ pub(crate) fn refresh_readiness(object: &RwLock<ObjectEntry>) {
     sync_readiness(object);
 }
 
+/// The outcome of [`reserve_and_bind`], with the guest port binding core
+/// reserved, which [`SocketAddressing::Host`] sockets lack.
 enum ReserveAndBindOutcome {
-    Completed(SocketAddrV4, Arc<GuestPortBinding>),
+    Completed(SocketAddrV4, Option<Arc<GuestPortBinding>>),
     Failed(SocketError),
-    Retired(Arc<GuestPortBinding>),
+    Retired(Option<Arc<GuestPortBinding>>),
 }
 
 fn reserve_and_bind(
@@ -2574,6 +2831,9 @@ fn reserve_and_bind(
     resource: &SocketResource,
     requested_address: SocketAddrV4,
 ) -> Result<ReserveAndBindOutcome> {
+    if process.core.socket_addressing == SocketAddressing::Host {
+        return host_bind(resource, requested_address);
+    }
     let (local_address, port_binding) = match process
         .core
         .socket_ports
@@ -2583,16 +2843,64 @@ fn reserve_and_bind(
         SocketOutcome::Failed(error) => return Ok(ReserveAndBindOutcome::Failed(error)),
     };
     let binding = GuestSocketBinding::new(&port_binding);
-    match resource.platform_socket.bind(binding)? {
+    match resource
+        .platform_socket
+        .bind(SocketBindRequest::Guest(binding))?
+    {
         SocketOutcome::Completed(bound_address) if bound_address == local_address => Ok(
-            ReserveAndBindOutcome::Completed(local_address, port_binding),
+            ReserveAndBindOutcome::Completed(local_address, Some(port_binding)),
         ),
-        SocketOutcome::Completed(_) => Ok(ReserveAndBindOutcome::Retired(port_binding)),
+        SocketOutcome::Completed(_) => Ok(ReserveAndBindOutcome::Retired(Some(port_binding))),
         SocketOutcome::Failed(error) => Ok(ReserveAndBindOutcome::Failed(error)),
     }
 }
 
-fn retire_before_releasing_binding(resource: &SocketResource, port_binding: Arc<GuestPortBinding>) {
+/// Binds a [`SocketAddressing::Host`] socket, which the platform does at the
+/// requested address as the `SO_REUSEADDR` setting it keeps directs. Core
+/// reserves nothing and checks only that the platform bound the requested IP
+/// and, if one was requested, port.
+fn host_bind(
+    resource: &SocketResource,
+    requested_address: SocketAddrV4,
+) -> Result<ReserveAndBindOutcome> {
+    let ip = requested_address.ip();
+    if ip.is_multicast() || ip.is_broadcast() {
+        return Ok(ReserveAndBindOutcome::Failed(
+            SocketError::AddressNotAvailable,
+        ));
+    }
+    let request = HostBindRequest {
+        address: requested_address,
+    };
+    match resource
+        .platform_socket
+        .bind(SocketBindRequest::Host(request))?
+    {
+        SocketOutcome::Completed(bound_address)
+            if bound_address.ip() == requested_address.ip()
+                && bound_address.port() != 0
+                && (requested_address.port() == 0
+                    || bound_address.port() == requested_address.port()) =>
+        {
+            Ok(ReserveAndBindOutcome::Completed(bound_address, None))
+        }
+        SocketOutcome::Completed(_) => Ok(ReserveAndBindOutcome::Retired(None)),
+        SocketOutcome::Failed(error) => Ok(ReserveAndBindOutcome::Failed(error)),
+    }
+}
+
+/// Returns whether the address a host bound for a connecting stream has a
+/// nonzero port and a unicast or unspecified IP, the latter of which
+/// [`stream_status`] refines once the platform reports it.
+fn is_host_connect_address(address: SocketAddrV4) -> bool {
+    let ip = address.ip();
+    !(ip.is_multicast() || ip.is_broadcast()) && address.port() != 0
+}
+
+fn retire_before_releasing_binding(
+    resource: &SocketResource,
+    port_binding: Option<Arc<GuestPortBinding>>,
+) {
     resource.retire();
     drop(port_binding);
 }
@@ -2602,6 +2910,7 @@ fn transport_connect_datagram(
     object: &spin::RwLock<ObjectEntry>,
     create_request: CreateSocketRequest,
     destination: SocketAddrV4,
+    egress: SocketEgress,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let (resource, previous_status, needs_bind) = {
         let mut object = object.write();
@@ -2652,12 +2961,12 @@ fn transport_connect_datagram(
         finish_datagram_connect(object, previous_status, None);
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    match resource.platform_socket.connect(destination, None) {
+    match resource.platform_socket.connect(destination, None, egress) {
         Ok(SocketConnectionStatus::Connected) => {
             finish_datagram_connect(object, SocketConnectionStatus::Connected, Some(destination));
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
         }
-        Ok(SocketConnectionStatus::Failed(error)) => {
+        Ok(SocketConnectionStatus::Failed(error)) | Err(PlatformConnectError::Rejected(error)) => {
             finish_datagram_connect(object, previous_status, None);
             Ok(SocketOutcome::Failed(error))
         }
@@ -2681,7 +2990,7 @@ fn transport_connect_datagram(
 fn attach_datagram_binding(
     object: &spin::RwLock<ObjectEntry>,
     local_address: SocketAddrV4,
-    port_binding: Arc<GuestPortBinding>,
+    port_binding: Option<Arc<GuestPortBinding>>,
 ) -> Result<()> {
     let duplicate = {
         let mut object = object.write();
@@ -2691,7 +3000,7 @@ fn attach_datagram_binding(
         if socket.local_address.is_some() {
             Some((Arc::clone(&socket.resource), port_binding))
         } else {
-            match socket.resource.set_port_binding(port_binding) {
+            match set_optional_port_binding(&socket.resource, port_binding) {
                 Ok(()) => {
                     socket.local_address = Some(local_address);
                     None
@@ -2763,17 +3072,29 @@ fn finish_retired_connect(object: &spin::RwLock<ObjectEntry>) {
     }
 }
 
+/// Gives `resource` its guest port binding, if core reserved one, returning
+/// it if the resource already has one.
+fn set_optional_port_binding(
+    resource: &SocketResource,
+    port_binding: Option<Arc<GuestPortBinding>>,
+) -> core::result::Result<(), Option<Arc<GuestPortBinding>>> {
+    match port_binding {
+        Some(port_binding) => resource.set_port_binding(port_binding).map_err(Some),
+        None => Ok(()),
+    }
+}
+
 fn attach_binding(
     object: &spin::RwLock<ObjectEntry>,
     local_address: SocketAddrV4,
-    port_binding: Arc<GuestPortBinding>,
+    port_binding: Option<Arc<GuestPortBinding>>,
 ) -> Result<()> {
     let duplicate = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::Internal);
         };
-        match socket.resource.set_port_binding(port_binding) {
+        match set_optional_port_binding(&socket.resource, port_binding) {
             Ok(()) => {
                 socket.local_address = Some(local_address);
                 None
@@ -3104,6 +3425,8 @@ pub(crate) struct SocketResource {
     /// The account the provider charges this socket to, which drops after the
     /// socket retires.
     account: Arc<SocketAccount>,
+    /// How the provider addresses the socket.
+    addressing: SocketAddressing,
 }
 
 impl SocketResource {

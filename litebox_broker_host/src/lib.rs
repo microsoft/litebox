@@ -2562,8 +2562,11 @@ mod tests {
     impl PlatformSocket for TestPlatformSocket {
         fn bind(
             &self,
-            binding: litebox_broker_core::socket::GuestSocketBinding,
+            request: litebox_broker_core::socket::SocketBindRequest,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
+            let litebox_broker_core::socket::SocketBindRequest::Guest(binding) = request else {
+                return Err(litebox_broker_core::BrokerError::Internal);
+            };
             let address = binding.local_address();
             *self.binding.lock().unwrap() = Some(binding);
             if self.create_request.socket_type == SocketType::Stream {
@@ -2601,6 +2604,7 @@ mod tests {
             &self,
             address: SocketAddrV4,
             _guest_source_lease: Option<litebox_broker_core::socket::GuestSourceLease>,
+            _egress: litebox_broker_core::socket::SocketEgress,
         ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
             let source_address = self
                 .binding
