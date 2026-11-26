@@ -295,7 +295,7 @@ fn private_mount_rejects_removal_and_replacement() {
     ));
     assert!(matches!(
         child.rmdir(ROOT, None, "/pinned"),
-        Err(RmdirError::Busy)
+        Err(RmdirError::ReadOnlyFileSystem)
     ));
     assert!(
         parent

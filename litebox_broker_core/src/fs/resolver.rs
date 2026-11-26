@@ -209,7 +209,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         use litebox_broker_protocol::fs::FileError;
 
         let composer = self.composer();
-        let _paths = composer.map(|c| c.mount_paths.lock());
+        let _mount_lock = composer.map(|c| c.mount_lock.lock());
         let context = context.into();
         let user = context.acting_user();
         let (path, walked) = self
@@ -221,27 +221,29 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         else {
             return Err(FileError::NotDirectory);
         };
-        let privileged = user.user == UserInfo::ROOT.user;
-        // XXX(jayb): Linux requires CAP_SYS_ADMIN; we let non-root mount over directories they own.
-        if !privileged
-            && !matches!(&target.permissions, PermissionCheck::ByResolver(info) if info.owner.user == user.user)
-        {
-            return Err(FileError::NotOwner);
-        }
-        // Overlay walking handles hold its namespace lock; release it before rewalking.
-        drop(target);
-        if !privileged {
-            let components: Vec<_> = path.components.iter().map(String::as_str).collect();
-            for i in 0..components.len() {
+        if user.user != UserInfo::ROOT.user {
+            // XXX(jayb): Linux requires CAP_SYS_ADMIN; we let non-root mount over directories they own.
+            if !matches!(&target.permissions, PermissionCheck::ByResolver(info) if info.owner.user == user.user)
+            {
+                return Err(FileError::NotOwner);
+            }
+            // Overlay walking handles hold its namespace lock; release it before rewalking.
+            drop(target);
+            // XXX(jayb): Path-based mount can race renames; refusing foreign sticky ancestors is a
+            // stopgap.
+            for len in 0..path.components.len() {
+                let components: Vec<_> =
+                    path.components[..len].iter().map(String::as_str).collect();
                 let Resolution::Found(ResolvedTarget::Dir(ancestor)) = self
-                    .resolve_components(&context, path.anchor.as_ref(), &components[..i])
+                    .resolve_components(&context, path.anchor.as_ref(), &components)
                     .map_err(|error| file_walk_error(error.error))?
                 else {
                     return Err(FileError::NotOwner);
                 };
-                if !matches!(&ancestor.permissions, PermissionCheck::ByResolver(info) if info.owner.user == user.user || !info.mode.contains(Mode::SVTX))
-                {
-                    return Err(FileError::NotOwner);
+                match ancestor.permissions {
+                    PermissionCheck::ByResolver(info)
+                        if info.owner.user == user.user || !info.mode.contains(Mode::SVTX) => {}
+                    _ => return Err(FileError::NotOwner),
                 }
             }
         }
@@ -1260,7 +1262,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         anchor: Option<DirAnchor>,
         path: &str,
     ) -> Result<(), UnlinkError> {
-        let _paths = self.composer().map(|c| c.mount_paths.lock());
         let context = context.into();
         let trailing_slash = path.ends_with('/');
         let Some((parent, name)) = self
@@ -1393,8 +1394,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         new_anchor: Option<DirAnchor>,
         new_path: &str,
     ) -> Result<(), RenameError> {
-        let composer = self.composer();
-        let _paths = composer.map(|c| c.mount_paths.lock());
+        let _mount_lock = self.composer().map(|c| c.mount_lock.lock());
         let context = context.into();
         let map_walk_error = |error| walk_error_or(RenameError::Io)(error);
         let parent = |anchor, path: &str| {
@@ -1435,18 +1435,21 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         };
         let (old_dir, old_name, old_writable) = parent(old_anchor, old_path)?;
         let (new_dir, new_name, new_writable) = parent(new_anchor, new_path)?;
-        // Report a mount conflict without ever sending a mutation to a read-only backend.
+        // Linux checks for a cross-mount rename, then for a read-only mount, before looking up
+        // either name. Only the backend knows whether the directories are on different mounts;
+        // asking it relies on every backend that sets `on_read_only_fs` (TarRo, ReadOnly,
+        // Composer virtual directories) refusing the rename without mutating anything.
         if [&old_writable, &new_writable]
             .into_iter()
             .any(|writable| matches!(writable, Err(RenameError::ReadOnlyFileSystem)))
         {
-            if let Some(composer) = composer
-                && let Err(e @ (RenameError::CrossDevice | RenameError::Busy)) =
-                    composer.check_rename(&old_dir, &old_name, &new_dir, &new_name)
+            return match self
+                .backend
+                .rename_at(old_dir, &old_name, new_dir, &new_name)
             {
-                return Err(e);
-            }
-            return Err(RenameError::ReadOnlyFileSystem);
+                Err(RenameError::CrossDevice) => Err(RenameError::CrossDevice),
+                _ => Err(RenameError::ReadOnlyFileSystem),
+            };
         }
         // A trailing slash on either path requires the source to be a directory; backends already
         // require a directory source to replace only a directory.
@@ -1491,7 +1494,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     ) -> Result<(), MkdirError> {
         // A failed mkdir may roll back a temporarily visible directory. Neither this resolver nor
         // a copy of it may mount on that directory between creation and rollback.
-        let _paths = self.composer().map(|c| c.mount_paths.lock());
+        let _mount_lock = self.composer().map(|c| c.mount_lock.lock());
         let context = context.into();
         let Some((parent, name)) = self
             .parent_dir_and_name(&context, anchor.clone(), path)
@@ -1544,8 +1547,7 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         anchor: Option<DirAnchor>,
         path: &str,
     ) -> Result<(), RmdirError> {
-        let composer = self.composer();
-        let _paths = composer.map(|c| c.mount_paths.lock());
+        let _mount_lock = self.composer().map(|c| c.mount_lock.lock());
         let context = context.into();
         let Some((parent, name)) = self
             .parent_dir_and_name(&context, anchor, path)
@@ -1566,9 +1568,6 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         );
         // Linux checks for a read-only mount before looking up the name.
         if matches!(writable, Err(RmdirError::ReadOnlyFileSystem)) {
-            if let Some(composer) = composer {
-                composer.check_rmdir(&parent, &name)?;
-            }
             return writable;
         }
         if let Err(error) = writable {
