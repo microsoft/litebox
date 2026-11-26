@@ -385,7 +385,9 @@ static void test_wait_with_restarting_handler(enum call call) {
     init_waiter(&w, call);
     w.fds[0].revents = REVENTS_UNWRITTEN;
     w.ts = (struct timespec){.tv_sec = huge, .tv_nsec = 0};
-    w.tv = (struct timeval){.tv_sec = huge, .tv_usec = 0};
+    // Same timeout, but raw select must carry the full 64-bit microseconds into seconds.
+    const long carry_sec = 5000;
+    w.tv = (struct timeval){.tv_sec = huge - carry_sec, .tv_usec = carry_sec * 1000000};
     launch_waiter(&w);
     wait_done(&w, SIGUSR1);
     finish_waiter(&w);

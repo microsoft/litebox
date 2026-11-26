@@ -237,6 +237,7 @@ bitflags::bitflags! {
         const NOCLDSTOP = 1;
         const NOCLDWAIT = 2;
         const SIGINFO = 4;
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         const RESTORER  = 0x04000000;
         const ONSTACK   = 0x08000000;
         const RESTART   = 0x10000000;
@@ -256,6 +257,7 @@ pub struct SigAction {
     #[cfg(target_pointer_width = "64")]
     #[doc(hidden)]
     pub __pad: u32, // NOTE: Maybe `SaFlags` and `SigSet` need to be `usize`-backed too?
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub restorer: usize,
     pub mask: SigSet,
 }
@@ -300,7 +302,7 @@ bitflags::bitflags! {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 pub const MINSIGSTKSZ: usize = 2048;
 #[cfg(target_arch = "aarch64")]
 pub const MINSIGSTKSZ: usize = 5120;
