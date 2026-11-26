@@ -25,7 +25,8 @@ use ttrpc::TtrpcContext;
 
 /// A process of the fake: `/echo [CODE]` writes its input to its stdout once it ends, and exits
 /// with CODE (default 0); `/kill SIGNAL` does so too, but then SIGNAL kills it; `/ready` first
-/// writes `ready`, then its input as it comes, and exits once it has some.
+/// writes `ready`, then its input as it comes, and exits once it has some. A terminal's resize
+/// writes `size ROWSxCOLUMNS` to its process's stdout.
 #[derive(Default)]
 struct Process {
     program: String,
@@ -208,8 +209,12 @@ impl GuestService for Fake {
     fn tty_win_resize(
         &self,
         _ctx: &TtrpcContext,
-        _request: TtyWinResizeRequest,
+        request: TtyWinResizeRequest,
     ) -> ttrpc::Result<Empty> {
+        self.update(&request.exec_id, |process| {
+            let size = format!("size {}x{}\n", request.row, request.column);
+            process.output.extend_from_slice(size.as_bytes());
+        });
         Ok(Empty::new())
     }
 }
@@ -329,4 +334,34 @@ fn a_run_that_ends_otherwise_fails() {
     );
     // Runs stop at the first failure.
     assert!(!report.contains("run 1"), "{report}");
+}
+
+/// A script waits for each prompt before it resizes the terminal and sends its input.
+#[test]
+fn a_script_answers_prompts_in_order() {
+    let (passed, report, output) = run_client(
+        r#"[{
+            "argv": ["/ready"],
+            "terminal": true,
+            "script": [{ "wait": "ready\n", "resize": [3, 4] }, { "wait": "3x4", "send": "in\n" }],
+            "expect_stdout": "ready\nsize 3x4\nin\n",
+            "expect_stdout_contains": ["size 3x4", "in"]
+        }]"#,
+        None,
+    );
+    assert!(passed, "{report}");
+    assert_eq!(output, "ready\nsize 3x4\nin\n");
+}
+
+#[test]
+fn a_run_without_an_expected_string_fails() {
+    let (passed, report, _) = run_client(
+        r#"[{ "argv": ["/echo"], "stdin": "hi\n", "expect_stdout_contains": ["hi", "bye"] }]"#,
+        None,
+    );
+    assert!(!passed, "{report}");
+    assert!(
+        report.contains(r#"FAIL  run 0 (/echo): stdout was "hi\n", without "bye""#),
+        "{report}"
+    );
 }

@@ -16,6 +16,11 @@
 //!   terminal up.
 //! - `expect_exit_code` (default 0), or `expect_signal` for a signal death.
 //! - `expect_stdout`, `expect_stderr`: the exact output, if given.
+//! - `expect_stdout_contains`: strings that the standard output must contain (default none), for
+//!   programs that print more than their checks' results, e.g. ports.
+//! - `script`: default none; with `terminal`, steps of the run's input, in order: each waits for
+//!   its `wait` (if any) in the standard output, after the previous step's, then resizes the
+//!   terminal to its `resize` (`[rows, columns]`, if any) and sends its `send` (if any).
 //! - `min_reflected_syscalls`: default 0; guest syscalls that the VM kernel reflected to the
 //!   runner, as the runner did not take them directly.
 //! - `replay`: default false; in debug builds of the VM kernel, every process gives up on its
@@ -27,7 +32,8 @@
 //! Only the VM kernel can check the last two, from its log: this client only lists the entries
 //! that have them ([`Entry::counts`]), for the test harness to run each in a boot of its own.
 //!
-//! In a group, runs take no `stdin`, `expect_stdout`, or `expect_stderr`, and at most one takes
+//! In a group, runs take no `stdin`, `expect_stdout`, `expect_stderr`, `expect_stdout_contains`,
+//! or `script`, and at most one takes
 //! `console_stdin`.
 
 use anyhow::{Result, bail, ensure};
@@ -67,9 +73,24 @@ pub struct Run {
     pub expect_stdout: Option<String>,
     pub expect_stderr: Option<String>,
     #[serde(default)]
+    pub expect_stdout_contains: Vec<String>,
+    #[serde(default)]
+    pub script: Vec<Step>,
+    #[serde(default)]
     min_reflected_syscalls: u64,
     #[serde(default)]
     replay: bool,
+}
+
+/// A step of a run's `script` (see the [module](self) docs).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Step {
+    #[serde(default)]
+    pub wait: String,
+    pub resize: Option<[u32; 2]>,
+    #[serde(default)]
+    pub send: String,
 }
 
 /// What the VM kernel checks of an entry's processes (see the [module](self) docs).
@@ -140,6 +161,22 @@ impl Run {
             !self.terminal || self.stdin.is_empty(),
             "run {index}: a terminal's input is `console_stdin`'s: its end would hang it up"
         );
+        ensure!(
+            self.script.is_empty() || (self.terminal && !self.console_stdin),
+            "run {index}: a `script` is the input of a `terminal`, without `console_stdin`"
+        );
+        ensure!(
+            self.script.iter().all(|step| !step.wait.is_empty()
+                || step.resize.is_some()
+                || !step.send.is_empty()),
+            "run {index}: a `script` step does nothing"
+        );
+        ensure!(
+            self.expect_stdout_contains
+                .iter()
+                .all(|text| !text.is_empty()),
+            "run {index}: an empty `expect_stdout_contains` string"
+        );
         Ok(())
     }
 }
@@ -177,12 +214,17 @@ pub fn parse(json: &[u8]) -> Result<Vec<Entry>> {
         if let Entry::Concurrent(Concurrent { concurrent }) = entry {
             ensure!(!concurrent.is_empty(), "runs {index}..: an empty group");
             if concurrent.iter().any(|run| {
-                !run.stdin.is_empty() || run.expect_stdout.is_some() || run.expect_stderr.is_some()
+                !run.stdin.is_empty()
+                    || run.expect_stdout.is_some()
+                    || run.expect_stderr.is_some()
+                    || !run.expect_stdout_contains.is_empty()
+                    || !run.script.is_empty()
             }) || concurrent.iter().filter(|run| run.console_stdin).count() > 1
             {
                 bail!(
-                    "runs {index}..: concurrent runs take no `stdin`, `expect_stdout`, or \
-                     `expect_stderr`, and at most one `console_stdin`"
+                    "runs {index}..: concurrent runs take no `stdin`, `expect_stdout`, \
+                     `expect_stderr`, `expect_stdout_contains`, or `script`, and at most one \
+                     `console_stdin`"
                 );
             }
         }
@@ -208,6 +250,13 @@ mod tests {
             br#"[{ "argv": ["/a"], "stdin": "x", "console_stdin": true }]"#,
             br#"[{ "argv": ["/a"], "stdin": "x", "terminal": true }]"#,
             br#"[{ "concurrent": [{ "argv": ["/a"], "expect_stdout": "" }] }]"#,
+            br#"[{ "concurrent": [{ "argv": ["/a"], "expect_stdout_contains": ["x"] }] }]"#,
+            br#"[{ "argv": ["/a"], "script": [{ "send": "x" }] }]"#,
+            br#"[{ "argv": ["/a"], "terminal": true, "console_stdin": true,
+                "script": [{ "send": "x" }] }]"#,
+            br#"[{ "argv": ["/a"], "terminal": true, "script": [{}] }]"#,
+            br#"[{ "argv": ["/a"], "terminal": true, "script": [{ "resize": [1] }] }]"#,
+            br#"[{ "argv": ["/a"], "expect_stdout_contains": [""] }]"#,
             br#"[{ "concurrent": [
                 { "argv": ["/a"], "console_stdin": true },
                 { "argv": ["/b"], "console_stdin": true }

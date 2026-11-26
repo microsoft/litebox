@@ -11,8 +11,8 @@ use std::thread;
 use anyhow::{Context as _, Result, bail, ensure};
 use litebox_guest_service_protocol::guest_service::{
     CloseStdinRequest, CreateContainerRequest, ExecProcessRequest, Process, ReadStreamRequest,
-    ReleaseProcessRequest, SignalProcessRequest, StartContainerRequest, WaitProcessRequest,
-    WriteStreamRequest,
+    ReleaseProcessRequest, SignalProcessRequest, StartContainerRequest, TtyWinResizeRequest,
+    WaitProcessRequest, WriteStreamRequest,
 };
 use litebox_guest_service_protocol::guest_service_ttrpc::GuestServiceClient;
 use ttrpc::context;
@@ -63,15 +63,23 @@ impl ReadyLine {
     }
 }
 
-/// Whether a run's standard output showed `ready`, or the run ended.
+/// A run's progress: whether its standard output showed `ready`, whether it ended, and its
+/// standard output so far.
 #[derive(Default)]
 struct Progress {
-    state: Mutex<(bool, bool)>,
+    state: Mutex<State>,
     changed: Condvar,
 }
 
+#[derive(Default)]
+struct State {
+    ready: bool,
+    ended: bool,
+    stdout: Vec<u8>,
+}
+
 impl Progress {
-    fn update(&self, update: impl FnOnce(&mut (bool, bool))) {
+    fn update(&self, update: impl FnOnce(&mut State)) {
         update(&mut self.state.lock().unwrap_or_else(PoisonError::into_inner));
         self.changed.notify_all();
     }
@@ -81,9 +89,26 @@ impl Progress {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = self
             .changed
-            .wait_while(state, |(ready, ended)| !*ready && !*ended)
+            .wait_while(state, |state| !state.ready && !state.ended)
             .unwrap_or_else(PoisonError::into_inner);
-        state.0
+        state.ready
+    }
+
+    /// Waits until the standard output has `text` at or after offset `from`, and returns the
+    /// offset after it, or `None` if the run ended first.
+    fn wait_output(&self, text: &[u8], from: usize) -> Option<usize> {
+        let find = |state: &State| {
+            state.stdout[from..]
+                .windows(text.len())
+                .position(|window| window == text)
+                .map(|at| from + at + text.len())
+        };
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = self
+            .changed
+            .wait_while(state, |state| find(state).is_none() && !state.ended)
+            .unwrap_or_else(PoisonError::into_inner);
+        find(&state)
     }
 }
 
@@ -215,7 +240,7 @@ impl Container {
             let stderr = scope.spawn(|| self.read(&exec_id, Stream::Stderr, &progress));
             let stdin = scope.spawn(|| self.feed(&exec_id, run, &progress));
             let exit_status = self.wait(&exec_id);
-            progress.update(|(_, ended)| *ended = true);
+            progress.update(|state| state.ended = true);
             let joined = |reader: thread::ScopedJoinHandle<'_, Result<Vec<u8>>>| {
                 reader
                     .join()
@@ -239,6 +264,10 @@ impl Container {
     /// Gives the run its standard input (see the `programs.json` format): failures to write are
     /// not the run's, which need not read it all.
     fn feed(&self, exec_id: &str, run: &Run, progress: &Progress) {
+        if !run.script.is_empty() {
+            self.play(exec_id, run, progress);
+            return;
+        }
         let input = if run.console_stdin {
             if !progress.wait_ready() {
                 return;
@@ -267,6 +296,43 @@ impl Container {
             let _ = self
                 .service
                 .close_stdin(context::Context::default(), &close);
+        }
+    }
+
+    /// Plays `run`'s `script` (see the `programs.json` format), until it ends or the run does; a
+    /// terminal's input stays open.
+    fn play(&self, exec_id: &str, run: &Run, progress: &Progress) {
+        let mut from = 0;
+        for step in &run.script {
+            if !step.wait.is_empty() {
+                let Some(after) = progress.wait_output(step.wait.as_bytes(), from) else {
+                    return;
+                };
+                from = after;
+            }
+            if let Some([row, column]) = step.resize {
+                let resize = TtyWinResizeRequest {
+                    container_id: CONTAINER.to_owned(),
+                    exec_id: exec_id.to_owned(),
+                    row,
+                    column,
+                    ..Default::default()
+                };
+                let _ = self
+                    .service
+                    .tty_win_resize(context::Context::default(), &resize);
+            }
+            if !step.send.is_empty() {
+                let write = WriteStreamRequest {
+                    container_id: CONTAINER.to_owned(),
+                    exec_id: exec_id.to_owned(),
+                    data: step.send.as_bytes().to_vec(),
+                    ..Default::default()
+                };
+                let _ = self
+                    .service
+                    .write_stdin(context::Context::default(), &write);
+            }
         }
     }
 
@@ -299,8 +365,12 @@ impl Container {
                 output.flush()?;
             }
             recorded.extend_from_slice(&response.data);
-            if matches!(stream, Stream::Stdout) && ready.feed(&response.data) {
-                progress.update(|(ready, _)| *ready = true);
+            if matches!(stream, Stream::Stdout) {
+                let ready_now = ready.feed(&response.data);
+                progress.update(|state| {
+                    state.ready |= ready_now;
+                    state.stdout.extend_from_slice(&response.data);
+                });
             }
         }
     }
@@ -357,6 +427,16 @@ fn check(run: &Run, outcome: &Outcome) -> Result<()> {
             expected.as_bytes() == actual.as_slice(),
             "{what} was {:?}, expected {expected:?}",
             String::from_utf8_lossy(actual)
+        );
+    }
+    for expected in &run.expect_stdout_contains {
+        ensure!(
+            outcome
+                .stdout
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes()),
+            "stdout was {:?}, without {expected:?}",
+            String::from_utf8_lossy(&outcome.stdout)
         );
     }
     Ok(())
