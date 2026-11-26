@@ -19,7 +19,7 @@ use litebox_broker_core::socket::SocketProvider;
 use litebox_broker_core::vsock_socket::VsockProvider;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngine};
 
-use crate::publish::Publishing;
+use crate::publish::{Networking, Publishing};
 use crate::random::UserlandRandomProvider;
 use crate::timer::UserlandTimerProvider;
 
@@ -80,7 +80,7 @@ pub struct BrokerCoreBuilder {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     vsock: Option<Arc<dyn VsockProvider>>,
-    publishing: Publishing,
+    networking: Networking,
 }
 
 impl BrokerCoreBuilder {
@@ -92,14 +92,20 @@ impl BrokerCoreBuilder {
             policy,
             limits: BrokerCoreLimits::DEFAULT,
             vsock: None,
-            publishing: Publishing::default(),
+            networking: Networking::default(),
         }
     }
 
-    /// Publishes guest ports on host ports as `publishing` says.
+    /// Publishes isolated guest ports on host ports as `publishing` says.
     #[must_use]
-    pub fn with_publishing(mut self, publishing: Publishing) -> Self {
-        self.publishing = publishing;
+    pub fn with_publishing(self, publishing: Publishing) -> Self {
+        self.with_networking(Networking::Isolated(publishing))
+    }
+
+    /// Connects guest sockets to the host's network as `networking` says.
+    #[must_use]
+    pub fn with_networking(mut self, networking: Networking) -> Self {
+        self.networking = networking;
         self
     }
 
@@ -132,7 +138,7 @@ impl BrokerCoreBuilder {
             litebox_platform::sync::init_lock_tracing(&LOCK_TRACING_PLATFORM);
         }
 
-        let socket_provider = platform_socket_provider(&self.limits, self.publishing)?;
+        let socket_provider = platform_socket_provider(&self.limits, self.networking)?;
         Ok(BrokerCore::new(
             self.policy,
             self.limits,
@@ -148,25 +154,28 @@ impl BrokerCoreBuilder {
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn platform_socket_provider(
     limits: &BrokerCoreLimits,
-    publishing: Publishing,
+    networking: Networking,
 ) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
-    let provider = crate::socket::UserlandSocketProvider::with_publishing(
+    let provider = crate::socket::UserlandSocketProvider::with_networking(
         limits.max_sockets,
         limits.max_sockets_per_process,
-        publishing,
+        networking,
     )?;
     Ok(Arc::new(provider))
 }
 
-// The `Result` return type is infallible on this cfg branch, but it must
-// match the fallible branch above since callers are not cfg-gated
-// themselves.
 #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
-#[allow(clippy::unnecessary_wraps)]
 fn platform_socket_provider(
     _limits: &BrokerCoreLimits,
-    _publishing: Publishing,
+    networking: Networking,
 ) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
+    if matches!(networking, Networking::Mirrored { .. }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "mirrored networking needs a Linux host",
+        )
+        .into());
+    }
     Ok(Arc::new(
         litebox_broker_core::socket::UnsupportedSocketProvider,
     ))

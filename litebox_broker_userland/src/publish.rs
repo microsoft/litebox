@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Published ports: rules that a guest listener's or UDP socket's host port follows.
+//! How guest sockets meet the host's network, and published ports: rules that a guest
+//! listener's or UDP socket's host port follows.
 
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -21,6 +22,38 @@ pub struct Publishing {
     pub tcp_sources: Vec<Ipv4Cidr>,
     /// The networks whose senders published and mirrored UDP ports admit, as the guest sees them.
     pub udp_sources: Vec<Ipv4Cidr>,
+}
+
+/// How guest sockets meet the host's network.
+#[derive(Clone, Debug)]
+pub enum Networking {
+    /// Guests share a private network behind the broker, which publishes their ports to the host
+    /// as `Publishing` says.
+    Isolated(Publishing),
+    /// Each guest TCP socket is a host socket at the guest's own host address and port, as when
+    /// the broker runs in a network namespace of the guest's own; the host's own addresses,
+    /// loopback included, are the guest's. Guest UDP sockets are not supported yet. Only a Linux
+    /// host supports it.
+    ///
+    /// Connections to broker listeners on an address owned by this namespace stay in memory,
+    /// even if a policy route would send a native connection elsewhere. Their ports stay taken
+    /// on the host while open, more conservatively than for native connections: a listener that
+    /// stops listening keeps its host socket bound, not listening, until the last server socket
+    /// accepted in memory closes. A wildcard listener thus reserves the port on every host
+    /// address while its accepted sockets drain. Rebinding requires `SO_REUSEADDR` on the new
+    /// socket and on every remaining socket that shares the bind.
+    Mirrored {
+        /// The networks whose clients the guest's TCP listeners admit.
+        tcp_sources: Vec<Ipv4Cidr>,
+        /// The networks whose senders the guest's UDP sockets admit.
+        udp_sources: Vec<Ipv4Cidr>,
+    },
+}
+
+impl Default for Networking {
+    fn default() -> Self {
+        Self::Isolated(Publishing::default())
+    }
 }
 
 /// Parses a canonical IPv4 CIDR, `NETWORK/PREFIX_LENGTH`.

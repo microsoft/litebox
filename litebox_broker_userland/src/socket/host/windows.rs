@@ -27,12 +27,12 @@ use windows_sys::Win32::Networking::WinSock::{
     LPFN_WSARECVMSG, MSG_BCAST, MSG_MCAST, MSG_PEEK, POLLERR, POLLRDNORM, POLLWRNORM,
     SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SO_CONNECT_TIME,
     SO_EXCLUSIVEADDRUSE, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSA_NOT_ENOUGH_MEMORY,
-    WSABUF, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY, WSAECONNABORTED,
-    WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR, WSAEINVAL,
-    WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN,
-    WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError, WSAID_WSARECVMSG, WSAIoctl,
-    WSAMSG, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend, WSASendMsg, WSASendTo, getsockopt,
-    ioctlsocket, setsockopt,
+    WSABUF, WSAEACCES, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY,
+    WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR,
+    WSAEINVAL, WSAEISCONN, WSAEMFILE, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH, WSAENOBUFS,
+    WSAENOTCONN, WSAEOPNOTSUPP, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK, WSAGetLastError,
+    WSAID_WSARECVMSG, WSAIoctl, WSAMSG, WSAPOLLFD, WSAPoll, WSARecv, WSARecvFrom, WSASend,
+    WSASendMsg, WSASendTo, getsockopt, ioctlsocket, setsockopt,
 };
 use windows_sys::core::GUID;
 
@@ -93,6 +93,7 @@ impl HostErrno for Errno {
     const HOSTUNREACH: Self = Self(WSAEHOSTUNREACH);
     const TIMEDOUT: Self = Self(WSAETIMEDOUT);
     const INVAL: Self = Self(WSAEINVAL);
+    const ACCES: Self = Self(WSAEACCES);
 
     fn broker_resource_error(self) -> Option<BrokerError> {
         match self {
@@ -111,6 +112,7 @@ impl Errno {
     /// A datagram is longer than a receive's output.
     const MSGSIZE: Self = Self(WSAEMSGSIZE);
     const MFILE: Self = Self(WSAEMFILE);
+    const OPNOTSUPP: Self = Self(WSAEOPNOTSUPP);
     /// `ERROR_OUTOFMEMORY`, which some calls report instead of
     /// [`Self::NOMEM`].
     const OUTOFMEMORY: Self = Self(14);
@@ -340,6 +342,17 @@ impl HostSocket for Socket {
         Ok(Self::new(Source::Udp(UdpSocket::from_std(socket.into()))))
     }
 
+    fn owns_address(address: Ipv4Addr) -> Result<bool, Errno> {
+        if address.is_unspecified() || address.is_multicast() || address.is_broadcast() {
+            return Ok(false);
+        }
+        match Self::udp()?.bind(SocketAddrV4::new(address, 0)) {
+            Ok(()) => Ok(true),
+            Err(Errno::ADDRNOTAVAIL) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// With `SO_EXCLUSIVEADDRUSE`, without which a socket bound to a specific address could share
     /// a wildcard one's port. Connections accepted on the port keep it from being bound again
     /// until they end.
@@ -353,27 +366,41 @@ impl HostSocket for Socket {
     }
 
     /// Winsock keeps a listener's first backlog: listening again succeeds without changing it.
+    ///
+    /// A stream that listens stays one for mio, which would drop its watch if it became a
+    /// listener, and reports a connection to accept on a watched stream as readable, as it does
+    /// on a listener; [`Self::accept`] accepts on either.
     fn listen(&self, backlog: u32) -> Result<(), Errno> {
         Ok(self
             .socket()
             .listen(i32::try_from(backlog).unwrap_or(i32::MAX))?)
     }
 
-    /// mio's accept rearms the listener when it would block. Unlike `socket`, `accept` cannot
-    /// make a socket non-inheritable, so runners would get it if it stayed so.
+    /// mio's accept rearms the listener when it would block, as `try_io` does a stream that
+    /// listens. Unlike `socket`, `accept` cannot make a socket non-inheritable, so runners would
+    /// get it if it stayed so.
     fn accept(&self) -> Result<(Self, SocketAddrV4), Errno> {
         let _accepting = INHERITABLE.read().unwrap_or_else(PoisonError::into_inner);
-        if let Source::Listener(listener) = &self.source
-            && let (stream, SocketAddr::V4(peer)) = listener.accept()?
-        {
-            let handle = raw_socket(&stream) as HANDLE;
-            // SAFETY: The call changes only the flags of the handle that `stream` owns.
-            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
-                return Err(Error::last_os_error().into());
+        let (stream, peer) = match &self.source {
+            Source::Listener(listener) => listener.accept()?,
+            Source::Tcp(stream) => {
+                // Winsock gives the accepted socket the listener's nonblocking mode, as mio's
+                // accept relies on.
+                let (socket, peer) = stream.try_io(|| SockRef::from(stream).accept())?;
+                let peer = peer.as_socket().ok_or(Errno::AFNOSUPPORT)?;
+                (TcpStream::from_std(socket.into()), peer)
             }
-            return Ok((Self::new(Source::Tcp(stream)), peer));
+            Source::Udp(_) => return Err(Errno::INVAL),
+        };
+        let SocketAddr::V4(peer) = peer else {
+            return Err(Errno::INVAL);
+        };
+        let handle = raw_socket(&stream) as HANDLE;
+        // SAFETY: The call changes only the flags of the handle that `stream` owns.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(Error::last_os_error().into());
         }
-        Err(Errno::INVAL)
+        Ok((Self::new(Source::Tcp(stream)), peer))
     }
 
     fn bind(&self, address: SocketAddrV4) -> Result<(), Errno> {
@@ -383,6 +410,16 @@ impl HostSocket for Socket {
     fn bind_exclusively(&self, address: SocketAddrV4) -> Result<(), Errno> {
         use_exclusively(self.raw())?;
         self.bind(address)
+    }
+
+    /// Winsock's `SO_REUSEADDR` lets a socket take a port that another holds, so the bind is
+    /// exclusive. Winsock reports some conflicts with an exclusive bind, as well as ports the
+    /// host reserves, as `WSAEACCES`, so the bind reports that as [`HostErrno::ADDRINUSE`].
+    fn bind_as_guest(&self, address: SocketAddrV4, _reuse_address: bool) -> Result<(), Errno> {
+        match self.bind_exclusively(address) {
+            Err(Errno::ACCES) => Err(Errno::ADDRINUSE),
+            result => result,
+        }
     }
 
     /// Winsock retries a refused TCP connect for about 2 seconds before it
@@ -440,6 +477,12 @@ impl HostSocket for Socket {
             self.read_shutdown.set(true);
         }
         Ok(())
+    }
+
+    /// Winsock cannot stop a listener or a connect in progress but by closing the socket, which
+    /// releases its port.
+    fn disconnect(&self) -> Result<(), Errno> {
+        Err(Errno::OPNOTSUPP)
     }
 
     /// A UDP send reports an ICMP error only once the event thread has taken
@@ -728,6 +771,15 @@ impl HostSocket for Socket {
 
     fn set_linger_zero(&self) -> Result<(), Errno> {
         Ok(self.socket().set_linger(Some(Duration::ZERO))?)
+    }
+
+    /// [`Self::bind_as_guest`] binds exclusively whatever the guest asks.
+    fn set_reuse_address(&self, _value: bool) -> Result<(), Errno> {
+        Ok(())
+    }
+
+    fn reuse_address(&self) -> Result<bool, Errno> {
+        Ok(self.socket().reuse_address()?)
     }
 
     fn set_receive_buffer_size(&self, size: usize) -> Result<(), Errno> {
