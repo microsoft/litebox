@@ -225,7 +225,12 @@ impl SocketPolicy {
         }
     }
 
-    /// Creates a policy allowing IPv4 TCP and UDP within the shared guest network.
+    /// Creates a policy allowing IPv4 TCP and UDP within the shared guest
+    /// network. With
+    /// [`SocketAddressing::Host`](crate::socket::SocketAddressing::Host), that
+    /// network holds only listeners of the provider's own sockets, as
+    /// [`SocketEgress::ServedOnly`](crate::socket::SocketEgress::ServedOnly)
+    /// describes.
     #[must_use]
     pub const fn guest_network() -> Self {
         Self {
