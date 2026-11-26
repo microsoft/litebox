@@ -143,7 +143,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts a pipe end this process inherited from its parent as `handle`.
+    /// Adopts a pipe end this process inherited from its parent, or received with Unix socket
+    /// data, as `handle`.
     pub(crate) fn adopt_inherited_pipe_end(
         &self,
         handle: ObjectHandle,

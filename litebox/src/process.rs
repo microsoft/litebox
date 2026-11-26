@@ -395,7 +395,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     }
 
     /// Returns the process this process inherited from its parent as `handle`
-    /// through [`PendingChild::inherit`].
+    /// through [`PendingChild::inherit`], or received with Unix socket data.
     ///
     /// The [`Process`] owns `handle`, so callers adopt each handle once and
     /// share the [`Process`] for every other use.
@@ -408,7 +408,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     }
 }
 
-/// A descriptor a pending child process can inherit through [`PendingChild::inherit`].
+/// A descriptor a pending child process can inherit through [`PendingChild::inherit`], or that
+/// data sent with [`UnixSocket::send`] can carry.
 ///
 /// This identifies only the object. The shim records guest-specific details, such as the
 /// descriptor number, in the child's startup payload alongside the handle `inherit` returns.
@@ -431,6 +432,23 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     ReadinessQueue(Arc<ReadinessQueue<Platform>>),
     /// A process, adopted with [`LiteBox::adopt_inherited_process`].
     Process(Arc<Process<Platform>>),
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> InheritableFd<Platform> {
+    /// The broker handle of the object.
+    pub(crate) fn handle(&self) -> ObjectHandle {
+        match self {
+            Self::File(file) => file.handle(),
+            Self::Pipe(pipe) => pipe.handle(),
+            Self::UnixSocket(socket) => socket.handle(),
+            Self::InetSocket(socket) => socket.handle(),
+            Self::VsockSocket(socket) => socket.handle(),
+            Self::EventCounter(counter) => counter.handle(),
+            Self::Timer(timer) => timer.handle(),
+            Self::ReadinessQueue(queue) => queue.handle(),
+            Self::Process(process) => process.handle(),
+        }
+    }
 }
 
 /// A child process that has not started.
@@ -508,21 +526,7 @@ impl PendingChild {
         fds: &[InheritableFd<Platform>],
     ) -> Result<Vec<ObjectHandle>, ProcessError> {
         // `fds` holds the objects, which keeps their handles open until the child has its own.
-        let mut fd_handles = Vec::new();
-        for fd in fds {
-            let handle = match fd {
-                InheritableFd::File(file) => file.handle(),
-                InheritableFd::Pipe(pipe) => pipe.handle(),
-                InheritableFd::UnixSocket(socket) => socket.handle(),
-                InheritableFd::InetSocket(socket) => socket.handle(),
-                InheritableFd::VsockSocket(socket) => socket.handle(),
-                InheritableFd::EventCounter(counter) => counter.handle(),
-                InheritableFd::Timer(timer) => timer.handle(),
-                InheritableFd::ReadinessQueue(queue) => queue.handle(),
-                InheritableFd::Process(process) => process.handle(),
-            };
-            fd_handles.push(handle);
-        }
+        let fd_handles: Vec<ObjectHandle> = fds.iter().map(InheritableFd::handle).collect();
         let mut handles = fd_handles.clone();
         handles.sort_unstable();
         handles.dedup();

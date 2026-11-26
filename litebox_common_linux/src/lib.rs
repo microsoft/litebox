@@ -2767,6 +2767,8 @@ bitflags::bitflags! {
     impl ReceiveFlags: u32 {
         /// `MSG_CMSG_CLOEXEC`: close-on-exec for the associated file descriptor
         const CMSG_CLOEXEC = 0x40000000;
+        /// `MSG_CTRUNC`: some control data was discarded, reported in `msg_flags`
+        const CTRUNC = 0x8;
         /// `MSG_DONTWAIT`: non-blocking operation
         const DONTWAIT = 0x40;
         /// `MSG_ERRQUEUE`: destination for error messages
@@ -2846,6 +2848,75 @@ pub struct UserMsgHdr {
     /// Linux's naturally-aligned `struct user_msghdr` on 64-bit (total size 56).
     #[cfg(target_pointer_width = "64")]
     _pad2: u32,
+}
+
+/// Linux's `struct cmsghdr`, which heads each control message in a `msghdr`'s ancillary data.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct CmsgHdr {
+    /// Length of the message, header included.
+    pub cmsg_len: usize,
+    /// Level of the message, such as [`SocketOptionLevel::SOCKET`].
+    pub cmsg_level: i32,
+    /// Type of the message within its level, such as a [`SocketControlMessageType`] for
+    /// [`SocketOptionLevel::SOCKET`].
+    pub cmsg_type: i32,
+}
+
+impl CmsgHdr {
+    /// `CMSG_LEN(0)`: the length of the header, which a message's data follows.
+    pub const LEN: usize = Self::align(size_of::<Self>());
+
+    /// Rounds `length` up as `CMSG_ALIGN` does.
+    #[must_use]
+    pub const fn align(length: usize) -> usize {
+        length.next_multiple_of(size_of::<usize>())
+    }
+}
+
+/// Linux's `SCM_MAX_FD`, the most descriptors the `SCM_RIGHTS` messages of one `sendmsg` pass.
+pub const SCM_MAX_FD: usize = 253;
+
+/// Type of a `SOL_SOCKET` control message.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, IntEnum)]
+pub enum SocketControlMessageType {
+    /// `SCM_RIGHTS`, which passes descriptors.
+    Rights = 1,
+    /// `SCM_CREDENTIALS`, which passes credentials.
+    Credentials = 2,
+}
+
+/// A control message's level and type, as [`SocketOptionName`] is a socket option's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketControlMessageName {
+    /// A `SOL_IP` message, of a type LiteBox doesn't interpret.
+    IP(i32),
+    /// A `SOL_SOCKET` message.
+    Socket(SocketControlMessageType),
+    /// A `SOL_UDP` message, of a type LiteBox doesn't interpret.
+    UDP(i32),
+}
+
+impl SocketControlMessageName {
+    /// Returns the name of a message of `level` and `kind`, or `None` for a level with no control
+    /// messages LiteBox knows, which every socket ignores.
+    ///
+    /// Fails with `EINVAL` for an unknown `SOL_SOCKET` type, which every socket that parses
+    /// control messages rejects, as Linux's `sock_cmsg_send` and `__scm_send` do.
+    pub fn try_from(level: i32, kind: i32) -> Result<Option<Self>, errno::Errno> {
+        let Ok(level) = SocketOptionLevel::try_from(level.cast_unsigned()) else {
+            return Ok(None);
+        };
+        Ok(match level {
+            SocketOptionLevel::IP => Some(Self::IP(kind)),
+            SocketOptionLevel::SOCKET => Some(Self::Socket(
+                SocketControlMessageType::try_from(kind).map_err(|_| errno::Errno::EINVAL)?,
+            )),
+            SocketOptionLevel::UDP => Some(Self::UDP(kind)),
+            SocketOptionLevel::TCP | SocketOptionLevel::RAW => None,
+        })
+    }
 }
 
 /// Linux's `struct mmsghdr`: a `msghdr` paired with the number of bytes

@@ -62,6 +62,12 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 pub use error::{BrokerLocalError, Result};
 
+pub type ReceivedUnixSocket = (
+    litebox_broker_protocol::unix_socket::ReceiveUnixSocketResponse,
+    Option<litebox_broker_protocol::unix_socket::UnixSocketName>,
+    alloc::vec::Vec<litebox_broker_protocol::unix_socket::TransferredObject>,
+);
+
 /// Typed broker-local control adapter for broker operations.
 ///
 /// The shared-buffer pool belongs to the broker association. Payload request

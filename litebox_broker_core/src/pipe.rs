@@ -122,6 +122,11 @@ impl PipeObject {
         }
     }
 
+    /// Returns whether this is the read end.
+    pub(crate) fn is_read_end(&self) -> bool {
+        matches!(self.endpoint, PipeEndpoint::Read)
+    }
+
     /// Returns the endpoint's access mode and status flags.
     pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
         self.status.get(match self.endpoint {

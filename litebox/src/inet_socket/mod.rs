@@ -99,7 +99,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     }
 
     /// Returns the IPv4 socket of type `socket_type` this process inherited
-    /// from its parent as `handle`.
+    /// from its parent, or received with Unix socket data, as `handle`.
     ///
     /// The socket owns `handle`, so callers adopt each handle once and share
     /// the socket for every other use.

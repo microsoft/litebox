@@ -742,12 +742,14 @@ fn request_codec_round_trips_all_variants() {
             handle,
             buffer: largest_sequence,
             address_length: u32::MAX,
+            object_count: u32::MAX,
             user: FileUser { user: 1, group: 2 },
         })),
         BrokerOperation::UnixSocket(UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
             handle,
             buffer: largest_sequence,
             capacity: u32::MAX,
+            max_objects: u32::MAX,
             peek: true,
             source: true,
             nonblocking: true,
@@ -1099,7 +1101,9 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::UnixSocket(UnixSocketResponse::Receive(ReceiveUnixSocketResponse {
             received: 1,
             length: u32::MAX,
-            source_length: 109
+            source_length: 109,
+            object_count: 253,
+            objects_truncated: true,
         })),
         BrokerResult::UnixSocket(UnixSocketResponse::Shutdown),
         BrokerResult::UnixSocket(UnixSocketResponse::GetName(GetUnixSocketNameResponse {
@@ -1115,6 +1119,9 @@ fn response_codec_round_trips_all_variants() {
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::AddressInUse)),
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::NotPermitted)),
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::ConnectionReset)),
+        BrokerResult::UnixSocket(UnixSocketResponse::Failed(
+            UnixSocketError::TooManyReferences,
+        )),
         BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::File(
             FileError::NoSuchFileOrDirectory
         ))),

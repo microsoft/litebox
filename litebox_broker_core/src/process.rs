@@ -301,6 +301,9 @@ pub struct BrokerProcess {
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Bytes queued in Unix sockets created by this process.
     pub(crate) unix_socket_bytes: Arc<AtomicUsize>,
+    /// References this process sent that queued Unix socket messages still
+    /// carry.
+    pub(crate) unix_socket_references: Arc<AtomicUsize>,
     /// The provider socket state charged to this process, until it releases
     /// its references.
     socket_account: Mutex<Option<Arc<SocketAccount>>>,
@@ -688,6 +691,7 @@ impl BrokerProcess {
             ended_thread_ids: Mutex::new(Vec::new()),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             unix_socket_bytes: Arc::new(AtomicUsize::new(0)),
+            unix_socket_references: Arc::new(AtomicUsize::new(0)),
             socket_account: Mutex::new(Some(socket_account)),
             readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             pid_namespaces: Arc::new(AtomicUsize::new(0)),
@@ -2581,7 +2585,7 @@ impl BrokerProcess {
         self.create_object_reference_with_rights(object, rights)
     }
 
-    fn create_object_reference_with_rights(
+    pub(crate) fn create_object_reference_with_rights(
         &self,
         object: Arc<RwLock<ObjectEntry>>,
         rights: ObjectRights,
@@ -2654,17 +2658,10 @@ impl BrokerProcess {
             return Err(BrokerError::InvalidRights);
         }
 
-        let object = {
-            let references = self.core.references.read();
-            let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-            if reference.owner != self.key {
-                return Err(BrokerError::UnknownObject);
-            }
-            if !reference.rights.contains(rights) {
-                return Err(BrokerError::InvalidRights);
-            }
-            Arc::clone(&reference.object)
-        };
+        let (object, source_rights) = self.object_reference(handle)?;
+        if !source_rights.contains(rights) {
+            return Err(BrokerError::InvalidRights);
+        }
 
         if !object.read().is_duplicable() {
             return Err(BrokerError::UnsupportedOperation);
@@ -2680,13 +2677,21 @@ impl BrokerProcess {
         target.create_object_reference_with_rights(object, rights)
     }
 
-    fn object_reference_rights(&self, handle: ObjectHandle) -> Result<ObjectRights> {
+    /// Returns the object `handle` refers to, and the reference's rights.
+    pub(crate) fn object_reference(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<(Arc<RwLock<ObjectEntry>>, ObjectRights)> {
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
         if reference.owner != self.key {
             return Err(BrokerError::UnknownObject);
         }
-        Ok(reference.rights)
+        Ok((Arc::clone(&reference.object), reference.rights))
+    }
+
+    fn object_reference_rights(&self, handle: ObjectHandle) -> Result<ObjectRights> {
+        self.object_reference(handle).map(|(_, rights)| rights)
     }
 
     /// Publishes readiness of all of this process's references through

@@ -26,13 +26,14 @@ use litebox_broker_protocol::{
     vsock_socket::VsockAddress,
 };
 use litebox_common_linux::{
-    AddressFamily, FileDescriptorFlags, IoReadVec, IoWriteVec, ReceiveFlags, SendFlags,
-    ShutdownHow, SockFlags, SockType, SocketOption, SocketOptionName, UserMmsgHdr, UserMsgHdr,
-    errno::Errno,
+    AddressFamily, CmsgHdr, FileDescriptorFlags, IoReadVec, IoWriteVec, ReceiveFlags, SendFlags,
+    ShutdownHow, SockFlags, SockType, SocketControlMessageName, SocketOption, SocketOptionName,
+    UserMmsgHdr, UserMsgHdr, errno::Errno,
 };
 use litebox_common_linux::{PAGE_SIZE, mm::VmemManager};
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use litebox_platform::time::Instant as _;
+use zerocopy::FromBytes as _;
 
 use crate::guest_buffer::{GuestReadBuffer, GuestWriteBuffer};
 use crate::syscalls::{
@@ -90,6 +91,9 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
     /// then ends instead of being reported.
     ///
     /// A message-oriented socket stores its sender's address in `source_addr` if requested.
+    ///
+    /// A Unix socket stores the objects the received data carried in `objects`, and discards them
+    /// without it unless peeking.
     fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -97,6 +101,7 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
         flags: ReceiveFlags,
         has_prior_progress: bool,
         source_addr: Option<&mut Option<SocketAddress>>,
+        objects: Option<&mut unix::ReceivedObjects>,
     ) -> Result<usize, Errno> {
         let want_source = source_addr.is_some();
         let (size, addr) = match self {
@@ -116,7 +121,7 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
             ReceiveSocket::Unix(handle) => {
                 let mut addr = None;
                 let size = handle.with_entry(|socket| {
-                    socket.recvfrom(cx, buf, flags, want_source.then_some(&mut addr))
+                    socket.recvfrom(cx, buf, flags, want_source.then_some(&mut addr), objects)
                 })?;
                 (size, addr.map(SocketAddress::Unix))
             }
@@ -148,6 +153,7 @@ impl<Platform: ShimPlatform> ReceiveSocket<Platform> {
             &mut probe,
             flags | ReceiveFlags::PEEK,
             has_prior_progress,
+            None,
             None,
         )
         .map(|size| size != 0)
@@ -257,6 +263,62 @@ pub(super) fn shutdown_mode(how: ShutdownHow) -> ShutdownMode {
         ShutdownHow::Write => ShutdownMode::Write,
         ShutdownHow::Both => ShutdownMode::Both,
     }
+}
+
+fn copy_send_control<Platform: ShimPlatform>(
+    control: UserPtr<u8>,
+    length: usize,
+) -> Result<alloc::boxed::Box<[u8]>, Errno> {
+    /// Linux's default `optmem_max`, which the control bytes it copies stay below.
+    const MAX_CONTROL_LENGTH: usize = 128 * 1024;
+
+    if length == 0 {
+        return Ok(alloc::boxed::Box::default());
+    }
+    if length >= MAX_CONTROL_LENGTH {
+        return Err(Errno::ENOBUFS);
+    }
+    control
+        .to_owned_slice::<Platform>(length)
+        .ok_or(Errno::EFAULT)
+}
+
+/// A control message that `sendmsg` passes.
+pub(super) struct ControlMessage<'a> {
+    /// The message's level and type, or `None` for a level with no control messages LiteBox
+    /// knows, which every socket ignores.
+    pub(super) name: Option<SocketControlMessageName>,
+    /// The message's data.
+    pub(super) data: &'a [u8],
+}
+
+/// Returns the control messages in `control` in order, as Linux's `for_each_cmsghdr` walks them.
+pub(super) fn control_messages(
+    control: &[u8],
+) -> impl Iterator<Item = Result<ControlMessage<'_>, Errno>> {
+    let mut next = Some(0);
+    core::iter::from_fn(move || {
+        let offset = next.filter(|&offset| control.len() - offset >= CmsgHdr::LEN)?;
+        next = None;
+        let header = CmsgHdr::read_from_prefix(&control[offset..])
+            .ok()
+            .map(|(header, _)| header)
+            .filter(|header| (CmsgHdr::LEN..=control.len() - offset).contains(&header.cmsg_len));
+        let Some(header) = header else {
+            return Some(Err(Errno::EINVAL));
+        };
+        let name = match SocketControlMessageName::try_from(header.cmsg_level, header.cmsg_type) {
+            Ok(name) => name,
+            Err(errno) => return Some(Err(errno)),
+        };
+        next = offset
+            .checked_add(CmsgHdr::align(header.cmsg_len))
+            .filter(|&next| next <= control.len());
+        Some(Ok(ControlMessage {
+            name,
+            data: &control[offset + CmsgHdr::LEN..offset + header.cmsg_len],
+        }))
+    })
 }
 
 impl<Platform: ShimPlatform> GlobalState<Platform> {
@@ -798,7 +860,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 is_message_oriented.set(!file.is_stream());
-                file.sendto(self, &buf, flags, addr)
+                file.sendto(self, &buf, flags, addr, &[])
             },
             |socket| socket.sendto(&self.wait_cx(), &buf, flags, sockaddr.is_some()),
         );
@@ -825,25 +887,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: SendFlags,
     ) -> Result<usize, Errno> {
         let msg_name = msg.msg_name;
-        // A vsock socket's destination is never parsed.
-        let is_vsock = matches!(socket, AnyTypedFd::Vsock(_));
-        let vsock_destination = is_vsock
-            && vsock::copy_msg_destination::<Platform>(
-                UserPtr::from_usize(msg_name.as_usize()),
-                msg.msg_namelen,
-            )?;
-        let sock_addr = if msg_name.as_usize() != 0 && !is_vsock {
-            Some(read_sockaddr_from_user::<Platform>(
+        let read_destination = || {
+            read_sockaddr_from_user::<Platform>(
                 UserPtr::from_usize(msg_name.as_usize()),
                 msg.msg_namelen as usize,
-            )?)
-        } else {
-            None
+            )
         };
-        if msg.msg_controllen != 0 {
-            log_unsupported!("ancillary data is not supported");
-            return Err(Errno::EINVAL);
-        }
+        // Like Linux, every socket copies the destination first. An inet or Unix socket parses it
+        // when sending, a Unix socket only after its control messages. A vsock socket's
+        // destination is never parsed, and fails the send.
+        let copied_destination = vsock::copy_msg_destination::<Platform>(
+            UserPtr::from_usize(msg_name.as_usize()),
+            msg.msg_namelen,
+        )?;
         if msg.msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
         }
@@ -858,27 +914,37 @@ impl<Platform: ShimPlatform> Task<Platform> {
             )
         };
         let data = GuestWriteBuffer::<Platform>::new(iovs.as_deref().unwrap_or_default())?;
+        // Like Linux, every socket copies the control bytes, then parses them its own way: a vsock
+        // socket ignores them.
+        let control = copy_send_control::<Platform>(msg.msg_control, msg.msg_controllen)?;
         let is_message_oriented = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
             |socket| {
                 is_message_oriented.set(!socket.is_stream());
-                let sock_addr = sock_addr
-                    .clone()
-                    .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
-                    .transpose()?;
+                let sock_addr = if copied_destination {
+                    Some(read_destination()?.inet().ok_or(Errno::EAFNOSUPPORT)?)
+                } else {
+                    None
+                };
+                // Linux parses the messages only after checking a UDP datagram's size and
+                // destination and a TCP socket's connection, which come later here; that only
+                // changes which error a send failing both ways reports.
+                inet::check_send_control(&control, socket.inet_socket().socket_type())?;
                 socket.sendto(&self.wait_cx(), &data, flags, sock_addr)
             },
             |file| {
-                let unix_addr = sock_addr
-                    .clone()
-                    .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
-                    .transpose()?;
+                let objects = self.passed_objects(&control)?;
+                let unix_addr = if copied_destination {
+                    Some(read_destination()?.unix().ok_or(Errno::EAFNOSUPPORT)?)
+                } else {
+                    None
+                };
                 is_message_oriented.set(!file.is_stream());
-                file.sendto(self, &data, flags, unix_addr)
+                file.sendto(self, &data, flags, unix_addr, &objects)
             },
-            |socket| socket.sendto(&self.wait_cx(), &data, flags, vsock_destination),
+            |socket| socket.sendto(&self.wait_cx(), &data, flags, copied_destination),
         );
         self.send_sigpipe_on_epipe(&res, is_message_oriented.get(), flags);
         res
@@ -992,6 +1058,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     None
                 },
+                None,
             ) {
                 Ok(size) => size,
                 // A fault after progress ends the call with that progress.
@@ -1038,7 +1105,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .files
             .borrow()
             .pin_receive_socket(&self.global, socket)?;
-        socket.receive(&self.wait_cx(), buf, flags, false, source_addr)
+        socket.receive(&self.wait_cx(), buf, flags, false, source_addr, None)
     }
 
     /// Handle syscall `recvmsg`
@@ -1051,7 +1118,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let supported_flags = ReceiveFlags::DONTWAIT
             | ReceiveFlags::PEEK
             | ReceiveFlags::TRUNC
-            | ReceiveFlags::WAITALL;
+            | ReceiveFlags::WAITALL
+            | ReceiveFlags::CMSG_CLOEXEC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -1077,11 +1145,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let msg_name = msg.msg_name;
         let msg_iov = msg.msg_iov;
         let msg_iovlen = msg.msg_iovlen;
+        let msg_control = msg.msg_control;
         let msg_controllen = msg.msg_controllen;
 
-        if msg_controllen != 0 {
-            log_unsupported!("ancillary data is not supported");
-        }
+        // A Unix socket passes descriptors in control messages; other ancillary data is
+        // unsupported.
+        let mut objects = if let ReceiveSocket::Unix(_) = socket {
+            Some(unix::ReceivedObjects {
+                limit: unix::max_received_fds(msg_controllen),
+                ..Default::default()
+            })
+        } else {
+            if msg_controllen != 0 {
+                log_unsupported!("ancillary data is not supported");
+            }
+            None
+        };
         if msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
         }
@@ -1095,7 +1174,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let want_source = msg_name.as_usize() != 0;
         let mut source_addr = None;
-        let mut ret_flags = ReceiveFlags::empty();
+        // Like Linux, which reports `MSG_CMSG_CLOEXEC` back.
+        let mut ret_flags = flags & ReceiveFlags::CMSG_CLOEXEC;
         let plan = socket.plan(flags)?;
         let cx = self.wait_cx().with_timeout(plan.timeout);
 
@@ -1141,6 +1221,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     None
                 },
+                objects.as_mut(),
             ) {
                 Ok(size) => size,
                 // A fault after progress ends the call with that progress.
@@ -1177,13 +1258,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
 
-        // Ancillary data is not supported, so report that no control bytes were delivered.
+        let control_used = match objects {
+            Some(objects) => {
+                let (used, truncated) = self.install_received_objects(
+                    objects,
+                    UserPtrMut::from_usize(msg_control.as_usize()),
+                    msg_controllen,
+                    flags.contains(ReceiveFlags::CMSG_CLOEXEC),
+                );
+                if truncated {
+                    ret_flags.insert(ReceiveFlags::CTRUNC);
+                }
+                used
+            }
+            None => 0,
+        };
         let controllen_offset =
             core::mem::offset_of!(litebox_common_linux::UserMsgHdr, msg_controllen);
         let controllen_ptr =
             UserPtrMut::<usize>::from_usize(msg_ptr.as_usize() + controllen_offset);
         controllen_ptr
-            .write_at_offset::<Platform>(0, 0)
+            .write_at_offset::<Platform>(0, control_used)
             .ok_or(Errno::EFAULT)?;
 
         // Write back msg_flags with any status flags (e.g. MSG_TRUNC).
@@ -1209,7 +1304,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | ReceiveFlags::PEEK
             | ReceiveFlags::TRUNC
             | ReceiveFlags::WAITALL
-            | ReceiveFlags::WAITFORONE;
+            | ReceiveFlags::WAITFORONE
+            | ReceiveFlags::CMSG_CLOEXEC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -1559,6 +1655,7 @@ mod tests {
                 &mut old,
                 ReceiveFlags::empty(),
                 false,
+                None,
                 None,
             )
             .unwrap();

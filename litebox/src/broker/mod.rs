@@ -9,7 +9,7 @@ use alloc::{
 use core::net::SocketAddrV4;
 
 use hashbrown::HashMap;
-use litebox_broker_local::BrokerLocal;
+use litebox_broker_local::{BrokerLocal, ReceivedUnixSocket};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::ConsumeEventResponse;
 use litebox_broker_protocol::fs::{
@@ -44,9 +44,9 @@ use litebox_broker_protocol::socket::{
 use litebox_broker_protocol::terminal::{TerminalOperation, TerminalResponse};
 use litebox_broker_protocol::timer::{TimerClock, TimerSetting, TimerSpec};
 use litebox_broker_protocol::unix_socket::{
-    CreateUnixSocketPairResponse, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE,
-    ReceiveUnixSocketResponse, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
-    UnixSocketName,
+    CreateUnixSocketPairResponse, ENCODED_TRANSFERRED_OBJECT_SIZE,
+    MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE,
+    ReceiveOptions, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError, UnixSocketName,
 };
 use litebox_broker_protocol::vsock_socket::{AcceptVsockSocketResponse, VsockAddress};
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
@@ -707,7 +707,8 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<core::result::Result<ObjectHandle, UnixSocketError>, BrokerControlError>;
 
     /// Sends `data` to `address`, or to the connected peer if `address` is
-    /// `None`.
+    /// `None`, carrying the objects `objects` refer to, at most
+    /// [`MAX_UNIX_SOCKET_OBJECTS`].
     ///
     /// Data that does not fit in one transfer fails with
     /// [`UnixSocketError::MessageTooLarge`], so stream callers send it in
@@ -716,22 +717,25 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         handle: ObjectHandle,
         address: Option<&UnixSocketAddress>,
+        objects: &[ObjectHandle],
         data: &dyn WriteBuffer,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>;
 
-    /// Receives into at most [`UNIX_SOCKET_BUFFER_SIZE`] bytes of `data`, as
-    /// for a non-blocking socket if `nonblocking` is set, returning the
-    /// sender's name if `source` is set.
+    /// Receives into at most [`UNIX_SOCKET_BUFFER_SIZE`] bytes of `data`, with
+    /// handles to at most `options.max_objects` of the objects the data
+    /// carried.
+    ///
+    /// Returns the broker's response with the sender's name, if
+    /// `options.source` is set, and the received objects. The caller owns the
+    /// returned handles.
     fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
         data: &mut dyn ReadBuffer,
-        peek: bool,
-        source: bool,
-        nonblocking: bool,
+        options: ReceiveOptions,
     ) -> core::result::Result<
-        core::result::Result<(ReceiveUnixSocketResponse, Option<UnixSocketName>), UnixSocketError>,
+        core::result::Result<ReceivedUnixSocket, UnixSocketError>,
         BrokerControlError,
     >;
 
@@ -2055,10 +2059,14 @@ where
         &self,
         handle: ObjectHandle,
         address: Option<&UnixSocketAddress>,
+        objects: &[ObjectHandle],
         data: &dyn WriteBuffer,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>
     {
+        if objects.len() > MAX_UNIX_SOCKET_OBJECTS as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
         let address = match address {
             Some(address) => match address.encode() {
                 Some(address) => address,
@@ -2066,35 +2074,37 @@ where
             },
             None => Vec::new(),
         };
-        if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize - address.len() {
+        let staged = address.len() + objects.len() * ObjectHandle::ENCODED_SIZE;
+        if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize - staged {
             return Ok(Err(UnixSocketError::MessageTooLarge));
         }
-        let lease = self.acquire_shared_buffer(address.len() + data.len())?;
-        self.request(|local| local.send_unix_socket(handle, lease.sequence(), &address, data, user))
+        let lease = self.acquire_shared_buffer(staged + data.len())?;
+        self.request(|local| {
+            local.send_unix_socket(handle, lease.sequence(), &address, objects, data, user)
+        })
     }
 
     fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
         data: &mut dyn ReadBuffer,
-        peek: bool,
-        source: bool,
-        nonblocking: bool,
+        mut options: ReceiveOptions,
     ) -> core::result::Result<
-        core::result::Result<(ReceiveUnixSocketResponse, Option<UnixSocketName>), UnixSocketError>,
+        core::result::Result<ReceivedUnixSocket, UnixSocketError>,
         BrokerControlError,
     > {
         let capacity = data.len().min(UNIX_SOCKET_BUFFER_SIZE as usize);
         let data = &mut data.sub_buffer(0, capacity);
-        let name_size = if source {
+        let name_size = if options.source {
             MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize
         } else {
             0
         };
-        let lease = self.acquire_shared_buffer(capacity + name_size)?;
-        self.request(|local| {
-            local.receive_unix_socket(handle, lease.sequence(), data, peek, source, nonblocking)
-        })
+        options.max_objects = options.max_objects.min(MAX_UNIX_SOCKET_OBJECTS as usize);
+        let lease = self.acquire_shared_buffer(
+            capacity + name_size + options.max_objects * ENCODED_TRANSFERRED_OBJECT_SIZE as usize,
+        )?;
+        self.request(|local| local.receive_unix_socket(handle, lease.sequence(), data, options))
     }
 
     fn shutdown_unix_socket(

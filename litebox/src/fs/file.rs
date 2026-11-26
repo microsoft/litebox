@@ -166,7 +166,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Returns the file this process inherited from its parent as `handle`
-    /// through [`PendingChild::inherit`](crate::process::PendingChild::inherit).
+    /// through [`PendingChild::inherit`](crate::process::PendingChild::inherit),
+    /// or received with Unix socket data.
     ///
     /// The file owns `handle`, so callers adopt each handle once and share the
     /// file for every other use.

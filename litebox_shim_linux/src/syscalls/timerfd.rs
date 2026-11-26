@@ -195,7 +195,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts a timerfd this process inherited from its parent as `handle`.
+    /// Adopts a timerfd this process inherited from its parent, or received with Unix socket
+    /// data, as `handle`.
     pub(crate) fn adopt_inherited_timerfd(
         &self,
         handle: ObjectHandle,

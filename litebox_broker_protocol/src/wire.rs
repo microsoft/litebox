@@ -72,6 +72,28 @@ pub(crate) const fn max_size(sizes: &[usize]) -> usize {
     maximum
 }
 
+/// Encodes `value` into a fixed-size slot, zero-filling the bytes after it, for
+/// arrays of values in shared buffers.
+pub(crate) fn encode_padded<T: Wire, const N: usize>(value: &T) -> [u8; N] {
+    const { assert!(T::MAX_SIZE <= N) };
+    let mut encoder = Encoder::default();
+    value.encode(&mut encoder);
+    let bytes = encoder.finish();
+    let mut slot = [0; N];
+    slot[..bytes.len()].copy_from_slice(&bytes);
+    slot
+}
+
+/// Decodes a value [`encode_padded`] produced, rejecting nonzero fill.
+pub(crate) fn decode_padded<T: Wire>(slot: &[u8]) -> Result<T, WireError> {
+    let mut decoder = Decoder::new(slot);
+    let value = T::decode(&mut decoder)?;
+    if decoder.remaining().iter().any(|&byte| byte != 0) {
+        return Err(WireError::TrailingBytes);
+    }
+    Ok(value)
+}
+
 fn encode_frame<T: Wire>(phase: u8, value: &T) -> Vec<u8> {
     let mut encoder = Encoder::default();
     phase.encode(&mut encoder);

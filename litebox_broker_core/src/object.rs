@@ -6,6 +6,7 @@
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::ObjectKind;
 use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
@@ -73,19 +74,26 @@ impl ObjectEntry {
     /// A duplicable kind whose waiters need wake-ups for changes made by
     /// other processes must also implement [`Self::watch`].
     pub(crate) fn is_duplicable(&self) -> bool {
-        match self {
-            Self::Event(_)
-            | Self::File(_)
-            | Self::UnixSocket(_)
-            | Self::Pipe(_)
-            | Self::Socket(_)
-            | Self::VsockSocket(_)
-            | Self::Timer(_)
-            | Self::ReadinessQueue(_)
-            | Self::Process(_) => true,
+        self.transferred_kind().is_some()
+    }
+
+    /// Returns what a reference to this object another process receives
+    /// refers to, or `None` if references to it may not be duplicated.
+    pub(crate) fn transferred_kind(&self) -> Option<ObjectKind> {
+        Some(match self {
+            Self::Event(_) => ObjectKind::EventCounter,
+            Self::File(_) => ObjectKind::File,
+            Self::UnixSocket(socket) => ObjectKind::UnixSocket(socket.socket_type()),
+            Self::Pipe(pipe) if pipe.is_read_end() => ObjectKind::PipeReadEnd,
+            Self::Pipe(_) => ObjectKind::PipeWriteEnd,
+            Self::Socket(socket) => ObjectKind::InetSocket(socket.socket_type()),
+            Self::VsockSocket(_) => ObjectKind::VsockSocket,
+            Self::Timer(_) => ObjectKind::Timer,
+            Self::ReadinessQueue(_) => ObjectKind::ReadinessQueue,
+            Self::Process(_) => ObjectKind::Process,
             // Signals belong to their process and a futex waiter to its thread.
-            Self::Signals(_) | Self::FutexWaiter(_) => false,
-        }
+            Self::Signals(_) | Self::FutexWaiter(_) => return None,
+        })
     }
 
     /// Returns a registration that publishes readiness changes to this

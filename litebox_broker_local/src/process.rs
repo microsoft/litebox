@@ -200,10 +200,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         );
         let mut data = Vec::new();
         let mut duplicates = Vec::new();
-        data.try_reserve_exact(handles.len() * size_of::<u64>())
+        data.try_reserve_exact(handles.len() * ObjectHandle::ENCODED_SIZE)
             .and_then(|()| duplicates.try_reserve_exact(handles.len()))
             .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
-        data.extend(handles.iter().flat_map(|handle| handle.0.to_le_bytes()));
+        data.extend(ObjectHandle::encode_all(handles));
         self.write_shared_buffer(buffer, &data);
         match self.request_process(ProcessRequest::DuplicateObjectsToChild(
             DuplicateObjectsToChildRequest {
@@ -213,12 +213,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         ))? {
             ProcessResponse::DuplicateObjectsToChild => {
                 self.read_shared_buffer(buffer, &mut data);
-                let (handles, _) = data.as_chunks::<{ size_of::<u64>() }>();
-                duplicates.extend(
-                    handles
-                        .iter()
-                        .map(|bytes| ObjectHandle(u64::from_le_bytes(*bytes))),
-                );
+                duplicates.extend(ObjectHandle::decode_all(&data));
                 Ok(duplicates)
             }
             response => panic!("broker returned unexpected process response: {response:?}"),

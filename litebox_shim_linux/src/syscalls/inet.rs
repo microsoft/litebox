@@ -35,7 +35,7 @@ use litebox_broker_protocol::{
 };
 use litebox_common_linux::{
     AddressFamily, IPProtocol, IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags,
-    SockType, SocketOption, SocketOptionName, TcpOption, errno::Errno,
+    SockType, SocketControlMessageName, SocketOption, SocketOptionName, TcpOption, errno::Errno,
 };
 use litebox_platform::buffer::{Buffer, ReadBuffer, WriteBuffer};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -44,7 +44,7 @@ use crate::{
     GlobalState, ShimPlatform, UserPtr, UserPtrMut,
     syscalls::{
         file::{linux_status_flags, status_flags_change},
-        net::{ReceivePlan, open_flags, shutdown_mode},
+        net::{ReceivePlan, control_messages, open_flags, shutdown_mode},
     },
     wait::wait_errno,
 };
@@ -144,6 +144,25 @@ pub(super) fn write_sockaddr<Platform: ShimPlatform>(
     dst.write_slice_at_offset::<Platform>(0, &bytes[..capacity.min(bytes.len())])
         .ok_or(Errno::EFAULT)?;
     Ok(bytes.len())
+}
+
+/// Checks the `control` messages that `sendmsg` passes to an inet socket of `socket_type`, as
+/// Linux's `sock_cmsg_send` and, for UDP, `udp_cmsg_send` and `ip_cmsg_send` do.
+pub(super) fn check_send_control(control: &[u8], socket_type: SocketType) -> Result<(), Errno> {
+    for message in control_messages(control) {
+        let message = message?;
+        // Every known `SOL_SOCKET` type passes descriptors or credentials, which only Unix
+        // sockets act on.
+        let parsed = matches!(
+            message.name,
+            Some(SocketControlMessageName::IP(_) | SocketControlMessageName::UDP(_))
+        ) && socket_type == SocketType::Datagram;
+        if parsed {
+            log_unsupported!("control message {:?}", message.name);
+            return Err(Errno::EINVAL);
+        }
+    }
+    Ok(())
 }
 
 impl<Platform: ShimPlatform> InetSocket<Platform> {
@@ -836,7 +855,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
     }
 
     /// Adopts an internet socket of type `socket_type` this process inherited
-    /// from its parent as `handle`.
+    /// from its parent, or received with Unix socket data, as `handle`.
     pub(super) fn adopt_inherited_inet_socket(
         &self,
         handle: ObjectHandle,

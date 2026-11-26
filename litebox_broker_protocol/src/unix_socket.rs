@@ -14,10 +14,11 @@ use alloc::vec::Vec;
 
 use thiserror::Error;
 
-use crate::ObjectHandle;
 use crate::fs::{FileError, FileMode, FileOpenFlags, FileUser};
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use crate::socket::{ShutdownMode, SocketOptionName, SocketOptionValue, SocketType};
+use crate::wire::{self, Wire};
+use crate::{ObjectHandle, ObjectKind};
 
 /// Maximum length in bytes of the guest-visible part of a Unix socket name.
 pub const MAX_UNIX_SOCKET_NAME_SIZE: u32 = 108;
@@ -37,14 +38,33 @@ pub const MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE: u32 =
 pub const UNIX_SOCKET_BUFFER_SIZE: u32 = 212_992;
 
 /// Maximum bytes one send or receive request transfers, including an encoded
-/// address or name staged with the data.
+/// address or name and the carried objects staged with the data.
 pub const MAX_UNIX_SOCKET_TRANSFER_SIZE: u32 = 4 * SHARED_BUFFER_SLOT_SIZE;
 
 /// Largest accepted listen backlog; larger requests are clamped.
 pub const MAX_UNIX_SOCKET_BACKLOG: u32 = 4096;
 
+/// Most object references one send carries, as Linux's `SCM_MAX_FD`.
+pub const MAX_UNIX_SOCKET_OBJECTS: u32 = 253;
+
+/// Length in bytes of one encoded [`TransferredObject`].
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a handle and a kind fit in u32"
+)]
+pub const ENCODED_TRANSFERRED_OBJECT_SIZE: u32 = <TransferredObject as Wire>::MAX_SIZE as u32;
+
 const _: () = assert!(
-    UNIX_SOCKET_BUFFER_SIZE + MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE <= MAX_UNIX_SOCKET_TRANSFER_SIZE
+    UNIX_SOCKET_BUFFER_SIZE as usize
+        + MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE as usize
+        + MAX_UNIX_SOCKET_OBJECTS as usize * ObjectHandle::ENCODED_SIZE
+        <= MAX_UNIX_SOCKET_TRANSFER_SIZE as usize
+);
+const _: () = assert!(
+    UNIX_SOCKET_BUFFER_SIZE
+        + MAX_ENCODED_UNIX_SOCKET_NAME_SIZE
+        + MAX_UNIX_SOCKET_OBJECTS * ENCODED_TRANSFERRED_OBJECT_SIZE
+        <= MAX_UNIX_SOCKET_TRANSFER_SIZE
 );
 const _: () = assert!(
     MAX_UNIX_SOCKET_TRANSFER_SIZE.div_ceil(SHARED_BUFFER_SLOT_SIZE) as usize
@@ -189,6 +209,47 @@ impl UnixSocketAddress {
     }
 }
 
+/// Options of a receive from a Unix socket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReceiveOptions {
+    /// Whether to leave the data queued.
+    pub peek: bool,
+    /// Whether to return the sender's name.
+    pub source: bool,
+    /// Whether the caller will not wait for data, as if the socket were
+    /// non-blocking.
+    pub nonblocking: bool,
+    /// Maximum carried objects to receive handles for.
+    pub max_objects: usize,
+}
+
+wire_struct! {
+    /// A handle the receiver of a Unix socket message got for an object the
+    /// message carried.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TransferredObject {
+        /// The receiver's new handle.
+        pub handle: ObjectHandle,
+        /// What the handle refers to.
+        pub kind: ObjectKind,
+    }
+}
+
+impl TransferredObject {
+    /// Encodes this object for a shared buffer.
+    #[must_use]
+    pub fn encode(self) -> [u8; ENCODED_TRANSFERRED_OBJECT_SIZE as usize] {
+        wire::encode_padded(&self)
+    }
+
+    /// Decodes an object produced by [`Self::encode`].
+    pub fn decode(
+        encoded: &[u8; ENCODED_TRANSFERRED_OBJECT_SIZE as usize],
+    ) -> Result<Self, UnixSocketCodecError> {
+        wire::decode_padded(encoded).map_err(|_| UnixSocketCodecError::Invalid)
+    }
+}
+
 /// Failure to decode a Unix socket name or address from a shared buffer.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum UnixSocketCodecError {
@@ -229,6 +290,10 @@ wire_enum! {
         ConnectionReset,
         #[error("address lookup failed: {0}")]
         File(FileError),
+        /// The sender has as many references in flight in queued messages as
+        /// it may.
+        #[error("too many references are in flight")]
+        TooManyReferences,
     }
 }
 
@@ -338,11 +403,15 @@ wire_struct! {
         /// Socket handle.
         pub handle: ObjectHandle,
         /// Shared-buffer region holding an encoded destination
-        /// [`UnixSocketAddress`] of `address_length` bytes followed by the data.
+        /// [`UnixSocketAddress`] of `address_length` bytes, then `object_count`
+        /// handles encoded by [`ObjectHandle::encode`], then the data.
         pub buffer: SharedBufferSequence,
         /// Length of the destination address, or zero to send to the connected
         /// peer.
         pub address_length: u32,
+        /// Number of the caller's object handles whose objects the data
+        /// carries, at most [`MAX_UNIX_SOCKET_OBJECTS`].
+        pub object_count: u32,
         /// Caller identity for filesystem permission checks.
         pub user: FileUser,
     }
@@ -363,6 +432,8 @@ wire_struct! {
     /// A stream socket receives queued bytes. A datagram or sequenced-packet
     /// socket receives one datagram or record, discarding the bytes beyond
     /// `capacity` unless peeking.
+    ///
+    /// Objects carried with the received data are received too.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ReceiveUnixSocketRequest {
         /// Socket handle.
@@ -371,10 +442,16 @@ wire_struct! {
         /// encoded [`UnixSocketName`] if `source` is set.
         ///
         /// It must hold `capacity` bytes, plus
-        /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] if `source` is set.
+        /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] if `source` is set, plus
+        /// `max_objects` [`TransferredObject`]s of
+        /// [`ENCODED_TRANSFERRED_OBJECT_SIZE`] bytes, which start after the
+        /// name's room.
         pub buffer: SharedBufferSequence,
         /// Maximum data bytes to receive.
         pub capacity: u32,
+        /// Maximum carried objects to receive handles for, at most
+        /// [`MAX_UNIX_SOCKET_OBJECTS`].
+        pub max_objects: u32,
         /// Whether to leave the data queued.
         pub peek: bool,
         /// Whether to return the sender's name.
@@ -403,6 +480,11 @@ wire_struct! {
         /// Length of the sender's encoded name, which follows the data, or zero
         /// if the request did not ask for it.
         pub source_length: u32,
+        /// Number of encoded [`TransferredObject`]s in the buffer.
+        pub object_count: u32,
+        /// Whether the received data carried objects the caller got no handle
+        /// for.
+        pub objects_truncated: bool,
     }
 }
 
@@ -497,6 +579,45 @@ mod tests {
             UnixSocketName::decode(&[]),
             Err(UnixSocketCodecError::Truncated)
         );
+    }
+
+    #[test]
+    fn transferred_objects_round_trip() {
+        for kind in [
+            ObjectKind::File,
+            ObjectKind::PipeReadEnd,
+            ObjectKind::PipeWriteEnd,
+            ObjectKind::UnixSocket(SocketType::SeqPacket),
+            ObjectKind::InetSocket(SocketType::Datagram),
+            ObjectKind::VsockSocket,
+            ObjectKind::EventCounter,
+            ObjectKind::Timer,
+            ObjectKind::ReadinessQueue,
+            ObjectKind::Process,
+        ] {
+            let object = TransferredObject {
+                handle: ObjectHandle(0x0102_0304_0506_0708),
+                kind,
+            };
+            assert_eq!(TransferredObject::decode(&object.encode()), Ok(object));
+        }
+        let valid = TransferredObject {
+            handle: ObjectHandle(1),
+            kind: ObjectKind::File,
+        }
+        .encode();
+        // A plain kind with a detail, an unknown tag, and a socket kind with
+        // an unknown socket type.
+        for (tag, detail) in [(0, 1), (10, 0), (3, 3)] {
+            let mut invalid = valid;
+            invalid[ObjectHandle::ENCODED_SIZE] = tag;
+            invalid[ObjectHandle::ENCODED_SIZE + 1] = detail;
+            assert_eq!(
+                TransferredObject::decode(&invalid),
+                Err(UnixSocketCodecError::Invalid),
+                "tag {tag}, detail {detail}"
+            );
+        }
     }
 
     #[test]

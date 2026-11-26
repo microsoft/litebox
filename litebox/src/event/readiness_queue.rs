@@ -322,7 +322,8 @@ fn broker_interest(interest: ReadinessInterest) -> ReadinessQueueInterest {
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Returns the readiness queue this process inherited from its parent as
-    /// `handle` through [`PendingChild::inherit`](crate::process::PendingChild::inherit).
+    /// `handle` through [`PendingChild::inherit`](crate::process::PendingChild::inherit),
+    /// or received with Unix socket data.
     ///
     /// The queue owns `handle`, so callers adopt each handle once and share
     /// the queue for every other use.

@@ -15,9 +15,11 @@ use litebox::{
         DirectoryAnchor,
         errors::{LockError, OpenError},
     },
+    pipes::HalfPipeType,
     process::{InheritableFd, ProcessError},
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
+use litebox_broker_protocol::ObjectKind;
 use litebox_broker_protocol::fs::{
     DirectoryRecordBudget, FileAccessMode, FileLockOperation, FileMode as Mode, FileOpenFlags,
     FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileTimeUpdate, FileTimestamp,
@@ -32,7 +34,7 @@ use litebox_common_linux::{
     FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, PAGE_SIZE,
     Statx, StatxMask, TimeParam,
     errno::Errno,
-    program_startup::{ForkedFd, InheritedFd, InheritedFdKind},
+    program_startup::{ForkedFd, InheritedFd},
 };
 use litebox_platform::buffer::{Buffer as _, Fault, ReadBuffer, WriteBuffer};
 use litebox_platform::time::{Instant as _, TimeProvider};
@@ -178,7 +180,80 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         })
     }
 
-    /// Adopts a file this process inherited from its parent as `handle`.
+    /// Returns the LiteBox object `fd` refers to, which another process can get its own
+    /// reference to, and what kind of descriptor it is.
+    pub(super) fn shareable_object(
+        &self,
+        fd: &AnyTypedFd<Platform>,
+    ) -> Result<(ObjectKind, InheritableFd<Platform>), Errno> {
+        Ok(match fd {
+            AnyTypedFd::File(file) => (
+                ObjectKind::File,
+                InheritableFd::File(self.with_file(file, |file| Ok(Arc::clone(file.file())))?),
+            ),
+            AnyTypedFd::Pipe(pipe) => {
+                let pipe = self.with_pipe_end(pipe, |pipe| Ok(Arc::clone(pipe.pipe_end())))?;
+                (
+                    match pipe.endpoint_type() {
+                        HalfPipeType::ReceiverHalf => ObjectKind::PipeReadEnd,
+                        HalfPipeType::SenderHalf => ObjectKind::PipeWriteEnd,
+                    },
+                    InheritableFd::Pipe(pipe),
+                )
+            }
+            AnyTypedFd::Unix(socket) => {
+                let socket = self.with_unix_socket(socket, |socket| {
+                    Ok(alloc::sync::Arc::clone(socket.unix_socket()))
+                })?;
+                (
+                    ObjectKind::UnixSocket(socket.socket_type()),
+                    InheritableFd::UnixSocket(socket),
+                )
+            }
+            AnyTypedFd::Eventfd(eventfd) => self.with_eventfd(eventfd, |file| {
+                Ok((
+                    ObjectKind::EventCounter,
+                    InheritableFd::EventCounter(alloc::sync::Arc::clone(file.counter())),
+                ))
+            })?,
+            AnyTypedFd::Timerfd(timerfd) => self.with_timerfd(timerfd, |file| {
+                Ok((
+                    ObjectKind::Timer,
+                    InheritableFd::Timer(alloc::sync::Arc::clone(file.timer())),
+                ))
+            })?,
+            AnyTypedFd::Epoll(epoll) => self.with_epoll(epoll, |file| {
+                Ok((
+                    ObjectKind::ReadinessQueue,
+                    InheritableFd::ReadinessQueue(alloc::sync::Arc::clone(file.queue())),
+                ))
+            })?,
+            AnyTypedFd::Inet(socket) => {
+                let socket = self.with_inet_socket(socket, |socket| {
+                    Ok(alloc::sync::Arc::clone(socket.inet_socket()))
+                })?;
+                (
+                    ObjectKind::InetSocket(socket.socket_type()),
+                    InheritableFd::InetSocket(socket),
+                )
+            }
+            AnyTypedFd::Vsock(socket) => (
+                ObjectKind::VsockSocket,
+                InheritableFd::VsockSocket(
+                    self.with_vsock_socket(socket, |socket| Ok(Arc::clone(socket.vsock_socket())))?,
+                ),
+            ),
+            AnyTypedFd::Pidfd(pidfd) => (
+                ObjectKind::Process,
+                InheritableFd::Process(
+                    self.with_pidfd(pidfd, |file| Ok(Arc::clone(file.process())))?,
+                ),
+            ),
+        })
+    }
+
+    /// Adopts a file this process inherited from its parent, or received with Unix socket
+    /// data, as `handle`.
     pub(crate) fn adopt_inherited_file(
         &self,
         handle: ObjectHandle,
@@ -353,6 +428,61 @@ pub(crate) struct FilesState<Platform: ShimPlatform> {
     max_fd: AtomicUsize,
 }
 
+/// Evaluates `$install` with `$adopt` bound to a closure that adopts the inherited or received
+/// broker `$handle` as a descriptor of the kind `$kind` describes.
+///
+/// Needed because a closure cannot be generic over the subsystem type.
+macro_rules! adopt_handle {
+    ($global:expr, $kind:expr, $handle:expr, |$adopt:ident| $install:expr) => {{
+        use litebox::pipes::HalfPipeType;
+        use litebox_broker_protocol::ObjectKind;
+        match $kind {
+            ObjectKind::File => {
+                let $adopt = || $global.adopt_inherited_file($handle);
+                $install
+            }
+            ObjectKind::PipeReadEnd => {
+                let $adopt =
+                    || $global.adopt_inherited_pipe_end($handle, HalfPipeType::ReceiverHalf);
+                $install
+            }
+            ObjectKind::PipeWriteEnd => {
+                let $adopt = || $global.adopt_inherited_pipe_end($handle, HalfPipeType::SenderHalf);
+                $install
+            }
+            ObjectKind::UnixSocket(socket_type) => {
+                let $adopt = || $global.adopt_inherited_unix_socket($handle, socket_type);
+                $install
+            }
+            ObjectKind::InetSocket(socket_type) => {
+                let $adopt = || $global.adopt_inherited_inet_socket($handle, socket_type);
+                $install
+            }
+            ObjectKind::EventCounter => {
+                let $adopt = || $global.adopt_inherited_eventfd($handle);
+                $install
+            }
+            ObjectKind::Timer => {
+                let $adopt = || $global.adopt_inherited_timerfd($handle);
+                $install
+            }
+            ObjectKind::ReadinessQueue => {
+                let $adopt = || $global.adopt_inherited_epoll($handle);
+                $install
+            }
+            ObjectKind::VsockSocket => {
+                let $adopt = || $global.adopt_inherited_vsock_socket($handle);
+                $install
+            }
+            ObjectKind::Process => {
+                let $adopt = || $global.adopt_inherited_pidfd($handle);
+                $install
+            }
+        }
+    }};
+}
+pub(super) use adopt_handle;
+
 impl<Platform: ShimPlatform> FilesState<Platform> {
     pub(crate) fn new() -> Self {
         Self {
@@ -446,71 +576,11 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             }
             let first_fd = descriptions.get(&inherited.handle).copied();
             let handle = inherited.handle;
-            match inherited.kind {
-                InheritedFdKind::File => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_file(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::Pipe { endpoint } => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_pipe_end(handle, endpoint)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::UnixSocket { socket_type } => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_unix_socket(handle, socket_type)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::InetSocket { socket_type } => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_inet_socket(handle, socket_type)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::Eventfd => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_eventfd(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::Timerfd => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_timerfd(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::Epoll => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_epoll(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::VsockSocket => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_vsock_socket(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::Pidfd => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_pidfd(handle)
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-            }
+            adopt_handle!(global, inherited.kind, handle, |adopt| {
+                self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                    adopt().map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                })?;
+            });
             descriptions.entry(handle).or_insert(raw_fd);
             next_fd = raw_fd + 1;
         }
@@ -851,81 +921,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if raw_fd - next_fd > MAX_INHERITED_FD_GAP {
                 return Err(Errno::EAGAIN);
             }
-            let (kind, object) = match fd {
-                AnyTypedFd::File(file) => (
-                    InheritedFdKind::File,
-                    InheritableFd::File(
-                        self.global
-                            .with_file(&file, |file| Ok(Arc::clone(file.file())))?,
-                    ),
-                ),
-                AnyTypedFd::Pipe(pipe) => {
-                    let pipe = self
-                        .global
-                        .with_pipe_end(&pipe, |pipe| Ok(Arc::clone(pipe.pipe_end())))?;
-                    (
-                        InheritedFdKind::Pipe {
-                            endpoint: pipe.endpoint_type(),
-                        },
-                        InheritableFd::Pipe(pipe),
-                    )
-                }
-                AnyTypedFd::Unix(socket) => {
-                    let socket = self.global.with_unix_socket(&socket, |socket| {
-                        Ok(alloc::sync::Arc::clone(socket.unix_socket()))
-                    })?;
-                    (
-                        InheritedFdKind::UnixSocket {
-                            socket_type: socket.socket_type(),
-                        },
-                        InheritableFd::UnixSocket(socket),
-                    )
-                }
-                AnyTypedFd::Eventfd(eventfd) => self.global.with_eventfd(&eventfd, |file| {
-                    Ok((
-                        InheritedFdKind::Eventfd,
-                        InheritableFd::EventCounter(alloc::sync::Arc::clone(file.counter())),
-                    ))
-                })?,
-                AnyTypedFd::Timerfd(timerfd) => self.global.with_timerfd(&timerfd, |file| {
-                    Ok((
-                        InheritedFdKind::Timerfd,
-                        InheritableFd::Timer(alloc::sync::Arc::clone(file.timer())),
-                    ))
-                })?,
-                AnyTypedFd::Epoll(epoll) => self.global.with_epoll(&epoll, |file| {
-                    Ok((
-                        InheritedFdKind::Epoll,
-                        InheritableFd::ReadinessQueue(alloc::sync::Arc::clone(file.queue())),
-                    ))
-                })?,
-                AnyTypedFd::Inet(socket) => {
-                    let socket = self.global.with_inet_socket(&socket, |socket| {
-                        Ok(alloc::sync::Arc::clone(socket.inet_socket()))
-                    })?;
-                    (
-                        InheritedFdKind::InetSocket {
-                            socket_type: socket.socket_type(),
-                        },
-                        InheritableFd::InetSocket(socket),
-                    )
-                }
-                AnyTypedFd::Vsock(socket) => (
-                    InheritedFdKind::VsockSocket,
-                    InheritableFd::VsockSocket(
-                        self.global.with_vsock_socket(&socket, |socket| {
-                            Ok(Arc::clone(socket.vsock_socket()))
-                        })?,
-                    ),
-                ),
-                AnyTypedFd::Pidfd(pidfd) => (
-                    InheritedFdKind::Pidfd,
-                    InheritableFd::Process(
-                        self.global
-                            .with_pidfd(&pidfd, |file| Ok(Arc::clone(file.process())))?,
-                    ),
-                ),
-            };
+            let (kind, object) = self.global.shareable_object(&fd)?;
             next_fd = raw_fd + 1;
             let inherited_fd = ForkedFd {
                 inherited: InheritedFd {
@@ -1564,6 +1560,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         &mut *buf.borrow_mut(),
                         litebox_common_linux::ReceiveFlags::empty(),
                         None,
+                        None,
                     )
                 })
             },
@@ -1664,7 +1661,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 espipe_for_non_seekable_offset(offset)?;
                 self.global.with_unix_socket(fd, |socket| {
                     is_message_oriented.set(!socket.is_stream());
-                    socket.sendto(self, &buf, litebox_common_linux::SendFlags::empty(), None)
+                    socket.sendto(
+                        self,
+                        &buf,
+                        litebox_common_linux::SendFlags::empty(),
+                        None,
+                        &[],
+                    )
                 })
             },
             |_fd| Err(Errno::EINVAL),

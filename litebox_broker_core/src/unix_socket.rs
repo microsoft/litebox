@@ -20,8 +20,8 @@
 //! 5. the broker's charge for queued data.
 //!
 //! Sockets are published, and waiting senders woken, only once every other
-//! lock is released. Operations call the file service and drop files without
-//! holding any lock.
+//! lock is released. Operations call the file service, and drop files and
+//! carried objects, without holding any lock.
 //!
 //! Readiness reaches every reference's registration from the moment the
 //! reference exists, since another process can change a socket through a
@@ -42,8 +42,9 @@ use litebox_broker_protocol::socket::{
     ShutdownMode, SocketOptionName, SocketOptionValue, SocketType,
 };
 use litebox_broker_protocol::unix_socket::{
-    MAX_UNIX_SOCKET_BACKLOG, MAX_UNIX_SOCKET_TRANSFER_SIZE, UNIX_SOCKET_BUFFER_SIZE,
-    UnixSocketAddress, UnixSocketError, UnixSocketName,
+    MAX_UNIX_SOCKET_BACKLOG, MAX_UNIX_SOCKET_OBJECTS, MAX_UNIX_SOCKET_TRANSFER_SIZE,
+    ReceiveOptions, TransferredObject, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
+    UnixSocketName,
 };
 use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 use spin::{Mutex, MutexGuard, rwlock::RwLock};
@@ -70,17 +71,8 @@ const DATAGRAM_OVERHEAD: usize = 256;
 /// which holds no reference until accepted.
 const CONNECTION_OVERHEAD: usize = 256;
 
-/// Result of receiving from a Unix socket.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Received {
-    /// Number of bytes received into the start of the caller's buffer.
-    pub received: usize,
-    /// Length of the whole datagram or record, or `received` for a stream
-    /// socket.
-    pub length: usize,
-    /// Name of the sending socket, if requested.
-    pub source: Option<UnixSocketName>,
-}
+/// Bytes charged for each object reference a queued message carries.
+const OBJECT_OVERHEAD: usize = 256;
 
 /// Creates an unconnected Unix socket.
 ///
@@ -337,20 +329,35 @@ pub fn accept(
 /// socket sends `data` as one datagram. A sequenced-packet socket sends
 /// `data` as one record to its peer, ignoring `address` like Linux. Fails
 /// with [`BrokerError::WouldBlock`] while the receiving socket is full.
+///
+/// The sent data carries the objects `objects` refer to, at most
+/// [`MAX_UNIX_SOCKET_OBJECTS`].
 pub fn send(
     process: &BrokerProcess,
     handle: ObjectHandle,
     address: Option<&UnixSocketAddress>,
+    objects: &[ObjectHandle],
     data: &dyn WriteBuffer,
     user: FileUser,
+    readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<UnixSocketResult<usize>> {
-    if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
+    if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize
+        || objects.len() > MAX_UNIX_SOCKET_OBJECTS as usize
+    {
         return Err(BrokerError::ResourceExhausted);
     }
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     let socket = &lease.socket;
+    // Declared before the operations take any lock, so the objects a failed
+    // send leaves drop after every lock is released.
+    let mut carrying = match Carrying::new(process, objects, readiness_sink)? {
+        Ok(carrying) => carrying,
+        Err(error) => return Ok(Err(error)),
+    };
     match socket.kind {
-        SocketType::Stream => socket.send_stream(address.is_some(), data, lease.nonblocking),
+        SocketType::Stream => {
+            socket.send_stream(address.is_some(), data, &mut carrying, lease.nonblocking)
+        }
         SocketType::Datagram => {
             // The node stays open until the send finishes, as for `connect`.
             let (target, _node) = match address {
@@ -366,15 +373,33 @@ pub fn send(
                 }
                 None => (None, None),
             };
-            socket.send_datagram(target, data, lease.nonblocking)
+            socket.send_datagram(target, data, &mut carrying, lease.nonblocking)
         }
-        SocketType::SeqPacket => socket.send_record(data, lease.nonblocking),
+        SocketType::SeqPacket => socket.send_record(data, &mut carrying, lease.nonblocking),
         _ => Err(BrokerError::Internal),
     }
 }
 
+/// What a receive from a Unix socket got.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnixSocketReceive {
+    /// Number of bytes received into the start of the caller's buffer.
+    pub received: usize,
+    /// Length of the whole datagram or record, or `received` for a stream
+    /// socket.
+    pub length: usize,
+    /// Name of the sending socket, if requested.
+    pub source: Option<UnixSocketName>,
+    /// The caller's new handles to the objects the received data carried.
+    pub objects: Vec<TransferredObject>,
+    /// Whether the received data carried objects the caller got no handle
+    /// for.
+    pub objects_truncated: bool,
+}
+
 /// Receives bytes from a Unix socket into the start of `output`, leaving them
-/// queued if `peek` is set and returning the sender's name if `source` is set.
+/// queued if `options.peek` is set and returning the sender's name if
+/// `options.source` is set.
 ///
 /// A stream socket receives queued bytes. A datagram or sequenced-packet
 /// socket receives one datagram or record, discarding the bytes beyond
@@ -383,31 +408,51 @@ pub fn send(
 /// data can arrive. Fails with [`BrokerError::WouldBlock`] while nothing is
 /// queued.
 ///
-/// If `nonblocking` is set, the receive acts as for a non-blocking socket:
-/// it fails with [`BrokerError::NonBlockingWouldBlock`], and, as in Linux, a
-/// datagram socket whose receive direction is shut down fails instead of
-/// reporting the end of data, while a sequenced-packet socket still reports
-/// it.
+/// If `options.nonblocking` is set, the receive acts as for a non-blocking
+/// socket: it fails with [`BrokerError::NonBlockingWouldBlock`], and, as in
+/// Linux, a datagram socket whose receive direction is shut down fails
+/// instead of reporting the end of data, while a sequenced-packet socket
+/// still reports it.
+///
+/// The caller gets references to the objects the received data carried, up
+/// to `options.max_objects`, as [`UnixSocketReceive::objects`] lists.
 pub fn receive(
     process: &BrokerProcess,
     handle: ObjectHandle,
     output: &mut dyn ReadBuffer,
-    peek: bool,
-    source: bool,
-    nonblocking: bool,
-) -> Result<UnixSocketResult<Received>> {
+    options: ReceiveOptions,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> Result<UnixSocketResult<UnixSocketReceive>> {
+    let ReceiveOptions {
+        peek,
+        source,
+        nonblocking,
+        max_objects,
+    } = options;
     if output.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WAIT)?)?;
     let socket = &lease.socket;
+    // Looked up before taking any data, which a failure must not lose.
+    let allowed = process
+        .core
+        .policy
+        .principal_object_rights(process.caller_credential)?;
     let nonblocking = nonblocking || lease.nonblocking;
-    match socket.kind {
+    let received = match socket.kind {
         SocketType::Stream => socket.receive_stream(output, peek, source, nonblocking),
         SocketType::Datagram => socket.receive_datagram(output, peek, source, nonblocking),
         SocketType::SeqPacket => socket.receive_record(output, peek, source, nonblocking),
         _ => Err(BrokerError::Internal),
-    }
+    }?;
+    let (mut received, delivery) = match received {
+        Ok(received) => received,
+        Err(error) => return Ok(Err(error)),
+    };
+    (received.objects, received.objects_truncated) =
+        delivery.install(process, max_objects, allowed, readiness_sink);
+    Ok(Ok(received))
 }
 
 /// Shuts down one or both directions of a Unix socket.
@@ -593,6 +638,11 @@ impl UnixSocketObject {
         self.socket.readiness()
     }
 
+    /// Returns the socket's type.
+    pub(crate) fn socket_type(&self) -> SocketType {
+        self.socket.kind
+    }
+
     /// Returns the socket's access mode and status flags.
     pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
         self.status.get(FileAccessMode::ReadWrite)
@@ -636,8 +686,8 @@ impl Lease {
     }
 }
 
-/// The Unix sockets of a broker: the names they hold, and the charge for the
-/// data queued in them.
+/// The Unix sockets of a broker: the names they hold, the charge for the
+/// data queued in them, and the count of references queued messages carry.
 pub(crate) struct UnixSockets {
     /// Socket holding each bound name.
     names: RwLock<HashMap<NameKey, Weak<Socket>>>,
@@ -646,6 +696,10 @@ pub(crate) struct UnixSockets {
     queued: Mutex<usize>,
     max_queued: usize,
     max_queued_per_process: usize,
+    /// Number of references that queued messages carry.
+    references: AtomicUsize,
+    max_references: usize,
+    max_references_per_process: usize,
 }
 
 impl UnixSockets {
@@ -655,6 +709,9 @@ impl UnixSockets {
             queued: Mutex::new(0),
             max_queued: limits.max_total_unix_socket_bytes,
             max_queued_per_process: limits.max_unix_socket_bytes_per_process,
+            references: AtomicUsize::new(0),
+            max_references: limits.max_references,
+            max_references_per_process: limits.max_references_per_process,
         }
     }
 
@@ -713,6 +770,253 @@ impl UnixSockets {
         *queued = queued
             .checked_sub(bytes)
             .expect("the broker's Unix socket charge must cover every socket's");
+    }
+}
+
+struct InFlightObject {
+    object: Arc<RwLock<ObjectEntry>>,
+    rights: ObjectRights,
+    _charge: InFlightCharge,
+}
+
+impl InFlightObject {
+    /// Returns another reference to the object, which stays in flight.
+    fn duplicate(&self) -> (Arc<RwLock<ObjectEntry>>, ObjectRights) {
+        (Arc::clone(&self.object), self.rights)
+    }
+
+    /// Takes the reference out of flight, returning it for the caller to
+    /// drop once it releases every lock.
+    fn discard(self) -> Arc<RwLock<ObjectEntry>> {
+        self.object
+    }
+}
+
+/// One reference in flight, counted against the broker's and its sender's
+/// limits until this drops.
+struct InFlightCharge {
+    registry: Arc<UnixSockets>,
+    sender: Arc<AtomicUsize>,
+}
+
+impl InFlightCharge {
+    /// Counts one more reference in flight from the process whose count is
+    /// `sender`, or returns `None` if that exceeds either limit.
+    fn new(registry: &Arc<UnixSockets>, sender: &Arc<AtomicUsize>) -> Option<Self> {
+        let count = |counter: &AtomicUsize, limit: usize| {
+            counter
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    count.checked_add(1).filter(|count| *count <= limit)
+                })
+                .is_ok()
+        };
+        if !count(&registry.references, registry.max_references) {
+            return None;
+        }
+        if !count(sender, registry.max_references_per_process) {
+            registry.references.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(Self {
+            registry: Arc::clone(registry),
+            sender: Arc::clone(sender),
+        })
+    }
+}
+
+impl Drop for InFlightCharge {
+    fn drop(&mut self) {
+        self.registry.references.fetch_sub(1, Ordering::Relaxed);
+        self.sender.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The objects a send carries.
+#[derive(Default)]
+struct Carrying {
+    objects: Vec<InFlightObject>,
+}
+
+impl Carrying {
+    /// Puts the objects `handles` refer to in flight, or fails with
+    /// [`UnixSocketError::Unsupported`] if one is a Unix socket, or with
+    /// [`UnixSocketError::TooManyReferences`] if that exceeds the references
+    /// in flight `process` may send.
+    fn new(
+        process: &BrokerProcess,
+        handles: &[ObjectHandle],
+        readiness_sink: &Arc<dyn ReadinessSink>,
+    ) -> Result<UnixSocketResult<Self>> {
+        let mut carrying = Self::default();
+        if handles.is_empty() {
+            return Ok(Ok(carrying));
+        }
+        // A registration left behind by a later failure only publishes
+        // readiness the process does not need.
+        process.register_readiness(readiness_sink)?;
+        carrying
+            .objects
+            .try_reserve_exact(handles.len())
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        for &handle in handles {
+            let (object, rights) = process.object_reference(handle)?;
+            {
+                let entry = object.read();
+                if !entry.is_duplicable() {
+                    return Err(BrokerError::UnsupportedOperation);
+                }
+                // TODO: Only Unix sockets carry references, so carrying none keeps
+                // carried references from forming cycles.
+                if matches!(&*entry, ObjectEntry::UnixSocket(_)) {
+                    return Ok(Err(UnixSocketError::Unsupported));
+                }
+            }
+            let Some(charge) =
+                InFlightCharge::new(&process.core.unix_sockets, &process.unix_socket_references)
+            else {
+                return Ok(Err(UnixSocketError::TooManyReferences));
+            };
+            carrying.objects.push(InFlightObject {
+                object,
+                rights,
+                _charge: charge,
+            });
+        }
+        Ok(Ok(carrying))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    /// Returns the bytes charged for queuing the objects.
+    fn charge(&self) -> usize {
+        self.objects.len() * OBJECT_OVERHEAD
+    }
+
+    fn take(&mut self) -> Vec<InFlightObject> {
+        core::mem::take(&mut self.objects)
+    }
+}
+
+#[derive(Default)]
+struct Teardown {
+    sockets: Vec<Arc<Socket>>,
+    objects: Vec<Arc<RwLock<ObjectEntry>>>,
+}
+
+impl Teardown {
+    /// Releases the objects the messages of `queue`, which no socket holds
+    /// any more, carry.
+    fn discard(&mut self, queue: Queue) {
+        self.objects
+            .extend(queue.into_objects().map(InFlightObject::discard));
+    }
+
+    fn run(mut self) {
+        while let Some(socket) = self.sockets.pop() {
+            socket.close_into(&mut self);
+        }
+    }
+}
+
+#[derive(Default)]
+enum Delivery {
+    #[default]
+    None,
+    /// Objects taken from the queue.
+    Taken(Vec<InFlightObject>),
+    /// Objects left in the queue by a peek.
+    Peeked(Vec<(Arc<RwLock<ObjectEntry>>, ObjectRights)>),
+}
+
+impl Delivery {
+    /// Delivers references to `objects`, which a peek leaves queued.
+    fn peek(objects: &[InFlightObject]) -> Self {
+        if objects.is_empty() {
+            Self::None
+        } else {
+            Self::Peeked(objects.iter().map(InFlightObject::duplicate).collect())
+        }
+    }
+
+    /// Delivers `objects`, taken from the queue.
+    fn take(objects: Vec<InFlightObject>) -> Self {
+        if objects.is_empty() {
+            Self::None
+        } else {
+            Self::Taken(objects)
+        }
+    }
+
+    /// Gives `process` references to at most `max_objects` of the objects,
+    /// with the rights the sender's references had within `allowed`,
+    /// publishing readiness through `readiness_sink`, and returns them and
+    /// whether any were not given.
+    ///
+    /// The receive already took the data, so this never fails: like Linux,
+    /// once one object cannot be given, neither are the rest.
+    fn install(
+        self,
+        process: &BrokerProcess,
+        max_objects: usize,
+        allowed: ObjectRights,
+        readiness_sink: &Arc<dyn ReadinessSink>,
+    ) -> (Vec<TransferredObject>, bool) {
+        let give = |object: Arc<RwLock<ObjectEntry>>, rights: ObjectRights| {
+            let rights = rights & allowed;
+            let kind = object.read().transferred_kind()?;
+            if rights.is_empty() {
+                return None;
+            }
+            let handle = process
+                .create_object_reference_with_rights(object, rights)
+                .ok()?;
+            Some(TransferredObject { handle, kind })
+        };
+        let mut installed = Vec::new();
+        let count = match self {
+            Self::None => return (Vec::new(), false),
+            Self::Taken(objects) => {
+                let count = objects.len();
+                let max_objects = if installed.try_reserve_exact(count.min(max_objects)).is_ok() {
+                    max_objects
+                } else {
+                    0
+                };
+                for object in objects.into_iter().take(max_objects) {
+                    // The charge drops with what is left of `object`, once
+                    // the receiver holds its own reference.
+                    let InFlightObject { object, rights, .. } = object;
+                    let Some(given) = give(object, rights) else {
+                        break;
+                    };
+                    installed.push(given);
+                }
+                count
+            }
+            Self::Peeked(objects) => {
+                let count = objects.len();
+                if installed.try_reserve_exact(count.min(max_objects)).is_ok() {
+                    installed.extend(
+                        objects
+                            .into_iter()
+                            .take(max_objects)
+                            .map_while(|(object, rights)| give(object, rights)),
+                    );
+                }
+                count
+            }
+        };
+        if !installed.is_empty() && process.register_readiness(readiness_sink).is_err() {
+            // The caller never learns of the handles. A failed close leaves
+            // one to the process's teardown.
+            for object in core::mem::take(&mut installed) {
+                let _ = process.close_object_reference(object.handle);
+            }
+        }
+        let truncated = installed.len() < count;
+        (installed, truncated)
     }
 }
 
@@ -795,6 +1099,11 @@ enum Connection {
 struct Queue {
     /// Bytes queued for a stream socket.
     bytes: VecDeque<u8>,
+    /// Stream position of the first byte of `bytes`.
+    head: u64,
+    /// Objects carried by the sends whose bytes `bytes` holds, in order, none
+    /// of which has started being received.
+    carried: VecDeque<StreamObjects>,
     /// Datagrams queued for a datagram socket, or records for a
     /// sequenced-packet socket.
     datagrams: VecDeque<Datagram>,
@@ -804,26 +1113,54 @@ impl Queue {
     fn is_empty(&self) -> bool {
         self.bytes.is_empty() && self.datagrams.is_empty()
     }
+
+    /// Returns the objects the queued messages carry.
+    fn into_objects(self) -> impl Iterator<Item = InFlightObject> {
+        let carried = self.carried.into_iter().flat_map(|carried| carried.objects);
+        let datagrams = self
+            .datagrams
+            .into_iter()
+            .flat_map(|datagram| datagram.objects);
+        carried.chain(datagrams)
+    }
+}
+
+/// The objects one stream send carried, with the stream positions of the
+/// bytes it sent.
+struct StreamObjects {
+    start: u64,
+    end: u64,
+    objects: Vec<InFlightObject>,
 }
 
 struct Datagram {
     data: Vec<u8>,
     source: UnixSocketName,
+    objects: Vec<InFlightObject>,
 }
 
 impl Datagram {
-    /// Copies `data` into a datagram sent by the socket named `source`.
-    fn new(data: &dyn WriteBuffer, source: UnixSocketName) -> Result<Self> {
+    /// Copies `data` into a datagram sent by the socket named `source`, which
+    /// carries the objects of `carrying`.
+    fn new(
+        data: &dyn WriteBuffer,
+        source: UnixSocketName,
+        carrying: &mut Carrying,
+    ) -> Result<Self> {
         let mut copy = Vec::new();
         copy.try_reserve_exact(data.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
         copy.resize(data.len(), 0);
         data.copy_to_slice_at(0, &mut copy)?;
-        Ok(Self { data: copy, source })
+        Ok(Self {
+            data: copy,
+            source,
+            objects: carrying.take(),
+        })
     }
 
     fn charge(&self) -> usize {
-        self.data.len() + DATAGRAM_OVERHEAD
+        self.data.len() + DATAGRAM_OVERHEAD + self.objects.len() * OBJECT_OVERHEAD
     }
 }
 
@@ -1034,7 +1371,7 @@ impl Socket {
     fn connect_datagram(self: &Arc<Self>, target: &Arc<Socket>) -> UnixSocketResult<()> {
         // Both states stay locked from the check to the connection, like
         // Linux, so neither socket connects elsewhere meanwhile.
-        let wakeups = if Arc::ptr_eq(self, target) {
+        let (wakeups, discarded) = if Arc::ptr_eq(self, target) {
             let mut state = self.state.lock();
             let peer_name = self.accept_peer(&state)?;
             self.set_datagram_peer(&mut state, target, peer_name)
@@ -1043,6 +1380,7 @@ impl Socket {
             let peer_name = self.accept_peer(&target_state)?;
             self.set_datagram_peer(&mut state, target, peer_name)
         };
+        drop(discarded);
         wakeups.wake();
         self.publish();
         Ok(())
@@ -1063,13 +1401,13 @@ impl Socket {
     }
 
     /// Connects this datagram socket, whose state is `state`, to `target`
-    /// named `peer_name`.
+    /// named `peer_name`, returning the datagrams it discarded.
     fn set_datagram_peer(
         &self,
         state: &mut State,
         target: &Arc<Socket>,
         peer_name: UnixSocketName,
-    ) -> Wakeups<Socket> {
+    ) -> (Wakeups<Socket>, Queue) {
         let previous = core::mem::replace(
             &mut state.connection,
             Connection::Connected {
@@ -1080,18 +1418,24 @@ impl Socket {
         let mut channel = self.incoming.lock();
         // Like Linux, connecting to another peer discards the queued
         // datagrams.
-        if matches!(&previous, Connection::Connected { peer, .. } if !refers_to(peer, target)) {
-            self.purge(&mut channel);
-        }
+        let discarded = if matches!(
+            &previous,
+            Connection::Connected { peer, .. } if !refers_to(peer, target)
+        ) {
+            self.purge(&mut channel)
+        } else {
+            Queue::default()
+        };
         // Senders waiting on this socket recheck whether it still accepts
         // their datagrams.
-        channel.wake()
+        (channel.wake(), discarded)
     }
 
     fn send_stream(
         self: &Arc<Self>,
         addressed: bool,
         data: &dyn WriteBuffer,
+        carrying: &mut Carrying,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<usize>> {
         let peer = {
@@ -1128,13 +1472,26 @@ impl Socket {
                 return Err(BrokerError::would_block(nonblocking));
             }
             let length = room.min(data.len());
+            let charge = length + carrying.charge();
             // Charging first keeps a rejected send from growing the queue.
-            self.sockets.charge(&peer.quota, length)?;
+            self.sockets.charge(&peer.quota, charge)?;
+            if !carrying.is_empty() && channel.queue.carried.try_reserve(1).is_err() {
+                self.sockets.refund(&peer.quota, charge);
+                return Err(BrokerError::OutOfMemory);
+            }
             if let Err(error) = append_to_queue(&mut channel.queue.bytes, length, data) {
-                self.sockets.refund(&peer.quota, length);
+                self.sockets.refund(&peer.quota, charge);
                 return Err(error);
             }
-            channel.add(length);
+            if !carrying.is_empty() {
+                let end = channel.queue.head + channel.queue.bytes.len() as u64;
+                channel.queue.carried.push_back(StreamObjects {
+                    start: end - length as u64,
+                    end,
+                    objects: carrying.take(),
+                });
+            }
+            channel.add(charge);
             length
         };
         peer.publish();
@@ -1147,6 +1504,7 @@ impl Socket {
         self: &Arc<Self>,
         target: Option<Arc<Socket>>,
         data: &dyn WriteBuffer,
+        carrying: &mut Carrying,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<usize>> {
         let (peer, write_shut, source) = {
@@ -1176,7 +1534,9 @@ impl Socket {
         if write_shut {
             return Ok(Err(UnixSocketError::BrokenPipe));
         }
-        let datagram = Datagram::new(data, source)?;
+        // Declared before the locks, so a datagram left unqueued drops after
+        // them.
+        let mut datagram = Some(Datagram::new(data, source, carrying)?);
         // The receiver's state stays locked while the datagram is queued, so
         // connecting it rejects other senders from then on, as in Linux.
         let closed = {
@@ -1191,7 +1551,7 @@ impl Socket {
             } else {
                 let mut channel = target.incoming.lock();
                 if let Err(error) =
-                    self.queue_datagram(&target, &mut channel, datagram, nonblocking)?
+                    self.queue_datagram(&target, &mut channel, &mut datagram, nonblocking)?
                 {
                     return Ok(Err(error));
                 }
@@ -1213,6 +1573,7 @@ impl Socket {
     fn send_record(
         self: &Arc<Self>,
         data: &dyn WriteBuffer,
+        carrying: &mut Carrying,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<usize>> {
         let (peer, write_shut, source) = {
@@ -1228,10 +1589,13 @@ impl Socket {
         let Some(peer) = peer.upgrade().filter(|_| !write_shut) else {
             return Ok(Err(UnixSocketError::BrokenPipe));
         };
-        let record = Datagram::new(data, source)?;
+        // Declared before the lock, so a record left unqueued drops after it.
+        let mut record = Some(Datagram::new(data, source, carrying)?);
         {
             let mut channel = peer.incoming.lock();
-            if let Err(error) = self.queue_datagram(&peer, &mut channel, record, nonblocking)? {
+            if let Err(error) =
+                self.queue_datagram(&peer, &mut channel, &mut record, nonblocking)?
+            {
                 return Ok(Err(error));
             }
         }
@@ -1239,7 +1603,8 @@ impl Socket {
         Ok(Ok(data.len()))
     }
 
-    /// Queues `datagram` in `channel`, the incoming channel of `receiver`.
+    /// Queues `datagram` in `channel`, the incoming channel of `receiver`,
+    /// taking it only if queued, so callers drop it after their locks.
     ///
     /// A datagram may overrun the capacity, so a receiver that is not full
     /// accepts any datagram, as its readiness reports.
@@ -1247,7 +1612,7 @@ impl Socket {
         self: &Arc<Self>,
         receiver: &Socket,
         channel: &mut ChannelState<Queue, Socket>,
-        datagram: Datagram,
+        datagram: &mut Option<Datagram>,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<()>> {
         if channel.is_shut() {
@@ -1257,13 +1622,16 @@ impl Socket {
             channel.wait(self)?;
             return Err(BrokerError::would_block(nonblocking));
         }
-        let charge = datagram.charge();
+        let charge = datagram.as_ref().ok_or(BrokerError::Internal)?.charge();
         self.sockets.charge(&receiver.quota, charge)?;
         if channel.queue.datagrams.try_reserve(1).is_err() {
             self.sockets.refund(&receiver.quota, charge);
             return Err(BrokerError::OutOfMemory);
         }
-        channel.queue.datagrams.push_back(datagram);
+        channel
+            .queue
+            .datagrams
+            .push_back(datagram.take().ok_or(BrokerError::Internal)?);
         channel.add(charge);
         Ok(Ok(()))
     }
@@ -1272,7 +1640,7 @@ impl Socket {
     /// refuses the send that found it closed. Like Linux, a send that raced
     /// a change of connection fails with a reset instead.
     fn disconnect_from(self: &Arc<Self>, peer: *const Socket) -> UnixSocketResult<usize> {
-        let wakeups = {
+        let (wakeups, discarded) = {
             let mut state = self.state.lock();
             match &state.connection {
                 Connection::Connected { peer: current, .. }
@@ -1283,10 +1651,11 @@ impl Socket {
             let mut channel = self.incoming.lock();
             // Like Linux, disconnecting from the closed peer discards the
             // queued datagrams.
-            self.purge(&mut channel);
+            let discarded = self.purge(&mut channel);
             // Senders it rejected while connected retry.
-            channel.wake()
+            (channel.wake(), discarded)
         };
+        drop(discarded);
         wakeups.wake();
         self.publish();
         Err(UnixSocketError::ConnectionRefused)
@@ -1298,52 +1667,84 @@ impl Socket {
         peek: bool,
         source: bool,
         nonblocking: bool,
-    ) -> Result<UnixSocketResult<Received>> {
+    ) -> Result<UnixSocketResult<(UnixSocketReceive, Delivery)>> {
         let source = match &self.state.lock().connection {
             Connection::Connected { peer_name, .. } => source.then(|| peer_name.clone()),
             Connection::None | Connection::Listening { .. } => {
                 return Ok(Err(UnixSocketError::InvalidArgument));
             }
         };
+        let nothing = |source| {
+            Ok(Ok((
+                UnixSocketReceive {
+                    source,
+                    ..UnixSocketReceive::default()
+                },
+                Delivery::None,
+            )))
+        };
         if output.is_empty() {
-            return Ok(Ok(Received {
-                source,
-                ..Received::default()
-            }));
+            return nothing(source);
         }
-        let (length, wakeups) = {
+        let (length, wakeups, delivery) = {
             let mut channel = self.incoming.lock();
-            if channel.queue.bytes.is_empty() {
+            let queue = &mut channel.queue;
+            if queue.bytes.is_empty() {
                 return if channel.is_shut() {
-                    Ok(Ok(Received {
-                        source,
-                        ..Received::default()
-                    }))
+                    nothing(source)
                 } else {
                     Err(BrokerError::would_block(nonblocking))
                 };
             }
-            let length = output.len().min(channel.queue.bytes.len());
+            let mut length = output.len().min(queue.bytes.len());
+            // Like Linux, a receive that reaches bytes sent with objects gets
+            // the objects and stops after those bytes.
+            let carried = queue
+                .carried
+                .front()
+                .filter(|carried| carried.start < queue.head + length as u64);
+            if let Some(carried) = carried {
+                length =
+                    length.min(usize::try_from(carried.end - queue.head).unwrap_or(usize::MAX));
+            }
+            let reaches_objects = carried.is_some();
             if peek {
-                copy_from_queue(&channel.queue.bytes, 0..length, output)?;
-                (length, Wakeups::default())
+                copy_from_queue(&queue.bytes, 0..length, output)?;
+                let delivery = match queue.carried.front().filter(|_| reaches_objects) {
+                    Some(carried) => Delivery::peek(&carried.objects),
+                    None => Delivery::None,
+                };
+                (length, Wakeups::default(), delivery)
             } else {
-                take_from_queue(&mut channel.queue.bytes, length, output)?;
-                if channel.queue.bytes.is_empty() {
-                    channel.queue.bytes = VecDeque::new();
+                take_from_queue(&mut queue.bytes, length, output)?;
+                queue.head += length as u64;
+                let mut removed = length;
+                let delivery = match queue.carried.pop_front_if(|_| reaches_objects) {
+                    Some(carried) => {
+                        removed += carried.objects.len() * OBJECT_OVERHEAD;
+                        Delivery::take(carried.objects)
+                    }
+                    None => Delivery::None,
+                };
+                if queue.bytes.is_empty() {
+                    queue.bytes = VecDeque::new();
                 }
-                channel.remove(length);
-                self.sockets.refund(&self.quota, length);
+                channel.remove(removed);
+                self.sockets.refund(&self.quota, removed);
                 // Senders waiting for room retry.
-                (length, channel.wake())
+                (length, channel.wake(), delivery)
             }
         };
         wakeups.wake();
-        Ok(Ok(Received {
-            received: length,
-            length,
-            source,
-        }))
+        Ok(Ok((
+            UnixSocketReceive {
+                received: length,
+                length,
+                source,
+                ..UnixSocketReceive::default()
+            },
+            delivery,
+        )))
     }
 
     fn receive_datagram(
@@ -1352,8 +1753,8 @@ impl Socket {
         peek: bool,
         source: bool,
         nonblocking: bool,
-    ) -> Result<UnixSocketResult<Received>> {
-        let (received, wakeups) = {
+    ) -> Result<UnixSocketResult<(UnixSocketReceive, Delivery)>> {
+        let (received, wakeups, delivery) = {
             let mut channel = self.incoming.lock();
             let Some(datagram) = channel.queue.datagrams.front() else {
                 // Like Linux, a sequenced-packet socket reports the end of
@@ -1361,10 +1762,13 @@ impl Socket {
                 // socket does not.
                 return if channel.is_shut() && (!nonblocking || self.kind == SocketType::SeqPacket)
                 {
-                    Ok(Ok(Received {
-                        source: source.then_some(UnixSocketName::Unnamed),
-                        ..Received::default()
-                    }))
+                    Ok(Ok((
+                        UnixSocketReceive {
+                            source: source.then_some(UnixSocketName::Unnamed),
+                            ..UnixSocketReceive::default()
+                        },
+                        Delivery::None,
+                    )))
                 } else {
                     Err(BrokerError::would_block(nonblocking))
                 };
@@ -1373,12 +1777,17 @@ impl Socket {
             let received = output.len().min(length);
             output.copy_from_slice_at(0, &datagram.data[..received])?;
             if peek {
-                let received = Received {
+                let received = UnixSocketReceive {
                     received,
                     length,
                     source: source.then(|| datagram.source.clone()),
+                    ..UnixSocketReceive::default()
                 };
-                (received, Wakeups::default())
+                (
+                    received,
+                    Wakeups::default(),
+                    Delivery::peek(&datagram.objects),
+                )
             } else {
                 let datagram = channel
                     .queue
@@ -1387,17 +1796,18 @@ impl Socket {
                     .ok_or(BrokerError::Internal)?;
                 channel.remove(datagram.charge());
                 self.sockets.refund(&self.quota, datagram.charge());
-                let received = Received {
+                let received = UnixSocketReceive {
                     received,
                     length,
                     source: source.then_some(datagram.source),
+                    ..UnixSocketReceive::default()
                 };
                 // Senders waiting for room retry.
-                (received, channel.wake())
+                (received, channel.wake(), Delivery::take(datagram.objects))
             }
         };
         wakeups.wake();
-        Ok(Ok(received))
+        Ok(Ok((received, delivery)))
     }
 
     /// Receives one record from the connected peer.
@@ -1407,7 +1817,7 @@ impl Socket {
         peek: bool,
         source: bool,
         nonblocking: bool,
-    ) -> Result<UnixSocketResult<Received>> {
+    ) -> Result<UnixSocketResult<(UnixSocketReceive, Delivery)>> {
         if !matches!(self.state.lock().connection, Connection::Connected { .. }) {
             return Ok(Err(UnixSocketError::NotConnected));
         }
@@ -1450,18 +1860,28 @@ impl Socket {
         self.publish();
     }
 
-    /// Discards the data queued for the socket.
-    fn purge(&self, channel: &mut ChannelState<Queue, Socket>) {
-        channel.queue = Queue::default();
+    /// Discards the data queued for the socket, returning it for the caller
+    /// to drop once it releases every lock.
+    fn purge(&self, channel: &mut ChannelState<Queue, Socket>) -> Queue {
+        let discarded = core::mem::take(&mut channel.queue);
         let queued = channel.queued();
         channel.remove(queued);
         self.sockets.refund(&self.quota, queued);
+        discarded
     }
 
     /// Tears the socket down once nothing reaches it through a reference or a
     /// backlog.
     fn close(&self) {
-        let (connection, marker, wakeups) = {
+        let mut teardown = Teardown::default();
+        self.close_into(&mut teardown);
+        teardown.run();
+    }
+
+    /// Tears the socket down, leaving the sockets and objects that releases to
+    /// `teardown`.
+    fn close_into(&self, teardown: &mut Teardown) {
+        let (connection, marker, wakeups, discarded) = {
             let mut state = self.state.lock();
             if core::mem::replace(&mut state.closed, true) {
                 return;
@@ -1473,23 +1893,23 @@ impl Socket {
             }
             let mut channel = self.incoming.lock();
             channel.shut();
-            self.purge(&mut channel);
+            let discarded = self.purge(&mut channel);
             (
                 core::mem::replace(&mut state.connection, Connection::None),
                 state.marker.take(),
                 channel.wake(),
+                discarded,
             )
         };
         drop(marker);
+        teardown.discard(discarded);
         match connection {
             Connection::Listening { backlog, .. } => {
                 self.sockets
                     .refund(&self.quota, backlog.len() * CONNECTION_OVERHEAD);
                 // Unaccepted sockets have no references, so they close with
                 // their listener.
-                for socket in backlog {
-                    socket.close();
-                }
+                teardown.sockets.extend(backlog);
             }
             Connection::Connected { peer, .. } if self.is_connection_oriented() => {
                 if let Some(peer) = peer.upgrade() {

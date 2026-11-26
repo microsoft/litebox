@@ -2940,6 +2940,11 @@ pub(crate) struct SocketObject {
 }
 
 impl SocketObject {
+    /// Returns the socket's type.
+    pub(crate) fn socket_type(&self) -> SocketType {
+        self.create_request.socket_type
+    }
+
     fn new(
         resource: Arc<SocketResource>,
         create_request: CreateSocketRequest,

@@ -86,6 +86,68 @@ impl From<ProcessId> for SessionId {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectHandle(pub u64);
 
+impl ObjectHandle {
+    /// Length in bytes of a handle encoded in a shared buffer.
+    pub const ENCODED_SIZE: usize = size_of::<u64>();
+
+    /// Encodes the handle for a shared buffer.
+    #[must_use]
+    pub fn encode(self) -> [u8; Self::ENCODED_SIZE] {
+        self.0.to_le_bytes()
+    }
+
+    /// Decodes a handle produced by [`Self::encode`].
+    #[must_use]
+    pub fn decode(encoded: &[u8; Self::ENCODED_SIZE]) -> Self {
+        Self(u64::from_le_bytes(*encoded))
+    }
+
+    /// Encodes `handles` one after another for a shared buffer.
+    pub fn encode_all(handles: &[Self]) -> impl Iterator<Item = u8> + '_ {
+        handles.iter().flat_map(|handle| handle.encode())
+    }
+
+    /// Decodes the handles [`Self::encode_all`] produced, ignoring trailing
+    /// bytes too few for a handle.
+    pub fn decode_all(encoded: &[u8]) -> impl Iterator<Item = Self> + '_ {
+        encoded
+            .as_chunks::<{ Self::ENCODED_SIZE }>()
+            .0
+            .iter()
+            .map(Self::decode)
+    }
+}
+
+wire_enum! {
+    /// The kind of object a handle refers to, which tells its holder how to use
+    /// it.
+    ///
+    /// Holders match every kind, so it is not `#[non_exhaustive]`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ObjectKind {
+        /// A file, including a terminal or standard stream.
+        File,
+        /// The read end of a pipe.
+        PipeReadEnd,
+        /// The write end of a pipe.
+        PipeWriteEnd,
+        /// A Unix socket of the given type.
+        UnixSocket(socket::SocketType),
+        /// An internet socket of the given type.
+        InetSocket(socket::SocketType),
+        /// A vsock stream socket.
+        VsockSocket,
+        /// An event counter.
+        EventCounter,
+        /// A timer.
+        Timer,
+        /// A readiness queue.
+        ReadinessQueue,
+        /// A process.
+        Process,
+    }
+}
+
 /// Association-scoped broker request identifier.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
