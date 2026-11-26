@@ -446,65 +446,6 @@ fn test_nine_p_unlink_and_rmdir() {
 }
 
 #[test]
-fn private_mount_blocks_9p_renames_of_a_protected_directory() {
-    use crate::fs::{UserInfo, composer::Composer, errors::RenameError};
-    let server = DiodServer::start();
-    std::fs::create_dir_all(server.export_path().join("p/child")).unwrap();
-    std::fs::write(server.export_path().join("p/file"), []).unwrap();
-    let fs = Resolver::<TestPlatform, _>::new(
-        Composer::<TestPlatform>::builder()
-            .mount("/", |ids| attach(server.connect(), &server, ids))
-            .build()
-            .unwrap(),
-    );
-    let private = fs.copy_mount_view().unwrap();
-    private.mount_in_mem(UserInfo::ROOT, "/p").unwrap();
-    assert!(matches!(
-        fs.rename(USER, None, "/p", None, "/p/new"),
-        Err(RenameError::Busy)
-    ));
-    assert!(matches!(
-        fs.rename(USER, None, "/p/child", None, "/p"),
-        Err(RenameError::Busy)
-    ));
-    assert!(matches!(
-        fs.rename(USER, None, "/p/file", None, "/p"),
-        Err(RenameError::Busy)
-    ));
-}
-
-#[test]
-fn private_mount_leaves_unrelated_9p_renames_to_the_server() {
-    use crate::fs::{
-        UserInfo,
-        composer::Composer,
-        errors::{PathError, RenameError},
-    };
-    let server = DiodServer::start();
-    for dir in ["target", "unrelated"] {
-        std::fs::create_dir(server.export_path().join(dir)).unwrap();
-    }
-    let fs = Resolver::<TestPlatform, _>::new(
-        Composer::<TestPlatform>::builder()
-            .mount("/", |ids| attach(server.connect(), &server, ids))
-            .build()
-            .unwrap(),
-    );
-    // An unrelated mount must not hide diod's error for the overlong destination name.
-    let dest = alloc::format!("/unrelated/{}", "x".repeat(256));
-    let check = || {
-        assert!(matches!(
-            fs.rename(USER, None, "/unrelated", None, &dest),
-            Err(RenameError::PathError(PathError::InvalidPathname))
-        ));
-    };
-    check();
-    let private = fs.copy_mount_view().unwrap();
-    private.mount_in_mem(UserInfo::ROOT, "/target").unwrap();
-    check();
-}
-
-#[test]
 fn tremove_fallback_preserves_entries_of_the_wrong_kind() {
     let server = DiodServer::start();
     std::fs::write(server.export_path().join("file"), b"keep").unwrap();

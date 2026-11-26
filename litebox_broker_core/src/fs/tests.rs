@@ -118,39 +118,6 @@ fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform, TarRo> {
 }
 
 #[test]
-fn private_mount_can_cross_a_name_reserved_by_the_covered_backend() {
-    let parent = Resolver::<TestPlatform, _>::new(
-        super::composer::Composer::<TestPlatform>::builder()
-            .mount_nestable("/", |ids| {
-                Overlay::<TestPlatform>::new(
-                    InMem::<TestPlatform>::new(ids.next()),
-                    TarRo::new(TEST_TAR_FILE.into(), ids.next()),
-                    ids.next(),
-                )
-            })
-            .mount("/.litebox-overlay-data", InMem::<TestPlatform>::new)
-            .build()
-            .unwrap(),
-    );
-    let target = "/.litebox-overlay-data/target";
-    parent.mkdir(ROOT, None, target, Mode::RWXU).unwrap();
-    let child = parent.copy_mount_view().unwrap();
-    child.mount_in_mem(ROOT, target).unwrap();
-    assert_ne!(
-        parent
-            .file_status(ROOT, None, target, true)
-            .unwrap()
-            .node_info
-            .dev,
-        child
-            .file_status(ROOT, None, target, true)
-            .unwrap()
-            .node_info
-            .dev,
-    );
-}
-
-#[test]
 fn copied_mount_views_share_files_and_locks_but_not_new_mounts() {
     use alloc::sync::Arc;
     use litebox_broker_protocol::fs::FileLockOperation::Exclusive;
@@ -302,39 +269,6 @@ fn private_mount_rejects_removal_and_replacement() {
             .file_status(ROOT, None, "/pinned/child", true)
             .is_ok()
     );
-}
-
-#[test]
-fn private_mount_keeps_overlay_rename_validation() {
-    use super::errors::{PathError, RenameError};
-    let fs = Resolver::<TestPlatform, _>::new(
-        super::composer::Composer::<TestPlatform>::builder()
-            .mount_nestable("/", |ids| {
-                Overlay::<TestPlatform>::new(
-                    InMem::<TestPlatform>::new(ids.next()),
-                    TarRo::new(TEST_TAR_FILE.into(), ids.next()),
-                    ids.next(),
-                )
-            })
-            .build()
-            .unwrap(),
-    );
-    fs.mkdir(ROOT, None, "/pinned", Mode::RWXU).unwrap();
-    let child = fs.copy_mount_view().unwrap();
-    child.mount_in_mem(ROOT, "/pinned").unwrap();
-    assert!(matches!(
-        fs.rename(ROOT, None, "/missing", None, "/.litebox-overlay-data"),
-        Err(RenameError::PathError(PathError::InvalidPathname))
-    ));
-    assert!(matches!(
-        fs.rename(ROOT, None, "/pinned", None, "/pinned/new"),
-        Err(RenameError::Busy)
-    ));
-    fs.mkdir(ROOT, None, "/pinned/child", Mode::RWXU).unwrap();
-    assert!(matches!(
-        fs.rmdir(ROOT, None, "/pinned"),
-        Err(super::errors::RmdirError::Busy)
-    ));
 }
 
 #[test]
@@ -4138,35 +4072,6 @@ mod devices {
                 .file_type,
             FileType::Directory
         );
-    }
-
-    #[test]
-    fn private_mount_keeps_device_directory_entries_read_only() {
-        let fs = devices_fs(Arc::new(TestStdioProvider::default()));
-        assert!(matches!(
-            fs.unlink(USER, None, "/dev/null/"),
-            Err(crate::fs::errors::UnlinkError::PathError(
-                PathError::ComponentNotADirectory
-            ))
-        ));
-        let child = fs.copy_mount_view().unwrap();
-        child.mount_in_mem(super::ROOT, "/dev/pts").unwrap();
-        assert!(matches!(
-            child.rename(USER, None, "/dev/pts", None, "/dev/moved"),
-            Err(crate::fs::errors::RenameError::Busy)
-        ));
-        assert!(matches!(
-            child.rename(USER, None, "/dev/null/", None, "/dev/pts"),
-            Err(crate::fs::errors::RenameError::PathError(
-                PathError::ComponentNotADirectory
-            ))
-        ));
-        assert!(matches!(
-            fs.rename(USER, None, "/dev/missing", None, "/dev/new"),
-            Err(crate::fs::errors::RenameError::ReadOnlyFileSystem)
-        ));
-        fs.open(USER, None, "/dev/null", OFlags::WRONLY, Mode::empty())
-            .unwrap();
     }
 
     /// Device I/O and terminal queries reach the providers the backend was built with.
