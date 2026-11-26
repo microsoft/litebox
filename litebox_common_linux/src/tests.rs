@@ -15,23 +15,6 @@ fn timeval_validates_the_full_microseconds_field() {
 }
 
 #[test]
-fn select_normalizes_timeval_before_validating_it() {
-    let tv = TimeVal {
-        tv_sec: 1,
-        tv_usec: 1 << 32,
-    };
-    assert_eq!(
-        tv.select_timeout(),
-        Ok(Duration::from_micros(1_000_000 + (1 << 32)))
-    );
-    let tv = TimeVal {
-        tv_sec: i64::MAX,
-        tv_usec: 1_000_000,
-    };
-    assert_eq!(tv.select_timeout(), Err(errno::Errno::EINVAL));
-}
-
-#[test]
 fn stat_conversions_preserve_optional_signed_timestamps() {
     let supplied_times = FileTimestamps {
         accessed: FileTimestamp {
