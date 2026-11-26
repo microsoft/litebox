@@ -1,11 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Checks how `sendmsg` handles control messages on each kind of socket: every socket copies the
-// control bytes after the data's iovec, then TCP and UDP sockets ignore the messages only Unix
-// sockets act on, and the levels they don't parse, while rejecting malformed messages and
-// unknown types.
-
 #define _GNU_SOURCE
 #include "helpers.h"
 #include <arpa/inet.h>

@@ -433,9 +433,7 @@ wire_struct! {
     /// socket receives one datagram or record, discarding the bytes beyond
     /// `capacity` unless peeking.
     ///
-    /// Objects carried with the received data are received too. A stream
-    /// socket stops receiving at the end of the data sent with the objects,
-    /// so one receive gets the objects of at most one send.
+    /// Objects carried with the received data are received too.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ReceiveUnixSocketRequest {
         /// Socket handle.

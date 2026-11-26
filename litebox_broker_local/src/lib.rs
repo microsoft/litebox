@@ -62,8 +62,6 @@ use litebox_platform::buffer::{ReadBuffer, WriteBuffer};
 
 pub use error::{BrokerLocalError, Result};
 
-/// What a receive from a Unix socket got: the broker's response, the sender's
-/// name if requested, and the caller's new handles to the carried objects.
 pub type ReceivedUnixSocket = (
     litebox_broker_protocol::unix_socket::ReceiveUnixSocketResponse,
     Option<litebox_broker_protocol::unix_socket::UnixSocketName>,
