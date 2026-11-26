@@ -6,8 +6,7 @@
 # Run Linux programs under QEMU or Cloud Hypervisor (VMM) with stacked
 # runners: litebox_runner_vm_kernel as the guest kernel and
 # litebox_runner_linux_on_vm_userland as a ring-3 process per guest process.
-# Every litebox_runner_vm_kernel/tests/linux/<name>.c, and each of SHARED,
-# the hosted runner's tests that run here as they are, is compiled three
+# Every litebox_runner_vm_kernel/tests/linux/<name>.c is compiled three
 # times, as /<name> (static), /<name>-pie (static PIE), and /<name>-dyn
 # (dynamically linked), or, if in DYNAMIC_ONLY, only as /<name>-dyn, and
 # every <name>.rs there, a no_std program, once, as /<name> (static), into
@@ -123,8 +122,6 @@ KERNEL_DIR="$REPO_DIR/litebox_runner_vm_kernel"
 USERLAND_DIR="$REPO_DIR/litebox_runner_linux_on_vm_userland"
 TESTS_DIR="$KERNEL_DIR/tests/linux"
 HOSTED_TESTS_DIR="$REPO_DIR/litebox_runner_linux_userland/tests"
-SHARED=(fork_threads_parent.c fork_interrupt_parent.c fork_event_parent.c fork_epoll_parent.c
-    fork_shared_futex_parent.c)
 HOSTED_DEDICATED="$KERNEL_DIR/tests/hosted_dedicated.json"
 HOSTED_SKIPPED="$KERNEL_DIR/tests/hosted_skipped.json"
 # shellcheck source=dev_tools/vm_test_lib.sh
@@ -270,7 +267,7 @@ describe_vm
 DYNAMIC_ONLY=(dynamic)
 
 mkdir -p "$WORK/rootfs"
-for src in "$TESTS_DIR"/*.c "${SHARED[@]/#/$HOSTED_TESTS_DIR/}"; do
+for src in "$TESTS_DIR"/*.c; do
     name=$(basename "$src" .c)
     if [[ ! " ${DYNAMIC_ONLY[*]} " =~ " $name " ]]; then
         ${CC:-cc} -static -O2 -o "$WORK/rootfs/$name" "$src"

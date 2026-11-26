@@ -6,7 +6,8 @@
 //   a mask, also check the VM policy: enable the supported components not
 //   in the mask and leave protection keys off.
 // - "signal": vector registers survive a signal whose handler clobbers them.
-// - "fork": vector registers survive a fork, on both sides.
+// - "fork": vector registers, the MXCSR, and the x87 control word survive a
+//   fork, on both sides.
 // - "thread": a new thread starts with its creator's MXCSR and x87 control
 //   word, which are not the defaults.
 // - "spin MS PATTERN": vector registers loaded with PATTERN survive MS
@@ -272,30 +273,6 @@ static int signal_mode(void) {
     return 0;
 }
 
-static int fork_mode(void) {
-    if (!skipped()) {
-        static struct vregs in, out;
-        fill(&in, 2);
-        fflush(NULL);
-        long pid = vector_syscall(&in, &out, SYS_fork, 0, 0, 0);
-        if (pid < 0) {
-            fprintf(stderr, "fork: %ld\n", pid);
-            return 1;
-        }
-        if (pid == 0) {
-            _exit(same(&in, &out, "fork child") ? 0 : 1);
-        }
-        int parent = same(&in, &out, "fork parent");
-        int status;
-        if (waitpid((pid_t)pid, &status, 0) != pid || !WIFEXITED(status) ||
-            WEXITSTATUS(status) != 0 || !parent) {
-            return 1;
-        }
-    }
-    printf("fork: ok\n");
-    return 0;
-}
-
 struct fp_control {
     unsigned int mxcsr;
     unsigned short fcw;
@@ -308,6 +285,58 @@ static struct fp_control read_fp_control(void) {
     return control;
 }
 
+// Round toward zero (SSE), and down with double precision (x87): not the defaults.
+static const struct fp_control nondefault_fp_control = {.mxcsr = 0x1f80 | 0x6000, .fcw = 0x067f};
+
+static void write_fp_control(struct fp_control control) {
+    _mm_setcsr(control.mxcsr);
+    __asm__ volatile("fldcw %0" : : "m"(control.fcw));
+}
+
+// Whether the MXCSR and x87 control word are `nondefault_fp_control`'s, saying if not.
+static int nondefault_fp(const char *what) {
+    struct fp_control seen = read_fp_control();
+    if (seen.mxcsr == nondefault_fp_control.mxcsr && seen.fcw == nondefault_fp_control.fcw) {
+        return 1;
+    }
+    fprintf(stderr, "%s: MXCSR %#x, FCW %#x, expected %#x, %#x\n", what, seen.mxcsr, seen.fcw,
+            nondefault_fp_control.mxcsr, nondefault_fp_control.fcw);
+    return 0;
+}
+
+static int fork_mode(void) {
+    static struct vregs in, out;
+    int vectors = !skipped();
+    struct fp_control initial = read_fp_control();
+    fflush(NULL);
+    write_fp_control(nondefault_fp_control);
+    long pid;
+    if (vectors) {
+        fill(&in, 2);
+        pid = vector_syscall(&in, &out, SYS_fork, 0, 0, 0);
+    } else {
+        pid = fork();
+    }
+    if (pid == 0) {
+        int child = (!vectors || same(&in, &out, "fork child")) & nondefault_fp("fork child");
+        _exit(child ? 0 : 1);
+    }
+    int parent = pid > 0 && (!vectors || same(&in, &out, "fork parent")) &
+                                nondefault_fp("fork parent");
+    write_fp_control(initial);
+    if (pid < 0) {
+        fprintf(stderr, "fork: %ld\n", pid);
+        return 1;
+    }
+    int status;
+    if (waitpid((pid_t)pid, &status, 0) != pid || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0 || !parent) {
+        return 1;
+    }
+    printf("fork: ok\n");
+    return 0;
+}
+
 static void *read_in_thread(void *arg) {
     *(struct fp_control *)arg = read_fp_control();
     return NULL;
@@ -315,18 +344,15 @@ static void *read_in_thread(void *arg) {
 
 static int thread_mode(void) {
     struct fp_control initial = read_fp_control();
-    // Round toward zero (SSE), and down with double precision (x87).
-    struct fp_control set = {.mxcsr = 0x1f80 | 0x6000, .fcw = 0x067f};
-    _mm_setcsr(set.mxcsr);
-    __asm__ volatile("fldcw %0" : : "m"(set.fcw));
+    struct fp_control set = nondefault_fp_control;
+    write_fp_control(set);
     struct fp_control seen = {0};
     pthread_t thread;
     int created = pthread_create(&thread, NULL, read_in_thread, &seen) == 0;
     if (created) {
         pthread_join(thread, NULL);
     }
-    _mm_setcsr(initial.mxcsr);
-    __asm__ volatile("fldcw %0" : : "m"(initial.fcw));
+    write_fp_control(initial);
     if (!created || seen.mxcsr != set.mxcsr || seen.fcw != set.fcw) {
         fprintf(stderr, "thread: MXCSR %#x, FCW %#x, expected %#x, %#x\n", seen.mxcsr, seen.fcw,
                 set.mxcsr, set.fcw);

@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 // Forks as its first argument says (see fork.json and fork_stress.json),
-// with what the hosted runner's fork tests (fork_hosted.json) do not cover:
+// with what the hosted runner's fork tests (the hosted tests of
+// dev_tools/run_linux_on_vm_userland.sh) do not cover:
 // - "chain <n>": n generations, each the child of the one before, which each
 //   waits for it; the last exits with n, which each passes on. Deeper (in
 //   fork_stress.json) than the runner's stack would hold if each generation
