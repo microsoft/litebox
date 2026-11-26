@@ -67,6 +67,9 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// this resolver.
     #[must_use]
     pub(super) fn copy_mount_view(&self) -> Option<Resolver<Platform, Composer<Platform>>> {
+        // XXX: An open file keeps the whole view it was opened in, so mounts made there later, with
+        // their pins and slots in the shared mount budget, outlive the view's last process until
+        // the file closes. Fixing this needs files that hold only their own mount.
         Some(Resolver {
             backend: self.composer()?.copy_mount_view(),
             flocks: Arc::clone(&self.flocks),
@@ -74,17 +77,28 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
         })
     }
 
-    /// Returns a walk anchor here for `entry`, opened through `opener`, a resolver over a related
-    /// mount view, if both views contain the object it names. Walks from the anchor see this
-    /// resolver's mounts.
-    pub(super) fn related_view_anchor(
-        &self,
-        opener: &Self,
-        entry: &ResolverEntry<Backend>,
-    ) -> Option<DirAnchor> {
-        self.composer()?
-            .shares_handle(opener.composer()?, entry.handle.as_ref())
-            .then(|| entry.anchor())
+    /// Whether this view contains the object `entry` refers to, where `opener`, a resolver over a
+    /// related mount view, opened it, so this resolver may look up from, list, and name it with its
+    /// own mounts.
+    pub(super) fn shares_object(&self, opener: &Self, entry: &ResolverEntry<Backend>) -> bool {
+        self.shares_handle(opener, entry.handle.as_ref())
+    }
+
+    /// Whether this view also contains the directory `entry` was opened from, if any, so this
+    /// resolver may name the entry under that directory's current name (see
+    /// [`Self::shares_object`]).
+    pub(super) fn shares_anchor(&self, opener: &Self, entry: &ResolverEntry<Backend>) -> bool {
+        entry
+            .name
+            .anchor
+            .as_ref()
+            .is_none_or(|anchor| self.shares_handle(opener, HandleRef::Dir(&anchor.dir)))
+    }
+
+    fn shares_handle(&self, opener: &Self, handle: HandleRef<'_>) -> bool {
+        self.composer()
+            .zip(opener.composer())
+            .is_some_and(|(this, opener)| this.shares_handle(opener, handle))
     }
 }
 
@@ -99,6 +113,10 @@ pub struct Context<'a> {
 impl<'a> Context<'a> {
     pub(super) fn new(user_info: UserInfo, caller: Caller<'a>) -> Self {
         Self { user_info, caller }
+    }
+
+    pub(super) const fn caller(&self) -> Caller<'a> {
+        self.caller
     }
 
     fn acting_user(&self) -> UserInfo {
@@ -1638,19 +1656,21 @@ impl<Platform: RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'st
     /// Returns the current physical name of a directory (or, where the backend cannot name it,
     /// the name it was opened by), or the name a file was opened by.
     ///
-    /// A file opened relative to a directory is named under that directory's current name. An
+    /// A file opened relative to a directory is named under that directory's current name in
+    /// `anchor_view`, a view containing that directory (see [`Self::shares_anchor`]). An
     /// unlinked directory has no name.
     pub(super) fn handle_path(
         &self,
         caller: Caller<'_>,
         entry: &ResolverEntry<Backend>,
+        anchor_view: &Self,
     ) -> Result<String, WalkError> {
         match &entry.handle {
             Handle::Dir(dir) => match self.backend.dir_path(caller, dir)? {
                 Some(components) => Ok(ResolvedPath::join(String::new(), &components)),
-                None => self.name_under_current_anchor(caller, entry),
+                None => anchor_view.name_under_current_anchor(caller, entry),
             },
-            Handle::File(_) => self.name_under_current_anchor(caller, entry),
+            Handle::File(_) => anchor_view.name_under_current_anchor(caller, entry),
         }
     }
 
@@ -1901,7 +1921,7 @@ mod tests {
         let open = |path| fs.open(user, None, path, OFlags::PATH, mode).unwrap();
         for path in ["/", "/bridge", "/bridge/fs", "/bridge/fs/nested"] {
             assert_eq!(
-                fs.handle_path(Caller::default(), &open(path)).unwrap(),
+                fs.handle_path(Caller::default(), &open(path), &fs).unwrap(),
                 path
             );
         }
@@ -1921,12 +1941,12 @@ mod tests {
             .unwrap();
         fs.mkdir(user, None, "/bridge/fs/old", mode).unwrap();
         assert_eq!(
-            fs.handle_path(Caller::default(), &dir).unwrap(),
+            fs.handle_path(Caller::default(), &dir, &fs).unwrap(),
             "/bridge/fs/moved/child"
         );
         // A file opened relative to a directory is named under the directory's current name.
         assert_eq!(
-            fs.handle_path(Caller::default(), &anchored).unwrap(),
+            fs.handle_path(Caller::default(), &anchored, &fs).unwrap(),
             "/bridge/fs/moved/anchored"
         );
 
@@ -1952,7 +1972,7 @@ mod tests {
         fs.rmdir(user, None, "/bridge/fs/promoted").unwrap();
         fs.mkdir(user, None, "/bridge/fs/promoted", mode).unwrap();
         assert!(matches!(
-            fs.handle_path(Caller::default(), &dir),
+            fs.handle_path(Caller::default(), &dir, &fs),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
@@ -1973,7 +1993,10 @@ mod tests {
         let dir = fs.open(user, None, "/mnt/dir", OFlags::PATH, mode).unwrap();
         fs.mount_in_mem(user, "/mnt").unwrap();
         // The shadowed directory is still linked, so it must not be reported as removed.
-        assert_eq!(fs.handle_path(Caller::default(), &dir).unwrap(), "/mnt/dir");
+        assert_eq!(
+            fs.handle_path(Caller::default(), &dir, &fs).unwrap(),
+            "/mnt/dir"
+        );
     }
 
     #[test]
@@ -2030,7 +2053,7 @@ mod tests {
             .open(user, Some(child.anchor()), "..", OFlags::PATH, mode)
             .unwrap();
         assert!(matches!(
-            fs.handle_path(Caller::default(), &parent),
+            fs.handle_path(Caller::default(), &parent, &fs),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(
@@ -2041,7 +2064,7 @@ mod tests {
             .open(user, Some(parent.anchor()), "../nested", OFlags::PATH, mode)
             .unwrap();
         assert_eq!(
-            fs.handle_path(Caller::default(), &nested).unwrap(),
+            fs.handle_path(Caller::default(), &nested, &fs).unwrap(),
             "/nested"
         );
     }
@@ -2253,7 +2276,7 @@ mod tests {
         let up = fs
             .open(user, Some(m.anchor()), "..", OFlags::PATH, mode)
             .unwrap();
-        assert_eq!(fs.handle_path(Caller::default(), &up).unwrap(), "/");
+        assert_eq!(fs.handle_path(Caller::default(), &up, &fs).unwrap(), "/");
         let outer = fs
             .open(user, Some(m.anchor()), "../outer", OFlags::PATH, mode)
             .unwrap();
@@ -2268,7 +2291,7 @@ mod tests {
         let top = fs
             .open(user, Some(m.anchor()), "../../..", OFlags::PATH, mode)
             .unwrap();
-        assert_eq!(fs.handle_path(Caller::default(), &top).unwrap(), "/");
+        assert_eq!(fs.handle_path(Caller::default(), &top, &fs).unwrap(), "/");
     }
 
     #[test]

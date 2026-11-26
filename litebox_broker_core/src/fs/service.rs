@@ -143,11 +143,12 @@ struct ResolverFile<Platform: RawSyncPrimitivesProvider, Backend: super::backend
 
 mod private {
     use super::{
-        Arc, BrokerError, Context, File, FileAccessMode, FileMode, FileOpenFlags, FileStatus,
+        Any, Arc, BrokerError, Context, File, FileAccessMode, FileMode, FileOpenFlags, FileStatus,
         ServiceResult, String, TerminalEndpoint,
     };
 
-    pub trait Service: Send + Sync {
+    // `Any` lets an open file find whether the service of the process using it is a view of its own.
+    pub trait Service: Any + Send + Sync {
         fn check_anchor(&self, _file: &File) -> super::Result<()> {
             Err(BrokerError::InvalidRights)
         }
@@ -304,15 +305,17 @@ where
                     .downcast_ref::<ResolverFile<Platform, Backend>>()
                     .ok_or(BrokerError::InvalidRights)?;
                 let entry = state.entry.read();
-                if core::ptr::eq(Arc::as_ptr(&state.resolver), self) {
-                    return Ok(entry.anchor());
-                }
                 // A handle transferred from a process with another filesystem names nothing here.
                 // One opened through a copy of this service with another mount view is usable
-                // only on an object both views contain, and later lookups from it use this
-                // service's mounts.
-                self.related_view_anchor(&state.resolver, &entry)
-                    .ok_or(BrokerError::InvalidRights)
+                // only if both views contain the object it refers to, and later lookups from it
+                // use this service's mounts.
+                if core::ptr::eq(Arc::as_ptr(&state.resolver), self)
+                    || self.shares_object(&state.resolver, &entry)
+                {
+                    Ok(entry.anchor())
+                } else {
+                    Err(BrokerError::InvalidRights)
+                }
             })
             .transpose()
     }
@@ -517,6 +520,34 @@ where
     }
 }
 
+impl<Platform, Backend> ResolverFile<Platform, Backend>
+where
+    Backend: super::backend::Backend,
+    Platform: RawSyncPrimitivesProvider,
+{
+    /// The resolver whose mounts apply to an open entry for a process whose file service is
+    /// `view`: that service if `shares` accepts it, so the results agree with its lookups (see
+    /// `directory_anchor`), and otherwise the opener's.
+    fn resolver_for<'a>(
+        &'a self,
+        view: Option<&'a dyn FileService>,
+        shares: impl FnOnce(&Resolver<Platform, Backend>) -> bool,
+    ) -> &'a Resolver<Platform, Backend> {
+        view.and_then(|view| (view as &dyn Any).downcast_ref::<Resolver<Platform, Backend>>())
+            .filter(|view| shares(view))
+            .unwrap_or(&self.resolver)
+    }
+}
+
+/// The file service of the process `caller`, if any. Fails with [`BrokerError::PeerClosed`] if
+/// that process has exited.
+fn caller_view(caller: Caller<'_>) -> Result<Option<Arc<dyn FileService>>> {
+    caller
+        .process()
+        .map(BrokerProcess::file_service)
+        .transpose()
+}
+
 impl<Platform, Backend> OpenFile for ResolverFile<Platform, Backend>
 where
     Backend: super::backend::Backend,
@@ -663,6 +694,7 @@ where
     ) -> ServiceResult<ReadDirectoryResponse> {
         // Cursor reads select, transfer, and advance under the same lock as seek and other
         // cursor reads; listings only need shared access.
+        let view = caller_view(caller)?;
         let read_guard;
         let mut write_guard = None;
         let entry = match mode {
@@ -678,7 +710,12 @@ where
         if !entry.allows_read() {
             return Ok(Err(FileError::NotForReading));
         }
-        let mut entries = match self.resolver.read_dir(caller, entry) {
+        let mut entries = match self
+            .resolver_for(view.as_deref(), |view| {
+                view.shares_object(&self.resolver, entry)
+            })
+            .read_dir(caller, entry)
+        {
             Ok(entries) => entries,
             Err(error) => return Ok(Err(file_read_directory_error(error))),
         };
@@ -760,10 +797,16 @@ where
     }
 
     fn handle_path(&self, caller: Caller<'_>) -> ServiceResult<String> {
+        let view = caller_view(caller)?;
         let entry = self.entry.read();
+        let anchor_view = self.resolver_for(view.as_deref(), |view| {
+            view.shares_anchor(&self.resolver, &entry)
+        });
         Ok(self
-            .resolver
-            .handle_path(caller, &entry)
+            .resolver_for(view.as_deref(), |view| {
+                view.shares_object(&self.resolver, &entry)
+            })
+            .handle_path(caller, &entry, anchor_view)
             .map_err(file_walk_error))
     }
 
@@ -802,9 +845,13 @@ where
     }
 
     fn set_times(&self, context: Context<'_>, times: &SetFileTimes) -> ServiceResult<()> {
+        let view = caller_view(context.caller())?;
         let entry = self.entry.read();
         Ok(self
-            .resolver
+            .resolver_for(view.as_deref(), |view| {
+                view.shares_object(&self.resolver, &entry)
+                    && view.shares_anchor(&self.resolver, &entry)
+            })
             .set_times(context, &entry, times)
             .map_err(file_set_times_error))
     }
@@ -2041,7 +2088,11 @@ mod tests {
     }
 
     #[test]
-    fn inherited_relative_handles_walk_the_receivers_mount_view() {
+    fn inherited_handles_use_the_receivers_mount_view() {
+        use litebox_broker_protocol::fs::{
+            FileTimeUpdate, FileTimestamp, decode_directory_entries,
+        };
+
         let fs: Arc<dyn FileService> = Arc::new(Resolver::<TestPlatform, _>::new(
             crate::fs::composer::Composer::<TestPlatform>::builder()
                 .mount("/", InMem::<TestPlatform>::new)
@@ -2083,6 +2134,38 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let [d, sub] = ["/work/d", "/work/d/sub"].map(|path| {
+            assert_eq!(mkdir(&owner, None, path, user, FileMode::RWXU), Ok(Ok(())));
+            open(
+                &owner,
+                None,
+                path,
+                user,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
+                FileMode::default(),
+                &sink,
+            )
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(
+            mkdir(&owner, None, "/work/d/s", user, FileMode::RWXU),
+            Ok(Ok(()))
+        );
+        assert_eq!(mount_in_mem(&owner, "/work/d/s", user), Ok(Ok(())));
+        let d_file = open(
+            &owner,
+            None,
+            "/work/d/f",
+            user,
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::CREATE,
+            FileMode::RWXU,
+            &sink,
+        )
+        .unwrap()
+        .unwrap();
         let child = broker
             .core
             .create_process(
@@ -2094,7 +2177,14 @@ mod tests {
                 None,
             )
             .unwrap();
-        let [child_root, child_work, child_file] = [root, work, file].map(|handle| {
+        let [
+            child_root,
+            child_work,
+            child_file,
+            child_d,
+            child_sub,
+            child_d_file,
+        ] = [root, work, file, d, sub, d_file].map(|handle| {
             owner
                 .duplicate_object_reference_to(handle, &child, ObjectRights::WAIT)
                 .unwrap()
@@ -2152,6 +2242,130 @@ mod tests {
             path_status(&child, Some(child_file), ".", user, true),
             Ok(Err(FileError::ComponentNotDirectory))
         );
+
+        // Listing and naming inherited directories use the receiver's mounts too: the sender's
+        // later mounts over and below `/work/d` neither appear in it nor hide its renamed child.
+        assert_eq!(mount_in_mem(&owner, "/work/d", user), Ok(Ok(())));
+        assert_eq!(
+            mkdir(&owner, None, "/work/d/p", user, FileMode::RWXU),
+            Ok(Ok(()))
+        );
+        assert_eq!(mount_in_mem(&owner, "/work/d/p", user), Ok(Ok(())));
+        assert_eq!(
+            rename(&child, None, "/work/d/sub", None, "/work/d/moved", user),
+            Ok(Ok(()))
+        );
+        let mut bytes = [0; 256];
+        let page = read_directory(
+            &child,
+            child_d,
+            &mut bytes.as_mut_slice(),
+            DirectoryReadMode::List(0),
+        )
+        .unwrap()
+        .unwrap();
+        let mut names: alloc::vec::Vec<_> =
+            decode_directory_entries(&bytes[..page.length as usize])
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+        names.sort_unstable();
+        assert_eq!(names, [".", "..", "f", "moved", "s"]);
+        assert_eq!(
+            handle_path(&child, child_sub),
+            Ok(Ok("/work/d/moved".into()))
+        );
+        let mtime = FileTimestamp {
+            seconds: 123,
+            nanoseconds: 456,
+        };
+        let times = SetFileTimes {
+            access: FileTimeUpdate::Omit,
+            modify: FileTimeUpdate::Set(mtime),
+        };
+        let modified = |handle| {
+            handle_status(&owner, handle)
+                .unwrap()
+                .unwrap()
+                .times
+                .map(|times| times.modified)
+        };
+        assert_eq!(set_times(&child, child_d_file, user, &times), Ok(Ok(())));
+        assert_eq!(modified(d_file), Some(mtime));
+
+        // A shared directory opened from one of the sender's private ones is a lookup anchor too.
+        let open_path = |directory, path| {
+            open(
+                &owner,
+                directory,
+                path,
+                user,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::PATH,
+                FileMode::default(),
+                &sink,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let owner_d = open_path(None, "/work/d");
+        let owner_s = open_path(Some(owner_d), "s");
+        let child_s = owner
+            .duplicate_object_reference_to(owner_s, &child, ObjectRights::WAIT)
+            .unwrap();
+        assert_eq!(
+            node(&child, Some(child_s), "."),
+            node(&child, None, "/work/d/s")
+        );
+
+        // It and a file the sender opens below it in a private mount are named through the
+        // receiver's mounts, which see a rename the sender's later mount over its parent hides.
+        for path in ["/work/d/s/x", "/work/d/s/x/old"] {
+            assert_eq!(mkdir(&owner, None, path, user, FileMode::RWXU), Ok(Ok(())));
+        }
+        let owner_old = open_path(Some(owner_d), "s/x/old");
+        assert_eq!(
+            rename(
+                &child,
+                None,
+                "/work/d/s/x/old",
+                None,
+                "/work/d/s/x/new",
+                user
+            ),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            mkdir(&owner, None, "/work/d/s/x/new/m", user, FileMode::RWXU),
+            Ok(Ok(()))
+        );
+        assert_eq!(mount_in_mem(&owner, "/work/d/s/x/new/m", user), Ok(Ok(())));
+        let owner_f = open(
+            &owner,
+            Some(owner_old),
+            "m/f",
+            user,
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::CREATE,
+            FileMode::RWXU,
+            &sink,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mount_in_mem(&owner, "/work/d/s/x", user), Ok(Ok(())));
+        for (handle, path) in [
+            (owner_old, "/work/d/s/x/new"),
+            (owner_f, "/work/d/s/x/new/m/f"),
+        ] {
+            let shared = owner
+                .duplicate_object_reference_to(handle, &child, ObjectRights::WAIT)
+                .unwrap();
+            assert_eq!(handle_path(&child, shared), Ok(Ok(path.into())));
+            // A view lacking the file is never asked to update it.
+            assert_eq!(set_times(&child, shared, user, &times), Ok(Ok(())));
+            assert_eq!(modified(handle), Some(mtime));
+        }
     }
 
     #[test]

@@ -23,8 +23,8 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    char tmp[] = "/tmp/mount-clone-XXXXXX";
-    TEST_ASSERT(mkdtemp(tmp) != NULL && chdir(tmp) == 0, "enter test directory");
+    char *tmp = mkdtemp(test_path("mount-clone-XXXXXX"));
+    TEST_ASSERT(tmp != NULL && chdir(tmp) == 0, "enter test directory");
     TEST_ASSERT(mkdir("target", 0700) == 0, "make mountpoint");
     int old = open("target/old", O_CREAT | O_RDWR, 0600);
     TEST_ASSERT(old >= 0, "open file before clone");

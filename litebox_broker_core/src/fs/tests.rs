@@ -2852,7 +2852,10 @@ mod tar_ro {
                 Mode::empty(),
             )
             .unwrap();
-        assert_eq!(fs.handle_path(Caller::default(), &bar).unwrap(), "/bar");
+        assert_eq!(
+            fs.handle_path(Caller::default(), &bar, &fs).unwrap(),
+            "/bar"
+        );
         let up = fs
             .open(
                 USER,
@@ -2862,7 +2865,7 @@ mod tar_ro {
                 Mode::empty(),
             )
             .unwrap();
-        assert_eq!(fs.handle_path(Caller::default(), &up).unwrap(), "/");
+        assert_eq!(fs.handle_path(Caller::default(), &up, &fs).unwrap(), "/");
         assert!(
             fs.file_status(USER, Some(bar.anchor()), "baz", true)
                 .is_ok()
@@ -3868,13 +3871,16 @@ mod overlay {
         ));
         assert!(fs.file_status(user, Some(bar.anchor()), ".", true).is_ok());
         assert!(matches!(
-            fs.handle_path(Caller::default(), &bar),
+            fs.handle_path(Caller::default(), &bar, &fs),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         let parent = fs
             .open(user, Some(bar.anchor()), "..", OFlags::PATH, Mode::empty())
             .unwrap();
-        assert_eq!(fs.handle_path(Caller::default(), &parent).unwrap(), "/");
+        assert_eq!(
+            fs.handle_path(Caller::default(), &parent, &fs).unwrap(),
+            "/"
+        );
     }
 
     #[test]
@@ -3931,8 +3937,11 @@ mod overlay {
         fs.rename(USER, None, "/a", None, "/b").unwrap();
 
         // Like Linux, held directories (and their descendants) move with the rename.
-        assert_eq!(fs.handle_path(Caller::default(), &a).unwrap(), "/b");
-        assert_eq!(fs.handle_path(Caller::default(), &sub).unwrap(), "/b/sub");
+        assert_eq!(fs.handle_path(Caller::default(), &a, &fs).unwrap(), "/b");
+        assert_eq!(
+            fs.handle_path(Caller::default(), &sub, &fs).unwrap(),
+            "/b/sub"
+        );
         let b_node = fs.file_status(USER, None, "/b", true).unwrap().node_info;
         assert_eq!(
             fs.handle_status(Caller::default(), &a).unwrap().node_info,
@@ -3949,14 +3958,14 @@ mod overlay {
             b_node
         );
         assert_eq!(
-            fs.handle_path(Caller::default(), &sub_parent).unwrap(),
+            fs.handle_path(Caller::default(), &sub_parent, &fs).unwrap(),
             "/b"
         );
 
         // The replaced directory is unlinked: it has no name, but `..` still reaches its former
         // parent rather than the directory that took its name.
         assert!(matches!(
-            fs.handle_path(Caller::default(), &old_b),
+            fs.handle_path(Caller::default(), &old_b, &fs),
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
         ));
         assert!(matches!(
@@ -3973,7 +3982,8 @@ mod overlay {
             )
             .unwrap();
         assert_eq!(
-            fs.handle_path(Caller::default(), &old_b_parent).unwrap(),
+            fs.handle_path(Caller::default(), &old_b_parent, &fs)
+                .unwrap(),
             "/"
         );
         assert_eq!(
@@ -4053,13 +4063,16 @@ mod devices {
         let pts = fs
             .open(USER, None, "/dev/pts", OFlags::PATH, Mode::empty())
             .unwrap();
-        assert_eq!(fs.handle_path(Caller::default(), &pts).unwrap(), "/dev/pts");
+        assert_eq!(
+            fs.handle_path(Caller::default(), &pts, &fs).unwrap(),
+            "/dev/pts"
+        );
         for (path, expected) in [("..", "/dev"), ("../..", "/")] {
             let parent = fs
                 .open(USER, Some(pts.anchor()), path, OFlags::PATH, Mode::empty())
                 .unwrap();
             assert_eq!(
-                fs.handle_path(Caller::default(), &parent).unwrap(),
+                fs.handle_path(Caller::default(), &parent, &fs).unwrap(),
                 expected
             );
         }
