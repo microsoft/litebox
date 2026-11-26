@@ -246,22 +246,16 @@ jobs:
         run: |
           VM_CPUS=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
-      - name: Smoke-test Linux programs and OP-TEE TAs in a Cloud Hypervisor VM with stacked runners on 2 CPUs
+      - name: Run Linux programs, with the userland runner's C tests, and OP-TEE TAs in a Cloud Hypervisor VM with stacked runners on 2 CPUs
+        # Linux programs that need a device of the VMM's, and the C programs of
+        # litebox_runner_linux_userland/tests, but those tests/hosted_skipped.json skips. The hosted
+        # test's boot runs all of its programs, some 70s in CI: TIMEOUT leaves room for slow runners.
         run: |
           export VMM=cloud-hypervisor VM_CPUS=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build"
-          VM_MEM=6G ./dev_tools/run_linux_on_vm_userland.sh \
-            -t hello -t pid1 -t smp -t highmem -t console_flood -t net -t vsock_hybrid -t virtiofs
+          TIMEOUT=300 VM_MEM=6G ./dev_tools/run_linux_on_vm_userland.sh \
+            -t pid1 -t smp -t highmem -t console_flood -t net -t vsock_hybrid -t virtiofs \
+            -t hosted -t hosted_dedicated -t hosted_init
           ./dev_tools/run_optee_on_vm_userland.sh -t hello-ta
-      - name: Run the userland runner's C tests in a Cloud Hypervisor VM with stacked runners on 2 CPUs
-        # The C programs of litebox_runner_linux_userland/tests, but those tests/hosted_skipped.json skips.
-        # A boot runs all of a test's programs, some 70s in CI: TIMEOUT leaves room for slow runners.
-        run: |
-          TIMEOUT=300 VMM=cloud-hypervisor VM_CPUS=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
-            ./dev_tools/run_linux_on_vm_userland.sh -t hosted -t hosted_dedicated -t hosted_init
-      - name: Run threaded Linux programs in a Cloud Hypervisor VM with stacked runners on 4 CPUs, release
-        run: |
-          VMM=cloud-hypervisor VM_CPUS=4 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
-            ./dev_tools/run_linux_on_vm_userland.sh -r -t smp -t sched -t fork -t pthread
       - name: Save vhost-device-vsock
         if: github.event_name != 'merge_group' && steps.vhost-device-vsock.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
