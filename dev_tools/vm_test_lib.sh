@@ -218,7 +218,7 @@ stop_vsock() {
 # it prints why not otherwise.
 run_vm() {
     local name=$1 kernel=$2 payload=$3 log="$WORK/$1.log" status why vm_pid cpid
-    local client_status=0 stopped=0 panicked=0 rebooted=0 cmdline exit_line
+    local client_status=0 stopped=0 panicked=0 rebooted=0 cmdline exit_line failed_runs=
     shift 3
     cmdline="litebox.log=${LITEBOX_LOG:-info}${kernel_args:+ $kernel_args}"
     local vm=(timeout "$TIMEOUT")
@@ -314,7 +314,12 @@ run_vm() {
             124) why="timed out after ${TIMEOUT}s" ;;
             *) if [[ $stopped -ne 0 ]]; then why="stopped"; else why="exit status $status"; fi ;;
         esac
-        [[ $client_status -eq 0 ]] || why="${why:+$why, }host client exit status $client_status"
+        if [[ $client_status -ne 0 ]]; then
+            why="${why:+$why, }host client exit status $client_status"
+            # The runs that the test client names as failed (see its docs), if any.
+            failed_runs=$(sed -n 's/^FAIL: failed: //p' "$WORK/$name.client" | tail -n 1)
+            why+="${failed_runs:+; failed: $failed_runs}"
+        fi
         [[ $panicked -eq 0 ]] || why="kernel panic${why:+, $why}"
         [[ $rebooted -eq 0 ]] || why="VM rebooted${why:+, $why}"
         echo "FAIL  $name  ($why)"
@@ -324,7 +329,7 @@ run_vm() {
             sed 's/^/      > /' "$WORK/$name.client" | tail -20
         fi
         fail=$((fail + 1))
-        failed+=("$name")
+        failed+=("$name${failed_runs:+ ($failed_runs)}")
     fi
 }
 

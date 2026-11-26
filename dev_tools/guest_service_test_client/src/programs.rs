@@ -4,6 +4,7 @@
 //! `programs.json`: the runs of a test, in order, and how each must end. It is an array of
 //! entries: a run, or a `{ "concurrent": [...] }` group of runs started together. A run:
 //! - `argv`: `argv[0]` is the program's absolute path in the sandbox's root file system.
+//! - `name`: what reports call the run (default: its `argv`, joined by spaces).
 //! - `envp`: `KEY=VALUE` strings (default none).
 //! - `stdin`: the run's standard input, after which it ends (default: none, so it ends at once).
 //! - `console_stdin`: default false; if true (without `stdin`), the run's standard input is the
@@ -60,6 +61,7 @@ pub struct Concurrent {
 #[serde(deny_unknown_fields)]
 pub struct Run {
     pub argv: Vec<String>,
+    pub name: Option<String>,
     #[serde(default)]
     pub envp: Vec<String>,
     #[serde(default)]
@@ -136,6 +138,11 @@ impl core::fmt::Display for ExitStatus {
 }
 
 impl Run {
+    /// What reports call the run: its `name`, or else its `argv`, joined by spaces.
+    pub fn label(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.argv.join(" "))
+    }
+
     /// How the run must end.
     pub fn expected_exit_status(&self) -> ExitStatus {
         match (self.expect_exit_code, self.expect_signal) {

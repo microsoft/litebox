@@ -113,6 +113,7 @@
       "-c",
       "trap '' HUP INT ALRM; exec /hosted/inherited_ignored_signals"
     ],
+    "name": "inherited_ignored_signals",
     "envp": [
       "HOME=/"
     ],
@@ -213,8 +214,9 @@
     "argv": [
       "/bin/sh",
       "-c",
-      "rm -f /tmp/udp_namespace; /hosted/udp_broker_namespace server >/tmp/udp_namespace & server=$!\nwhile ! { read -r word port </tmp/udp_namespace && [ \"$word\" = LISTEN ]; } 2>/dev/null; do :; done\n/hosted/udp_broker_namespace client \"$port\"; client=$?\nwait $server; echo \"client=$client server=$?\""
+      ": >/tmp/udp_namespace; /hosted/udp_broker_namespace server >/tmp/udp_namespace & server=$!\nwhile ! { read -r word port </tmp/udp_namespace && [ \"$word\" = LISTEN ]; } 2>/dev/null; do :; done\n/hosted/udp_broker_namespace client \"$port\"; client=$?\nwait $server; echo \"client=$client server=$?\""
     ],
+    "name": "udp_broker_namespace server and client",
     "envp": [
       "HOME=/"
     ],

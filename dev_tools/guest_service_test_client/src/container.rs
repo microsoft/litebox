@@ -182,8 +182,9 @@ impl Container {
         self.release(INIT)
     }
 
-    /// Runs `entry`, whose first run is run `first`, and checks how its runs ended.
-    pub fn run_entry(&self, first: usize, entry: &Entry) -> Result<()> {
+    /// Runs `entry`, whose first run is run `first`, checks how its runs ended, and returns the
+    /// failed ones, as `run INDEX (LABEL)`.
+    pub fn run_entry(&self, first: usize, entry: &Entry) -> Vec<String> {
         let runs = entry.runs();
         let outcomes: Vec<Result<Outcome>> = thread::scope(|scope| {
             let started: Vec<_> = (first..)
@@ -200,17 +201,16 @@ impl Container {
         });
         let mut failures = Vec::new();
         for ((index, run), outcome) in (first..).zip(runs).zip(outcomes) {
-            let path = &run.argv[0];
+            let run_label = format!("run {index} ({})", run.label());
             match outcome.and_then(|outcome| check(run, &outcome)) {
-                Ok(()) => println!("PASS  run {index} ({path})"),
+                Ok(()) => println!("PASS  {run_label}"),
                 Err(error) => {
-                    println!("FAIL  run {index} ({path}): {error:#}");
-                    failures.push(index);
+                    println!("FAIL  {run_label}: {error:#}");
+                    failures.push(run_label);
                 }
             }
         }
-        ensure!(failures.is_empty(), "runs {failures:?} failed");
-        Ok(())
+        failures
     }
 
     /// Runs `run`, number `index`, in an exec process of its own.

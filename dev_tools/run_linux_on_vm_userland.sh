@@ -59,6 +59,8 @@
 #     tests run them, with their arguments, and checks of their output.
 #   hosted_root_init: an init test, root_init.c, as litebox.init, which must
 #     also print `root-init survived`.
+# hosted and hosted_dedicated run every program, even after one fails, and
+# their failures name each program that failed.
 # Their root also has dash as /bin/sh, a /tmp, and a directory /held/lower,
 # with a file `entry`, both the guest's (uid 1000), for held_lower_dir.c.
 #
@@ -661,6 +663,8 @@ for test in "${tests[@]}"; do
         continue
     }
     client_args=(--skip-counted "$json")
+    # The hosted tests' programs are independent: name each that fails.
+    ! is_hosted "$test" || client_args+=(--keep-going)
     boot_client "$test"
     while read -r index min_reflected replay; do
         [[ -n $index ]] || continue

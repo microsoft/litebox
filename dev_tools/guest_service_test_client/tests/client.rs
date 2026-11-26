@@ -257,6 +257,11 @@ fn serve(dir: &Path) -> (ttrpc::Server, PathBuf) {
 /// Runs the client on `programs` (with `input`, if any), and returns whether it passed, its
 /// stdout, and the runs' output.
 fn run_client(programs: &str, input: Option<&str>) -> (bool, String, String) {
+    run_client_with(programs, input, &[])
+}
+
+/// As [`run_client`], with the extra command-line arguments `args`.
+fn run_client_with(programs: &str, input: Option<&str>, args: &[&str]) -> (bool, String, String) {
     let dir = tempfile::tempdir().unwrap();
     let (server, bridge) = serve(dir.path());
     std::fs::write(dir.path().join("programs.json"), programs).unwrap();
@@ -266,6 +271,7 @@ fn run_client(programs: &str, input: Option<&str>) -> (bool, String, String) {
         .arg(&bridge)
         .arg("--output")
         .arg(dir.path().join("output"))
+        .args(args)
         .arg(dir.path().join("programs.json"));
     if let Some(input) = input {
         std::fs::write(dir.path().join("input"), input).unwrap();
@@ -334,6 +340,31 @@ fn a_run_that_ends_otherwise_fails() {
     );
     // Runs stop at the first failure.
     assert!(!report.contains("run 1"), "{report}");
+    assert!(
+        report.ends_with("FAIL: failed: run 0 (/echo)\n"),
+        "{report}"
+    );
+}
+
+/// With `--keep-going`, every run runs, and the last line names each failed one, by its name or
+/// its arguments.
+#[test]
+fn keep_going_names_every_failed_run() {
+    let (passed, report, _) = run_client_with(
+        r#"[
+            { "argv": ["/echo", "1"] },
+            { "argv": ["/echo"] },
+            { "argv": ["/echo", "2"], "name": "second" }
+        ]"#,
+        None,
+        &["--keep-going"],
+    );
+    assert!(!passed, "{report}");
+    assert!(report.contains("PASS  run 1 (/echo)\n"), "{report}");
+    assert!(
+        report.ends_with("FAIL: failed: run 0 (/echo 1), run 2 (second)\n"),
+        "{report}"
+    );
 }
 
 /// A script waits for each prompt before it resizes the terminal and sends its input.
