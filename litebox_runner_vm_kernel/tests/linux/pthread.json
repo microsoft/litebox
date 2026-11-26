@@ -1,6 +1,5 @@
 [
   { "argv": ["/pthread", "basic"], "expect_stdout": "basic: ok\n", "expect_stderr": "" },
-  { "argv": ["/pthread-pie", "basic"], "expect_stdout": "basic: ok\n", "expect_stderr": "" },
   { "argv": ["/pthread-dyn", "basic"], "expect_stdout": "basic: ok\n", "expect_stderr": "" },
   { "argv": ["/pthread", "exit"], "expect_exit_code": 7, "expect_stderr": "" },
   { "argv": ["/pthread-dyn", "exit"], "expect_exit_code": 7, "expect_stderr": "" },

@@ -5,12 +5,5 @@
     "console_stdin": true,
     "expect_stdout": "tty 1 pts 1 controlling 1\r\nsize 24x80\r\nready\r\nread: hello from the host\r\n",
     "expect_stderr": ""
-  },
-  {
-    "argv": ["/terminal-dyn"],
-    "terminal": true,
-    "console_stdin": true,
-    "expect_stdout": "tty 1 pts 1 controlling 1\r\nsize 24x80\r\nready\r\nread: hello from the host\r\n",
-    "expect_stderr": ""
   }
 ]

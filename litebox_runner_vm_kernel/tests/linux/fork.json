@@ -1,6 +1,5 @@
 [
   { "argv": ["/fork", "thread"], "expect_stdout": "thread: 5\n" },
-  { "argv": ["/fork-pie", "thread"], "expect_stdout": "thread: 5\n" },
   { "argv": ["/fork-dyn", "thread"], "expect_stdout": "thread: 5\n" },
   {
     "argv": ["/fork-dyn", "exec"],

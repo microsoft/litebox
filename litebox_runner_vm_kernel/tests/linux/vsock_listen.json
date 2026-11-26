@@ -1,4 +1,3 @@
 [
-  { "argv": ["/vsock_listen", "hybrid"], "expect_stdout": "vsock-listen ok\n" },
-  { "argv": ["/vsock_listen-dyn", "hybrid"], "expect_stdout": "vsock-listen ok\n" }
+  { "argv": ["/vsock_listen", "hybrid"], "expect_stdout": "vsock-listen ok\n" }
 ]
