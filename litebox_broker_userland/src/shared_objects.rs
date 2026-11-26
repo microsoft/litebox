@@ -4,10 +4,13 @@
 //! Host-file-backed storage for the broker's in-memory files, and its delivery to runners.
 
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+use std::sync::Arc;
 
 use litebox_broker_core::BrokerProcess;
 use litebox_broker_core::fs::errors::MapSharedError;
-use litebox_broker_core::fs::shared_storage::{HostHandle, SharedFileObject};
+use litebox_broker_core::fs::shared_storage::{
+    HostHandle, SharedFileMemoryProvider, SharedFileObject,
+};
 use litebox_broker_host::RequestFailure;
 use litebox_broker_protocol::fs::{FileError, MapFileRequest, MapFileResponse};
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
@@ -21,6 +24,18 @@ pub trait SharedObjectDelivery: Send + Sync {
     /// Fails with [`ErrorKind::Unsupported`] if this deployment cannot deliver `object` at all,
     /// which the runner sees as a file it cannot share.
     fn deliver(&self, object: &dyn SharedFileObject, writable: bool, end: u64) -> IoResult<u64>;
+}
+
+/// Returns this platform's provider of host shared memory, which holds the contents of shared
+/// files and keyed shared segments, if it has one.
+#[must_use]
+pub fn host_memory_provider() -> Option<Arc<dyn SharedFileMemoryProvider>> {
+    #[cfg(target_os = "linux")]
+    return Some(Arc::new(linux::MemfdFileMemoryProvider));
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    return Some(Arc::new(windows::TempFileMemoryProvider));
+    #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+    None
 }
 
 /// Returns `object`'s host handle for delivering it with `writable` rights.

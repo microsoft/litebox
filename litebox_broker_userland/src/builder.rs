@@ -5,7 +5,8 @@
 //!
 //! [`BrokerCoreBuilder`] selects the platform socket provider, the
 //! cross-platform getrandom-backed random provider, the thread-backed timer
-//! provider, and, if given, the vsock provider, and applies whatever platform
+//! provider, the platform's host shared memory for keyed shared segments, and,
+//! if given, the vsock provider, and applies whatever platform
 //! setup a deployment needs before its first association is served (for
 //! example, Linux lock-tracing initialization). This is what lets an
 //! in-process caller construct the same [`BrokerCore`] the userland broker
@@ -139,6 +140,7 @@ impl BrokerCoreBuilder {
             self.vsock,
             Arc::new(UserlandRandomProvider),
             Arc::new(UserlandTimerProvider::new()?),
+            crate::shared_objects::host_memory_provider(),
         )?)
     }
 }

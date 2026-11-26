@@ -29,6 +29,7 @@ pub mod process_group;
 pub mod random;
 pub mod readiness;
 pub mod readiness_queue;
+pub mod segment;
 pub mod shared_buffer;
 pub mod shared_futex;
 pub mod signal;
