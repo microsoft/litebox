@@ -293,7 +293,7 @@ static void write_fp_control(struct fp_control control) {
     __asm__ volatile("fldcw %0" : : "m"(control.fcw));
 }
 
-// Whether the MXCSR and x87 control word are `nondefault_fp_control`'s, saying if not.
+// Whether the FP control state is `nondefault_fp_control`; says if not.
 static int nondefault_fp(const char *what) {
     struct fp_control seen = read_fp_control();
     if (seen.mxcsr == nondefault_fp_control.mxcsr && seen.fcw == nondefault_fp_control.fcw) {

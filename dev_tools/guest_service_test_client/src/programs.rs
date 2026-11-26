@@ -17,11 +17,9 @@
 //!   terminal up.
 //! - `expect_exit_code` (default 0), or `expect_signal` for a signal death.
 //! - `expect_stdout`, `expect_stderr`: the exact output, if given.
-//! - `expect_stdout_contains`: strings that the standard output must contain (default none), for
-//!   programs that print more than their checks' results, e.g. ports.
-//! - `script`: default none; with `terminal`, steps of the run's input, in order: each waits for
-//!   its `wait` (if any) in the standard output, after the previous step's, then resizes the
-//!   terminal to its `resize` (`[rows, columns]`, if any) and sends its `send` (if any).
+//! - `expect_stdout_contains`: strings the standard output must contain.
+//! - `script`: with `terminal`, input steps: each waits for its `wait` in the output, then
+//!   resizes the terminal to its `resize` (`[rows, columns]`) and sends its `send`.
 //! - `min_reflected_syscalls`: default 0; guest syscalls that the VM kernel reflected to the
 //!   runner, as the runner did not take them directly.
 //! - `replay`: default false; in debug builds of the VM kernel, every process gives up on its
@@ -138,7 +136,7 @@ impl core::fmt::Display for ExitStatus {
 }
 
 impl Run {
-    /// What reports call the run: its `name`, or else its `argv`, joined by spaces.
+    /// The run's `name`, or else its `argv` joined by spaces.
     pub fn label(&self) -> String {
         self.name.clone().unwrap_or_else(|| self.argv.join(" "))
     }

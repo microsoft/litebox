@@ -1,9 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Booted as litebox.init, which takes no arguments, starts a hosted test program with some: it
-// executes the command line in the file at its own path with `.args` appended, an argument a
-// line, staying process 1. See dev_tools/run_linux_on_vm_userland.sh (hosted_init).
+// As litebox.init, which takes no arguments: executes the command line in `<own path>.args`, an
+// argument a line, staying process 1.
 
 #include <stdio.h>
 #include <string.h>

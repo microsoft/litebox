@@ -69,8 +69,8 @@ impl Backend {
 }
 
 /// Defines each test `test(backend)` once per backend, as `userland::test`, `vm::test` and
-/// `ch::test`; but each of `one vmm` only as `userland::test` and `vm::test`: the VM backends
-/// differ only in how they start the VM, which these tests don't depend on.
+/// `ch::test`; each of `one vmm`, which does not depend on the VMM, only as `userland::test` and
+/// `vm::test`.
 macro_rules! on_both_backends {
     (
         $($test:ident),* $(,)?;

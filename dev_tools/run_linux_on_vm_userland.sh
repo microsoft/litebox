@@ -45,29 +45,14 @@
 #   egress: sockets reach only the policy's destinations.
 #   console_flood: the console keeps 4 writers' records (check_records).
 #
-# The hosted tests, which run only when given with -t, run the C programs of
-# litebox_runner_linux_userland/tests (HOSTED_TESTS_DIR) as that runner's
-# tests do, each built once, static, as /hosted/<name>, with its tests' gcc
-# flags; they need python3 and /usr/bin/dash:
-#   hosted: each program but those its build.rs lists as dedicated or helpers,
-#     and those that litebox_runner_vm_kernel/tests/hosted_skipped.json
-#     skips, with why, must exit 0, run with HOME=/ and LITEBOX_PIPE_BROKER=1
-#     (see sendfile.c), and one that build.rs lists as with_exec_child with
-#     /hosted/vfork_exec_child.
-#   hosted_dedicated: the runs of
-#     litebox_runner_vm_kernel/tests/hosted_dedicated.json, as its dedicated
-#     tests run them, with their arguments, and checks of their output.
-#   hosted_init: a boot each of litebox_runner_vm_kernel/tests/hosted_init.json's
-#     programs, which, as the hosted runner's first process, expect to be
-#     process 1 with no parent: each is litebox.init, an ordinary process (with
-#     litebox.root_process_as_init=0, so debug kernels only), or, with
-#     `as_init`, the guest's init; its exit status (`expect_status`) and console
-#     (`expect_console_contains`) are checked. One with arguments starts
-#     through hosted_init.c, which execs the command line in a file.
-# hosted and hosted_dedicated run every program, even after one fails, and
-# their failures name each program that failed.
-# Their root also has dash as /bin/sh, a /tmp, and a directory /held/lower,
-# with a file `entry`, both the guest's (uid 1000), for held_lower_dir.c.
+# The hosted tests, only with -t, run litebox_runner_linux_userland/tests/*.c,
+# built static as /hosted/<name> (in litebox_runner_vm_kernel/tests below):
+#   hosted: each program must exit 0, but build.rs's dedicated and helpers,
+#     those in hosted_skipped.json, and those the files below run.
+#   hosted_dedicated: the runs in hosted_dedicated.json.
+#   hosted_init: a boot each of hosted_init.json's programs, as litebox.init:
+#     an ordinary process 1 (debug kernels only) unless `as_init`.
+# Their root adds dash as /bin/sh, /tmp, and /held/lower (uid 1000).
 #
 # Runner processes' standard output and error go to a virtio console, backed
 # by a file.
@@ -171,7 +156,7 @@ virtiofsd=
 declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writable_root [egress]=/egress
     [console_flood]=/console_flood [lifecycle]=/lifecycle)
 
-# The hosted tests (see the header), which run only when given with -t.
+# Only with -t (see the header).
 HOSTED=(hosted hosted_dedicated hosted_init)
 
 # Whether test $1 is a hosted test.
@@ -276,7 +261,7 @@ describe_vm
 DYNAMIC_ONLY=(dynamic)
 
 mkdir -p "$WORK/rootfs"
-# Builds the program $1 (see the header).
+# Builds $1 static, as a static PIE, and dynamic (see the header).
 build_program() {
     local src=$1 name
     name=$(basename "$src" .c)
@@ -286,7 +271,7 @@ build_program() {
     fi
     ${CC:-cc} -O2 -o "$WORK/rootfs/$name-dyn" "$src"
 }
-# At once: each step of CI builds them all.
+# In parallel.
 builds=()
 for src in "$TESTS_DIR"/*.c; do
     build_program "$src" &
@@ -307,17 +292,15 @@ for t in "${tests[@]}"; do
     ! is_hosted "$t" || hosted=1
 done
 if [[ $hosted -ne 0 ]]; then
-    # The hosted sweep's programs.json; hosted_init's boots, a line each, `NAME AS_INIT INIT
-    # EXPECT_STATUS` in $WORK/hosted_init.boots, with the strings that its console must contain
-    # in $WORK/hosted_init/NAME.contains, and the command lines of its launcher's copies in
-    # rootfs/hosted/init; and, a line each, the programs that the hosted tests run.
+    # Writes hosted.json and hosted_init's boots (`NAME AS_INIT INIT STATUS`), and prints the
+    # programs to build.
     mkdir -p "$WORK/rootfs/hosted/init" "$WORK/hosted_init"
     hosted_programs=$(python3 - "$HOSTED_TESTS_DIR" "$HOSTED_SKIPPED" "$HOSTED_DEDICATED" \
         "$HOSTED_INIT" "$WORK" <<'EOF'
 import json, pathlib, re, sys
 
 tests, skipped_path, dedicated, init, work = map(pathlib.Path, sys.argv[1:])
-# The kinds of the hosted tests' programs: their build.rs's lists of names.
+# Program kinds, from build.rs's lists.
 build_rs = tests.parent / "build.rs"
 lists = {
     name: re.findall(r'"([^"]+\.c)"', body)
@@ -328,7 +311,10 @@ lists = {
 for name in ("DEDICATED_C_TESTS", "HELPER_C_PROGRAMS", "WITH_EXEC_CHILD_C_TESTS"):
     if not lists.get(name):
         sys.exit(f"error: no list {name} of C programs in {build_rs}")
-unswept = set(lists["DEDICATED_C_TESTS"] + lists["HELPER_C_PROGRAMS"])
+elsewhere = {
+    f"{name}.c" for name in re.findall(r"/hosted/(\w+)", dedicated.read_text() + init.read_text())
+}
+unswept = set(lists["DEDICATED_C_TESTS"] + lists["HELPER_C_PROGRAMS"]) | elsewhere
 skipped = json.loads(skipped_path.read_text())
 for name in skipped:
     if name in unswept or not (tests / name).is_file():
@@ -342,13 +328,13 @@ for source in sorted(tests.glob("*.c")):
         argv.append("/hosted/vfork_exec_child")
     runs.append({"argv": argv, "envp": ["HOME=/", "LITEBOX_PIPE_BROKER=1"]})
     programs.add(source.stem)
-programs.update(re.findall(r"/hosted/(\w+)", dedicated.read_text() + init.read_text()))
+programs.update(name[:-2] for name in elsewhere)
 (work / "hosted.json").write_text(json.dumps(runs, indent=1))
 boots = []
 for entry in json.loads(init.read_text()):
     name, argv = entry["name"], entry["argv"]
     status = entry["expect_status"]
-    if not re.fullmatch(r"\w+", name) or not argv or not re.fullmatch(r"(exited|signaled) \d+", status):
+    if not (re.fullmatch(r"\w+", name) and argv and re.fullmatch(r"(exited|signaled) \d+", status)):
         sys.exit(f"error: {init}: a bad entry {entry}")
     path = argv[0]
     if len(argv) > 1:
@@ -362,16 +348,16 @@ print("\n".join(sorted(programs)))
 EOF
     )
     mkdir -p "$WORK/rootfs/hosted"
-    # As the hosted tests build them (gcc -static), whose output they don't show.
+    # As the hosted tests build them.
     # shellcheck disable=SC2016 # expanded by the inner shell
     xargs -P "$(nproc)" -I{} sh -c '${CC:-cc} -static -w -o "$1/{}" "$2/{}.c"' _ \
         "$WORK/rootfs/hosted" "$HOSTED_TESTS_DIR" <<<"$hosted_programs"
-    # hosted_init's launcher, a copy for each command line.
+    # hosted_init's launcher, a copy per command line.
     ${CC:-cc} -static -O2 -o "$WORK/hosted_init/launcher" "$KERNEL_DIR/tests/hosted_init.c"
     for args in "$WORK/rootfs/hosted/init"/*.args; do
         [[ ! -f $args ]] || cp "$WORK/hosted_init/launcher" "${args%.args}"
     done
-    # dash as /bin/sh, and a /tmp, for the shells that programs start.
+    # For programs that start shells.
     mkdir -p "$WORK/rootfs/bin" "$WORK/rootfs/tmp"
     cp /usr/bin/dash "$WORK/rootfs/bin/sh"
     : >"$WORK/rootfs/tmp/.keep"
@@ -395,7 +381,7 @@ cp "$GUEST_SERVICE" "$WORK/rootfs/.litebox/guest-service"
 (cd "$WORK/rootfs" && find . -type f -printf '%P\n' |
     tar --format=ustar --owner=0 --group=0 -cf "$WORK/rootfs.tar" -T -)
 if [[ $hosted -ne 0 ]]; then
-    # The guest's directory for held_lower_dir.c (see the header).
+    # For held_lower_dir.c.
     mkdir -p "$WORK/held/held/lower"
     : >"$WORK/held/held/lower/entry"
     tar --format=ustar --owner=1000 --group=1000 --no-recursion -rf "$WORK/rootfs.tar" \
@@ -602,8 +588,7 @@ check_records() {
         }' "$1"
 }
 
-# Checks hosted_init's boot $1, hosted_init.NAME: its init's exit status and console (see the
-# header).
+# Checks hosted_init's boot $1: init's exit status and console.
 check_hosted_init() {
     show_output "$1"
     local name=${1#hosted_init.} expected text
@@ -611,7 +596,8 @@ check_hosted_init() {
     grep -qE "^\[litebox\] init exit status: $expected"$'\r?$' "$WORK/$1.log" ||
         { echo "no init exit status \`$expected\` in the log"; return 1; }
     while IFS= read -r text; do
-        grep -qF -- "$text" "$WORK/$1.console" || { echo "no \`$text\` on the console"; return 1; }
+        grep -qF -- "$text" "$WORK/$1.console" ||
+            { echo "no \`$text\` on the console"; return 1; }
     done <"$WORK/hosted_init/$name.contains"
 }
 
@@ -696,7 +682,7 @@ for test in "${tests[@]}"; do
     if [[ $test == hosted_init ]]; then
         while read -r name as_init path expected_status; do
             if [[ $as_init -eq 0 && $profile != debug ]]; then
-                echo "FAIL  hosted_init.$name  (runs as an ordinary process 1: needs a debug kernel)"
+                echo "FAIL  hosted_init.$name  (an ordinary process 1 needs a debug kernel)"
                 fail=$((fail + 1))
                 failed+=("hosted_init.$name")
                 continue
@@ -705,7 +691,7 @@ for test in "${tests[@]}"; do
             kernel_args="litebox.init=$path"
             [[ $as_init -ne 0 ]] || kernel_args+=" litebox.root_process_as_init=0"
             check=check_hosted_init
-            # The kernel reports a failure for any other status: check_hosted_init judges it.
+            # The kernel reports any other status as a failure.
             [[ $expected_status == "exited 0" ]] || guest_failure_expected=1
             boot "hosted_init.$name" "$WORK/hosted_init.$name.tar"
             check=check_boot
@@ -735,7 +721,7 @@ for test in "${tests[@]}"; do
         continue
     }
     client_args=(--skip-counted "$json")
-    # The hosted tests' programs are independent: name each that fails.
+    # Report every failed program.
     ! is_hosted "$test" || client_args+=(--keep-going)
     boot_client "$test"
     while read -r index min_reflected replay; do

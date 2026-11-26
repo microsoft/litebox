@@ -10,11 +10,12 @@
 //! exits with 0 if the test passed, 1 otherwise.
 //!
 //! A test is a `programs.json` (see [`programs`]). The client creates and starts one container,
-//! whose init is `--init` (a program that waits until killed), runs the entries in order (until one
-//! fails, unless `--keep-going`, or the guest service stops answering), each run an exec process, the runs of a group at once, then kills
-//! the container's init. It prints a line per run, `PASS  run INDEX (LABEL)` or `FAIL  run INDEX
-//! (LABEL): WHY`, and, if any failed, last, `FAIL: failed: run INDEX (LABEL), ...`. With
-//! `--counted`, it only lists the entries with checks that only the VM kernel makes
+//! whose init is `--init` (a program that waits until killed), runs the entries in order, each run
+//! an exec process, the runs of a group at once, then kills the container's init. It stops at the
+//! first failed entry (unless `--keep-going`) or when the guest service stops answering. It prints
+//! `PASS  run INDEX (LABEL)` or `FAIL  run INDEX (LABEL): WHY` per run, then, if any failed,
+//! `FAIL: failed: run INDEX (LABEL), ...`.
+//! With `--counted`, it only lists the entries with checks that only the VM kernel makes
 //! (see [`programs`]), a line `INDEX MIN_REFLECTED_SYSCALLS REPLAY` each (`REPLAY` 0 or 1), for
 //! the test harness to run each alone (`--only`) in a boot of its own, and the others together
 //! (`--skip-counted`).
@@ -69,8 +70,7 @@ struct Cli {
     /// Skips the entries that `--counted` lists.
     #[arg(long)]
     skip_counted: bool,
-    /// Runs every entry, even after one fails, instead of stopping at the first that does; but
-    /// not after the guest service stops answering.
+    /// Runs every entry, even after one fails.
     #[arg(long)]
     keep_going: bool,
     /// Lists the entries with checks that only the VM kernel makes, and exits.
@@ -147,7 +147,7 @@ fn run(cli: &Cli) -> Result<()> {
         let result = container.run_entry(first, entry);
         failures.extend(result.failures);
         lost = result.lost;
-        // Without the guest service, the next runs would fail too, naming none that failed.
+        // Without the guest service, later runs could only fail.
         if lost || (!failures.is_empty() && !cli.keep_going) {
             break;
         }

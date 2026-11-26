@@ -25,9 +25,9 @@ use ttrpc::TtrpcContext;
 
 /// A process of the fake: `/echo [CODE]` writes its input to its stdout once it ends, and exits
 /// with CODE (default 0); `/kill SIGNAL` does so too, but then SIGNAL kills it; `/lost` fails to
-/// start, as if the guest service stopped answering; `/ready` first
-/// writes `ready`, then its input as it comes, and exits once it has some. A terminal's resize
-/// writes `size ROWSxCOLUMNS` to its process's stdout.
+/// start, as a dead guest service does; `/ready` first
+/// writes `ready`, then its input as it comes, and exits once it has some. A resize writes
+/// `size ROWSxCOLUMNS`.
 #[derive(Default)]
 struct Process {
     program: String,
@@ -350,8 +350,7 @@ fn a_run_that_ends_otherwise_fails() {
     );
 }
 
-/// Even with `--keep-going`, no run runs once the guest service stops answering; the last line
-/// names the run that lost it.
+/// A dead guest service stops the runs, even with `--keep-going`.
 #[test]
 fn a_lost_guest_service_stops_the_runs() {
     let (passed, report, _) = run_client_with(
@@ -367,8 +366,7 @@ fn a_lost_guest_service_stops_the_runs() {
     );
 }
 
-/// With `--keep-going`, every run runs, and the last line names each failed one, by its name or
-/// its arguments.
+/// With `--keep-going`, every run runs; the last line names the failed ones.
 #[test]
 fn keep_going_names_every_failed_run() {
     let (passed, report, _) = run_client_with(
@@ -388,7 +386,7 @@ fn keep_going_names_every_failed_run() {
     );
 }
 
-/// A script waits for each prompt before it resizes the terminal and sends its input.
+/// A script waits for each prompt before its resize and input.
 #[test]
 fn a_script_answers_prompts_in_order() {
     let (passed, report, output) = run_client(

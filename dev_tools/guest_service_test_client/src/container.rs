@@ -63,8 +63,7 @@ impl ReadyLine {
     }
 }
 
-/// A run's progress: whether its standard output showed `ready`, whether it ended, and its
-/// standard output so far.
+/// A run's progress: `ready` seen, ended, and its standard output so far.
 #[derive(Default)]
 struct Progress {
     state: Mutex<State>,
@@ -94,8 +93,8 @@ impl Progress {
         state.ready
     }
 
-    /// Waits until the standard output has `text` at or after offset `from`, and returns the
-    /// offset after it, or `None` if the run ended first.
+    /// Waits for `text` in the standard output at or after `from`, and returns the offset after
+    /// it, or `None` if the run ended first.
     fn wait_output(&self, text: &[u8], from: usize) -> Option<usize> {
         let find = |state: &State| {
             state.stdout[from..]
@@ -117,8 +116,7 @@ impl Progress {
 pub struct EntryResult {
     /// The failed runs, as `run INDEX (LABEL)`.
     pub failures: Vec<String>,
-    /// Whether a run failed as the guest service did (e.g., as the VM ended), not as the run
-    /// ended: no other run could run.
+    /// Whether the guest service stopped answering (e.g., the VM ended).
     pub lost: bool,
 }
 
@@ -211,7 +209,7 @@ impl Container {
         let mut result = EntryResult::default();
         for ((index, run), outcome) in (first..).zip(runs).zip(outcomes) {
             let run_label = format!("run {index} ({})", run.label());
-            // A run that did not end, as the guest service stopped answering, loses the service.
+            // An error, not a check's failure: the guest service failed.
             result.lost |= outcome.is_err();
             match outcome.and_then(|outcome| check(run, &outcome)) {
                 Ok(()) => println!("PASS  {run_label}"),
@@ -310,8 +308,7 @@ impl Container {
         }
     }
 
-    /// Plays `run`'s `script` (see the `programs.json` format), until it ends or the run does; a
-    /// terminal's input stays open.
+    /// Plays `run`'s `script`, until it or the run ends.
     fn play(&self, exec_id: &str, run: &Run, progress: &Progress) {
         let mut from = 0;
         for step in &run.script {

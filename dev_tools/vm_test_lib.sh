@@ -215,8 +215,8 @@ stop_vsock() {
 # function, `$client NAME` runs alongside as the host client, and a pass needs
 # it to exit 0; its end stops the VM, and the VM's end stops it after 5s. If
 # $check names a function, a guest pass also needs `$check NAME` to succeed;
-# it prints why not otherwise. With $guest_failure_expected, a guest that
-# reports failure may pass too, if $check says so.
+# it prints why not otherwise. With $guest_failure_expected, $check also
+# judges a guest that reports failure.
 run_vm() {
     local name=$1 kernel=$2 payload=$3 log="$WORK/$1.log" status why vm_pid cpid
     local client_status=0 stopped=0 panicked=0 rebooted=0 cmdline exit_line failed_runs=
@@ -318,7 +318,7 @@ run_vm() {
         esac
         if [[ $client_status -ne 0 ]]; then
             why="${why:+$why, }host client exit status $client_status"
-            # The runs that the test client names as failed (see its docs), if any.
+            # The client's failed runs.
             failed_runs=$(sed -n 's/^FAIL: failed: //p' "$WORK/$name.client" | tail -n 1)
             why+="${failed_runs:+; failed: $failed_runs}"
         fi

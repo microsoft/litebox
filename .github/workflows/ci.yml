@@ -247,9 +247,7 @@ jobs:
           VM_CPUS=2 QEMU_ACCEL=kvm CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
       - name: Run Linux programs, with the userland runner's C tests, and OP-TEE TAs in a Cloud Hypervisor VM with stacked runners on 2 CPUs
-        # Linux programs that need a device of the VMM's, and the C programs of
-        # litebox_runner_linux_userland/tests, but those tests/hosted_skipped.json skips. The hosted
-        # test's boot runs all of its programs, some 70s in CI: TIMEOUT leaves room for slow runners.
+        # TIMEOUT: the hosted test's one boot takes some 70s.
         run: |
           export VMM=cloud-hypervisor VM_CPUS=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build"
           TIMEOUT=300 VM_MEM=6G ./dev_tools/run_linux_on_vm_userland.sh \
