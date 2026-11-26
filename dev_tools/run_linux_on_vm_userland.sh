@@ -276,13 +276,24 @@ describe_vm
 DYNAMIC_ONLY=(dynamic)
 
 mkdir -p "$WORK/rootfs"
-for src in "$TESTS_DIR"/*.c; do
+# Builds the program $1 (see the header).
+build_program() {
+    local src=$1 name
     name=$(basename "$src" .c)
     if [[ ! " ${DYNAMIC_ONLY[*]} " =~ " $name " ]]; then
         ${CC:-cc} -static -O2 -o "$WORK/rootfs/$name" "$src"
         ${CC:-cc} -static-pie -fPIE -O2 -o "$WORK/rootfs/$name-pie" "$src"
     fi
     ${CC:-cc} -O2 -o "$WORK/rootfs/$name-dyn" "$src"
+}
+# At once: each step of CI builds them all.
+builds=()
+for src in "$TESTS_DIR"/*.c; do
+    build_program "$src" &
+    builds+=("$!")
+done
+for build in "${builds[@]}"; do
+    wait "$build" || { echo "error: a program of $TESTS_DIR did not build" >&2; exit 2; }
 done
 for src in "$TESTS_DIR"/*.rs; do
     [[ -f $src ]] || continue
