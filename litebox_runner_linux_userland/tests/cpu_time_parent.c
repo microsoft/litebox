@@ -7,7 +7,6 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
-#include <string.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -115,23 +114,6 @@ static void dump_getrusage(const char *what, int who) {
     }
 }
 
-// Prints `/proc/<pid>/<file>`, if any.
-static void dump_proc(pid_t pid, const char *file) {
-    char path[64], buffer[1024];
-    snprintf(path, sizeof path, "/proc/%d/%s", (int)pid, file);
-    FILE *stream = fopen(path, "r");
-    if (stream == NULL) {
-        printf("DEBUG %s: %s\n", path, strerror(errno));
-        return;
-    }
-    size_t length = fread(buffer, 1, sizeof buffer - 1, stream);
-    fclose(stream);
-    buffer[length] = 0;
-    while (length > 0 && buffer[length - 1] == '\n') {
-        buffer[--length] = 0;
-    }
-    printf("DEBUG %s: %s\n", path, buffer);
-}
 
 // Waits up to a second for the SIGCHLD handler to run.
 static void await_sigchld(void) {
@@ -147,7 +129,7 @@ static void run_child(int report) {
     pid_t grandchild = fork_flushed();
     if (grandchild < 0) {
         perror("fork");
-        _exit(1);
+        _exit(2);
     }
     if (grandchild == 0) {
         burn();
@@ -156,7 +138,7 @@ static void run_child(int report) {
     int status;
     struct rusage usage;
     if (wait_child(grandchild, &status, &usage) != grandchild || !WIFEXITED(status)) {
-        _exit(1);
+        _exit(3);
     }
     struct rusage self, children;
     getrusage(RUSAGE_SELF, &self);
@@ -170,9 +152,18 @@ static void run_child(int report) {
                           timeval_ns(children.ru_stime),
                           clock_ns(CLOCK_PROCESS_CPUTIME_ID),
                           monotonic_ns()};
-    if (rusage_ns(&usage) != times[1] ||
-        write(report, times, sizeof times) != (ssize_t)sizeof times) {
-        _exit(1);
+    // TEMPORARY (cpu-time-stress branch): reports even on a mismatch, so that the parent's checks
+    // still have the numbers, and tells the failures apart by exit status.
+    if (write(report, times, sizeof times) != (ssize_t)sizeof times) {
+        _exit(4);
+    }
+    if (rusage_ns(&usage) != times[1]) {
+        printf("DEBUG child mismatch: wait4(grandchild) u=%lld s=%lld total=%lld, "
+               "RUSAGE_CHILDREN u=%lld s=%lld total=%lld, diff=%lld ns\n",
+               timeval_ns(usage.ru_utime), timeval_ns(usage.ru_stime), rusage_ns(&usage),
+               times[4], times[5], times[1], rusage_ns(&usage) - times[1]);
+        fflush(stdout);
+        _exit(5);
     }
     _exit(0);
 }
@@ -226,24 +217,11 @@ int main(void) {
     long long reported[8] = {0};
     CHECK(read(report[0], reported, sizeof reported) == (ssize_t)sizeof reported);
     long long read_mono = monotonic_ns();
-    // TEMPORARY (cpu-time-stress branch): the kernel's view of the exited, unreaped child.
-    if (getenv("CPU_TIME_DEBUG") != NULL) {
-        siginfo_t info = {0};
-        int waited;
-        do {
-            waited = waitid(P_PID, child, &info, WEXITED | WNOWAIT);
-        } while (waited < 0 && errno == EINTR);
-        printf("DEBUG waitid(WNOWAIT)=%d utime=%ld stime=%ld code=%d status=%d\n", waited,
-               (long)info.si_utime, (long)info.si_stime, info.si_code, info.si_status);
-        dump_proc(child, "stat");
-        dump_proc(child, "schedstat");
-        dump_proc(getpid(), "stat");
-        dump_proc(getpid(), "schedstat");
-    }
     int status;
     struct rusage usage;
     CHECK(wait_child(child, &status, &usage) == child && WIFEXITED(status) &&
           WEXITSTATUS(status) == 0);
+    printf("DEBUG child status: exited=%d code=%d\n", WIFEXITED(status), WEXITSTATUS(status));
 
     // The child's usage covers what it used until it reported and its grandchild's.
     long long child_ns = rusage_ns(&usage);
