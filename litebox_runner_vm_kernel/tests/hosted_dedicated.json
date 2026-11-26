@@ -1,0 +1,216 @@
+[
+  {
+    "argv": [
+      "/hosted/fork_chain_parent",
+      "fork",
+      "32"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "fork-chain depth=32 code=42"
+    ]
+  },
+  {
+    "argv": [
+      "/hosted/fork_chain_parent",
+      "exec",
+      "32"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "exec-chain depth=32 code=42"
+    ]
+  },
+  {
+    "argv": [
+      "/hosted/dup_directory_position",
+      "fork"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout": "duplicated directory descriptors share position: PASS\n"
+  },
+  {
+    "argv": [
+      "/hosted/dup_directory_position",
+      "exec"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout": "duplicated directory descriptors share position: PASS\n"
+  },
+  {
+    "argv": [
+      "/hosted/held_lower_dir",
+      "/held/lower"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "held lower directory ok"
+    ]
+  },
+  {
+    "argv": [
+      "/hosted/mount"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "mount tmpfs ok"
+    ]
+  },
+  {
+    "argv": [
+      "/hosted/sigreturn"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "sigreturn ok"
+    ]
+  },
+  {
+    "argv": [
+      "/hosted/async_x16"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "async x16 ok"
+    ]
+  },
+  {
+    "argv": [
+      "/hosted/svc_scratch_regs"
+    ],
+    "envp": [
+      "HOME=/"
+    ]
+  },
+  {
+    "argv": [
+      "/bin/sh",
+      "-c",
+      "trap '' HUP INT ALRM; exec /hosted/inherited_ignored_signals"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout": "SIGHUP=ignored\nSIGINT=ignored\nSIGALRM=ignored\nSIGPIPE=default\nSIGTERM=default\nsurvived SIGINT\n"
+  },
+  {
+    "argv": [
+      "/hosted/pid_namespace",
+      "unprivileged"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "pid-namespace unprivileged code=0"
+    ]
+  },
+  {
+    "argv": [
+      "/hosted/uts_ipc_namespace",
+      "unprivileged"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "uts-ipc-namespace unprivileged failures=0"
+    ]
+  },
+  {
+    "argv": [
+      "/hosted/vfork_shell_parent"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "system exited=1 code=7",
+      "popen-read cwd=/tmp",
+      "popen-read umask=0027",
+      "popen-read exited=1 code=0",
+      "popen-write exited=1 code=0",
+      "vfork-child cwd=/",
+      "vfork-child umask=0077",
+      "vfork-child kept=closed",
+      "vfork exited=1 code=0",
+      "parent cwd=/tmp umask=027 kept=1"
+    ]
+  },
+  {
+    "argv": [
+      "/hosted/vfork_job_control_parent"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "before-cmd",
+      "in-cmd",
+      "after-cmd",
+      "leader exited code=5"
+    ]
+  },
+  {
+    "argv": [
+      "/hosted/tty",
+      "jobs"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "terminal": true,
+    "script": [
+      {
+        "wait": "JOB READY",
+        "send": "\u0003"
+      }
+    ],
+    "expect_stdout_contains": [
+      "JOBS DONE"
+    ]
+  },
+  {
+    "argv": [
+      "/hosted/tcp_broker_server"
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "LISTEN ",
+      "FIRST ",
+      "BLOCKING\n",
+      "SECOND "
+    ]
+  },
+  {
+    "argv": [
+      "/bin/sh",
+      "-c",
+      "rm -f /tmp/udp_namespace; /hosted/udp_broker_namespace server >/tmp/udp_namespace & server=$!\nwhile ! { read -r word port </tmp/udp_namespace && [ \"$word\" = LISTEN ]; } 2>/dev/null; do :; done\n/hosted/udp_broker_namespace client \"$port\"; client=$?\nwait $server; echo \"client=$client server=$?\""
+    ],
+    "envp": [
+      "HOME=/"
+    ],
+    "expect_stdout_contains": [
+      "client=0 server=0"
+    ]
+  }
+]

@@ -46,6 +46,23 @@
 #   egress: sockets reach only the policy's destinations.
 #   console_flood: the console keeps 4 writers' records (check_records).
 #
+# The hosted tests, which run only when given with -t, run the C programs of
+# litebox_runner_linux_userland/tests (HOSTED_TESTS_DIR) as that runner's
+# tests do, each built once, static, as /hosted/<name>, with its tests' gcc
+# flags; they need python3 and /usr/bin/dash:
+#   hosted: each program but those its build.rs lists as dedicated or helpers,
+#     and those that litebox_runner_vm_kernel/tests/hosted_skipped.json
+#     skips, with why, must exit 0, run with HOME=/ and LITEBOX_PIPE_BROKER=1
+#     (see sendfile.c), and one that build.rs lists as with_exec_child with
+#     /hosted/vfork_exec_child.
+#   hosted_dedicated: the runs of
+#     litebox_runner_vm_kernel/tests/hosted_dedicated.json, as its dedicated
+#     tests run them, with their arguments, and checks of their output.
+#   hosted_root_init: an init test, root_init.c, as litebox.init, which must
+#     also print `root-init survived`.
+# Their root also has dash as /bin/sh, a /tmp, and a directory /held/lower,
+# with a file `entry`, both the guest's (uid 1000), for held_lower_dir.c.
+#
 # Runner processes' standard output and error go to a virtio console, backed
 # by a file.
 #
@@ -69,7 +86,8 @@
 # would be skipped is an error instead.
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
-#   -t   test to run, e.g. hello (repeatable; default: every test)
+#   -t   test to run, e.g. hello (repeatable; default: every test but the
+#        hosted ones)
 #   -r   build and run the release kernel, runner and guest service
 #   -v   print the full guest log and console output for passing runs too
 #
@@ -107,6 +125,8 @@ TESTS_DIR="$KERNEL_DIR/tests/linux"
 HOSTED_TESTS_DIR="$REPO_DIR/litebox_runner_linux_userland/tests"
 SHARED=(fork_threads_parent.c fork_interrupt_parent.c fork_event_parent.c fork_epoll_parent.c
     fork_shared_futex_parent.c)
+HOSTED_DEDICATED="$KERNEL_DIR/tests/hosted_dedicated.json"
+HOSTED_SKIPPED="$KERNEL_DIR/tests/hosted_skipped.json"
 # shellcheck source=dev_tools/vm_test_lib.sh
 source "$SCRIPT_DIR/vm_test_lib.sh"
 
@@ -144,7 +164,24 @@ virtiofsd=
 
 # Init tests (see the header): their init's path in the root.
 declare -A INIT_TESTS=([pid1]=/pid1 [init_exit]=/init_exit [writable_root]=/writable_root [egress]=/egress
-    [console_flood]=/console_flood [lifecycle]=/lifecycle)
+    [console_flood]=/console_flood [lifecycle]=/lifecycle [hosted_root_init]=/hosted/root_init)
+
+# The hosted tests (see the header), which run only when given with -t.
+HOSTED=(hosted hosted_dedicated hosted_root_init)
+
+# Whether test $1 is a hosted test.
+is_hosted() {
+    [[ " ${HOSTED[*]} " == *" $1 "* ]]
+}
+
+# Test $1's programs.json.
+test_json() {
+    case $1 in
+        hosted) echo "$WORK/hosted.json" ;;
+        hosted_dedicated) echo "$HOSTED_DEDICATED" ;;
+        *) echo "$TESTS_DIR/$1.json" ;;
+    esac
+}
 
 # Why test $1 is skipped with these CPUs or this RAM (see the header), if it
 # is.
@@ -162,6 +199,7 @@ if [[ ${#tests[@]} -eq 0 ]]; then
         tests+=("$(basename "$f" .json)")
     done
     mapfile -t -O "${#tests[@]}" tests < <(printf '%s\n' "${!INIT_TESTS[@]}" | sort)
+    mapfile -t tests < <(for t in "${tests[@]}"; do is_hosted "$t" || echo "$t"; done)
 else
     for t in "${tests[@]}"; do
         why=$(skip_reason "$t")
@@ -246,9 +284,62 @@ for src in "$TESTS_DIR"/*.rs; do
     ${RUSTC:-rustc} --edition=2024 --target x86_64-unknown-none -C opt-level=2 \
         -C relocation-model=static -o "$WORK/rootfs/$(basename "$src" .rs)" "$src"
 done
+extra_programs=()
+hosted=0
+for t in "${tests[@]}"; do
+    ! is_hosted "$t" || hosted=1
+done
+if [[ $hosted -ne 0 ]]; then
+    # The hosted sweep's programs.json, and, a line each, the programs that the hosted tests run.
+    hosted_programs=$(python3 - "$HOSTED_TESTS_DIR" "$HOSTED_SKIPPED" "$HOSTED_DEDICATED" \
+        "$WORK/hosted.json" <<'EOF'
+import json, pathlib, re, sys
+
+tests, skipped_path, dedicated, out = map(pathlib.Path, sys.argv[1:])
+# The kinds of the hosted tests' programs: their build.rs's lists of names.
+build_rs = tests.parent / "build.rs"
+lists = {
+    name: re.findall(r'"([^"]+\.c)"', body)
+    for name, body in re.findall(
+        r"const (\w+): &\[&str\] = &\[(.*?)\];", build_rs.read_text(), re.S
+    )
+}
+for name in ("DEDICATED_C_TESTS", "HELPER_C_PROGRAMS", "WITH_EXEC_CHILD_C_TESTS"):
+    if not lists.get(name):
+        sys.exit(f"error: no list {name} of C programs in {build_rs}")
+unswept = set(lists["DEDICATED_C_TESTS"] + lists["HELPER_C_PROGRAMS"])
+skipped = json.loads(skipped_path.read_text())
+for name in skipped:
+    if name in unswept or not (tests / name).is_file():
+        sys.exit(f"error: {skipped_path} skips {name}, which the sweep does not run")
+runs, programs = [], {"vfork_exec_child", "root_init"}
+for source in sorted(tests.glob("*.c")):
+    if source.name in unswept or source.name in skipped:
+        continue
+    argv = [f"/hosted/{source.stem}"]
+    if source.name in lists["WITH_EXEC_CHILD_C_TESTS"]:
+        argv.append("/hosted/vfork_exec_child")
+    runs.append({"argv": argv, "envp": ["HOME=/", "LITEBOX_PIPE_BROKER=1"]})
+    programs.add(source.stem)
+programs.update(re.findall(r"/hosted/(\w+)", dedicated.read_text()))
+out.write_text(json.dumps(runs, indent=1))
+print("\n".join(sorted(programs)))
+EOF
+    )
+    mkdir -p "$WORK/rootfs/hosted"
+    # As the hosted tests build them (gcc -static), whose output they don't show.
+    # shellcheck disable=SC2016 # expanded by the inner shell
+    xargs -P "$(nproc)" -I{} sh -c '${CC:-cc} -static -w -o "$1/{}" "$2/{}.c"' _ \
+        "$WORK/rootfs/hosted" "$HOSTED_TESTS_DIR" <<<"$hosted_programs"
+    # dash as /bin/sh, and a /tmp, for the shells that programs start.
+    mkdir -p "$WORK/rootfs/bin" "$WORK/rootfs/tmp"
+    cp /usr/bin/dash "$WORK/rootfs/bin/sh"
+    : >"$WORK/rootfs/tmp/.keep"
+    extra_programs+=(/usr/bin/dash)
+fi
 # ldd's lines are `soname => /path (address)` or `/path (address)`, after a
 # `program:` line per program; the vDSO has no path.
-libs=$(ldd "$WORK"/rootfs/*-dyn |
+libs=$(ldd "$WORK"/rootfs/*-dyn "${extra_programs[@]}" |
     awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// && $2 ~ /^\(/ { print $1 }' | sort -u)
 # Not a link-time dependency, but glibc loads it (dlopen) to unwind threads
 # for pthread_exit and pthread_cancel; without it, they abort.
@@ -263,6 +354,13 @@ cp "$GUEST_SERVICE" "$WORK/rootfs/.litebox/guest-service"
 # Files only: the broker's root infers directories from paths.
 (cd "$WORK/rootfs" && find . -type f -printf '%P\n' |
     tar --format=ustar --owner=0 --group=0 -cf "$WORK/rootfs.tar" -T -)
+if [[ $hosted -ne 0 ]]; then
+    # The guest's directory for held_lower_dir.c (see the header).
+    mkdir -p "$WORK/held/held/lower"
+    : >"$WORK/held/held/lower/entry"
+    tar --format=ustar --owner=1000 --group=1000 --no-recursion -rf "$WORK/rootfs.tar" \
+        -C "$WORK/held" held held/lower held/lower/entry
+fi
 
 # Packs test $1's payload, with the root $2, as $WORK/$1.tar: the userland
 # runner, the root, and the test's policy, if any.
@@ -472,6 +570,8 @@ check_boot() {
         grep -qF '[litebox] init exit status: exited 0' "$WORK/$1.log" ||
             { echo "no exit status 0 of init in the log"; return 1; }
         [[ $1 != console_flood ]] || check_records "$WORK/$1.console" 4 512
+        [[ $1 != hosted_root_init ]] || grep -qF "root-init survived" "$WORK/$1.console" ||
+            { echo "no \`root-init survived\` on the console"; return 1; }
         return
     fi
     # The container's end must end every guest process (e.g., fork.c's).
@@ -531,8 +631,8 @@ boot_client() {
 }
 
 for test in "${tests[@]}"; do
-    [[ -f "$TESTS_DIR/$test.json" || -n ${INIT_TESTS[$test]:-} ]] ||
-        { echo "error: no test $TESTS_DIR/$test.json" >&2; exit 2; }
+    json=$(test_json "$test")
+    [[ -f $json || -n ${INIT_TESTS[$test]:-} ]] || { echo "error: no test $json" >&2; exit 2; }
     why=$(skip_reason "$test")
     if [[ -n $why ]]; then
         echo "SKIP  $test  ($why: see the header)"
@@ -557,13 +657,13 @@ for test in "${tests[@]}"; do
         continue
     fi
     pack_payload "$test" "$WORK/rootfs.tar"
-    counts=$("$CLIENT" --counted "$TESTS_DIR/$test.json") || {
+    counts=$("$CLIENT" --counted "$json") || {
         echo "FAIL  $test  (guest_service_test_client --counted failed: $counts)"
         fail=$((fail + 1))
         failed+=("$test")
         continue
     }
-    client_args=(--skip-counted "$TESTS_DIR/$test.json")
+    client_args=(--skip-counted "$json")
     boot_client "$test"
     while read -r index min_reflected replay; do
         [[ -n $index ]] || continue
@@ -571,7 +671,7 @@ for test in "${tests[@]}"; do
         [[ $replay -eq 1 ]] || replay=
         kernel_args=
         [[ -z $replay || $profile != debug ]] || kernel_args=litebox.replay=1
-        client_args=(--only "$index" "$TESTS_DIR/$test.json")
+        client_args=(--only "$index" "$json")
         LITEBOX_LOG=$counted_log boot_client "$test.$index"
     done <<<"$counts"
 done

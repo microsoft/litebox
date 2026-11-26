@@ -1,0 +1,14 @@
+{
+  "cpu_time_parent.c": "the VM's userland platform measures no CPU time: clock_gettime on a CPU clock fails with EINVAL",
+  "fork_inet_parent.c": "expects LiteBox's initial process to adopt an orphan, which in the VM the container's init does",
+  "process_group_parent.c": "expects no other process to remain, but in the VM the container's init does",
+  "process_tree_parent.c": "expects LiteBox's initial process to have no parent and adopt orphans, which in the VM the container's init does",
+  "rlimit_parent.c": "hangs: without CPU time, nothing enforces RLIMIT_CPU",
+  "shared_file_mapping.c": "a shared mapping of a file in the VM's root fails with ENODEV",
+  "tcp_broker.c": "needs its broker test's host server; with one, shutdown(SHUT_WR) of a reset socket returns 0, not ENOTCONN",
+  "tcp_broker_server.c": "its output is checked in hosted_dedicated.json",
+  "tcp_broker_states.c": "needs its broker test's host servers; with them, poll of a reset socket lacks POLLHUP",
+  "udp_broker.c": "needs its broker test's host server; with one, UDP payloads above 1472 bytes fail with EINVAL (no IPv4 fragmentation)",
+  "udp_broker_namespace.c": "needs a server and a client run together: see hosted_dedicated.json",
+  "vsock_unsupported.c": "checks the userland policy; the VM supports AF_VSOCK"
+}

@@ -252,6 +252,11 @@ jobs:
           VM_MEM=6G ./dev_tools/run_linux_on_vm_userland.sh \
             -t hello -t pid1 -t smp -t highmem -t console_flood -t net -t vsock_hybrid -t virtiofs
           ./dev_tools/run_optee_on_vm_userland.sh -t hello-ta
+      - name: Run the userland runner's C tests in a Cloud Hypervisor VM with stacked runners on 2 CPUs
+        # The C programs of litebox_runner_linux_userland/tests, but those tests/hosted_skipped.json skips.
+        run: |
+          VMM=cloud-hypervisor VM_CPUS=2 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+            ./dev_tools/run_linux_on_vm_userland.sh -t hosted -t hosted_dedicated -t hosted_root_init
       - name: Run threaded Linux programs in a Cloud Hypervisor VM with stacked runners on 4 CPUs, release
         run: |
           VMM=cloud-hypervisor VM_CPUS=4 CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
