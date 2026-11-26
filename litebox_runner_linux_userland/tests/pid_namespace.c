@@ -2,8 +2,9 @@
 // Licensed under the MIT license.
 
 // Checks PID namespaces: creating them with `clone` and `unshare`, the IDs processes see in them,
-// orphans, the first process's signal rules and exit, and `CLONE_PARENT`. Runs as guest root, or,
-// with the argument `unprivileged`, as another user, who can't create namespaces.
+// orphans, the first process's signal rules and exit, `CLONE_PARENT`, and the segment creator IDs
+// processes see. Runs as guest root, or, with the argument `unprivileged`, as another user, who
+// can't create namespaces.
 //
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -18,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -201,6 +203,24 @@ static void clone_makes_a_first_process(void) {
     CHECK(fstatat(child_dir, ".", &status, 0) == -1 && errno == ENOENT);
     close(child_dir);
     close(proc);
+}
+
+// A process in a namespace that doesn't number a segment's creator sees its ID as 0.
+static void a_segment_creator_outside_the_namespace_is_0(void) {
+    int id = shmget(IPC_PRIVATE, 1, 0600);
+    CHECK(id >= 0);
+    if (id < 0) {
+        return;
+    }
+    pid_t child = clone_child(CLONE_NEWPID);
+    if (child == 0) {
+        struct shmid_ds ds;
+        _exit(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_cpid == 0 ? 0 : 1);
+    }
+    CHECK(child > 1 && exited_with(child, 0));
+    struct shmid_ds ds;
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_cpid == getpid());
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
 }
 
 // After `unshare`, the caller keeps its ID, its next child is the new namespace's first process,
@@ -513,6 +533,7 @@ int main(int argc, char **argv) {
     self_path = argv[0];
     setvbuf(stdout, NULL, _IONBF, 0);
     clone_makes_a_first_process();
+    a_segment_creator_outside_the_namespace_is_0();
     unshare_makes_a_namespace_for_children();
     the_first_process_ignores_unhandled_signals();
     the_first_process_dies_of_an_unhandled_fault();

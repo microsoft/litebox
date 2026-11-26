@@ -6,8 +6,7 @@
 // namespace share them, and that a new namespace starts with a copy. Runs as guest root, or, with
 // the argument `unprivileged`, as another user, who can't create namespaces or set the names.
 //
-// LiteBox has no IPC objects, so nothing tells a new IPC namespace apart from its creator's. Those
-// checks see only whether creating one succeeds.
+// A new IPC namespace starts without its creator's shared memory segments.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -19,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/shm.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -102,6 +102,39 @@ static void clone_creates_namespaces(void) {
     CHECK(child > 0 && exited_with(child, CHILD_CODE));
     child = vfork_child(CLONE_NEWUTS | CLONE_NEWIPC, exit_now, NULL);
     CHECK(child > 0 && exited_with(child, CHILD_CODE));
+}
+
+static void segment_namespaces_are_separate(void) {
+    key_t key = getpid();
+    int parent = shmget(key, 1, IPC_CREAT | IPC_EXCL | 0600);
+    CHECK(parent >= 0);
+    if (parent < 0) {
+        return;
+    }
+    for (int use_clone = 0; use_clone <= 1; ++use_clone) {
+        pid_t child = use_clone ? clone_child(CLONE_NEWIPC) : fork();
+        if (child == 0) {
+            if ((!use_clone && unshare(CLONE_NEWIPC) != 0) ||
+                shmget(key, 0, 0) != -1 || errno != ENOENT) {
+                _exit(1);
+            }
+            struct shmid_ds ds;
+            if (shmctl(parent, IPC_STAT, &ds) != -1 || errno != EINVAL) {
+                _exit(2);
+            }
+            // The new namespace's summary and indexes cover only its own segments.
+            struct shm_info usage;
+            if (shmctl(0, SHM_INFO, (struct shmid_ds *)&usage) != 0 || usage.used_ids != 0 ||
+                usage.shm_tot != 0 || shmctl(0, SHM_STAT_ANY, &ds) != -1 || errno != EINVAL) {
+                _exit(4);
+            }
+            int local = shmget(key, 1, IPC_CREAT | IPC_EXCL | 0600);
+            _exit(local >= 0 && shmctl(local, IPC_RMID, NULL) == 0 ? CHILD_CODE : 3);
+        }
+        CHECK(child > 0 && exited_with(child, CHILD_CODE));
+        CHECK(shmget(key, 0, 0) == parent);
+    }
+    CHECK(shmctl(parent, IPC_RMID, NULL) == 0);
 }
 
 // Runs `check` in a new child, which `check` may change, and returns whether it returned 0.
@@ -497,6 +530,7 @@ int main(int argc, char **argv) {
     set_and_read_names();
     children_share_the_names();
     new_namespaces_are_separate();
+    segment_namespaces_are_separate();
     vfork_children_have_their_own_names();
     unshare_copies_the_names();
     printf("uts-ipc-namespace failures=%d\n", failures);

@@ -14,6 +14,7 @@ pub(crate) mod net;
 pub(crate) mod pidfd;
 pub(crate) mod pipe;
 pub mod process;
+mod shm;
 pub(crate) mod timerfd;
 pub(crate) mod unix;
 pub(crate) mod vsock;
