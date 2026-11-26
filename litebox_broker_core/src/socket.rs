@@ -500,9 +500,9 @@ pub enum SocketAddressing {
     /// each guest port, at [`GUEST_IPV4_ADDRESS`], loopback, or the wildcard
     /// address, in a namespace of its own, independent of host ports.
     /// Connections between guest addresses stay within the provider. Other
-    /// destinations are external and reached through host sockets as
-    /// destination policy permits; [`HOST_GATEWAY_IPV4_ADDRESS`] names the
-    /// host's loopback.
+    /// destinations, including [`HOST_GATEWAY_IPV4_ADDRESS`], are external;
+    /// the provider reaches them as destination policy permits, e.g., through
+    /// host sockets or a network device.
     #[default]
     Isolated,
     /// Each guest TCP socket is a host socket at its own host address and
@@ -513,6 +513,9 @@ pub enum SocketAddressing {
     /// provider's own sockets may stay within the provider; any other
     /// destination is reached only as destination policy permits, as
     /// [`SocketEgress`] describes.
+    ///
+    /// Core supports only TCP with this mode, so a provider reporting it must
+    /// fail [`SocketProvider::create`] for UDP sockets.
     Host,
 }
 
@@ -547,12 +550,14 @@ pub enum SocketEgress {
     /// having checked its destination itself.
     Permitted,
     /// With [`SocketAddressing::Host`], policy permits the destination only
-    /// if a listener of the provider's own sockets serves it. The provider
-    /// decides that in the same step as the connect, so that the listener
-    /// cannot close in between. A destination no such listener serves fails
-    /// the connect with [`SocketError::ConnectionRefused`] if it is an
-    /// address of the host's own, at which a host refuses a port nobody
-    /// listens at. Otherwise policy denies it, with
+    /// if a listener of the provider's own sockets serves it, so the provider
+    /// must not connect to it from the host. It checks for such a listener in
+    /// the same step as the connect, so that the listener cannot close in
+    /// between, and connects to one within the provider. Without one, if the
+    /// destination is one of the host's own addresses, the provider fails the
+    /// connect as a host refuses it, with [`SocketConnectionStatus::Failed`]
+    /// and [`SocketError::ConnectionRefused`], even if another host process
+    /// listens there. Otherwise policy denies it, with
     /// [`PlatformConnectError::Rejected`] and [`SocketError::PolicyDenied`],
     /// which leaves the socket as it was, as a destination core denies does.
     ServedOnly,
@@ -688,9 +693,13 @@ pub trait PlatformSocket: Send + Sync {
     /// unchanged from one whose state is indeterminate. Once an external
     /// host-socket connect may have started, implementations must retain enough
     /// platform state to settle or conservatively retire it without
-    /// reconstructing its lifecycle during teardown. A guest TCP attempt
-    /// receives a source lease. An internal path must move it through to
-    /// [`AcceptedPlatformSocket`]; external paths may drop it. Returning
+    /// reconstructing its lifecycle during teardown. Core passes a source
+    /// lease only to a [`SocketAddressing::Isolated`] TCP attempt whose
+    /// destination is within the guest network. An internal path must move
+    /// it through to [`AcceptedPlatformSocket`]; external paths may drop it.
+    /// A [`SocketAddressing::Host`] provider that connects within itself
+    /// names the connector with a lease of its own instead, which retains the
+    /// connector's port (see [`GuestSourceLease::retaining`]). Returning
     /// [`PlatformConnectError::PeerUnchanged`] or
     /// [`PlatformConnectError::Rejected`] requires releasing the lease;
     /// [`PlatformSocket::retire`] must release one retained by an indeterminate
@@ -699,10 +708,7 @@ pub trait PlatformSocket: Send + Sync {
     /// [`SocketAddressing::normalize_destination`] before choosing a host-socket target.
     ///
     /// `egress` is what destination policy lets the connect reach, as
-    /// [`SocketEgress`] describes. With [`SocketAddressing::Host`], a guest TCP
-    /// attempt receives no lease; the provider names the source of a
-    /// connection that stays within it with its own lease, which retains the
-    /// connector's port.
+    /// [`SocketEgress`] describes.
     fn connect(
         &self,
         address: SocketAddrV4,
@@ -922,11 +928,14 @@ pub fn create(
 /// address fail with `ConnectionRefused` without changing the socket.
 /// Otherwise an authorized attempt first binds an unbound socket.
 /// Connect never reports [`SocketConnectionStatus::Failed`]: a failed attempt
-/// is a [`SocketOutcome::Failed`], after which a stream is unconnected but
-/// fails every later attempt the same way. UDP connects complete
-/// synchronously, and a failed attempt preserves the previous peer. Policy
-/// denial is also a [`SocketOutcome::Failed`] that preserves existing state:
-/// a previously unbound stream remains unbound and an existing bind is kept.
+/// is a [`SocketOutcome::Failed`]. After an attempt fails, a stream is
+/// unconnected but fails every later attempt the same way, except after an
+/// attempt that policy denies or the platform rejects (see
+/// [`PlatformConnectError::Rejected`]), which leaves it free to try again.
+/// Such an attempt keeps an existing bind, and an unbound stream stays
+/// unbound after a policy denial or, with [`SocketAddressing::Host`], any
+/// rejection. UDP connects complete synchronously, and a failed attempt
+/// preserves the previous peer.
 pub fn connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
