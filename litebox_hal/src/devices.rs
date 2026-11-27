@@ -193,6 +193,18 @@ impl fmt::Display for NetworkDevice {
     }
 }
 
+/// Whether a polled request's reply came (see [`FuseDevice::transmit_polled`]).
+#[derive(Debug)]
+pub enum Polled<W> {
+    /// Its length, as [`FuseDevice::receive`] gives it.
+    Received(usize),
+    /// Not yet: the caller waits with this (e.g., registered for the
+    /// interrupt's wake), then looks. The device interrupts once it answers
+    /// only if it [interrupts](FuseDevice::interrupts) at all: else the caller
+    /// must look again on its own, within a bounded wait.
+    Waiting(W),
+}
+
 /// A host directory served over FUSE, one request at a time (see
 /// [`crate::virtio::fs`]), through bytes shared with the device ([`Shared`]).
 /// Not internally synchronized.
@@ -243,9 +255,52 @@ impl FuseDevice {
         self.0.payload()
     }
 
-    /// See [`VirtioFs::transmit`].
+    /// See [`VirtioFs::transmit`], the device interrupting as it answers
+    /// (e.g., for a caller that halts until then).
     pub fn transmit(&mut self, request: usize, payload: usize, room: usize) -> bool {
-        self.0.transmit(request, payload, room)
+        self.0.transmit(request, payload, room, true)
+    }
+
+    /// Queues a request as [`Self::transmit`] does, but with the device's
+    /// interrupt off (by event index where the device offers it, as some
+    /// ignore the flag: see [`crate::virtio::fs`]), and looks for its reply
+    /// while `poll`, called before each look, returns true. Then calls
+    /// `prepare` (e.g., registering for the interrupt's wake), has the device
+    /// interrupt as it answers, and looks once more if it answered meanwhile:
+    /// so a reply that came before the device was asked to interrupt is seen
+    /// then, and one after interrupts, with `prepare` done. The reply's length
+    /// is [`Self::receive`]'s. `None` if a request is in flight.
+    ///
+    /// # Panics
+    ///
+    /// As [`VirtioFs::transmit`].
+    pub fn transmit_polled<W>(
+        &mut self,
+        request: usize,
+        payload: usize,
+        room: usize,
+        mut poll: impl FnMut() -> bool,
+        prepare: impl FnOnce() -> W,
+    ) -> Option<Polled<W>> {
+        if !self.0.transmit(request, payload, room, false) {
+            return None;
+        }
+        while poll() {
+            if let Some(len) = self.0.receive() {
+                return Some(Polled::Received(len));
+            }
+            core::hint::spin_loop();
+        }
+        let waiting = prepare();
+        Some(
+            if self.0.enable_interrupts()
+                && let Some(len) = self.0.receive()
+            {
+                Polled::Received(len)
+            } else {
+                Polled::Waiting(waiting)
+            },
+        )
     }
 
     /// See [`VirtioFs::receive`].
@@ -437,5 +492,83 @@ impl fmt::Display for VsockDevice {
             self.interrupts(),
             self.0.guest_cid()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::{FuseDevice, Polled};
+    use crate::virtio::fs::{OUT_HEADER_SIZE, VirtioFs};
+    use crate::virtio::queue::testing::{Registers, device_returns};
+    use alloc::boxed::Box;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// A polled request's reply, if there before the call, is found by a look
+    /// of the poll, which goes on while `poll` says so, or by the last look,
+    /// which comes after `prepare`; if not, the caller waits. The device is
+    /// asked to interrupt only once the poll is over, and then always: by the
+    /// flag, and by an event index, which arms one chain at a time. Each
+    /// request, without a payload, is one chain, whose head is 0.
+    #[test]
+    fn a_polled_requests_reply_is_never_missed() {
+        let len = u32::try_from(OUT_HEADER_SIZE).unwrap();
+        let received = |polled: Option<Polled<()>>| match polled {
+            Some(Polled::Received(received)) => received == len as usize,
+            _ => false,
+        };
+        // A polled request whose `poll` says yes `looks` times: how many times
+        // it was called, and the result.
+        let request = |fuse: &mut FuseDevice, looks: usize| {
+            let mut polls = 0;
+            let poll = || {
+                polls += 1;
+                polls <= looks
+            };
+            let polled = fuse.transmit_polled(4, 0, 0, poll, || ());
+            (polls, polled)
+        };
+        for event_index in [false, true] {
+            let registers = Registers::new();
+            let mut fuse = FuseDevice(Box::new(VirtioFs::in_memory(&registers, event_index)));
+            // There: the poll's first look finds it, with the interrupt off.
+            device_returns(fuse.0.requests(), 0, 0, len);
+            let (polls, polled) = request(&mut fuse, 1);
+            assert!(received(polled));
+            assert_eq!(polls, 1);
+            assert!(!fuse.0.requests().asks_to_interrupt(), "during the poll");
+            // There, with the poll over at once: the last look finds it, with
+            // the interrupt on (an event index armed the chain found, not the
+            // next).
+            device_returns(fuse.0.requests(), 1, 0, len);
+            let (_, polled) = request(&mut fuse, 0);
+            assert!(received(polled));
+            assert_eq!(
+                fuse.0.requests().asks_to_interrupt(),
+                !event_index,
+                "after the poll"
+            );
+            // Not there: the poll looks while `poll` says so, then the caller
+            // waits, with the interrupt on.
+            let (polls, polled) = request(&mut fuse, 3);
+            assert!(matches!(polled, Some(Polled::Waiting(()))));
+            assert_eq!(polls, 4);
+            assert!(fuse.0.requests().asks_to_interrupt(), "waiting");
+            device_returns(fuse.0.requests(), 2, 0, len);
+            assert_eq!(fuse.receive(), Some(len as usize));
+            // `prepare` comes before the arming and the last look: one that
+            // stops the call leaves the interrupt off and the reply there.
+            device_returns(fuse.0.requests(), 3, 0, len);
+            let stopped = catch_unwind(AssertUnwindSafe(|| {
+                fuse.transmit_polled(4, 0, 0, || false, || panic!("prepare"))
+            }));
+            assert!(stopped.is_err());
+            assert!(
+                !fuse.0.requests().asks_to_interrupt(),
+                "armed only after prepare"
+            );
+            assert_eq!(fuse.receive(), Some(len as usize));
+        }
     }
 }

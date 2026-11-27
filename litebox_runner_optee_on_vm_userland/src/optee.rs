@@ -195,6 +195,7 @@ pub fn serve(info: &StartupInfo) -> ! {
         // Requires upcalls, registered by `ready`.
         check_guest_memory_access();
         check_lockdown_validation();
+        #[cfg(debug_assertions)]
         litebox_broker_local_vm_userland::self_check(&notifications, platform);
     }
     // As in the Linux runner: the platform's waits and interrupts dispatch

@@ -1,27 +1,28 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker timers on the kernel clock. Alarms fire when the broker runs: on
-//! each futex operation on the control ring and each poll of a blocked wait,
-//! after the kernel halts until the earliest deadline
-//! ([`KernelTimers::next_deadline`]), and when that deadline interrupts a
-//! running process. A fired alarm publishes
+//! Broker timers on the kernel clock. Alarms fire as the broker looks at its
+//! sources: on the source thread, which sleeps until the earliest deadline,
+//! and after each serve. A fired alarm publishes
 //! its timer's readiness to its watchers (e.g., processes sharing the timer
 //! across fork), through their associations' notification rings.
 //!
 //! Every armed timer interrupts the running process when due, whether or not
 //! anything watches it: a fast periodic timer file interrupts even a busy
-//! loop every period.
+//! loop every period. The kernel reads when the broker must next run as the
+//! broker publishes it ([`PublishedDeadline`]), without its locks.
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use litebox_broker_core::readiness::SharedReadinessWatchers;
 use litebox_broker_core::timer::{Alarm, TimerProvider};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_common_vm_abi::WallClock;
 use litebox_platform::time::TimeProvider as _;
+use litebox_platform_vm_kernel::kthread::{Prepared, WaitQueue};
 use litebox_platform_vm_kernel::{Instant, VmKernel};
 use spin::mutex::SpinMutex;
 
@@ -31,6 +32,8 @@ pub(crate) struct KernelTimers {
     wall_clock: WallClock,
     /// Every alarm not yet dropped.
     alarms: SpinMutex<Vec<Weak<KernelAlarm>>>,
+    /// Lowered as an alarm is set.
+    published: Arc<PublishedDeadline>,
 }
 
 struct KernelAlarm {
@@ -40,20 +43,90 @@ struct KernelAlarm {
 }
 
 /// Dropping it cancels the alarm.
-struct AlarmHandle(Arc<KernelAlarm>);
+struct AlarmHandle {
+    alarm: Arc<KernelAlarm>,
+    published: Arc<PublishedDeadline>,
+}
 
 impl Alarm for AlarmHandle {
     fn set(&self, deadline: Option<Duration>) {
-        *self.0.deadline.lock() = deadline;
+        *self.alarm.deadline.lock() = deadline;
+        if let Some(deadline) = deadline {
+            self.published.lower(instant(deadline));
+        }
+    }
+}
+
+/// When the broker must next run, for the kernel to read without the broker's
+/// locks: the earliest of its sources' deadlines, published anew as they may
+/// change (see `publish_deadline`) and lowered as an alarm is set. It
+/// may be early (e.g., an alarm since cancelled), which costs a poll, but never
+/// late: one lock orders publications and lowerings, so that a publication
+/// computed before an alarm was set never replaces its lowering.
+/// The source thread sleeps until it: a lowering wakes it.
+pub(crate) struct PublishedDeadline {
+    /// In nanoseconds; `u64::MAX` for none.
+    nanos: AtomicU64,
+    /// Orders publications and lowerings.
+    publishing: SpinMutex<()>,
+    source: WaitQueue,
+}
+
+impl PublishedDeadline {
+    pub(crate) fn new() -> Self {
+        Self {
+            nanos: AtomicU64::new(u64::MAX),
+            publishing: SpinMutex::new(()),
+            source: WaitQueue::new(),
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<Instant> {
+        let nanos = self.nanos.load(Ordering::SeqCst);
+        (nanos != u64::MAX).then(|| Instant::from_nanos(nanos))
+    }
+
+    /// Publishes the deadline `next` computes: whether it is earlier than before.
+    pub(crate) fn publish(&self, next: impl FnOnce() -> Option<Instant>) -> bool {
+        let _publishing = self.publishing.lock();
+        let nanos = next().map_or(u64::MAX, Instant::as_nanos);
+        self.nanos.swap(nanos, Ordering::SeqCst) > nanos
+    }
+
+    /// Lowers the published deadline to `deadline`, if earlier, then waking
+    /// the source thread.
+    fn lower(&self, deadline: Instant) {
+        let lowered = {
+            let _publishing = self.publishing.lock();
+            self.nanos.fetch_min(deadline.as_nanos(), Ordering::SeqCst) > deadline.as_nanos()
+        };
+        if lowered {
+            self.wake_source();
+        }
+    }
+
+    /// For the source thread, to sleep until the published deadline.
+    pub(crate) fn prepare_source(&self) -> Prepared<'_> {
+        self.source.prepare()
+    }
+
+    pub(crate) fn wake_source(&self) {
+        self.source.wake(1);
     }
 }
 
 impl KernelTimers {
-    pub(crate) fn new(platform: &'static VmKernel, wall_clock: WallClock) -> Self {
+    /// Its alarms lower `published` as they are set.
+    pub(crate) fn new(
+        platform: &'static VmKernel,
+        wall_clock: WallClock,
+        published: Arc<PublishedDeadline>,
+    ) -> Self {
         Self {
             platform,
             wall_clock,
             alarms: SpinMutex::new(Vec::new()),
+            published,
         }
     }
 
@@ -114,7 +187,10 @@ impl TimerProvider for KernelTimers {
             watchers,
         });
         self.alarms.lock().push(Arc::downgrade(&alarm));
-        Ok(Box::new(AlarmHandle(alarm)))
+        Ok(Box::new(AlarmHandle {
+            alarm,
+            published: self.published.clone(),
+        }))
     }
 }
 

@@ -169,7 +169,7 @@
 //!   (`StartChildWithExistingRunner`), which [`encode_clone_descriptor`]
 //!   describes. The kernel then makes the clone's handshake, as a launched
 //!   process's, with the request runners make (for the current
-//!   `litebox_broker_protocol` version), before the clone runs. The clone's
+//!   `litebox_broker_protocol` version), as the clone runs. The clone's
 //!   [`CallId::BrokerHandshake`] returns its response, with the startup data
 //!   passed along, if its request is that one, else
 //!   [`Status::InvalidArgument`]; either way, it is the clone's one attempt.
@@ -179,8 +179,8 @@
 //!   published requests apart from the call, as the userland broker's
 //!   workers do; so on a word of the control ring:
 //!   - [`FutexOp::Wake`] on the requests' producer wake counter has the kernel
-//!     serve them (before the call returns, unless a request waits, e.g., for
-//!     a device); on other words, it wakes nothing.
+//!     serve them before the call returns, unless it serves them already; on
+//!     other words, it wakes nothing.
 //!   - [`FutexOp::Wait`] needs no wake: it returns once the word differs from
 //!     `expected`, the kernel serving the published requests meanwhile. It
 //!     is not interrupted ([`Status::Interrupted`]); a thread interrupted
