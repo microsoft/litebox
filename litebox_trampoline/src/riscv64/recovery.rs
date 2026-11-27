@@ -8,10 +8,13 @@
 //! never touches index 3: physical gp is the runtime's, and the platform
 //! substitutes [`GateTls::guest_gp`](super::GateTls::guest_gp).
 //!
-//! A gate changes no guest-visible state before its last [`GateTls`] write,
-//! other than its scratch register (saved in `spill`) and, for `ecall`,
-//! through the runtime. So a context interrupted before the reload restarts
-//! the original instruction, and one at or after the reload completes it:
+//! Apart from its scratch register (saved in `spill`), a gate changes
+//! guest-visible state only in the instruction just before its reload: the
+//! `GUEST_GP` store, a relocated instruction that does not write gp, or, for
+//! `ecall`, the `jalr` into the runtime, which returns to the reload only
+//! after completing the syscall. So a context interrupted before the reload
+//! restarts the original instruction, and one at or after the reload
+//! completes it:
 //!
 //! | Interrupted at        | Scratch register | pc        |
 //! | --------------------- | ---------------- | --------- |
@@ -20,7 +23,7 @@
 //! | the reload            | `spill`          | `next`    |
 //! | the return `jal`      | unchanged        | `next`    |
 //!
-//! Recovery decodes only the gate, which is in the readable trampoline. A
+//! Recovery needs to read only the gate, which is in the readable trampoline. A
 //! restart resumes at the site when it is known: for `ecall`, which has no
 //! compressed form, the site is always `next - 4`; for other gates it is the
 //! instruction before `next` that jumps to the gate, if that can be read.
@@ -30,14 +33,10 @@
 //!
 //! An `ecall` gate is at its reload only after the runtime has completed the
 //! syscall; [`canonicalize_syscall_entry`] handles a context interrupted when
-//! entering the runtime, before the syscall. A restart re-executes at most a
-//! relocated load or computation, which wrote only the scratch register: a
-//! relocated store is followed directly by the reload.
+//! entering the runtime, before the syscall.
 //!
 //! Gates are recognized by their exact form. Guest code never contains one,
 //! as the rewriter replaces every instruction with a gp operand.
-//!
-//! [`GateTls`]: super::GateTls
 
 use super::gate::{self, Form, MAX_GATE_WORDS, Template};
 
@@ -97,9 +96,9 @@ fn locate(pc: usize, read: &mut impl FnMut(usize, &mut [u8]) -> bool) -> Option<
         return None;
     }
     // Gates are contiguous whole words, and none contains another's first
-    // instruction, so at most one candidate decodes. Nor is a gate a prefix
-    // of another, so a candidate is read only until it decodes: the words
-    // after a gate may be unmapped.
+    // instruction, so at most one decoded candidate contains pc. Nor is a gate
+    // a prefix of another, so a candidate is read only until it decodes: the
+    // words after a gate may be unmapped.
     for back in 0..MAX_GATE_WORDS {
         let Some(start) = pc.checked_sub(back * 4) else {
             break;
@@ -168,8 +167,8 @@ fn site_of(
 /// Maps a context interrupted inside a gate to the guest context it stands
 /// for, given the interrupted thread's [`GateTls::spill`](super::GateTls::spill).
 /// A [`GateInterruption::Synchronous`] fault of a gate's own [`GateTls`]
-/// access is [`GateSignalResult::InvalidRuntimeState`]; any other
-/// interruption is canonicalized alike.
+/// access is [`GateSignalResult::InvalidRuntimeState`]; every other
+/// interruption is canonicalized the same way, whether synchronous or not.
 ///
 /// `read(addr, buf)` must fill `buf` from guest memory at `addr`, returning
 /// false instead of faulting. Recovery does not allocate. Platform-specific

@@ -18,8 +18,10 @@ pub const RD: u32 = 7;
 pub const RS1: u32 = 15;
 /// Bit position of an instruction's `rs2` field.
 pub const RS2: u32 = 20;
-/// Registers a gate may borrow, in order of preference: t0, t1, t2 and t3.
-const SCRATCH: [u32; 4] = [5, 6, 7, 28];
+/// Registers a gate may borrow, in order of preference: t0, t1 and t2. A
+/// relocated instruction has at most three operands, one of them gp, so one
+/// is always free.
+const SCRATCH: [u32; 3] = [5, 6, 7];
 
 /// The longest gate: an `auipc gp` gate, or a gp read-modify-write.
 pub const MAX_GATE_WORDS: usize = 6;
@@ -137,7 +139,8 @@ pub(super) const fn compressed_jump_offset(half: u16) -> Option<i32> {
     Some(sign_extend(imm, 12))
 }
 
-/// What a rewritten site does, and so which gate [`emit`] appends.
+/// The instruction a site held before rewriting, which selects the gate
+/// [`emit`] appends.
 #[derive(Clone, Copy, Debug)]
 pub enum GateKind {
     /// `ecall`: enter the runtime through [`GateTls::syscall_entry`].
@@ -155,8 +158,8 @@ pub enum GateKind {
     /// result, so writing the scratch register must then be its only effect,
     /// as for a load or an integer computation. Any other `word` is followed
     /// directly by the reload, which completes the gate. The rewriter
-    /// relocates only loads, stores, integer computations and `lui`, and
-    /// rejects control transfers through gp.
+    /// relocates only integer loads and stores, integer computations and
+    /// `lui`, and rejects control transfers through gp.
     Gp { word: u32, fields: &'static [u32] },
 }
 
@@ -165,15 +168,14 @@ pub enum GateKind {
 /// to it.
 ///
 /// # Errors
-/// Fails if the gate would not be 4-byte aligned, or a [`GateKind::Ecall`]
-/// site is not four bytes, both of which recovery requires, the site's jump
-/// to the gate or the gate's return jump is out of range, a relocated `auipc`
-/// is out of range, or an address overflows. The first two fail before
-/// appending anything.
+/// Fails, before appending anything, if the gate would not be 4-byte aligned
+/// or a [`GateKind::Ecall`] site is not four bytes; recovery requires both.
+/// Otherwise fails if the site's jump to the gate, the gate's return jump or a
+/// relocated `auipc` is out of range, or an address overflows.
 ///
 /// # Panics
 /// Panics if `site` is not two or four bytes long or, for [`GateKind::Gp`], if
-/// `fields` names more than three registers.
+/// `fields` names all of t0, t1 and t2, which a gp operand rules out.
 pub fn emit(
     site: &mut [u8],
     pc: u64,
@@ -216,7 +218,7 @@ pub fn emit(
         }
         GateKind::Gp { mut word, fields } => {
             // Never borrow a real source or destination; e.g., sd t0,8(gp)
-            // must still store the guest t0. At most three registers are used.
+            // must still store the guest t0.
             let tmp = SCRATCH
                 .into_iter()
                 .find(|&r| fields.iter().all(|&f| reg(word, f) != r))
