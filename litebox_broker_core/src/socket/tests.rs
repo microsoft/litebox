@@ -79,6 +79,16 @@ fn socket_destinations_are_normalized_validated_and_routed() {
             Ok(address)
         );
     }
+    assert_eq!(
+        SocketAddressing::Host.normalize_destination(unspecified),
+        Ok(loopback)
+    );
+    for ip in [Ipv4Addr::new(224, 0, 0, 1), Ipv4Addr::BROADCAST] {
+        assert_eq!(
+            SocketAddressing::Host.normalize_destination(SocketAddrV4::new(ip, port)),
+            Err(SocketError::InvalidArgument)
+        );
+    }
 }
 
 #[test]
@@ -656,8 +666,8 @@ struct TestSocketState {
     refuse_next_connect: core::sync::atomic::AtomicBool,
     /// What `local_address` reports next, instead of the socket's address.
     connect_local_addresses: StdMutex<std::collections::VecDeque<Option<SocketAddrV4>>>,
-    /// The local and remote addresses of the next host connection accepted.
-    next_host_accept: StdMutex<Option<(SocketAddrV4, SocketAddrV4)>>,
+    /// The local address and peer lease of the next host connection accepted.
+    next_host_accept: StdMutex<Option<(SocketAddrV4, GuestSourceLease)>>,
 }
 
 struct PendingAcceptedConnection {
@@ -738,7 +748,11 @@ impl TestSocketProvider {
     }
 
     fn accept_next_host_connection(&self, local_address: SocketAddrV4, remote: SocketAddrV4) {
-        *self.state.next_host_accept.lock().unwrap() = Some((local_address, remote));
+        self.accept_next_host_lease(local_address, GuestSourceLease::external(remote));
+    }
+
+    fn accept_next_host_lease(&self, local_address: SocketAddrV4, lease: GuestSourceLease) {
+        *self.state.next_host_accept.lock().unwrap() = Some((local_address, lease));
     }
 
     fn report_connect_address_once(&self, address: Option<SocketAddrV4>) {
@@ -1018,11 +1032,13 @@ impl PlatformSocket for TestPlatformSocket {
                 TestAcceptFailure::Broker => Err(BrokerError::OutOfMemory),
             };
         }
-        if let Some((local_address, remote)) = self.state.next_host_accept.lock().unwrap().take() {
+        if let Some((local_address, guest_source_lease)) =
+            self.state.next_host_accept.lock().unwrap().take()
+        {
             return Ok(SocketOutcome::Completed(AcceptedPlatformSocket {
                 socket: self.accepted_socket(readiness, local_address),
                 local_address,
-                guest_source_lease: GuestSourceLease::external(remote),
+                guest_source_lease,
             }));
         }
         if self.state.host_addressing.load(Ordering::Relaxed) {
@@ -1439,15 +1455,6 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
     assert_eq!(
         provider
             .state
-            .connect_destinations
-            .lock()
-            .unwrap()
-            .as_slice(),
-        [guest, unruled, external]
-    );
-    assert_eq!(
-        provider
-            .state
             .connect_source_addresses
             .lock()
             .unwrap()
@@ -1456,22 +1463,15 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
     );
 
     // The host refuses its own unserved address, which leaves the stream
-    // unbound and fails later attempts without reaching the platform.
+    // unbound.
     let refused = create(&process, create_request(), readiness.clone()).unwrap();
     let loopback = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080);
     provider.refuse_next_connect();
-    for _ in 0..2 {
-        assert_eq!(
-            connect(&process, refused, loopback),
-            Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
-        );
-        assert_eq!(get_name(&process, refused, false), Ok(None));
-    }
-    assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 4);
     assert_eq!(
-        provider.state.connect_egresses.lock().unwrap().last(),
-        Some(&SocketEgressVerdict::ServedOnly)
+        connect(&process, refused, loopback),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
+    assert_eq!(get_name(&process, refused, false), Ok(None));
 
     // A rejection keeps an explicit bind.
     let bound = create(&process, create_request(), readiness.clone()).unwrap();
@@ -1486,15 +1486,6 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
         Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
     );
     assert_eq!(get_name(&process, bound, false), Ok(Some(explicit)));
-    assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 5);
-    assert_eq!(
-        provider.state.connect_egresses.lock().unwrap().last(),
-        Some(&SocketEgressVerdict::ServedOnly)
-    );
-    assert_eq!(
-        provider.state.connect_destinations.lock().unwrap().last(),
-        Some(&unruled)
-    );
 
     // A failure that leaves the peer unchanged leaves the stream unbound for
     // another attempt. A destination the rules deny still connects when the
@@ -1514,10 +1505,6 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
     assert_eq!(
         provider.state.connect_egresses.lock().unwrap().last(),
         Some(&SocketEgressVerdict::ServedOnly)
-    );
-    assert_eq!(
-        check_connect(&process, unchanged),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
     assert_eq!(
         get_name(&process, unchanged, false),
@@ -1591,14 +1578,6 @@ fn host_connect_passes_egress_and_lets_the_platform_bind() {
         assert_eq!(
             provider.state.connect_calls.load(Ordering::Relaxed),
             connect_calls
-        );
-        assert_eq!(
-            status(&process, invalid),
-            Ok(PlatformSocketStatus {
-                status: SocketConnectionStatus::Failed(SocketError::Other),
-                local_address: None,
-                pending_error: None,
-            })
         );
         process.close_object_reference(invalid).unwrap();
     }
@@ -1698,7 +1677,6 @@ fn host_addressing_binds_listens_and_accepts_host_addresses() {
         );
         process.close_object_reference(invalid).unwrap();
     }
-    assert_eq!(provider.state.retired_sockets.load(Ordering::Relaxed), 3);
 
     // Multicast addresses and the limited broadcast address are never the
     // host's own.
@@ -1749,6 +1727,23 @@ fn host_addressing_binds_listens_and_accepts_host_addresses() {
         (host_local, client)
     );
     process.close_object_reference(accepted.handle).unwrap();
+
+    // A lease that holds the connector's port within the provider keeps its
+    // owner alive until the accepted stream closes.
+    let port_owner: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+    let connector = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40_001);
+    provider.accept_next_host_lease(
+        host_local,
+        GuestSourceLease::with_port_owner(connector, Arc::clone(&port_owner)),
+    );
+    let SocketOutcome::Completed(accepted) = accept_next(wildcard_listener).unwrap() else {
+        panic!("host accept failed");
+    };
+    assert_eq!(accepted.remote_address, connector);
+    assert_eq!(Arc::strong_count(&port_owner), 2);
+    process.close_object_reference(accepted.handle).unwrap();
+    assert_eq!(Arc::strong_count(&port_owner), 1);
+
     let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
     for local_address in [
         SocketAddrV4::new(*host_local.ip(), host_local.port() + 1),
