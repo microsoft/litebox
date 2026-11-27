@@ -287,8 +287,9 @@ impl SocketPolicy {
         }
     }
 
-    /// Whether the caller may reach `destination` over `protocol`: any
-    /// destination within the guest network, and any other a rule permits.
+    /// Whether the caller may reach `destination` over `protocol`: if the
+    /// policy allows `protocol`, any destination within the guest network,
+    /// and any other a rule permits.
     fn permits_destination(
         &self,
         protocol: IpProtocol,
@@ -555,8 +556,8 @@ impl PolicyEngine {
     }
 
     /// Checks that the caller may connect to `destination` over `protocol`:
-    /// to any destination within the guest network, and to any other a rule
-    /// permits.
+    /// if the policy allows `protocol`, to any destination within the guest
+    /// network, and to any other a rule permits.
     pub(crate) fn authorize_socket_connect(
         &self,
         caller_credential: CallerCredential,
