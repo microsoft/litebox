@@ -18,6 +18,7 @@ extern crate alloc;
 #[cfg(any(test, feature = "test-std-platform"))]
 extern crate std;
 
+pub mod authority;
 mod channel;
 mod error;
 pub mod event;
