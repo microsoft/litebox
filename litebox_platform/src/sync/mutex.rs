@@ -264,6 +264,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Mutex<Platform, T> {
     #[inline]
     #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, Platform, T> {
+        Platform::might_block();
+
         #[cfg(feature = "lock_tracing")]
         self.creation
             .ensure_registered(LockType::Mutex, || self.raw.raw.underlying_atomic());

@@ -3,13 +3,38 @@
 
 //! Heap and page-table allocations share the RAM supplied by `seed_heap`.
 
+use core::alloc::{GlobalAlloc, Layout};
+use litebox_platform_vm_kernel::preempt::NoPreempt;
+
 /// Largest single allocation: `1 << (HEAP_ORDER - 1)` bytes (1 GiB), e.g., an in-memory file's
 /// contents.
 const HEAP_ORDER: usize = 31;
 
+type Allocator = litebox::mm::allocator::SafeZoneAllocator<'static, HEAP_ORDER, NoHost>;
+
+/// Its locks are the kernel's, which broker work, running with interrupts
+/// enabled, shares. They are upstream's, so no lock type of the kernel covers
+/// them: the allocator's entry points (these and [`KernelPages`]'s) are their
+/// one boundary, each taking a [`NoPreempt`].
 #[global_allocator]
-static KERNEL_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<'static, HEAP_ORDER, NoHost> =
-    litebox::mm::allocator::SafeZoneAllocator::new();
+static KERNEL_ALLOCATOR: KernelAllocator = KernelAllocator(Allocator::new());
+
+struct KernelAllocator(Allocator);
+
+// Safety: forwards to the allocator, with interrupts disabled.
+unsafe impl GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _no_preempt = NoPreempt::new();
+        // Safety: forwarded to the caller.
+        unsafe { self.0.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _no_preempt = NoPreempt::new();
+        // Safety: forwarded to the caller.
+        unsafe { self.0.dealloc(ptr, layout) }
+    }
+}
 
 struct NoHost;
 
@@ -31,7 +56,7 @@ impl litebox::mm::allocator::MemoryProvider for NoHost {
 /// The range must be mapped, writable, and unused by anything else.
 pub unsafe fn add_memory(start: usize, size: usize) {
     // Safety: forwarded to the caller.
-    unsafe { KERNEL_ALLOCATOR.fill_pages(start, size) }
+    unsafe { KERNEL_ALLOCATOR.0.fill_pages(start, size) }
 }
 
 pub struct KernelPages;
@@ -41,11 +66,13 @@ pub struct KernelPages;
 // `BootConfig::ram` and mapped at `PA + KERNEL_OFFSET` from then on.
 unsafe impl litebox_platform_vm_kernel::mm::PageAllocator for KernelPages {
     fn allocate_pages(&self, order: u32) -> Option<*mut u8> {
-        KERNEL_ALLOCATOR.allocate_pages(order)
+        let _no_preempt = NoPreempt::new();
+        KERNEL_ALLOCATOR.0.allocate_pages(order)
     }
 
     unsafe fn free_pages(&self, ptr: *mut u8, order: u32) {
+        let _no_preempt = NoPreempt::new();
         // Safety: forwarded to the caller.
-        unsafe { KERNEL_ALLOCATOR.free_pages(ptr, order) }
+        unsafe { KERNEL_ALLOCATOR.0.free_pages(ptr, order) }
     }
 }

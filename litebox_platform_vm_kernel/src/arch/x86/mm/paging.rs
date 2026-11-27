@@ -30,6 +30,7 @@ use crate::mm::{
     MemoryProvider,
     pgtable::{COW, PROT_NONE, PageTableAllocator, PageTableImpl, SHARED},
 };
+use crate::preempt::{KernelMutex, KernelMutexGuard, KernelMutexSectionGuard, NoPreempt};
 use crate::tlb;
 
 const PAGE_SHIFT: usize = Size4KiB::SIZE.trailing_zeros() as usize;
@@ -185,12 +186,30 @@ fn for_each_user_leaf<'a, M: MemoryProvider>(
 }
 
 /// The frames that more than one user leaf maps, each with [`COW`] or [`SHARED`], and how many
-/// leaves map each. A frame it does not count belongs to its one leaf.
-static SHARED_FRAMES: spin::Once<spin::Mutex<SharedFrames>> = spin::Once::new();
+/// leaves map each. A frame it does not count belongs to its one leaf. Kernel-grade, as a table's
+/// last drop takes it, which broker work may make (see `PinnedUserPages`); set up at boot
+/// ([`set_up_shared_frames`]), so that no kernel thread runs the `Once`'s initialization.
+static SHARED_FRAMES: spin::Once<KernelMutex<SharedFrames>> = spin::Once::new();
+
+/// Sets up [`SHARED_FRAMES`], before any kernel thread exists.
+pub(crate) fn set_up_shared_frames() {
+    SHARED_FRAMES.call_once(Default::default);
+}
 
 /// [`SHARED_FRAMES`], locked.
-pub(crate) fn shared_frames() -> spin::MutexGuard<'static, SharedFrames> {
-    SHARED_FRAMES.call_once(Default::default).lock()
+pub(crate) fn shared_frames() -> KernelMutexGuard<'static, SharedFrames> {
+    shared_frames_mutex().lock()
+}
+
+/// [`SHARED_FRAMES`], locked inside `section`: for a walk that takes it once
+/// per leaf, in one section (see [`KernelMutex::lock_in`]).
+fn shared_frames_in(section: &NoPreempt) -> KernelMutexSectionGuard<'_, SharedFrames> {
+    shared_frames_mutex().lock_in(section)
+}
+
+fn shared_frames_mutex() -> &'static KernelMutex<SharedFrames> {
+    // Set up at boot, so this only returns it; host tests set it up here.
+    SHARED_FRAMES.call_once(Default::default)
 }
 
 /// Frames per block of [`SharedFrames`]: a page of counts, for 4 MiB of RAM.
@@ -321,13 +340,18 @@ impl SharedFrames {
 }
 
 /// Releases a user leaf's frame, mapped with `flags`, which the leaf no
-/// longer maps: frees it unless another leaf maps it.
+/// longer maps: frees it unless another leaf maps it. In `section`, which a
+/// walk that releases many leaves takes once.
 ///
 /// # Safety
 ///
 /// No access or stale translation through the leaf may remain.
-unsafe fn release_user_frame<M: MemoryProvider>(frame: PhysFrame, flags: PageTableFlags) {
-    if flags.intersects(COW | SHARED) && shared_frames().remove_leaf(frame) {
+unsafe fn release_user_frame<M: MemoryProvider>(
+    frame: PhysFrame,
+    flags: PageTableFlags,
+    section: &NoPreempt,
+) {
+    if flags.intersects(COW | SHARED) && shared_frames_in(section).remove_leaf(frame) {
         return;
     }
     // Safety: the leaf was the frame's only one, and the caller guarantees
@@ -377,15 +401,17 @@ unsafe fn map_fresh_frame<M: MemoryProvider>(
     }
 }
 
+/// Its locks are kernel-grade: broker work takes them through pinned pages
+/// (see `PinnedUserPages`).
 pub(crate) struct X64PageTable<'a, M: MemoryProvider, const ALIGN: usize> {
-    inner: spin::mutex::SpinMutex<MappedPageTable<'a, FrameMapping<M>>>,
+    inner: KernelMutex<MappedPageTable<'a, FrameMapping<M>>>,
     /// For CR3 and shootdowns, without `inner`.
     p4: PhysFrame,
     /// See [`tlb::Cpus`]; never set for the base and trampoline tables.
     cpus: tlb::Cpus,
     /// The ranges of [`Self::pin`] and [`Self::pin_lazily`]: their frames are
     /// never shared.
-    pinned: spin::Mutex<Vec<Range<usize>>>,
+    pinned: KernelMutex<Vec<Range<usize>>>,
 }
 
 struct FrameMapping<M: MemoryProvider> {
@@ -586,11 +612,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             );
             drop(inner);
             if options.free_frames {
+                let section = NoPreempt::new();
                 for entry in unmapped {
                     let frame = PhysFrame::containing_address(entry.addr());
                     // Safety: unmapped, and flushed (or never used again);
                     // the caller guarantees nothing else uses it.
-                    unsafe { release_user_frame::<M>(frame, entry.flags()) };
+                    unsafe { release_user_frame::<M>(frame, entry.flags(), &section) };
                 }
             }
             removed.map_err(|HugePage| page_mgmt::DeallocationError::Unaligned)?;
@@ -810,6 +837,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         // The leaves made read-only may be cached writable.
         self.change_leaves(|src, stale| {
             let mut dst = dst.inner.lock();
+            let section = NoPreempt::new();
             let mut result = Ok(());
             for_each_user_leaf::<M>(src.level_4_table_mut(), |page, entry| {
                 let addr: usize = page.start_address().as_u64().trunc();
@@ -828,7 +856,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 // Per leaf, not across the walk: other CPUs' page faults, unmaps
                 // and teardowns take it too, spinning. From `reserve` to
                 // `add_leaf`, which adds the block `reserve` may make.
-                let mut shared = shared_frames();
+                let mut shared = shared_frames_in(&section);
                 // Room to count it below, before `dst` maps it.
                 let room = match shared.reserve(frame) {
                     Ok(room) => room,
@@ -903,6 +931,36 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             .ignore();
         }
         Ok(())
+    }
+
+    /// Maps the direct map's `page` to its frame again, RW/NX, after an unmap
+    /// that kept its tables: writes only its leaf, under the table's lock, and
+    /// needs no flush, as no CPU caches an absent translation.
+    ///
+    /// # Safety
+    ///
+    /// `page` is a page of the direct map (`PA + KERNEL_OFFSET`).
+    pub(crate) unsafe fn remap_direct(&self, page: Page<Size4KiB>) {
+        let frame = PhysFrame::containing_address(M::va_to_pa(page.start_address()));
+        let mut inner = self.inner.lock();
+        let Walk::Leaf(entry) = leaf_entry::<M>(inner.level_4_table_mut(), page) else {
+            panic!("the tables of {page:?} are gone");
+        };
+        assert!(entry.is_unused(), "{page:?} is mapped");
+        entry.set_frame(
+            frame,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+        );
+    }
+
+    /// Debug builds: whether `page` has a present leaf.
+    #[cfg(debug_assertions)]
+    pub(crate) fn is_present(&self, page: Page<Size4KiB>) -> bool {
+        let mut inner = self.inner.lock();
+        matches!(
+            leaf_entry::<M>(inner.level_4_table_mut(), page),
+            Walk::Leaf(entry) if entry.flags().contains(PageTableFlags::PRESENT)
+        )
     }
 
     /// Gives the kernel PML4 slot holding `va` its P3 table now, as Linux
@@ -1023,6 +1081,7 @@ impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> 
     fn drop(&mut self) {
         debug_assert!(self.cpus.is_empty(), "a page table dropped in use");
         let mut allocator = PageTableAllocator::<M>::new();
+        let section = NoPreempt::new();
         let mut inner = self.inner.lock();
         for_each_user_leaf::<M>(inner.level_4_table_mut(), |page, entry| {
             let flags = entry.flags();
@@ -1033,7 +1092,7 @@ impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> 
                 let frame = PhysFrame::containing_address(entry.addr());
                 // Safety: the table is being dropped, so nothing reaches the
                 // frame through this leaf anymore.
-                unsafe { release_user_frame::<M>(frame, flags) };
+                unsafe { release_user_frame::<M>(frame, flags, &section) };
             } else if !entry.is_unused() {
                 litebox_util_log::error!("BUG: leaking malformed task leaf during destruction");
                 debug_assert!(false, "malformed task leaf during destruction");
@@ -1088,10 +1147,10 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
         X64PageTable {
             // Safety: `mapping` translates every frame of this table (see
             // `FrameMapping`).
-            inner: unsafe { MappedPageTable::new(p4, mapping) }.into(),
+            inner: KernelMutex::new(unsafe { MappedPageTable::new(p4, mapping) }),
             p4: frame,
             cpus: tlb::Cpus::default(),
-            pinned: spin::Mutex::new(Vec::new()),
+            pinned: KernelMutex::new(Vec::new()),
         }
     }
 
@@ -1244,7 +1303,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
             drop(inner);
             // Safety: the leaf maps the copy now, and no CPU caches the
             // shared frame through it anymore (flushed).
-            unsafe { release_user_frame::<M>(shared, current) };
+            unsafe { release_user_frame::<M>(shared, current, &NoPreempt::new()) };
         }
         Ok(())
     }

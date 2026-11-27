@@ -53,9 +53,9 @@ use litebox_hal::virtio::fs::Shared as FuseShared;
 use litebox_platform::buffer::RawBytes;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::cpu::{self, CpuId, InterruptController, Ipi, MAX_CPUS};
+use litebox_platform_vm_kernel::preempt::{KernelMutex, KernelMutexGuard};
 use litebox_platform_vm_kernel::{Handled, Instant, VmKernel};
 use litebox_shim_vm_kernel::ProcessTimer;
-use spin::Mutex;
 
 /// How long a share's server may take to answer a request before the share
 /// fails.
@@ -109,13 +109,15 @@ pub struct Devices {
     platform: &'static VmKernel,
     apic: LocalApic,
     clock: Clock,
-    console: Mutex<ConsoleDevice>,
+    /// The devices' locks are kernel-grade: the broker drives them from code
+    /// that runs with interrupts enabled.
+    console: KernelMutex<ConsoleDevice>,
     /// Whether the console interrupts; else it is polled.
     console_interrupts: bool,
-    network: Option<Mutex<NetworkDevice>>,
+    network: Option<KernelMutex<NetworkDevice>>,
     /// Whether the network device interrupts; else it is polled.
     network_interrupts: bool,
-    vsock: Option<Mutex<VsockDevice>>,
+    vsock: Option<KernelMutex<VsockDevice>>,
     /// Whether the socket device interrupts; else it is polled.
     vsock_interrupts: bool,
     /// Per CPU, what [`ProcessTimer::arm`] last programmed into its timer
@@ -177,15 +179,15 @@ impl Devices {
             clock,
             console_interrupts: console.interrupts(),
             network_interrupts: network.as_ref().is_some_and(NetworkDevice::interrupts),
-            network: network.map(Mutex::new),
+            network: network.map(KernelMutex::new),
             vsock_interrupts: vsock.as_ref().is_some_and(VsockDevice::interrupts),
-            vsock: vsock.map(Mutex::new),
+            vsock: vsock.map(KernelMutex::new),
             armed: [const { AtomicU64::new(ARMED_UNKNOWN) }; MAX_CPUS],
             device_interrupted: AtomicU64::new(0),
-            console: Mutex::new(console),
+            console: KernelMutex::new(console),
         }));
-        litebox_platform_vm_kernel::set_interrupt_handler(Box::leak(Box::new(|vector| {
-            devices.on_interrupt(vector)
+        litebox_platform_vm_kernel::set_interrupt_handler(Box::leak(Box::new(|cpu, vector| {
+            devices.on_interrupt(cpu, vector)
         })));
         devices
     }
@@ -208,7 +210,7 @@ impl Devices {
         self.network.is_some().then_some(self)
     }
 
-    fn network_device(&self) -> spin::MutexGuard<'_, NetworkDevice> {
+    fn network_device(&self) -> KernelMutexGuard<'_, NetworkDevice> {
         self.network
             .as_ref()
             .expect("the broker has a network only with a device")
@@ -222,7 +224,7 @@ impl Devices {
             .then(|| Arc::new(VmVsock(self)) as Arc<dyn VsockTransport>)
     }
 
-    fn vsock_device(&self) -> spin::MutexGuard<'_, VsockDevice> {
+    fn vsock_device(&self) -> KernelMutexGuard<'_, VsockDevice> {
         self.vsock
             .as_ref()
             .expect("the broker has vsock sockets only with a device")
@@ -299,16 +301,12 @@ impl Devices {
 
     /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
     /// per-CPU data.
-    fn on_interrupt(&self, vector: u8) -> Handled {
+    fn on_interrupt(&self, cpu: CpuId, vector: u8) -> Handled {
         match vector {
             // Fired: arming the same deadline again (e.g., after an early
-            // fire) must reprogram it. Which CPU's timer it was is per-CPU
-            // data: forget them all.
-            TIMER_VECTOR => {
-                for armed in &self.armed {
-                    armed.store(ARMED_UNKNOWN, Ordering::Relaxed);
-                }
-            }
+            // fire) must reprogram it. Only `cpu`'s: another CPU's timer may
+            // still be armed for an earlier deadline.
+            TIMER_VECTOR => self.armed[cpu.index()].store(ARMED_UNKNOWN, Ordering::Relaxed),
             // The other idle CPUs step again, to poll the devices (this one,
             // the boot CPU, is already in).
             DEVICE_VECTOR => {
@@ -329,6 +327,13 @@ impl Devices {
     /// The calling CPU's [`Self::armed`].
     fn armed(&self) -> &AtomicU64 {
         &self.armed[cpu::current().index()]
+    }
+
+    /// Debug builds: whether the calling CPU's timer was last disarmed, and not
+    /// armed or fired since.
+    #[cfg(debug_assertions)]
+    pub(crate) fn timer_disarmed(&self) -> bool {
+        self.armed().load(Ordering::Relaxed) == armed(None)
     }
 
     /// Halts the calling CPU until an interrupt, or until `deadline`; while
@@ -411,6 +416,18 @@ impl ProcessTimer for Devices {
                 .arm_timer(self.clock.ticks_at(deadline.as_nanos())),
             None => self.apic.disarm_timer(),
         }
+    }
+
+    /// `armed(None)` and [`ARMED_UNKNOWN`] both mean that none is armed.
+    fn arm_if_earlier(&self, deadline: Instant) {
+        let armed_now = self.armed().load(Ordering::Relaxed);
+        if armed_now != armed(None)
+            && armed_now != ARMED_UNKNOWN
+            && armed_now <= armed(Some(deadline))
+        {
+            return;
+        }
+        self.arm(Some(deadline));
     }
 }
 

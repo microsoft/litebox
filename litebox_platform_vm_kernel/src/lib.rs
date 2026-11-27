@@ -11,9 +11,9 @@
 //! must precede execution that needs derived keys. The runner may then start
 //! the other CPUs ([`VmKernel::start_cpus`], [`cpu`]), which run its entry.
 //!
-//! Assumptions: no kernel threads (the runner may switch user threads);
-//! kernel mappings changed after boot only to add some or to unmap a stack's
-//! guard page, which only its CPU uses, so flushed locally; synchronized
+//! Assumptions: kernel threads only as [`kthread`] runs them (the runner may
+//! switch user threads); kernel mappings changed after boot only to add some
+//! or for stacks' guard pages (see [`kthread::Stack`]); synchronized
 //! TSCs (see [`cpu`]); and not a confidential VM (no #VE/#VC/#HV). A task's
 //! address space may be current on several CPUs at once: a change to its
 //! mappings that may leave stale translations is shot down, by IPI, on those
@@ -29,7 +29,8 @@
 //! enters the shim's `interrupt` (e.g., for the runner's one-shot timer, a
 //! device's input, or another CPU's wake IPI, see [`cpu`]), unless only a
 //! doorbell ([`Handled::Doorbell`]); ending the run there lets the runner
-//! preempt the thread ([`resume_thread_ref`]).
+//! preempt the thread ([`resume_thread_ref`]). Kernel threads ([`kthread`])
+//! run with them enabled too, except in the kernel services they enter.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -88,8 +89,10 @@ mod boot;
 pub mod clock;
 pub mod cpu;
 mod dma;
+pub mod kthread;
 pub mod mm;
 mod per_cpu;
+pub mod preempt;
 pub mod providers;
 
 mod syscall_entry;
@@ -122,7 +125,7 @@ pub struct BootConfig<'a> {
 }
 
 /// See [`set_interrupt_handler`].
-pub type InterruptHandler = dyn Fn(u8) -> Handled + Sync;
+pub type InterruptHandler = dyn Fn(cpu::CpuId, u8) -> Handled + Sync;
 
 /// What [`set_interrupt_handler`]'s handler made of an interrupt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,13 +142,17 @@ pub enum Handled {
 
 /// Installs the handler for external interrupts (vectors 32 and up, except
 /// [`BootConfig::ignored_vectors`]), which says what it made of the vector
-/// ([`Handled`]). Before this, every external interrupt panics.
+/// ([`Handled`]) on the CPU it arrived on, given. Before this, every external
+/// interrupt panics.
 ///
-/// The handler runs with interrupts disabled, on the interrupted context's GS
-/// (user mode, [`cpu::halt`], or a spin's [`cpu::relax`]), on any CPU: it
-/// must not touch per-CPU data, block, or take locks; it should only end the
-/// interrupt, maybe wake CPUs (e.g., [`cpu::wake_idle`]), and leave the work
-/// to the kernel after the halt. It also handles the wake IPI
+/// The handler runs with interrupts disabled, on the kernel's GS (also for an
+/// interrupt of user mode), on any CPU, having interrupted user mode,
+/// [`cpu::halt`], a spin's [`cpu::relax`], or a kernel thread (which runs with
+/// them enabled, see [`kthread`]): it must not block or take locks, which what
+/// it interrupted may hold; it should only end the interrupt, maybe wake CPUs
+/// (e.g., [`cpu::wake_idle`]), and leave the work to the kernel after the
+/// halt, or at the interrupted thread's check. It also
+/// handles the wake IPI
 /// ([`cpu::Ipi::Wake`]) and the TLB-flush IPI ([`cpu::Ipi::FlushTlb`]), on
 /// every CPU, the boot CPU too, from [`VmKernel::start_cpus`] on.
 ///
@@ -394,6 +401,10 @@ impl PageTableManager {
         &self,
         task_pt_id: AddressSpaceId,
     ) -> Result<(), Errno> {
+        debug_assert!(
+            !kthread::in_kthread(),
+            "a kernel thread ends an address space"
+        );
         if task_pt_id == AddressSpaceId::KERNEL {
             return Err(Errno::EINVAL);
         }
@@ -562,6 +573,7 @@ impl VmKernel {
                 .all(|r| r.end.start_address().as_u64() <= DIRECT_MAP_LIMIT),
             "guest RAM extends past the direct map"
         );
+        arch::mm::paging::set_up_shared_frames();
         let base_pt =
             mm::PageTable::new_top_level().expect("Failed to allocate a new page table frame");
         let trampoline_table =
@@ -598,9 +610,12 @@ impl VmKernel {
             ioremap_next: spin::Mutex::new(IOREMAP.start),
             trampoline_table: spin::Mutex::new(Some(trampoline_table)),
         }));
+        kthread::init(&platform.page_table_manager.base_page_table);
         if cfg!(debug_assertions) {
             worker::self_check(platform);
         }
+        #[cfg(debug_assertions)]
+        kthread::self_check();
         platform
     }
 
@@ -821,7 +836,9 @@ impl VmKernel {
 /// The process may write these pages at any time: access them only with
 /// peer-safe operations, never through Rust references. Keeps the whole
 /// address space alive, every frame it maps, not only these, until dropped,
-/// even once unregistered.
+/// even once unregistered. Broker work uses and drops them, with interrupts
+/// enabled: the table's locks, and those its last drop takes, are
+/// kernel-grade ([`preempt::KernelMutex`]).
 pub struct PinnedUserPages {
     /// Keeps the table, and every frame it owns, alive.
     page_table: Arc<mm::PageTable<PAGE_SIZE>>,
@@ -944,42 +961,73 @@ impl PinnedUserPages {
 
 impl RawMutexProvider for VmKernel {
     type RawMutex = RawMutex;
+
+    /// Debug builds: once a kernel thread exists, only kernel threads take a
+    /// lock, outside kernel services.
+    #[track_caller]
+    fn might_block() {
+        debug_assert!(
+            x86_64::instructions::interrupts::are_enabled() || kthread::live() == 0,
+            "kernel code took a lock that kernel threads take (see `RawMutex`)"
+        );
+    }
 }
 
 impl WaitWakerProvider for VmKernel {}
 
-/// No kernel thread blocks, so nothing wakes a waiter: it spins until
-/// another CPU changes the value (every wake follows a change), with
-/// [`cpu::relax`], taking interrupts meanwhile, as a halt does. That CPU may
-/// be holding the lock in its worker, suspended, until it resumes it (see
-/// [`worker`]). A spin that sees no change for [`LOCK_WARNING`] warns, once,
-/// and spins on: it may be a deadlock (e.g., the holder's CPU waits for the
-/// spinning one; which CPU holds a lock is unknown), or a long hold. With no
-/// other CPU online, blocking would deadlock, and panics; timeouts are
-/// unsupported (no kernel code uses one), and panic.
+/// The platform's locks, which kernel threads ([`kthread`]) take and may hold
+/// as they sleep or are preempted. With another CPU online, a kernel thread
+/// spins for one while its run is not due to end, up to [`cpu::NOTIFIED`];
+/// then it sleeps on the lock's queue.
+/// Other kernel code takes one only while no kernel thread exists, as it would
+/// spin for a preempted holder; with no other CPU online, that spin panics.
+/// Timeouts are unsupported, and panic.
 pub struct RawMutex {
     inner: AtomicU32,
+    waiters: kthread::WaitQueue,
 }
 
 impl RawMutexTrait for RawMutex {
     const INIT: Self = Self {
         inner: AtomicU32::new(0),
+        waiters: kthread::WaitQueue::new(),
     };
 
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
         &self.inner
     }
 
-    fn wake_many(&self, _n: usize) -> usize {
-        0
+    fn wake_many(&self, n: usize) -> usize {
+        self.waiters.wake(n)
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        match self.block_or_maybe_timeout(val, None) {
-            Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
-            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
-            Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
+        // Interrupts are enabled only in a kernel thread, outside services.
+        if !x86_64::instructions::interrupts::are_enabled() {
+            return match self.spin(val, None) {
+                Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
+                Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
+                Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
+            };
         }
+        if cpu::online_count() > 1
+            && let Some(platform) = boot::started()
+        {
+            if self.inner.load(Ordering::Relaxed) != val {
+                return Err(ImmediatelyWokenUp);
+            }
+            let start = platform.now();
+            loop {
+                cpu::relax();
+                if self.inner.load(Ordering::Relaxed) != val {
+                    return Ok(());
+                }
+                if platform.now().duration_since(&start) >= cpu::NOTIFIED || kthread::yield_due() {
+                    break;
+                }
+            }
+        }
+        self.sleep(val, boot::started())
     }
 
     fn block_or_timeout(
@@ -987,11 +1035,11 @@ impl RawMutexTrait for RawMutex {
         val: u32,
         time: core::time::Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        self.block_or_maybe_timeout(val, Some(time))
+        self.spin(val, Some(time))
     }
 }
 
-/// How long a [`RawMutex`] spins seeing no change, or a claim stays held for
+/// How long a [`RawMutex`] waits seeing no change, or a claim stays held for
 /// a waiter (see the shim), before it warns of a possible deadlock (once per
 /// wait); it then waits on, as some locks are held longer: e.g., an open
 /// file's, across a whole read, which takes a FUSE round trip per request, each
@@ -999,7 +1047,7 @@ impl RawMutexTrait for RawMutex {
 pub const LOCK_WARNING: core::time::Duration = core::time::Duration::from_mins(1);
 
 impl RawMutex {
-    fn block_or_maybe_timeout(
+    fn spin(
         &self,
         val: u32,
         timeout: Option<core::time::Duration>,
@@ -1707,13 +1755,16 @@ unsafe extern "C" fn run_thread_arch(thread_ctx: &ThreadContext, ctx: *mut PtReg
         // From `isr_external`, for an external interrupt of user mode. On
         // entry: rsp = ISR stack [vector, error_code, rip, cs,
         // rflags, rsp, ss] (vector and error code are placeholders, unused),
-        // all GPRs hold the interrupted values, IF is clear, and GS is still
-        // the user's.
+        // all GPRs hold the interrupted values, IF is clear, and GS is the
+        // user's again (`isr_external` swapped it back).
         ".globl interrupt_callback",
         "interrupt_callback:",
         "cld",
         "clac",
         "swapgs",
+        // No GS access runs ahead with the wrong GS, as after a mispredicted
+        // branch of `isr_external`'s exit (SWAPGS speculation).
+        "lfence",
         "mov gs:[{scratch_off}], rax",
         "mov rax, rsp", // ISR stack, for SAVE_PF_USER_CONTEXT_ASM
         "mov rsp, gs:[{user_context_top_off}]",

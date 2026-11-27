@@ -148,11 +148,13 @@ isr_ignore:
  * vector lookup.
  *
  * They arrive from user mode, or from the kernel only while it halts, or
- * spins in `cpu::relax`, with IF=1. Entry does not depend on GS
- * (which may still be the user's): `external_interrupt_handler_impl` finds
- * its CPU without it (see `per_cpu::interrupted_cpu`), and the handler must
- * not touch per-CPU data, so no SWAPGS. The kernel runs with SSE disabled, so
- * only the caller-saved GPRs need saving.
+ * spins in `cpu::relax`, or runs a kernel thread, with IF=1. From user mode,
+ * entry swaps in the kernel's GS (SWAPGS) before any Rust, and back before it
+ * returns there, so `external_interrupt_handler_impl` and the handler always
+ * run on the kernel's GS, as other kernel code does. The kernel runs with SSE
+ * disabled, so only the caller-saved GPRs need saving (a kernel thread's
+ * check that switches away saves the rest, and may return here on another
+ * CPU).
  *
  * One that interrupted user mode then also reaches the shim, unless the
  * handler says otherwise (e.g., for a doorbell): with an `errcode`/`vector`
@@ -171,6 +173,11 @@ isr_external:
     cld
     clac                        /* SMAP stays enforced; IRETQ restores AC */
     /* [rsp] stub return address, [rsp+8] RIP, [rsp+16] CS */
+    test    qword ptr [rsp + 16], 0x3  /* From user mode? */
+    jz      1f
+    swapgs                      /* The kernel's GS */
+1:
+    lfence                      /* Neither path runs ahead with the other's GS */
     push    rax
     push    rcx
     push    rdx
@@ -204,7 +211,12 @@ isr_external:
     pop     rdx
     pop     rcx
     pop     rax
-    /* All GPRs hold their interrupted values; [rsp] `Then`, [rsp+8] RIP. */
+    /* All GPRs hold their interrupted values; [rsp] `Then`, [rsp+8] RIP,
+       [rsp+16] CS. */
+    test    qword ptr [rsp + 16], 0x3  /* To user mode? */
+    jz      2f
+    swapgs                      /* The user's GS, for IRETQ or the shim's entry */
+2:
     cmp     byte ptr [rsp], 0   /* `Then::Return` */
     lea     rsp, [rsp + 8]      /* keeps the flags */
     jne     .Lisr_external_user

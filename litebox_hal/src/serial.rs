@@ -95,6 +95,7 @@ impl ComPort {
     }
 }
 
+/// Locked with interrupts disabled (see [`with_com`]).
 static COM_ONCE: Once<Mutex<ComPort>> = Once::new();
 
 fn com() -> &'static Mutex<ComPort> {
@@ -112,29 +113,41 @@ impl fmt::Write for ComPort {
     }
 }
 
+/// Runs `f` on the port, holding its lock with interrupts disabled: code that
+/// runs with them enabled (e.g., a kernel's preemptible threads) logs too, and
+/// a preempted holder would stall the CPUs spinning for it with them disabled.
+fn with_com<R>(f: impl FnOnce(&mut ComPort) -> R) -> R {
+    x86_64::instructions::interrupts::without_interrupts(|| f(&mut com().lock()))
+}
+
 pub fn print(args: core::fmt::Arguments) {
     use core::fmt::Write;
-    let _ = com().lock().write_fmt(args);
+    let _ = with_com(|com| com.write_fmt(args));
 }
 
 pub fn print_str(s: &str) {
-    com().lock().write_string(s);
+    with_com(|com| com.write_string(s));
 }
 
 /// Non-printable bytes show as `0xfe`.
 pub fn print_bytes(bytes: &[u8]) {
-    com().lock().write_bytes(bytes);
+    with_com(|com| com.write_bytes(bytes));
 }
 
 /// Panic may interrupt a locked or initializing console. Wait for it only
 /// briefly, and never alias its mutable handle; emergency output may
-/// interleave.
+/// interleave. It holds the lock it takes with interrupts disabled, as the
+/// other writers do.
 pub fn panic_print(args: core::fmt::Arguments) {
     use core::fmt::Write;
     if let Some(com) = COM_ONCE.get() {
         for _ in 0..MAX_LOCK_ATTEMPTS {
-            if let Some(mut com) = com.try_lock() {
+            let written = x86_64::instructions::interrupts::without_interrupts(|| {
+                let mut com = com.try_lock()?;
                 let _ = com.write_fmt(args);
+                Some(())
+            });
+            if written.is_some() {
                 return;
             }
             core::hint::spin_loop();
