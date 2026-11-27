@@ -63,7 +63,7 @@ use arch::{
     run_thread_arch, set_guest_thread_marker, set_signal_return, switch_to_guest,
 };
 
-#[cfg(all(test, not(target_arch = "x86_64")))]
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "riscv64")))]
 const AT_FDCWD: usize = (litebox_common_linux::AT_FDCWD as isize).cast_unsigned();
 
 /// The userland Linux platform.
@@ -337,7 +337,7 @@ impl LinuxUserland {
             // glibc implements `poll(3)` there via `ppoll`.
             #[cfg(target_arch = "x86_64")]
             (libc::SYS_poll, vec![]),
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             (libc::SYS_ppoll, vec![]),
             // memory management
             (libc::SYS_mmap, vec![]),
@@ -2115,7 +2115,7 @@ unsafe fn exception_signal_handler(
 
     let _ = run_thread_arch as *const () as usize;
 
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let sigctx = &context.uc_mcontext;
     #[cfg(target_arch = "x86_64")]
     let (trapno, err, cr2) = (
@@ -2499,7 +2499,7 @@ unsafe fn interrupt_signal_handler(
     } else {
         interrupt_callback
     };
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let callback = interrupt_callback;
     set_signal_return(context, callback, 0, 0, 0, 0);
 }
@@ -2991,7 +2991,7 @@ mod tests {
         let mkdir_res = unsafe {
             syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
         };
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         let mkdir_res = unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::mkdirat,
@@ -3019,7 +3019,7 @@ mod tests {
                     flags.bits() as usize,
                 )
             };
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             let open_res = unsafe {
                 syscalls::syscall4(
                     syscalls::Sysno::openat,

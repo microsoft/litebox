@@ -162,7 +162,7 @@ const _: () = {
     );
 };
 
-// Storage layout and alignment must exactly match `TlsBlock`.
+// Reserves `TlsBlock`'s size and alignment in `.tbss`.
 core::arch::global_asm!(
     ".section .tbss, \"awT\", @nobits",
     ".balign {align}",
@@ -210,10 +210,10 @@ fn slot<T>(offset: usize) -> *mut T {
     (tls_block() + offset) as *mut T
 }
 
-/// Verifies the block's alignment, which the Rust references into it, the
-/// atomics the assembly applies to it (RISC-V faults on misaligned AMOs), and
-/// the resume frame, which becomes `sp` for `rt_sigreturn` and so needs the
-/// psABI's 16-byte stack alignment, all rely on.
+/// Checks that the TLS block is aligned. The Rust atomics on its fields need
+/// natural alignment (RISC-V faults on misaligned AMOs), and the resume frame
+/// becomes `sp` for `rt_sigreturn`, so it needs the psABI's 16-byte stack
+/// alignment.
 ///
 /// # Panics
 ///
@@ -302,10 +302,10 @@ pub(super) unsafe fn record_pending_signal(mask: u32) -> usize {
 /// Runs the shim's `init` or `reenter` on `thread_ctx`, and later every other
 /// shim entry for the guest thread, on this host stack frame.
 ///
-/// The frame saves every callee-saved register. The callbacks below are entered
-/// with guest state, reload the host `sp` from [`TlsBlock::host_sp`] and
-/// re-establish `s0` before calling Rust: the FDE's CFA is `s0`, so an unwind
-/// out of a handler never reads guest memory.
+/// The frame saves every callee-saved register. The callbacks below may be
+/// entered with a guest `sp` and `s0`, so they reload the host `sp` from
+/// [`TlsBlock::host_sp`] and re-establish `s0` before calling Rust: the FDE's
+/// CFA is `s0`, so an unwind out of a handler never reads guest memory.
 #[unsafe(naked)]
 pub(super) unsafe extern "C-unwind" fn run_thread_arch(
     thread_ctx: &mut ThreadContext,
@@ -370,9 +370,9 @@ pub(super) unsafe extern "C-unwind" fn run_thread_arch(
     fsd  fs11, 8(sp)
     .cfi_offset fs11, -200
     // Anchor the CFA on `s0` for the whole FDE, so that the callbacks'
-    // wholesale `sp` reload keeps unwinding valid. Each callback is entered
-    // with a guest `s0` and re-establishes `s0 = host_sp + 224` before calling
-    // Rust.
+    // wholesale `sp` reload keeps unwinding valid. Each callback may be
+    // entered with a guest `s0`, so it re-establishes `s0 = host_sp + 224`
+    // before calling Rust.
     addi s0, sp, 208
     .cfi_def_cfa s0, 0
     // `thread_ctx` for the callbacks; `host_sp` points at it.
@@ -442,7 +442,8 @@ syscall_callback_in_guest_cleared:
     sd   a0, 40(t0)
     ld   a0, {GUEST_GP}(gp)
     sd   a0, 24(t0)
-    // Provisional pc; `syscall_entry_handler` replaces it.
+    // Provisional pc, the continuation; `syscall_entry_handler` replaces it
+    // if the gate is intact.
     ld   a0, {GATE_CONTINUATION}(gp)
     sd   a0, 0(t0)
     addi t1, gp, {GUEST_FP}
@@ -585,14 +586,14 @@ interrupt_callback:
 /// Completes the guest context `syscall_callback` saved, then handles the
 /// syscall.
 ///
-/// The gate's continuation is a host-independent fact of the gate code, so
-/// the guest pc after the `ecall` site is recovered from it rather than
-/// trusted. That pc and the continuation are recorded so that
-/// [`switch_to_guest`] can resume through the gate. If the continuation is not
-/// an intact `ecall` gate (a guest that jumps to the runtime entry itself, or
-/// unreadable code), the pc stays at the continuation and nothing is
-/// recorded, so the resume goes through `rt_sigreturn` with the context's
-/// `t0`, which `syscall_callback` took from `spill`.
+/// The pc after the `ecall` site is decoded from the gate at the
+/// continuation, as the target of its final `jal`. That pc and the
+/// continuation are recorded so that [`switch_to_guest`] can resume through
+/// the gate. If the continuation is not an intact `ecall` gate (a guest that
+/// jumps to the runtime entry itself, or unreadable code), the pc stays at the
+/// continuation and the record is cleared, so the resume goes through
+/// `rt_sigreturn` with the context's `t0`, which `syscall_callback` took from
+/// `spill`.
 unsafe extern "C-unwind" fn syscall_entry_handler(thread_ctx: &mut ThreadContext) {
     let next = recovery::syscall_return_pc(thread_ctx.ctx.pc, read_guest);
     // SAFETY: this thread's own TLS slots.
@@ -646,16 +647,16 @@ pub(super) unsafe extern "C" fn switch_stack(
 
 /// Switches to the provided guest context.
 ///
+/// The generic resume restores the complete context through `rt_sigreturn`.
+/// As an optimization, a resume at the pc recorded by the most recent syscall
+/// entry jumps back into that syscall's gate instead, which reloads `t0` and
+/// jumps to the pc. The record is consumed here, so it is used at most once.
+///
 /// # Safety
 /// The context must be a valid guest context. This can only be called if
 /// `run_thread_arch` is on the stack; after the guest exits, it will return to
 /// the interior of `run_thread_arch`. Do not call this where the stack needs
 /// unwinding to run destructors.
-///
-/// The generic resume restores the complete context through `rt_sigreturn`.
-/// As an optimization, a resume at the pc recorded by the most recent syscall
-/// entry jumps back into that syscall's gate instead, which reloads `t0` and
-/// jumps to the pc. The record is consumed here, so it is used at most once.
 pub(super) unsafe extern "C" fn switch_to_guest(ctx: &PtRegs) -> ! {
     // SAFETY: this thread's own TLS slots.
     let continuation = unsafe {
@@ -678,13 +679,13 @@ pub(super) unsafe extern "C" fn switch_to_guest(ctx: &PtRegs) -> ! {
 /// Resumes the guest at `continuation` with every register but `t0` from
 /// `ctx`, and the guest floating-point state from the TLS block.
 ///
-/// # Safety
-/// As [`switch_to_guest`], which has set `spill` to `ctx.t0`; `continuation`
-/// must reload `t0` from `spill` and continue at `ctx.pc`.
-///
 /// One of the ranges [`in_switch_to_guest`] tests: once `in_guest` is set, a
 /// signal here returns to the host with `ctx` and the block's floating-point
 /// state still authoritative.
+///
+/// # Safety
+/// As [`switch_to_guest`], which has set `spill` to `ctx.t0`; `continuation`
+/// must reload `t0` from `spill` and continue at `ctx.pc`.
 #[unsafe(naked)]
 unsafe extern "C" fn switch_to_guest_via_gate(ctx: &PtRegs, continuation: usize) -> ! {
     core::arch::naked_asm!(
@@ -842,10 +843,10 @@ fn prepare_resume_frame(ctx: &PtRegs) -> *mut ResumeFrame {
 /// Restores the guest through a prepared [`ResumeFrame`], by a host
 /// `rt_sigreturn` unrelated to any guest `rt_sigreturn` the shim emulates.
 ///
+/// The other range [`in_switch_to_guest`] tests.
+///
 /// # Safety
 /// As [`switch_to_guest`]; `frame` must be from [`prepare_resume_frame`].
-///
-/// The other range [`in_switch_to_guest`] tests.
 #[unsafe(naked)]
 unsafe extern "C" fn switch_to_guest_via_sigreturn(frame: *mut ResumeFrame) -> ! {
     core::arch::naked_asm!(
@@ -963,8 +964,8 @@ pub(super) fn sync_instruction_stream(range: core::ops::Range<usize>) {
 ///
 /// `in_guest` alone does not identify the guest: it stays set while a
 /// handler that interrupted the guest runs up to this call, where another
-/// signal (SIGINT and SIGALRM are not masked in exception handlers) may
-/// interrupt it. Such a nested signal leaves the guest to the outer handler
+/// signal (SIGINT and SIGALRM are not masked in exception handlers, nor in
+/// each other's) may interrupt it. Such a nested signal leaves the guest to the outer handler
 /// (see [`interrupted_host_code`]), so a handler that interrupted the guest
 /// must leave through the runtime, not return to the guest directly, for the
 /// shim to see an interrupt the nested signal set.
@@ -987,14 +988,17 @@ pub(super) fn signal_handler_exit_guest(
     }
 }
 
-/// Whether a signal interrupted host code, from its context alone.
+/// Whether a signal interrupted host code, judged from its context alone.
 ///
-/// `in_guest` is set only within [`in_switch_to_guest`], which installs the
-/// block as `gp` before leaving its range. While it is set, outside that
-/// range, `gp` is the block from guest code until a signal handler or
-/// `syscall_callback` clears it: the guest, its gates, the first instruction
-/// of `syscall_callback`, and the signal entry before it installs the host
-/// `gp`. Every other context has the host `gp`.
+/// `in_guest` is set only inside the [`in_switch_to_guest`] ranges, which
+/// install the block as `gp` before leaving them with `in_guest` set. From
+/// there until a signal handler or `syscall_callback` clears `in_guest`, `gp`
+/// stays the block: in the guest, its gates, the first instruction of
+/// `syscall_callback`, and signal entry before it installs the host `gp`.
+/// Every other context has the host `gp`. So the host `gp` means host code
+/// except inside the switch ranges, where `in_guest` decides, and signal
+/// entry is host code whatever its `gp`, as the outer handler has yet to
+/// claim the guest.
 fn interrupted_host_code(context: &libc::ucontext_t) -> bool {
     let gregs = &context.uc_mcontext.__gregs;
     let pc: usize = gregs[0].trunc();
@@ -1162,8 +1166,9 @@ fn is_compressed_instruction(pc: usize) -> bool {
 
 /// Whether the instruction at `pc` is a store or AMO, other than `lr`. Reads
 /// fallibly and only what decides: the first halfword gives the opcode, and an
-/// unreadable one is not a store; only an AMO's operation is in the second,
-/// and an AMO whose second halfword is unreadable is taken as a store.
+/// unreadable one is not a store; the second halfword matters only for an AMO,
+/// whose operation it holds, and an AMO whose second halfword is unreadable is
+/// taken as a store.
 fn is_store(pc: usize) -> bool {
     let mut half = [0; 2];
     if !read_guest(pc, &mut half) {
@@ -1220,7 +1225,8 @@ impl litebox::platform::GuestVectorStateProvider for LinuxUserland {
 }
 
 /// Installs inherited guest floating-point state. Otherwise the thread keeps
-/// its state, which is zero, as Linux starts threads, on a fresh thread.
+/// its current state, which on a fresh thread is all zero, as after a Linux
+/// `execve`.
 pub(super) fn prepare_guest_vector_state(inherited: Option<&FpState>) {
     if let Some(state) = inherited {
         // SAFETY: this thread's own TLS slot.
@@ -1242,7 +1248,8 @@ impl Registration {
 #[inline]
 pub(crate) unsafe fn reset_after_fork() {}
 
-/// Admits [`sync_instruction_stream`].
+/// Admits the `riscv_flush_icache` syscall that [`sync_instruction_stream`]
+/// makes.
 pub(crate) fn add_seccomp_rules(rules: &mut Vec<(i64, Vec<seccompiler::SeccompRule>)>) {
     rules.push((syscalls::Sysno::riscv_flush_icache as i64, vec![]));
 }
