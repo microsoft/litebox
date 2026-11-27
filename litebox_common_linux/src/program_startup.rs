@@ -389,7 +389,11 @@ impl LinuxForkStartup {
         output.extend_from_slice(self.signal_actions.as_bytes());
         output.extend_from_slice(self.alternate_signal_stack.as_bytes());
         output.extend_from_slice(self.registers.as_bytes());
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        #[cfg(any(
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "x86_64"
+        ))]
         push_vector_state(&mut output, &self.vector_state);
         #[cfg(target_arch = "aarch64")]
         output.push(u8::from(self.sve_vl_inherit));
@@ -446,7 +450,11 @@ impl LinuxForkStartup {
         let signal_actions = read_value(&mut input)?;
         let alternate_signal_stack = read_value(&mut input)?;
         let registers = read_value(&mut input)?;
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        #[cfg(any(
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "x86_64"
+        ))]
         let vector_state = read_vector_state(&mut input)?;
         #[cfg(target_arch = "aarch64")]
         let sve_vl_inherit = read_bool(&mut input)?;
@@ -492,9 +500,17 @@ impl LinuxForkStartup {
             signal_actions,
             alternate_signal_stack,
             registers,
-            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            #[cfg(any(
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "x86_64"
+            ))]
             vector_state,
-            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            #[cfg(not(any(
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "x86_64"
+            )))]
             vector_state: (),
             #[cfg(target_arch = "aarch64")]
             sve_vl_inherit,
@@ -688,6 +704,17 @@ fn read_vector_state(input: &mut &[u8]) -> Result<GuestVectorState, LinuxProgram
     let bytes = take_bytes(input, length)?;
     let layout = litebox::arch::x86_64::xstate::XsaveLayout::get();
     GuestVectorState::from_bytes(bytes, layout).ok_or(LinuxProgramStartupError::Malformed)
+}
+
+/// Appends the fixed-size F/D state.
+#[cfg(target_arch = "riscv64")]
+fn push_vector_state(output: &mut Vec<u8>, state: &GuestVectorState) {
+    output.extend_from_slice(state.as_bytes());
+}
+
+#[cfg(target_arch = "riscv64")]
+fn read_vector_state(input: &mut &[u8]) -> Result<GuestVectorState, LinuxProgramStartupError> {
+    read_value(input)
 }
 
 fn read_u32(input: &mut &[u8]) -> Result<u32, LinuxProgramStartupError> {
@@ -899,7 +926,19 @@ mod tests {
         GuestVectorState::initial(litebox::arch::x86_64::xstate::XsaveLayout::get())
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(target_arch = "riscv64")]
+    fn fork_vector_state() -> GuestVectorState {
+        GuestVectorState::new(
+            core::array::from_fn(|index| u64::MAX / 3 - index as u64),
+            0xe1,
+        )
+    }
+
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )))]
     fn fork_vector_state() -> GuestVectorState {}
 
     fn fork_startup() -> LinuxForkStartup {
@@ -992,6 +1031,8 @@ mod tests {
             assert_eq!(decoded.vector_state, not_live.vector_state);
             assert_eq!(decoded.encode().unwrap(), not_live_encoded);
         }
+        #[cfg(target_arch = "riscv64")]
+        assert_eq!(decoded.vector_state, startup.vector_state);
         assert_eq!(decoded.encode().unwrap(), encoded);
     }
 

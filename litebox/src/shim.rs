@@ -161,6 +161,32 @@ pub struct ExceptionInfo {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Exception(pub usize);
 
+#[cfg(target_arch = "riscv64")]
+impl Exception {
+    /// Instruction address misaligned.
+    pub const INSTRUCTION_ADDRESS_MISALIGNED: Self = Self(0);
+    /// Instruction access fault.
+    pub const INSTRUCTION_ACCESS_FAULT: Self = Self(1);
+    /// Illegal instruction.
+    pub const ILLEGAL_INSTRUCTION: Self = Self(2);
+    /// Breakpoint (`ebreak`).
+    pub const BREAKPOINT: Self = Self(3);
+    /// Load address misaligned.
+    pub const LOAD_ADDRESS_MISALIGNED: Self = Self(4);
+    /// Load access fault.
+    pub const LOAD_ACCESS_FAULT: Self = Self(5);
+    /// Store/AMO address misaligned.
+    pub const STORE_ADDRESS_MISALIGNED: Self = Self(6);
+    /// Store/AMO access fault.
+    pub const STORE_ACCESS_FAULT: Self = Self(7);
+    /// Instruction page fault.
+    pub const INSTRUCTION_PAGE_FAULT: Self = Self(12);
+    /// Load page fault.
+    pub const LOAD_PAGE_FAULT: Self = Self(13);
+    /// Store/AMO page fault.
+    pub const STORE_PAGE_FAULT: Self = Self(15);
+}
+
 /// An x86 exception type.
 #[cfg(target_arch = "x86_64")]
 #[repr(transparent)]

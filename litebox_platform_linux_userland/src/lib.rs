@@ -8,7 +8,11 @@
 
 #![cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
 ))]
 
 use litebox::mm::vmap::VmapManager;
@@ -33,6 +37,7 @@ extern crate alloc;
 
 #[cfg_attr(target_arch = "aarch64", path = "aarch64.rs")]
 #[cfg_attr(target_arch = "x86_64", path = "x86_64.rs")]
+#[cfg_attr(target_arch = "riscv64", path = "riscv64.rs")]
 mod arch;
 mod page_mgmt;
 pub mod process;
@@ -45,6 +50,11 @@ use arch::{
     signal_handler_capture_guest_vector_state, signal_handler_set_interrupt,
     sync_instruction_stream,
 };
+#[cfg(target_arch = "riscv64")]
+use arch::{
+    GateInterruption, assert_tls_block_placement, copy_signal_context, exception_from_signal,
+    signal_handler_exit_guest, sync_instruction_stream,
+};
 #[cfg(target_arch = "x86_64")]
 use arch::{copy_signal_context, interrupt_callback_no_xsave, signal_handler_exit_guest};
 use arch::{
@@ -53,7 +63,7 @@ use arch::{
     run_thread_arch, set_guest_thread_marker, set_signal_return, switch_to_guest,
 };
 
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "riscv64")))]
 const AT_FDCWD: usize = (litebox_common_linux::AT_FDCWD as isize).cast_unsigned();
 
 /// The userland Linux platform.
@@ -105,7 +115,7 @@ impl core::fmt::Debug for LinuxUserland {
 impl LinuxUserland {
     /// Create a new userland-Linux platform for use in `LiteBox`.
     pub fn new() -> &'static Self {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         assert_tls_block_placement();
 
         register_exception_handlers();
@@ -126,7 +136,7 @@ impl LinuxUserland {
     /// The caller must be the sole thread in a process cloned from an initialized
     /// [`LinuxUserland`] runner. The child must not use or destroy the copied platform instance.
     pub unsafe fn new_after_process_clone() -> &'static Self {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         assert_tls_block_placement();
         // Independently usable bootstrap: prepare_fork_child need not have run.
         // SAFETY: sole surviving clone thread; copied guest guards cannot resume.
@@ -313,6 +323,8 @@ impl LinuxUserland {
         let calling_thread = || vec![SeccompRule::new(vec![arg_eq(0, 0)]).unwrap()];
         let target_arch = if cfg!(target_arch = "x86_64") {
             seccompiler::TargetArch::x86_64
+        } else if cfg!(target_arch = "riscv64") {
+            seccompiler::TargetArch::riscv64
         } else {
             seccompiler::TargetArch::aarch64
         };
@@ -321,11 +333,11 @@ impl LinuxUserland {
             // Terminal and broker I/O
             (libc::SYS_read, vec![]),
             (libc::SYS_write, vec![]),
-            // The AArch64 (asm-generic) syscall table has no `poll`; glibc
-            // implements `poll(3)` there via `ppoll`.
+            // The asm-generic syscall table of AArch64 and RV64 has no `poll`;
+            // glibc implements `poll(3)` there via `ppoll`.
             #[cfg(target_arch = "x86_64")]
             (libc::SYS_poll, vec![]),
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             (libc::SYS_ppoll, vec![]),
             // memory management
             (libc::SYS_mmap, vec![]),
@@ -1514,6 +1526,25 @@ extern "C-unwind" fn exception_handler(
             bus_error,
         }
     };
+    // On RV64 `exception_signal_handler` recovers the `scause` exception code
+    // from the signal; see `arch::exception_from_signal`. A misaligned access
+    // also raises SIGBUS, but its memory could service it.
+    #[cfg(target_arch = "riscv64")]
+    let info = {
+        use litebox::shim::Exception;
+        let _ = error;
+        let exception = Exception(trapno);
+        let misaligned = matches!(
+            exception,
+            Exception::LOAD_ADDRESS_MISALIGNED | Exception::STORE_ADDRESS_MISALIGNED
+        );
+        litebox::shim::ExceptionInfo {
+            exception,
+            fault_address: cr2,
+            kernel_mode: false,
+            bus_error: bus_error && !misaligned,
+        }
+    };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
 }
 
@@ -1651,7 +1682,7 @@ fn register_exception_handlers() {
                 // guest jumping to a bad pointer would take the host with it.
                 // Nothing on the x86-64 path probes guest memory, so leaving
                 // the flag off there keeps the kernel's recursion backstop.
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
                 {
                     sa.sa_flags |= libc::SA_NODEFER;
                 }
@@ -1880,6 +1911,15 @@ fn gate_interruption(signum: libc::c_int, code: libc::c_int) -> GateInterruption
     }
 }
 
+#[cfg(target_arch = "riscv64")]
+fn gate_interruption(signum: libc::c_int, code: libc::c_int) -> GateInterruption {
+    if is_synchronous_memory_fault(signum, code) {
+        GateInterruption::Synchronous
+    } else {
+        GateInterruption::Asynchronous
+    }
+}
+
 /// Updates guest registers; returns true when the gate consumes the signal.
 #[cfg(target_arch = "aarch64")]
 fn update_aarch64_guest_signal_context(
@@ -1933,6 +1973,8 @@ unsafe fn exception_signal_handler(
     let faulting_pc: usize = context.uc_mcontext.gregs[libc::REG_RIP as usize]
         .reinterpret_as_unsigned()
         .trunc();
+    #[cfg(target_arch = "riscv64")]
+    let faulting_pc: usize = context.uc_mcontext.__gregs[libc::REG_PC].trunc();
 
     // Staging can raise SIGSEGV/SIGBUS with `in_guest` set; fix up before checking it.
     #[cfg(target_arch = "aarch64")]
@@ -1992,6 +2034,14 @@ unsafe fn exception_signal_handler(
                 context.uc_mcontext.regs[1] as *const core::ffi::c_char,
             )
         };
+        #[cfg(target_arch = "riscv64")]
+        let (sysno, arg0, arg1) = {
+            let gregs = &mut context.uc_mcontext.__gregs;
+            let sysno = gregs[17].cast_signed();
+            let arg0 = gregs[10].cast_signed();
+            gregs[10] = i64::from(-libc::EINVAL).cast_unsigned();
+            (sysno, arg0, gregs[11] as *const core::ffi::c_char)
+        };
         // Signal-safe: format on the stack via arrayvec (no heap allocation).
         let mut buf = arrayvec::ArrayString::<320>::new();
         if sysno == libc::SYS_openat {
@@ -2016,7 +2066,7 @@ unsafe fn exception_signal_handler(
                 buf.len(),
             )
         };
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         return;
         #[cfg(target_arch = "aarch64")]
         {
@@ -2034,7 +2084,7 @@ unsafe fn exception_signal_handler(
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     let Some(regs) = signal_handler_exit_guest(context, false) else {
         return unsafe { next_signal_handler(signum, info, context) };
     };
@@ -2044,6 +2094,12 @@ unsafe fn exception_signal_handler(
     };
     #[cfg(target_arch = "x86_64")]
     copy_signal_context(unsafe { &mut *regs }, context);
+    #[cfg(target_arch = "riscv64")]
+    copy_signal_context(
+        unsafe { &mut *regs },
+        context,
+        gate_interruption(signum, info.si_code),
+    );
     #[cfg(target_arch = "aarch64")]
     {
         signal_handler_capture_guest_vector_state(context);
@@ -2059,6 +2115,7 @@ unsafe fn exception_signal_handler(
 
     let _ = run_thread_arch as *const () as usize;
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let sigctx = &context.uc_mcontext;
     #[cfg(target_arch = "x86_64")]
     let (trapno, err, cr2) = (
@@ -2081,6 +2138,33 @@ unsafe fn exception_signal_handler(
         0isize,
         TruncateExt::<usize>::trunc(sigctx.fault_address).reinterpret_as_signed(),
     );
+    // RV64 exposes no `scause` to userspace either, so the exception code is
+    // recovered from the signal, using the faulting instruction itself, not a
+    // canonicalized pc. Only kernel-generated memory faults carry an address:
+    // for a sent signal (`si_code <= 0`) the union holds the sender's pid and
+    // uid instead. For a misaligned access, Linux reports the pc rather than
+    // the data address, so no fault address is available.
+    #[cfg(target_arch = "riscv64")]
+    let (trapno, err, cr2) = {
+        let si_addr = if matches!(signum, libc::SIGSEGV | libc::SIGBUS) && info.si_code > 0 {
+            // SAFETY: the kernel fills `si_addr` for the memory faults it
+            // generates.
+            unsafe { info.si_addr() }.addr()
+        } else {
+            0
+        };
+        let exception = exception_from_signal(signum, info.si_code, faulting_pc, si_addr);
+        let address = if signum == libc::SIGBUS && info.si_code == libc::BUS_ADRALN {
+            0
+        } else {
+            si_addr
+        };
+        (
+            exception.0.reinterpret_as_signed(),
+            0isize,
+            address.reinterpret_as_signed(),
+        )
+    };
     // The host signal tells the shim what the trap cannot, such as whether a page fault was a
     // bus error. Widen infallibly: a panic is not async-signal-safe.
     let signal = TruncateExt::<isize>::trunc(i64::from(signum));
@@ -2098,6 +2182,10 @@ fn context_ip(context: &libc::ucontext_t) -> usize {
     #[cfg(target_arch = "aarch64")]
     {
         context.uc_mcontext.pc.trunc()
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        context.uc_mcontext.__gregs[libc::REG_PC].trunc()
     }
 }
 
@@ -2119,6 +2207,10 @@ unsafe fn next_signal_handler(
         #[cfg(target_arch = "aarch64")]
         {
             context.uc_mcontext.pc = fixup_addr as u64;
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            context.uc_mcontext.__gregs[libc::REG_PC] = fixup_addr as u64;
         }
         return;
     }
@@ -2231,6 +2323,8 @@ unsafe fn terminate_on_host_signal(
             core::arch::asm!("int3", options(nomem, nostack));
             #[cfg(target_arch = "aarch64")]
             core::arch::asm!("brk #0", options(nomem, nostack));
+            #[cfg(target_arch = "riscv64")]
+            core::arch::asm!("ebreak", options(nomem, nostack));
         }
     }
     // Otherwise, the signal reports no fault that recurs: another process sent it, as the seccomp
@@ -2274,6 +2368,8 @@ unsafe fn interrupt_signal_handler(
 ) {
     #[cfg(target_arch = "aarch64")]
     let interrupted_guest = entry.take_interrupted_guest(context.uc_mcontext.pc.trunc());
+    #[cfg(target_arch = "riscv64")]
+    let mut set_interrupt = true;
 
     #[cfg(debug_assertions)]
     let raise_signal = |signum: libc::c_int, info: &libc::siginfo_t| {
@@ -2319,19 +2415,27 @@ unsafe fn interrupt_signal_handler(
                 return;
             }
         } else {
-            // Unknown signals are dropped, but aarch64 has already cleared `in_guest`:
-            // an interrupted guest must exit through `interrupt_callback`.
+            // Unknown signals are dropped, but an interrupted guest must exit through
+            // `interrupt_callback`: aarch64 has already cleared `in_guest`, and on riscv64
+            // a nested signal may have left its interrupt to this handler.
             #[cfg(target_arch = "x86_64")]
             return;
             #[cfg(target_arch = "aarch64")]
             if interrupted_guest.is_none() {
                 return;
             }
+            #[cfg(target_arch = "riscv64")]
+            {
+                set_interrupt = false;
+            }
         }
     }
 
-    // Note that this signal can't arrive while in an exception signal handler
-    // since we mask the interrupt signal while handling exceptions.
+    // Note that the interrupt signal can't arrive while in an exception signal
+    // handler since we mask it while handling exceptions, but SIGINT and
+    // SIGALRM can. On riscv64, `signal_handler_exit_guest` recognizes such a
+    // nested signal from its context and leaves the guest, and the interrupt,
+    // to the outer handler.
 
     #[cfg(target_arch = "x86_64")]
     let ip = context.uc_mcontext.gregs[libc::REG_RIP as usize]
@@ -2339,6 +2443,8 @@ unsafe fn interrupt_signal_handler(
         .trunc();
     #[cfg(target_arch = "aarch64")]
     let ip = context.uc_mcontext.pc.trunc();
+    #[cfg(target_arch = "riscv64")]
+    let ip = context.uc_mcontext.__gregs[libc::REG_PC].trunc();
 
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
@@ -2350,6 +2456,10 @@ unsafe fn interrupt_signal_handler(
     let in_switch_to_guest = in_switch_to_guest(ip);
     #[cfg(target_arch = "x86_64")]
     let Some(regs) = signal_handler_exit_guest(context, true) else {
+        return;
+    };
+    #[cfg(target_arch = "riscv64")]
+    let Some(regs) = signal_handler_exit_guest(context, set_interrupt) else {
         return;
     };
     #[cfg(target_arch = "aarch64")]
@@ -2369,6 +2479,12 @@ unsafe fn interrupt_signal_handler(
     } else {
         #[cfg(target_arch = "x86_64")]
         copy_signal_context(unsafe { &mut *regs }, context);
+        #[cfg(target_arch = "riscv64")]
+        copy_signal_context(
+            unsafe { &mut *regs },
+            context,
+            GateInterruption::Asynchronous,
+        );
         #[cfg(target_arch = "aarch64")]
         update_aarch64_guest_signal_context(
             context,
@@ -2383,7 +2499,7 @@ unsafe fn interrupt_signal_handler(
     } else {
         interrupt_callback
     };
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let callback = interrupt_callback;
     set_signal_return(context, callback, 0, 0, 0, 0);
 }
@@ -2875,7 +2991,7 @@ mod tests {
         let mkdir_res = unsafe {
             syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
         };
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         let mkdir_res = unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::mkdirat,
@@ -2903,7 +3019,7 @@ mod tests {
                     flags.bits() as usize,
                 )
             };
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             let open_res = unsafe {
                 syscalls::syscall4(
                     syscalls::Sysno::openat,
@@ -3157,6 +3273,12 @@ mod tests {
                 inout(reg) address => _,
                 options(nostack, readonly),
             );
+            #[cfg(target_arch = "riscv64")]
+            core::arch::asm!(
+                "lb {0}, 0({0})",
+                inout(reg) address => _,
+                options(nostack, readonly),
+            );
         }
     }
 
@@ -3200,17 +3322,18 @@ mod tests {
 
     /// Fallible copies recover from the faults the kernel raises for them, including for an
     /// address past the end of the address space: a general-protection fault, reported with
-    /// `SI_KERNEL`, on x86-64, and a translation fault, reported with `SEGV_MAPERR`, on AArch64.
+    /// `SI_KERNEL`, on x86-64, and a translation fault, reported with `SEGV_MAPERR`, on AArch64
+    /// and RV64.
     #[test]
     fn fallible_copies_recover_from_faults() {
         let _platform = LinuxUserland::new();
         let mut byte = 0u8;
-        // Non-canonical on x86-64, and beyond the largest, 52-bit, address space on AArch64,
-        // whose top byte, which AArch64 ignores, is zero.
-        let beyond_address_space: usize = if cfg!(target_arch = "x86_64") {
-            0x8000_0000_0000_0000
-        } else {
+        // Non-canonical on x86-64 and RV64, and beyond the largest, 52-bit, address space on
+        // AArch64, whose top byte, which AArch64 ignores, is zero.
+        let beyond_address_space: usize = if cfg!(target_arch = "aarch64") {
             0x0080_0000_0000_0000
+        } else {
+            0x8000_0000_0000_0000
         };
         for source in [0, beyond_address_space] {
             // SAFETY: Nothing is mapped at `source`, which the copy reports instead of reading.
@@ -3254,6 +3377,20 @@ mod tests {
                 fixup = out(reg) fixup,
                 options(nomem, nostack, preserves_flags),
             );
+            #[cfg(target_arch = "riscv64")]
+            core::arch::asm!(
+                "lla {address}, 2f",
+                "lla {fixup}, 4f",
+                "j 4f",
+                "2:",
+                "nop",
+                "3:",
+                "4:",
+                litebox::ex_table_entry!("2b", "3b", "4b"),
+                address = out(reg) address,
+                fixup = out(reg) fixup,
+                options(nomem, nostack, preserves_flags),
+            );
         }
         (address, fixup)
     }
@@ -3288,6 +3425,14 @@ mod tests {
             core::arch::asm!("int3", options(nomem, nostack));
             #[cfg(target_arch = "aarch64")]
             core::arch::asm!("brk #0", options(nomem, nostack));
+            #[cfg(target_arch = "riscv64")]
+            core::arch::asm!(
+                ".option push",
+                ".option norvc",
+                "ebreak",
+                ".option pop",
+                options(nomem, nostack)
+            );
         }
     }
 
@@ -3322,8 +3467,9 @@ mod tests {
             _: *mut libc::siginfo_t,
             context: *mut libc::c_void,
         ) {
-            // `int3` traps with the PC after it; `ud2`, `brk` and `udf` with the PC at them.
-            let length = if cfg!(target_arch = "aarch64") {
+            // `int3` traps with the PC after it; `ud2`, `brk`, `udf`, `ebreak` and `unimp` with the
+            // PC at them. The RV64 ones are 4-byte encodings here.
+            let length = if cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {
                 4
             } else if signum == libc::SIGILL {
                 2
@@ -3340,6 +3486,10 @@ mod tests {
             {
                 context.uc_mcontext.pc += length;
             }
+            #[cfg(target_arch = "riscv64")]
+            {
+                context.uc_mcontext.__gregs[libc::REG_PC] += length;
+            }
         }
 
         /// Executes an undefined instruction.
@@ -3350,6 +3500,14 @@ mod tests {
                 core::arch::asm!("ud2", options(nomem, nostack));
                 #[cfg(target_arch = "aarch64")]
                 core::arch::asm!("udf #0", options(nomem, nostack));
+                #[cfg(target_arch = "riscv64")]
+                core::arch::asm!(
+                    ".option push",
+                    ".option norvc",
+                    "unimp",
+                    ".option pop",
+                    options(nomem, nostack)
+                );
             }
         }
 

@@ -33,6 +33,8 @@ mod guest_vector_state {
             pub type Selected = litebox::arch::x86_64::xstate::XsaveArea;
         } else if #[cfg(target_arch = "aarch64")] {
             pub type Selected = litebox::arch::aarch64::vector::VectorArea;
+        } else if #[cfg(target_arch = "riscv64")] {
+            pub type Selected = litebox::arch::riscv64::fp::FpState;
         } else {
             pub type Selected = ();
         }
