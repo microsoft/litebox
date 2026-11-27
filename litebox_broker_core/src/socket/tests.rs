@@ -72,6 +72,23 @@ fn socket_destinations_are_normalized_validated_and_routed() {
             Err(SocketError::InvalidArgument)
         );
     }
+    for ip in [Ipv4Addr::new(0, 0, 0, 1), Ipv4Addr::new(240, 0, 0, 1)] {
+        let address = SocketAddrV4::new(ip, port);
+        assert_eq!(
+            SocketAddressing::Host.normalize_destination(address),
+            Ok(address)
+        );
+    }
+    assert_eq!(
+        SocketAddressing::Host.normalize_destination(unspecified),
+        Ok(loopback)
+    );
+    for ip in [Ipv4Addr::new(224, 0, 0, 1), Ipv4Addr::BROADCAST] {
+        assert_eq!(
+            SocketAddressing::Host.normalize_destination(SocketAddrV4::new(ip, port)),
+            Err(SocketError::InvalidArgument)
+        );
+    }
 }
 
 #[test]
@@ -642,6 +659,15 @@ struct TestSocketState {
     readiness_hook: StdMutex<Option<std::boxed::Box<dyn Fn() + Send>>>,
     queue_next_guest_connect: core::sync::atomic::AtomicBool,
     pending_accept: StdMutex<Option<PendingAcceptedConnection>>,
+    /// Whether the provider reports [`SocketAddressing::Host`].
+    host_addressing: core::sync::atomic::AtomicBool,
+    connect_egresses: StdMutex<std::vec::Vec<SocketEgressVerdict>>,
+    reject_next_connect: StdMutex<Option<SocketError>>,
+    refuse_next_connect: core::sync::atomic::AtomicBool,
+    /// What `local_address` reports next, instead of the socket's address.
+    connect_local_addresses: StdMutex<std::collections::VecDeque<Option<SocketAddrV4>>>,
+    /// The local address and peer lease of the next host connection accepted.
+    next_host_accept: StdMutex<Option<(SocketAddrV4, GuestSourceLease)>>,
 }
 
 struct PendingAcceptedConnection {
@@ -660,6 +686,7 @@ enum TestInvalidAddress {
     WrongPort,
     Gateway,
     LoopbackAlias,
+    ZeroPort,
 }
 
 #[derive(Clone, Copy)]
@@ -689,10 +716,53 @@ fn invalid_address(address: SocketAddrV4, kind: TestInvalidAddress) -> SocketAdd
             };
             SocketAddrV4::new(ip, address.port())
         }
+        TestInvalidAddress::ZeroPort => SocketAddrV4::new(*address.ip(), 0),
     }
 }
 
+/// The host address [`TestSocketProvider::host`] binds a connecting stream at.
+const HOST_CONNECT_SOURCE: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
+
 impl TestSocketProvider {
+    /// A provider that reports [`SocketAddressing::Host`], chooses each port a
+    /// bind requests as 0, and binds an unbound stream as it connects, at
+    /// [`HOST_CONNECT_SOURCE`].
+    fn host() -> Self {
+        let provider = Self::default();
+        provider
+            .state
+            .host_addressing
+            .store(true, Ordering::Relaxed);
+        provider
+    }
+
+    fn reject_next_connect(&self, error: SocketError) {
+        *self.state.reject_next_connect.lock().unwrap() = Some(error);
+    }
+
+    /// Fails the next connect as a host refuses it.
+    fn refuse_next_connect(&self) {
+        self.state
+            .refuse_next_connect
+            .store(true, Ordering::Relaxed);
+    }
+
+    fn accept_next_host_connection(&self, local_address: SocketAddrV4, remote: SocketAddrV4) {
+        self.accept_next_host_lease(local_address, GuestSourceLease::external(remote));
+    }
+
+    fn accept_next_host_lease(&self, local_address: SocketAddrV4, lease: GuestSourceLease) {
+        *self.state.next_host_accept.lock().unwrap() = Some((local_address, lease));
+    }
+
+    fn report_connect_address_once(&self, address: Option<SocketAddrV4>) {
+        self.state
+            .connect_local_addresses
+            .lock()
+            .unwrap()
+            .push_back(address);
+    }
+
     fn fail_next_create(&self) {
         self.state.fail_create.store(true, Ordering::Relaxed);
     }
@@ -823,6 +893,14 @@ impl SocketProvider for TestSocketProvider {
             .unwrap()
             .push(process_key);
     }
+
+    fn addressing(&self) -> SocketAddressing {
+        if self.state.host_addressing.load(Ordering::Relaxed) {
+            SocketAddressing::Host
+        } else {
+            SocketAddressing::Isolated
+        }
+    }
 }
 
 struct TestPlatformSocket {
@@ -839,6 +917,7 @@ struct TestPlatformSocket {
 struct TestTcpOptions {
     no_delay: bool,
     keep_alive: bool,
+    reuse_address: bool,
 }
 
 impl TestPlatformSocket {
@@ -854,6 +933,30 @@ impl TestPlatformSocket {
         }
     }
 
+    fn accepted_socket(
+        &self,
+        readiness: ReadinessRegistration,
+        local_address: SocketAddrV4,
+    ) -> Arc<TestPlatformSocket> {
+        let socket = Arc::new(TestPlatformSocket {
+            state: Arc::clone(&self.state),
+            readiness,
+            create_request: self.create_request,
+            tcp_options: StdMutex::new(TestTcpOptions::default()),
+            guest_local_address: StdMutex::new(Some(local_address)),
+            guest_binding: StdMutex::new(None),
+            active: core::sync::atomic::AtomicBool::new(true),
+        });
+        if self.state.retain_next_socket.swap(false, Ordering::Relaxed) {
+            self.state
+                .retained_platform_sockets
+                .lock()
+                .unwrap()
+                .push(Arc::clone(&socket));
+        }
+        socket
+    }
+
     /// Copies in `data`.
     fn copy_in(&self, data: &dyn WriteBuffer) -> Result<()> {
         let mut bytes = vec![0; data.len()];
@@ -864,10 +967,30 @@ impl TestPlatformSocket {
 }
 
 impl PlatformSocket for TestPlatformSocket {
-    fn bind(&self, binding: GuestSocketBinding) -> Result<SocketOutcome<SocketAddrV4>> {
-        let address = binding.local_address();
-        *self.guest_binding.lock().unwrap() = Some(binding);
-        self.state.binds.lock().unwrap().push(address);
+    fn bind(&self, request: SocketBindRequest) -> Result<SocketOutcome<SocketAddrV4>> {
+        if self.state.host_addressing.load(Ordering::Relaxed)
+            != matches!(request, SocketBindRequest::Host(_))
+        {
+            return Err(BrokerError::Internal);
+        }
+        let address = match request {
+            SocketBindRequest::Isolated(binding) => {
+                let address = binding.local_address();
+                *self.guest_binding.lock().unwrap() = Some(binding);
+                address
+            }
+            SocketBindRequest::Host(request) => request.address(),
+        };
+        let address = {
+            let mut binds = self.state.binds.lock().unwrap();
+            binds.push(address);
+            if address.port() == 0 {
+                let port = 50_000 + u16::try_from(binds.len()).unwrap();
+                SocketAddrV4::new(*address.ip(), port)
+            } else {
+                address
+            }
+        };
         let bound_address = self
             .state
             .invalid_bind_address
@@ -909,6 +1032,18 @@ impl PlatformSocket for TestPlatformSocket {
                 TestAcceptFailure::Broker => Err(BrokerError::OutOfMemory),
             };
         }
+        if let Some((local_address, guest_source_lease)) =
+            self.state.next_host_accept.lock().unwrap().take()
+        {
+            return Ok(SocketOutcome::Completed(AcceptedPlatformSocket {
+                socket: self.accepted_socket(readiness, local_address),
+                local_address,
+                guest_source_lease,
+            }));
+        }
+        if self.state.host_addressing.load(Ordering::Relaxed) {
+            return Err(BrokerError::WouldBlock);
+        }
         let binding = self
             .guest_binding
             .lock()
@@ -934,24 +1069,8 @@ impl PlatformSocket for TestPlatformSocket {
             .map_or(pending.destination, |kind| {
                 invalid_address(pending.destination, kind)
             });
-        let socket = Arc::new(TestPlatformSocket {
-            state: Arc::clone(&self.state),
-            readiness,
-            create_request: self.create_request,
-            tcp_options: StdMutex::new(TestTcpOptions::default()),
-            guest_local_address: StdMutex::new(Some(local_address)),
-            guest_binding: StdMutex::new(None),
-            active: core::sync::atomic::AtomicBool::new(true),
-        });
-        if self.state.retain_next_socket.swap(false, Ordering::Relaxed) {
-            self.state
-                .retained_platform_sockets
-                .lock()
-                .unwrap()
-                .push(Arc::clone(&socket));
-        }
         Ok(SocketOutcome::Completed(AcceptedPlatformSocket {
-            socket,
+            socket: self.accepted_socket(readiness, local_address),
             local_address,
             guest_source_lease: pending.guest_source_lease,
         }))
@@ -961,8 +1080,14 @@ impl PlatformSocket for TestPlatformSocket {
         &self,
         address: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
+        egress: SocketEgressVerdict,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
-        self.state.connect_calls.fetch_add(1, Ordering::Relaxed);
+        let connect_call = self.state.connect_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        // Core lets the provider decide egress only with host addressing.
+        if !self.state.host_addressing.load(Ordering::Relaxed) {
+            assert_eq!(egress, SocketEgressVerdict::Permitted);
+        }
+        self.state.connect_egresses.lock().unwrap().push(egress);
         let connect_block = self.state.connect_block.lock().unwrap().take();
         if let Some((started, release)) = connect_block {
             started.send(()).unwrap();
@@ -978,6 +1103,18 @@ impl PlatformSocket for TestPlatformSocket {
                 .as_ref()
                 .map(GuestSourceLease::source_address),
         );
+        if let Some(error) = self.state.reject_next_connect.lock().unwrap().take() {
+            return Err(PlatformConnectError::Rejected(error));
+        }
+        if self
+            .state
+            .refuse_next_connect
+            .swap(false, Ordering::Relaxed)
+        {
+            return Ok(SocketConnectionStatus::Failed(
+                SocketError::ConnectionRefused,
+            ));
+        }
         if self.state.fail_connect.swap(false, Ordering::Relaxed) {
             return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal));
         }
@@ -996,6 +1133,13 @@ impl PlatformSocket for TestPlatformSocket {
             .swap(false, Ordering::Relaxed)
         {
             return Ok(SocketConnectionStatus::Unconnected);
+        }
+        if self.state.host_addressing.load(Ordering::Relaxed) && is_tcp(self.create_request) {
+            let port = 60_000 + u16::try_from(connect_call).unwrap();
+            self.guest_local_address
+                .lock()
+                .unwrap()
+                .get_or_insert(SocketAddrV4::new(HOST_CONNECT_SOURCE, port));
         }
         self.readiness.publish(ReadinessFlags::WRITE);
         if is_udp(self.create_request) {
@@ -1120,6 +1264,12 @@ impl PlatformSocket for TestPlatformSocket {
         match value {
             SocketOptionValue::NoDelay(value) => options.no_delay = value,
             SocketOptionValue::KeepAlive(value) => options.keep_alive = value,
+            // Core forwards ReuseAddress only for host-addressed sockets.
+            SocketOptionValue::ReuseAddress(value)
+                if self.state.host_addressing.load(Ordering::Relaxed) =>
+            {
+                options.reuse_address = value;
+            }
             _ => return Err(BrokerError::UnsupportedOperation),
         }
         Ok(())
@@ -1130,8 +1280,23 @@ impl PlatformSocket for TestPlatformSocket {
         match name {
             SocketOptionName::NoDelay => Ok(SocketOptionValue::NoDelay(options.no_delay)),
             SocketOptionName::KeepAlive => Ok(SocketOptionValue::KeepAlive(options.keep_alive)),
+            SocketOptionName::ReuseAddress
+                if self.state.host_addressing.load(Ordering::Relaxed) =>
+            {
+                Ok(SocketOptionValue::ReuseAddress(options.reuse_address))
+            }
             _ => Err(BrokerError::UnsupportedOperation),
         }
+    }
+
+    fn local_address(&self) -> Result<Option<SocketAddrV4>> {
+        Ok(self
+            .state
+            .connect_local_addresses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(*self.guest_local_address.lock().unwrap()))
     }
 
     fn status(&self) -> Result<PlatformSocketStatus> {
@@ -1238,6 +1403,401 @@ fn zero_port_connect_fails_before_platform_dispatch() {
         connect(&process, socket, loopback_address()),
         Ok(SocketOutcome::Failed(SocketError::AlreadyInProgress))
     );
+}
+
+#[test]
+fn host_connect_passes_egress_and_lets_the_platform_bind() {
+    let provider = Arc::new(TestSocketProvider::host());
+    let external = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 443);
+    let policy = crate::SocketPolicy::guest_network()
+        .with_tcp_destination_rules(&[destination_rule(*external.ip(), external.port())])
+        .unwrap();
+    let broker = test_broker_with_policy(Arc::clone(&provider) as Arc<dyn SocketProvider>, &policy);
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let readiness = Arc::new(TestReadinessSink::default());
+    let socket = create(&process, create_request(), readiness.clone()).unwrap();
+    let host_source = |port| SocketAddrV4::new(HOST_CONNECT_SOURCE, port);
+
+    // Host addressing exempts no internal destination. Policy denies one that
+    // no provider listener serves and that is not the host's own, which
+    // leaves the stream unbound.
+    let guest = SocketAddrV4::new(GUEST_IPV4_ADDRESS, 8080);
+    let unruled = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 8080);
+    for destination in [guest, unruled] {
+        provider.reject_next_connect(SocketError::PolicyDenied);
+        assert_eq!(
+            connect(&process, socket, destination),
+            Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
+        );
+        assert_eq!(get_name(&process, socket, false), Ok(None));
+    }
+
+    // The platform, not core, binds an unbound stream as it connects.
+    assert_eq!(
+        connect(&process, socket, external),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    assert!(provider.state.binds.lock().unwrap().is_empty());
+    assert_eq!(
+        get_name(&process, socket, false),
+        Ok(Some(host_source(60_003)))
+    );
+    assert_eq!(
+        provider.state.connect_egresses.lock().unwrap().as_slice(),
+        [
+            SocketEgressVerdict::ServedOnly,
+            SocketEgressVerdict::ServedOnly,
+            SocketEgressVerdict::Permitted
+        ]
+    );
+    assert_eq!(
+        provider
+            .state
+            .connect_source_addresses
+            .lock()
+            .unwrap()
+            .as_slice(),
+        [None; 3]
+    );
+
+    // The host refuses its own unserved address, which leaves the stream
+    // unbound.
+    let refused = create(&process, create_request(), readiness.clone()).unwrap();
+    let loopback = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080);
+    provider.refuse_next_connect();
+    assert_eq!(
+        connect(&process, refused, loopback),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(get_name(&process, refused, false), Ok(None));
+
+    // A rejection keeps an explicit bind.
+    let bound = create(&process, create_request(), readiness.clone()).unwrap();
+    let explicit = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40_000);
+    assert_eq!(
+        bind(&process, bound, explicit),
+        Ok(SocketOutcome::Completed(explicit))
+    );
+    provider.reject_next_connect(SocketError::PolicyDenied);
+    assert_eq!(
+        connect(&process, bound, unruled),
+        Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
+    );
+    assert_eq!(get_name(&process, bound, false), Ok(Some(explicit)));
+
+    // A failure that leaves the peer unchanged leaves the stream unbound for
+    // another attempt. A destination the rules deny still connects when the
+    // provider serves it at one of the host's own addresses.
+    let unchanged = create(&process, create_request(), readiness.clone()).unwrap();
+    let served = SocketAddrV4::new(HOST_CONNECT_SOURCE, 8080);
+    provider.fail_next_connect();
+    assert_eq!(
+        connect(&process, unchanged, served),
+        Err(BrokerError::Internal)
+    );
+    assert_eq!(get_name(&process, unchanged, false), Ok(None));
+    assert_eq!(
+        connect(&process, unchanged, served),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    assert_eq!(
+        provider.state.connect_egresses.lock().unwrap().last(),
+        Some(&SocketEgressVerdict::ServedOnly)
+    );
+    assert_eq!(
+        get_name(&process, unchanged, false),
+        Ok(Some(host_source(60_007)))
+    );
+
+    // A connection that ended before core read its address has none.
+    let ended = create(&process, create_request(), readiness.clone()).unwrap();
+    provider.report_connect_address_once(None);
+    assert_eq!(
+        connect(&process, ended, external),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    provider.return_next_status(
+        SocketConnectionStatus::Failed(SocketError::ConnectionRefused),
+        None,
+    );
+    assert_eq!(
+        check_connect(&process, ended),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(get_name(&process, ended, false), Ok(None));
+    assert_eq!(provider.state.retired_sockets.load(Ordering::Relaxed), 0);
+
+    // A host may report the unspecified IP until the connection completes;
+    // core then learns the IP from the stream's status.
+    let wildcard = create(&process, create_request(), readiness.clone()).unwrap();
+    provider.report_connect_address_once(Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 60_009)));
+    assert_eq!(
+        connect(&process, wildcard, external),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    provider
+        .state
+        .status_responses
+        .lock()
+        .unwrap()
+        .push_back(PlatformSocketStatus {
+            status: SocketConnectionStatus::Connected,
+            local_address: Some(host_source(60_009)),
+            pending_error: None,
+        });
+    assert_eq!(
+        get_name(&process, wildcard, false),
+        Ok(Some(host_source(60_009)))
+    );
+    assert_eq!(provider.state.retired_sockets.load(Ordering::Relaxed), 0);
+
+    // Core retires a stream whose platform reports no port, a multicast IP, or
+    // the limited broadcast IP, without reaching the platform again.
+    for (retired, address) in (1..).zip([
+        host_source(0),
+        SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), 60_011),
+        SocketAddrV4::new(Ipv4Addr::BROADCAST, 60_012),
+    ]) {
+        let invalid = create(&process, create_request(), readiness.clone()).unwrap();
+        provider.report_connect_address_once(Some(address));
+        assert_eq!(
+            connect(&process, invalid, external),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired
+        );
+        let connect_calls = provider.state.connect_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            connect(&process, invalid, external),
+            Ok(SocketOutcome::Failed(SocketError::ConnectionAborted))
+        );
+        assert_eq!(
+            provider.state.connect_calls.load(Ordering::Relaxed),
+            connect_calls
+        );
+        process.close_object_reference(invalid).unwrap();
+    }
+
+    // Nor may the host refine an unspecified IP to the limited broadcast one.
+    let unrefinable = create(&process, create_request(), readiness.clone()).unwrap();
+    provider.report_connect_address_once(Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 60_013)));
+    assert_eq!(
+        connect(&process, unrefinable, external),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    provider
+        .state
+        .status_responses
+        .lock()
+        .unwrap()
+        .push_back(PlatformSocketStatus {
+            status: SocketConnectionStatus::Connected,
+            local_address: Some(SocketAddrV4::new(Ipv4Addr::BROADCAST, 60_013)),
+            pending_error: None,
+        });
+    assert_eq!(status(&process, unrefinable), Err(BrokerError::Internal));
+    assert_eq!(provider.state.retired_sockets.load(Ordering::Relaxed), 4);
+    process.close_object_reference(unrefinable).unwrap();
+
+    // The host must keep a stream's port.
+    provider
+        .state
+        .status_responses
+        .lock()
+        .unwrap()
+        .push_back(PlatformSocketStatus {
+            status: SocketConnectionStatus::Connected,
+            local_address: Some(host_source(60_004)),
+            pending_error: None,
+        });
+    assert_eq!(status(&process, socket), Err(BrokerError::Internal));
+    assert_eq!(provider.state.retired_sockets.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn host_addressing_refuses_sockets_other_than_tcp() {
+    let provider = Arc::new(TestSocketProvider::host());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+
+    assert_eq!(
+        create(
+            &process,
+            create_udp_request(),
+            Arc::new(TestReadinessSink::default())
+        ),
+        Err(BrokerError::UnsupportedOperation)
+    );
+    assert!(provider.state.creates.lock().unwrap().is_empty());
+}
+
+#[test]
+fn host_addressing_binds_listens_and_accepts_host_addresses() {
+    let provider = Arc::new(TestSocketProvider::host());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let readiness = Arc::new(TestReadinessSink::default());
+    let accept_next = |listener| {
+        accept(
+            &process,
+            listener,
+            FileOpenFlags::NONE,
+            Arc::new(TestReadinessSink::default()),
+        )
+    };
+
+    // The platform must bind the requested IP, a nonzero port, and the
+    // requested port if there is one.
+    for (retired, (requested_port, kind)) in (1..).zip([
+        (0, TestInvalidAddress::Gateway),
+        (0, TestInvalidAddress::ZeroPort),
+        (40_000, TestInvalidAddress::WrongPort),
+    ]) {
+        let invalid = create(&process, create_request(), readiness.clone()).unwrap();
+        provider.return_invalid_bind_address_once(kind);
+        assert_eq!(
+            bind(
+                &process,
+                invalid,
+                SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, requested_port)
+            ),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired
+        );
+        process.close_object_reference(invalid).unwrap();
+    }
+
+    // Multicast addresses and the limited broadcast address are never the
+    // host's own.
+    let unbindable = create(&process, create_request(), readiness.clone()).unwrap();
+    for ip in [Ipv4Addr::new(224, 0, 0, 1), Ipv4Addr::BROADCAST] {
+        assert_eq!(
+            bind(&process, unbindable, SocketAddrV4::new(ip, 0)),
+            Ok(SocketOutcome::Failed(SocketError::AddressNotAvailable))
+        );
+    }
+    assert_eq!(provider.state.binds.lock().unwrap().len(), 3);
+    process.close_object_reference(unbindable).unwrap();
+
+    // The guest's ReuseAddress reaches the platform, which binds with it.
+    let wildcard_listener = create(&process, create_request(), readiness.clone()).unwrap();
+    assert_eq!(
+        set_option(
+            &process,
+            wildcard_listener,
+            SocketOptionValue::ReuseAddress(true)
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        get_option(&process, wildcard_listener, SocketOptionName::ReuseAddress),
+        Ok(SocketOptionValue::ReuseAddress(true))
+    );
+    assert_eq!(
+        provider.state.tcp_option_sets.lock().unwrap().as_slice(),
+        [SocketOptionValue::ReuseAddress(true)]
+    );
+
+    // An unbound listener binds an ephemeral port on every address and
+    // accepts a concrete address on that port.
+    let wildcard_address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 50_004);
+    assert_eq!(
+        listen(&process, wildcard_listener, 1),
+        Ok(SocketOutcome::Completed(wildcard_address))
+    );
+    let host_local = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), wildcard_address.port());
+    let client = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 5), 40_000);
+    provider.accept_next_host_connection(host_local, client);
+    let SocketOutcome::Completed(accepted) = accept_next(wildcard_listener).unwrap() else {
+        panic!("host accept failed");
+    };
+    assert_eq!(
+        (accepted.local_address, accepted.remote_address),
+        (host_local, client)
+    );
+    process.close_object_reference(accepted.handle).unwrap();
+
+    // A lease that holds the connector's port within the provider keeps its
+    // owner alive until the accepted stream closes.
+    let port_owner: Arc<dyn core::any::Any + Send + Sync> = Arc::new(());
+    let connector = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40_001);
+    provider.accept_next_host_lease(
+        host_local,
+        GuestSourceLease::with_port_owner(connector, Arc::clone(&port_owner)),
+    );
+    let SocketOutcome::Completed(accepted) = accept_next(wildcard_listener).unwrap() else {
+        panic!("host accept failed");
+    };
+    assert_eq!(accepted.remote_address, connector);
+    assert_eq!(Arc::strong_count(&port_owner), 2);
+    process.close_object_reference(accepted.handle).unwrap();
+    assert_eq!(Arc::strong_count(&port_owner), 1);
+
+    let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+    for local_address in [
+        SocketAddrV4::new(*host_local.ip(), host_local.port() + 1),
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, host_local.port()),
+        SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), host_local.port()),
+        SocketAddrV4::new(Ipv4Addr::BROADCAST, host_local.port()),
+    ] {
+        provider.accept_next_host_connection(local_address, client);
+        provider.retain_next_socket();
+        assert!(matches!(
+            accept_next(wildcard_listener),
+            Err(BrokerError::Internal)
+        ));
+    }
+    assert_eq!(
+        provider.state.retired_sockets.load(Ordering::Relaxed),
+        retired_before + 4
+    );
+    provider
+        .state
+        .retained_platform_sockets
+        .lock()
+        .unwrap()
+        .clear();
+
+    // A listener on one host IP, which need not be a guest address, accepts
+    // only connections to that IP.
+    let exact_listener = create(&process, create_request(), readiness).unwrap();
+    let exact_address = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 11), 50_005);
+    assert_eq!(
+        bind(
+            &process,
+            exact_listener,
+            SocketAddrV4::new(*exact_address.ip(), 0)
+        ),
+        Ok(SocketOutcome::Completed(exact_address))
+    );
+    assert_eq!(
+        listen(&process, exact_listener, 1),
+        Ok(SocketOutcome::Completed(exact_address))
+    );
+    provider.accept_next_host_connection(
+        SocketAddrV4::new(*host_local.ip(), exact_address.port()),
+        client,
+    );
+    assert!(matches!(
+        accept_next(exact_listener),
+        Err(BrokerError::Internal)
+    ));
+    provider.accept_next_host_connection(exact_address, client);
+    assert!(matches!(
+        accept_next(exact_listener),
+        Ok(SocketOutcome::Completed(_))
+    ));
 }
 
 #[test]
@@ -1515,6 +2075,7 @@ fn test_broker_with_policy(
         readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
         reserved_child_image_size: Arc::new(core::sync::atomic::AtomicU64::new(0)),
         random_provider: Arc::new(crate::random::TestRandomProvider),
+        socket_addressing: socket_provider.addressing(),
         socket_provider,
         vsock_provider: None,
         timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),
@@ -2519,7 +3080,7 @@ fn check_duplicate_port_binding_retires_socket(broker: &TestBroker, provider: &T
         .unwrap();
     let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
     assert_eq!(
-        attach_binding(&object, duplicate_address, duplicate_binding),
+        attach_binding(&object, duplicate_address, Some(duplicate_binding)),
         Err(BrokerError::Internal)
     );
     assert_eq!(

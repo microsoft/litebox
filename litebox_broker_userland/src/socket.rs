@@ -52,7 +52,8 @@ use litebox_broker_core::socket::stream::StreamWaker;
 use litebox_broker_core::socket::{
     AcceptedPlatformSocket, GuestSocketBinding, GuestSourceLease, HOST_GATEWAY_IPV4_ADDRESS,
     PlatformConnectError, PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus,
-    PlatformStreamReceive, SocketProvider, is_internal_socket_address,
+    PlatformStreamReceive, SocketBindRequest, SocketEgressVerdict, SocketProvider,
+    is_internal_socket_address,
 };
 use litebox_broker_core::{BrokerError, Ipv4Cidr, ProcessKey, Result as BrokerResult};
 use litebox_broker_protocol::ObjectHandle;
@@ -902,7 +903,10 @@ impl UserlandSocket {
 }
 
 impl PlatformSocket for UserlandSocket {
-    fn bind(&self, binding: GuestSocketBinding) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
+    fn bind(&self, request: SocketBindRequest) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
+        let SocketBindRequest::Isolated(binding) = request else {
+            return Err(BrokerError::Internal);
+        };
         self.call(|socket| socket.bind_socket(binding))
     }
 
@@ -934,6 +938,7 @@ impl PlatformSocket for UserlandSocket {
         &self,
         address: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
+        _egress: SocketEgressVerdict,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         self.call(|socket| {
             Ok(match socket.kind() {
