@@ -40,6 +40,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             self.global.platform.take_pending_signals(|signal| {
                 self.queue_signals(signal);
             });
+            self.take_signals_from_other_threads();
             #[cfg(feature = "alarm_fallback")]
             self.check_alarm_deadline();
             self.process_signals(ctx);
@@ -53,6 +54,7 @@ impl<Platform: ShimPlatform> litebox::event::wait::CheckForInterrupt for Task<Pl
         self.global.platform.take_pending_signals(|sig| {
             self.queue_signals(sig);
         });
+        self.take_signals_from_other_threads();
         #[cfg(feature = "alarm_fallback")]
         self.check_alarm_deadline();
         self.is_exiting() || self.has_pending_signals()

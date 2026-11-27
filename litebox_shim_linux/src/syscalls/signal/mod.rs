@@ -531,13 +531,46 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
         let signal = Signal::try_from(signal)?;
-        if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid) {
-            self.send_signal(signal, siginfo_kill(signal));
-            Ok(0)
-        } else {
-            log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
-            Err(Errno::ESRCH)
+        let Some(tid) = tid else {
+            // kill
+            return if pid == Some(self.pid) {
+                self.send_signal(signal, siginfo_kill(signal));
+                Ok(0)
+            } else {
+                log_unsupported!("sys_kill with remote pid");
+                Err(Errno::ESRCH)
+            };
+        };
+        // tkill or tgkill
+        if tid <= 0 || pid.is_some_and(|pid| pid <= 0) {
+            return Err(Errno::EINVAL);
         }
+        if tid == self.tid {
+            // For tgkill, the thread must belong to thread group `pid`.
+            if pid.is_some_and(|pid| pid != self.pid) {
+                return Err(Errno::ESRCH);
+            }
+            self.send_signal(signal, siginfo_kill(signal));
+            return Ok(0);
+        }
+        if pid.is_none_or(|pid| pid == self.pid) {
+            if self.send_signal_to_thread(tid, siginfo_kill(signal)) {
+                return Ok(0);
+            }
+        } else if self.has_thread(tid) {
+            // `tid` is in this process, so it cannot be in thread group `pid`.
+            return Err(Errno::ESRCH);
+        }
+        log_unsupported!("sys_{{t|tg}}kill to a thread in another process");
+        Err(Errno::ESRCH)
+    }
+
+    /// Moves signals sent by other threads into this thread's pending set.
+    pub(crate) fn take_signals_from_other_threads(&self) {
+        self.take_remote_signals(|siginfo| {
+            let signal = Signal::try_from(siginfo.signo).unwrap();
+            self.send_signal(signal, siginfo);
+        });
     }
 
     /// Returns whether there are any pending signals that can be delivered.
